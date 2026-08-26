@@ -1,0 +1,91 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cloudaudit
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+var (
+	windowStart = time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
+	windowEnd   = time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
+)
+
+func TestCloudLoggingFilterScopesToDataAccessAndTheCluster(t *testing.T) {
+	// The filter is the entire correctness of the L2 instance: too broad and the check drowns in
+	// another cluster's traffic, too narrow and it reads an empty stream and calls it clean. It is
+	// asserted here rather than only in the L2 script because the L2 script cannot run in CI.
+	c := &Source{Project: "adamparco-kage", ClusterName: "gke-scratch-kube-agents-dev"}
+	f := c.dataAccessFilter(windowStart, windowEnd)
+	for _, want := range []string{
+		// Admin Activity is on by default and does NOT contain the reads and writes this check
+		// needs; asking the wrong stream is the most likely way to get a confidently wrong pass.
+		`logName:"cloudaudit.googleapis.com%2Fdata_access"`,
+		`resource.type="k8s_cluster"`,
+		`resource.labels.cluster_name="gke-scratch-kube-agents-dev"`,
+		windowStart.UTC().Format(time.RFC3339),
+		windowEnd.UTC().Format(time.RFC3339),
+	} {
+		if !strings.Contains(f, want) {
+			t.Fatalf("filter is missing %q:\n%s", want, f)
+		}
+	}
+}
+
+func TestCloudLoggingUnavailableNamesTheRemedy(t *testing.T) {
+	// Planning defect 3: GKE Kubernetes Data Access audit logs are OFF by default and switching them
+	// on is a project-level IAM policy change. When the stream is unreadable the check is `deferred`
+	// with a NAMED BLOCKER (09 §9.6) -- and a blocker a reader cannot act on gets waived, so the
+	// message has to say what to turn on. `gcloud` is pointed at a binary that does not exist, which
+	// is the same shape of failure as an unauthenticated or unconfigured environment.
+	c := &Source{Project: "p", ClusterName: "c", GCloud: filepath.Join(t.TempDir(), "no-such-gcloud")}
+	err := c.Available(context.Background())
+	if err == nil {
+		t.Fatal("an unreadable Data Access stream reported itself as available; V-BRK-003 would pass on no evidence")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Data Access") || !strings.Contains(msg, "auditConfigs") {
+		t.Fatalf("the blocker does not name what has to be switched on: %s", msg)
+	}
+}
+
+func TestK8sVerbFromMethodRecognisesMutations(t *testing.T) {
+	// Cloud Logging reports a methodName, not a verb. Getting this wrong in the safe direction (a
+	// mutation classified as a read) drops writes from the scan silently, which is the failure mode
+	// V-BRK-003 exists to catch in the broker -- reproduced inside the check itself.
+	for method, want := range map[string]string{
+		"io.k8s.core.v1.pods.create":                  "create",
+		"io.k8s.apps.v1.deployments.update":           "update",
+		"io.k8s.apps.v1.deployments.patch":            "patch",
+		"io.k8s.core.v1.configmaps.delete":            "delete",
+		"io.k8s.core.v1.pods.deletecollection":        "deletecollection",
+		"io.k8s.apps.v1.deployments.status.update":    "update",
+		"io.k8s.core.v1.pods.get":                     "",
+		"io.k8s.core.v1.pods.list":                    "",
+		"io.k8s.core.v1.pods.watch":                   "",
+		"io.k8s.authorization.v1.subjectaccessreview": "",
+		"": "",
+	} {
+		if got := k8sVerbFromMethod(method); got != want {
+			t.Fatalf("k8sVerbFromMethod(%q) = %q, want %q", method, got, want)
+		}
+	}
+}

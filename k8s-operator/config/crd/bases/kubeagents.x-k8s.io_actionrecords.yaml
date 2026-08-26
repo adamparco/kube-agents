@@ -1,0 +1,1038 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: actionrecords.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    categories:
+      - kube-agents
+    kind: ActionRecord
+    listKind: ActionRecordList
+    plural: actionrecords
+    shortNames:
+      - ar
+    singular: actionrecord
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .spec.classification.class
+          name: Class
+          type: string
+        - jsonPath: .spec.agentIdentity
+          name: Identity
+          type: string
+        - jsonPath: .spec.dryRun
+          name: DryRun
+          type: boolean
+        - jsonPath: .spec.classification.undoable
+          name: Undoable
+          type: boolean
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: ActionRecord is the append-only journal entry for one action.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: |-
+                ActionRecordSpec is IMMUTABLE after creation. Every field below carries a transition rule, and
+                the object-level rule is the backstop for fields added later without one.
+              properties:
+                actionId:
+                  description:
+                    ActionID is the uppercase ULID naming this action. metadata.name
+                    is "ar-" + its lowercase form.
+                  pattern: ^[0-9A-HJKMNP-TV-Z]{26}$
+                  type: string
+                actorServiceAccount:
+                  description:
+                    ActorServiceAccount is who actually wrote — the actor
+                    SA, not the reader.
+                  minLength: 1
+                  type: string
+                agentIdentity:
+                  description: |-
+                    AgentIdentity is the (tier, scope) key, e.g. developer-team/my-project/cluster-a/team-x.
+                    The broker may only write status on records whose identity equals its own derived identity.
+                  minLength: 1
+                  type: string
+                agentRef:
+                  description: AgentRef is the Agent CR this action was taken by.
+                  properties:
+                    name:
+                      description: Name of the Agent CR.
+                      minLength: 1
+                      type: string
+                    namespace:
+                      description: Namespace of the Agent CR.
+                      minLength: 1
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
+                attributionUnverified:
+                  description: |-
+                    AttributionUnverified is true when no signed requester assertion was present. The action is
+                    still recorded — it is marked, not discarded, because an unattributed change that happened is
+                    more useful to an investigator than a gap (06 §8).
+                  type: boolean
+                classification:
+                  description: Classification is the verbatim classifier output.
+                  properties:
+                    blastRadius:
+                      description: BlastRadius is the measured size of the change.
+                      properties:
+                        cap:
+                          description:
+                            Cap is the blast-radius ceiling that was in force
+                            for this action.
+                          format: int32
+                          minimum: 0
+                          type: integer
+                        fractionOfScope:
+                          description:
+                            FractionOfScope is objects divided by the size
+                            of the agent's scope. Above 0.5 aborts.
+                          type: string
+                        objects:
+                          description:
+                            Objects is the number of distinct objects the
+                            envelope would mutate, after selector fan-out.
+                          format: int32
+                          minimum: 0
+                          type: integer
+                      required:
+                        - objects
+                      type: object
+                    class:
+                      description:
+                        Class is the final risk class after the full six-step
+                        evaluation order.
+                      enum:
+                        - routine
+                        - elevated
+                        - gated
+                        - forbidden
+                      type: string
+                    policySources:
+                      description:
+                        PolicySources names every input that contributed,
+                        e.g. code-floor and any ChangePolicy.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    reasons:
+                      description: Reasons is every rule that fired, in evaluation order.
+                      items:
+                        description: |-
+                          ClassificationReason is one rule that fired, with the class it contributed. The classifier is
+                          table-driven and deterministic, so this list is a complete explanation of the outcome — that is
+                          what makes a classification reviewable rather than an opinion (06 §4.2).
+                        properties:
+                          class:
+                            description:
+                              "Class is the contribution: a class name, or
+                              the literal +1 for a one-step escalation."
+                            type: string
+                          detail:
+                            description:
+                              Detail is the concrete evidence, e.g. the label
+                              that matched.
+                            type: string
+                          rule:
+                            description:
+                              Rule is the stable identifier of the rule that
+                              fired, e.g. production-environment.
+                            minLength: 1
+                            type: string
+                        required:
+                          - class
+                          - rule
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    undoable:
+                      description:
+                        Undoable records whether an undo plan could be generated.
+                        False forces class >= gated.
+                      type: boolean
+                  required:
+                    - class
+                    - undoable
+                  type: object
+                dryRun:
+                  description: |-
+                    DryRun means the action was classified, planned and journaled but deliberately not executed.
+                    The whole of Phase 9 runs this way.
+                  type: boolean
+                idempotencyKey:
+                  description: |-
+                    IdempotencyKey is "sha256:" + lowerhex(SHA-256(JCS(K))), recomputed by the broker from the
+                    canonicalized envelope and never trusted from the body (06 §4.1).
+                  pattern: ^sha256:[0-9a-f]{64}$
+                  type: string
+                intent:
+                  description:
+                    Intent is the one-line statement of what the action was
+                    for.
+                  minLength: 1
+                  type: string
+                preState:
+                  description:
+                    PreState is the snapshot of every target. Absent on records
+                    that never reached Executing.
+                  items:
+                    description: |-
+                      PreStateSnapshot is what one target looked like before the action, sanitized. Exactly one of
+                      `object` and `objectRef` is set: a snapshot that is neither is a record that cannot be undone
+                      while claiming it can, which is the specific dishonesty the CEL rule below rejects.
+
+                      If the snapshot cannot be persisted at all, the action does not execute — fail-closed, the same
+                      rule as journalling (03 §6).
+                    properties:
+                      capturedAt:
+                        description:
+                          CapturedAt is when the snapshot was taken, inside
+                          the broker at step 8.
+                        format: date-time
+                        type: string
+                      object:
+                        description:
+                          Object is the sanitized object body, inline. Set
+                          only when the body is at most 1 MiB.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      objectRef:
+                        description:
+                          ObjectRef points at the body in the journal store.
+                          Set only when the body exceeds 1 MiB.
+                        properties:
+                          key:
+                            description: Key is the store-scoped identifier of the body.
+                            minLength: 1
+                            type: string
+                          sha256:
+                            description:
+                              SHA256 is the lower-hex digest of the stored
+                              body.
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          store:
+                            description:
+                              Store names the journal store backend that
+                              holds the body.
+                            minLength: 1
+                            type: string
+                        required:
+                          - key
+                          - sha256
+                          - store
+                        type: object
+                      sha256:
+                        description:
+                          SHA256 is the digest of the sanitized body, whether
+                          inline or stored.
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                      targetIndex:
+                        description:
+                          TargetIndex is the position in spec.targets this
+                          snapshot belongs to.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    required:
+                      - capturedAt
+                      - sha256
+                      - targetIndex
+                    type: object
+                    x-kubernetes-validations:
+                      - message:
+                          preState entry must carry exactly one of object (inline)
+                          or objectRef (>1 MiB, stored out of band) — 06 §4.3 large snapshots
+                        rule: has(self.object) != has(self.objectRef)
+                  type: array
+                  x-kubernetes-list-type: atomic
+                rationale:
+                  description: |-
+                    Rationale is recorded and is NEVER a classification input. The classifier reads live cluster
+                    state, never prose — otherwise an agent could argue its way down a risk class (06 §4.2).
+                  type: string
+                requester:
+                  description: Requester is who asked.
+                  properties:
+                    displayName:
+                      description:
+                        DisplayName is a human-readable label. Never matched
+                        against; display only.
+                      type: string
+                    id:
+                      description: ID is the platform-qualified principal, e.g. slack:U02ABCDEF.
+                      minLength: 1
+                      type: string
+                    kind:
+                      description:
+                        Kind distinguishes a human from a system or agent
+                        principal.
+                      enum:
+                        - human
+                        - system
+                        - agent
+                      type: string
+                    platform:
+                      description:
+                        Platform is the chat or automation platform the request
+                        arrived on.
+                      type: string
+                  required:
+                    - id
+                    - kind
+                  type: object
+                retention:
+                  description: Retention carries the two clocks.
+                  properties:
+                    class:
+                      description:
+                        Class is the final risk class the clocks were derived
+                        from.
+                      enum:
+                        - routine
+                        - elevated
+                        - gated
+                        - forbidden
+                      type: string
+                    expiresAt:
+                      description: |-
+                        ExpiresAt is submitted + ttl. The retention controller deletes on this, and only after the
+                        exporter has confirmed the record landed in the audit sink.
+                      format: date-time
+                      type: string
+                    ttl:
+                      description: |-
+                        TTL is how long the record lives. A ChangePolicy may LENGTHEN it — stricter-only in the audit
+                        direction — and may never shorten it.
+                      pattern: ^[0-9]+h$
+                      type: string
+                    undoWindow:
+                      description:
+                        UndoWindow is how long undo is promised. Must be
+                        at most ttl.
+                      pattern: ^[0-9]+h$
+                      type: string
+                    undoWindowExpiresAt:
+                      description: |-
+                        UndoWindowExpiresAt is executionEnded + undoWindow, falling back to submitted for records that
+                        never executed. Past it, the undo controller REFUSES rather than errors: the record is still
+                        there and a human may reconstruct the change by hand — the system just stops claiming one
+                        command will do it correctly.
+                      format: date-time
+                      type: string
+                  required:
+                    - class
+                    - expiresAt
+                    - ttl
+                    - undoWindow
+                    - undoWindowExpiresAt
+                  type: object
+                  x-kubernetes-validations:
+                    - message:
+                        retention.undoWindowExpiresAt must be at or before retention.expiresAt
+                        — the undo promise may never outlive the record (06 §4.3)
+                      rule: self.undoWindowExpiresAt <= self.expiresAt
+                targets:
+                  description:
+                    Targets is every object the action operates on, after
+                    selector fan-out.
+                  items:
+                    description: |-
+                      TargetRef identifies one object the action operates on, pinned by uid and resourceVersion at
+                      classification time. The uid is what an undo precondition checks: replaying a restore against a
+                      different object that happens to share a name is the failure the pin exists to prevent.
+                    properties:
+                      group:
+                        description: Group is the API group, empty for core.
+                        type: string
+                      kind:
+                        description: Kind is the object kind.
+                        minLength: 1
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        minLength: 1
+                        type: string
+                      namespace:
+                        description: Namespace is empty for cluster-scoped targets.
+                        type: string
+                      resourceVersion:
+                        description:
+                          ResourceVersion pins the observed version at classification
+                          time.
+                        type: string
+                      uid:
+                        description:
+                          UID pins the object identity at classification
+                          time.
+                        type: string
+                      version:
+                        description: Version is the API version.
+                        minLength: 1
+                        type: string
+                    required:
+                      - kind
+                      - name
+                      - version
+                    type: object
+                  minItems: 1
+                  type: array
+                  x-kubernetes-list-type: atomic
+                trace:
+                  description: Trace correlates with the telemetry pipeline.
+                  properties:
+                    sessionId:
+                      description:
+                        SessionID is the harness session the action came
+                        from.
+                      type: string
+                    spanId:
+                      description: SpanID is the originating span.
+                      type: string
+                    traceId:
+                      description: TraceID is the W3C trace identifier.
+                      type: string
+                  type: object
+                trigger:
+                  description: Trigger is what caused the action.
+                  properties:
+                    chainId:
+                      description: |-
+                        ChainID is the ULID naming the delegation this action belongs to. An agent that starts a
+                        chain sets it to its own actionId, so there is no empty case and no allocator.
+                      minLength: 1
+                      type: string
+                    detail:
+                      description:
+                        Detail is the human-readable trigger condition, e.g.
+                        CrashLoopBackOff x7/10m.
+                      type: string
+                    ref:
+                      description:
+                        Ref is the object or signal that triggered it, e.g.
+                        pod/api-gateway-7d9c-4kk2.
+                      type: string
+                    source:
+                      description: Source is what caused the action.
+                      enum:
+                        - chat
+                        - watch
+                        - alert
+                        - cron
+                        - delegation
+                        - escalation
+                        - undo
+                      type: string
+                    undoOf:
+                      description: |-
+                        UndoOf is the actionId this action reverts. Required and non-empty iff source is undo.
+                        It lives in spec, so it is immutable and survives deletion of the original — which is the
+                        whole reason the linkage is bidirectional rather than status-only (06 §4.3).
+                      type: string
+                  required:
+                    - chainId
+                    - source
+                  type: object
+                  x-kubernetes-validations:
+                    - message:
+                        spec.trigger.undoOf is required and non-empty exactly when
+                        spec.trigger.source is undo (06 §4.3 undo linkage)
+                      rule:
+                        "self.source == 'undo' ? (has(self.undoOf) && size(self.undoOf)
+                        > 0) : (!has(self.undoOf) || size(self.undoOf) == 0)"
+                undo:
+                  description: Undo is the plan generated before execution.
+                  properties:
+                    caveats:
+                      description: |-
+                        Caveats states what the undo will NOT restore, e.g. pods replaced by a rollout. Recorded so
+                        the promise made to a human is the one the plan can keep.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    generatedAt:
+                      description:
+                        GeneratedAt is when the plan was produced — before
+                        execution, always.
+                      format: date-time
+                      type: string
+                    steps:
+                      description: Steps is the ordered plan.
+                      items:
+                        description: |-
+                          UndoStep is one operation in the undo plan. Each is dry-run against the API server when the plan
+                          is generated, which is what `UndoPlan.Validated` records.
+                        properties:
+                          object:
+                            description:
+                              Object is the sanitized body to apply or recreate,
+                              where the op needs one.
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          objectRef:
+                            description:
+                              ObjectRef points at the body in the journal
+                              store for large snapshots.
+                            properties:
+                              key:
+                                description:
+                                  Key is the store-scoped identifier of the
+                                  body.
+                                minLength: 1
+                                type: string
+                              sha256:
+                                description:
+                                  SHA256 is the lower-hex digest of the stored
+                                  body.
+                                pattern: ^[0-9a-f]{64}$
+                                type: string
+                              store:
+                                description:
+                                  Store names the journal store backend that
+                                  holds the body.
+                                minLength: 1
+                                type: string
+                            required:
+                              - key
+                              - sha256
+                              - store
+                            type: object
+                          op:
+                            description:
+                              Op is the operation to perform, e.g. apply,
+                              delete, create, scale.
+                            minLength: 1
+                            type: string
+                          preconditions:
+                            description:
+                              Preconditions must hold at replay time or the
+                              step refuses.
+                            properties:
+                              resourceVersion:
+                                description:
+                                  ResourceVersion optionally pins the version
+                                  as well, for steps that require it.
+                                type: string
+                              uid:
+                                description:
+                                  UID refuses the undo if the object was
+                                  replaced meanwhile.
+                                type: string
+                            type: object
+                          target:
+                            description: Target is the object the step acts on.
+                            properties:
+                              group:
+                                description: Group is the API group, empty for core.
+                                type: string
+                              kind:
+                                description: Kind is the object kind.
+                                minLength: 1
+                                type: string
+                              name:
+                                description: Name is the object name.
+                                minLength: 1
+                                type: string
+                              namespace:
+                                description: Namespace is empty for cluster-scoped targets.
+                                type: string
+                              resourceVersion:
+                                description:
+                                  ResourceVersion pins the observed version
+                                  at classification time.
+                                type: string
+                              uid:
+                                description:
+                                  UID pins the object identity at classification
+                                  time.
+                                type: string
+                              version:
+                                description: Version is the API version.
+                                minLength: 1
+                                type: string
+                            required:
+                              - kind
+                              - name
+                              - version
+                            type: object
+                        required:
+                          - op
+                          - target
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    strategy:
+                      description: Strategy is the inverse chosen by the 06 §4.3.1 table.
+                      enum:
+                        - delete
+                        - restore
+                        - recreate
+                        - inverse
+                        - none
+                      type: string
+                    validated:
+                      description:
+                        Validated records whether every step dry-ran cleanly
+                        against the API server.
+                      type: boolean
+                  required:
+                    - generatedAt
+                    - strategy
+                    - validated
+                  type: object
+                  x-kubernetes-validations:
+                    - message:
+                        an undo plan with a strategy other than none must contain
+                        at least one step (06 §4.3.1)
+                      rule:
+                        self.strategy == 'none' || (has(self.steps) && size(self.steps)
+                        > 0)
+              required:
+                - actionId
+                - actorServiceAccount
+                - agentIdentity
+                - agentRef
+                - attributionUnverified
+                - classification
+                - dryRun
+                - idempotencyKey
+                - intent
+                - requester
+                - retention
+                - targets
+                - trigger
+              type: object
+              x-kubernetes-validations:
+                - message:
+                    ActionRecord.spec is immutable after creation — the journal
+                    is append-only (06 §4.3)
+                  rule: self == oldSelf
+            status:
+              description:
+                "ActionRecordStatus is written by a closed set of principals,
+                each restricted to a subset of these\nfields (06 §4.3). The Go type
+                cannot express that — it is enforced by `vap-agent-scope-journal` —\nso
+                the table is reproduced here beside the fields it governs:\n\n\tthe
+                owning broker SA      phase, observedGeneration, applied, verification,
+                recovery, report,\n\t                          timestamps, message  —
+                and only on its own agentIdentity. NEVER\n\t                          approvals,
+                contested, or undoneBy.\n\tthe undo controller       phase (to Undone
+                only), undoneBy, contested, message — any namespace,\n\t                          because
+                undo must work for an agent that no longer exists.\n\tthe ChatOps gateway
+                \      approvals, phase (PendingApproval to Pending/Rejected), contested\n\t
+                \                         (clear only).\n\tthe retention controller
+                \ nothing; delete only, and only post-export.\n\tevery reader SA           nothing.\n\ta
+                human cluster-admin     NOTHING. Deliberate: otherwise four-eyes is
+                decorative."
+              properties:
+                applied:
+                  description: Applied is what actually changed, per target.
+                  items:
+                    description: AppliedTarget is what actually happened to one target.
+                    properties:
+                      diff:
+                        description:
+                          Diff is the normalized JSON-patch the server actually
+                          accepted.
+                        items:
+                          description: |-
+                            AppliedDiffOp is one entry of the normalized JSON-patch of what actually changed on the server.
+
+                            NOTE the path dialect. `path` here is an RFC 6901 JSON Pointer (slash-separated, `~1` escaping),
+                            which is NOT the dotted relaxed JSONPath used by `ChangePolicy.when.fieldPaths`. The two dialects
+                            live one screen apart in 06 §4.2 and are the most likely thing to be cross-wired; a `fieldPaths`
+                            entry beginning with a slash is rejected at admission for exactly this reason.
+                          properties:
+                            from:
+                              description:
+                                From is the previous value, rendered as a
+                                string.
+                              type: string
+                            op:
+                              description:
+                                "Op is the JSON-patch operation: add, remove,
+                                or replace."
+                              minLength: 1
+                              type: string
+                            path:
+                              description:
+                                Path is an RFC 6901 JSON Pointer into the
+                                object.
+                              minLength: 1
+                              type: string
+                            value:
+                              description: Value is the new value, rendered as a string.
+                              type: string
+                          required:
+                            - op
+                            - path
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      resourceVersionAfter:
+                        description:
+                          ResourceVersionAfter is the object version after
+                          the apply.
+                        type: string
+                      targetIndex:
+                        description: TargetIndex is the position in spec.targets.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    required:
+                      - targetIndex
+                    type: object
+                  type: array
+                  x-kubernetes-list-type: atomic
+                approvals:
+                  description: Approvals is present only for gated actions.
+                  properties:
+                    expiresAt:
+                      description:
+                        ExpiresAt is when the approval TTL elapses, after
+                        which the action becomes Expired.
+                      format: date-time
+                      type: string
+                    granted:
+                      description: Granted is who approved.
+                      items:
+                        description:
+                          ApprovalEntry is one roster decision, recorded
+                          with who and when.
+                        properties:
+                          at:
+                            description: At is when the decision was recorded.
+                            format: date-time
+                            type: string
+                          comment:
+                            description: Comment is optional free text from the approver.
+                            type: string
+                          principal:
+                            description: Principal is the approving or rejecting identity.
+                            minLength: 1
+                            type: string
+                        required:
+                          - at
+                          - principal
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    rejected:
+                      description: Rejected is who rejected.
+                      items:
+                        description:
+                          ApprovalEntry is one roster decision, recorded
+                          with who and when.
+                        properties:
+                          at:
+                            description: At is when the decision was recorded.
+                            format: date-time
+                            type: string
+                          comment:
+                            description: Comment is optional free text from the approver.
+                            type: string
+                          principal:
+                            description: Principal is the approving or rejecting identity.
+                            minLength: 1
+                            type: string
+                        required:
+                          - at
+                          - principal
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    required:
+                      description: Required is the number of distinct approvals needed.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                    - required
+                  type: object
+                contested:
+                  description: |-
+                    Contested is set true when a human undoes or manually reverts this change (06 §4.4). It is the
+                    signal that the agent and a human disagreed, and it is an input to the trust metrics.
+                  type: boolean
+                escalation:
+                  description:
+                    "Escalation is rung 5: what the broker asked for, and
+                    what C-BR did about it."
+                  properties:
+                    failure:
+                      description: |-
+                        Failure is what went wrong in the fan-out, if anything. Written by the controller. An empty
+                        Failure alongside a request with no timestamps means the fan-out has not run yet, which is a
+                        different state from one that ran and failed — and telling them apart is the whole reason
+                        this is a string rather than a boolean.
+                      maxLength: 1024
+                      type: string
+                    pageRequested:
+                      description: |-
+                        PageRequested records that rung 5 asked for a human. It is separate from PauseRequested
+                        because 05 §1.5's auto-brake table is explicit that the two are different responses to
+                        different classes of trouble: a budget exhaustion escalates WITHOUT pausing, and conflating
+                        them gives you an agent that stops working every busy afternoon.
+                      type: boolean
+                    pagedAt:
+                      description:
+                        PagedAt is when C-BR delivered the page. Written
+                        by the controller.
+                      format: date-time
+                      type: string
+                    pauseRequested:
+                      description:
+                        PauseRequested records that rung 5 asked for the
+                        brake.
+                      type: boolean
+                    pausedAt:
+                      description:
+                        PausedAt is when C-BR set `spec.operations.paused`
+                        on the agent. Written by the controller.
+                      format: date-time
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is the one-line cause, carried through to `Agent.spec.operations.pauseReason` so the
+                        human running `resume` can see what stopped it. Bounded because it is echoed into a spec
+                        field with its own length limit; the broker truncates rather than failing the escalation,
+                        since a pause that does not happen because its reason was long is the wrong trade.
+                      maxLength: 512
+                      type: string
+                    requestedAt:
+                      description: RequestedAt is when the broker recorded the escalation.
+                      format: date-time
+                      type: string
+                  type: object
+                exported:
+                  description: |-
+                    Exported records that the audit exporter has confirmed this record landed in the durable sink.
+                    The retention controller may delete ONLY when this is set and expiresAt has passed: the
+                    exported journal, not the CR, is the system of record, so deleting before export destroys the
+                    evidence rather than aging it out (06 §4.3, 05 §1.2).
+                  properties:
+                    at:
+                      description: At is when the acknowledgement was received.
+                      format: date-time
+                      type: string
+                    confirmed:
+                      description:
+                        Confirmed is true once the sink has acknowledged
+                        the record.
+                      type: boolean
+                    sink:
+                      description:
+                        Sink names the destination, e.g. cloud-logging or
+                        the journal repository.
+                      type: string
+                  required:
+                    - confirmed
+                  type: object
+                message:
+                  description: Message is the one-line human summary.
+                  type: string
+                observedGeneration:
+                  description:
+                    ObservedGeneration is the spec generation this status
+                    reflects.
+                  format: int64
+                  type: integer
+                phase:
+                  description: Phase is the lifecycle position.
+                  enum:
+                    - Pending
+                    - PendingApproval
+                    - Executing
+                    - Verified
+                    - Failed
+                    - RolledBack
+                    - Undone
+                    - Rejected
+                    - Expired
+                    - DryRun
+                  type: string
+                recovery:
+                  description: Recovery is the observable recovery ladder.
+                  properties:
+                    rung:
+                      description: Rung is the current position on the ladder.
+                      format: int32
+                      maximum: 5
+                      minimum: 0
+                      type: integer
+                    transitions:
+                      description: Transitions is the append-only history.
+                      items:
+                        description: |-
+                          RecoveryTransition is one movement on the recovery ladder. A SKIPPED rung must carry a reason —
+                          that is what makes "never skips a rung silently" (04 §5) checkable rather than aspirational.
+                        properties:
+                          at:
+                            description: At is when the transition happened.
+                            format: date-time
+                            type: string
+                          from:
+                            description: From is the rung left.
+                            format: int32
+                            minimum: 0
+                            type: integer
+                          reason:
+                            description:
+                              Reason is why. Mandatory in practice for any
+                              transition that skips a rung.
+                            type: string
+                          to:
+                            description: To is the rung entered.
+                            format: int32
+                            minimum: 0
+                            type: integer
+                        required:
+                          - at
+                          - from
+                          - to
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                  required:
+                    - rung
+                  type: object
+                report:
+                  description: Report is the four beats, structured.
+                  properties:
+                    did:
+                      description: Did is what it changed.
+                      type: string
+                    noticed:
+                      description: Noticed is what the agent observed.
+                      type: string
+                    undo:
+                      description:
+                        Undo is the exact command a human can run to reverse
+                        it.
+                      type: string
+                    verified:
+                      description: Verified is the evidence the change worked.
+                      type: string
+                  type: object
+                timestamps:
+                  description: Timestamps is the lifecycle clock.
+                  properties:
+                    approved:
+                      description:
+                        Approved is when the roster was satisfied. Nil for
+                        non-gated actions.
+                      format: date-time
+                      type: string
+                    classified:
+                      description: Classified is when the classifier returned.
+                      format: date-time
+                      type: string
+                    executionEnded:
+                      description:
+                        ExecutionEnded is when the last mutating call returned.
+                        It is the base for undoWindowExpiresAt.
+                      format: date-time
+                      type: string
+                    executionStarted:
+                      description:
+                        ExecutionStarted is when the first mutating call
+                        was issued.
+                      format: date-time
+                      type: string
+                    submitted:
+                      description: Submitted is when the envelope was accepted.
+                      format: date-time
+                      type: string
+                    verified:
+                      description: Verified is when verification completed.
+                      format: date-time
+                      type: string
+                  type: object
+                undoneBy:
+                  description: |-
+                    UndoneBy is the actionId of the undo action, once executed — the reverse half of the
+                    bidirectional linkage. It answers "was this ever undone?", the question a human asks before
+                    re-attempting a fix.
+                  type: string
+                verification:
+                  description: Verification is the outcome confirmation.
+                  properties:
+                    checks:
+                      description: Checks is every predicate that ran.
+                      items:
+                        description:
+                          VerificationCheck is one named post-condition and
+                          its outcome.
+                        properties:
+                          detail:
+                            description:
+                              Detail is the evidence, e.g. 1/1 updated replicas
+                              available.
+                            type: string
+                          name:
+                            description: Name is the stable check identifier, e.g. rollout-complete.
+                            minLength: 1
+                            type: string
+                          passed:
+                            description: Passed is the outcome.
+                            type: boolean
+                        required:
+                          - name
+                          - passed
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    completedAt:
+                      description: CompletedAt is when verification finished.
+                      format: date-time
+                      type: string
+                    passed:
+                      description: Passed is the conjunction of every check.
+                      type: boolean
+                  required:
+                    - passed
+                  type: object
+              type: object
+          required:
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

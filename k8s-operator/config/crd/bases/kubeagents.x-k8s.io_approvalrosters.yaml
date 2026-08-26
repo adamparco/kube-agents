@@ -1,0 +1,269 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: approvalrosters.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    categories:
+      - kube-agents
+    kind: ApprovalRoster
+    listKind: ApprovalRosterList
+    plural: approvalrosters
+    shortNames:
+      - roster
+    singular: approvalroster
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - description: Agents consulting this roster
+          jsonPath: .status.agentsReferencing
+          name: Approvers
+          type: integer
+        - description: How long a gated action waits
+          jsonPath: .spec.ttl
+          name: TTL
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: |-
+            ApprovalRoster is the closed list of principals who may approve a gated action, resume a paused
+            agent, or clear a contested marker.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: ApprovalRosterSpec is the roster body.
+              properties:
+                allowSelfApproval:
+                  default: false
+                  description: |-
+                    AllowSelfApproval lets the human who requested an action also approve it. Default FALSE.
+
+                    Default-false is four-eyes. The requester is the one person guaranteed to already believe the
+                    action is a good idea, so their approval carries no information — it converts the gate into a
+                    confirmation dialog, which is the control-shaped object people click through.
+                  type: boolean
+                approvers:
+                  description: |-
+                    Approvers is the closed list of principals who may approve. Required and non-empty.
+
+                    A roster resource that exists with zero approvers is refused at admission rather than stored,
+                    because the two things it could mean are opposites: "nobody may approve" (correct behaviour
+                    under fail-closed rule 6, and better expressed by having no roster) and "I have not filled
+                    this in yet" (the actual cause, every time).
+                  items:
+                    description: Approver is one member of the roster.
+                    properties:
+                      displayName:
+                        description:
+                          DisplayName is for humans reading the roster and
+                          is never matched against.
+                        maxLength: 253
+                        type: string
+                      id:
+                        description: |-
+                          ID is the platform-native IMMUTABLE user ID — a Slack member ID, or a Google Chat
+                          `users/<n>` resource name. Never an @handle, a display name, or an email.
+
+                          06 §1.2 V-11 is a hard schema rule for a reason that is easy to miss: handles and emails are
+                          reassignable. A roster naming `@alice` keeps approving after Alice leaves and the handle is
+                          recycled, and nothing in the system notices, because the roster still matches. An immutable
+                          ID that no longer resolves fails to match, which is the correct failure.
+
+                          The pattern excludes whitespace and the `:` that separates the two halves of the canonical
+                          form — an ID containing a colon would make `<platform>:<id>` ambiguous to parse back.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[^\s:]+(/[^\s:]+)*$
+                        type: string
+                      platform:
+                        description: Platform is the chat platform the ID belongs to.
+                        enum:
+                          - slack
+                          - googlechat
+                        type: string
+                    required:
+                      - id
+                      - platform
+                    type: object
+                  maxItems: 128
+                  minItems: 1
+                  type: array
+                escalateTo:
+                  description: |-
+                    EscalateTo is an optional roster the request escalates to on TTL expiry.
+
+                    Escalation does NOT extend the original action's life. The action still expires; what
+                    escalation buys is that somebody senior is told it did. Letting a chain of rosters extend the
+                    clock would make the effective TTL the sum of every roster in the chain, and the 72 h ceiling
+                    exists precisely because a stale classification stops describing the cluster.
+                  properties:
+                    name:
+                      description: Name is the roster's name.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    namespace:
+                      description:
+                        Namespace is where the roster lives. Empty means
+                        the referring object's own namespace.
+                      maxLength: 253
+                      type: string
+                  required:
+                    - name
+                  type: object
+                minApprovals:
+                  default: 1
+                  description: |-
+                    MinApprovals is how many distinct roster members must approve. Default 1.
+
+                    Bounded above by the roster size at admission: `minApprovals: 3` against a two-person roster
+                    is not a strict policy, it is an action that can never be approved and will always expire.
+                  format: int32
+                  maximum: 128
+                  minimum: 1
+                  type: integer
+                notify:
+                  description: Notify is where approval requests are delivered (06 §2b.1).
+                  properties:
+                    googleChat:
+                      description: GoogleChat is the Google Chat destination.
+                      properties:
+                        space:
+                          description:
+                            Space is the Google Chat space resource name
+                            (`spaces/…`).
+                          maxLength: 253
+                          type: string
+                      type: object
+                    slack:
+                      description: Slack is the Slack destination.
+                      properties:
+                        channel:
+                          description:
+                            Channel is the Slack channel ID (`C…`), not a
+                            `#name`.
+                          maxLength: 253
+                          type: string
+                      type: object
+                  type: object
+                ttl:
+                  default: 24h
+                  description: |-
+                    TTL is how long a gated action waits for approval before becoming `Expired`. Default 24h,
+                    floor 1h, ceiling 72h (the DefaultApprovalTTL / MinApprovalTTL / MaxApprovalTTL constants).
+
+                    Expiry is never an approval: an `Expired` action is terminal (06 §4.3) and is not executed
+                    afterwards, no matter who says yes later.
+                  type: string
+              required:
+                - approvers
+              type: object
+            status:
+              description: ApprovalRosterStatus reports what the roster is bound to.
+              properties:
+                agentsReferencing:
+                  description: |-
+                    AgentsReferencing is how many Agent CRs name this roster. Written by the controller so an
+                    operator can see a roster that nothing consults — the failure that looks identical to a
+                    working one right up until the first gated action expires unreviewed.
+                  format: int32
+                  type: integer
+                conditions:
+                  description: Conditions follow the standard Kubernetes convention.
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                observedGeneration:
+                  description:
+                    ObservedGeneration is the spec generation this status
+                    was computed from.
+                  format: int64
+                  type: integer
+              type: object
+          required:
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

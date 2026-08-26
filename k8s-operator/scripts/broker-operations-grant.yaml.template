@@ -1,0 +1,94 @@
+# Broker operations grant — the CLUSTER-SCOPED half of 06 §2.2.1. THE INSTALL-PATH COPY.
+#
+# Rendered by `render_broker_operations_grant` in common.sh and applied by every step that installs
+# an agent tier. `examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml` is the reference
+# copy a human reads; this is the one that lands on a cluster. Both are held to 06 §2.2.1 itself by
+# `dev/tests/actor-grant-single-sourced.py` (V-BRK-013), in both directions — neither is checked
+# against the other, because two copies that agree with each other and disagree with the spec is the
+# failure mode a copy-to-copy check cannot see.
+#
+# ── THE NAMESPACED HALF IS RETIRED (P9-T9b-5b-0-ii-b), THIS ONE IS NOT ─────────────────────────
+# This file used to carry a second document: a tier-neutral `Role kubeagents-broker-operations` with
+# the journal and the approval roster, bound per namespace from agent-identity.yaml.template. Every
+# triple of it now lands in the per-tier `actor-grant-<tier>.yaml.template` beside this one, stamped
+# `kube-agents/tier`, because V-BRK-013 property 4 holds the UNION OF A TIER'S OBJECTS to that tier's
+# profile and an unstamped shared object belongs to every tier and is therefore evidence for none.
+# Two objects granting one thing is also the drift surface this whole check exists to close.
+#
+# The ClusterRole below survives that argument, and the reason is the developer-team tier. 06 §2.2
+# makes its template a `Role` and `vap-agent-readonly` validation 2 denies a ClusterRole labelled
+# `kube-agents/tier: developer-team`, so the three cluster-scoped kinds here — `tokenreviews`,
+# `fleetfreezes`, `changepolicies` — cannot be granted to that tier by any object the tier may own.
+# A namespace-scoped tier needs a cluster-scoped grant it does not own, and the only admissible one
+# is an object wearing no tier label at all. Losing this is not a narrowing: 06 §2.2.1 says a tier
+# that cannot read `fleetfreezes` fails closed permanently (06 §4.4), which bricks it.
+#
+# On a cluster provisioned before that change the old Role and its RoleBinding are still standing.
+# They grant exactly what the tier Role now grants, so they are stale rather than dangerous;
+# `delete_agent_identity` removes the binding by its old name, and the Role is left as the fleet
+# object it always was.
+#
+# WHY THIS FILE EXISTS AT ALL. Until P9-T7d-5 the grant existed only under examples/, and nothing on
+# the install path applied it. Every actor identity the broker resolves by name would have been
+# absent from a freshly provisioned cluster: the broker authenticates its caller with a TokenReview
+# it has no permission to create, and fails closed on step 1 of its own pipeline. That is LSN-039 —
+# the reference tree is not an install path, and a manifest nobody applies is a design document with
+# YAML syntax.
+#
+# TIER-NEUTRAL BY SPECIFICATION. One ClusterRole and one Role *shape* for the whole fleet; each tier
+# binds to them from `agent-identity.yaml.template`. There is deliberately no `kube-agents/tier`
+# label here — stamping one on a shared object would be a lie the ValidatingAdmissionPolicy would
+# then enforce. `kube-agents/role: actor` is what selects it into `vap-agent-readonly`'s actor arm,
+# which is why that policy's match condition tests for either label rather than for tier alone.
+#
+# THE SPLIT IS THE API'S OWN SEAM. tokenreviews, fleetfreezes and changepolicies are cluster-scoped
+# and cannot be granted by a namespaced Role; actionrecords, actionrecords/status and approvalrosters
+# are namespaced and now live in the per-tier Role. The split is chosen so that every verb in the
+# grant that changes PERSISTED state lands in the namespaced half: an actor appends to the journal in
+# its own namespace and nowhere else. `create tokenreviews` is the one write verb here, and it stores
+# nothing.
+#
+# NOT HERE, DELIBERATELY: `update` and `delete` on `actionrecords`. The broker appends and advances
+# `status`; it can never rewrite or remove a record, including its own (06 §2.2.1, 03 §3.3 rule 4).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-broker-operations
+  labels:
+    kube-agents/role: actor
+rules:
+  # step 1: authenticate the calling agent. Creates nothing; TokenReview is a request object.
+  # Not `system:auth-delegator`, which also confers subjectaccessreviews — this grant must be
+  # EXACTLY 06 §2.2.1 and V-BRK-013 fails on a superset as readily as on a subset.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # step 5: the brake. MUST be readable by every tier — a tier that cannot read the freeze object
+  # fails closed permanently (06 §4.4), so omitting this does not fail safe, it bricks the tier.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  # step 4: classification input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+  # steps 3 and 5: the Agent set. Read-only, and CLUSTER-SCOPED deliberately.
+  #
+  # 06 §2.2 appends this grant "verbatim to every actor Role/ClusterRole", and for the platform
+  # and cluster-admin tiers that object is a ClusterRole -- so the spec grants this read at
+  # cluster scope. It used to sit in the namespaced half below, on the reading that agents is a
+  # namespaced kind. That is true of the kind and false of the requirement: `LowerTierOwner`
+  # answers "which Agent's SCOPE covers namespace X", which cannot be found by listing in X,
+  # so it lists cluster-wide on every namespaced operation and `resolveOwner` guards it with
+  # nothing but `live != nil`. Granted namespaced, the ownership gate failed closed for every
+  # envelope on every cluster, and nothing below L2 could see it -- `broker-execute-l2.sh` was
+  # the first thing to submit a real envelope at a deployed broker and it stopped here.
+  #
+  # Moving it does not widen the grant: the (apiGroup, resource, verb) set is unchanged, which
+  # is why V-BRK-013 stays green across this edit. Nor does it touch the split's actual rule --
+  # "every verb that changes PERSISTED state lands in the namespaced half" -- because get, list
+  # and watch change nothing. The two verbs that do write, `create actionrecords` and the status
+  # update, stay below, bound by a RoleBinding, for the reason stated there.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]

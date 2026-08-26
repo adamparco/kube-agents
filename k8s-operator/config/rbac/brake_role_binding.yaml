@@ -1,0 +1,42 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: brake-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: brake-controller-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: brake-controller-role
+subjects:
+  - kind: ServiceAccount
+    name: brake-controller
+    namespace: system
+---
+# Leader election. The brake reuses the operator's `leader-election-role` -- it is the generic
+# configmaps/leases/events grant every controller-runtime manager needs, and duplicating it would
+# mean two files to keep in step. What is NOT shared is the Lease itself: `cmd/main.go` derives a
+# distinct LeaderElectionID for the brake selection, because one Lease shared between two
+# Deployments has one winner, and the loser would sit idle holding no controllers while reporting
+# Ready.
+#
+# A RoleBinding and not a ClusterRoleBinding: the Lease lives in this pod's own namespace and
+# nowhere else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: brake-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: brake-controller-leader-election-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: leader-election-role
+subjects:
+  - kind: ServiceAccount
+    name: brake-controller
+    namespace: system

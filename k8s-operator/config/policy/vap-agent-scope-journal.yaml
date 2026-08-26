@@ -1,0 +1,467 @@
+# ValidatingAdmissionPolicy — who may write ActionRecord.status, and what (06 §4.3).
+#
+# "Writable only by the broker and the undo controller" is too loose to conformance-test. 06 §4.3
+# turns it into a principal list crossed with a field list, and this file is that table as code. Any
+# (principal, field) pair not in the table is DENIED.
+#
+# The row that matters most is the one that grants nothing: **a human cluster-admin may not write
+# ActionRecord.status.** The policy matches ALL principals, not just agent identities, so a
+# `kubectl patch actionrecord … --subresource=status` by a human is rejected exactly the way an
+# agent's is. Approving, rejecting and un-contesting go through /kage approve, /kage reject and
+# /kage uncontest (06 §2b.1) — paths that check the roster, record the human, and leave an audit
+# trail. Without this, four-eyes is decorative: any cluster-admin could mark their own gated action
+# granted and then execute it.
+#
+# Two honest limits, stated in 06 §4.3 and repeated here so nobody discovers them during an
+# incident:
+#
+#   1. A principal holding `delete` on validatingadmissionpolicybindings can remove this policy.
+#      It is TAMPER-EVIDENT, not tamper-proof — removal is itself an audited cluster-scoped write
+#      and is alarmed (SLI 3).
+#   2. Admission has no clock. The retention rule "delete only after expiresAt" cannot be expressed
+#      here; only its other half — "delete only after the exporter confirmed" — can, and is, below.
+#      The time half lives in journal.DeletableAt and is unit-tested against an injected clock.
+#
+# Requires K8s >= 1.30 (VAP GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-scope-journal
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kubeagents.x-k8s.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE"]
+        resources: ["actionrecords/status"]
+  variables:
+    - name: user
+      expression: "request.userInfo.username"
+
+    # --- principal classes -------------------------------------------------------------------
+    #
+    # The broker is identified by matching the record's OWN declared actorServiceAccount in the
+    # record's OWN namespace. That is the "only on its own records" constraint of 06 §4.3, and it is
+    # checked this way rather than by re-deriving `<tier>-<scope>-actor` from spec.agentIdentity
+    # because a scope leaf over 40 characters is truncated (06 §4.3) and a re-derivation would deny
+    # a legitimate broker on a long namespace name. What binds spec.actorServiceAccount to the
+    # identity that created the record is elsewhere and stronger: the record is namespaced, the
+    # broker's RBAC is namespace-scoped, and spec is immutable, so the field cannot be edited to
+    # point somewhere else after the fact.
+    - name: isOwningBroker
+      expression: >-
+        variables.user == 'system:serviceaccount:' + object.metadata.namespace + ':' + object.spec.actorServiceAccount
+    - name: isUndoController
+      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kube-agents-undo-controller'"
+    - name: isChatOpsGateway
+      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway'"
+    # C-JR, the journal reconciler, runs inside the operator manager. It writes status.exported and
+    # nothing else. 06 §4.3's table predates an explicit `exported` field — it says only that the
+    # retention controller may delete "after the exporter has confirmed" without naming who the
+    # exporter is — so this row is the table's missing entry, added with the field it governs.
+    - name: isExporter
+      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kubeagents-controller'"
+    # C-BR, the brake surface (05 §1.5). It reads a recorded escalation and fans it out into
+    # `Agent.spec.operations.paused` and a page, then timestamps what it did. Its OWN service
+    # account, deliberately not the operator's, even though the reconciler is a controller like the
+    # exporter is: see validation 5 below for why sharing that identity would be a downgrade.
+    #
+    # `kubeagents-brake-controller`, with the same one-word prefix as `kubeagents-controller` above
+    # and not the `kube-agents-` spelling the undo controller and the ChatOps gateway carry. Those
+    # two are identities the spec names and nothing yet creates; this one exists. It is
+    # `config/rbac/brake_service_account.yaml` -- declared as `brake-controller` and rendered by
+    # `namePrefix: kubeagents-` in config/default -- and a CEL literal naming a principal the
+    # install does not produce is a policy row that can never match, which is to say no policy at
+    # all. The name follows what kustomize emits because kustomize is what mints the token.
+    - name: isBrakeController
+      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kubeagents-brake-controller'"
+
+    # --- per-field change detection ----------------------------------------------------------
+    #
+    # Enumerated one field at a time rather than looped, because Kubernetes' CEL types an
+    # OpenAPI object as a struct and a struct cannot be indexed by a runtime string.
+    #
+    # THE ENUMERATION IS THE ALLOW-LIST, AND IT FAILS OPEN. This is the opposite of what an earlier
+    # version of this comment claimed, and the correction is the point: a field added to
+    # `ActionRecordStatus` and NOT added below appears in no changed-variable, so `nothingChanged`
+    # stays true when only that field changes — and validation 1 then admits the write from ANY
+    # principal, including the human cluster-admin this policy exists to stop. There is no catch-all
+    # that could close it here, because CEL cannot enumerate a struct's keys at runtime; the closest
+    # expressible thing, comparing `object.status != oldObject.status`, would deny the no-op
+    # re-Update that controllers do on every conflict retry.
+    #
+    # So the property is enforced OUTSIDE admission, by `dev/tests/journal-status-vap-parity.py` in
+    # the L0 chain: every json field of `ActionRecordStatus` must have a `<field>Changed` variable
+    # here, and that variable must appear in `nothingChanged`. A new status field fails the build
+    # until somebody comes back here and decides who may write it. That check has a negative control
+    # for exactly the mutation described above.
+    - name: hasOld
+      expression: "has(oldObject.status)"
+    - name: hasNew
+      expression: "has(object.status)"
+
+    - name: phaseChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.phase) ? oldObject.status.phase : '') !=
+        (variables.hasNew && has(object.status.phase) ? object.status.phase : '')
+    - name: newPhase
+      expression: "variables.hasNew && has(object.status.phase) ? object.status.phase : ''"
+    - name: oldPhase
+      expression: "variables.hasOld && has(oldObject.status.phase) ? oldObject.status.phase : ''"
+
+    - name: observedGenerationChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.observedGeneration) ? oldObject.status.observedGeneration : 0) !=
+        (variables.hasNew && has(object.status.observedGeneration) ? object.status.observedGeneration : 0)
+    - name: messageChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.message) ? oldObject.status.message : '') !=
+        (variables.hasNew && has(object.status.message) ? object.status.message : '')
+    - name: contestedChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.contested) ? oldObject.status.contested : false) !=
+        (variables.hasNew && has(object.status.contested) ? object.status.contested : false)
+    - name: newContested
+      expression: "variables.hasNew && has(object.status.contested) ? object.status.contested : false"
+    - name: undoneByChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.undoneBy) ? oldObject.status.undoneBy : '') !=
+        (variables.hasNew && has(object.status.undoneBy) ? object.status.undoneBy : '')
+
+    - name: appliedChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.applied)) != (variables.hasNew && has(object.status.applied)) ||
+        (variables.hasOld && has(oldObject.status.applied) && variables.hasNew && has(object.status.applied) &&
+         oldObject.status.applied != object.status.applied)
+    - name: verificationChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.verification)) != (variables.hasNew && has(object.status.verification)) ||
+        (variables.hasOld && has(oldObject.status.verification) && variables.hasNew && has(object.status.verification) &&
+         oldObject.status.verification != object.status.verification)
+    - name: recoveryChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.recovery)) != (variables.hasNew && has(object.status.recovery)) ||
+        (variables.hasOld && has(oldObject.status.recovery) && variables.hasNew && has(object.status.recovery) &&
+         oldObject.status.recovery != object.status.recovery)
+    - name: reportChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.report)) != (variables.hasNew && has(object.status.report)) ||
+        (variables.hasOld && has(oldObject.status.report) && variables.hasNew && has(object.status.report) &&
+         oldObject.status.report != object.status.report)
+    - name: timestampsChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.timestamps)) != (variables.hasNew && has(object.status.timestamps)) ||
+        (variables.hasOld && has(oldObject.status.timestamps) && variables.hasNew && has(object.status.timestamps) &&
+         oldObject.status.timestamps != object.status.timestamps)
+    - name: approvalsChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.approvals)) != (variables.hasNew && has(object.status.approvals)) ||
+        (variables.hasOld && has(oldObject.status.approvals) && variables.hasNew && has(object.status.approvals) &&
+         oldObject.status.approvals != object.status.approvals)
+    - name: exportedChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.exported)) != (variables.hasNew && has(object.status.exported)) ||
+        (variables.hasOld && has(oldObject.status.exported) && variables.hasNew && has(object.status.exported) &&
+         oldObject.status.exported != object.status.exported)
+    - name: escalationChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.escalation)) != (variables.hasNew && has(object.status.escalation)) ||
+        (variables.hasOld && has(oldObject.status.escalation) && variables.hasNew && has(object.status.escalation) &&
+         oldObject.status.escalation != object.status.escalation)
+    # `escalation` has TWO writers in ONE struct (04 §5.1, rung 5), so `escalationChanged` above is
+    # too coarse to authorise on: the broker asks, C-BR does it and timestamps what it did, and each
+    # must be denied the other's fields. The two groupings below split the struct along that seam:
+    # `escalationFulfilmentTouched` (the broker's denial) and `escalationRequestTouched` (C-BR's).
+    #
+    # Both are named `...Touched`, not `...Changed`, and that is load-bearing rather than stylistic:
+    # `dev/tests/journal-status-vap-parity.py` treats every `<field>Changed` variable as a claim that
+    # `ActionRecordStatus` has a json field `<field>`, and fails the build on a phantom. These are
+    # sub-field groupings, not status fields.
+    #
+    # `hasOldEsc`/`hasNewEsc` exist so the per-field expressions do not repeat the two-level presence
+    # guard six times. The guards are still required — CEL errors on `has(a.b.c)` when `a.b` is
+    # absent, and only `&&`'s short-circuit keeps that from happening.
+    - name: hasOldEsc
+      expression: "variables.hasOld && has(oldObject.status.escalation)"
+    - name: hasNewEsc
+      expression: "variables.hasNew && has(object.status.escalation)"
+
+    # The FULFILMENT half. A broker that could write these could record that the agent was paged and
+    # paused without either having happened — worse than not recording it at all, because the audit
+    # trail would then actively assert the promise was kept.
+    #
+    # CHANGED, not SET. An earlier version asked only whether the new object carries a fulfilment
+    # field, which answers "no" when a field is being DELETED — so the broker could erase C-BR's
+    # receipt and leave a request that looks like it was never fanned out. Now that C-BR exists and
+    # writes those fields, that is a reachable way to launder a failed pause into a pending one.
+    - name: escPagedAtTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pagedAt)) !=
+        (variables.hasNewEsc && has(object.status.escalation.pagedAt)) ||
+        (variables.hasOldEsc && has(oldObject.status.escalation.pagedAt) &&
+         variables.hasNewEsc && has(object.status.escalation.pagedAt) &&
+         oldObject.status.escalation.pagedAt != object.status.escalation.pagedAt)
+    - name: escPausedAtTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pausedAt)) !=
+        (variables.hasNewEsc && has(object.status.escalation.pausedAt)) ||
+        (variables.hasOldEsc && has(oldObject.status.escalation.pausedAt) &&
+         variables.hasNewEsc && has(object.status.escalation.pausedAt) &&
+         oldObject.status.escalation.pausedAt != object.status.escalation.pausedAt)
+    - name: escFailureTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.failure) ? oldObject.status.escalation.failure : '') !=
+        (variables.hasNewEsc && has(object.status.escalation.failure) ? object.status.escalation.failure : '')
+    - name: escalationFulfilmentTouched
+      expression: >-
+        variables.escPagedAtTouched || variables.escPausedAtTouched || variables.escFailureTouched
+
+    # The REQUEST half, the mirror denial: C-BR may write its receipt and may not edit the thing it
+    # is a receipt FOR. Without this, the controller that performs the pause could also author the
+    # justification for it after the fact — rewrite `reason` to something the pause looks warranted
+    # by, or backdate `requestedAt` — and the journal would agree with it. The broker is the only
+    # writer of these four, and it is the only party that observed the failure they describe.
+    - name: escPageRequestedTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pageRequested) ? oldObject.status.escalation.pageRequested : false) !=
+        (variables.hasNewEsc && has(object.status.escalation.pageRequested) ? object.status.escalation.pageRequested : false)
+    - name: escPauseRequestedTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pauseRequested) ? oldObject.status.escalation.pauseRequested : false) !=
+        (variables.hasNewEsc && has(object.status.escalation.pauseRequested) ? object.status.escalation.pauseRequested : false)
+    - name: escReasonTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.reason) ? oldObject.status.escalation.reason : '') !=
+        (variables.hasNewEsc && has(object.status.escalation.reason) ? object.status.escalation.reason : '')
+    - name: escRequestedAtTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.requestedAt)) !=
+        (variables.hasNewEsc && has(object.status.escalation.requestedAt)) ||
+        (variables.hasOldEsc && has(oldObject.status.escalation.requestedAt) &&
+         variables.hasNewEsc && has(object.status.escalation.requestedAt) &&
+         oldObject.status.escalation.requestedAt != object.status.escalation.requestedAt)
+    - name: escalationRequestTouched
+      expression: >-
+        variables.escPageRequestedTouched || variables.escPauseRequestedTouched ||
+        variables.escReasonTouched || variables.escRequestedAtTouched
+
+    # Nothing at all changed. A no-op status write is harmless and must not be denied — controllers
+    # re-Update on conflict retries and a denial there would look like a permission bug.
+    - name: nothingChanged
+      expression: >-
+        !variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
+        !variables.verificationChanged && !variables.recoveryChanged && !variables.reportChanged &&
+        !variables.timestampsChanged && !variables.messageChanged && !variables.approvalsChanged &&
+        !variables.contestedChanged && !variables.undoneByChanged && !variables.exportedChanged &&
+        !variables.escalationChanged
+
+  validations:
+    # 1) The principal must be in the table at all. This is the row for every reader SA, every other
+    #    controller, and every human — including cluster-admin. Denying by default is the whole
+    #    design: an allow-list means a principal introduced later gets no access until someone adds
+    #    it here on purpose.
+    - expression: >-
+        variables.nothingChanged ||
+        variables.isOwningBroker || variables.isUndoController ||
+        variables.isChatOpsGateway || variables.isExporter || variables.isBrakeController
+      messageExpression: >-
+        '"' + variables.user + '" may not write ActionRecord.status. Only the owning broker, the undo controller, ' +
+        'the ChatOps gateway, the journal exporter and the brake controller may, each on a fixed field set (06 §4.3). ' +
+        'A human cluster-admin is explicitly denied — use /kage approve, /kage reject or /kage uncontest, ' +
+        'which check the roster and leave an audit trail'
+      reason: Forbidden
+
+    # 2) The owning broker: phase, observedGeneration, applied, verification, recovery, report,
+    #    timestamps, message, and the REQUEST half of escalation. NEVER approvals, contested,
+    #    undoneBy — those three are the record of what OTHERS thought of the action, and an actor
+    #    that could write them could approve itself, un-contest a change a human objected to, and
+    #    claim its own action was already undone. NEVER exported either: confirming your own export
+    #    is confirming your own evidence.
+    - expression: >-
+        !variables.isOwningBroker ||
+        (!variables.approvalsChanged && !variables.contestedChanged &&
+         !variables.undoneByChanged && !variables.exportedChanged)
+      message: >-
+        the owning broker may write phase, observedGeneration, applied, verification, recovery, report,
+        timestamps, message and the request half of escalation — never approvals, contested, undoneBy
+        or exported (06 §4.3)
+      reason: Forbidden
+
+    # 2b) The broker asks for rung 5; it does not carry it out (04 §5.1, 05 §1.7). It has no verb that
+    #     could pause an agent or emit an Event — 06 §2.2.1 gives it `get, list, watch` on `agents` and
+    #     nothing on `events` — so writing `pagedAt`, `pausedAt` or `failure` would be recording an
+    #     outcome it is structurally incapable of producing. Those belong to C-BR, which does the
+    #     fan-out from the operator's identity. Without this row the two-writer split in
+    #     `ActionEscalation` would be a convention, and the auditable half of "a failed rollback pages
+    #     AND auto-pauses" (V-REV-006) would be self-attested by the party with the motive.
+    - expression: "!variables.isOwningBroker || !variables.escalationFulfilmentTouched"
+      message: >-
+        the owning broker may request a page and a pause, never record that they happened —
+        pagedAt, pausedAt and failure are written by C-BR, which performs them (04 §5.1, 05 §1.7)
+      reason: Forbidden
+
+    # 3) The undo controller: phase (to Undone only), undoneBy, contested, message. Any record in
+    #    any namespace, because undo must work for an agent that no longer exists (05 §1.3).
+    - expression: >-
+        !variables.isUndoController ||
+        (!variables.observedGenerationChanged && !variables.appliedChanged && !variables.verificationChanged &&
+         !variables.recoveryChanged && !variables.reportChanged && !variables.timestampsChanged &&
+         !variables.approvalsChanged && !variables.exportedChanged && !variables.escalationChanged)
+      message: >-
+        the undo controller may write only phase, undoneBy, contested and message (06 §4.3)
+      reason: Forbidden
+    - expression: >-
+        !variables.isUndoController || !variables.phaseChanged || variables.newPhase == 'Undone'
+      message: >-
+        the undo controller may move a record only to the Undone phase (06 §4.3)
+      reason: Forbidden
+
+    # 4) The ChatOps gateway: approvals, the PendingApproval transition, and CLEARING contested.
+    #    It cannot touch applied or verification — it records a decision about an action, it does
+    #    not get to describe what the action did.
+    - expression: >-
+        !variables.isChatOpsGateway ||
+        (!variables.observedGenerationChanged && !variables.appliedChanged && !variables.verificationChanged &&
+         !variables.recoveryChanged && !variables.reportChanged && !variables.timestampsChanged &&
+         !variables.undoneByChanged && !variables.exportedChanged && !variables.escalationChanged)
+      message: >-
+        the ChatOps gateway may write only approvals, phase and contested (06 §4.3);
+        it may not touch applied or verification
+      reason: Forbidden
+    - expression: >-
+        !variables.isChatOpsGateway || !variables.phaseChanged ||
+        (variables.oldPhase == 'PendingApproval' && (variables.newPhase == 'Pending' || variables.newPhase == 'Rejected'))
+      message: >-
+        the ChatOps gateway may move a record only from PendingApproval to Pending or Rejected (06 §4.3)
+      reason: Forbidden
+    # `contested` marks that a human disagreed with a change. The gateway may CLEAR it — that is
+    # /kage uncontest — and may not set it, because setting it is the undo controller's observation
+    # that an undo actually happened, not a thing anyone declares.
+    - expression: >-
+        !variables.isChatOpsGateway || !variables.contestedChanged || variables.newContested == false
+      message: >-
+        the ChatOps gateway may only CLEAR contested (/kage uncontest), never set it (06 §4.3)
+      reason: Forbidden
+
+    # 5) The journal exporter writes status.exported and nothing else. Narrow on purpose: it is the
+    #    only principal whose write unlocks deletion, so any additional field it could reach would
+    #    be a field that could be rewritten immediately before the record is destroyed.
+    #
+    #    `escalation` is denied here too, and this is the row a change was most likely to want to
+    #    loosen: C-BR — which fans a recorded escalation out into a pause and a page — is a
+    #    controller, and the cheap way to ship it was inside the operator manager, arriving as the
+    #    same service account. That would not have made it the same principal. Widening this row
+    #    would have handed the escalation field to the exporter as a side effect, and the exporter is
+    #    the one principal that can then delete the record — so the receipt and the deletion of the
+    #    thing it is a receipt for would be reachable from one token.
+    #
+    #    That was refused, and validation 6 below is what the refusal cost: C-BR has its OWN service
+    #    account and its own deployment, the way 06 §4.3 already contemplates for the retention
+    #    controller in the note further down this file. This row stays exactly as narrow as it was.
+    - expression: >-
+        !variables.isExporter ||
+        (!variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
+         !variables.verificationChanged && !variables.recoveryChanged && !variables.reportChanged &&
+         !variables.timestampsChanged && !variables.messageChanged && !variables.approvalsChanged &&
+         !variables.contestedChanged && !variables.undoneByChanged && !variables.escalationChanged)
+      message: >-
+        the journal exporter may write only status.exported (06 §4.3, 05 §1.2)
+      reason: Forbidden
+
+    # 6) C-BR, the brake controller: the FULFILMENT half of escalation and nothing else. It is the
+    #    mirror of row 2b — the broker asks, C-BR answers, and neither can write the other's half.
+    #    Together the two rows make `status.escalation` a two-party record: the request is attested
+    #    by the principal that decided rung 5 was warranted, the outcome by the principal that holds
+    #    the verbs to produce it. That is what makes V-REV-006 checkable from the record alone.
+    - expression: >-
+        !variables.isBrakeController ||
+        (!variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
+         !variables.verificationChanged && !variables.recoveryChanged && !variables.reportChanged &&
+         !variables.timestampsChanged && !variables.messageChanged && !variables.approvalsChanged &&
+         !variables.contestedChanged && !variables.undoneByChanged && !variables.exportedChanged)
+      message: >-
+        the brake controller may write only status.escalation — never phase, applied, verification,
+        recovery, report, timestamps, message, approvals, contested, undoneBy or exported (06 §4.3)
+      reason: Forbidden
+    # 6b) …and only the fulfilment half of it. C-BR may not manufacture the request it then fulfils:
+    #     `hasOldEsc` requires the struct to already exist, so C-BR cannot create the escalation, and
+    #     `escalationRequestTouched` denies any edit to pageRequested, pauseRequested, reason or
+    #     requestedAt. Without this row a compromised C-BR could write itself an escalation and pause
+    #     the fleet — the exact concentration of authority the broker/C-BR split exists to prevent.
+    - expression: >-
+        !variables.isBrakeController ||
+        (variables.hasOldEsc && !variables.escalationRequestTouched)
+      message: >-
+        the brake controller may record that a page and a pause happened; it may not create the
+        escalation or change what was requested (04 §5.1, 05 §1.7)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-scope-journal
+spec:
+  policyName: kube-agents-agent-scope-journal
+  validationActions: [Deny]
+  # No matchResources selector: the table in 06 §4.3 matches ALL principals in ALL namespaces, and a
+  # namespace selector here would be a way to opt a namespace out of it.
+---
+# The retention controller's deletion predicate, admission half.
+#
+# 05 §1.2: the EXPORT is the durable record. A record deleted before the exporter confirmed is
+# evidence destroyed, not evidence aged out, and from inside the controller the two are
+# indistinguishable — same code path, same log line, same absence afterwards. So the precondition is
+# enforced here as well as in journal.DeletableAt: defence in depth against the controller-side
+# predicate being weakened, and against anything else that ever gains delete on this resource.
+#
+# The `now > expiresAt` half of the predicate is NOT here. Admission has no clock. That half is
+# controller-side only, and is the reason V-REV-008 keeps an L4 (wall-clock) instance.
+#
+# NOTE: 06 §4.3 names `kube-agents-retention-controller` as a distinct SA. This build runs retention
+# as a controller inside the operator manager (internal/controller/retention_controller.go), so the
+# operator SA is listed alongside it. Splitting it into its own Deployment and SA — so that delete
+# authority is not co-resident with everything else the operator can do — is tracked for the unit
+# that lands the undo controller, which has the same shape.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-journal-retention
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kubeagents.x-k8s.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["DELETE"]
+        resources: ["actionrecords"]
+  variables:
+    - name: user
+      expression: "request.userInfo.username"
+    - name: exported
+      expression: >-
+        has(oldObject.status) && has(oldObject.status.exported) &&
+        has(oldObject.status.exported.confirmed) && oldObject.status.exported.confirmed
+  validations:
+    # Only the retention path deletes records. Every agent identity — including the actor SA that
+    # created the record — is denied, which is the append-only property of 06 §2.2.1.
+    - expression: >-
+        variables.user == 'system:serviceaccount:kubeagents-system:kube-agents-retention-controller' ||
+        variables.user == 'system:serviceaccount:kubeagents-system:kubeagents-controller'
+      messageExpression: >-
+        '"' + variables.user + '" may not delete an ActionRecord. The journal is append-only; ' +
+        'records are removed only by the retention controller, post-export (06 §4.3, 05 §1.2)'
+      reason: Forbidden
+    - expression: "variables.exported"
+      message: >-
+        this ActionRecord has not been confirmed as exported to the audit sink; deleting it would
+        destroy the evidence rather than age it out — the export is the durable record (05 §1.2)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-journal-retention
+spec:
+  policyName: kube-agents-journal-retention
+  validationActions: [Deny]

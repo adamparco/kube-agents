@@ -1,0 +1,75 @@
+# C-BR's grant: read the escalation, stop the agent, page, write the receipt. Nothing else.
+#
+# HAND-WRITTEN, NOT GENERATED, AND THAT IS THE POINT. Every `+kubebuilder:rbac` marker in
+# internal/controller composes into the single `manager-role` above, so a marker on
+# BrakeReconciler would have widened the OPERATOR's ClusterRole -- handing `agents` patch and
+# `actionrecords/status` write to the journal exporter as a side effect, which is the exact
+# concentration of authority this controller's separate identity exists to prevent. The brake
+# controller therefore carries no markers and this file is its whole authority. See the note on
+# `BrakeReconciler.Reconcile`.
+#
+# WHY A ClusterRole AND NOT A NAMESPACED Role. 08 §2.7 is normative that the controller holds no
+# cluster-wide write verb "on any workload or Secret resource", and enumerates them: Pods,
+# Deployments, Secrets, Services, NetworkPolicies, ConfigMaps, PersistentVolumeClaims. None of
+# those appear below. What does appear -- `Agent` CRs and `ActionRecord`s -- is on the other side of
+# that same paragraph, which names "the cluster-scoped objects it must own (`Agent` CRs and their
+# status...)" as what the ClusterRole retains. A brake is fleet-wide by definition: 05 §1.5's
+# trigger is "the world is in a state the system did not intend and cannot restore", and an agent
+# in a placement namespace created ten minutes ago is exactly the one that needs stopping. There is
+# no static namespace list to bind per-namespace RoleBindings to at install time.
+#
+# `events` is not on 08 §2.7's list and is cluster-wide for the same reason: the page is emitted on
+# the Agent object, which lives in whatever namespace the agent was placed in. An Event is the only
+# write here that reaches a core resource, it is append-only in practice, and it is the page itself
+# -- a brake that cannot say it braked is 04 §5.1 rung 5 half-performed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: brake-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: brake-controller-role
+rules:
+  # The trigger. Watch is what wakes the reconciler; the predicate in
+  # `escalationPendingPredicate` filters to records that still owe a fan-out.
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - actionrecords
+    verbs:
+      - get
+      - list
+      - watch
+  # The receipt. `patch` only -- no `update`, because a full-object status write from a stale read
+  # would carry the broker's and the exporter's fields backwards, and `recordFulfilment` uses a
+  # merge patch precisely so it cannot. No `create`, no `delete`: C-BR never authors a record.
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - actionrecords/status
+    verbs:
+      - get
+      - patch
+  # The pause. `patch` on the main resource, because `spec.operations.paused` is spec, not status --
+  # it is the same field a human sets, which is what makes `resume` unchanged (05 §1.7). No
+  # `update` for the reason above: a human may be editing the same spec at the same moment, and
+  # losing their edit to an automated brake is a way for the brake to become a source of incidents.
+  # No `create` and no `delete`: C-BR stops agents, it does not make or unmake them.
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - agents
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+  # The page. See the note above on why this is cluster-wide.
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
