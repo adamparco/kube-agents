@@ -442,7 +442,10 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — nine keys, always all nine:
+Exit contract — eleven keys, always all eleven. The nine semantic keys below decide behaviour;
+the two timing keys (`inspect_s`, `publish_s`) are telemetry added by
+[`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.4, elided from
+the examples for width, and `inspect_s` is `null` when `start`'s timestamp file is missing:
 
 - `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
 - `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`

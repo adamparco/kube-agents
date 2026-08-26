@@ -312,7 +312,7 @@ Worked example, for a 3.2 finding on `serving/vllm-llama`:
   --findings-file /opt/data/scratch/findings_ai-security-audit.json
 ```
 
-One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
 `partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence: `resolved` comes back `0`, no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; a model-free cluster needs neither field, because its six checks ran and matched nothing.
 

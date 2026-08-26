@@ -184,7 +184,7 @@ Every finding must conform to the full findings schema:
 ./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
-#     "silent_ok":true}
+#     "silent_ok":true,"inspect_s":214.0,"publish_s":41.5}
 ```
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.

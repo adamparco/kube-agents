@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from unittest.mock import patch
@@ -537,6 +537,23 @@ class BaseTestCase(unittest.TestCase):
 
     def stdout_json(self):
         return json.loads(self.out.strip())
+
+    def stdout_json_sans_timing(self, *keys):
+        """The exit payload minus its wall-clock keys, which are asserted by type.
+
+        Durations are real elapsed time and cannot appear in an exact-dict
+        assertion; everything semantic still can. Each named key must be
+        present — a payload that dropped one fails here, not silently.
+        """
+        payload = json.loads(self.out.strip())
+        for key in keys:
+            self.assertIn(key, payload)
+            value = payload.pop(key)
+            self.assertTrue(
+                value is None or isinstance(value, (int, float)),
+                f"{key}={value!r} is not a duration or None",
+            )
+        return payload
 
     def write_findings(self, doc):
         path = self.tmp_path / "findings.json"
@@ -2448,7 +2465,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s"),
             {
                 "status": "OPENED",
                 "issue_url": "https://github.com/acme/fleet/issues/7",
@@ -2506,7 +2523,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s"),
             {
                 "status": "UPDATED",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -2733,7 +2750,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("branch", "-D"))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s"),
             {
                 "status": "CLEAN",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -2764,7 +2781,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("issue", "close"))
         self.assertFalse(self.harness.gh_calls("issue", "comment"))
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s"),
             {
                 "status": "CLEAN",
                 "issue_url": None,
@@ -4694,9 +4711,122 @@ class TestLabelDescriptions(HarnessTestCase):
 
     def test_the_stale_closed_label_is_among_them(self):
         # The guard above is only worth having while this label is in scope.
-        self.assertIn(
-            audit_report.STALE_CLOSED_LABEL, self.descriptions(AUDIT)
+        self.assertIn(audit_report.STALE_CLOSED_LABEL, self.descriptions(AUDIT))
+
+
+class TestEnsureLabelsCaching(HarnessTestCase):
+    """One `label list`, then create only what is missing.
+
+    Seven unconditional creates per subcommand were fourteen network round
+    trips on a plain run. The list is a cache, not a gate: any failure to
+    read it falls back to creating everything, because under-creating is the
+    dangerous direction — `pr_closed_by_harness` reads STALE_CLOSED_LABEL,
+    and a label that quietly never exists makes every harness close read as
+    a human rejection.
+    """
+
+    def creates(self):
+        return [c for c in self.harness.calls if c[:3] == ["gh", "label", "create"]]
+
+    def all_label_names(self):
+        # Learned from the code path itself (list unavailable → create all),
+        # so this test cannot drift from the label roster.
+        self.harness.failures = {"label list": 1}
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        names = [c[3] for c in self.creates()]
+        self.harness.calls.clear()
+        self.harness.failures = {}
+        return names
+
+    def test_existing_labels_are_not_recreated(self):
+        names = self.all_label_names()
+        self.assertEqual(len(names), 7)
+        self.harness.replies = {
+            "label list": json.dumps([{"name": n} for n in names])
+        }
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual(self.creates(), [])
+
+    def test_missing_labels_are_created(self):
+        names = self.all_label_names()
+        present = [n for n in names if n != audit_report.STALE_CLOSED_LABEL]
+        self.harness.replies = {
+            "label list": json.dumps([{"name": n} for n in present])
+        }
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual([c[3] for c in self.creates()], [audit_report.STALE_CLOSED_LABEL])
+
+    def test_a_failed_list_falls_back_to_creating_everything(self):
+        self.harness.failures = {"label list": 1}
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual(len(self.creates()), 7)
+
+    def test_garbage_list_output_falls_back_to_creating_everything(self):
+        self.harness.replies = {"label list": "not json"}
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual(len(self.creates()), 7)
+
+
+class TestTiming(HarnessTestCase):
+    """`inspect_s`/`publish_s`/`duration_s` are telemetry: measured when
+    possible, null when not, and never able to fail a run."""
+
+    def scratch(self):
+        path = Path(audit_report.SCRATCH_DIR)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def test_start_writes_a_parseable_t0(self):
+        self.scratch()
+        self.harness.replies = {"issue list": "[]"}
+        with patch.object(audit_report.os, "makedirs", lambda *a, **k: None):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        t0 = audit_report.read_phase_t0(AUDIT)
+        self.assertIsNotNone(t0)
+        self.assertIsNotNone(t0.tzinfo)
+
+    def test_finish_measures_inspect_s_from_start_s_t0(self):
+        self.scratch()
+        audit_report.write_phase_start(
+            AUDIT, datetime.now(timezone.utc) - timedelta(seconds=90)
         )
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        payload = self.stdout_json()
+        self.assertGreaterEqual(payload["inspect_s"], 90.0)
+        self.assertIsInstance(payload["publish_s"], (int, float))
+
+    def test_finish_without_a_phase_file_reports_null_not_an_error(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_a_garbage_phase_file_degrades_to_null(self):
+        scratch = self.scratch()
+        (scratch / f"phase_{AUDIT}.json").write_text("not json", encoding="utf-8")
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_a_t0_in_the_future_degrades_to_null(self):
+        # A clock that moved backwards between the two processes reads as "no
+        # measurement", never as a negative duration.
+        self.scratch()
+        audit_report.write_phase_start(
+            AUDIT, datetime.now(timezone.utc) + timedelta(hours=1)
+        )
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_an_unwritable_scratch_dir_does_not_fail_start(self):
+        # SCRATCH_DIR is left uncreated and makedirs is a no-op, so the phase
+        # write raises OSError inside write_phase_start — which must degrade
+        # to a stderr warning, not an exit code.
+        self.harness.replies = {"issue list": "[]"}
+        with patch.object(audit_report.os, "makedirs", lambda *a, **k: None):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertIn("could not write", self.err)
 
 
 class TestSyncOpenRemediationLabels(HarnessTestCase):
@@ -5378,7 +5508,7 @@ class TestRemediateSubcommand(HarnessTestCase):
         rc = self.run_remediate(make_doc(), [derived_id()])
         self.assertEqual(rc, 0)
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("duration_s"),
             {
                 "status": "REMEDIATED",
                 "prs_opened": ["https://github.com/acme/fleet/pull/8"],

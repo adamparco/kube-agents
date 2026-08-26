@@ -961,6 +961,55 @@ def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
 
 
+def phase_path_for(audit_id: str) -> str:
+    """Where `start` records the run's t0 for `finish` to compute `inspect_s`.
+
+    `start` and `finish` are separate processes with the whole LLM inspection
+    phase between them, so the only way `finish` can time that phase is a
+    timestamp `start` left behind. Same crashed-run rule as the findings file:
+    `start` overwrites it unconditionally, so a stale one can only be read by a
+    `finish` whose `start` crashed before writing — and a missing or
+    unparseable file degrades to `inspect_s: null`, never to an error. Timing
+    is telemetry; it must not be able to fail a run.
+    """
+    return f"{SCRATCH_DIR}/phase_{audit_id}.json"
+
+
+def write_phase_start(audit_id: str, t0: datetime) -> None:
+    """Best-effort: a phase file that cannot be written costs a metric, not a run."""
+    try:
+        Path(phase_path_for(audit_id)).write_text(
+            json.dumps({"audit": audit_id, "t0": t0.isoformat()}), encoding="utf-8"
+        )
+    except OSError as exc:
+        log(f"WARNING: could not write {phase_path_for(audit_id)}: {exc}")
+
+
+def read_phase_t0(audit_id: str) -> datetime | None:
+    """The t0 `start` recorded, or None when there is nothing usable to read."""
+    try:
+        raw = json.loads(Path(phase_path_for(audit_id)).read_text(encoding="utf-8"))
+        t0 = datetime.fromisoformat(str(raw.get("t0", "")))
+    except (OSError, ValueError):
+        return None
+    if t0.tzinfo is None:
+        return None
+    return t0
+
+
+def inspect_seconds(audit_id: str, now: datetime) -> float | None:
+    """Wall-clock from `start`'s t0 to `now`, or None without a usable t0.
+
+    Clamped at zero: a clock that moved backwards between the two processes
+    should read as "no measurement", not as evidence of time travel.
+    """
+    t0 = read_phase_t0(audit_id)
+    if t0 is None:
+        return None
+    seconds = (now - t0).total_seconds()
+    return round(seconds, 1) if seconds >= 0 else None
+
+
 def base_branch() -> str:
     """The branch remediation pull requests target: this repository's own default.
 
@@ -4202,7 +4251,29 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         ("severity:major", "D93F0B", "Highest audit finding severity: major"),
         ("severity:minor", "FBCA04", "Highest audit finding severity: minor"),
     ]
+    # One list, then create only what is missing. This used to be seven
+    # unconditional `label create --force` calls, from `start`, `finish`, and
+    # `remediate` alike — fourteen network round trips on a plain run,
+    # twenty-one with a promotion, to assert labels that have existed since the
+    # stream's first run. A failed or unparseable list degrades to the old
+    # behaviour (create everything, `check=False`), never to skipped labels:
+    # `pr_closed_by_harness` reads STALE_CLOSED_LABEL, so under-creating is the
+    # failure mode that matters and over-creating is free.
+    existing: set[str] = set()
+    listed = gh(
+        ["label", "list", "-R", repo, "--limit", "100", "--json", "name"],
+        check=False,
+    )
+    if listed.returncode == 0 and (listed.stdout or "").strip():
+        try:
+            existing = {
+                str(entry.get("name", "")) for entry in json.loads(listed.stdout)
+            }
+        except (ValueError, AttributeError):
+            existing = set()
     for name, color, description in labels:
+        if name in existing:
+            continue
         gh(
             [
                 "label",
@@ -5184,6 +5255,11 @@ def handle_start(args: argparse.Namespace) -> None:
     findings_path = findings_path_for(audit_id)
     Path(findings_path).unlink(missing_ok=True)
 
+    # t0 for `finish`'s `inspect_s`. Written after the scrub so a crash between
+    # the two lines leaves a fresh t0 and a missing findings file — the safe
+    # combination — rather than the reverse.
+    write_phase_start(audit_id, datetime.now(timezone.utc))
+
     print(
         json.dumps(
             {
@@ -5464,6 +5540,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
+    entry_mono = time.monotonic()
 
     by_id = {str(f.get("id", "")): f for f in findings}
     unknown = [fid for fid in args.finding if fid not in by_id]
@@ -5625,6 +5702,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
                 "already_open": plan.already_open,
                 "superseded": plan.superseded,
                 "refused": refused,
+                "duration_s": round(time.monotonic() - entry_mono, 1),
             }
         )
     )
@@ -5635,6 +5713,11 @@ def handle_finish(args: argparse.Namespace) -> None:
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
+    # Timing: `inspect_s` is t0 → here (the LLM-inclusive inspection phase),
+    # `publish_s` is here → the exit payload. Both ride the payload as
+    # telemetry; neither can fail the run (see phase_path_for).
+    inspect_s = inspect_seconds(audit_id, now)
+    entry_mono = time.monotonic()
 
     if args.dry_run:
         _handle_finish_dry_run(audit_id, data, now)
@@ -5818,6 +5901,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                     "silent_ok": not (clean_resolved or gaps or prs_closed),
                     "partial": bool(gaps),
                     "coverage_gaps": gaps,
+                    "inspect_s": inspect_s,
+                    "publish_s": round(time.monotonic() - entry_mono, 1),
                 }
             )
         )
@@ -6099,6 +6184,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # WARNING in the run log.
                 "partial": bool(gaps),
                 "coverage_gaps": gaps,
+                "inspect_s": inspect_s,
+                "publish_s": round(time.monotonic() - entry_mono, 1),
             }
         )
     )

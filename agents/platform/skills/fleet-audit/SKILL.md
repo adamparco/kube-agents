@@ -166,14 +166,17 @@ about is not covered by that guarantee.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with nine fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
-`partial`, `coverage_gaps`, and `silent_ok`:
+JSON line with eleven fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
+`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two timing fields, `inspect_s`
+(wall-clock from `start` to `finish`, i.e. the inspection phase; `null` when `start`'s
+timestamp file is missing) and `publish_s` (time `finish` itself spent publishing). The timing
+fields are telemetry — read them for the report if useful, never branch on them:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":214.0,"publish_s":41.5}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":180.2,"publish_s":38.9}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":95.1,"publish_s":12.3}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -581,9 +584,10 @@ one `--finding` produces one pull request (or one, shared, for the group that pa
 five more for critical findings the requester never mentioned and cannot tell apart from the one they
 did. Auto-promotion happens in `finish`, where the whole fleet is being reported on anyway.
 
-It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, and `refused`:
+It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, `refused`, and
+`duration_s` (telemetry: how long the command itself took):
 
-- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"superseded":[],"refused":["ns-quota"]}`
+- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"superseded":[],"refused":["ns-quota"],"duration_s":18.4}`
 
 `superseded` names targets whose pull request a human closed: that close stands, and the
 subcommand does not re-propose them. Revival belongs to the write-gated `/remediate` comment
