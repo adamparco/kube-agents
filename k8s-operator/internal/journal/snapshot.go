@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // InlineSnapshotLimit is the 1 MiB threshold of 05 §1.2 / 06 §4.3. Above it the body goes to the

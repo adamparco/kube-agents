@@ -23,14 +23,13 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // Admission for the three brake objects of 06 §4.4.
@@ -81,20 +80,17 @@ var brakeNow = time.Now
 
 // SetupBrakeWebhooksWithManager registers validators for all three brake objects.
 func SetupBrakeWebhooksWithManager(mgr ctrl.Manager) error {
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&agentv1alpha1.FleetFreeze{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &agentv1alpha1.FleetFreeze{}).
 		WithValidator(&FleetFreezeCustomValidator{}).
 		Complete(); err != nil {
 		return err
 	}
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&agentv1alpha1.ApprovalRoster{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &agentv1alpha1.ApprovalRoster{}).
 		WithValidator(&ApprovalRosterCustomValidator{}).
 		Complete(); err != nil {
 		return err
 	}
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&agentv1alpha1.UndoRequest{}).
+	return ctrl.NewWebhookManagedBy(mgr, &agentv1alpha1.UndoRequest{}).
 		WithValidator(&UndoRequestCustomValidator{}).
 		Complete()
 }
@@ -107,35 +103,27 @@ func SetupBrakeWebhooksWithManager(mgr ctrl.Manager) error {
 // the object alone, so admission cannot be made to hang by a slow API server.
 type FleetFreezeCustomValidator struct{}
 
-var _ admission.CustomValidator = &FleetFreezeCustomValidator{}
+var _ admission.Validator[*agentv1alpha1.FleetFreeze] = &FleetFreezeCustomValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *FleetFreezeCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	ff, ok := obj.(*agentv1alpha1.FleetFreeze)
-	if !ok {
-		return nil, fmt.Errorf("expected a FleetFreeze object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator.
+func (v *FleetFreezeCustomValidator) ValidateCreate(_ context.Context, ff *agentv1alpha1.FleetFreeze) (admission.Warnings, error) {
 	brakelog.Info("validating FleetFreeze creation", "name", ff.Name)
 	return ValidateFleetFreeze(ff)
 }
 
-// ValidateUpdate implements admission.CustomValidator.
-func (v *FleetFreezeCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	ff, ok := newObj.(*agentv1alpha1.FleetFreeze)
-	if !ok {
-		return nil, fmt.Errorf("expected a FleetFreeze object but got %T", newObj)
-	}
+// ValidateUpdate implements admission.Validator.
+func (v *FleetFreezeCustomValidator) ValidateUpdate(_ context.Context, _, ff *agentv1alpha1.FleetFreeze) (admission.Warnings, error) {
 	brakelog.Info("validating FleetFreeze update", "name", ff.Name)
 	return ValidateFleetFreeze(ff)
 }
 
-// ValidateDelete implements admission.CustomValidator.
+// ValidateDelete implements admission.Validator.
 //
 // Deleting a freeze is how a freeze is lifted -- there is no `enabled: false` -- so this must
 // always be permitted. WHO may delete one is an authorization question answered by RBAC and by
 // `vap-agent-scope`; refusing it here would mean a stuck freeze could only be cleared by editing
 // etcd, during the incident that produced it.
-func (v *FleetFreezeCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (v *FleetFreezeCustomValidator) ValidateDelete(_ context.Context, _ *agentv1alpha1.FleetFreeze) (admission.Warnings, error) {
 	return nil, nil
 }
 
@@ -194,34 +182,26 @@ func ValidateFleetFreeze(ff *agentv1alpha1.FleetFreeze) (admission.Warnings, err
 // ApprovalRosterCustomValidator validates ApprovalRoster objects.
 type ApprovalRosterCustomValidator struct{}
 
-var _ admission.CustomValidator = &ApprovalRosterCustomValidator{}
+var _ admission.Validator[*agentv1alpha1.ApprovalRoster] = &ApprovalRosterCustomValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *ApprovalRosterCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	ar, ok := obj.(*agentv1alpha1.ApprovalRoster)
-	if !ok {
-		return nil, fmt.Errorf("expected an ApprovalRoster object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator.
+func (v *ApprovalRosterCustomValidator) ValidateCreate(_ context.Context, ar *agentv1alpha1.ApprovalRoster) (admission.Warnings, error) {
 	brakelog.Info("validating ApprovalRoster creation", "name", ar.Name, "namespace", ar.Namespace)
 	return ValidateApprovalRoster(ar)
 }
 
-// ValidateUpdate implements admission.CustomValidator.
-func (v *ApprovalRosterCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	ar, ok := newObj.(*agentv1alpha1.ApprovalRoster)
-	if !ok {
-		return nil, fmt.Errorf("expected an ApprovalRoster object but got %T", newObj)
-	}
+// ValidateUpdate implements admission.Validator.
+func (v *ApprovalRosterCustomValidator) ValidateUpdate(_ context.Context, _, ar *agentv1alpha1.ApprovalRoster) (admission.Warnings, error) {
 	brakelog.Info("validating ApprovalRoster update", "name", ar.Name, "namespace", ar.Namespace)
 	return ValidateApprovalRoster(ar)
 }
 
-// ValidateDelete implements admission.CustomValidator.
+// ValidateDelete implements admission.Validator.
 //
 // Deleting a roster does not open a gate -- 06 §4.4's sixth fail-closed rule is that a gated action
 // with no roster stays PendingApproval and expires. So the failure mode of an over-eager delete is
 // that approvals stop working, which is loud, and not that they start being skipped, which is not.
-func (v *ApprovalRosterCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (v *ApprovalRosterCustomValidator) ValidateDelete(_ context.Context, _ *agentv1alpha1.ApprovalRoster) (admission.Warnings, error) {
 	return nil, nil
 }
 
@@ -300,35 +280,27 @@ func ValidateApprovalRoster(ar *agentv1alpha1.ApprovalRoster) (admission.Warning
 // UndoRequestCustomValidator validates UndoRequest objects.
 type UndoRequestCustomValidator struct{}
 
-var _ admission.CustomValidator = &UndoRequestCustomValidator{}
+var _ admission.Validator[*agentv1alpha1.UndoRequest] = &UndoRequestCustomValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *UndoRequestCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	ur, ok := obj.(*agentv1alpha1.UndoRequest)
-	if !ok {
-		return nil, fmt.Errorf("expected an UndoRequest object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator.
+func (v *UndoRequestCustomValidator) ValidateCreate(_ context.Context, ur *agentv1alpha1.UndoRequest) (admission.Warnings, error) {
 	brakelog.Info("validating UndoRequest creation", "name", ur.Name, "namespace", ur.Namespace)
 	return ValidateUndoRequest(ur)
 }
 
-// ValidateUpdate implements admission.CustomValidator.
+// ValidateUpdate implements admission.Validator.
 //
 // The spec is immutable by CEL, so an update here is a status-adjacent or metadata change. It is
 // still validated, because CEL immutability holds the spec and this holds the rest.
-func (v *UndoRequestCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	ur, ok := newObj.(*agentv1alpha1.UndoRequest)
-	if !ok {
-		return nil, fmt.Errorf("expected an UndoRequest object but got %T", newObj)
-	}
+func (v *UndoRequestCustomValidator) ValidateUpdate(_ context.Context, _, ur *agentv1alpha1.UndoRequest) (admission.Warnings, error) {
 	return ValidateUndoRequest(ur)
 }
 
-// ValidateDelete implements admission.CustomValidator.
+// ValidateDelete implements admission.Validator.
 //
 // Deleting an UndoRequest does not un-undo anything: the undo is a separate, journaled action, and
 // the record of it lives in the journal rather than here. This object is the ask, not the receipt.
-func (v *UndoRequestCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (v *UndoRequestCustomValidator) ValidateDelete(_ context.Context, _ *agentv1alpha1.UndoRequest) (admission.Warnings, error) {
 	return nil, nil
 }
 

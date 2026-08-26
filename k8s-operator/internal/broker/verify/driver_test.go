@@ -28,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // flippingProber answers with the fake's object until `after` Gets have been served, then with

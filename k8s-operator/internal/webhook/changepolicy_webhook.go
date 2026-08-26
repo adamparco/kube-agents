@@ -22,14 +22,13 @@ import (
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/classify"
 )
 
@@ -56,8 +55,7 @@ var changepolicylog = logf.Log.WithName("changepolicy-resource")
 
 // SetupChangePolicyWebhookWithManager registers the webhook for ChangePolicy in the manager.
 func SetupChangePolicyWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&agentv1alpha1.ChangePolicy{}).
+	return ctrl.NewWebhookManagedBy(mgr, &agentv1alpha1.ChangePolicy{}).
 		WithValidator(&ChangePolicyCustomValidator{}).
 		Complete()
 }
@@ -78,36 +76,28 @@ func SetupChangePolicyWebhookWithManager(mgr ctrl.Manager) error {
 // verdict does not depend on cluster state that could differ between admission and evaluation.
 type ChangePolicyCustomValidator struct{}
 
-var _ admission.CustomValidator = &ChangePolicyCustomValidator{}
+var _ admission.Validator[*agentv1alpha1.ChangePolicy] = &ChangePolicyCustomValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *ChangePolicyCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	cp, ok := obj.(*agentv1alpha1.ChangePolicy)
-	if !ok {
-		return nil, fmt.Errorf("expected a ChangePolicy object but got %T", obj)
-	}
+// ValidateCreate implements admission.Validator.
+func (v *ChangePolicyCustomValidator) ValidateCreate(_ context.Context, cp *agentv1alpha1.ChangePolicy) (admission.Warnings, error) {
 	changepolicylog.Info("validating ChangePolicy creation", "name", cp.Name)
 	return ValidateChangePolicy(cp)
 }
 
-// ValidateUpdate implements admission.CustomValidator.
-func (v *ChangePolicyCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	cp, ok := newObj.(*agentv1alpha1.ChangePolicy)
-	if !ok {
-		return nil, fmt.Errorf("expected a ChangePolicy object but got %T", newObj)
-	}
+// ValidateUpdate implements admission.Validator.
+func (v *ChangePolicyCustomValidator) ValidateUpdate(_ context.Context, _, cp *agentv1alpha1.ChangePolicy) (admission.Warnings, error) {
 	changepolicylog.Info("validating ChangePolicy update", "name", cp.Name)
 	return ValidateChangePolicy(cp)
 }
 
-// ValidateDelete implements admission.CustomValidator.
+// ValidateDelete implements admission.Validator.
 //
 // Deleting a policy is a loosening, and it is allowed here on purpose: the thing that may not
 // delete a ChangePolicy is an AGENT, and that is an authorization question answered by RBAC and by
 // `vap-agent-scope`. A human with cluster-admin removing a policy they added is the intended
 // workflow, and blocking it in a webhook would mean the only way out of a bad policy is editing
 // etcd.
-func (v *ChangePolicyCustomValidator) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (v *ChangePolicyCustomValidator) ValidateDelete(_ context.Context, _ *agentv1alpha1.ChangePolicy) (admission.Warnings, error) {
 	return nil, nil
 }
 

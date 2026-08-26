@@ -38,7 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/brake"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"

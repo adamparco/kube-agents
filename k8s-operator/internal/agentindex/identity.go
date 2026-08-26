@@ -23,7 +23,7 @@ package agentindex
 import (
 	"fmt"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // EffectiveTier returns the agent's tier, defaulting an empty value to platform (the CRD default) so

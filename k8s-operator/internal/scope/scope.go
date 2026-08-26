@@ -23,7 +23,7 @@
 package scope
 
 import (
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // Scope is a resolved (project, cluster, namespace) triple. It is a value type on purpose: the

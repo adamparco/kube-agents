@@ -28,7 +28,7 @@ import (
 
 	authnv1 "k8s.io/api/authentication/v1"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // The 08 §2.3 two-layer check, one conformance ID per test.

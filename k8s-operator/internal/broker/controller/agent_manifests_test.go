@@ -1,0 +1,1330 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"strings"
+	"testing"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
+)
+
+func TestBuildConfigMap(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{
+					AgentHome: "/custom/home",
+				},
+			},
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	if cm.Name != "test-agent-config" {
+		t.Errorf("expected configmap name test-agent-config, got %s", cm.Name)
+	}
+
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "provider: custom") {
+		t.Errorf("expected config to contain provider: custom, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "default: model-default") {
+		t.Errorf("expected config to contain default: model-default, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "model: model-default") {
+		t.Errorf("expected config to contain model: model-default, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "base_url: http://litellm.test-ns.svc.cluster.local/v1") {
+		t.Errorf("expected config to contain correct base_url, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "api_key: none") {
+		t.Errorf("expected config to contain api_key: none, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "cwd: /custom/home") {
+		t.Errorf("expected config to contain custom home path, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "enabled: true") {
+		t.Errorf("expected config to enable google_chat platform, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "mcp_servers:") {
+		t.Errorf("expected config to contain mcp_servers, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "platform_toolsets:") {
+		t.Errorf("expected config to contain platform_toolsets, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "cron_mode: approve") {
+		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "backend: ddgs") {
+		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
+	}
+}
+
+func TestBuildConfigMap_MemoryConfig(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "memory-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Memory: &agentv1alpha1.MemorySpec{
+					MemoryEnabled:      ptr.To(true),
+					Provider:           "custom_memory",
+					UserProfileEnabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "memory_enabled: true") {
+		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "provider: custom_memory") {
+		t.Errorf("expected config to contain provider: custom_memory, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "user_profile_enabled: true") {
+		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
+	}
+}
+
+func TestDisplayMode(t *testing.T) {
+	// Test Default (Quiet) Mode
+	defaultAgent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "quiet-agent", Namespace: "ns"},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Mode: "default",
+				},
+			},
+		},
+	}
+	defaultConfig := buildConfigMap(defaultAgent).Data["config.yaml"]
+	if !strings.Contains(defaultConfig, "tool_progress: \"off\"") || !strings.Contains(defaultConfig, "memory_notifications: \"off\"") {
+		t.Errorf("expected default mode to turn off tool_progress and memory_notifications, got:\n%s", defaultConfig)
+	}
+
+	// Test Debug Mode
+	debugAgent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "debug-agent", Namespace: "ns"},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Mode: "debug",
+				},
+			},
+		},
+	}
+	debugConfig := buildConfigMap(debugAgent).Data["config.yaml"]
+	if !strings.Contains(debugConfig, "tool_progress: all") || !strings.Contains(debugConfig, "memory_notifications: verbose") {
+		t.Errorf("expected debug mode to enable all tool_progress and verbose memory_notifications, got:\n%s", debugConfig)
+	}
+}
+
+func TestBuildPVC(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	pvc := buildPVC(agent)
+	if pvc.Name != "test-agent-data" {
+		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
+	}
+	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if storageReq.String() != "10Gi" {
+		t.Errorf("expected storage request 10Gi, got %s", storageReq.String())
+	}
+}
+
+func TestBuildSystemPVC(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	pvc := buildSystemPVC(agent)
+	// Per-agent, not a namespace-shared name: two agents in one namespace (platform +
+	// cluster-admin both live in kubeagents-system) would otherwise collide on the same RWO claim.
+	if pvc.Name != "test-agent-system-metadata" {
+		t.Errorf("expected PVC name test-agent-system-metadata, got %s", pvc.Name)
+	}
+	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if storageReq.String() != "1Gi" {
+		t.Errorf("expected storage request 1Gi, got %s", storageReq.String())
+	}
+}
+
+func TestBuildDeployment(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				RuntimeClassName: ptr.To("gvisor"),
+				Image:            "gcr.io/my-proj/agent",
+				Tag:              ptr.To("v1.0.0"),
+				ImagePullPolicy:  ptr.To(corev1.PullAlways),
+				BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "CUSTOM_VAR",
+						Value: "custom-value",
+					},
+					{
+						Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
+						Value: "new-custom-value",
+					},
+				},
+				InitContainers: []corev1.Container{
+					{
+						Name:  "init-git",
+						Image: "git-image:latest",
+					},
+					{
+						Name:  "init-bootstrap",
+						Image: "busybox:1.36",
+					},
+				},
+				Sidecars: []corev1.Container{
+					{
+						Name:  "my-sidecar",
+						Image: "sidecar-image:latest",
+					},
+				},
+				SidecarVolumes: []corev1.Volume{
+					{
+						Name: "sidecar-vol",
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{},
+						},
+					},
+				},
+				ExtraVolumes: []corev1.Volume{
+					{
+						Name: "extra-vol",
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{},
+						},
+					},
+				},
+				ExtraVolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      "extra-vol",
+						MountPath: "/extra/path",
+					},
+				},
+			},
+			Security: &agentv1alpha1.SecuritySpec{
+				ServiceAccountName: "custom-sa",
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ClusterName: "gke-cluster",
+				Location:    "us-east1",
+				ProjectID:   "my-gcp-project",
+				Hermes: &agentv1alpha1.HermesSpec{
+					DashboardEnabled: ptr.To(true),
+					PluginsDebug:     ptr.To(false),
+					AgentHome:        "/var/agent",
+					ApiServerSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "secrets"},
+						Key:                  "api-key",
+					},
+				},
+			},
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://github.com/my-org/my-repo.git",
+					},
+				},
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:          ptr.To(true),
+					ProjectID:        "my-gcp-project",
+					SubscriptionName: "chat-sub",
+					AllowedUsers:     []string{"alice", "bob"},
+					HomeChannel:      "spaces/123",
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+
+	if dep.Name != "my-agent-gateway" {
+		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
+	}
+
+	// The tier label must be stamped on both the Deployment and the pod template so a per-tier
+	// egress NetworkPolicy (03 §10) can select every agent pod of a tier by label. This agent has
+	// no explicit tier, so EffectiveTier defaults to platform. The pod selector must remain app-only.
+	if got := dep.Labels["kube-agents/tier"]; got != "platform" {
+		t.Errorf("expected deployment tier label platform, got %q", got)
+	}
+	if got := dep.Spec.Template.Labels["kube-agents/tier"]; got != "platform" {
+		t.Errorf("expected pod-template tier label platform, got %q", got)
+	}
+	if _, ok := dep.Spec.Selector.MatchLabels["kube-agents/tier"]; ok {
+		t.Error("tier label must NOT be part of the immutable pod selector")
+	}
+
+	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"] != "abcd1234" {
+		t.Errorf("expected config-hash annotation to be abcd1234, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"])
+	}
+
+	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/fluent-bit-config-hash"] != "efgh5678" {
+		t.Errorf("expected fluent-bit-config-hash annotation to be efgh5678, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/fluent-bit-config-hash"])
+	}
+
+	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"] != "ijkl9012" {
+		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
+	}
+
+	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
+		t.Errorf("expected ShareProcessNamespace true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+	}
+
+	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
+		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
+	}
+
+	if len(dep.Spec.Template.Spec.Containers) != 5 {
+		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	} else {
+		dashboardC := dep.Spec.Template.Spec.Containers[1]
+		if dashboardC.Name != "platform-agent-dashboard" {
+			t.Errorf("expected container index 1 name platform-agent-dashboard, got %s", dashboardC.Name)
+		}
+		if len(dashboardC.Args) != 2 || dashboardC.Args[0] != "hermes" || dashboardC.Args[1] != "dashboard" {
+			t.Errorf("expected args [hermes dashboard], got %v", dashboardC.Args)
+		}
+		if len(dashboardC.Ports) != 1 || dashboardC.Ports[0].Name != "dashboard" || dashboardC.Ports[0].ContainerPort != 9119 {
+			t.Errorf("expected dashboard port 9119, got %v", dashboardC.Ports)
+		}
+		if dashboardC.Image != "gcr.io/my-proj/agent:v1.0.0" {
+			t.Errorf("expected dashboard container image gcr.io/my-proj/agent:v1.0.0, got %s", dashboardC.Image)
+		}
+		if dashboardC.ImagePullPolicy != corev1.PullAlways {
+			t.Errorf("expected dashboard container image pull policy Always, got %s", dashboardC.ImagePullPolicy)
+		}
+		if len(dashboardC.VolumeMounts) != 5 {
+			t.Errorf("expected 5 volume mounts on dashboard container (2 base + 1 tmp + 1 extra + config), got %d", len(dashboardC.VolumeMounts))
+		}
+		// P8-T4: the dashboard renders the SAME config the agent runs on. Before this it mounted no
+		// config at all and fell back to the image-baked copy, so the UI could describe a model,
+		// toolset and integration set the running agent had not used since the CR last changed
+		// (LSN-003 — assert against the operator-rendered ConfigMap, not the baked file).
+		// The path follows the agent's own agentHome (/var/agent in this fixture), not a fixed
+		// /opt/data — the mount has to shadow the config file wherever THIS agent's home puts it.
+		var dashConfigMount *corev1.VolumeMount
+		for i := range dashboardC.VolumeMounts {
+			if dashboardC.VolumeMounts[i].MountPath == "/var/agent/config.yaml" {
+				dashConfigMount = &dashboardC.VolumeMounts[i]
+			}
+		}
+		if dashConfigMount == nil {
+			t.Errorf("dashboard container has no /var/agent/config.yaml mount — it would fall back to the image-baked config")
+		} else {
+			if dashConfigMount.SubPath != "config.yaml" {
+				t.Errorf("expected dashboard config mount subPath config.yaml, got %q", dashConfigMount.SubPath)
+			}
+			if !dashConfigMount.ReadOnly {
+				t.Errorf("dashboard config mount must be readOnly")
+			}
+		}
+		if dashboardC.SecurityContext == nil || dashboardC.SecurityContext.AllowPrivilegeEscalation == nil || *dashboardC.SecurityContext.AllowPrivilegeEscalation {
+			t.Errorf("expected SecurityContext.AllowPrivilegeEscalation false on dashboard container")
+		}
+		if dashboardC.Resources.Requests.Cpu().String() != "256m" || dashboardC.Resources.Requests.Memory().String() != "512Mi" {
+			t.Errorf("expected CPU 256m and Mem 512Mi requests on dashboard container, got %v", dashboardC.Resources.Requests)
+		}
+		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
+			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
+		}
+		if len(dashboardC.Env) != 7 {
+			t.Errorf("expected 7 env vars on dashboard container (3 base + 4 OTEL), got %d", len(dashboardC.Env))
+		}
+		{
+			dashboardEnvMap := make(map[string]corev1.EnvVar)
+			for _, env := range dashboardC.Env {
+				dashboardEnvMap[env.Name] = env
+			}
+			// P8-T4: the dashboard emits its own traces. Without these four it was the one
+			// container in the pod invisible to the collector — so a dashboard-side failure left
+			// no span at all and looked like the agent had simply not been asked anything.
+			for _, name := range []string{
+				"OTEL_SERVICE_NAME",
+				"OTEL_EXPORTER_OTLP_ENDPOINT",
+				"OTEL_EXPORTER_OTLP_PROTOCOL",
+				"OTEL_RESOURCE_ATTRIBUTES",
+			} {
+				if dashboardEnvMap[name].Value == "" {
+					t.Errorf("dashboard container is missing telemetry env %s", name)
+				}
+			}
+			if dashboardEnvMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
+				t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", dashboardEnvMap["PLATFORM_AGENT_HOME"].Value)
+			}
+			if dashboardEnvMap["HOME"].Value != "/var/agent/home" {
+				t.Errorf("expected HOME /var/agent/home, got %s", dashboardEnvMap["HOME"].Value)
+			}
+			if dashboardEnvMap["SESSION_KV_DB_PATH"].Value != sessionKVDBPath {
+				t.Errorf("expected SESSION_KV_DB_PATH %s, got %s", sessionKVDBPath, dashboardEnvMap["SESSION_KV_DB_PATH"].Value)
+			}
+		}
+
+		watcherC := dep.Spec.Template.Spec.Containers[3]
+		if watcherC.Name != "event-watcher" {
+			t.Errorf("expected sidecar name event-watcher, got %s", watcherC.Name)
+		}
+		if watcherC.Image != "gcr.io/my-proj/agent:v1.0.0" {
+			t.Errorf("expected watcher image gcr.io/my-proj/agent:v1.0.0, got %s", watcherC.Image)
+		}
+		if watcherC.Command[0] != "/usr/local/bin/k8s-event-watcher" {
+			t.Errorf("expected watcher command /usr/local/bin/k8s-event-watcher, got %s", watcherC.Command[0])
+		}
+
+		sidecarC := dep.Spec.Template.Spec.Containers[4]
+		if sidecarC.Name != "my-sidecar" {
+			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
+		}
+		if sidecarC.Image != "sidecar-image:latest" {
+			t.Errorf("expected sidecar image sidecar-image:latest, got %s", sidecarC.Image)
+		}
+	}
+
+	// Three, not two: `wait-for-broker` is prepended ahead of whatever the CR asked for (08 §2.4).
+	// The position matters as much as the presence — a CR-supplied init container ahead of it would
+	// run before the pair is known to be up, which is precisely where an author who wanted the
+	// agent to act unobserved would put one.
+	if len(dep.Spec.Template.Spec.InitContainers) != 3 {
+		t.Errorf("expected 3 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
+	} else {
+		initC0 := dep.Spec.Template.Spec.InitContainers[0]
+		if initC0.Name != "wait-for-broker" {
+			t.Errorf("expected wait-for-broker first, got %s", initC0.Name)
+		}
+
+		initC1 := dep.Spec.Template.Spec.InitContainers[1]
+		if initC1.Name != "init-git" {
+			t.Errorf("expected second init container name init-git, got %s", initC1.Name)
+		}
+		if initC1.Image != "git-image:latest" {
+			t.Errorf("expected second init container image git-image:latest, got %s", initC1.Image)
+		}
+
+		initC2 := dep.Spec.Template.Spec.InitContainers[2]
+		if initC2.Name != "init-bootstrap" {
+			t.Errorf("expected third init container name init-bootstrap, got %s", initC2.Name)
+		}
+		if initC2.Image != "busybox:1.36" {
+			t.Errorf("expected third init container image busybox:1.36, got %s", initC2.Image)
+		}
+	}
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	if container.Image != "gcr.io/my-proj/agent:v1.0.0" {
+		t.Errorf("expected container image gcr.io/my-proj/agent:v1.0.0, got %s", container.Image)
+	}
+
+	// Verify env vars
+	envMap := make(map[string]corev1.EnvVar)
+	seen := make(map[string]bool)
+	for _, env := range container.Env {
+		if seen[env.Name] {
+			t.Errorf("duplicate env var found: %s", env.Name)
+		}
+		seen[env.Name] = true
+		envMap[env.Name] = env
+	}
+
+	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
+		t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", envMap["PLATFORM_AGENT_HOME"].Value)
+	}
+	if envMap["HOME"].Value != "/var/agent/home" {
+		t.Errorf("expected HOME /var/agent/home, got %s", envMap["HOME"].Value)
+	}
+	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
+		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
+	}
+	if envMap["CUSTOM_VAR"].Value != "new-custom-value" {
+		t.Errorf("expected CUSTOM_VAR new-custom-value, got %s", envMap["CUSTOM_VAR"].Value)
+	}
+	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
+		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
+	}
+	if envMap["TOKEN_BROKER_URL"].Value != "http://github-token-minter.my-ns.svc.cluster.local:8080/token" {
+		t.Errorf("expected TOKEN_BROKER_URL http://github-token-minter.my-ns.svc.cluster.local:8080/token, got %s", envMap["TOKEN_BROKER_URL"].Value)
+	}
+	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
+		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)
+	}
+	if envMap["GKE_LOCATION"].Value != "us-east1" {
+		t.Errorf("expected GKE_LOCATION us-east1, got %s", envMap["GKE_LOCATION"].Value)
+	}
+	if envMap["GCP_PROJECT_ID"].Value != "my-gcp-project" {
+		t.Errorf("expected GCP_PROJECT_ID my-gcp-project, got %s", envMap["GCP_PROJECT_ID"].Value)
+	}
+	if envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name != "secrets" {
+		t.Errorf("expected API_SERVER_KEY SecretRef secrets, got %s", envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name)
+	}
+	if _, ok := envMap["GEMINI_API_KEY"]; ok {
+		t.Errorf("expected GEMINI_API_KEY to not be set on platform agent container")
+	}
+	if envMap["GOOGLE_CHAT_PROJECT_ID"].Value != "my-gcp-project" {
+		t.Errorf("expected GOOGLE_CHAT_PROJECT_ID my-gcp-project, got %s", envMap["GOOGLE_CHAT_PROJECT_ID"].Value)
+	}
+	if envMap["GOOGLE_CHAT_SUBSCRIPTION_NAME"].Value != "projects/my-gcp-project/subscriptions/chat-sub" {
+		t.Errorf("expected GOOGLE_CHAT_SUBSCRIPTION_NAME project sub, got %s", envMap["GOOGLE_CHAT_SUBSCRIPTION_NAME"].Value)
+	}
+	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "alice,bob" {
+		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS alice,bob, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
+	}
+	if _, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; ok {
+		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS not to be set when allowed users is populated")
+	}
+	if envMap["API_SERVER_ENABLED"].Value != "true" {
+		t.Errorf("expected API_SERVER_ENABLED true, got %s", envMap["API_SERVER_ENABLED"].Value)
+	}
+	if envMap["API_SERVER_HOST"].Value != "0.0.0.0" {
+		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
+	}
+	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
+		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
+	}
+
+	// Verify volume mounts
+	mountsMap := make(map[string]corev1.VolumeMount)
+	for _, m := range container.VolumeMounts {
+		mountsMap[m.Name] = m
+	}
+	if _, ok := mountsMap["settings-volume"]; !ok {
+		t.Errorf("expected settings-volume mount, not found")
+	} else {
+		m := mountsMap["settings-volume"]
+		if m.MountPath != "/var/agent/SETTINGS.md" {
+			t.Errorf("expected settings-volume mount path /var/agent/SETTINGS.md, got %s", m.MountPath)
+		}
+		if m.SubPath != "SETTINGS.md" {
+			t.Errorf("expected settings-volume subpath SETTINGS.md, got %s", m.SubPath)
+		}
+		if !m.ReadOnly {
+			t.Errorf("expected settings-volume to be read-only")
+		}
+	}
+	if _, ok := mountsMap["system-metadata"]; !ok {
+		t.Errorf("expected system-metadata mount, not found")
+	} else if mountsMap["system-metadata"].MountPath != "/var/lib/kube-agents/session" {
+		t.Errorf("expected system-metadata mount path /var/lib/kube-agents/session, got %s", mountsMap["system-metadata"].MountPath)
+	} else if mountsMap["system-metadata"].SubPath != "session" {
+		t.Errorf("expected system-metadata subpath session, got %s", mountsMap["system-metadata"].SubPath)
+	}
+
+	if _, ok := mountsMap["extra-vol"]; !ok {
+		t.Errorf("expected extra-vol mount, not found")
+	} else {
+		m := mountsMap["extra-vol"]
+		if m.MountPath != "/extra/path" {
+			t.Errorf("expected extra-vol mount path /extra/path, got %s", m.MountPath)
+		}
+	}
+
+	// Verify Fluent Bit container
+	fbContainer := dep.Spec.Template.Spec.Containers[2]
+	if fbContainer.Name != "fluent-bit" {
+		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
+	}
+	if fbContainer.Image != "fluent/fluent-bit:5.0.7" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.0.7, got %s", fbContainer.Image)
+	}
+
+	// Verify volumes
+	volumesMap := make(map[string]corev1.Volume)
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		volumesMap[vol.Name] = vol
+	}
+	if _, ok := volumesMap["fluent-bit-config"]; !ok {
+		t.Errorf("expected fluent-bit-config volume, not found")
+	}
+	if _, ok := volumesMap["fluent-bit-state"]; !ok {
+		t.Errorf("expected fluent-bit-state volume, not found")
+	}
+	if _, ok := volumesMap["system-metadata"]; !ok {
+		t.Errorf("expected system-metadata volume, not found")
+	} else {
+		v := volumesMap["system-metadata"]
+		if v.PersistentVolumeClaim == nil {
+			t.Errorf("expected system-metadata to be a PVC")
+		} else if v.PersistentVolumeClaim.ClaimName != "my-agent-system-metadata" {
+			t.Errorf("expected system-metadata claim my-agent-system-metadata, got %s", v.PersistentVolumeClaim.ClaimName)
+		}
+	}
+
+	if _, ok := volumesMap["settings-volume"]; !ok {
+		t.Errorf("expected settings-volume, not found")
+	} else {
+		v := volumesMap["settings-volume"]
+		if v.ConfigMap == nil {
+			t.Errorf("expected settings-volume to be ConfigMap")
+		} else {
+			if v.ConfigMap.Name != "my-agent-settings" {
+				t.Errorf("expected settings-volume ConfigMap name my-agent-settings, got %s", v.ConfigMap.Name)
+			}
+			if v.ConfigMap.DefaultMode == nil {
+				t.Errorf("expected settings-volume ConfigMap DefaultMode to be set, got nil")
+			} else if *v.ConfigMap.DefaultMode != int32(0644) {
+				t.Errorf("expected settings-volume ConfigMap DefaultMode 0644, got %o", *v.ConfigMap.DefaultMode)
+			}
+		}
+	}
+
+	if _, ok := volumesMap["sidecar-vol"]; !ok {
+		t.Errorf("expected sidecar-vol volume, not found")
+	} else {
+		v := volumesMap["sidecar-vol"]
+		if v.EmptyDir == nil {
+			t.Errorf("expected sidecar-vol to be emptyDir")
+		}
+	}
+
+	if _, ok := volumesMap["extra-vol"]; !ok {
+		t.Errorf("expected extra-vol volume, not found")
+	} else {
+		v := volumesMap["extra-vol"]
+		if v.EmptyDir == nil {
+			t.Errorf("expected extra-vol to be emptyDir")
+		}
+	}
+}
+
+func TestBuildDeployment_DashboardEnabled(t *testing.T) {
+	testCases := []struct {
+		name   string
+		hermes *agentv1alpha1.HermesSpec
+	}{
+		{
+			name:   "HermesSpec is nil",
+			hermes: nil,
+		},
+		{
+			name: "DashboardEnabled is nil",
+			hermes: &agentv1alpha1.HermesSpec{
+				DashboardEnabled: nil,
+			},
+		},
+		{
+			name: "DashboardEnabled is true",
+			hermes: &agentv1alpha1.HermesSpec{
+				DashboardEnabled: ptr.To(true),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-agent",
+					Namespace: "my-ns",
+				},
+				Spec: agentv1alpha1.AgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{
+						Hermes: tc.hermes,
+					},
+				},
+			}
+
+			if !isDashboardEnabled(agent) {
+				t.Errorf("expected isDashboardEnabled to be true")
+			}
+
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
+				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+			}
+			if len(dep.Spec.Template.Spec.Containers) != 4 {
+				t.Fatalf("expected 4 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			}
+			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
+				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[1].Name != "platform-agent-dashboard" {
+				t.Errorf("expected container 1 to be platform-agent-dashboard, got %s", dep.Spec.Template.Spec.Containers[1].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
+				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[3].Name != "event-watcher" {
+				t.Errorf("expected container 3 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[3].Name)
+			}
+
+			svc := buildAgentService(agent)
+			hasDashboardPort := false
+			for _, port := range svc.Spec.Ports {
+				if port.Name == "dashboard" && port.Port == 9119 {
+					hasDashboardPort = true
+					break
+				}
+			}
+			if !hasDashboardPort {
+				t.Errorf("expected service port 9119 (dashboard) to be present")
+			}
+		})
+	}
+}
+
+func TestBuildDeployment_DashboardDisabled(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{
+					DashboardEnabled: ptr.To(false),
+				},
+			},
+		},
+	}
+
+	if isDashboardEnabled(agent) {
+		t.Errorf("expected isDashboardEnabled to be false")
+	}
+
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
+		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
+	}
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Fatalf("expected 3 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	}
+	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
+		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
+	}
+	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
+		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
+	}
+	if dep.Spec.Template.Spec.Containers[2].Name != "event-watcher" {
+		t.Errorf("expected container 2 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[2].Name)
+	}
+
+	svc := buildAgentService(agent)
+	for _, port := range svc.Spec.Ports {
+		if port.Name == "dashboard" || port.Port == 9119 {
+			t.Errorf("expected dashboard port 9119 to be omitted when dashboard disabled")
+		}
+	}
+}
+
+// TestBuildDeploymentGoogleChatAllowedUsersDegenerate replaces the former
+// TestBuildDeploymentGoogleChatAllowedUsersEmpty, which asserted the opposite:
+// that an empty allowlist renders GOOGLE_CHAT_ALLOW_ALL_USERS=true. P8-T1
+// deleted that backstop (V-CTR-014), so the property under test is inverted —
+// a degenerate allowlist must produce no permissive env at all.
+//
+// Admission rejects these CRs (06 §1.2 V-7), so this is defense in depth for the
+// path where a CR predates the rule or the webhook is unavailable: the renderer
+// must still fail closed rather than open.
+func TestBuildDeploymentGoogleChatAllowedUsersDegenerate(t *testing.T) {
+	cases := map[string][]string{
+		"nil":            nil,
+		"empty":          {},
+		"single blank":   {""},
+		"all whitespace": {"  ", "\t"},
+	}
+
+	for name, allowed := range cases {
+		t.Run(name, func(t *testing.T) {
+			agent := &agentv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-agent",
+					Namespace: "my-ns",
+				},
+				Spec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						Image: "gcr.io/my-proj/agent",
+					},
+					Integration: &agentv1alpha1.AgentIntegrationSpec{
+						GoogleChat: &agentv1alpha1.GoogleChatSpec{
+							Enabled:          ptr.To(true),
+							ProjectID:        "my-gcp-project",
+							SubscriptionName: "chat-sub",
+							AllowedUsers:     allowed,
+							HomeChannel:      "spaces/123",
+						},
+					},
+				},
+			}
+
+			dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+			container := dep.Spec.Template.Spec.Containers[0]
+			envMap := make(map[string]corev1.EnvVar)
+			for _, env := range container.Env {
+				envMap[env.Name] = env
+			}
+
+			if got := envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value; got != "" {
+				t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS empty, got %q", got)
+			}
+			if _, present := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; present {
+				t.Error("GOOGLE_CHAT_ALLOW_ALL_USERS is set: the permissive backstop was deleted in P8-T1 and must never be rendered")
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentAllowedUsersDropsBlankEntries proves the partially-blank
+// case: a list mixing real principals with blanks renders only the principals,
+// so a stray comma cannot smuggle a meaningless member into the in-pod allowlist.
+func TestBuildDeploymentAllowedUsersDropsBlankEntries(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{Image: "gcr.io/my-proj/agent"},
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:          ptr.To(true),
+					ProjectID:        "my-gcp-project",
+					SubscriptionName: "chat-sub",
+					AllowedUsers:     []string{"user-a@example.com", "", "  ", "user-b@example.com"},
+				},
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled:      ptr.To(true),
+					AllowedUsers: []string{"", "U123", " "},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+		envMap[env.Name] = env
+	}
+
+	if got, want := envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value, "user-a@example.com,user-b@example.com"; got != want {
+		t.Errorf("GOOGLE_CHAT_ALLOWED_USERS = %q, want %q", got, want)
+	}
+	if got, want := envMap["SLACK_ALLOWED_USERS"].Value, "U123"; got != want {
+		t.Errorf("SLACK_ALLOWED_USERS = %q, want %q", got, want)
+	}
+	for _, name := range []string{"GOOGLE_CHAT_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS"} {
+		if _, present := envMap[name]; present {
+			t.Errorf("%s is set: the permissive backstop was deleted in P8-T1", name)
+		}
+	}
+}
+
+func TestBuildDeploymentSlackIntegration(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled: ptr.To(true),
+					BotTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "custom-slack-secret"},
+						Key:                  "bot-token-key",
+					},
+					AppTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "custom-slack-secret"},
+						Key:                  "app-token-key",
+					},
+					AllowedUsers:    []string{"U123", "U456"},
+					HomeChannel:     "C999",
+					HomeChannelName: "general",
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
+		t.Errorf("expected SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", envMap["SLACK_BOT_TOKEN"].ValueFrom)
+	}
+	if envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
+		t.Errorf("expected SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", envMap["SLACK_APP_TOKEN"].ValueFrom)
+	}
+	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
+		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
+	}
+	if envMap["SLACK_HOME_CHANNEL"].Value != "C999" {
+		t.Errorf("expected SLACK_HOME_CHANNEL C999, got %s", envMap["SLACK_HOME_CHANNEL"].Value)
+	}
+	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
+		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
+	}
+}
+
+// TestBuildDeploymentSlackDegenerateAllowlistFailsClosed replaces the former
+// TestBuildDeploymentSlackAllowAllUsers, which asserted that `allowedUsers: [""]`
+// — the exact shape an unset envsubst variable produced — renders
+// SLACK_ALLOW_ALL_USERS=true. That was the bypass. P8-T1 deleted it, so the
+// inverted property is asserted here: the pod gets an empty allowlist and no
+// permissive flag, and the in-pod authorizer therefore admits nobody.
+func TestBuildDeploymentSlackDegenerateAllowlistFailsClosed(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled:      ptr.To(true),
+					AllowedUsers: []string{""},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if got := envMap["SLACK_ALLOWED_USERS"].Value; got != "" {
+		t.Errorf("expected SLACK_ALLOWED_USERS empty for a blank-only allowlist, got %q", got)
+	}
+	if _, present := envMap["SLACK_ALLOW_ALL_USERS"]; present {
+		t.Error("SLACK_ALLOW_ALL_USERS is set: the permissive backstop was deleted in P8-T1 and must never be rendered")
+	}
+}
+
+func TestBuildConfigMapSlackEnabled(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
+		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
+	}
+}
+
+func TestBuildFluentBitConfigMap(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	cm := buildFluentBitConfigMap(agent)
+	if cm.Name != "test-agent-fluent-bit-config" {
+		t.Errorf("expected configmap name test-agent-fluent-bit-config, got %s", cm.Name)
+	}
+	if cm.Namespace != "test-ns" {
+		t.Errorf("expected configmap namespace test-ns, got %s", cm.Namespace)
+	}
+	fbConf, ok := cm.Data["fluent-bit.conf"]
+	if !ok {
+		t.Fatalf("expected fluent-bit.conf key, not found")
+	}
+	if !strings.Contains(fbConf, "Name              tail") {
+		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+func TestBuildPlatformService(t *testing.T) {
+	t.Run("DashboardEnabled_Default", func(t *testing.T) {
+		agent := &agentv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-platform-agent",
+				Namespace: "test-ns",
+			},
+		}
+
+		svc := buildAgentService(agent)
+		if svc.Name != "test-platform-agent" {
+			t.Errorf("expected Service name test-platform-agent, got %s", svc.Name)
+		}
+		if svc.Namespace != "test-ns" {
+			t.Errorf("expected Service namespace test-ns, got %s", svc.Namespace)
+		}
+
+		if len(svc.Spec.Ports) != 2 {
+			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
+		}
+
+		portsMap := make(map[string]int32)
+		for _, port := range svc.Spec.Ports {
+			portsMap[port.Name] = port.Port
+		}
+
+		if portsMap["api"] != 8642 {
+			t.Errorf("expected api port 8642, got %d", portsMap["api"])
+		}
+		if portsMap["dashboard"] != 9119 {
+			t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+		}
+
+		if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {
+			t.Errorf("expected selector app=test-platform-agent-gateway, got %s", svc.Spec.Selector["app"])
+		}
+	})
+
+	t.Run("DashboardDisabled_Explicit", func(t *testing.T) {
+		agent := &agentv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-platform-agent",
+				Namespace: "test-ns",
+			},
+			Spec: agentv1alpha1.AgentSpec{
+				Harness: &agentv1alpha1.HarnessSpec{
+					Hermes: &agentv1alpha1.HermesSpec{
+						DashboardEnabled: ptr.To(false),
+					},
+				},
+			},
+		}
+
+		svc := buildAgentService(agent)
+		if len(svc.Spec.Ports) != 1 {
+			t.Errorf("expected 1 service port when dashboard disabled, got %d", len(svc.Spec.Ports))
+		}
+	})
+
+	t.Run("DashboardEnabled", func(t *testing.T) {
+		agent := &agentv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-platform-agent",
+				Namespace: "test-ns",
+			},
+			Spec: agentv1alpha1.AgentSpec{
+				Harness: &agentv1alpha1.HarnessSpec{
+					Hermes: &agentv1alpha1.HermesSpec{
+						DashboardEnabled: ptr.To(true),
+					},
+				},
+			},
+		}
+
+		svc := buildAgentService(agent)
+		if len(svc.Spec.Ports) != 2 {
+			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
+		}
+
+		portsMap := make(map[string]int32)
+		for _, port := range svc.Spec.Ports {
+			portsMap[port.Name] = port.Port
+		}
+
+		if portsMap["api"] != 8642 {
+			t.Errorf("expected api port 8642, got %d", portsMap["api"])
+		}
+		if portsMap["dashboard"] != 9119 {
+			t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+		}
+	})
+}
+
+func TestBuildSettingsConfigMap(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://github.com/my-org/my-repo.git",
+					},
+				},
+			},
+		},
+	}
+
+	cm := buildSettingsConfigMap(agent)
+	if cm.Name != "test-agent-settings" {
+		t.Errorf("expected configmap name test-agent-settings, got %s", cm.Name)
+	}
+	if cm.Namespace != "test-ns" {
+		t.Errorf("expected configmap namespace test-ns, got %s", cm.Namespace)
+	}
+	content, ok := cm.Data["SETTINGS.md"]
+	if !ok {
+		t.Fatalf("expected SETTINGS.md key, not found")
+	}
+	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** https://github.com/my-org/my-repo.git\n"
+	if content != expectedContent {
+		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
+	}
+}
+
+func TestBuildSettingsConfigMapEmptyGitRepo(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "",
+					},
+				},
+			},
+		},
+	}
+
+	cm := buildSettingsConfigMap(agent)
+	content, ok := cm.Data["SETTINGS.md"]
+	if !ok {
+		t.Fatalf("expected SETTINGS.md key, not found")
+	}
+	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	if content != expectedContent {
+		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
+	}
+}
+
+func TestBuildSettingsConfigMapNilIntegration(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: nil,
+		},
+	}
+
+	cm := buildSettingsConfigMap(agent)
+	content, ok := cm.Data["SETTINGS.md"]
+	if !ok {
+		t.Fatalf("expected SETTINGS.md key, not found")
+	}
+	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	if content != expectedContent {
+		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
+	}
+}
+
+func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: nil,
+				},
+			},
+		},
+	}
+
+	cm := buildSettingsConfigMap(agent)
+	content, ok := cm.Data["SETTINGS.md"]
+	if !ok {
+		t.Fatalf("expected SETTINGS.md key, not found")
+	}
+	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	if content != expectedContent {
+		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
+	}
+}
+
+// NOTE: TestBuildPlatformExplorerRole / TestBuildClusterRoleBinding /
+// TestBuildClusterRoleBindingDefaultSA were removed in P1-T4 along with the runtime RBAC-minting
+// builders they covered. The read-only agent identity is now pre-created via GitOps and enforced by
+// vap-agent-readonly; there is no controller-side RBAC builder to unit-test.
+
+func TestGetConfigMapHash(t *testing.T) {
+	hashNil, err := getConfigMapHash(nil)
+	if err != nil {
+		t.Errorf("unexpected error for nil configmap: %v", err)
+	}
+	if hashNil != "" {
+		t.Errorf("expected empty string for nil configmap, got %s", hashNil)
+	}
+
+	cm := &corev1.ConfigMap{
+		Data: map[string]string{
+			"key1": "value1",
+		},
+	}
+	hash1, err := getConfigMapHash(cm)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Add more data to change the hash
+	cm.Data["key2"] = "value2"
+	hash2, err := getConfigMapHash(cm)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if hash1 == hash2 {
+		t.Errorf("expected different hashes for different configmap data")
+	}
+}
+
+// findWatcherArgs returns the args of the event-watcher sidecar, or fails the
+// test if the container is absent. Shared by the per-tier scoping assertions.
+func findWatcherArgs(t *testing.T, dep *appsv1.Deployment) []string {
+	t.Helper()
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == "event-watcher" {
+			return c.Args
+		}
+	}
+	t.Fatalf("event-watcher sidecar not found in deployment %q", dep.Name)
+	return nil
+}
+
+// hasArg reports whether want appears verbatim in args.
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// hasArgPrefix reports whether any arg starts with prefix (for flags we assert
+// the presence of without pinning the value).
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWatcherArgsPerTierScoping locks D2 (Phase 4 / P4-T3): the event-watcher
+// sidecar's --owner must be derived from the agent's effective tier (not
+// hardcoded), and a namespace-scoped tier (developer-team) must additionally
+// carry --scope-namespace so its informer List/Watch is pinned server-side to
+// its own namespace. Cluster-wide tiers (platform, cluster-admin) must NOT
+// carry --scope-namespace (an empty value would still watch cluster-wide, but
+// omitting the flag keeps the fail-closed validate() in main.go meaningful).
+func TestWatcherArgsPerTierScoping(t *testing.T) {
+	tests := []struct {
+		name          string
+		tier          agentv1alpha1.AgentTier
+		scopeNS       string
+		wantOwner     string
+		wantScopeFlag bool
+		wantScopeArg  string
+	}{
+		{
+			name:          "platform is cluster-wide, no scope-namespace",
+			tier:          "",
+			wantOwner:     "--owner=platform",
+			wantScopeFlag: false,
+		},
+		{
+			name:          "cluster-admin is cluster-wide, no scope-namespace",
+			tier:          agentv1alpha1.TierClusterAdmin,
+			wantOwner:     "--owner=cluster-admin",
+			wantScopeFlag: false,
+		},
+		{
+			name:          "developer-team is namespace-scoped, carries scope-namespace",
+			tier:          agentv1alpha1.TierDeveloperTeam,
+			scopeNS:       "team-a",
+			wantOwner:     "--owner=developer-team",
+			wantScopeFlag: true,
+			wantScopeArg:  "--scope-namespace=team-a",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &agentv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-agent",
+					Namespace: "my-ns",
+				},
+				Spec: agentv1alpha1.AgentSpec{
+					Tier: tt.tier,
+				},
+			}
+			if tt.scopeNS != "" {
+				agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Namespace: tt.scopeNS}
+			}
+
+			dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+			args := findWatcherArgs(t, dep)
+
+			if !hasArg(args, tt.wantOwner) {
+				t.Errorf("expected watcher args to contain %q, got %v", tt.wantOwner, args)
+			}
+			gotScopeFlag := hasArgPrefix(args, "--scope-namespace=")
+			if gotScopeFlag != tt.wantScopeFlag {
+				t.Errorf("scope-namespace flag present = %v, want %v (args %v)", gotScopeFlag, tt.wantScopeFlag, args)
+			}
+			if tt.wantScopeFlag && !hasArg(args, tt.wantScopeArg) {
+				t.Errorf("expected watcher args to contain %q, got %v", tt.wantScopeArg, args)
+			}
+		})
+	}
+}

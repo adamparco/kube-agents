@@ -23,7 +23,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // The ChangePolicy admission surface (V-GAT-009).
@@ -258,20 +258,9 @@ func TestValidateDeleteAllowsAHumanToRemoveAPolicy(t *testing.T) {
 	}
 }
 
-func TestValidatorRejectsTheWrongType(t *testing.T) {
-	// A misregistered webhook path is otherwise a fail-open: the handler would decode into the wrong
-	// type, find no rules, and admit.
-	v := &ChangePolicyCustomValidator{}
-	ctx := context.Background()
-	other := &agentv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "not-a-policy"}}
-
-	if _, err := v.ValidateCreate(ctx, other); err == nil {
-		t.Error("ValidateCreate admitted an object that is not a ChangePolicy")
-	}
-	if _, err := v.ValidateUpdate(ctx, other, other); err == nil {
-		t.Error("ValidateUpdate admitted an object that is not a ChangePolicy")
-	}
-}
+// TestValidatorRejectsTheWrongType is gone: admission.Validator is now generic
+// (admission.Validator[*ChangePolicy]), so passing an *Agent to ValidateCreate/ValidateUpdate is a
+// compile error, not a runtime type assertion this test could exercise.
 
 func TestValidateCreateAndUpdateApplyTheSameRules(t *testing.T) {
 	// The way a policy gets weaker in practice is an edit, not a create. A webhook wired for

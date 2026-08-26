@@ -78,7 +78,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentindex"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/scope"
 )

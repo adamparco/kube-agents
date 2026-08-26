@@ -1,0 +1,41 @@
+{
+  "apiVersion": "kubeagents.x-k8s.io/v1alpha1",
+  "kind": "ActionEnvelope",
+  "intent": "rehearse resizing the batch node pool from three nodes to five",
+  "rationale": "The batch pool has been at its three-node ceiling for six hours with fourteen Pending pods. This is the dry run whose plan goes to review before anything is resized.",
+  "operations": [
+    {
+      "op": "scale",
+      "cloudTarget": {
+        "provider": "gcp",
+        "service": "container.googleapis.com",
+        "resource": "projects/adamparco-kage/locations/us-east4-a/clusters/gke-scratch-kube-agents-dev/nodePools/batch",
+        "method": "setSize"
+      },
+      "scale": {
+        "replicas": 5
+      }
+    }
+  ],
+  "requester": {
+    "kind": "agent",
+    "id": "agent:platform",
+    "platform": "mesh",
+    "displayName": "platform agent"
+  },
+  "trigger": {
+    "source": "cron",
+    "ref": "cron:batch-headroom",
+    "detail": "3/3 nodes allocated, 14 pods Pending for 6h"
+  },
+  "trace": {
+    "traceId": "7c1e0a5b9d3f2648ae70b1c4d8e6f902",
+    "spanId": "1a2b3c4d5e6f7081",
+    "sessionId": "s-2026-07-30-04"
+  },
+  "issuedAt": "2026-07-30T09:14:07Z",
+  "nonce": "c4d8e6f9021a2b3c4d5e6f70817c1e0a",
+  "idempotencyKey": "sha256:b3881e6594a171c0abf8fb2a8bf918caca3279625ca595d33e5b9c5f66c8ac29",
+  "dryRun": true,
+  "deadlineSeconds": 300
+}

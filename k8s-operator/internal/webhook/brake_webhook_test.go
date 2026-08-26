@@ -25,7 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // The admission surface of the three brake objects (06 §4.4).
@@ -434,33 +434,8 @@ func TestUndoRequestWarnings(t *testing.T) {
 	})
 }
 
-// TestBrakeValidatorsRejectTheWrongType. Each CustomValidator is registered against one GroupKind, so
-// a mismatched object means the webhook configuration points somewhere it should not. Returning an
-// error rather than nil matters: these webhooks are failurePolicy=Ignore, so a nil would make a
-// misrouted object sail through admission entirely and silently.
-func TestBrakeValidatorsRejectTheWrongType(t *testing.T) {
-	ctx := context.Background()
-	wrong := &agentv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "not-a-brake-object"}}
-
-	if _, err := (&FleetFreezeCustomValidator{}).ValidateCreate(ctx, wrong); err == nil {
-		t.Error("FleetFreeze validator accepted an Agent")
-	}
-	if _, err := (&ApprovalRosterCustomValidator{}).ValidateCreate(ctx, wrong); err == nil {
-		t.Error("ApprovalRoster validator accepted an Agent")
-	}
-	if _, err := (&UndoRequestCustomValidator{}).ValidateCreate(ctx, wrong); err == nil {
-		t.Error("UndoRequest validator accepted an Agent")
-	}
-
-	// Update takes the same path and has its own type assertion, which is exactly the kind of thing
-	// that gets copy-pasted with the wrong type left in it.
-	if _, err := (&FleetFreezeCustomValidator{}).ValidateUpdate(ctx, wrong, wrong); err == nil {
-		t.Error("FleetFreeze validator accepted an Agent on update")
-	}
-	if _, err := (&ApprovalRosterCustomValidator{}).ValidateUpdate(ctx, wrong, wrong); err == nil {
-		t.Error("ApprovalRoster validator accepted an Agent on update")
-	}
-	if _, err := (&UndoRequestCustomValidator{}).ValidateUpdate(ctx, wrong, wrong); err == nil {
-		t.Error("UndoRequest validator accepted an Agent on update")
-	}
-}
+// TestBrakeValidatorsRejectTheWrongType is gone: admission.Validator is now generic
+// (admission.Validator[*FleetFreeze] etc.), so passing an *Agent to ValidateCreate/ValidateUpdate
+// is a compile error, not a runtime type assertion this test could exercise. The property the test
+// checked -- a misrouted object cannot sail through a failurePolicy=Ignore webhook as a nil error --
+// is now enforced by the compiler instead.

@@ -1,7 +1,7 @@
 package classify
 
 import (
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // The seventeen code-floor rules of 06 §4.2.

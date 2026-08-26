@@ -66,6 +66,12 @@ rules:
       - update
       - watch
   - apiGroups:
+      - authorization.k8s.io
+    resources:
+      - subjectaccessreviews
+    verbs:
+      - create
+  - apiGroups:
       - autoscaling
     resources:
       - horizontalpodautoscalers
@@ -83,6 +89,18 @@ rules:
       - list
       - watch
   - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificates
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
       - coordination.k8s.io
     resources:
       - leases
@@ -97,15 +115,24 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - agentplugins
+      - actionrecords
     verbs:
+      - delete
       - get
       - list
+      - patch
+      - update
       - watch
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - actionrecords/status
       - agentplugins/status
+      - agents/status
+      - approvalrosters/status
+      - changepolicies/status
+      - fleetfreezes/status
+      - undorequests/status
     verbs:
       - get
       - patch
@@ -113,6 +140,19 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - agentplugins
+      - approvalrosters
+      - changepolicies
+      - fleetfreezes
+      - undorequests
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - agents
       - platformagents
     verbs:
       - create
@@ -125,6 +165,7 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - agents/finalizers
       - platformagents/finalizers
     verbs:
       - update

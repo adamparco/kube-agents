@@ -1,0 +1,2819 @@
+# The risk-classification corpus of docs/design/09-verification-and-validation.md §7.1.
+#
+# Each case is one already-RESOLVED envelope and the class a human would defend for it. Resolved
+# means every live-state lookup has already happened, so these run with no cluster, no network, and
+# the same answer on every run forever (see k8s-operator/internal/broker/classify/resolve.go).
+#
+# Read `expect.notRules` as carefully as `expect.rules`. The negative half is what catches an
+# OVER-eager classifier, and an over-eager gate is not a safe failure -- it trains operators to
+# approve without reading, which is how a gate stops being a control.
+#
+# BLOCK STYLE THROUGHOUT, no flow mappings. Two reasons, both learned the hard way. Prettier owns
+# the formatting of this file and explodes a flow mapping that does not fit on one line into a
+# nine-line tower, so a corpus written in flow style is unreadable after the first `prettier
+# --write`. And the L0 chain installs no dependencies, so dev/tests/classifier-corpus-lint.py reads
+# this file with a stdlib parser that accepts exactly the subset below -- anything fancier fails
+# loudly there rather than being reinterpreted into something plausible.
+#
+# Defaults, so each case shows only what it varies:
+#   caller     cluster-admin-1, scoped to proj/cluster-1
+#   seen       true  (the action is familiar; novel-action does not fire)
+#   undoPlan   true  (a plan exists; no-undo-plan does not fire)
+#   objects    1
+#
+# Consumed by:
+#   k8s-operator/internal/broker/classify/corpus_test.go   (runs every case)
+#   dev/tests/classifier-corpus-lint.py                    (V-MET-005: coverage of the rule set)
+
+cases:
+  # ---------------------------------------------------------------------------------------------
+  # A. The default. Ordinary work is routine, and most of the corpus's value is in proving that the
+  #    gates stay quiet -- a classifier that gates everything passes every positive test.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-001
+    description: patching a Deployment's replicas is routine
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      rules:
+        - default-routine
+
+  - id: gat-002
+    description: applying a ConfigMap is routine
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+    expect:
+      class: routine
+      notRules:
+        - secret-material-egress
+
+  - id: gat-003
+    description: scaling a Deployment is routine
+    ops:
+      - verb: scale
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+
+  - id: gat-004
+    description: creating a Service in a dev namespace is routine
+    ops:
+      - verb: create
+        kind: Service
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - public-exposure
+
+  - id: gat-005
+    description: deleting a Deployment is routine -- disruptive, but the undo plan holds the spec
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-006
+    description: creating a Job is routine
+    ops:
+      - verb: create
+        group: batch
+        kind: Job
+        namespace: team-a
+        name: migrate
+    expect:
+      class: routine
+
+  - id: gat-007
+    description: patching an HPA is routine
+    ops:
+      - verb: patch
+        group: autoscaling
+        kind: HorizontalPodAutoscaler
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+
+  - id: gat-008
+    description: a cloud write to an ordinary Config Connector kind is routine
+    ops:
+      - verb: cloud
+        group: storage.cnrm.cloud.google.com
+        kind: StorageBucket
+        namespace: team-a
+        name: assets
+    expect:
+      class: routine
+      notRules:
+        - identity-change
+
+  # ---------------------------------------------------------------------------------------------
+  # B. secret-write. Elevated, not gated: writing a Secret is ordinary operational work, it just
+  #    deserves an immediate ping rather than a line in a digest nobody reads.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-010
+    description: applying a Secret is elevated
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+    expect:
+      class: elevated
+      rules:
+        - secret-write
+
+  - id: gat-011
+    description: creating a Secret is elevated
+    ops:
+      - verb: create
+        kind: Secret
+        namespace: team-a
+        name: api-key
+    expect:
+      class: elevated
+      rules:
+        - secret-write
+
+  - id: gat-012
+    description: patching a Secret is elevated
+    ops:
+      - verb: patch
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+    expect:
+      class: elevated
+      rules:
+        - secret-write
+
+  - id: gat-013
+    description: deleting a Secret gates -- the material is gone and no undo plan holds it
+    ops:
+      - verb: delete
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+        - secret-write
+
+  - id: gat-014
+    description: patching a Deployment does not fire the Secret rule
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - secret-write
+
+  # ---------------------------------------------------------------------------------------------
+  # C. destructive-stateful-delete. The line is RECOVERABLE, not important: a Deployment delete is
+  #    routine because the undo plan holds the spec; a PVC delete gates because no field in an undo
+  #    plan contains a disk.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-020
+    description: deleting a PersistentVolumeClaim gates
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-021
+    description: deleting a PersistentVolume gates
+    ops:
+      - verb: delete
+        kind: PersistentVolume
+        name: pv-0001
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-022
+    description: deleting a StatefulSet gates
+    ops:
+      - verb: delete
+        group: apps
+        kind: StatefulSet
+        namespace: team-a
+        name: postgres
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-023
+    description: deleting a ConfigMap gates -- config is data someone hand-wrote
+    ops:
+      - verb: delete
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-024
+    description: deleting a Namespace gates
+    ops:
+      - verb: delete
+        kind: Namespace
+        name: team-a
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-025
+    description: deleting a VolumeSnapshot gates
+    ops:
+      - verb: delete
+        group: snapshot.storage.k8s.io
+        kind: VolumeSnapshot
+        namespace: team-a
+        name: nightly
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-026
+    description: PATCHING a StatefulSet does not fire the DELETE rule
+    ops:
+      - verb: patch
+        group: apps
+        kind: StatefulSet
+        namespace: team-a
+        name: postgres
+    expect:
+      class: routine
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-027
+    description: creating a PVC does not fire the delete rule
+    ops:
+      - verb: create
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+    expect:
+      class: routine
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-028
+    description: deleting a ReplicaSet is routine -- it is generated, not authored
+    ops:
+      - verb: delete
+        group: apps
+        kind: ReplicaSet
+        namespace: team-a
+        name: web-7d9f
+    expect:
+      class: routine
+      notRules:
+        - destructive-stateful-delete
+
+  # ---------------------------------------------------------------------------------------------
+  # D. THE ASYMMETRY (V-GAT-010, V-GAT-021). Each control loosening and tightening, plus the mixed
+  #    case. Same kind, same verb, opposite direction, different class -- 03 §5.2: "Agents are
+  #    trusted to make things safer without asking, never to make them less safe."
+  #
+  #    `security-loosen` keys off the DIRECTION alone and carries no kind list, so these cases are
+  #    also the coverage for every kind the direction analysis understands. See the rule's comment
+  #    in floor.go for what the kind list cost when it was there.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-030
+    description: "network-policy LOOSEN: deleting a NetworkPolicy gates"
+    ops:
+      - verb: delete
+        group: networking.k8s.io
+        kind: NetworkPolicy
+        namespace: team-a
+        name: default-deny
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-031
+    description: "network-policy TIGHTEN: creating a NetworkPolicy is routine"
+    ops:
+      - verb: create
+        group: networking.k8s.io
+        kind: NetworkPolicy
+        namespace: team-a
+        name: default-deny
+        direction: tighten
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-032
+    description: "rbac LOOSEN: widening a ClusterRole gates"
+    ops:
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: app-reader
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-033
+    description: "rbac TIGHTEN: narrowing a ClusterRole is routine"
+    ops:
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: app-reader
+        direction: tighten
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-034
+    description: "rbac LOOSEN: granting a new Role gates"
+    ops:
+      - verb: create
+        group: rbac.authorization.k8s.io
+        kind: Role
+        namespace: team-a
+        name: reader
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-035
+    description: "admission-webhook LOOSEN: setting failurePolicy to Ignore gates"
+    ops:
+      - verb: patch
+        group: admissionregistration.k8s.io
+        kind: ValidatingWebhookConfiguration
+        name: tenant-policy
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-036
+    description: "admission-webhook TIGHTEN: setting failurePolicy to Fail is routine"
+    ops:
+      - verb: patch
+        group: admissionregistration.k8s.io
+        kind: ValidatingWebhookConfiguration
+        name: tenant-policy
+        direction: tighten
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-037
+    description: "pod-security LOOSEN: dropping a Namespace's enforce level to privileged gates"
+    ops:
+      - verb: patch
+        kind: Namespace
+        name: team-a
+        direction: loosen
+        touchedPaths:
+          - /metadata/labels/pod-security.kubernetes.io~1enforce
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-038
+    description: "pod-security TIGHTEN: raising a Namespace's enforce level to restricted is routine"
+    ops:
+      - verb: patch
+        kind: Namespace
+        name: team-a
+        direction: tighten
+        touchedPaths:
+          - /metadata/labels/pod-security.kubernetes.io~1enforce
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-039
+    description: "security-context LOOSEN: privileged true on a Deployment gates"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        direction: loosen
+        touchedPaths:
+          - /spec/template/spec/containers/0/securityContext/privileged
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-040
+    description: "security-context TIGHTEN: runAsNonRoot true on a Deployment is routine"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        direction: tighten
+        touchedPaths:
+          - /spec/template/spec/containers/0/securityContext/runAsNonRoot
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-041
+    description: "authentication LOOSEN: repointing a workload's serviceAccountName gates"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        direction: loosen
+        touchedPaths:
+          - /spec/template/spec/serviceAccountName
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-042
+    description: "authentication TIGHTEN: turning off automountServiceAccountToken is routine"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        direction: tighten
+        touchedPaths:
+          - /spec/template/spec/automountServiceAccountToken
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-043
+    description: "resource-limits LOOSEN: deleting a ResourceQuota gates"
+    ops:
+      - verb: delete
+        kind: ResourceQuota
+        namespace: team-a
+        name: compute
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-044
+    description: "resource-limits TIGHTEN: creating a ResourceQuota is routine"
+    ops:
+      - verb: create
+        kind: ResourceQuota
+        namespace: team-a
+        name: compute
+        direction: tighten
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-045
+    description: "service-exposure LOOSEN: ClusterIP to LoadBalancer gates"
+    ops:
+      - verb: patch
+        kind: Service
+        namespace: team-a
+        name: web
+        direction: loosen
+        touchedPaths:
+          - /spec/type
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+        - public-exposure
+
+  - id: gat-046
+    description: "service-exposure TIGHTEN: LoadBalancer to ClusterIP is routine"
+    ops:
+      - verb: patch
+        kind: Service
+        namespace: team-a
+        name: web
+        direction: tighten
+        touchedPaths:
+          - /spec/type
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+        - public-exposure
+
+  - id: gat-047
+    description: >-
+      MIXED: an operation whose direction analysis saw a tightening AND a loosening resolves to
+      loosen and gates. The netting-out refusal of 03 §5.2 at the classifier's end of it -- an
+      implementation that scored the two against each other would let any loosening be laundered by
+      bundling a tightening alongside it.
+    ops:
+      - verb: apply
+        group: networking.k8s.io
+        kind: NetworkPolicy
+        namespace: team-a
+        name: app-policy
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-048
+    description: a change with no computed direction does not fire the direction-scoped rule
+    ops:
+      - verb: patch
+        group: networking.k8s.io
+        kind: NetworkPolicy
+        namespace: team-a
+        name: default-deny
+    expect:
+      class: routine
+      notRules:
+        - security-loosen
+
+  - id: gat-049
+    description: "rbac LOOSEN on a RoleBinding gates on BOTH security-loosen and identity-change"
+    ops:
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: RoleBinding
+        namespace: team-a
+        name: app-binding
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+        - identity-change
+
+  # ---------------------------------------------------------------------------------------------
+  # E. public-exposure. Its own rule alongside security-loosen, because the approver's question is
+  #    different: "what can reach this now?" rather than "which control moved?".
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-050
+    description: creating an internet-facing Ingress gates
+    ops:
+      - verb: create
+        group: networking.k8s.io
+        kind: Ingress
+        namespace: team-a
+        name: web
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - public-exposure
+
+  - id: gat-051
+    description: creating a Gateway gates when it widens reachability
+    ops:
+      - verb: create
+        group: gateway.networking.k8s.io
+        kind: Gateway
+        namespace: team-a
+        name: edge
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - public-exposure
+
+  - id: gat-052
+    description: opening a ComputeFirewall gates
+    ops:
+      - verb: cloud
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeFirewall
+        namespace: team-a
+        name: allow-web
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - public-exposure
+
+  - id: gat-053
+    description: deleting an Ingress narrows reachability and is routine
+    ops:
+      - verb: delete
+        group: networking.k8s.io
+        kind: Ingress
+        namespace: team-a
+        name: web
+        direction: tighten
+    expect:
+      class: routine
+      notRules:
+        - public-exposure
+
+  - id: gat-054
+    description: a ConfigMap write is not an exposure change
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+    expect:
+      class: routine
+      notRules:
+        - public-exposure
+
+  # ---------------------------------------------------------------------------------------------
+  # F. traffic-shift. Where live traffic goes is a gate regardless of direction: there is no "safe"
+  #    direction for repointing production traffic.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-060
+    description: changing a Service selector shifts traffic and gates
+    ops:
+      - verb: patch
+        kind: Service
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /spec/selector
+    expect:
+      class: gated
+      rules:
+        - traffic-shift-production
+
+  - id: gat-061
+    description: changing Ingress rules shifts traffic and gates
+    ops:
+      - verb: patch
+        group: networking.k8s.io
+        kind: Ingress
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /spec/rules
+    expect:
+      class: gated
+      rules:
+        - traffic-shift-production
+
+  - id: gat-062
+    description: changing an HTTPRoute backendRefs gates
+    ops:
+      - verb: patch
+        group: gateway.networking.k8s.io
+        kind: HTTPRoute
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /spec/backendRefs
+    expect:
+      class: gated
+      rules:
+        - traffic-shift-production
+
+  - id: gat-063
+    description: changing an Istio VirtualService route weight gates
+    ops:
+      - verb: patch
+        group: networking.istio.io
+        kind: VirtualService
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /spec/http/0/route/0/weight
+    expect:
+      class: gated
+      rules:
+        - traffic-shift-production
+
+  - id: gat-064
+    description: changing a Service's annotations does not shift traffic
+    ops:
+      - verb: patch
+        kind: Service
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /metadata/annotations/note
+    expect:
+      class: routine
+      notRules:
+        - traffic-shift-production
+
+  - id: gat-065
+    description: changing a Service port is not a selector change
+    ops:
+      - verb: patch
+        kind: Service
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /spec/ports/0/port
+    expect:
+      class: routine
+      notRules:
+        - traffic-shift-production
+
+  - id: gat-066
+    description: a Deployment patch cannot shift traffic, whatever it touches
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        touchedPaths:
+          - /spec/selector
+    expect:
+      class: routine
+      notRules:
+        - traffic-shift-production
+
+  # ---------------------------------------------------------------------------------------------
+  # G. identity-change. Who something runs AS, distinct from what it may do.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-070
+    description: creating a ServiceAccount gates
+    ops:
+      - verb: create
+        kind: ServiceAccount
+        namespace: team-a
+        name: app
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-071
+    description: patching a ClusterRoleBinding gates
+    ops:
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: ClusterRoleBinding
+        name: app-admin
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-072
+    description: creating an IAMPolicyMember gates
+    ops:
+      - verb: cloud
+        group: iam.cnrm.cloud.google.com
+        kind: IAMPolicyMember
+        namespace: team-a
+        name: app-sa-binding
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-073
+    description: creating an IAMServiceAccount gates
+    ops:
+      - verb: cloud
+        group: iam.cnrm.cloud.google.com
+        kind: IAMServiceAccount
+        namespace: team-a
+        name: app-sa
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-074
+    description: deleting a ServiceAccount gates
+    ops:
+      - verb: delete
+        kind: ServiceAccount
+        namespace: team-a
+        name: app
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-075
+    description: an IAMPartialPolicy write gates like an in-cluster identity change
+    ops:
+      - verb: cloud
+        group: iam.cnrm.cloud.google.com
+        kind: IAMPartialPolicy
+        namespace: team-a
+        name: bucket-access
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-076
+    description: patching a Deployment is not an identity change
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - identity-change
+
+  # ---------------------------------------------------------------------------------------------
+  # H. cross-tier-direct-operation. GATES, never forbids: the cluster admin genuinely has the
+  #    authority (V-6 admitted the child precisely because its scope is inside the parent's), so
+  #    what is wrong is doing it silently.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-080
+    description: a cluster admin patching a dev-team-owned Deployment gates
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        lowerTierOwner: dev-team-a
+    expect:
+      class: gated
+      rules:
+        - cross-tier-direct-operation
+
+  - id: gat-081
+    description: cross-tier gates rather than forbidding, so a human can still say yes
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        lowerTierOwner: dev-team-a
+    expect:
+      class: gated
+      rules:
+        - cross-tier-direct-operation
+
+  - id: gat-082
+    description: an object with no lower-tier owner does not fire the rule
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - cross-tier-direct-operation
+
+  - id: gat-083
+    description: a dev-team agent operating in its own namespace is not cross-tier
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - cross-tier-direct-operation
+
+  - id: gat-084
+    description: a platform agent writing to a cluster-admin-owned object gates
+    caller:
+      name: platform-1
+      tier: platform
+      project: proj
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        lowerTierOwner: cluster-admin-1
+    expect:
+      class: gated
+      rules:
+        - cross-tier-direct-operation
+
+  # ---------------------------------------------------------------------------------------------
+  # I. secret-material-egress. Digest match, never entropy. Excludes Secret targets: moving material
+  #    between Secrets is `secret-write`, not egress.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-090
+    description: writing Secret material into a ConfigMap gates
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+        secretMaterial:
+          - namespace: team-a
+            secret: db-creds
+            key: password
+            where: /data/DB_PASSWORD
+            form: raw
+    expect:
+      class: gated
+      rules:
+        - secret-material-egress
+
+  - id: gat-091
+    description: base64-encoded Secret material in a ConfigMap still gates
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+        secretMaterial:
+          - namespace: team-a
+            secret: db-creds
+            key: password
+            where: /data/ENCODED
+            form: base64
+    expect:
+      class: gated
+      rules:
+        - secret-material-egress
+
+  - id: gat-092
+    description: Secret material in a Deployment env var gates
+    ops:
+      - verb: apply
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        secretMaterial:
+          - namespace: team-a
+            secret: db-creds
+            key: password
+            where: /spec/template/spec/containers/0/env/2/value
+            form: raw
+    expect:
+      class: gated
+      rules:
+        - secret-material-egress
+
+  - id: gat-093
+    description: cross-namespace egress -- material read in team-a written into team-b
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-b
+        name: shared
+        secretMaterial:
+          - namespace: team-a
+            secret: db-creds
+            key: password
+            where: /data/UPSTREAM
+            form: raw
+    expect:
+      class: gated
+      rules:
+        - secret-material-egress
+
+  - id: gat-094
+    description: url-encoded material in an annotation gates
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        secretMaterial:
+          - namespace: team-a
+            secret: webhook
+            key: token
+            where: /metadata/annotations/callback
+            form: url
+    expect:
+      class: gated
+      rules:
+        - secret-material-egress
+
+  - id: gat-095
+    description: Secret-to-Secret is secret-write, NOT egress
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds-copy
+        secretMaterial:
+          - namespace: team-a
+            secret: db-creds
+            key: password
+            where: /data/password
+            form: raw
+    expect:
+      class: elevated
+      rules:
+        - secret-write
+      notRules:
+        - secret-material-egress
+
+  - id: gat-096
+    description: a ConfigMap with no matching material does not gate
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+    expect:
+      class: routine
+      notRules:
+        - secret-material-egress
+
+  # ---------------------------------------------------------------------------------------------
+  # J. Blast radius (V-GAT-011). Three thresholds: >50 objects gates, >100 aborts, fraction >0.5
+  #    aborts. An abort has NO approval path, which is why it is not simply a stricter class.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-100
+    description: 1 object is routine
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        objects: 1
+    expect:
+      class: routine
+      notRules:
+        - blast-radius-cap
+
+  - id: gat-101
+    description: 50 objects is AT the threshold, not over it
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 50
+    expect:
+      class: routine
+      notRules:
+        - blast-radius-cap
+
+  - id: gat-102
+    description: 51 objects gates
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 51
+    expect:
+      class: gated
+      rules:
+        - blast-radius-cap
+
+  - id: gat-103
+    description: 100 objects gates but does not abort
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 100
+    expect:
+      class: gated
+      rules:
+        - blast-radius-cap
+      abort: false
+
+  - id: gat-104
+    description: 101 objects aborts -- refused outright, no approval path
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 101
+    expect:
+      abort: true
+      rules:
+        - blast-radius-hard-cap
+
+  - id: gat-105
+    description: a fraction over 0.5 aborts even at a low object count
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 30
+        fraction: 0.6
+    expect:
+      abort: true
+      rules:
+        - blast-radius-hard-cap
+
+  - id: gat-106
+    description: a fraction of exactly 0.5 does not abort
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 30
+        fraction: 0.5
+    expect:
+      abort: false
+      notRules:
+        - blast-radius-hard-cap
+
+  - id: gat-107
+    description: an UNAVAILABLE denominator does not abort -- nil is not zero, and not "everything"
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 10
+    expect:
+      class: routine
+      abort: false
+      notRules:
+        - blast-radius-hard-cap
+
+  - id: gat-108
+    description: a large blast radius on a non-destructive verb still counts
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 75
+    expect:
+      class: gated
+      rules:
+        - blast-radius-cap
+
+  - id: gat-109
+    description: a 51-object Secret write gates on both blast radius and secret-write
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        objects: 51
+    expect:
+      class: gated
+      rules:
+        - blast-radius-cap
+        - secret-write
+
+  # ---------------------------------------------------------------------------------------------
+  # K. The production ladder. object canonical > object alias > namespace canonical > namespace
+  #    alias, FIRST MATCH WINS, and a match is PRESENCE rather than "says production".
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-110
+    description: "rung 1: the object's kube-agents/environment escalates"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: production
+    expect:
+      class: elevated
+      rules:
+        - production-environment
+
+  - id: gat-111
+    description: "rung 2: the object's env alias escalates"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          env: production
+    expect:
+      class: elevated
+      rules:
+        - production-environment
+
+  - id: gat-112
+    description: "rung 3: the namespace's kube-agents/environment escalates"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: elevated
+      rules:
+        - production-environment
+
+  - id: gat-113
+    description: "rung 4: the namespace's env alias escalates"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        namespaceLabels:
+          env: production
+    expect:
+      class: elevated
+      rules:
+        - production-environment
+
+  - id: gat-114
+    description: a staging OBJECT in a production namespace is staging -- the carve-out works
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: staging
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: routine
+      notRules:
+        - production-environment
+
+  - id: gat-115
+    description: the canonical key wins even when it disagrees with the alias
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: staging
+          env: production
+    expect:
+      class: routine
+      notRules:
+        - production-environment
+
+  - id: gat-116
+    description: an empty-valued canonical label is PRESENT and stops the ladder
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: ""
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: routine
+      notRules:
+        - production-environment
+
+  - id: gat-117
+    description: "`Production` matches -- the comparison is case-insensitive after trim"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: Production
+    expect:
+      class: elevated
+      rules:
+        - production-environment
+
+  - id: gat-118
+    description: "`prod` is NOT accepted -- it is ambiguous with product and team names"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: prod
+    expect:
+      class: routine
+      notRules:
+        - production-environment
+
+  - id: gat-119
+    description: "`live` is not accepted either"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: live
+    expect:
+      class: routine
+      notRules:
+        - production-environment
+
+  - id: gat-120
+    description: "`nonprod` must not match production by substring"
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        liveLabels:
+          kube-agents/environment: nonprod
+    expect:
+      class: routine
+      notRules:
+        - production-environment
+
+  - id: gat-121
+    description: production plus a gated rule stays gated -- the escalation caps
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+        - production-environment
+
+  - id: gat-122
+    description: production escalates a secret-write from elevated to gated
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - secret-write
+        - production-environment
+
+  # ---------------------------------------------------------------------------------------------
+  # L. novel-action. Escalates by one, capped, and is about the (verb, kind, namespace) SHAPE --
+  #    not the object. The twenty-first Deployment restart in a namespace is not novel.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-130
+    description: a first-of-its-kind action escalates
+    seen: false
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: elevated
+      rules:
+        - novel-action
+
+  - id: gat-131
+    description: a familiar action does not escalate
+    seen: true
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - novel-action
+
+  - id: gat-132
+    description: TWO escalations are not a +2 -- production plus novel on a routine action is elevated
+    seen: false
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        namespaceLabels:
+          env: production
+    expect:
+      class: elevated
+      rules:
+        - novel-action
+        - production-environment
+
+  - id: gat-133
+    description: novel plus production plus a gated rule is still gated, never forbidden
+    seen: false
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  # ---------------------------------------------------------------------------------------------
+  # M. object-override. Raises only. An annotation saying `routine` on an action the floor gates is
+  #    ignored -- otherwise it is a self-service exemption writable by anyone who can label a
+  #    Deployment.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-140
+    description: an object marked gated gates a routine action
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        override: gated
+    expect:
+      class: gated
+      rules:
+        - object-override
+
+  - id: gat-141
+    description: an object marked elevated raises a routine action
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        override: elevated
+    expect:
+      class: elevated
+      rules:
+        - object-override
+
+  - id: gat-142
+    description: an object marked routine does NOT lower a gated action
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+        override: routine
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+      notRules:
+        - object-override
+
+  - id: gat-143
+    description: an object marked elevated does NOT lower a gated action
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+        override: elevated
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+      notRules:
+        - object-override
+
+  - id: gat-144
+    description: a MALFORMED override gates rather than being ignored
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        override: sort-of-important
+    expect:
+      class: gated
+      rules:
+        - object-override
+
+  - id: gat-145
+    description: an object marked forbidden is refused
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        override: forbidden
+    expect:
+      class: forbidden
+      rules:
+        - object-override
+
+  - id: gat-146
+    description: an object with no override annotation does not fire the rule
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - object-override
+
+  # ---------------------------------------------------------------------------------------------
+  # N. out-of-scope (step 1). Forbidden, and it SHORT-CIRCUITS: no other rule is consulted, because
+  #    reasons about the merits of the action would invite an approver to weigh something they
+  #    should simply refuse.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-150
+    description: a namespace-scoped agent reaching into another namespace is forbidden
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-b
+        name: web
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+
+  - id: gat-151
+    description: >-
+      a namespace-scoped agent reaching at CLUSTER scope is forbidden. This case found a scope
+      escape: ScopeOfTarget used to leave the caller's own namespace on a target that has none, so
+      every cluster-scoped object in the cluster resolved to the caller's own scope and passed
+      step 1. See the function's comment.
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: admin
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+
+  - id: gat-152
+    description: out-of-scope short-circuits even when the action would otherwise be routine
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        kind: ConfigMap
+        namespace: team-b
+        name: app-config
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+      notRules:
+        - default-routine
+
+  - id: gat-153
+    description: out-of-scope beats a gated rule and reports only itself
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-b
+        name: data
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-154
+    description: >-
+      a cluster admin for a DIFFERENT cluster is in scope for its own cluster's namespaces. There is
+      no cross-cluster case to write here: a broker serves exactly one cluster, so a target's project
+      and cluster are the caller's by construction (see ScopeOfTarget) and reaching into another
+      cluster is not something an envelope can express -- it is refused a layer earlier, by there
+      being no connection to that cluster at all.
+    caller:
+      name: cluster-admin-2
+      tier: cluster-admin
+      project: proj
+      cluster: cluster-2
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - out-of-scope
+
+  - id: gat-155
+    description: an agent operating inside its own scope is not out of scope
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - out-of-scope
+
+  - id: gat-156
+    description: a cluster admin operating in any namespace of its cluster is in scope
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-z
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - out-of-scope
+
+  - id: gat-157
+    description: a cluster admin operating on a cluster-scoped object of its own cluster is in scope
+    ops:
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: app-reader
+        direction: tighten
+    expect:
+      class: routine
+      notRules:
+        - out-of-scope
+
+  - id: gat-158
+    description: a platform agent operating in a namespace of its project is in scope
+    caller:
+      name: platform-1
+      tier: platform
+      project: proj
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - out-of-scope
+
+  # ---------------------------------------------------------------------------------------------
+  # O. The forbidden set (step 2). Not "very dangerous" -- dangerous things gate. Forbidden is for
+  #    actions where a human's approval would not make the action safe, because the action destroys
+  #    the ability to review, undo or audit it.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-160
+    description: deleting an ActionRecord is forbidden -- it is the journal this action lands in
+    ops:
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-161
+    description: patching an ActionRecord is forbidden
+    ops:
+      - verb: patch
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-162
+    description: editing a ChangePolicy is forbidden -- it decides which actions need approval
+    ops:
+      - verb: apply
+        group: kubeagents.x-k8s.io
+        kind: ChangePolicy
+        name: tenant-floor
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-163
+    description: deleting a FleetFreeze is forbidden -- it is the brake
+    ops:
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: FleetFreeze
+        name: global
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-164
+    description: editing an ApprovalRoster is forbidden -- it lists the humans who may approve
+    ops:
+      - verb: patch
+        group: kubeagents.x-k8s.io
+        kind: ApprovalRoster
+        name: oncall
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-165
+    description: creating an Agent is forbidden -- it is how an agent would widen its own scope
+    ops:
+      - verb: create
+        group: kubeagents.x-k8s.io
+        kind: Agent
+        namespace: kube-agents-system
+        name: new-agent
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-166
+    description: disabling the kube-agents admission webhook is forbidden
+    ops:
+      - verb: delete
+        group: admissionregistration.k8s.io
+        kind: ValidatingWebhookConfiguration
+        name: kube-agents-validating-webhook
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-167
+    description: a DIFFERENT webhook config is not in the forbidden set -- the entry is name-scoped
+    ops:
+      - verb: delete
+        group: admissionregistration.k8s.io
+        kind: ValidatingWebhookConfiguration
+        name: some-other-webhook
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+      notRules:
+        - forbidden-set
+
+  - id: gat-168
+    description: changing the audit policy is forbidden
+    ops:
+      - verb: patch
+        group: apiserver.config.k8s.io
+        kind: AuditPolicy
+        name: default
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-169
+    description: redirecting the audit log sink is forbidden
+    ops:
+      - verb: cloud
+        group: logging.cnrm.cloud.google.com
+        kind: LoggingLogSink
+        namespace: kube-agents-system
+        name: audit
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-170
+    description: adding a log exclusion is forbidden -- it is a redirect wearing a filter
+    ops:
+      - verb: create
+        group: logging.cnrm.cloud.google.com
+        kind: LoggingLogExclusion
+        namespace: kube-agents-system
+        name: quiet
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-171
+    description: deleting kube-system is forbidden
+    ops:
+      - verb: delete
+        kind: Namespace
+        name: kube-system
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-172
+    description: deleting kube-agents-system is forbidden
+    ops:
+      - verb: delete
+        kind: Namespace
+        name: kube-agents-system
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-173
+    description: deleting a TENANT namespace is merely gated -- a human can meaningfully say yes
+    ops:
+      - verb: delete
+        kind: Namespace
+        name: team-a
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+      notRules:
+        - forbidden-set
+
+  - id: gat-174
+    description: CREATING an ActionRecord is not in the set -- the broker writes the journal
+    ops:
+      - verb: create
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-2
+    expect:
+      class: routine
+      notRules:
+        - forbidden-set
+
+  # ---------------------------------------------------------------------------------------------
+  # P. no-undo-plan (step 6). At least gated: an action that cannot be rolled back has no remedy but
+  #    a human noticing in time, which is what a gate is for.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-180
+    description: a routine action with no undo plan gates
+    undoPlan: false
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: gated
+      rules:
+        - no-undo-plan
+
+  - id: gat-181
+    description: an elevated action with no undo plan gates
+    undoPlan: false
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+    expect:
+      class: gated
+      rules:
+        - no-undo-plan
+        - secret-write
+
+  - id: gat-182
+    description: a DRY RUN with no undo plan does not gate -- there is nothing to undo
+    undoPlan: false
+    dryRun: true
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - no-undo-plan
+
+  - id: gat-183
+    description: no-undo-plan does not lower an already-forbidden action
+    undoPlan: false
+    ops:
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+      notRules:
+        - no-undo-plan
+
+  - id: gat-184
+    description: an action WITH an undo plan does not fire the rule
+    undoPlan: true
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+      notRules:
+        - no-undo-plan
+
+  # ---------------------------------------------------------------------------------------------
+  # Q. The caller's own knobs. Both raise only, which is why they are safe to accept from an
+  #    envelope at all.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-190
+    description: an agent voluntarily asking for approval gets it
+    requireApproval: true
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: gated
+      rules:
+        - caller-requested-approval
+
+  - id: gat-191
+    description: requireApproval cannot lower a forbidden action
+    requireApproval: true
+    ops:
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+    expect:
+      class: forbidden
+      notRules:
+        - caller-requested-approval
+
+  - id: gat-192
+    description: a dry run of a forbidden action is still forbidden
+    dryRun: true
+    ops:
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-193
+    description: a dry run of a gated action is still gated -- classification is not execution
+    dryRun: true
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-194
+    description: a declared maxObjects does not by itself change the class
+    maxObjects: 10
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+    expect:
+      class: routine
+
+  # ---------------------------------------------------------------------------------------------
+  # R. Multi-operation envelopes. ONE classification for N operations, taking the max: 06 §5
+  #    executes an envelope as a unit and undoes it as a unit, so classifying operations
+  #    independently would tear the transaction in half.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-200
+    description: an envelope of routine operations is routine
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: api
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+    expect:
+      class: routine
+
+  - id: gat-201
+    description: one elevated operation makes the envelope elevated
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+    expect:
+      class: elevated
+      rules:
+        - secret-write
+
+  - id: gat-202
+    description: one gated operation makes the whole envelope gated
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+        - secret-write
+
+  - id: gat-203
+    description: one forbidden operation forbids the whole envelope
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+    expect:
+      class: forbidden
+      rules:
+        - forbidden-set
+
+  - id: gat-204
+    description: an abort in any operation aborts the envelope
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 150
+    expect:
+      abort: true
+      rules:
+        - blast-radius-hard-cap
+
+  - id: gat-205
+    description: an out-of-scope operation forbids the envelope even if the rest is in scope
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-b
+        name: web
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+
+  - id: gat-206
+    description: an envelope of fifty routine operations is still routine
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: a
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: b
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: c
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: d
+    expect:
+      class: routine
+
+  # ---------------------------------------------------------------------------------------------
+  # S. Combinations. The reason a corpus exists rather than only per-rule tests: these are the cases
+  #    where several inputs interact and where an implementation that is right about each rule
+  #    individually can still be wrong.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-210
+    description: production PVC delete by a novel agent against a routine-marked object still gates
+    seen: false
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        name: data
+        override: routine
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-211
+    description: a cross-tier write into production stays gated, not forbidden
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        lowerTierOwner: dev-team-a
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - cross-tier-direct-operation
+        - production-environment
+
+  - id: gat-212
+    description: secret egress into production gates and names both inputs
+    ops:
+      - verb: apply
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+        namespaceLabels:
+          env: production
+        secretMaterial:
+          - namespace: team-a
+            secret: db-creds
+            key: password
+            where: /data/DB
+            form: raw
+    expect:
+      class: gated
+      rules:
+        - secret-material-egress
+        - production-environment
+
+  - id: gat-213
+    description: a large production rollout gates on blast radius rather than aborting
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 60
+        fraction: 0.2
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      abort: false
+      rules:
+        - blast-radius-cap
+        - production-environment
+
+  - id: gat-214
+    description: an out-of-scope operation beats an abort -- scope is step 1 and short-circuits
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-b
+        objects: 500
+    expect:
+      class: forbidden
+      abort: false
+      rules:
+        - out-of-scope
+      notRules:
+        - blast-radius-hard-cap
+
+  - id: gat-215
+    description: a forbidden-set operation beats an abort in the same envelope
+    ops:
+      - verb: delete
+        group: kubeagents.x-k8s.io
+        kind: ActionRecord
+        namespace: kube-agents-system
+        name: ar-1
+      - verb: delete
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        objects: 500
+    expect:
+      class: forbidden
+      abort: false
+      rules:
+        - forbidden-set
+
+  - id: gat-216
+    description: identity change plus production plus novel is gated, never forbidden
+    seen: false
+    ops:
+      - verb: create
+        kind: ServiceAccount
+        namespace: team-a
+        name: app
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - identity-change
+
+  - id: gat-217
+    description: a tightening security change in production is elevated, not gated
+    ops:
+      - verb: create
+        group: networking.k8s.io
+        kind: NetworkPolicy
+        namespace: team-a
+        name: default-deny
+        direction: tighten
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: elevated
+      rules:
+        - production-environment
+      notRules:
+        - security-loosen
+
+  - id: gat-218
+    description: no undo plan on an out-of-scope action does not soften it to gated
+    undoPlan: false
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-b
+        name: web
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+
+  - id: gat-219
+    description: an object override cannot rescue an out-of-scope action
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-b
+        name: web
+        override: routine
+    expect:
+      class: forbidden
+      rules:
+        - out-of-scope
+
+  - id: gat-220
+    description: traffic shift plus production plus cross-tier is gated and names all three
+    ops:
+      - verb: patch
+        kind: Service
+        namespace: team-a
+        name: web
+        lowerTierOwner: dev-team-a
+        touchedPaths:
+          - /spec/selector
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - traffic-shift-production
+        - cross-tier-direct-operation
+        - production-environment
+
+  - id: gat-221
+    description: an envelope mixing a tightening and a loosening operation gates
+    ops:
+      - verb: create
+        group: networking.k8s.io
+        kind: NetworkPolicy
+        namespace: team-a
+        name: deny
+        direction: tighten
+      - verb: patch
+        group: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: app
+        direction: loosen
+    expect:
+      class: gated
+      rules:
+        - security-loosen
+
+  - id: gat-222
+    description: deleting a ConfigMap in production gates on the delete, capped at gated
+    ops:
+      - verb: delete
+        kind: ConfigMap
+        namespace: team-a
+        name: app-config
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+        - production-environment
+
+  - id: gat-223
+    description: a dev-team agent's own secret write is elevated, not cross-tier
+    caller:
+      name: dev-team-a
+      tier: developer-team
+      project: proj
+      cluster: cluster-1
+      namespace: team-a
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+    expect:
+      class: elevated
+      rules:
+        - secret-write
+      notRules:
+        - cross-tier-direct-operation
+
+  - id: gat-224
+    description: an abort beats a gate -- there is no approval button for a hard cap
+    ops:
+      - verb: delete
+        kind: PersistentVolumeClaim
+        namespace: team-a
+        objects: 200
+    expect:
+      abort: true
+      rules:
+        - blast-radius-hard-cap
+
+  - id: gat-225
+    description: a novel, no-undo-plan, production secret write is gated and not forbidden
+    seen: false
+    undoPlan: false
+    ops:
+      - verb: apply
+        kind: Secret
+        namespace: team-a
+        name: db-creds
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - secret-write
+        - production-environment
+        - novel-action
+
+  - id: gat-226
+    description: >-
+      the whole ladder at once on an action that is otherwise routine. Two escalations, a
+      blast-radius gate under the threshold, and an override that agrees with the outcome -- the
+      answer is gated, from the override, and the escalations do not push it past.
+    seen: false
+    ops:
+      - verb: patch
+        group: apps
+        kind: Deployment
+        namespace: team-a
+        name: web
+        objects: 20
+        override: gated
+        namespaceLabels:
+          kube-agents/environment: production
+    expect:
+      class: gated
+      rules:
+        - object-override
+      notRules:
+        - blast-radius-cap
+
+  # ---------------------------------------------------------------------------------------------
+  # M. destructive-stateful-delete, WHERE THE DATA ACTUALLY LIVES.
+  #
+  #    Added in P9-T4, after `TestNonRecreatableKindsAreGatedByTheClassifier` found that thirteen of
+  #    the seventeen kinds the undo generator cannot restore classified `routine`, reason
+  #    "default-routine: no rule matched". The split was perfectly clean: every kind the floor knew
+  #    about was Kubernetes-native, and every kind it missed was a Config Connector object. So
+  #    `delete SQLInstance` executed without anyone being asked, while `delete ConfigMap` -- section
+  #    C, six cases, all green since P9-T3a -- required approval.
+  #
+  #    Section C is why this section is separate rather than folded into it. Those cases were
+  #    written from the rule table they were meant to check, so they agreed with it, including where
+  #    it was silent. Every case below was written from the OTHER side: from the list of kinds an
+  #    undo plan provably cannot restore. The two lists are maintained apart and reconciled by a
+  #    test, which is the only arrangement that would have caught this.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-227
+    description: deleting a Cloud SQL instance gates -- the database is not in any undo plan
+    ops:
+      - verb: delete
+        group: sql.cnrm.cloud.google.com
+        kind: SQLInstance
+        namespace: team-a
+        name: orders-primary
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-228
+    description: deleting a Cloud SQL database gates
+    ops:
+      - verb: delete
+        group: sql.cnrm.cloud.google.com
+        kind: SQLDatabase
+        namespace: team-a
+        name: orders
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-229
+    description: deleting a storage bucket gates
+    ops:
+      - verb: delete
+        group: storage.cnrm.cloud.google.com
+        kind: StorageBucket
+        namespace: team-a
+        name: customer-exports
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-230
+    description: deleting a BigQuery dataset gates
+    ops:
+      - verb: delete
+        group: bigquery.cnrm.cloud.google.com
+        kind: BigQueryDataset
+        namespace: team-a
+        name: analytics
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-231
+    description: deleting a BigQuery table gates
+    ops:
+      - verb: delete
+        group: bigquery.cnrm.cloud.google.com
+        kind: BigQueryTable
+        namespace: team-a
+        name: events
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-232
+    description: deleting a persistent disk gates
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeDisk
+        namespace: team-a
+        name: postgres-pd
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-233
+    description: deleting a disk snapshot gates -- a backup is the last copy by definition
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeSnapshot
+        namespace: team-a
+        name: nightly-2026-07-26
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-234
+    description: >-
+      deleting a GKE cluster gates. Cascading and non-atomic: recreating the container does not
+      recreate what was inside it.
+    ops:
+      - verb: delete
+        group: container.cnrm.cloud.google.com
+        kind: ContainerCluster
+        namespace: team-a
+        name: prod-us-east4
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-235
+    description: deleting a node pool gates
+    ops:
+      - verb: delete
+        group: container.cnrm.cloud.google.com
+        kind: ContainerNodePool
+        namespace: team-a
+        name: default-pool
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-236
+    description: >-
+      deleting a reserved static IP gates. The address is re-allocated within seconds, so a
+      recreated object has the same name and a different address -- worse than a missing one,
+      because everything pointing at it resolves and reaches a stranger.
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeAddress
+        namespace: team-a
+        name: ingress-static-ip
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-237
+    description: deleting a global static IP gates, for the same reason
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeGlobalAddress
+        namespace: team-a
+        name: global-lb-ip
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-238
+    description: >-
+      deleting a DNS zone gates. The records are the data, and re-creating the zone gives you an
+      empty one with new nameservers.
+    ops:
+      - verb: delete
+        group: dns.cnrm.cloud.google.com
+        kind: DNSManagedZone
+        namespace: team-a
+        name: example-com
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-239
+    description: >-
+      deleting a service account KEY gates. `IAMServiceAccount` was already on the identity list and
+      `IAMServiceAccountKey` -- the credential itself -- was not, so deleting the account required
+      approval and revoking its key did not. It is on the IDENTITY list rather than the stateful
+      one: a key is not data someone authored, and putting the kind on both lists would make two
+      rules fire for one fact and leave a human reading a duplicated reason.
+    ops:
+      - verb: delete
+        group: iam.cnrm.cloud.google.com
+        kind: IAMServiceAccountKey
+        namespace: team-a
+        name: exporter-key
+    expect:
+      class: gated
+      rules:
+        - identity-change
+      notRules:
+        - destructive-stateful-delete
+
+  # The negative half, and the half that makes the section mean something. A floor that gated every
+  # CNRM kind would pass all thirteen cases above and be useless: `patch` is how a node pool is
+  # resized and how a bucket's lifecycle policy is set, and gating those teaches people that the
+  # gate is noise. The rule is about DELETING data, not about touching cloud objects.
+  - id: gat-240
+    description: patching a Cloud SQL instance does not fire the delete rule
+    ops:
+      - verb: patch
+        group: sql.cnrm.cloud.google.com
+        kind: SQLInstance
+        namespace: team-a
+        name: orders-primary
+    expect:
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-241
+    description: creating a storage bucket does not fire the delete rule
+    ops:
+      - verb: create
+        group: storage.cnrm.cloud.google.com
+        kind: StorageBucket
+        namespace: team-a
+        name: customer-exports
+    expect:
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-242
+    description: >-
+      deleting a cloud object that holds no data is not covered by this rule. A ComputeFirewall
+      delete is a security change and is caught by `security-loosen`; it is not a data loss, and
+      claiming it here would make the rule mean "any CNRM delete".
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeFirewall
+        namespace: team-a
+        name: allow-ingress
+    expect:
+      notRules:
+        - destructive-stateful-delete

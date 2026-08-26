@@ -25,7 +25,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // fakeLister answers List from a settable set of policies, or fails.

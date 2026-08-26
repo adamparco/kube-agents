@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // The three anti-replay mechanisms of 06 §4.1, each tested for the blind spot the other two cover.

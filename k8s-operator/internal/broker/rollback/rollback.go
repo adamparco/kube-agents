@@ -69,7 +69,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/execute"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/undo"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"

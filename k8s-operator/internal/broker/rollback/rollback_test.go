@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/execute"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/rollback"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/undo"

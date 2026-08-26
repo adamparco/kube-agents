@@ -35,7 +35,7 @@ import (
 	"strings"
 	"testing"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/undo"
 	"k8s.io/utils/ptr"

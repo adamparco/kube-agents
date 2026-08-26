@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 )
 
 // fakeLister answers a selector with a fixed set, and can change its answer between calls so a test

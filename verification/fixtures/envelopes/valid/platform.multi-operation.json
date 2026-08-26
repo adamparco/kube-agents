@@ -1,0 +1,74 @@
+{
+  "apiVersion": "kubeagents.x-k8s.io/v1alpha1",
+  "kind": "ActionEnvelope",
+  "intent": "drain the deprecated worker pool and scale the replacement up",
+  "rationale": "The v1 pool is cordoned; the v2 pool has capacity for the shifted load.",
+  "operations": [
+    {
+      "op": "scale",
+      "target": {
+        "group": "apps",
+        "version": "v1",
+        "kind": "Deployment",
+        "namespace": "checkout",
+        "name": "worker-v1"
+      },
+      "scale": {
+        "replicas": 0
+      }
+    },
+    {
+      "op": "scale",
+      "target": {
+        "group": "apps",
+        "version": "v1",
+        "kind": "Deployment",
+        "namespace": "checkout",
+        "name": "worker-v2"
+      },
+      "scale": {
+        "replicas": 6
+      }
+    },
+    {
+      "op": "patch",
+      "target": {
+        "group": "apps",
+        "version": "v1",
+        "kind": "Deployment",
+        "namespace": "checkout",
+        "name": "worker-v2"
+      },
+      "patch": {
+        "type": "application/json-patch+json",
+        "body": [
+          {
+            "op": "replace",
+            "path": "/spec/template/spec/priorityClassName",
+            "value": "high"
+          }
+        ]
+      }
+    }
+  ],
+  "requester": {
+    "kind": "human",
+    "id": "slack:U02ABCDEF",
+    "platform": "slack",
+    "displayName": "Dana"
+  },
+  "trigger": {
+    "source": "chat",
+    "ref": "slack:C01ABC/1721840000.000100",
+    "detail": "@platform please scale api-gateway back to 4"
+  },
+  "trace": {
+    "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "spanId": "00f067aa0ba902b7",
+    "sessionId": "s-2026-07-24-01"
+  },
+  "issuedAt": "2026-07-24T18:02:41Z",
+  "nonce": "9f2b1c7d4e6a8b0c3d5e7f9a1b2c3d4e",
+  "idempotencyKey": "sha256:04f912e274891eb842e5acc127a1c7423941a79b909f8a5864be70aafb158553",
+  "maxObjects": 3
+}
