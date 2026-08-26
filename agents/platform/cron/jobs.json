@@ -73,7 +73,7 @@
         "expr": "50 8 * * *",
         "display": "50 8 * * *"
       },
-      "prompt": "Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your profile home — all 342 lines of it, before you run anything. Its six checks are section 3, lines 148-272, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 defines which workloads count as AI workloads; on a cluster running none the six checks still ran and matched nothing, so record all six in checks_run with the collection command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your profile home — all 235 lines of it, before you run anything. Its six checks are section 3, lines 93-162, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 defines which workloads count as AI workloads; on a cluster running none the six checks still ran and matched nothing, so record all six in checks_run with the collection command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "chat"

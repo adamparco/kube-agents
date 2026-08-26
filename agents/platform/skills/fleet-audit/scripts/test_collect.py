@@ -926,6 +926,26 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
         doc = {"audit": "compliance-audit", "scope": {"clusters": [{"name": "c1", "checks_run": checks_run}]}}
         audit_report.cross_check_manifest(doc, manifest)  # must not raise
 
+    def test_ai_security_audits_full_roster_also_verifies_through_collect_fleet(self):
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return Run(argv, 0, clusters_json, "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet("ai-security-audit", "acme", run=run)
+
+        checks_run = [{"check": c.slug, "command": "x"} for c in collect.AI_SECURITY_CHECKS]
+        doc = {"audit": "ai-security-audit", "scope": {"clusters": [{"name": "c1", "checks_run": checks_run}]}}
+        audit_report.cross_check_manifest(doc, manifest)  # must not raise
+
 
 # --------------------------------------------------------------------------- #
 # compliance-audit
@@ -1461,6 +1481,367 @@ class TestComplianceCollectCluster(unittest.TestCase):
                 result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
+
+
+# --------------------------------------------------------------------------- #
+# ai-security-audit
+# --------------------------------------------------------------------------- #
+
+
+def ai_workload(kind="Deployment", name="vllm-llama", ns="default", image="acme/vllm:v1", container=None, pod_labels=None, volumes=None):
+    """A workload whose default image trips the §2 AI discriminator on its
+    own — every test that does not care about the discriminator itself can
+    ignore that and focus on its own check."""
+    c = {"name": "server", "image": image}
+    if container:
+        c.update(container)
+    pod_spec = {"containers": [c]}
+    if volumes is not None:
+        pod_spec["volumes"] = volumes
+    labels = pod_labels if pod_labels is not None else {"app": name}
+    if kind == "Pod":
+        return {"kind": "Pod", "metadata": {"namespace": ns, "name": name, "labels": labels}, "spec": pod_spec}
+    template = {"metadata": {"labels": labels}, "spec": pod_spec}
+    spec = {"jobTemplate": {"spec": {"template": template}}} if kind == "CronJob" else {"template": template}
+    return {"kind": kind, "metadata": {"namespace": ns, "name": name, "labels": {}}, "spec": spec}
+
+
+def ai_service(name, ns="default", selector=None, svc_type="LoadBalancer", annotations=None):
+    return {
+        "kind": "Service",
+        "metadata": {"namespace": ns, "name": name, "annotations": annotations or {}},
+        "spec": {"type": svc_type, "selector": selector if selector is not None else {"app": name}},
+    }
+
+
+class TestIsAiWorkload(unittest.TestCase):
+    def test_a_known_model_server_image_matches(self):
+        self.assertTrue(collect._is_ai_workload({"containers": [{"image": "docker.io/vllm/vllm-openai:v0.6"}]}))
+
+    def test_an_unrelated_image_does_not_match(self):
+        self.assertFalse(collect._is_ai_workload({"containers": [{"image": "nginx:1.25"}]}))
+
+    def test_a_gpu_request_matches_regardless_of_image(self):
+        spec = {"containers": [{"image": "acme/recommender:v4", "resources": {"limits": {"nvidia.com/gpu": "1"}}}]}
+        self.assertTrue(collect._is_ai_workload(spec))
+
+    def test_a_tpu_request_matches(self):
+        spec = {"containers": [{"image": "acme/recommender:v4", "resources": {"limits": {"google.com/tpu": "1"}}}]}
+        self.assertTrue(collect._is_ai_workload(spec))
+
+    def test_a_node_label_style_tpu_key_does_not_match_a_resource_limit(self):
+        # cloud.google.com/tpu-accelerator is a nodeSelector value, never a
+        # resources.limits key -- the SOP is explicit this must not match.
+        spec = {"containers": [{"image": "acme/x", "resources": {"limits": {}}}]}
+        self.assertFalse(collect._is_ai_workload(spec))
+
+
+class TestNormalizeAiWorkloads(unittest.TestCase):
+    def test_a_deployment_carries_its_pod_template_labels(self):
+        d = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm", "tier": "serving"})
+        out = collect.normalize_ai_workloads(dump_of(d))
+        self.assertEqual(out[0]["lbl"], {"app": "vllm", "tier": "serving"})
+
+    def test_a_cronjob_carries_the_nested_template_labels(self):
+        c = ai_workload("CronJob", "batch-embed", pod_labels={"app": "batch-embed"})
+        out = collect.normalize_ai_workloads(dump_of(c))
+        self.assertEqual(out[0]["lbl"], {"app": "batch-embed"})
+
+    def test_a_bare_pod_carries_its_own_labels(self):
+        p = ai_workload("Pod", "one-off", pod_labels={"app": "one-off"})
+        out = collect.normalize_ai_workloads(dump_of(p))
+        self.assertEqual(out[0]["lbl"], {"app": "one-off"})
+
+    def test_an_owned_pod_is_suppressed(self):
+        p = ai_workload("Pod", "one-off")
+        p["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "x"}]
+        self.assertEqual(collect.normalize_ai_workloads(dump_of(p)), [])
+
+    def test_a_system_namespace_is_suppressed(self):
+        d = ai_workload("Deployment", "vllm", ns="kube-system")
+        self.assertEqual(collect.normalize_ai_workloads(dump_of(d)), [])
+
+    def test_a_non_ai_workload_never_appears(self):
+        d = ai_workload("Deployment", "web", image="nginx:1.25")
+        self.assertEqual(collect.normalize_ai_workloads(dump_of(d)), [])
+
+    def test_an_addon_managed_object_is_suppressed_even_if_it_would_match(self):
+        d = ai_workload("DaemonSet", "nvidia-gpu-device-plugin", container={"resources": {"limits": {"nvidia.com/gpu": "1"}}})
+        d["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        self.assertEqual(collect.normalize_ai_workloads(dump_of(d)), [])
+
+
+class TestModelRemoteCodeTrusted(unittest.TestCase):
+    def hit(self, container):
+        w = ai_workload(container=container)
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        return collect.check_model_remote_code_trusted(w, {})
+
+    def test_flags_the_trust_remote_code_arg(self):
+        self.assertIsNotNone(self.hit({"args": ["--trust-remote-code", "--model", "x"]}))
+
+    def test_flags_the_underscore_spelling(self):
+        self.assertIsNotNone(self.hit({"args": ["--trust_remote_code"]}))
+
+    def test_does_not_flag_the_flag_explicitly_disabled(self):
+        self.assertIsNone(self.hit({"args": ["--trust-remote-code=false"]}))
+
+    def test_flags_a_truthy_env_var(self):
+        self.assertIsNotNone(self.hit({"env": [{"name": "TRUST_REMOTE_CODE", "value": "true"}]}))
+
+    def test_does_not_flag_a_falsy_env_var(self):
+        self.assertIsNone(self.hit({"env": [{"name": "TRUST_REMOTE_CODE", "value": "false"}]}))
+
+    def test_init_containers_count(self):
+        w = ai_workload()
+        w["spec"]["template"]["spec"]["initContainers"] = [{"name": "fetch", "args": ["--trust-remote-code"]}]
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        hit = collect.check_model_remote_code_trusted(w, {})
+        self.assertIn("fetch", hit["excerpt"])
+
+
+class TestWeightsMountWritable(unittest.TestCase):
+    def collected(self, container, volumes):
+        w = ai_workload(container=container, volumes=volumes)
+        return collect.normalize_ai_workloads(dump_of(w))[0]
+
+    def test_flags_a_readwrite_csi_mount(self):
+        w = self.collected(
+            {"volumeMounts": [{"name": "weights", "mountPath": "/weights"}]},
+            [{"name": "weights", "csi": {"driver": "gcsfuse.csi.storage.gke.io"}}],
+        )
+        self.assertIsNotNone(collect.check_weights_mount_writable(w, {}))
+
+    def test_flags_a_readwrite_pvc_mount(self):
+        w = self.collected(
+            {"volumeMounts": [{"name": "weights", "mountPath": "/weights"}]},
+            [{"name": "weights", "persistentVolumeClaim": {"claimName": "weights-pvc"}}],
+        )
+        self.assertIsNotNone(collect.check_weights_mount_writable(w, {}))
+
+    def test_does_not_flag_a_readonly_mount(self):
+        w = self.collected(
+            {"volumeMounts": [{"name": "weights", "mountPath": "/weights", "readOnly": True}]},
+            [{"name": "weights", "csi": {"driver": "x"}}],
+        )
+        self.assertIsNone(collect.check_weights_mount_writable(w, {}))
+
+    def test_does_not_flag_a_readonly_volume(self):
+        w = self.collected(
+            {"volumeMounts": [{"name": "weights", "mountPath": "/weights"}]},
+            [{"name": "weights", "csi": {"driver": "x", "readOnly": True}}],
+        )
+        self.assertIsNone(collect.check_weights_mount_writable(w, {}))
+
+    def test_does_not_flag_an_emptydir(self):
+        w = self.collected(
+            {"volumeMounts": [{"name": "scratch", "mountPath": "/tmp"}]},
+            [{"name": "scratch", "emptyDir": {}}],
+        )
+        self.assertIsNone(collect.check_weights_mount_writable(w, {}))
+
+    def test_the_join_by_name_is_required_not_a_direct_field_test(self):
+        # Regression for the exact bug the SOP calls load-bearing: csi/pvc
+        # live on the volume, never on the mount, so a mount naming a
+        # volume that does not exist must not spuriously match.
+        w = self.collected({"volumeMounts": [{"name": "missing", "mountPath": "/x"}]}, [])
+        self.assertIsNone(collect.check_weights_mount_writable(w, {}))
+
+
+class TestModelArtifactUnpinnedSource(unittest.TestCase):
+    def hit(self, container):
+        w = ai_workload(container=container)
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        return collect.check_model_artifact_unpinned_source(w, {})
+
+    def test_flags_a_plaintext_http_url(self):
+        self.assertIsNotNone(self.hit({"args": ["--weights", "http://example.com/model.bin"]}))
+
+    def test_flags_an_ftp_url(self):
+        self.assertIsNotNone(self.hit({"env": [{"name": "MODEL_URL", "value": "ftp://example.com/model.bin"}]}))
+
+    def test_does_not_flag_an_https_url(self):
+        self.assertIsNone(self.hit({"args": ["--weights", "https://example.com/model.bin"]}))
+
+    def test_does_not_flag_an_object_store_uri(self):
+        self.assertIsNone(self.hit({"args": ["--weights", "gs://bucket/model.bin"]}))
+
+    def test_flags_model_without_revision(self):
+        self.assertIsNotNone(self.hit({"args": ["--model", "meta-llama/Llama-3"]}))
+
+    def test_does_not_flag_model_with_revision(self):
+        self.assertIsNone(self.hit({"args": ["--model", "meta-llama/Llama-3", "--revision", "abc123"]}))
+
+    def test_accepts_the_equals_spelling_of_both_flags(self):
+        self.assertIsNone(self.hit({"args": ["--model=meta-llama/Llama-3", "--revision=abc123"]}))
+        self.assertIsNotNone(self.hit({"args": ["--model=meta-llama/Llama-3"]}))
+
+    def test_escalates_to_critical_alongside_a_remote_code_finding_on_the_same_container(self):
+        hit = self.hit({"args": ["--model", "x", "--trust-remote-code"]})
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_does_not_escalate_without_a_remote_code_finding(self):
+        hit = self.hit({"args": ["--model", "x"]})
+        self.assertNotIn("severity", hit)
+
+
+class TestModelCredentialPlaintextEnv(unittest.TestCase):
+    def hit(self, env):
+        w = ai_workload(container={"env": env})
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        return collect.check_model_credential_plaintext_env(w, {})
+
+    def test_flags_a_literal_hf_token(self):
+        self.assertIsNotNone(self.hit([{"name": "HF_TOKEN", "value": "hf_xxx"}]))
+
+    def test_does_not_flag_a_secretkeyref(self):
+        self.assertIsNone(self.hit([{"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}]))
+
+    def test_does_not_flag_an_empty_value(self):
+        self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": ""}]))
+
+    def test_flags_openai_and_anthropic_keys(self):
+        self.assertIsNotNone(self.hit([{"name": "OPENAI_API_KEY", "value": "sk-x"}]))
+        self.assertIsNotNone(self.hit([{"name": "ANTHROPIC_API_KEY", "value": "sk-ant-x"}]))
+
+    def test_never_puts_the_value_in_the_excerpt(self):
+        hit = self.hit([{"name": "HF_TOKEN", "value": "hf_super_secret_value"}])
+        self.assertNotIn("hf_super_secret_value", hit["excerpt"])
+
+
+class TestModelImageFloatingTag(unittest.TestCase):
+    def hit(self, image):
+        # The discriminator is independent of the image under test here, so
+        # pin it via the accelerator prong -- otherwise an image string that
+        # does not happen to name a known model server (e.g. a bare registry
+        # host) would drop the workload out of scope before this check ever
+        # saw it.
+        w = ai_workload(container={"image": image, "resources": {"limits": {"nvidia.com/gpu": "1"}}})
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        return collect.check_model_image_floating_tag(w, {})
+
+    def test_flags_latest(self):
+        self.assertIsNotNone(self.hit("acme/vllm:latest"))
+
+    def test_flags_no_tag_at_all(self):
+        self.assertIsNotNone(self.hit("acme/vllm"))
+
+    def test_does_not_flag_a_version_tag(self):
+        self.assertIsNone(self.hit("acme/vllm:v0.6.2"))
+
+    def test_does_not_flag_a_digest_even_with_a_floating_tag(self):
+        self.assertIsNone(self.hit("acme/vllm:latest@sha256:" + "a" * 64))
+
+    def test_a_registry_port_is_not_mistaken_for_a_tag(self):
+        # gcr.io:5000/i has a colon with a `/` after it before the string
+        # ends -- that is not a tag, so this is the untagged case, not a
+        # false negative.
+        self.assertIsNotNone(self.hit("gcr.io:5000/i"))
+        self.assertIsNone(self.hit("gcr.io:5000/i:v1"))
+
+
+class TestInferenceEndpointPublic(unittest.TestCase):
+    def result(self, svc, workloads):
+        context = {"services": [svc], "ai_workloads": collect.normalize_ai_workloads(dump_of(*workloads))}
+        return collect.check_inference_endpoint_public(context)
+
+    def test_flags_a_public_loadbalancer_selecting_an_ai_workload(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        hits = self.result(svc, [w])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Service/vllm-svc")
+
+    def test_does_not_flag_clusterip(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, svc_type="ClusterIP")
+        self.assertEqual(self.result(svc, [w]), [])
+
+    def test_does_not_flag_the_current_internal_lb_annotation(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, annotations={"networking.gke.io/load-balancer-type": "Internal"})
+        self.assertEqual(self.result(svc, [w]), [])
+
+    def test_does_not_flag_the_legacy_internal_lb_annotation(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, annotations={"cloud.google.com/load-balancer-type": "Internal"})
+        self.assertEqual(self.result(svc, [w]), [])
+
+    def test_does_not_flag_a_selector_less_service(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("headless", selector={})
+        self.assertEqual(self.result(svc, [w]), [])
+
+    def test_does_not_flag_a_loadbalancer_selecting_a_non_ai_workload(self):
+        svc = ai_service("web-svc", selector={"app": "web"})
+        self.assertEqual(self.result(svc, []), [])
+
+    def test_the_selector_must_be_a_subset_not_an_exact_match(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm", "tier": "serving"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        self.assertEqual(len(self.result(svc, [w])), 1)
+
+
+class TestAiSecurityCollectCluster(unittest.TestCase):
+    """One end-to-end pass over ai-security-audit's real collection plan --
+    a workload dump and a Service dump, joined for one check and read alone
+    by the other five."""
+
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+
+    def run_with(self, workload_items=(), service_items=()):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"]:
+                if argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                    return Run(argv, 0, json.dumps(dump_of(*workload_items)), "", 0.1)
+                if argv[2] == "svc":
+                    return Run(argv, 0, json.dumps(dump_of(*service_items)), "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
+
+    def test_a_cluster_with_no_ai_workloads_still_runs_every_check(self):
+        result = self.run_with(workload_items=[deployment("web")], service_items=[])
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(len(result["commands"]), 6)
+
+    def test_a_dirty_cluster_reports_across_both_sources(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"}, container={"args": ["--trust-remote-code"], "image": "acme/vllm:latest"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        result = self.run_with(workload_items=[w], service_items=[svc])
+        slugs = {c["check"] for c in result["candidates"]}
+        self.assertIn("model-remote-code-trusted", slugs)
+        self.assertIn("model-image-floating-tag", slugs)
+        self.assertIn("inference-endpoint-public", slugs)
+
+    def test_a_gate_failure_on_the_service_dump_fails_the_whole_cluster(self):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == "svc":
+                return Run(argv, 1, "", "RBAC forbidden", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "gate-failed")
+        self.assertNotIn("candidates", result)
+
+    def test_the_service_dump_backs_only_inference_endpoint_public(self):
+        result = self.run_with(workload_items=[deployment("web")], service_items=[])
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        self.assertIn(" svc ", commands_by_slug["inference-endpoint-public"])
+        for slug in commands_by_slug:
+            if slug != "inference-endpoint-public":
+                self.assertIn(collect.COMPLIANCE_DUMP_KINDS, commands_by_slug[slug])
 
 
 if __name__ == "__main__":

@@ -4,21 +4,26 @@ wearing prose.
 
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
-**Scope of this file today: the collector engine, plus both pilot streams'
-check tables in full.** `obtainability-audit`'s complete eleven-check roster
-(§3.1–§3.11 of `governance/obtainability_audit_sop.md`) and
-`compliance-audit`'s complete eleven-check roster (§2.1–§2.11 of
-`governance/compliance_audit_sop.md`) are both converted — every check
-either SOP defines is fully mechanical (design §2, point 2: neither stream
-needed a `needs_triage` judgment call), so nothing was left on the SOP side
-to skip. Every other stream's checks still run the way they do today, by SOP
-prose executed as shell — this collector does not change that yet. The two
+**Scope of this file today: the collector engine, plus three streams' check
+tables in full.** `obtainability-audit`'s complete eleven-check roster
+(§3.1–§3.11 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+complete eleven-check roster (§2.1–§2.11 of `governance/compliance_audit_sop.md`),
+and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
+`governance/ai_security_audit_sop.md`) are all converted — every check any of
+the three SOPs defines is fully mechanical (design §2, point 2: none needed a
+`needs_triage` judgment call, including ai-security's §3.4, whose severity
+forks on whether the same container also trips §3.2 — a fact both checks can
+compute from the same dump), so nothing was left on the SOP side to skip.
+Every other stream's checks still run the way they do today, by SOP prose
+executed as shell — this collector does not change that yet. The three
 streams collect in genuinely different shapes: obtainability answers every
 check from one dump; compliance reads a workload dump plus RBAC, NetworkPolicy
 and Namespace, ServiceAccount, and two distinct `gcloud` calls, none of them
-optional. `collect_cluster` is a thin dispatcher over a per-stream *context
-builder* for exactly this reason — the engine below is what both streams
-share, not what the first one happened to need. Converting the rest is the
+optional; ai-security reads a workload dump and a Service dump, the second
+backing exactly one check (`inference-endpoint-public`) that joins it against
+the first. `collect_cluster` is a thin dispatcher over a per-stream *context
+builder* for exactly this reason — the engine below is what every stream
+shares, not what the first one happened to need. Converting the rest is the
 next several phases in the design's §10 work breakdown, each its own PR,
 deliberately.
 
@@ -29,8 +34,9 @@ What this file does for the checks it covers:
      path convention every SOP already uses (`AGENTS.md`, "Cluster
      Credentials") — then runs the stream's context builder: one dump for
      obtainability, several distinct `kubectl`/`gcloud` reads for
-     compliance, each behind its own fail-closed `jq -e`-equivalent gate so
-     a truncated or empty result cannot read as a clean cluster.
+     compliance, two dumps for ai-security, each behind its own fail-closed
+     `jq -e`-equivalent gate so a truncated or empty result cannot read as a
+     clean cluster.
   3. Runs every covered check's filter against the collected context, in
      parallel across clusters (a thread pool; each cluster's kubeconfig is a
      private file, so no cluster's read can bleed into another's — see
@@ -1010,6 +1016,209 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
     return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
 
 
+# --------------------------------------------------------------------------- #
+# ai-security-audit: §3.1 `inference-endpoint-public` … §3.6
+# `model-image-floating-tag`. Same dump kinds as compliance (`deploy,sts,ds,
+# cronjob,pod`), plus a `svc` dump for §3.1's exposure check, so the workload
+# normalizer here mirrors `normalize_compliance_workloads`'s suppressions but
+# adds `lbl` (the pod template's labels, needed to match a Service selector
+# against a workload in §3.1) and the §2 AI-workload discriminator, so the
+# list this collector hands every check is already narrowed to AI workloads
+# the way `$PRE`'s last `select` narrows the SOP's own pipeline.
+# --------------------------------------------------------------------------- #
+
+AI_MODEL_IMAGE_RE = re.compile(
+    r"(^|/)(vllm|sglang|text-generation-inference|tgi|tritonserver|torchserve|tensorflow-serving|"
+    r"kserve|ollama|ray|llama|mlserver|seldon|lorax|aibrix)([-:@/]|$)"
+)
+AI_ACCELERATOR_KEY_RE = re.compile(r"nvidia\.com/gpu|google\.com/tpu")
+
+
+def _is_ai_workload(spec: dict) -> bool:
+    containers = spec.get("containers") or []
+    if any(AI_MODEL_IMAGE_RE.search(c.get("image") or "") for c in containers):
+        return True
+    for c in containers:
+        limits = (c.get("resources") or {}).get("limits") or {}
+        if any(AI_ACCELERATOR_KEY_RE.search(key) for key in limits):
+            return True
+    return False
+
+
+def _pod_template_labels_of(item: dict) -> dict:
+    """The same three-way fallback chain as the SOP's `lbl` field: a
+    Deployment/StatefulSet/DaemonSet's pod template labels, a CronJob's
+    (nested one level deeper), or a bare Pod's own labels."""
+    spec = item.get("spec") or {}
+    labels = ((spec.get("template") or {}).get("metadata") or {}).get("labels")
+    if labels:
+        return labels
+    labels = (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("metadata", {}).get("labels")
+    if labels:
+        return labels
+    return (item.get("metadata") or {}).get("labels") or {}
+
+
+def normalize_ai_workloads(dump: dict) -> list[dict]:
+    out = []
+    for item in dump.get("items", []) or []:
+        if item.get("kind") not in COMPLIANCE_WORKLOAD_KINDS:
+            continue
+        meta = item.get("metadata") or {}
+        ns = meta.get("namespace", "")
+        if _is_system_namespace(ns):
+            continue
+        labels = meta.get("labels") or {}
+        if "addonmanager.kubernetes.io/mode" in labels:
+            continue
+        if (meta.get("annotations") or {}).get("components.gke.io/component-name"):
+            continue
+        if item.get("kind") == "Pod" and meta.get("ownerReferences"):
+            continue
+        spec = _pod_spec_of(item)
+        if not _is_ai_workload(spec):
+            continue
+        out.append({"kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": spec, "lbl": _pod_template_labels_of(item)})
+    return out
+
+
+def _ai_containers(spec: dict) -> list[dict]:
+    return (spec.get("containers") or []) + (spec.get("initContainers") or [])
+
+
+TRUST_REMOTE_CODE_ARG_RE = re.compile(r"trust[-_]remote[-_]code(?!=(0|false|no))", re.IGNORECASE)
+TRUST_REMOTE_CODE_ENV_NAME_RE = re.compile(r"TRUST_REMOTE_CODE", re.IGNORECASE)
+
+
+def _container_trusts_remote_code(c: dict) -> bool:
+    tokens = [str(t) for t in (c.get("args") or [])] + [str(t) for t in (c.get("command") or [])]
+    if any(TRUST_REMOTE_CODE_ARG_RE.search(t) for t in tokens):
+        return True
+    for e in c.get("env") or []:
+        if TRUST_REMOTE_CODE_ENV_NAME_RE.search(e.get("name") or "") and str(e.get("value", "")).lower() in ("1", "true", "yes"):
+            return True
+    return False
+
+
+def check_model_remote_code_trusted(workload: dict, context: dict) -> dict | None:
+    bad = [c.get("name", "") for c in _ai_containers(workload["spec"]) if _container_trusts_remote_code(c)]
+    if not bad:
+        return None
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
+
+
+def check_weights_mount_writable(workload: dict, context: dict) -> dict | None:
+    vols_by_name = {v.get("name"): v for v in workload["spec"].get("volumes") or []}
+    bad = []
+    for c in workload["spec"].get("containers") or []:
+        for m in c.get("volumeMounts") or []:
+            if m.get("readOnly", False):
+                continue
+            vol = vols_by_name.get(m.get("name"))
+            if vol is None:
+                continue
+            csi, pvc = vol.get("csi"), vol.get("persistentVolumeClaim")
+            if (csi is not None and not csi.get("readOnly", False)) or (pvc is not None and not pvc.get("readOnly", False)):
+                bad.append(f"{c.get('name', '')}:{m.get('name')}:{m.get('mountPath')}")
+    if not bad:
+        return None
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": "; ".join(bad)}
+
+
+AI_URL_RE = re.compile(r"(^|=)(http|ftp)://")
+AI_MODEL_FLAG_RE = re.compile(r"^--model(-id)?(=|$)")
+AI_REVISION_FLAG_RE = re.compile(r"^--revision(=|$)")
+
+
+def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict | None:
+    bad = []
+    escalate = False
+    for c in _ai_containers(workload["spec"]):
+        args_cmd = [str(a) for a in (c.get("args") or [])] + [str(a) for a in (c.get("command") or [])]
+        env_vals = [str(e.get("value", "")) for e in (c.get("env") or [])]
+        has_url = any(AI_URL_RE.search(v) for v in args_cmd + env_vals)
+        has_model_flag = any(AI_MODEL_FLAG_RE.search(a) for a in args_cmd)
+        has_revision_flag = any(AI_REVISION_FLAG_RE.search(a) for a in args_cmd)
+        if has_url or (has_model_flag and not has_revision_flag):
+            bad.append(c.get("name", ""))
+            if _container_trusts_remote_code(c):
+                escalate = True  # §3.4: escalates to critical alongside a 3.2 finding on the same container
+    if not bad:
+        return None
+    hit = {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
+    if escalate:
+        hit["severity"] = "critical"
+    return hit
+
+
+AI_CREDENTIAL_ENV_NAME_RE = re.compile(
+    r"HF_[A-Z_]*TOKEN|HUGGING_?FACE.*TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|WANDB_API_KEY|"
+    r"(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)",
+    re.IGNORECASE,
+)
+
+
+def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict | None:
+    bad = []
+    for c in _ai_containers(workload["spec"]):
+        for e in c.get("env") or []:
+            name = e.get("name") or ""
+            if e.get("value") and e.get("valueFrom") is None and AI_CREDENTIAL_ENV_NAME_RE.search(name):
+                bad.append(f"{c.get('name', '')}:{name}")
+    if not bad:
+        return None
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"set with a literal value: {', '.join(bad)}"}
+
+
+AI_FLOATING_TAG_RE = re.compile(r":(latest|main|master|dev|nightly|stable)$")
+AI_TAG_RE = re.compile(r":[^/]*$")
+AI_DIGEST_RE = re.compile(r"@sha256:")
+
+
+def check_model_image_floating_tag(workload: dict, context: dict) -> dict | None:
+    bad = []
+    for c in _ai_containers(workload["spec"]):
+        img = c.get("image") or ""
+        if not img or AI_DIGEST_RE.search(img):
+            continue
+        if AI_FLOATING_TAG_RE.search(img) or not AI_TAG_RE.search(img):
+            bad.append(f"{c.get('name', '')}:{img}")
+    if not bad:
+        return None
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": "; ".join(bad)}
+
+
+def check_inference_endpoint_public(context: dict) -> list[dict]:
+    hits = []
+    for svc in context.get("services") or []:
+        meta, spec = svc.get("metadata") or {}, svc.get("spec") or {}
+        if spec.get("type") != "LoadBalancer":
+            continue
+        annotations = meta.get("annotations") or {}
+        if annotations.get("networking.gke.io/load-balancer-type") == "Internal":
+            continue
+        if annotations.get("cloud.google.com/load-balancer-type") == "Internal":
+            continue
+        selector = spec.get("selector") or {}
+        if not selector:
+            continue
+        ns = meta.get("namespace", "")
+        matched = any(
+            w["ns"] == ns and all(w.get("lbl", {}).get(k) == v for k, v in selector.items())
+            for w in context.get("ai_workloads") or []
+        )
+        if not matched:
+            continue
+        hits.append(
+            {
+                "namespace": ns,
+                "object": f"Service/{meta.get('name', '')}",
+                "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace",
+            }
+        )
+    return hits
+
+
 class CheckSpec(NamedTuple):
     slug: str
     kind: str  # "workload": run(workload, context) -> hit|None, one call per workload.
@@ -1231,9 +1440,72 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
     ),
 )
 
+AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
+    CheckSpec(
+        "inference-endpoint-public",
+        "cluster",
+        check_inference_endpoint_public,
+        "critical",
+        None,
+        "This model server is reachable from the public internet. Anyone who finds the address can "
+        "send it inference traffic, consume its accelerator capacity, and probe whatever the model "
+        "can reach.",
+    ),
+    CheckSpec(
+        "model-remote-code-trusted",
+        "workload",
+        check_model_remote_code_trusted,
+        "critical",
+        None,
+        "The model loader executes arbitrary code shipped inside the model repository, with this "
+        "pod's ServiceAccount, network access, and mounted volumes. A compromised or swapped model "
+        "artifact is remote code execution in this namespace.",
+    ),
+    CheckSpec(
+        "weights-mount-writable",
+        "workload",
+        check_weights_mount_writable,
+        "major",
+        None,
+        "The serving process can overwrite its own model weights. Any code execution in this pod "
+        "becomes a persistent, replica-wide model swap that outlives the compromised pod and is "
+        "invisible to an image scanner.",
+    ),
+    CheckSpec(
+        "model-artifact-unpinned-source",
+        "workload",
+        check_model_artifact_unpinned_source,
+        "major",  # overridden per hit: critical alongside a model-remote-code-trusted finding on the same container
+        None,
+        "The model artifact this container loads is not pinned: the bytes that arrive at the next "
+        "pod restart are whatever the source serves then. Nothing in the manifest records which "
+        "model is actually running.",
+    ),
+    CheckSpec(
+        "model-credential-plaintext-env",
+        "workload",
+        check_model_credential_plaintext_env,
+        "major",
+        None,
+        "A model-registry credential is embedded in this workload's pod spec in plaintext. It is "
+        "visible to anyone who can describe the pod or read the manifest in Git, and it is not "
+        "rotatable without a redeploy.",
+    ),
+    CheckSpec(
+        "model-image-floating-tag",
+        "workload",
+        check_model_image_floating_tag,
+        "minor",
+        None,
+        "The image this container runs is not reproducible: a restart can pull different bytes than "
+        "the ones running now, with no manifest change to review.",
+    ),
+)
+
 CHECK_TABLES: dict[str, tuple[CheckSpec, ...]] = {
     "obtainability-audit": OBTAINABILITY_CHECKS,
     "compliance-audit": COMPLIANCE_CHECKS,
+    "ai-security-audit": AI_SECURITY_CHECKS,
 }
 
 
@@ -1361,9 +1633,36 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     return CollectedContext(context, context["workloads"], commands)
 
 
+def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
+    """Two dumps, the same shape the SOP's own §2 describes: the workload
+    dump backs every `workload`-kind check, the Service dump backs
+    `inference-endpoint-public` alone. Either failing fails the whole
+    cluster closed, the same trade-off compliance-audit's several
+    independent reads accept."""
+    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
+    parsed, result = run_and_gate(workload_argv, kubeconfig, run=run)
+    if parsed is None:
+        raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    ai_workloads = normalize_ai_workloads(parsed)
+    workload_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(workload_argv)}", result)
+
+    svc_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
+    svc_parsed, svc_result = run_and_gate(svc_argv, kubeconfig, run=run)
+    if svc_parsed is None:
+        raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:300]}")
+    svc_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(svc_argv)}", svc_result)
+
+    context = {"ai_workloads": ai_workloads, "services": svc_parsed.get("items", [])}
+    commands = {
+        spec.slug: (svc_record if spec.slug == "inference-endpoint-public" else workload_record) for spec in checks
+    }
+    return CollectedContext(context, ai_workloads, commands)
+
+
 _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
     "obtainability-audit": _collect_obtainability,
     "compliance-audit": _collect_compliance,
+    "ai-security-audit": _collect_ai_security,
 }
 
 

@@ -618,10 +618,17 @@ Each phase is one PR, independently valuable, in this order:
    its own slice, reviewable without also reviewing twenty-two checks' worth of logic in the
    same diff.
 4. **SOP shrink for both pilot streams, then the remaining streams** — retire each SOP's
-   command/filter prose now that `collect.py` carries it, update the cron prompts, then the
+   command/filter prose now that a collector carries it, update the cron prompts, then the
    other six streams in turn, including the cost stream's hoisted sampling and the drift
    stream's arithmetic; stockout last, after its qualitative thresholds ("latency-sensitive",
-   "substantial") are pinned in an SOP-hardening pre-PR.
+   "substantial") are pinned in an SOP-hardening pre-PR. Done: both pilots
+   (`obtainability-audit`, `compliance-audit`); `gcp-networking-fabric-audit`, converted as its
+   own project-scoped collector script (`networking_audit.py`) rather than folded into
+   `collect.py`, whose target model is GKE clusters reached through a kubeconfig; and
+   `ai-security-audit`, folded into `collect.py` alongside the two pilots since its target
+   model — and its two-dump collection shape — is the same one obtainability and compliance
+   already use. Remaining: `security-patch-orchestrator`, `fleet-wide-cost-analysis`,
+   `fleet-consistency-drift`, `stockout-prevention`.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'
