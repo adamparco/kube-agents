@@ -658,7 +658,24 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'
-   collectors onto the framework as they land.
+   collectors onto the framework as they land. **Stale-docs half done, §4.7 deliberately
+   deferred.** All five named surfaces already say "eight" correctly (fixed before phase 4
+   started); re-swept after phase 4 landed and found one more of the same class the original
+   pass missed — `declarative-workflow.md`'s "a Pod runs six audit crons" — fixed to eight. The
+   five in-flight stream PRs are still open on `main`, so their collectors have nothing to fold
+   onto yet; that step waits for each to land. §4.7's own consolidation — growing `AuditSpec`
+   to carry the §4.2 check table so a ninth stream stops touching `SOP_FILENAMES`,
+   `generate_docs.py`'s skill grouping, and the docs-site counts by hand — is **not done**: it is
+   a code-organization refactor across `audit_report.py` and `generate_docs.py`, both files this
+   phase's work already leans on heavily and neither of which needed to change to convert all
+   eight streams onto collectors. The problem it was named to fix (a stale stream count nothing
+   catches) turned out to have a narrower, safer fix than restructuring `AUDITS`: a regex sweep
+   over the five surfaces for a number-word next to "audit/SOP/ledger/watchdog" was tried and
+   produced more false positives (historical incident counts, unrelated "six audit crons" vs.
+   "eight fleet audits" both matching the same pattern) than real findings, so it was not kept as
+   a permanent guard — the two real staleness incidents to date were both caught by inspection,
+   not a missing mechanism, and a fragile heuristic guard would trade a rare manual sweep for a
+   standing maintenance cost. Revisit §4.7 if a ninth stream is actually proposed.
 
 ## 11. Files touched
 
