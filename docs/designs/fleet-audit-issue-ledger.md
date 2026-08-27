@@ -45,11 +45,13 @@ Two tiers. The issue is the only always-on object.
 One open GitHub issue per audit stream, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
-- The run-over-run delta mechanism is carried over unchanged: the hidden
-  `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
-  `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of
-  findings the body actually rendered, which under the size budget of §7.1 may be a strict subset of
-  the run's findings.
+- The hidden `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body, and
+  `compute_delta` is reused verbatim. What the marker _lists_ is the set of findings the body
+  actually rendered, which under the size budget of §7.1 may be a strict subset of the run's
+  findings. It is the body's published machine-readable contract — bench's verifiers parse it to
+  grade audit evals — rather than the delta's memory; the previous run's ids come from a local
+  report store on the PVC, described in §4.8 of
+  [`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md).
 - Findings render as rows in a findings table with per-finding anchors, each row naming its
   remediation state and, where one exists, its remediation PR.
 - A clean run closes the issue **as completed** and closes any remediation PRs still open for that
@@ -90,13 +92,13 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   segment and no `.lock` suffix — even though the path digest took it out of the branch name. The
   original justification was that it was a git ref component; that is no longer true, and a rule
   whose stated reason has evaporated is a rule someone deletes. Two live reasons replace it. The id
-  is the **join key** of the ledger's hidden delta block and of the `audit-persists:<id>` marker,
-  both matched by line-anchored regexes that whitespace or a stray newline would silently break —
-  and a silent break here means the delta reports every finding as new. And it is **typed by a
-  human** in `/remediate <id>`, which rules out case variation and shell metacharacters. The git
-  constraints are kept as a superset rather than relaxed: they cost nothing, the SOP-generated
-  shapes already satisfy them, and a future change that puts an id back in a ref then finds the
-  gate already in place. The
+  is the **join key** of the run-over-run delta and of two line-anchored markers — the hidden delta
+  block in a remediation pull request body and `audit-persists:<id>` — where whitespace or a stray
+  newline silently breaks the match, leaving a stale pull request open and re-posting a persistence
+  comment every morning. And it is **typed by a human** in `/remediate <id>`, which rules out case
+  variation and shell metacharacters. The git constraints are kept as a superset rather than
+  relaxed: they cost nothing, the SOP-generated shapes already satisfy them, and a future change
+  that puts an id back in a ref then finds the gate already in place. The
   SOPs already build ids deterministically from lowercased slugs; the rule makes that a hard gate
   rather than a convention, and `hack/check-docs-terminology.sh` now extracts the pattern from
   `FINDING_ID_RE` and fails the build if any document quotes a different one.
@@ -297,8 +299,8 @@ one.** A finding that no longer reproduces is absent from the run's document, so
 the findings table to carry a state — `derive_finding_state` is only ever called with
 `reproduces=True` in production, and the two resolved labels never reach a reader. What the reader
 sees instead is the delta comment, which names the resolution by id and by the title recovered from
-the previous body. The distinction between the two states survives only in the code, where it
-decides whether a pull request is closed as stale or left alone because it already merged.
+the stored previous document. The distinction between the two states survives only in the code,
+where it decides whether a pull request is closed as stale or left alone because it already merged.
 
 Three of the rendered rows are easy to misread, and two of them were wrong in an earlier draft:
 
@@ -397,9 +399,12 @@ branch.
 1. Validate the document (existing validator plus `recommendation`, the finding-id charset rule of
    §2, and the scope rules of §7.2).
 2. Reconcile: one `gh pr list` call builds the finding→PR state map from head branch names.
-3. Compute the delta against the ledger issue's `<!-- audit-findings -->` marker, unless its
-   `<!-- audit-id-scheme -->` stamp names a scheme this run cannot join against — then `resolved`
-   is withheld for the one run it takes to rewrite the block.
+3. Compute the delta against the local report store's `latest.json`
+   ([`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.8), trusted
+   only when its `issue_number` matches the ledger just found and its `id_scheme` matches this
+   run's. A store that is absent, written for another ledger, or scheme-stale makes the previous
+   run _unknowable_ rather than empty, so the run publishes with no delta claim at all — `new: 0`,
+   `resolved: 0`, and no delta comment.
 4. Compute coverage gaps (§7.4). A gap does not stop the run; it narrows what the run may conclude.
 5. Clean run → answer every unanswered `/remediate` on the ledger, then close the ledger issue as
    completed, close every open remediation PR for the stream, print `CLEAN`. **Unless the run is
@@ -442,7 +447,10 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — nine keys, always all nine:
+Exit contract — eleven keys, always all eleven. The nine semantic keys below decide behaviour;
+the two timing keys (`inspect_s`, `publish_s`) are telemetry added by
+[`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.4, elided from
+the examples for width, and `inspect_s` is `null` when `start`'s timestamp file is missing:
 
 - `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
 - `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
@@ -545,9 +553,10 @@ headroom for the trailing marker and for anything a later section appends.
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
-  body contains, not the full finding set. Otherwise the next run would see a truncated finding
-  absent from the previous marker, or present in it and absent from the body, and report a finding
-  that is very much still reproducing as _resolved_. The marker is itself a size term and was
+  body contains, not the full finding set, and the report store's `current_ids` carries that same
+  rendered set. Otherwise the next run would see a truncated finding absent from the previous run's
+  ids, or present in them and absent from the body, and report a finding that is very much still
+  reproducing as _resolved_. The marker is itself a size term and was
   unbounded: 1,250 finding ids render 80,526 characters of marker alone, over the limit before a
   single word of prose. That figure came from an earlier reading of the obtainability SOP's
   roll-up rule; that SOP now caps a check at 25 findings per cluster
@@ -558,8 +567,8 @@ headroom for the trailing marker and for anything a later section appends.
   unbounded.
 - **The two halves of the delta are measured against different sets**, because "appeared" and "was
   fixed" are different claims and truncation breaks them apart. `new` is _rendered minus previous_:
-  the previous marker records what the last body rendered, so comparing it to anything wider
-  announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
+  the previous run's stored ids record what the last body rendered, so comparing them to anything
+  wider announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
   minus **every** current finding, rendered or not_: a finding cut for space still reproduces, and
   calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
   to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
@@ -771,7 +780,7 @@ tempting generalisation — also raising it when the body budget (§7.1) dropped
 description — was implemented and then removed, because the two are not the same kind of incomplete
 and the flag has one job. A coverage gap means the audit did not look, which is precisely why it
 suppresses the resolved count. Truncation means it looked, found everything, counted it all in the
-title, and could not print the tail; resolution accounting is untouched, because the delta block
+title, and could not print the tail; resolution accounting is untouched, because the stored id set
 already carries only the ids the body rendered (§2). Folding them together produced
 `partial: true` with an empty `coverage_gaps` — a flag six SOPs instruct the agent to explain to a
 human, with nothing to explain it with. Truncation is surfaced where it belongs: a line in the body
@@ -791,11 +800,11 @@ applies correctly most of the time is a rule the harness should be applying.
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
 moved nothing an operator needs to hear about — nothing new, nothing resolved, no coverage gap, no
 remediation PR opened or closed — and it is computed from the numbers `finish` is about to _report_,
-not the ones it privately knows. A partial run reports `resolved: 0`; an unreadable previous body
-makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
-and the report can never disagree. The PR counters are in the conjunction because opening a fix is
-news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
-while a pull request now exists that did not before.
+not the ones it privately knows. A partial run reports `resolved: 0`; a report store this run cannot
+trust makes the delta unknowable and reports `new: 0` and `resolved: 0`. `silent_ok` follows what
+was published, so the flag and the report can never disagree. The PR counters are in the conjunction
+because opening a fix is news even on a run that found nothing new: the ids were already in the
+ledger, so `new` is zero, while a pull request now exists that did not before.
 
 `silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
 to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So

@@ -62,6 +62,30 @@ def is_valid_repository(repository: Any) -> bool:
     )
 
 
+# fleet-audit status: a fixed ConfigMap key this container patches with its
+# own in-cluster identity, never the agent's. See
+# docs/designs/fleet-audit-collectors-and-status.md §4.5 and
+# `_handle_fleet_audit_status` below for why this exists and why it is not a
+# `command_policy` exception. `_STREAM_SLUG` is deliberately generic — this
+# module has no business knowing which audit streams exist, only that a key
+# cannot be pathological (path separators, a name long enough to matter for
+# the ConfigMap's own size budget).
+FLEET_AUDIT_STATUS_CONFIGMAP = "kube-agents-fleet-audit-status"
+MAX_STATUS_STREAM_LENGTH = 64
+MAX_STATUS_DATA_BYTES = 96 * 1024
+_STATUS_STREAM_SLUG = re.compile(r"[a-z][a-z0-9-]*")
+_SERVICE_ACCOUNT_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+
+
+def is_valid_status_stream(stream: Any) -> bool:
+    """Return True if ``stream`` is safe to use as one ConfigMap data key."""
+    return (
+        isinstance(stream, str)
+        and len(stream) <= MAX_STATUS_STREAM_LENGTH
+        and _STATUS_STREAM_SLUG.fullmatch(stream) is not None
+    )
+
+
 # Two shapes, because two are what the GitHub refresh helper handles: the
 # installation token Minty returns, and the Google OIDC identity token sent to
 # authenticate the request to it.
@@ -2899,6 +2923,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/github/refresh":
             self._handle_github_refresh()
             return
+        if self.path == "/v1/internal/fleet-audit-status":
+            self._handle_fleet_audit_status()
+            return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
@@ -3175,6 +3202,88 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         self._json(HTTPStatus.OK, {"status": "refreshed"})
+
+    def _handle_fleet_audit_status(self) -> None:
+        """Patch one stream's key in the fleet-audit status ConfigMap.
+
+        Not a `command_policy` exception, and not routed through
+        `execute_internal`'s kubectl subprocess path either — deliberately.
+        The agent's `kubectl` always carries this container's *fleet*
+        identity (a managed kubeconfig for a customer cluster, ultimately the
+        pod's Workload-Identity GSA); the read-only gate exists precisely to
+        keep that identity from mutating anything. This endpoint is the
+        opposite shape: it never touches agent-supplied argv, and it
+        authenticates as this pod's own Kubernetes ServiceAccount against
+        *this* cluster, using the standard token/CA/namespace this container
+        already has projected at `_SERVICE_ACCOUNT_DIR` for the
+        k8s-event-watcher it also hosts. RBAC on that ServiceAccount (a chart
+        Role/RoleBinding scoped by `resourceNames` to exactly
+        `FLEET_AUDIT_STATUS_CONFIGMAP`) is the only thing that can make this
+        call succeed, and it can never succeed against a customer cluster —
+        there is no argument that selects one.
+
+        Best-effort throughout, matching the writer that calls this: a
+        missing identity, an unreachable API server, or a chart that never
+        rendered the ConfigMap (an older install, or the feature disabled)
+        all become a 4xx/5xx the caller logs and moves on from. Nothing here
+        may block or fail an audit run.
+        """
+        try:
+            payload = self._read_json_body(max_bytes=MAX_STATUS_DATA_BYTES)
+            stream = payload["stream"]
+            data = payload["data"]
+            if not is_valid_status_stream(stream):
+                raise ValueError("stream must be a lowercase slug")
+            if not isinstance(data, str):
+                raise ValueError("data must be a JSON-encoded string")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        try:
+            token = (_SERVICE_ACCOUNT_DIR / "token").read_text(encoding="utf-8").strip()
+            namespace = (
+                (_SERVICE_ACCOUNT_DIR / "namespace").read_text(encoding="utf-8").strip()
+            )
+            ca_file = str(_SERVICE_ACCOUNT_DIR / "ca.crt")
+        except OSError as exc:
+            # Expected on a non-Kubernetes run (a dev machine, a unit test
+            # harness) where this projected volume does not exist.
+            LOGGER.warning("fleet-audit status: no in-cluster identity available: %s", exc)
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no in-cluster identity"})
+            return
+
+        url = (
+            f"https://kubernetes.default.svc/api/v1/namespaces/{namespace}"
+            f"/configmaps/{FLEET_AUDIT_STATUS_CONFIGMAP}"
+        )
+        request = urllib.request.Request(
+            url,
+            method="PATCH",
+            data=json.dumps({"data": {f"{stream}.json": data}}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/merge-patch+json",
+            },
+        )
+        try:
+            context = ssl.create_default_context(cafile=ca_file)
+            with urllib.request.urlopen(request, timeout=10, context=context) as resp:
+                resp.read()
+        except urllib.request.HTTPError as exc:
+            # 404 is the expected shape of "this install's chart never
+            # rendered the ConfigMap"; 403 is "RBAC was not granted" (no
+            # Workload Identity, or a chart predating this feature). Neither
+            # is an operator page -- both are already the writer's normal
+            # best-effort no-op.
+            LOGGER.warning("fleet-audit status patch refused: HTTP %s", exc.code)
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"apiserver refused: {exc.code}"})
+            return
+        except (urllib.request.URLError, TimeoutError, OSError) as exc:
+            LOGGER.warning("fleet-audit status patch failed: %s", exc)
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": "apiserver unreachable"})
+            return
+        self._json(HTTPStatus.OK, {"status": "patched"})
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))

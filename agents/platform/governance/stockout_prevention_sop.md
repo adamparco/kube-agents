@@ -78,6 +78,21 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 ### 3. Checks
 
+**Run the collector before evaluating a covered check below by hand.**
+
+```bash
+./skills/fleet-audit/scripts/fleet_stockout.py --project "$PROJECT" > /opt/data/scratch/manifest_stockout-prevention.json
+```
+
+This covers ten of the twelve checks below — every one built on a `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute reservations list`, or `gcloud compute regions describe --format=json(quotas)`. The `Node` dump exists only so 3.9's "`>= 90%` of `maxNodeCount`" test can count each pool's _live_ nodes — `initialNodeCount` is creation-time and the autoscaler never updates it. It does **not** cover `spot-scarcity-risk` (3.8) or `autoscaler-out-of-resources` (3.11) — see the collector's own module docstring for why: both read a beta API or an internal log schema this repository has not verified elsewhere, and encoding an unconfirmed shape as tested code would make a guess look like a fact. Run those two by hand, every time, from their own `Command` lines below. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` carries `outcome: "collected"`. Copy its `commands` list verbatim into that cluster's `checks_run` — the ten covered slugs that actually applied there, never a slug this manifest does not list.
+- Every entry in `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed, including `ccc-no-ondemand-floor`'s escalation to `critical` for an inference workload and `reservation-mismatch-risk`'s two forms (an `Automatic`/`AnyBestEffort` affinity binding under a `ComputeClass/<name>` object, an idle reservation under a `Reservation/<name>` object). What is still yours to write is the `recommendation` (§4) and, for a `kind: manifest` remediation, the manifest file itself.
+- The manifest also carries a `project/<project-id>` entry for the two project-scoped checks (`quota-exhaustion-risk`, `reservation-mismatch-risk`'s idle-capacity form), per §3's project-scoped object rule.
+- Pass `--manifest-file <path>` to `finish` (§6) so it cross-checks your `checks_run` against what the collector actually ran.
+- 3.10(b) — a `ComputeClass` targeting a specific reservation that does not exist or sits in an unreachable zone — is not yet in the collector; check it by hand alongside 3.8 and 3.11.
+- 3.12(b) — a ComputeClass whose own `status.conditions` reports invalid configuration — is also not yet in the collector, for the same reason: check it by hand alongside 3.8, 3.10(b), and 3.11.
+
 **Standard exclusions — apply to every check below:**
 
 - **S1 — system namespace:** `kube-system`, `kube-public`, `kube-node-lease`, `gmp-system`, `gmp-public`, `gke-gmp-system`, `cnrm-system`, `configconnector-operator-system`, `krmapihosting-system`, `istio-system`, `asm-system`, `anthos-identity-service`, `gatekeeper-system`, `composer-system`, or any namespace matching `gke-*`, `gke-managed-*`, or `config-management-*`.
@@ -85,6 +100,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 - **S3 — operator-owned:** non-empty `metadata.ownerReferences`.
 - **S4 — explicit opt-out:** carries `kubeagents.x-k8s.io/stockout-audit: exempt`.
 - **S5 — not running:** `spec.replicas == 0`, or completed batch Jobs.
+- **"Non-production" — every check below that names it:** an explicit opt-out (S4), a namespace or workload name containing `test`, `staging`, `stage`, `dev`, `sandbox`, or `qa` as a `-`/`_`-delimited token, or a `resourceLabels`/label value of `environment`/`env`/`stage`/`tier` matching one of those tokens. Anything else is production for this SOP's purposes — the same name-token heuristic the Fleet Waste and GCP Networking Fabric audits already use, so a workload does not read as production in one ledger and non-production in another.
 
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
@@ -100,9 +116,9 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
-- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end, or a latency-sensitive inference workload is configured Spot-first.
+- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end.
 - **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`; workloads with explicit non-production/test opt-out.
-- **Severity:** `major`.
+- **Severity:** `major`, escalated to `critical` when a workload referencing the ComputeClass is an inference workload per the AI Workload Security audit's own discriminator (`governance/ai_security_audit_sop.md` §2: a container image naming a known inference or serving runtime, or a container requesting an accelerator) — a Spot preemption there breaches a user-facing latency SLA immediately rather than delaying a batch job, and reusing that audit's own definition means this SOP names no second "which workloads count as inference" rule for the two to drift apart on.
 - **Impact:** "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state."
 - **Remediation:** `kind: manifest`. Append an On-Demand priority rule at the lowest priority in the ComputeClass manifest to act as a guaranteed capacity floor.
 
@@ -170,7 +186,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
-- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or node pools near `autoscaling.maxNodeCount` ceilings.
+- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or a node pool's current node count is `>= 90%` of its `autoscaling.maxNodeCount` — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); regional clusters with multi-zone node pools.
 - **Severity:** `major`.
 - **Impact:** "Node pool is locked to a single zone: any zonal stockout in that zone halts all cluster auto-scaling."
@@ -180,7 +196,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `gcloud compute reservations list --project=<project> --format=json`
-- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) Substantial reservation capacity is unallocated (`inUseCount << count`) while production workloads in the same region run unreserved. (Note: CUDs are financial commitments, not physical capacity reservations).
+- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) `inUseCount / count <= 0.5` **and** `count - inUseCount >= 4` — at most half the reservation is in use, and at least four whole instances of headroom sit idle, while production workloads in the same region run unreserved. Both conditions together, not either alone: the ratio catches a large reservation nobody uses, the absolute floor keeps a tiny reservation's normal one-or-two-instance headroom from reading as a leak. (Note: CUDs are financial commitments, not physical capacity reservations).
 - **Do NOT flag:** ComputeClasses with valid targeted reservation bindings; non-production workloads.
 - **Severity:** `critical` for broken/bypassed bindings, `major` for unallocated capacity mismatches.
 - **Impact:** "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts."
@@ -233,10 +249,13 @@ Write the schema exactly as the helper validates it to the `findings_path` retur
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
-  --findings-file /opt/data/scratch/findings_stockout-prevention.json
+  --findings-file /opt/data/scratch/findings_stockout-prevention.json \
+  --manifest-file /opt/data/scratch/manifest_stockout-prevention.json
 ```
 
-One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+Omit `--manifest-file` only on a run where §3's collector never produced one — every check on every cluster came from the manual fallback (unavoidable for `spot-scarcity-risk` and `autoscaler-out-of-resources`, which it never covers). Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`.
+
+One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
 `partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload or ComputeClass you never queried is not one that got resolved: `resolved` comes back `0` and no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out.
 

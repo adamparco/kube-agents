@@ -113,6 +113,21 @@ The project is deliberately not part of the identity. Two clusters sharing a nam
 
 ### 3. Checks
 
+**Run the collector before evaluating any check below by hand.**
+
+```bash
+./skills/fleet-audit/scripts/patch_readiness.py > /opt/data/scratch/manifest_security-patch-orchestrator.json
+```
+
+This stream's targets are GKE control-plane and node-pool metadata, not workload state, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for why one `clusters list` call and one `get-server-config` call per location back every check below, with no per-pool `describe` ever issued. It sweeps this project plus, per §1, every other project with at least one cluster; pass `--project <id>` to scope a run to one. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` carries `outcome: "collected"` (a project whose `clusters list` failed contributes no entries at all — its clusters are simply absent, per the one-question scope rule in §1) and a `commands` list. Copy that list verbatim into the cluster's `checks_run`.
+- A `commands` list missing `master-behind`/`stale-image-type` means that cluster's location could not be baselined — write a `limitations` note naming those two rather than treating the cluster as unreachable; every other check on it is still fully collected.
+- Every entry in `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed, including `pool-skew`'s per-condition severity fork and `blocking-exclusion`'s escalation alongside a critical/major version finding on the same cluster. What is still yours to write is the `recommendation` (§5) and, for a `kind: manifest` remediation, the manifest file itself (§4).
+- Pass `--manifest-file <path>` to `finish` (§6) so it cross-checks your `checks_run` against what the collector actually ran.
+
+**A cluster the collector covered is not a cluster you query again.** The commands below exist for a cluster whose baseline the collector could not fetch, for confirming a candidate's evidence, and for a project the fleet's own discovery missed.
+
 #### 3.1 Control plane behind its release-channel baseline (`master-behind`)
 
 - **Command:** `gcloud container clusters describe <cluster> --location=<loc> --project=<p> --format="value(currentMasterVersion,releaseChannel.channel)"`
@@ -252,10 +267,13 @@ Worked example, for a 3.5 finding on node pool `batch-a`:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit security-patch-orchestrator \
-  --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json
+  --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json \
+  --manifest-file /opt/data/scratch/manifest_security-patch-orchestrator.json
 ```
 
-One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+Omit `--manifest-file` only on a run where §3's collector never produced one — every check on every cluster came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`.
+
+One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
 **`partial` is the coverage flag.** It is `true` when any cluster landed in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` lists those gaps as readable sentences. An upgrade audit that could not reach a cluster has no idea whether that cluster's node pools are still behind, so the harness will not let the run act as if it does: `resolved` is forced to `0` with no resolved-delta posted, no remediation PR is closed as stale, and even a findings-free run keeps the ledger open — `status: "CLEAN"`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag: it left the denominator, so an Autopilot cluster that ran everything that _can_ apply to it is a fully covered cluster. It is a coverage flag and nothing more: `true` if and only if `coverage_gaps` is non-empty. The step 5 size budget does not raise it, because a description that could not carry every finding still counted them all in the title and names in the body what it dropped.
 
