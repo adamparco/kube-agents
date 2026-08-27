@@ -12,7 +12,7 @@ per-cluster kubeconfig; this one reads only GKE control-plane and node-pool
 *metadata* through `gcloud container`, and needs no kubeconfig at all. Its
 collection is also flatter than any `kubectl`-based stream's: one
 `clusters list` call per project already returns every cluster's full
-resource, node pools included (the SOP's own §1, point 2), so nine of the
+resource, node pools included (the SOP's own §1, point 2), so eight of the
 ten checks below read data already in memory — the one per-pool
 `node-pools describe` the SOP's own §3 command lines show is never actually
 issued, because `clusters list` already carries every field those describes

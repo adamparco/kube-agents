@@ -32,6 +32,11 @@ exhausted is this":
   Google could not allocate an external IP at all); `routers
   get-nat-mapping-info` for each VM's `interfaceNatMappings[].numTotalNatPorts`
   against that ceiling.
+- `psc-routing-deadlock` reads `forwarding-rules list --filter
+  target:ServiceAttachment`. Each item's `target` names the Private Service
+  Connect service attachment it points at, and `pscConnectionStatus` carries
+  the connection's live state — `REJECTED` or `CLOSED` means traffic aimed at
+  it cannot reach the target service.
 - `mtu-packet-fragmentation` reads `networks list`, whose `peerings[]` on
   each network names the peer network. A mismatch is an ACTIVE peering
   between two networks with different `mtu` values, not an absolute MTU
@@ -269,6 +274,9 @@ def check_router_nat(router: dict, status: dict | None, mapping: list | None) ->
 
 
 def check_psc_routing(forwarding_rules: list[dict]) -> list[dict]:
+    """`forwarding_rules` is `forwarding-rules list --filter
+    target:ServiceAttachment`'s response. One finding per rule whose PSC
+    connection has been rejected or closed at the target's end."""
     hits = []
     for fr in forwarding_rules or []:
         name = fr.get("name", "")
@@ -365,7 +373,19 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
         log(f"{project}: subnets list-usable gate failed (rc={result.rc}); no subnet-scoped targets this run")
-        return []
+        # A silent `[]` here would read as "this project has no subnets" --
+        # a clean, fully-covered scope -- rather than "this scope could not
+        # be read this run". §6's manifest contract requires a surfaced
+        # coverage gap instead, the same as any other failed gate.
+        return [
+            {
+                "name": f"project/{project}/subnets",
+                "project": project,
+                "location": "global",
+                "outcome": "gate-failed",
+                "error": f"subnet-ip-exhaustion: {' '.join(argv)} failed (rc={result.rc}): {result.stderr.strip()[:300]}",
+            }
+        ]
     record = _record(" ".join(argv), result)
     out = []
     for item in parsed:

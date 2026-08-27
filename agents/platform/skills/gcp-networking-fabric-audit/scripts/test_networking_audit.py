@@ -244,7 +244,7 @@ class CollectProjectTest(unittest.TestCase):
             "cloud-nat-exhaustion", "psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
         })
 
-    def test_subnets_list_usable_failure_yields_no_subnet_targets_but_project_target_survives(self):
+    def test_subnets_list_usable_failure_surfaces_a_gate_failed_entry_and_the_project_target_survives(self):
         responses = {
             "subnets list-usable": run_of(1, "", "denied"),
             "routers list": run_of(0, "[]"),
@@ -254,9 +254,12 @@ class CollectProjectTest(unittest.TestCase):
             "backend-services list": run_of(0, "[]"),
         }
         entries = na.collect_project("proj-1", run=self.fake_run(responses))
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["name"], "project/proj-1")
-        self.assertEqual(entries[0]["outcome"], "collected")
+        self.assertEqual(len(entries), 2)
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("subnet-ip-exhaustion", subnet_entry["error"])
+        project_entry = next(e for e in entries if e["name"] == "project/proj-1")
+        self.assertEqual(project_entry["outcome"], "collected")
 
     def test_one_failed_project_level_read_gates_the_whole_project_target_closed(self):
         responses = {
