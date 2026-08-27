@@ -9,7 +9,7 @@ governance/stockout_prevention_sop.md.
 into two groups by how confident this collector can be in the field it is
 reading. Ten read structures this repository's other collectors already
 read with confidence — a `ComputeClass`/`Deployment`/`StatefulSet`/
-`StorageClass` dump, `gcloud container node-pools list`, `gcloud compute
+`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute
 reservations list`, `gcloud compute regions describe --format=json(quotas)`
 — and are converted here: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
@@ -25,6 +25,16 @@ are — encoding an unverified schema as tested code would make a wrong guess
 look like a fact, which is worse than leaving the SOP's own manual
 instructions in place. They stay prose-only until someone can confirm the
 real response shape against a live cluster.
+
+`dangling-compute-class` (3.12) is one of the ten, but only three of its
+four sub-conditions are covered: (a) a dangling `nodeSelector` reference,
+(c) `nodePoolAutoCreation.enabled: false` with no matching pool label, and
+(d) a GPU workload missing its toleration. 3.12(b) — a ComputeClass whose
+own `status.conditions` reports invalid configuration — is not: this
+repository has not exercised that CRD's condition `type`/`reason` values
+anywhere else, the same reason `spot-scarcity-risk` and
+`autoscaler-out-of-resources` stay prose-only. Check 3.12(b) by hand
+alongside 3.8 and 3.11.
 
 The ComputeClass field names and family-generation lists below (Gen 2 vs
 Gen 4/Hyperdisk-compatible in `ccc-mixed-disk-generations`, the
@@ -55,7 +65,7 @@ DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
 
 GEN2_FAMILIES = {"n2", "n2d", "c2"}
-GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3", "c3d"}
+GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3"}  # §3.5's list, exactly -- §3.6 lists a different, wider set for its own check
 HYPERDISK_INCOMPATIBLE_FAMILIES = {"c2", "n2", "e2"}
 HYPERDISK_TYPES = {"hyperdisk-balanced", "hyperdisk-throughput", "hyperdisk-extreme"}
 
@@ -125,12 +135,25 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> list[dict]:
-    result = run(["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"])
+    result = run(
+        [
+            "gcloud", "container", "clusters", "list", "--project", project,
+            "--format", "json(name,location,status,autopilot.enabled,autoscaling.enableNodeAutoprovisioning)",
+        ]
+    )
     if result.rc != 0:
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
     clusters = json.loads(result.stdout or "[]")
     return [
-        {"name": c["name"], "location": c.get("location"), "project": project, "autopilot": bool((c.get("autopilot") or {}).get("enabled"))}
+        {
+            "name": c["name"],
+            "location": c.get("location"),
+            "project": project,
+            "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
+            # A cluster-level setting, not derivable from any one node
+            # pool's own autoscaling config -- see `check_single_zone_nodepool`.
+            "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
+        }
         for c in clusters
         if c.get("status") == "RUNNING"
     ]
@@ -184,11 +207,19 @@ def check_ccc_missing_fallbacks(cc: dict) -> dict | None:
     }
 
 
-def check_ccc_no_ondemand_floor(cc: dict) -> dict | None:
+def check_ccc_no_ondemand_floor(cc: dict, referenced_by_inference: bool) -> dict | None:
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities or not all(_priority_is_spot(p) for p in priorities):
         return None
-    return {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"{len(priorities)} priorities, all Spot, no On-Demand floor"}
+    hit = {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"{len(priorities)} priorities, all Spot, no On-Demand floor"}
+    if referenced_by_inference:
+        # §3.2's escalation, reusing ai-security-audit's own discriminator
+        # (`collect.py`'s `_is_ai_workload`) rather than a second "which
+        # workloads count as inference" rule the two SOPs could drift apart
+        # on.
+        hit["severity"] = "critical"
+        hit["excerpt"] += "; referenced by an inference workload"
+    return hit
 
 
 def check_ccc_large_vm_scarcity(cc: dict) -> list[dict]:
@@ -259,15 +290,20 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
 # --------------------------------------------------------------------------- #
 
 
-def check_single_zone_nodepool(pool: dict, has_nap: bool) -> dict | None:
+def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: int) -> dict | None:
+    """`current_node_count` must be the pool's *live* node count (counted
+    from the cluster's own `Node` objects, grouped by the
+    `cloud.google.com/gke-nodepool` label) -- `initialNodeCount` is a
+    creation-time field the GKE API never updates as the autoscaler scales
+    the pool, so it cannot stand in for "how close to `maxNodeCount` is this
+    pool right now"."""
     locations = pool.get("locations") or []
     autoscaling = pool.get("autoscaling") or {}
     max_nodes = autoscaling.get("maxNodeCount")
-    current = pool.get("initialNodeCount")
     if len(locations) <= 1 and autoscaling.get("enabled") and not has_nap:
         return {"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"single-zone ({locations}), autoscaling enabled, no NAP and no regional multi-zone configuration"}
-    if max_nodes and current is not None and current >= 0.9 * max_nodes:
-        return {"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"{current}/{max_nodes} nodes ({current / max_nodes * 100:.0f}% of maxNodeCount)"}
+    if max_nodes and current_node_count >= 0.9 * max_nodes:
+        return {"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"{current_node_count}/{max_nodes} live nodes ({current_node_count / max_nodes * 100:.0f}% of maxNodeCount)"}
     return None
 
 
@@ -337,7 +373,7 @@ IMPACT = {
 }
 SEVERITY = {
     "ccc-missing-fallbacks": "critical",
-    "ccc-no-ondemand-floor": "major",
+    "ccc-no-ondemand-floor": "major",  # overridden to critical when referenced by an inference workload
     "ccc-large-vm-scarcity": "major",
     "ccc-priority-starvation": "critical",
     "ccc-mixed-disk-generations": "critical",
@@ -368,7 +404,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         return {"name": name, "project": project, "location": location, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    dump_argv = ["kubectl", "get", "computeclasses,deployments,statefulsets,storageclasses", "-A", "-o", "json"]
+    dump_argv = ["kubectl", "get", "computeclasses,deployments,statefulsets,storageclasses,nodes", "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
         return {"name": name, "project": project, "location": location, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}
@@ -382,11 +418,21 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     workloads = deployments + statefulsets
     compute_classes_by_name = {cc["metadata"]["name"]: cc for cc in compute_classes}
 
+    # §3.9's ">= 90% of maxNodeCount" test needs the pool's *live* node
+    # count, which the GKE `NodePool` resource itself never exposes --
+    # `initialNodeCount` is creation-time and the autoscaler never updates
+    # it. Count live `Node` objects by the same nodepool label
+    # `fleet_waste.py`'s idle-nodepool check already groups by.
+    live_node_count_by_pool: dict[str, int] = {}
+    for node in (i for i in items if i.get("kind") == "Node"):
+        pool = (node.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool", "")
+        live_node_count_by_pool[pool] = live_node_count_by_pool.get(pool, 0) + 1
+
     node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
     pools_result = run(node_pools_argv)
     node_pools = json.loads(pools_result.stdout) if pools_result.rc == 0 and pools_result.stdout.strip() else []
     pools_record = _record(" ".join(node_pools_argv), pools_result)
-    has_nap = any((p.get("autoscaling") or {}).get("enabled") and len(p.get("locations") or []) > 1 for p in node_pools)
+    has_nap = bool(cluster.get("has_nap"))
     # ComputeClass-managed pools carry the class name as this label, not as
     # their own pool name -- matching against pool names would test the
     # wrong field and never actually find the reference.
@@ -412,9 +458,24 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         cc_ref = ((sts.get("spec", {}).get("template", {}).get("spec", {}) or {}).get("nodeSelector") or {}).get("cloud.google.com/compute-class")
         if not cc_ref:
             continue
-        cc_referenced_by_stateful.add(cc_ref)
+        # §3.5 flags "a stateful workload *using PersistentVolumes*" -- a
+        # StatefulSet with no `volumeClaimTemplates` has nothing that can
+        # deadlock on a machine-family mismatch, so it does not count here
+        # even though it references the ComputeClass.
+        if sts.get("spec", {}).get("volumeClaimTemplates"):
+            cc_referenced_by_stateful.add(cc_ref)
         if (sts["metadata"].get("namespace", ""), sts["metadata"]["name"]) in stateful_names_using_hyperdisk:
             cc_referenced_by_hyperdisk.add(cc_ref)
+
+    from collect import _is_ai_workload  # ai-security-audit's own inference-workload discriminator, per §3.2
+
+    cc_referenced_by_inference = set()
+    for workload in workloads:
+        spec = workload.get("spec") or {}
+        template_spec = ((spec.get("template") or {}).get("spec")) or spec
+        cc_ref = (template_spec.get("nodeSelector") or {}).get("cloud.google.com/compute-class")
+        if cc_ref and _is_ai_workload(template_spec):
+            cc_referenced_by_inference.add(cc_ref)
 
     if compute_classes:
         for cc_slug in ("ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation"):
@@ -423,7 +484,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             for hit in [check_ccc_missing_fallbacks(cc)]:
                 if hit:
                     candidates.append(_emit("ccc-missing-fallbacks", hit))
-            for hit in [check_ccc_no_ondemand_floor(cc)]:
+            for hit in [check_ccc_no_ondemand_floor(cc, cc["metadata"]["name"] in cc_referenced_by_inference)]:
                 if hit:
                     candidates.append(_emit("ccc-no-ondemand-floor", hit))
             candidates += [_emit("ccc-large-vm-scarcity", hit) for hit in check_ccc_large_vm_scarcity(cc)]
@@ -460,7 +521,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     if not cluster.get("autopilot") and node_pools:
         commands["single-zone-nodepool"] = pools_record
         for pool in node_pools:
-            for hit in [check_single_zone_nodepool(pool, has_nap)]:
+            live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
+            for hit in [check_single_zone_nodepool(pool, has_nap, live_count)]:
                 if hit:
                     candidates.append(_emit("single-zone-nodepool", hit))
 

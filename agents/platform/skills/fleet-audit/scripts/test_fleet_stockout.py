@@ -51,6 +51,27 @@ def storage_class(name, provisioner="pd.csi.storage.gke.io", params=None):
     return {"kind": "StorageClass", "metadata": {"name": name}, "provisioner": provisioner, "parameters": params or {}}
 
 
+def node(name, pool):
+    return {"kind": "Node", "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": pool}}}
+
+
+class EnumerateClustersTest(unittest.TestCase):
+    def test_reads_cluster_level_node_auto_provisioning(self):
+        clusters_json = json.dumps(
+            [
+                {"name": "c1", "location": "us-central1-a", "status": "RUNNING", "autoscaling": {"enableNodeAutoprovisioning": True}},
+                {"name": "c2", "location": "us-central1-a", "status": "RUNNING"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            return run_of(0, clusters_json)
+
+        clusters = fs.enumerate_clusters("acme", run=run)
+        self.assertTrue(next(c for c in clusters if c["name"] == "c1")["has_nap"])
+        self.assertFalse(next(c for c in clusters if c["name"] == "c2")["has_nap"])
+
+
 class RegionOfTest(unittest.TestCase):
     def test_zonal_location(self):
         self.assertEqual(fs.region_of("us-central1-a"), "us-central1")
@@ -93,15 +114,26 @@ class CccMissingFallbacksTest(unittest.TestCase):
 class CccNoOndemandFloorTest(unittest.TestCase):
     def test_flags_all_spot(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}, {"machineFamily": "n4", "spot": True}])
-        self.assertIsNotNone(fs.check_ccc_no_ondemand_floor(cc))
+        self.assertIsNotNone(fs.check_ccc_no_ondemand_floor(cc, False))
 
     def test_does_not_flag_with_ondemand_floor(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}, {"machineFamily": "n4", "spot": False}])
-        self.assertIsNone(fs.check_ccc_no_ondemand_floor(cc))
+        self.assertIsNone(fs.check_ccc_no_ondemand_floor(cc, False))
 
     def test_recognizes_provisioning_model_spelling(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "provisioningModel": "SPOT"}])
-        self.assertIsNotNone(fs.check_ccc_no_ondemand_floor(cc))
+        self.assertIsNotNone(fs.check_ccc_no_ondemand_floor(cc, False))
+
+    def test_default_severity_is_major(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        self.assertEqual(fs.SEVERITY["ccc-no-ondemand-floor"], "major")
+        hit = fs.check_ccc_no_ondemand_floor(cc, False)
+        self.assertNotIn("severity", hit)
+
+    def test_escalates_to_critical_when_referenced_by_inference_workload(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        hit = fs.check_ccc_no_ondemand_floor(cc, True)
+        self.assertEqual(hit["severity"], "critical")
 
 
 class CccLargeVmScarcityTest(unittest.TestCase):
@@ -140,6 +172,13 @@ class CccMixedDiskGenerationsTest(unittest.TestCase):
 
     def test_does_not_flag_pure_gen2(self):
         cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c2"}])
+        self.assertIsNone(fs.check_ccc_mixed_disk_generations(cc, stateful_referencing=True))
+
+    def test_c3d_is_not_in_the_gen4_hyperdisk_list(self):
+        """§3.5's own Gen4/Hyperdisk-compatible list is `c4, n4, c3` --
+        `c3d` is not on it, even though a different check's (§3.6) list
+        does include it."""
+        cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c3d"}])
         self.assertIsNone(fs.check_ccc_mixed_disk_generations(cc, stateful_referencing=True))
 
 
@@ -208,26 +247,33 @@ class DanglingComputeClassTest(unittest.TestCase):
 
 class SingleZoneNodepoolTest(unittest.TestCase):
     def test_flags_single_zone_autoscaling_no_nap(self):
-        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 1}
-        self.assertIsNotNone(fs.check_single_zone_nodepool(pool, has_nap=False))
+        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        self.assertIsNotNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1))
 
     def test_does_not_flag_multi_zone(self):
-        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 1}
-        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False))
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1))
 
     def test_does_not_flag_single_zone_with_nap(self):
-        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 1}
-        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True))
+        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=1))
 
     def test_flags_near_max_node_count(self):
-        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 9}
-        hit = fs.check_single_zone_nodepool(pool, has_nap=True)
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9)
         self.assertIsNotNone(hit)
         self.assertIn("90%", hit["excerpt"])
 
     def test_does_not_flag_comfortably_under_ceiling(self):
-        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 3}
-        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True))
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=3))
+
+    def test_ignores_stale_initial_node_count_field(self):
+        """A pool created with 9 nodes that the autoscaler has since scaled
+        down to 1 live node must not be flagged on its stale creation-time
+        field."""
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 9}
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=1))
 
 
 class ReservationTest(unittest.TestCase):
@@ -286,7 +332,7 @@ class QuotaTest(unittest.TestCase):
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def run_with(self, dump_items=(), pools=()):
+    def run_with(self, dump_items=(), pools=(), cluster=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
                 return run_of(0)
@@ -298,7 +344,7 @@ class CollectClusterTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
-                return fs.collect_cluster(self.CLUSTER, run=run)
+                return fs.collect_cluster(cluster or self.CLUSTER, run=run)
 
     def test_clean_cluster_collects_with_no_candidates(self):
         cc = compute_class("cc1", [{"machineFamily": "n4", "spot": False}, {"machineFamily": "c3", "spot": True}])
@@ -341,6 +387,25 @@ class CollectClusterTest(unittest.TestCase):
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("single-zone-nodepool", slugs)
 
+    def test_near_max_node_count_uses_live_nodes_not_the_stale_initial_field(self):
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 9}
+        live_nodes = [node(f"n{i}", "p1") for i in range(2)]  # scaled down since creation
+        entry = self.run_with(dump_items=live_nodes, pools=[pool])
+        slugs = {c["check"] for c in entry["candidates"]}
+        self.assertNotIn("single-zone-nodepool", slugs)
+
+    def test_near_max_node_count_flagged_from_live_nodes(self):
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        live_nodes = [node(f"n{i}", "p1") for i in range(9)]
+        entry = self.run_with(dump_items=live_nodes, pools=[pool])
+        slugs = {c["check"] for c in entry["candidates"]}
+        self.assertIn("single-zone-nodepool", slugs)
+
+    def test_cluster_level_nap_suppresses_the_finding(self):
+        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        entry = self.run_with(pools=[pool], cluster={**self.CLUSTER, "has_nap": True})
+        self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
+
     def test_autopilot_skips_single_zone_nodepool(self):
         cluster = {**self.CLUSTER, "autopilot": True}
         pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 1}
@@ -367,10 +432,17 @@ class CollectClusterTest(unittest.TestCase):
 
     def test_mixed_disk_generation_on_stateful_reported(self):
         cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
-        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"})
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"}, storage_class_name="standard-rwo")
         entry = self.run_with(dump_items=[cc, sts])
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("ccc-mixed-disk-generations", slugs)
+
+    def test_mixed_disk_generation_not_flagged_without_persistent_volumes(self):
+        cc = compute_class("cc1", [{"machineFamily": "n2"}, {"machineFamily": "c4"}])
+        sts = statefulset("db", node_selector={"cloud.google.com/compute-class": "cc1"})  # no volumeClaimTemplates
+        entry = self.run_with(dump_items=[cc, sts])
+        slugs = {c["check"] for c in entry["candidates"]}
+        self.assertNotIn("ccc-mixed-disk-generations", slugs)
 
     def test_hyperdisk_incompatible_reported(self):
         sc = storage_class("hd", params={"type": "hyperdisk-balanced"})
@@ -379,6 +451,21 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[sc, cc, sts])
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("ccc-hyperdisk-incompatible", slugs)
+
+    def test_no_ondemand_floor_escalates_for_a_referencing_inference_workload(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        gpu_container = {"name": "app", "resources": {"limits": {"nvidia.com/gpu": "1"}}}
+        d = deployment("infer", node_selector={"cloud.google.com/compute-class": "cc1"}, containers=[gpu_container])
+        entry = self.run_with(dump_items=[cc, d])
+        hit = next(c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor")
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_no_ondemand_floor_stays_major_for_a_non_inference_referencing_workload(self):
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        d = deployment("web", node_selector={"cloud.google.com/compute-class": "cc1"})
+        entry = self.run_with(dump_items=[cc, d])
+        hit = next(c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor")
+        self.assertEqual(hit["severity"], "major")
 
     def test_reservation_affinity_reported(self):
         cc = compute_class("cc1", [{"machineFamily": "n4", "reservations": {"affinity": "Automatic"}}])
