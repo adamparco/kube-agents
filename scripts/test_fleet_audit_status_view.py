@@ -133,6 +133,13 @@ class TestRender(unittest.TestCase):
         self.assertIn("3m34s", out)
         self.assertIn("#12", out)
 
+    def test_collect_s_renders_in_its_own_column(self):
+        out = view.render(
+            {"compliance-audit": {"last": row(collect_s=95.0)}}, self.ROSTER, NOW, "jobs.json"
+        )
+        self.assertIn("COLLECT", out)
+        self.assertIn("1m35s", out)
+
     def test_a_rostered_stream_with_no_rows_reads_never_ran(self):
         out = view.render({}, self.ROSTER, NOW, "jobs.json")
         self.assertIn("never ran", out)

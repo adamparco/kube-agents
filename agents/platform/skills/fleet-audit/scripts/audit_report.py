@@ -980,7 +980,7 @@ def write_phase_start(audit_id: str, t0: datetime) -> None:
     """Best-effort: a phase file that cannot be written costs a metric, not a run."""
     try:
         Path(phase_path_for(audit_id)).write_text(
-            json.dumps({"audit": audit_id, "t0": t0.isoformat()}), encoding="utf-8"
+            json.dumps({"audit": audit_id, "t0": t0.isoformat(), "pid": os.getpid()}), encoding="utf-8"
         )
     except OSError as exc:
         log(f"WARNING: could not write {phase_path_for(audit_id)}: {exc}")
@@ -1008,6 +1008,25 @@ def inspect_seconds(audit_id: str, now: datetime) -> float | None:
     if t0 is None:
         return None
     seconds = (now - t0).total_seconds()
+    return round(seconds, 1) if seconds >= 0 else None
+
+
+def collector_seconds(manifest: dict | None) -> float | None:
+    """The collector's own wall-clock, from a `collect.py`-shaped manifest's
+    top-level `started_at`/`finished_at` -- the "collector's totals" §4.4
+    promises alongside `inspect_s`/`publish_s`. `None` without a manifest or
+    with an unparseable timestamp: timing is telemetry, so a malformed
+    manifest degrades this to absent rather than raising, the same rule
+    `inspect_seconds` follows for a missing or garbage phase file.
+    """
+    if not manifest:
+        return None
+    try:
+        started = datetime.fromisoformat(str(manifest.get("started_at", "")).replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(str(manifest.get("finished_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    seconds = (finished - started).total_seconds()
     return round(seconds, 1) if seconds >= 0 else None
 
 
@@ -1078,6 +1097,7 @@ def _status_row(payload: dict, data: dict, findings: list, now: datetime) -> dic
         "issue_url": payload.get("issue_url"),
         "inspect_s": payload.get("inspect_s"),
         "publish_s": payload.get("publish_s"),
+        "collect_s": payload.get("collect_s"),
         "clusters": len(scope.get("clusters") or []),
         "skipped": len(scope.get("skipped") or []),
         "coverage_gaps": len(gaps),
@@ -5845,6 +5865,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
+    manifest = None
     if getattr(args, "manifest_file", None):
         manifest_path = Path(args.manifest_file)
         if not manifest_path.is_file():
@@ -5859,9 +5880,12 @@ def handle_finish(args: argparse.Namespace) -> None:
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
     # Timing: `inspect_s` is t0 → here (the LLM-inclusive inspection phase),
-    # `publish_s` is here → the exit payload. Both ride the payload as
-    # telemetry; neither can fail the run (see phase_path_for).
+    # `publish_s` is here → the exit payload, and `collect_s` — present only
+    # when a manifest was given — is the collector's own wall-clock. All
+    # three ride the payload as telemetry; none can fail the run (see
+    # phase_path_for).
     inspect_s = inspect_seconds(audit_id, now)
+    collect_s = collector_seconds(manifest)
     entry_mono = time.monotonic()
 
     if args.dry_run:
@@ -6046,6 +6070,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             "coverage_gaps": gaps,
             "inspect_s": inspect_s,
             "publish_s": round(time.monotonic() - entry_mono, 1),
+            "collect_s": collect_s,
         }
         status_record_run(audit_id, _status_row(payload, data, findings, now))
         print(json.dumps(payload))
@@ -6327,6 +6352,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "coverage_gaps": gaps,
                 "inspect_s": inspect_s,
                 "publish_s": round(time.monotonic() - entry_mono, 1),
+                "collect_s": collect_s,
     }
     status_record_run(audit_id, _status_row(payload, data, findings, now))
     print(json.dumps(payload))

@@ -2465,7 +2465,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
         self.assertEqual(
-            self.stdout_json_sans_timing("inspect_s", "publish_s"),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "OPENED",
                 "issue_url": "https://github.com/acme/fleet/issues/7",
@@ -2523,7 +2523,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
 
         self.assertEqual(
-            self.stdout_json_sans_timing("inspect_s", "publish_s"),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "UPDATED",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -2750,7 +2750,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("branch", "-D"))
 
         self.assertEqual(
-            self.stdout_json_sans_timing("inspect_s", "publish_s"),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "CLEAN",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -2781,7 +2781,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("issue", "close"))
         self.assertFalse(self.harness.gh_calls("issue", "comment"))
         self.assertEqual(
-            self.stdout_json_sans_timing("inspect_s", "publish_s"),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "CLEAN",
                 "issue_url": None,
@@ -4785,6 +4785,12 @@ class TestTiming(HarnessTestCase):
         self.assertIsNotNone(t0)
         self.assertIsNotNone(t0.tzinfo)
 
+    def test_phase_file_records_the_writing_process_pid(self):
+        self.scratch()
+        audit_report.write_phase_start(AUDIT, datetime.now(timezone.utc))
+        raw = json.loads(Path(audit_report.phase_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(raw["pid"], os.getpid())
+
     def test_finish_measures_inspect_s_from_start_s_t0(self):
         self.scratch()
         audit_report.write_phase_start(
@@ -4818,6 +4824,16 @@ class TestTiming(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_collector_seconds_from_a_manifests_endpoints(self):
+        manifest = {"started_at": "2026-08-26T06:00:00Z", "finished_at": "2026-08-26T06:03:30Z"}
+        self.assertEqual(audit_report.collector_seconds(manifest), 210.0)
+
+    def test_collector_seconds_is_none_without_a_manifest(self):
+        self.assertIsNone(audit_report.collector_seconds(None))
+
+    def test_collector_seconds_degrades_on_a_garbage_timestamp(self):
+        self.assertIsNone(audit_report.collector_seconds({"started_at": "not-a-time", "finished_at": "also-not"}))
 
     def test_an_unwritable_scratch_dir_does_not_fail_start(self):
         # SCRATCH_DIR is left uncreated and makedirs is a no-op, so the phase
@@ -5019,6 +5035,25 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         rc = self.run_finish(make_doc(findings=[]))
         self.assertEqual(rc, 0)
+
+    def test_a_passing_manifest_surfaces_collect_s_in_the_exit_payload(self):
+        self.harness.replies = {"issue list": "[]"}
+        manifest = {
+            "clusters": [
+                {"name": "prod-us-east", "outcome": "collected",
+                 "commands": [{"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)]},
+            ],
+            "started_at": "2026-08-26T06:00:00Z",
+            "finished_at": "2026-08-26T06:03:30Z",
+        }
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.stdout_json()["collect_s"], 210.0)
+
+    def test_no_manifest_flag_means_collect_s_is_none(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["collect_s"])
 
 
 class TestSyncOpenRemediationLabels(HarnessTestCase):

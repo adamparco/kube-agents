@@ -170,7 +170,7 @@ def render(streams: dict, roster: dict, now: datetime, roster_path: str) -> str:
     ids = sorted(set(roster) | set(streams))
     header = [
         "STREAM", "ENABLED", "SCHEDULE", "LAST RUN (local)", "STATUS",
-        "FINDINGS", "Δ", "PRS", "INSPECT", "PUBLISH", "ISSUE", "FLAGS",
+        "FINDINGS", "Δ", "PRS", "COLLECT", "INSPECT", "PUBLISH", "ISSUE", "FLAGS",
     ]
     rows = [header]
     gaps: list[str] = []
@@ -206,6 +206,7 @@ def render(streams: dict, roster: dict, now: datetime, roster_path: str) -> str:
             findings_cell,
             delta,
             str(last.get("prs_opened", "—")),
+            duration(last.get("collect_s")),
             duration(last.get("inspect_s")),
             duration(last.get("publish_s")),
             issue_ref(last.get("issue_url")),
