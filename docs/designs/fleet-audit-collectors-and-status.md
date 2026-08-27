@@ -1,10 +1,14 @@
 # Fleet Audit — Procedural Collection, Native Timing, and the Status Surface
 
-> **STATUS — draft; not yet implemented.** Nothing described here ships yet. The behaviour that
-> ships today is [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md), the design of
-> record for the reporting half; this document redesigns the half it deliberately did not
-> touch — how the checks get _run_ — and amends its reporting contract in exactly one place,
-> named in **Builds on** below.
+> **STATUS — implemented.** All five phases in §10's work breakdown have shipped: every stream now
+> runs through a procedural collector (or names, in its own module docstring, exactly which of its
+> checks it does not cover and why), native timing rides `finish`'s exit JSON and the status
+> ConfigMap, and `make fleet-audit-view` renders it. Two pieces are deliberately not done, each
+> with its reasoning recorded where it applies rather than here: `stockout-prevention`'s two
+> beta-API/internal-log-schema checks stay prose-only (§10 phase 4), and §4.7's `AuditSpec`
+> consolidation is deferred (§10 phase 5). [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md)
+> remains the design of record for the reporting half — the ledger, delta, and promotion
+> contracts — which this document amends in exactly one place, named in **Builds on** below.
 
 **Scope:** How the eight audit streams execute their checks, how long a run takes and where the
 time goes, how an operator sees any of it without reading eight GitHub issues, and what it costs
@@ -41,11 +45,12 @@ and the agent executes them one shell call at a time.
 
 The corroboration is already in the repository. `agents/platform/config.yaml:154-168` records
 three runs dying at `Iteration budget exhausted (90/90)` — fixed by raising `max_turns` to 250,
-i.e. the ceiling moved and the consumption did not. And the harness measures nothing:
-`audit_report.py` (6,202 lines) uses `time` once, for a stderr log-line prefix. The `finish`
-payload carries no timestamp, no duration, and no phase split. When a run dies at the iteration
-ceiling it is reported as `timed_out` even though no clock ran out, because no component knows
-how long anything took.
+i.e. the ceiling moved and the consumption did not. And, as of `c0eff3d8`, the harness measured
+nothing: `audit_report.py` (6,202 lines) used `time` once, for a stderr log-line prefix; the
+`finish` payload carried no timestamp, no duration, and no phase split; a run that died at the
+iteration ceiling was reported as `timed_out` even though no clock ran out, because no component
+knew how long anything took. §4.4/§10 phase 1 closed this: `finish` now emits `inspect_s`,
+`publish_s`, and — when a manifest is present — `collect_s`.
 
 Three further costs ride on the same architecture:
 
@@ -82,11 +87,12 @@ Three statements the rest of the design follows from:
    the SOP. 18 need judgment only to apply a contextual "Do NOT flag" exception _after_ a
    mechanical candidate scan (org-email admin groups, ingress data-plane DaemonSets, free-text
    DR annotations, "latency-sensitive" qualifiers). Zero checks need judgment to detect.
-3. **Nobody can see a run.** Per-run wall-clock exists only in the on-PVC cron executions ledger
-   (`executions.db`: `claimed_at`/`started_at`/`finished_at`, plus the skip vocabulary), which is
-   invisible off-pod. The ledger issues carry findings, not run health. §14 of the design of
-   record accepted "a dead cron is indistinguishable from a healthy fleet" — an operator today
-   discovers a dead stream by noticing an absence.
+3. **Nobody can see a run.** As of `c0eff3d8`, per-run wall-clock existed only in the on-PVC cron
+   executions ledger (`executions.db`: `claimed_at`/`started_at`/`finished_at`, plus the skip
+   vocabulary), which was invisible off-pod; the ledger issues carry findings, not run health.
+   §14 of the design of record accepted "a dead cron is indistinguishable from a healthy fleet" —
+   an operator discovered a dead stream by noticing an absence. §4.5/§10 phase 2 closed this: the
+   status ConfigMap and `make fleet-audit-view` now answer exactly this gap.
 
 ## 3. Target model
 
@@ -525,13 +531,26 @@ cross-check activates per stream as collectors ship.
 Per converted stream: §"Checks" keeps each `####` heading (the roster contract and the
 terminology tests hang off them) but each check body shrinks to semantics — flag condition,
 exception classes, severity rationale, remediation guidance — with the command/filter text
-moving to the check table. A new short §"Collection" says: run the collector, read the
-candidate list, triage what is flagged, and the four things that remain the agent's to verify
-(scope reconciliation statement, limitations prose, evidence confirm reads, the findings
-document). The cron prompts drop line-count geography for converted streams and instead direct
-the agent to the collector first. `checks_not_applicable` mechanics are unchanged, but the
-collector detects the structural cases itself (Autopilot ⇒ the four node-facing compliance
-checks) and pre-fills them with the SOP's canonical reasons.
+moving to the collector's own per-stream check table in `collect.py` (or its standalone
+script). The instruction to run the collector first, read the candidate list, and triage what
+is flagged lands as a leading bolded sentence inside the existing "Checks" section for most
+streams; `obtainability-audit` is the one exception, with its own new numbered step ("§2. Run
+the collector") ahead of "Checks" instead. No stream actually grew a section titled literally
+"Collection" — that name did not survive contact with the eight SOPs' existing structure.
+`checks_not_applicable` mechanics are unchanged, but the collector detects the structural cases
+itself (Autopilot ⇒ the four node-facing compliance checks) and pre-fills them with the SOP's
+canonical reasons.
+
+The cron prompts keep the line-count-geography citation style for every stream, converted or
+not, rather than dropping it for the eight in favor of directing the agent to the collector
+first as originally planned here. That citation is a tested safety net —
+`test_cron_prompts_cite_the_real_sop_geography` re-derives both numbers from the SOP file on
+every run, specifically so a read that stops early cannot report a clean fleet it never looked
+at — and it is uniform across all eight prompts today. Dropping it for only the converted
+streams would have meant carving an exemption into that shared test for a subset of streams,
+a larger and riskier change than a design-accuracy pass justifies; the geography citations for
+every converted SOP are instead kept numerically correct as each SOP shrinks. Revisit this if a
+stream-specific prompt style is deliberately proposed.
 
 ## 8. Red lines
 
@@ -591,14 +610,14 @@ with redaction as backstop. New ones:
 
 Each phase is one PR, independently valuable, in this order:
 
-1. **Instrumentation** — t0 phase file, `finish`/`remediate` duration keys, payload-pin
+1. **Done. Instrumentation** — t0 phase file, `finish`/`remediate` duration keys, payload-pin
    updates, `ensure_labels` list-then-create. No behaviour change to any audit. Turns §5's
    projections into measurements.
-2. **Status ConfigMap + view** — chart object plus Role/RoleBinding on the pod's KSA, the
+2. **Done. Status ConfigMap + view** — chart object plus Role/RoleBinding on the pod's KSA, the
    sidecar's internal endpoint (`credential_proxy.py`, no `command_policy.py` or operator
    change), the harness writer, `scripts/fleet_audit_status_view.py`, `make fleet-audit-view`.
    Depends on 1 for durations; ships without collectors (rows carry today's runs).
-3. **Collector framework, proved against both pilot streams' full rosters.** The driver
+3. **Done. Collector framework, proved against both pilot streams' full rosters.** The driver
    (`collect.py`: fleet enumeration, per-cluster credential fetch, the fail-closed dump gate,
    cross-cluster parallelism, manifest emission) plus every check of `obtainability-audit`
    (eleven — label-selector matching for PDBs/HPAs/Services, cross-object resolution, a
@@ -626,8 +645,13 @@ Each phase is one PR, independently valuable, in this order:
    own project-scoped collector script (`networking_audit.py`) rather than folded into
    `collect.py`, whose target model is GKE clusters reached through a kubeconfig; and
    `ai-security-audit`, folded into `collect.py` alongside the two pilots since its target
-   model — and its two-dump collection shape — is the same one obtainability and compliance
-   already use; `security-patch-orchestrator`, its own script (`patch_readiness.py`) since
+   model is the same — GKE clusters reached through a kubeconfig — even though its concrete
+   collection shape is its own: a workload dump plus a Service dump, the second backing exactly
+   one check (`inference-endpoint-public`) that joins it against the first, genuinely different
+   from both obtainability's single dump and compliance's five distinct reads. The dispatcher
+   phase 3 built already generalizes over a per-stream context builder for exactly this reason,
+   so a third distinct shape needed no new script, only a new context builder;
+   `security-patch-orchestrator`, its own script (`patch_readiness.py`) since
    it reads only GKE control-plane/node-pool metadata through `gcloud container` and needs no
    kubeconfig at all — one `clusters list` call per project plus one `get-server-config` call
    per distinct location backs every one of its ten checks, where the SOP's own per-check
@@ -679,15 +703,15 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
 
 ## 11. Files touched
 
-| Area      | Files                                                                                                                                                                                                                          |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Harness   | `agents/platform/skills/fleet-audit/scripts/audit_report.py` (t0, duration keys, manifest cross-check, status writer, label caching), `test_audit_report.py`                                                                   |
-| Collector | `agents/platform/skills/fleet-audit/scripts/collect.py` + per-stream check tables (new), tests (new)                                                                                                                           |
-| SOPs      | all eight in `agents/platform/governance/` (shrink per §7), `agents/platform/cron/jobs.json` (prompts)                                                                                                                         |
-| Proxy     | `agents/platform/scripts/credential_proxy.py` — one new internal route (`_handle_fleet_audit_status`) and its tests; `command_policy.py` untouched                                                                             |
-| Chart     | `charts/kube-agents/templates/fleet-audit-status.yaml` (new): status ConfigMap + Role/RoleBinding on the pod's existing KSA — no new values, no operator change                                                                |
-| View      | `scripts/fleet_audit_status_view.py` (new), `Makefile`, tests (new)                                                                                                                                                            |
-| Docs      | this file's row in `docs/README.md`; `fleet-audit-issue-ledger.md` §6 exit-contract sentence; SKILL.md payload/field-count text; the stale stream-count pages named in §10 phase 5; generated regions via `make docs-generate` |
+| Area      | Files                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Harness   | `agents/platform/skills/fleet-audit/scripts/audit_report.py` (t0, duration keys, manifest cross-check, status writer, label caching), `test_audit_report.py`                                                                                                                                                                                                                             |
+| Collector | `agents/platform/skills/fleet-audit/scripts/collect.py` (obtainability, compliance, ai-security check tables), `patch_readiness.py`, `fleet_waste.py`, `fleet_drift.py`, `fleet_stockout.py` (all new), `agents/platform/skills/gcp-networking-fabric-audit/scripts/networking_audit.py` (extended from a PSC-only helper to the stream's full roster), tests for all of the above (new) |
+| SOPs      | all eight in `agents/platform/governance/` (shrink per §7), `agents/platform/cron/jobs.json` (prompts)                                                                                                                                                                                                                                                                                   |
+| Proxy     | `agents/platform/scripts/credential_proxy.py` — one new internal route (`_handle_fleet_audit_status`) and its tests; `command_policy.py` untouched                                                                                                                                                                                                                                       |
+| Chart     | `charts/kube-agents/templates/fleet-audit-status.yaml` (new): status ConfigMap + Role/RoleBinding on the pod's existing KSA — no new values, no operator change                                                                                                                                                                                                                          |
+| View      | `scripts/fleet_audit_status_view.py` (new), `Makefile`, tests (new)                                                                                                                                                                                                                                                                                                                      |
+| Docs      | this file's row in `docs/README.md`; `fleet-audit-issue-ledger.md` §6 exit-contract sentence; SKILL.md payload/field-count text; the stale stream-count pages named in §10 phase 5; generated regions via `make docs-generate`                                                                                                                                                           |
 
 ## 12. Questions, resolved
 
