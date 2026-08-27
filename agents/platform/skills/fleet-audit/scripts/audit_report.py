@@ -4813,6 +4813,17 @@ def _write_temp(text: str, suffix: str = ".md") -> str:
     )
     with handle:
         handle.write(text)
+    # NamedTemporaryFile always creates the file mode 0600, ignoring umask --
+    # a Python security default, not a mistake here. But `gh` for this project
+    # runs in a separate sidecar container that reads this same PVC path under
+    # a different uid, so a 0600 file this process can read is one the sidecar
+    # is refused: every issue/PR create, edit, and comment fails with
+    # "permission denied" despite the path resolving correctly on both sides.
+    # Widen to a shared-readable mode so the sidecar's uid can open it too.
+    try:
+        os.chmod(handle.name, 0o644)
+    except OSError:
+        pass
     return handle.name
 
 
