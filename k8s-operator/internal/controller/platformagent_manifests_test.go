@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -482,8 +483,8 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("dashboard readiness probe must not use curl --fail: any HTTP response proves the listener is up, got %q", cmd)
 			}
 		}
-		if len(dashboardC.Env) != 6 {
-			t.Errorf("expected 6 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 7 {
+			t.Errorf("expected 7 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -2971,6 +2972,58 @@ func TestDashboardLoadsTheSameConfigAsTheGateway(t *testing.T) {
 	}
 }
 
+// TestHermesHomeModeGrantsTheCredentialProxyGroupAccess pins the mode Hermes re-applies to
+// $HERMES_HOME on every process start. Without HERMES_HOME_MODE it defaults to 0700, and
+// a cron or kanban worker runs with $HERMES_HOME set to profiles/platform — the directory
+// the credential proxy writes a kubeconfig into for `gcloud container clusters
+// get-credentials`. The proxy is uid 10001 and the agent is 10000, so 0700 denies it and
+// the mkdir fails with EACCES on every proxied command the worker makes.
+//
+// The assertion is on the permission bits rather than the literal string: what the proxy
+// needs is group write (mkdir on the parent) plus group execute (traverse), and a future
+// mode that keeps the string plausible while dropping either would reintroduce the bug.
+// Group read is asserted too — the proxy stats what it filed.
+func TestHermesHomeModeGrantsTheCredentialProxyGroupAccess(t *testing.T) {
+	dep := buildDeployment(haAgent("mode-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	raw, found := envValue(gateway, "HERMES_HOME_MODE")
+	if !found {
+		t.Fatalf("no HERMES_HOME_MODE on the gateway; hermes falls back to 0700 and every proxied " +
+			"command from a cron or kanban worker fails with EACCES")
+	}
+	mode, err := strconv.ParseInt(raw, 8, 32)
+	if err != nil {
+		t.Fatalf("HERMES_HOME_MODE = %q, which hermes parses as octal and this does not: %v", raw, err)
+	}
+	for _, bit := range []struct {
+		mask int64
+		what string
+		why  string
+	}{
+		{0o070, "group rwx", "the credential proxy (uid 10001, gid 10000) must traverse into " +
+			"$HERMES_HOME and mkdir .kubeconfigs/ and workspace/ inside it"},
+		{0o700, "owner rwx", "the agent itself owns these directories and must keep full access"},
+	} {
+		if mode&bit.mask != bit.mask {
+			t.Errorf("HERMES_HOME_MODE = %q lacks %s (%04o & %03o = %03o); %s",
+				raw, bit.what, mode, bit.mask, mode&bit.mask, bit.why)
+		}
+	}
+	if mode&0o007 != 0 {
+		t.Errorf("HERMES_HOME_MODE = %q grants `other` %03o, but no uid on this volume reaches it "+
+			"— both containers that mount the PVC are in gid 10000", raw, mode&0o007)
+	}
+
+	// The dashboard runs hermes against the same directories. A different mode there means
+	// the two containers re-chmod the PVC out from under each other on every start.
+	dash := containerNamed(t, dep, "platform-agent-dashboard")
+	if dashMode, ok := envValue(dash, "HERMES_HOME_MODE"); !ok || dashMode != raw {
+		t.Errorf("HERMES_HOME_MODE = %q on the dashboard but %q on the gateway (found=%v); both run "+
+			"hermes against the same PVC, so they must agree", dashMode, raw, ok)
+	}
+}
+
 func TestRWOStoragePerReplica(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3413,6 +3466,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
+				{Name: "HERMES_HOME_MODE", Value: "0777"},
 			},
 		},
 	}
@@ -3455,6 +3509,14 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	if env["HERMES_MANAGED_DIR"] != managedScopeDir {
 		t.Errorf("plugin must not be able to override HERMES_MANAGED_DIR, got %q",
 			env["HERMES_MANAGED_DIR"])
+	}
+	// HERMES_HOME_MODE is operator-owned by the same means. An arbitrary value reaches
+	// every directory hermes secures on the shared PVC — 0777 would open the agent's
+	// sessions, memories and logs to anything else that mounts it — and nothing about the
+	// widened tree surfaces as an unhealthy pod.
+	if env["HERMES_HOME_MODE"] != hermesHomeMode {
+		t.Errorf("plugin must not be able to override HERMES_HOME_MODE, got %q",
+			env["HERMES_HOME_MODE"])
 	}
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])
