@@ -68,6 +68,11 @@ gcloud container clusters list --format=json
   export KC="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml"
   KUBECONFIG=$KC gcloud container clusters get-credentials <cluster> --location=<location> --project=<project>
   ```
+- **Manual fallback only** — a cluster the collector marks `"unreachable"` or `"gate-failed"` still needs this cluster's workload state dumped once, the same object kinds Step 2's collector reads, so every `$STATE` reference in Step 3 has something to derive from:
+  ```bash
+  export STATE="/opt/data/scratch/state_<cluster>.json"
+  KUBECONFIG=$KC kubectl get deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,services,limitranges -A -o json > "$STATE"
+  ```
 - If **zero** clusters land in `scope.clusters`, do **not** call `finish` — the helper hard-fails on an empty scope. Report the enumeration failure as your one-line summary and stop.
 
 ### 2. Run the collector

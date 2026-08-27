@@ -47,41 +47,48 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 
 #### 2.1 Subnet primary and secondary IP range exhaustion (`subnet-ip-exhaustion`)
 
-- **Severity**: `critical`
-- **Command**: `gcloud compute networks subnets list-usable --project=$PROJECT --format=json`
-- **Condition**: Subnet primary or secondary Pod IP range has < 15% available IP address capacity remaining.
-- **Remediation**: Expand subnet CIDR or allocate additional secondary IP range in Terraform VPC definition.
+- **Command:** `gcloud compute networks subnets list-usable --project=$PROJECT --format=json`
+- **Flag when:** the subnet's primary range, or any entry in `secondaryIpRanges`, carries `ipUtilization > 0.85` — under 15% of that range's addresses remain.
+- **Do NOT flag:** a primary or secondary range at or under 85% utilization.
+- **Severity:** `critical`.
+- **Impact:** "New pods or nodes cannot be scheduled once this range's addresses run out, and GKE has no way to expand a live cluster's Pod CIDR after creation."
+- **Remediation:** `kind: manifest`. Expand the subnet's primary CIDR or allocate an additional secondary IP range in the Terraform VPC definition.
 
 #### 2.2 Cloud NAT gateway port allocation saturation (`cloud-nat-exhaustion`)
 
-- **Severity**: `critical`
-- **Command**: `gcloud compute routers get-nat-mapping-info $ROUTER --region=$REGION --project=$PROJECT --format=json`
-- **Condition**: Cloud NAT mapping indicates allocated ports exceed 80% available port capacity per VM or gateway lacks auto-allocated IP addresses.
-- **Remediation**: Increase `minPortsPerVm` or add additional NAT IP addresses in Cloud Router specification.
+- **Command:** `gcloud compute routers get-nat-mapping-info $ROUTER --region=$REGION --project=$PROJECT --format=json`, corroborated by `routers list` (each NAT's `natIpAllocateOption`/`maxPortsPerVm`) and `routers get-status` (`result.natStatus[].autoAllocatedNatIps`).
+- **Flag when:** a NAT gateway is `AUTO_ONLY` with no auto-allocated external IP at all, or any VM's `interfaceNatMappings[].numTotalNatPorts` is `>= 80%` of that NAT's configured port ceiling (`maxPortsPerVm` when dynamic port allocation is on, `minPortsPerVm` otherwise).
+- **Do NOT flag:** a `MANUAL` NAT IP allocation that still has addresses assigned; a VM under 80% of its port ceiling.
+- **Severity:** `critical`.
+- **Impact:** "VMs that exhaust their NAT port allocation see new outbound connections silently fail, which for a GKE node means pods lose egress with no error at the workload layer."
+- **Remediation:** `kind: manifest`. Increase `minPortsPerVm` (or `maxPortsPerVm` under dynamic allocation) or add additional NAT IP addresses to the Cloud Router specification in Terraform.
 
 #### 2.3 Private Service Connect endpoint routing deadlock (`psc-routing-deadlock`)
 
-- **Severity**: `major`
-- **Command**: `gcloud compute forwarding-rules list --filter="target:ServiceAttachment" --project=$PROJECT --format=json`
-- **Condition**: PSC forwarding rule points to rejected or inactive target service attachment.
-- **Do NOT flag**: Active PSC forwarding rules in ACCEPTED status.
-- **Remediation**: Repair target service attachment reference or update forwarding rule routing in Terraform.
+- **Command:** `gcloud compute forwarding-rules list --filter="target:ServiceAttachment" --project=$PROJECT --format=json`
+- **Flag when:** a forwarding rule targeting a Private Service Connect service attachment carries `pscConnectionStatus: REJECTED` or `pscConnectionStatus: CLOSED`.
+- **Do NOT flag:** a PSC forwarding rule in `ACCEPTED` status; a forwarding rule whose target is not a service attachment at all.
+- **Severity:** `major`.
+- **Impact:** "Traffic aimed at this Private Service Connect endpoint cannot reach its target service; consumers see connection failures with no signal at the VPC layer."
+- **Remediation:** `kind: manual`. Repair the target service attachment reference or update the forwarding rule's routing in Terraform — the correct target is a fact about the producer service this audit cannot read.
 
 #### 2.4 VPC network MTU packet fragmentation mismatch (`mtu-packet-fragmentation`)
 
-- **Severity**: `major`
-- **Command**: `gcloud compute networks list --project=$PROJECT --format=json`
-- **Condition**: VPC network MTU is configured below 1500 (e.g. 1460) while jumbo frame processing is enabled or workloads require 1500 MTU.
-- **Do NOT flag**: Standard VPC networks operating with default 1460 MTU where workloads do not exchange jumbo frames.
-- **Remediation**: Configure VPC MTU to 1500 or adjust workload MSS clamp in network configuration.
+- **Command:** `gcloud compute networks list --project=$PROJECT --format=json`
+- **Flag when:** two networks are joined by an `ACTIVE` VPC peering and their `mtu` values differ. This is a mismatch between two peered networks, never an absolute threshold — a single network's own MTU (1460, 1500, or otherwise) is a choice, not a defect, and packets only fragment where two different choices meet at a peering.
+- **Do NOT flag:** a peering that is not `ACTIVE`; two peered networks whose `mtu` values agree, whatever the shared value is; a network with no peerings at all.
+- **Severity:** `major`.
+- **Impact:** "Packets crossing this peering at the larger MTU get fragmented or dropped, which shows up as intermittent, hard-to-diagnose latency and retransmits rather than a clean failure."
+- **Remediation:** `kind: manual`. Align both networks' MTU to the smaller of the two, or to 1500 if the larger side can be raised — either changes a network's core configuration, which this audit does not have enough context to propose automatically.
 
 #### 2.5 Cloud Armor security policy evaluation anomalies (`cloud-armor-false-positive`)
 
-- **Severity**: `minor`
-- **Command**: `gcloud compute security-policies list --project=$PROJECT --format=json`
-- **Condition**: Production backend service security policy is in preview mode or contains conflicting rule priorities.
-- **Do NOT flag**: Non-production test environments deliberately validating staging rules in preview mode.
-- **Remediation**: Enforce validated Cloud Armor security rules and remove conflicting rule definitions.
+- **Command:** `gcloud compute security-policies list --project=$PROJECT --format=json`, cross-referenced against `gcloud compute backend-services list --project=$PROJECT --format=json` to find which policies protect a production-looking backend.
+- **Flag when:** a security policy attached to at least one production-looking backend service carries a rule in `preview` mode (excluding GCP's implicit default rule at priority `2147483647`), or the policy has two or more rules sharing one `priority`.
+- **Do NOT flag:** a policy attached only to backends whose name contains a non-production token (`test`, `staging`, `stage`, `dev`, `sandbox`, `qa`); the implicit default rule's own priority collision with itself.
+- **Severity:** `minor`.
+- **Impact:** "A preview-mode rule on a production backend logs matches without enforcing them, so the WAF looks like it is protecting traffic it is only observing; conflicting priorities make the effective policy unpredictable."
+- **Remediation:** `kind: manual`. Take the validated rule out of preview mode and resolve the conflicting priorities — which of two colliding rules should win is a policy-intent judgment this audit cannot make.
 
 ### 3. Generate remediation artifacts
 
