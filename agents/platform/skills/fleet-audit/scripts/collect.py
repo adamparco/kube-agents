@@ -735,6 +735,12 @@ def check_host_namespace(workload: dict, context: dict) -> dict | None:
     if not (host_pid or host_ipc or host_net):
         return None
     severity = "critical" if (host_pid or host_ipc) else "major"
+    has_host_port = any(p.get("hostPort") for c in spec.get("containers") or [] for p in c.get("ports") or [])
+    if severity == "major" and workload["kind"] == "DaemonSet" and has_host_port:
+        # §2.2's ingress/gateway data-plane downgrade: hostNetwork is the
+        # only flag set and a hostPort is declared -- record it rather than
+        # suppressing silently.
+        severity = "minor"
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"hostNetwork={host_net} hostPID={host_pid} hostIPC={host_ipc}",
@@ -883,6 +889,10 @@ def check_netpol_missing(context: dict) -> list[dict]:
     for wl in context.get("workloads") or []:
         if wl["kind"] == "Pod":
             pod_count_by_ns[wl["ns"]] = pod_count_by_ns.get(wl["ns"], 0) + 1
+    # §2.6's Do-NOT-flag case: a namespace already covered fleet-wide by a
+    # Dataplane V2 ClusterNetworkPolicy is not a default-allow posture just
+    # because it has no *namespaced* NetworkPolicy of its own.
+    has_cluster_network_policy = bool(context.get("cluster_network_policies"))
 
     for ns_item in context.get("namespaces") or []:
         ns = (ns_item.get("metadata") or {}).get("name", "")
@@ -892,6 +902,8 @@ def check_netpol_missing(context: dict) -> list[dict]:
         if not policies:
             if pod_count_by_ns.get(ns, 0) == 0:
                 continue  # no workloads, no exposure, pure churn
+            if has_cluster_network_policy:
+                continue
             hits.append(
                 {"namespace": ns, "object": f"Namespace/{ns}", "excerpt": "zero NetworkPolicies", "severity": "major"}
             )
@@ -1156,6 +1168,11 @@ AI_CREDENTIAL_ENV_NAME_RE = re.compile(
     r"(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)",
     re.IGNORECASE,
 )
+# §3.5's own named non-secret examples (`HF_TOKEN_PATH`, `OPENAI_API_KEY_FILE`,
+# `MODEL_REGISTRY_KEY_ID`): a name ending in one of these suffixes names a
+# path, a file, or an identifier *about* a credential, never the credential's
+# value itself, no matter what it matches upstream of the suffix.
+AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE = re.compile(r"_(PATH|FILE|ID)$", re.IGNORECASE)
 
 
 def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict | None:
@@ -1163,7 +1180,12 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
     for c in _ai_containers(workload["spec"]):
         for e in c.get("env") or []:
             name = e.get("name") or ""
-            if e.get("value") and e.get("valueFrom") is None and AI_CREDENTIAL_ENV_NAME_RE.search(name):
+            if (
+                e.get("value")
+                and e.get("valueFrom") is None
+                and AI_CREDENTIAL_ENV_NAME_RE.search(name)
+                and not AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE.search(name)
+            ):
                 bad.append(f"{c.get('name', '')}:{name}")
     if not bad:
         return None
@@ -1552,12 +1574,26 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
 _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "cluster-admin-binding": ("rbac",),
     "wildcard-rbac": ("rbac",),
-    "netpol-missing": ("netpol", "namespaces", "workloads"),
+    "netpol-missing": ("netpol", "namespaces", "workloads", "ccnp"),
     "default-sa-automount": ("serviceaccounts", "workloads"),
     "workload-identity-off": ("describe",),
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
 }
+
+# §1's four node-facing checks Autopilot's admission controller rules out
+# structurally, with the SOP's own canonical reasons verbatim. On an
+# Autopilot cluster these must never appear in the manifest's `commands` --
+# an agent that copies `commands` verbatim into `checks_run` (§2's
+# instruction for every other check) and *also* follows §1's instruction to
+# record these four in `checks_not_applicable` would name the same slug in
+# both lists, which the validator rejects.
+_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
+    ("privileged-container", "GKE Autopilot: privileged containers are rejected at admission and cannot exist here."),
+    ("host-namespace", "GKE Autopilot: hostPID/hostIPC/hostNetwork are rejected at admission and cannot exist here."),
+    ("hostpath-mount", "GKE Autopilot: hostPath volumes are rejected at admission and cannot exist here."),
+    ("legacy-metadata", "GKE Autopilot: no user-managed node pools to carry a metadata setting."),
+)
 
 
 def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
@@ -1602,6 +1638,18 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
     commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {' '.join(netpol_argv)}", result)
+
+    # A deliberate exception to "every read above raises": Dataplane V2's
+    # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
+    # -o name`) is not installed on every cluster, so a failure here almost
+    # always means "this cluster has no such CRD," not "this input is
+    # missing." Gating the whole cluster closed on that would fail every
+    # compliance-audit run on a cluster without the CRD -- worse than the
+    # false positive it exists to suppress. Absence reads as zero
+    # ClusterNetworkPolicies, the same posture as before this read existed.
+    ccnp_argv = ["kubectl", "get", "ccnp", "-A", "-o", "json"]
+    ccnp_parsed, ccnp_result = run_and_gate(ccnp_argv, kubeconfig, run=run)
+    context["cluster_network_policies"] = [i for i in (ccnp_parsed or {}).get("items", [])] if ccnp_parsed else []
 
     sa_argv = ["kubectl", "get", "sa", "-A", "--field-selector", "metadata.name=default", "-o", "json"]
     parsed, result = gated(sa_argv)
@@ -1718,12 +1766,24 @@ def collect_cluster(
             for hit in spec.run(collected.context):
                 candidates.append(emit(spec, hit, hit.get("namespace", "")))
 
-    return {
+    not_applicable_slugs: set[str] = set()
+    checks_not_applicable: list[dict] = []
+    if audit_id == "compliance-audit" and cluster.get("autopilot"):
+        applicable = {spec.slug for spec in checks}
+        for slug, reason in _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE:
+            if slug in applicable:
+                not_applicable_slugs.add(slug)
+                checks_not_applicable.append({"check": slug, "reason": reason})
+
+    result = {
         "name": name, "project": project, "location": location,
         "outcome": "collected",
-        "commands": [{"check": spec.slug, **collected.commands[spec.slug]} for spec in checks],
+        "commands": [{"check": spec.slug, **collected.commands[spec.slug]} for spec in checks if spec.slug not in not_applicable_slugs],
         "candidates": candidates,
     }
+    if checks_not_applicable:
+        result["checks_not_applicable"] = checks_not_applicable
+    return result
 
 
 def collect_fleet(

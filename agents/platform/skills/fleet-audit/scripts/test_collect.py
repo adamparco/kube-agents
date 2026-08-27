@@ -1115,6 +1115,26 @@ class TestHostNamespace(unittest.TestCase):
     def test_none_set_is_not_flagged(self):
         self.assertIsNone(collect.check_host_namespace(self.wl(), context_of()))
 
+    def ds(self, host_network, host_port=None):
+        doc = compliance_workload("DaemonSet", "cni-agent")
+        spec = pod_spec_of(doc)
+        spec["hostNetwork"] = host_network
+        if host_port is not None:
+            spec["containers"][0]["ports"] = [{"hostPort": host_port}]
+        return collect.normalize_compliance_workloads(dump_of(doc))[0]
+
+    def test_ingress_daemonset_with_hostnetwork_and_hostport_is_downgraded_to_minor(self):
+        hit = collect.check_host_namespace(self.ds(True, host_port=443), context_of())
+        self.assertEqual(hit["severity"], "minor")
+
+    def test_daemonset_with_hostnetwork_but_no_hostport_stays_major(self):
+        hit = collect.check_host_namespace(self.ds(True), context_of())
+        self.assertEqual(hit["severity"], "major")
+
+    def test_non_daemonset_with_hostnetwork_and_hostport_stays_major(self):
+        hit = collect.check_host_namespace(self.wl(hostNetwork=True), context_of())
+        self.assertEqual(hit["severity"], "major")
+
 
 class TestHostpathMount(unittest.TestCase):
     def wl(self, path, ro, mount_name="hostvol"):
@@ -1269,6 +1289,24 @@ class TestNetpolMissing(unittest.TestCase):
         ctx = context_of(namespaces=[namespace("kube-system")], networkpolicies=[], workloads=[])
         self.assertEqual(collect.check_netpol_missing(ctx), [])
 
+    def test_a_cluster_network_policy_suppresses_zero_policy_namespaces(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+            cluster_network_policies=[{"kind": "ClusterNetworkPolicy", "metadata": {"name": "fleet-wide"}}],
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_no_cluster_network_policy_still_flags_zero_policy_namespaces(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+            cluster_network_policies=[],
+        )
+        self.assertEqual(len(collect.check_netpol_missing(ctx)), 1)
+
 
 class TestDefaultSaAutomount(unittest.TestCase):
     def test_default_sa_with_no_override_is_flagged(self):
@@ -1412,7 +1450,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=()):
+    def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None):
         describe = describe if describe is not None else {}
 
         def run(argv, **kwargs):
@@ -1428,6 +1466,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     return Run(argv, 0, json.dumps(dump_of(*netpol_items)), "", 0.1)
                 if kinds == "sa":
                     return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
+                if kinds == "ccnp" and ccnp_run is not None:
+                    return ccnp_run
             if argv[:3] == ["gcloud", "container", "clusters"]:
                 return Run(argv, 0, json.dumps(describe), "", 0.1)
             if argv[:3] == ["gcloud", "container", "node-pools"]:
@@ -1436,7 +1476,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
-                return collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+                return collect.collect_cluster(cluster or self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
 
     def test_a_clean_cluster_reports_nothing(self):
         result = self.run_with(
@@ -1481,6 +1521,45 @@ class TestComplianceCollectCluster(unittest.TestCase):
                 result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
+
+    def test_a_cluster_network_policy_suppresses_netpol_missing(self):
+        result = self.run_with(
+            workload_items=[compliance_pod("api", ns="payments")],
+            netpol_items=[namespace("payments")],
+            ccnp_run=Run(["x"], 0, json.dumps(dump_of({"kind": "ClusterNetworkPolicy", "metadata": {"name": "fleet-wide"}})), "", 0.1),
+        )
+        self.assertNotIn("netpol-missing", {c["check"] for c in result["candidates"]})
+
+    def test_ccnp_read_failure_does_not_gate_the_cluster_closed(self):
+        """Unlike RBAC/netpol/workload dumps, a missing `ccnp` CRD is the
+        common case (Dataplane V2's ClusterNetworkPolicy is not installed on
+        every cluster) -- it must degrade to "no cluster-wide policies seen"
+        rather than failing the whole cluster the way a real input gap does."""
+        result = self.run_with(
+            workload_items=[compliance_pod("api", ns="payments")],
+            netpol_items=[namespace("payments")],
+            ccnp_run=Run(["x"], 1, "", "the server doesn't have a resource type \"ccnp\"", 0.01),
+        )
+        self.assertEqual(result["outcome"], "collected")
+        self.assertIn("netpol-missing", {c["check"] for c in result["candidates"]})
+
+    def test_autopilot_pre_fills_checks_not_applicable_and_excludes_them_from_commands(self):
+        autopilot_cluster = {**self.CLUSTER, "autopilot": True}
+        result = self.run_with(cluster=autopilot_cluster)
+        not_applicable_slugs = {e["check"] for e in result["checks_not_applicable"]}
+        self.assertEqual(
+            not_applicable_slugs,
+            {"privileged-container", "host-namespace", "hostpath-mount", "legacy-metadata"},
+        )
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertFalse(not_applicable_slugs & command_slugs)
+        # Every reason is the SOP's own canonical text, not a placeholder.
+        for entry in result["checks_not_applicable"]:
+            self.assertIn("Autopilot", entry["reason"])
+
+    def test_standard_cluster_carries_no_checks_not_applicable_key(self):
+        result = self.run_with()
+        self.assertNotIn("checks_not_applicable", result)
 
 
 # --------------------------------------------------------------------------- #
@@ -1707,6 +1786,11 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
     def test_never_puts_the_value_in_the_excerpt(self):
         hit = self.hit([{"name": "HF_TOKEN", "value": "hf_super_secret_value"}])
         self.assertNotIn("hf_super_secret_value", hit["excerpt"])
+
+    def test_does_not_flag_the_sops_own_named_non_secret_examples(self):
+        self.assertIsNone(self.hit([{"name": "HF_TOKEN_PATH", "value": "/var/run/secrets/hf/token"}]))
+        self.assertIsNone(self.hit([{"name": "OPENAI_API_KEY_FILE", "value": "/etc/openai/key"}]))
+        self.assertIsNone(self.hit([{"name": "MODEL_REGISTRY_KEY_ID", "value": "key-2026-01"}]))
 
 
 class TestModelImageFloatingTag(unittest.TestCase):
