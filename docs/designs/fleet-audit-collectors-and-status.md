@@ -642,8 +642,19 @@ Each phase is one PR, independently valuable, in this order:
    no kubeconfig, and because this stream's "check" is not a per-cluster verdict at all but a
    majority vote across a cohort: the collector carries §2's cohort-building, §3's
    baseline/confidence/severity-ladder arithmetic, and the split-cluster guard, none of which
-   any other converted stream needed. Remaining: `stockout-prevention`, blocked on the
-   threshold-pinning pre-PR its own §10 bullet calls for.
+   any other converted stream needed. `stockout-prevention` closes the phase, after its own
+   threshold-pinning pre-PR (`latency-sensitive` recast as an inference-workload severity
+   escalation reusing `ai-security-audit`'s own §2 discriminator; `substantial`/`inUseCount <<
+count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a shared
+   name-token "non-production" definition for the three checks that used the term undefined) —
+   and even then only a **partial** conversion, deliberately: its own script (`fleet_stockout.py`)
+   covers ten of twelve checks, built on the same `ComputeClass`/`Deployment`/`StatefulSet`/
+   `StorageClass`/node-pool/reservation/quota reads every other collector already reads with
+   confidence. `spot-scarcity-risk` and `autoscaler-out-of-resources` stay prose-only: the first
+   reads a beta Spot capacity-advice API, the second parses `jsonPayload` fields out of an
+   internal autoscaler-visibility log schema, and neither shape is one this repository has
+   verified anywhere else — encoding a guess as tested code would make the guess look like a
+   fact. Phase 4 is otherwise complete.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'

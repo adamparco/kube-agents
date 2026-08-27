@@ -78,6 +78,20 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 ### 3. Checks
 
+**Run the collector before evaluating a covered check below by hand.**
+
+```bash
+./skills/fleet-audit/scripts/fleet_stockout.py --project "$PROJECT" > /opt/data/scratch/manifest_stockout-prevention.json
+```
+
+This covers ten of the twelve checks below — every one built on a `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass` dump, `gcloud container node-pools list`, `gcloud compute reservations list`, or `gcloud compute regions describe --format=json(quotas)`. It does **not** cover `spot-scarcity-risk` (3.8) or `autoscaler-out-of-resources` (3.11) — see the collector's own module docstring for why: both read a beta API or an internal log schema this repository has not verified elsewhere, and encoding an unconfirmed shape as tested code would make a guess look like a fact. Run those two by hand, every time, from their own `Command` lines below. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` carries `outcome: "collected"`. Copy its `commands` list verbatim into that cluster's `checks_run` — the ten covered slugs that actually applied there, never a slug this manifest does not list.
+- Every entry in `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed, including `ccc-no-ondemand-floor`'s escalation to `critical` for an inference workload and `reservation-mismatch-risk`'s two forms (an `Automatic`/`AnyBestEffort` affinity binding under a `ComputeClass/<name>` object, an idle reservation under a `Reservation/<name>` object). What is still yours to write is the `recommendation` (§4) and, for a `kind: manifest` remediation, the manifest file itself.
+- The manifest also carries a `project/<project-id>` entry for the two project-scoped checks (`quota-exhaustion-risk`, `reservation-mismatch-risk`'s idle-capacity form), per §3's project-scoped object rule.
+- Pass `--manifest-file <path>` to `finish` (§6) so it cross-checks your `checks_run` against what the collector actually ran.
+- 3.10(b) — a `ComputeClass` targeting a specific reservation that does not exist or sits in an unreachable zone — is not yet in the collector; check it by hand alongside 3.8 and 3.11.
+
 **Standard exclusions — apply to every check below:**
 
 - **S1 — system namespace:** `kube-system`, `kube-public`, `kube-node-lease`, `gmp-system`, `gmp-public`, `gke-gmp-system`, `cnrm-system`, `configconnector-operator-system`, `krmapihosting-system`, `istio-system`, `asm-system`, `anthos-identity-service`, `gatekeeper-system`, `composer-system`, or any namespace matching `gke-*`, `gke-managed-*`, or `config-management-*`.
@@ -234,8 +248,11 @@ Write the schema exactly as the helper validates it to the `findings_path` retur
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
-  --findings-file /opt/data/scratch/findings_stockout-prevention.json
+  --findings-file /opt/data/scratch/findings_stockout-prevention.json \
+  --manifest-file /opt/data/scratch/manifest_stockout-prevention.json
 ```
+
+Omit `--manifest-file` only on a run where §3's collector never produced one — every check on every cluster came from the manual fallback (unavoidable for `spot-scarcity-risk` and `autoscaler-out-of-resources`, which it never covers). Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`.
 
 One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
