@@ -60,7 +60,7 @@
         "expr": "20 8 * * 1",
         "display": "20 8 * * 1"
       },
-      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 264 lines of it, before you run anything. Its nineteen facets are section 4, lines 90-195, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
+      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 283 lines of it, before you run anything. Its nineteen facets are section 4, lines 90-211, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "chat"

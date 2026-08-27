@@ -89,6 +89,22 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 
 ### 4. Facet comparison
 
+**Run the collector before evaluating any facet below by hand.**
+
+```bash
+./skills/fleet-audit/scripts/fleet_drift.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-consistency-drift.json
+```
+
+Every facet reads only GKE control-plane and node-pool metadata through `gcloud container`, so this stream's collector needs no kubeconfig at all — see the script's own module docstring for why one `clusters list` call per project backs every facet, in place of the per-cluster `describe` §1.3 describes (the collector records that literal `list` command as `evidence.command` instead, per its own note on why). It sweeps this project plus, per §1.1, every project ID already recorded in `/opt/data/INVENTORY.raw.md`; pass `--project <id>` to scope a run to one. It also carries §2's cohort-building, §3's baseline/confidence/severity-ladder arithmetic, and §3.6's split-cluster guard — the whole vote is arithmetic once the tokens are normalized, and the collector runs it exactly as this section specifies. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` carries `outcome: "collected"` — a project whose `clusters list` failed contributes no entries at all, the same "absent is silent" contract every other converted stream's manifest keeps. Copy `commands` verbatim into that cluster's `checks_run`: it lists only the facets that cluster was actually a voting member for, which is `checks_run`'s own contract, not a shortened list to pad.
+- A cluster excluded from every cohort (§1's `RECONCILING`/too-new/§2.4 floor cases) is `outcome: "collected"` with empty `commands` and `candidates` — write the `limitations` string those sections already specify; the empty list is what tells you to.
+- An Autopilot cluster's `commands` never include the five Standard-only facets (§1's `checks_not_applicable` list) or, despite being computed, ever carries a `datapath-provider` finding (§4.9's own suppression) — declare the five as directed; `datapath-provider` needs no declaration, it simply never fires there.
+- Every entry in `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` (already in §3.8's four-line shape) are computed, including the confidence-to-severity ladder and the split-cluster guard's `uncohorted` consolidation. What is still yours to write is the `recommendation` (§6) and, for the rare `kind: manifest` remediation, the manifest file itself (§5).
+- Pass `--manifest-file <path>` to `finish` (§7) so it cross-checks your `checks_run` against what the collector actually voted on.
+
+**A cluster the collector covered is not a cluster you re-derive a vote for.** The commands below exist for the manual fallback and for confirming a candidate's evidence.
+
 #### 4.0 Rules that apply to every facet
 
 - **Field-path discipline.** Confirm a facet's path exists in at least one cluster's real `--format=json` output before comparing it. If it is absent from every cluster in the cohort the facet is `UNREADABLE` fleet-wide — skip it silently; never emit a finding asserting the whole fleet is missing a field you could not locate. Where two paths are plausible (a field that migrated between API versions), read the first present and record which one in the excerpt.
@@ -236,8 +252,11 @@ Worked example, for a 4.4 network-policy outlier:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
-  --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json
+  --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json \
+  --manifest-file /opt/data/scratch/manifest_fleet-consistency-drift.json
 ```
+
+Omit `--manifest-file` only on a run where §4's collector never produced one — every facet on every cluster came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a facet the manifest never voted on for it.
 
 - One JSON line comes back: `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`).
 - `partial: true` means the run could not compare the whole fleet — a cluster in `scope.skipped`, or one read but not compared and so carrying a `limitations` string (§1.4, §2.4, §3.1) — and `coverage_gaps` puts each gap in a sentence. On a drift audit that cuts deep, because the majority is what defines normal and a missing peer changes the majority. So the harness declines to infer: `resolved` comes back `0` with no resolved-delta, no remediation PR is closed as stale, and the ledger stays open even with an empty findings array — `status` is still `CLEAN`, the issue simply survives with a comment naming the gaps. A facet declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. The flag tracks coverage and nothing else, so it is `true` exactly when `coverage_gaps` is non-empty; a body too long to hold every finding is a rendering limit, not a gap in what was compared, and says so in the body itself.

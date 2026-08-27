@@ -636,8 +636,14 @@ Each phase is one PR, independently valuable, in this order:
    `project/<id>` manifest entries the way `networking_audit.py` does, whose collector is this
    phase's "hoisted sampling": §2's three `kubectl top` samples five minutes apart are still a
    real ten-minute wall-clock cost, but the thread pool now pays it once per cluster,
-   concurrently across the whole fleet, instead of serially inside one SOP-executed shell.
-   Remaining: `fleet-consistency-drift`, `stockout-prevention`.
+   concurrently across the whole fleet, instead of serially inside one SOP-executed shell; and
+   `fleet-consistency-drift`, its own script (`fleet_drift.py`) since — like
+   `security-patch-orchestrator` — every facet reads only `gcloud container` metadata and needs
+   no kubeconfig, and because this stream's "check" is not a per-cluster verdict at all but a
+   majority vote across a cohort: the collector carries §2's cohort-building, §3's
+   baseline/confidence/severity-ladder arithmetic, and the split-cluster guard, none of which
+   any other converted stream needed. Remaining: `stockout-prevention`, blocked on the
+   threshold-pinning pre-PR its own §10 bullet calls for.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'
