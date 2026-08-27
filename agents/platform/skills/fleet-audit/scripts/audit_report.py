@@ -1123,13 +1123,21 @@ def _status_row(payload: dict, data: dict, findings: list, now: datetime) -> dic
 # memory that predates everything this run published.
 # --------------------------------------------------------------------------- #
 
-# Profile-scoped, because the store belongs to the agent that produced it.
+# A fixed root, not $HERMES_HOME, and the distinction is the whole feature.
+# `finish` only ever runs under a cron or kanban worker, which the dispatcher
+# spawns with HERMES_HOME pointed at the profile directory
+# (kanban_db.py: env["HERMES_HOME"] = resolve_profile_env(...)), while the chat
+# session that reads the store back runs in the gateway process, whose
+# HERMES_HOME is the container's /opt/data. Interpolating it therefore wrote to
+# profiles/platform/fleet-audit/reports and read from /opt/data/fleet-audit/
+# reports — and the failure is silent in the direction that would catch it,
+# because the run-to-run delta is worker-to-worker and agrees with itself. Chat
+# just sees a store that is permanently empty, which is the one job it has.
+#
 # Overridable for the suite, on the same reasoning as SCRATCH_DIR: off-cluster
 # /opt/data does not exist, and a store whose failure paths can only be
 # exercised where it is deployed is a store whose failure paths are untested.
-REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or (
-    f"{os.environ.get('HERMES_HOME') or '/opt/data'}/fleet-audit/reports"
-)
+REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or "/opt/data/fleet-audit/reports"
 
 # Two weeks of a daily stream, a quarter of a weekly one. At the ledger's own
 # 60k-character body ceiling that bounds the store near 1 MB per stream.

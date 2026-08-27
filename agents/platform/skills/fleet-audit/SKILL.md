@@ -85,7 +85,7 @@ own `deliver` setting; repeating them here sends the same content twice.
 ## Answering a question about a past run
 
 "What did the last compliance audit find?" is a file read, not a run and not a `gh issue view`.
-`finish` keeps what it published, under `${HERMES_HOME:-/opt/data}/fleet-audit/reports/<audit-id>/`:
+`finish` keeps what it published, under `/opt/data/fleet-audit/reports/<audit-id>/`:
 
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmssZ>.json` — one envelope per run, newest 14 kept. Comparing two of them is

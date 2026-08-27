@@ -470,7 +470,12 @@ are the same missing thing: the run's structured output, kept where it was produ
 `finish` therefore keeps what it publishes. On the exit-0 path — CLEAN and findings branches
 alike, never on `--dry-run`, never after a validation failure, and not from `remediate`, which
 changes no findings — it writes, atomically (`os.replace` from a temp file in the same
-directory), under `${HERMES_HOME:-/opt/data}/fleet-audit/reports/<audit-id>/`:
+directory), under `/opt/data/fleet-audit/reports/<audit-id>/` — a fixed root rather than
+`$HERMES_HOME`, because `finish` runs under a cron or kanban worker, which the dispatcher spawns
+with `HERMES_HOME` pointed at the profile directory, while the chat path that reads the store back
+runs in the gateway process, where it is `/opt/data`. Rooting the store at `$HERMES_HOME` writes it
+to one path and reads it from the other, and the run-to-run delta agrees with itself either way, so
+the only symptom is a chat path that never finds a report:
 
 - `runs/<finished-at, UTC, filename-safe>.json` — an envelope carrying the run's outcome
   (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`), its three durations

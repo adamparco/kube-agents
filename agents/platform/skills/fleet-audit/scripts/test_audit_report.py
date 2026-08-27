@@ -4889,6 +4889,50 @@ class TestReportStore(HarnessTestCase):
             "issue create": f"https://github.com/acme/fleet/issues/{issue}\n",
         }
 
+    def test_the_store_path_does_not_move_with_hermes_home(self):
+        """Writer and reader disagree if it does, and nothing says so.
+
+        `finish` runs only under a cron or kanban worker, and the dispatcher
+        spawns those with HERMES_HOME pointed at the profile directory
+        (`kanban_db.py`: ``env["HERMES_HOME"] = resolve_profile_env(...)``).
+        The chat session that reads the store back runs in the gateway process,
+        whose HERMES_HOME is the container's /opt/data. Root the store at
+        $HERMES_HOME and it is written to one path and read from another.
+
+        The reason this needs a test rather than care is that the failure is
+        silent in the direction that would catch it: the run-to-run delta is
+        worker-to-worker, so it agrees with itself whichever path it lands on,
+        and every store test above passes against a patched REPORTS_DIR. The
+        only symptom is the chat path never finding a report — which is the one
+        job §4.8 was added to do.
+        """
+        probe = "import audit_report; print(audit_report.REPORTS_DIR)"
+        seen = {}
+        for home in ("/opt/data", "/opt/data/profiles/platform"):
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k != "FLEET_AUDIT_REPORTS_DIR"
+            }
+            env["HERMES_HOME"] = home
+            env["PYTHONPATH"] = str(Path(audit_report.__file__).resolve().parent)
+            done = subprocess.run(
+                [sys.executable, "-c", probe],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            seen[home] = done.stdout.strip()
+
+        self.assertEqual(
+            seen["/opt/data/profiles/platform"],
+            seen["/opt/data"],
+            "REPORTS_DIR moves with HERMES_HOME: a cron/kanban worker would "
+            f"write to {seen['/opt/data/profiles/platform']} while the chat "
+            f"path reads {seen['/opt/data']}",
+        )
+
     def test_a_finishing_run_stores_the_document_it_published(self):
         self.open_ledger()
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
