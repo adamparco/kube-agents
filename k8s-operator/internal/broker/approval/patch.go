@@ -22,6 +22,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
@@ -93,14 +94,35 @@ func ApplyReject(ar *agentv1alpha1.ActionRecord, roster *agentv1alpha1.ApprovalR
 
 // Write patches exactly the fields ApplyApprove/ApplyReject touched — approvals and phase, the
 // ChatOps gateway's whole write surface (config/policy/vap-agent-scope-journal.yaml validation 4)
-// — using a merge patch computed against a copy taken before mutation. A full-object Status().Update
-// here would risk carrying a stale copy of fields another writer changed concurrently (verification,
-// recovery, timestamps) backward over their write; the merge patch only ever contains what actually
-// changed in this call, matching the idiom in internal/broker/controller/undo_controller.go.
+// — using a merge patch computed against a copy taken immediately before mutation, so a
+// concurrent writer's change to an unrelated field (verification, recovery, timestamps) is never
+// carried backward the way a full-object Status().Update would.
+//
+// The patch carries client.MergeFromWithOptimisticLock, and the whole call is wrapped in
+// retry.RetryOnConflict, re-`Get`ting the record fresh on every attempt including the first. Both
+// are load-bearing, not defensive habit: `Granted`/`Rejected` are `+listType=atomic`, so a plain
+// JSON merge patch (client.MergeFrom's default) REPLACES the whole array server-side rather than
+// merging it — two approvers approving within the same window each compute a merge patch from
+// their own stale base, and whichever lands second silently discards the first approver's entry,
+// with no error to either side, ever again reaching EffectiveMinApprovals(). The optimistic lock
+// is what turns "second patch wins silently" into a real conflict; the retry-with-re-Get is what
+// turns that conflict into a correct outcome instead of a dropped write.
 func Write(ctx context.Context, c client.Client, ar *agentv1alpha1.ActionRecord, mutate func(*agentv1alpha1.ActionRecord)) error {
-	base := ar.DeepCopy()
-	mutate(ar)
-	if err := c.Status().Patch(ctx, ar, client.MergeFrom(base)); err != nil {
+	key := client.ObjectKeyFromObject(ar)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		live := &agentv1alpha1.ActionRecord{}
+		if err := c.Get(ctx, key, live); err != nil {
+			return err
+		}
+		base := live.DeepCopy()
+		mutate(live)
+		if err := c.Status().Patch(ctx, live, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		*ar = *live
+		return nil
+	})
+	if err != nil {
 		return fmt.Errorf("approval: patching %s/%s status: %w", ar.Namespace, ar.Name, err)
 	}
 	return nil

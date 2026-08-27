@@ -113,11 +113,3 @@ func (r *ResumeController) deadline(ctx context.Context, ar *agentv1alpha1.Actio
 	}
 	return ar.CreationTimestamp.Add(ttl), nil
 }
-
-// SetupWithManager wires the reconciler to watch ActionRecord.
-func (r *ResumeController) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&agentv1alpha1.ActionRecord{}).
-		Named("broker-resume").
-		Complete(r)
-}

@@ -194,6 +194,39 @@ func TestChatOpsGatewayApprovalPackageObeysThePolicy(t *testing.T) {
 			t.Errorf("phase = %q, want Rejected", fresh.Status.Phase)
 		}
 	})
+
+	// V-CHAT-003: two approvers racing the same record, or a retried slash command arriving after
+	// the record already resolved, must not re-open it. Validation 4 admits a gateway write only
+	// when the record's OLD phase is PendingApproval; once approval.Write above has already moved
+	// it to Rejected, a second gateway write is denied at admission, not merely a no-op that
+	// silently succeeds.
+	t.Run("a late gateway write is denied once the record has already left PendingApproval", func(t *testing.T) {
+		ar := mkPendingRecord(t)
+		gatewayClient := as(chatOpsUser)
+
+		fresh := &agentv1alpha1.ActionRecord{}
+		if err := gatewayClient.Get(ctx, client.ObjectKeyFromObject(ar), fresh); err != nil {
+			t.Fatalf("gateway reading the record: %v", err)
+		}
+		if err := approval.Write(ctx, gatewayClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			approval.ApplyReject(ar, roster, "slack:U02", "not now", now)
+		}); err != nil {
+			t.Fatalf("resolving the record ahead of the late write: %v", err)
+		}
+		if fresh.Status.Phase != agentv1alpha1.PhaseRejected {
+			t.Fatalf("setup: phase = %q, want Rejected before the late write", fresh.Status.Phase)
+		}
+
+		err := approval.Write(ctx, gatewayClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			approval.ApplyApprove(ar, roster, "slack:U02", "", now)
+		})
+		if err == nil {
+			t.Fatal("a late write against an already-resolved record was admitted")
+		}
+		if !apierrors.IsForbidden(err) {
+			t.Fatalf("expected Forbidden, got: %v", err)
+		}
+	})
 }
 
 // statusUpdateAs applies mutate to ar's status as user and refreshes ar in place with the server's

@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
 
 type recordingReconciler struct {
@@ -56,10 +57,17 @@ func resumeTestScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
+// recordWithPhase sets the status label alongside status.phase, the way journal.Store always keeps
+// them (internal/journal/store.go's StatusLabel) -- resumeSweep now filters its List by that label
+// server-side, so a fixture missing it would never be fetched regardless of what status.phase says.
 func recordWithPhase(name string, phase agentv1alpha1.ActionPhase) *agentv1alpha1.ActionRecord {
 	return &agentv1alpha1.ActionRecord{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kubeagents-system"},
-		Status:     agentv1alpha1.ActionRecordStatus{Phase: phase},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "kubeagents-system",
+			Labels:    map[string]string{journal.StatusLabel: string(phase)},
+		},
+		Status: agentv1alpha1.ActionRecordStatus{Phase: phase},
 	}
 }
 
@@ -112,6 +120,25 @@ func TestResumeSweepContinuesAfterAReconcileError(t *testing.T) {
 
 	if len(rc.attempted) != 2 {
 		t.Errorf("attempted %v, want both records reconciled despite the first erroring", rc.attempted)
+	}
+}
+
+// The old resumeSweep fetched everything in the namespace and filtered client-side on status.phase;
+// this record would have been reconciled under that implementation, since its status.phase is
+// Pending. The fix (V-EFF-001) filters the List itself by journal.StatusLabel, and this label says
+// Verified -- a stale index the store's own docs allow (internal/journal/store.go:289's "best-effort
+// ordering, never best-effort truth") until JournalReconciler repairs it. This test only passes
+// against a List that is actually driven by the label, not a re-read of status.phase.
+func TestResumeSweepDoesNotFetchARecordWhoseLabelHasNotCaughtUp(t *testing.T) {
+	stale := recordWithPhase("ar-stale-label", agentv1alpha1.PhasePending)
+	stale.Labels[journal.StatusLabel] = string(agentv1alpha1.PhaseVerified)
+	c := fake.NewClientBuilder().WithScheme(resumeTestScheme(t)).WithObjects(stale).Build()
+	rc := &recordingReconciler{}
+
+	resumeSweep(context.Background(), c, rc, "kubeagents-system", noopLog{})
+
+	if len(rc.reconciled) != 0 {
+		t.Errorf("reconciled %v, want none: the List must be filtered by the status label, not by re-checking status.phase after an unfiltered fetch", rc.reconciled)
 	}
 }
 

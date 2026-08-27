@@ -18,6 +18,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,8 +60,24 @@ func approve(ar *agentv1alpha1.ActionRecord) {
 	}
 }
 
+// withUsableRoster gives the rig's brake a roster that reads as usable (06 §4.4 row 6 wants
+// nothing more than EffectiveMinApprovals() <= the approver count). newRig's own default brake
+// view carries no roster at all -- fine for every test that never resumes, since nothing before
+// Resume consults it -- but Resume's brake re-check (the fix for the adversarial review's
+// resume-safety finding #1) means a resumed action now genuinely needs one, the same way a real
+// Agent with a configured ApprovalRosterRef would have one via brake.Source in production.
+func withUsableRoster(r *rig) {
+	one := int32(1)
+	r.brake.view.Roster = &agentv1alpha1.ApprovalRoster{
+		Spec: agentv1alpha1.ApprovalRosterSpec{
+			MinApprovals: &one,
+			Approvers:    []agentv1alpha1.Approver{{Platform: "slack", ID: "U02"}},
+		},
+	}
+}
+
 func TestResumeExecutesAnApprovedAction(t *testing.T) {
-	r := newRig(t)
+	r := newRig(t, withUsableRoster)
 	ar := park(t, r, createEnvelope())
 	approve(ar)
 
@@ -84,7 +101,7 @@ func TestResumePersistsAFreshPreStateAndUndoPlan(t *testing.T) {
 	// applyEnvelope, not createEnvelope: a create against an absent object legitimately has no
 	// pre-state to capture. An apply against an object that already exists does, which is what
 	// this test needs to see freshly (re-)populated.
-	r := newRig(t, func(r *rig) {
+	r := newRig(t, withUsableRoster, func(r *rig) {
 		r.reader = &fakeReader{obj: liveConfigMap(), absent: false}
 	})
 	ar := park(t, r, applyEnvelope("info"))
@@ -198,3 +215,62 @@ func TestResumeRefusesWhenStoredClassIsBelowReclassification(t *testing.T) {
 		t.Errorf("final phase = %v, want Rejected", got)
 	}
 }
+
+// Adversarial review finding (resume-safety #1): stepGate is the ONLY step that acts on
+// BrakeRaiseToGated/BrakePark, and Resume never calls it. Without s.brakeEffect closing the gap,
+// a brake row that fires fresh at resume time -- row 5 (the re-generated undo plan is unusable) or
+// row 6 (the roster shrank below minApprovals) -- had no effect at all, and the action executed
+// anyway. These two tests are the reproduction that finding was built on.
+func TestResumeRefusesWhenTheReGeneratedUndoPlanIsUnusable(t *testing.T) {
+	r := newRig(t)
+	ar := park(t, r, createEnvelope())
+	approve(ar)
+
+	// The dry-runner starts failing between park and resume -- the undo plan Resume regenerates
+	// (chat-approval.md §3: "the approval path re-snapshots") comes back unvalidated, which is
+	// brake row 5, BrakeRaiseToGated.
+	r.dryRunner.err = errors.New("dry run: field manager conflict")
+
+	res, err := r.pipeline.Resume(context.Background(), ar)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if res.Decision != "refused" {
+		t.Fatalf("decision = %q, want refused: an unusable undo plan must stop the resumption (06 §4.4 row 5)", res.Decision)
+	}
+	if r.applier.mutations != 0 {
+		t.Error("a refused resumption must never reach the applier")
+	}
+	if got := r.records.phases[len(r.records.phases)-1]; got != agentv1alpha1.PhaseRejected {
+		t.Errorf("final phase = %v, want Rejected", got)
+	}
+}
+
+func TestResumeRefusesWhenTheRosterBecameUnusable(t *testing.T) {
+	r := newRig(t, func(r *rig) {
+		// A roster the brake reads as unusable: EffectiveMinApprovals() exceeds the approver
+		// count, so rosterUsable() (brake.go) returns false and row 6 (BrakePark) fires. This
+		// models the roster shrinking between the original approval and resumption.
+		r.brake = &fakeBrake{view: BrakeView{
+			Agent:   testAgentCR(),
+			Freezes: &broker.FreezeView{ObservedAt: testClock},
+			Journal: broker.BrakeOK,
+			Roster:  &agentv1alpha1.ApprovalRoster{Spec: agentv1alpha1.ApprovalRosterSpec{MinApprovals: int32Ptr(5), Approvers: []agentv1alpha1.Approver{{Platform: "slack", ID: "U02"}}}},
+		}}
+	})
+	ar := park(t, r, createEnvelope())
+	approve(ar)
+
+	res, err := r.pipeline.Resume(context.Background(), ar)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if res.Decision != "refused" {
+		t.Fatalf("decision = %q, want refused: a roster the brake reads as unusable must stop the resumption (06 §4.4 row 6)", res.Decision)
+	}
+	if r.applier.mutations != 0 {
+		t.Error("a refused resumption must never reach the applier")
+	}
+}
+
+func int32Ptr(i int32) *int32 { return &i }

@@ -20,12 +20,15 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
 
 // resumePollInterval bounds how long a just-approved action can sit before this broker notices.
@@ -61,8 +64,30 @@ type reconciler interface {
 }
 
 func resumeSweep(ctx context.Context, c client.Client, rc reconciler, namespace string, log logSink) {
+	// Filtered server-side by journal.StatusLabel, not an unfiltered List: RetentionSpec keeps
+	// terminal records around long after this loop stops caring about them, and a full-object List
+	// of that whole retained history every resumePollInterval is unbounded work for a poll that only
+	// ever wants the small live set. journal.Store keeps the label in step with status.phase, and
+	// JournalReconciler repairs the rare write that drops it (internal/broker/controller/
+	// journal_reconciler.go), so this List can lag the true live set by at most one repair cycle --
+	// self-healing, and far cheaper than scanning everything to avoid that lag. The status.phase
+	// switch below stays as a second check: it is what actually decides which records get reconciled,
+	// the label selector only bounds what gets fetched.
+	req, err := labels.NewRequirement(journal.StatusLabel, selection.In, []string{
+		string(agentv1alpha1.PhasePending),
+		string(agentv1alpha1.PhasePendingApproval),
+	})
+	if err != nil {
+		log.Error(err, "resume: building the status label selector")
+		return
+	}
+
 	var list agentv1alpha1.ActionRecordList
-	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+	opts := []client.ListOption{
+		client.InNamespace(namespace),
+		client.MatchingLabelsSelector{Selector: labels.NewSelector().Add(*req)},
+	}
+	if err := c.List(ctx, &list, opts...); err != nil {
 		log.Error(err, "resume: listing action records")
 		return
 	}

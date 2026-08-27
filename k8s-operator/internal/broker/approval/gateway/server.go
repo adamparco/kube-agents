@@ -22,6 +22,11 @@ import "net/http"
 // against dedicated apps (chat-approval.md §3) — nothing about the routing shares state between
 // them beyond the one Dispatcher, which is exactly the point: one authorization path regardless of
 // which platform a command arrived on.
+//
+// No /healthz or /readyz here on purpose: cmd/chatops-gateway wires those to the controller-runtime
+// manager's own health server on a separate port, and its /readyz is leadership-gated (chat-
+// approval.md §7's one-socket rule; a rolling update must not route webhook traffic to a pod that
+// has not yet won the lease). A second, bare-200 readyz on this mux would contradict that one.
 func NewServeMux(slack *SlackHandler, googleChat *GoogleChatHandler) *http.ServeMux {
 	mux := http.NewServeMux()
 	if slack != nil {
@@ -30,7 +35,5 @@ func NewServeMux(slack *SlackHandler, googleChat *GoogleChatHandler) *http.Serve
 	if googleChat != nil {
 		mux.Handle("/googlechat/events", googleChat)
 	}
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	return mux
 }

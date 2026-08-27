@@ -18,13 +18,18 @@ package gateway_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval/gateway"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestDispatchApproveEndToEnd(t *testing.T) {
@@ -148,6 +153,23 @@ func TestDispatchRefusesUnknownAction(t *testing.T) {
 	reply := d.Handle(context.Background(), "event-1", "slack:U02", "approve ar-does-not-exist")
 	if !strings.Contains(reply, "no such action") {
 		t.Fatalf("reply = %q", reply)
+	}
+}
+
+func TestDispatchSurfacesALookupListError(t *testing.T) {
+	c := fake.NewClientBuilder().
+		WithScheme(gatewayScheme(t)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return apierrors.NewInternalError(errors.New("etcd is unavailable"))
+			},
+		}).
+		Build()
+	d := &gateway.Dispatcher{Client: c, Now: func() time.Time { return fixedNow }}
+
+	reply := d.Handle(context.Background(), "event-1", "slack:U02", "approve ar-1")
+	if !strings.Contains(reply, "listing action records") {
+		t.Fatalf("reply = %q, want it to name the lookup failure rather than read as \"no such action\"", reply)
 	}
 }
 

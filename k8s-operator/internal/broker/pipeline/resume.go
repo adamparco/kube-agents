@@ -108,6 +108,23 @@ func (p *Pipeline) Resume(ctx context.Context, ar *agentv1alpha1.ActionRecord) (
 		}
 	}
 
+	// stepGate is the ONLY step that acts on BrakeRaiseToGated/BrakePark in Submit's flow -- both
+	// effects change nothing but s.class.Class, and stepGate is what reads that class and parks.
+	// Resume never calls stepGate (see the tr.Skip below), so without this check a brake that fires
+	// EITHER effect during the fresh re-evaluation above would be silently ignored: row 5 (the
+	// re-generated undo plan is unusable) or row 6 (the roster shrank below minApprovals since the
+	// original approval) would both fall through to execution instead of stopping it. Refusing
+	// rather than re-parking either way: re-parking would mean re-running the whole approval loop
+	// (a fresh notify, a fresh threshold) for a record that already has one round of approvals on
+	// it, which is more state to reconcile correctly than the value of not making the requester
+	// resubmit -- the same "re-propose, don't resurrect" choice chat-approval.md sequence 3 already
+	// makes for a record that expired the ordinary way.
+	if s.brakeEffect == broker.BrakeRaiseToGated || s.brakeEffect == broker.BrakePark {
+		return p.refuseResumption(ctx, ar, fmt.Sprintf(
+			"the brake's fresh check at resume time raised this action back to gated (%s); the approval that got it here no longer covers it (06 §4.4)",
+			s.brakeEffect))
+	}
+
 	// stepUndoPlan's buildRecord path is for a record that does not exist yet; this one already
 	// does. Persist the fresh snapshot and plan onto it directly instead — Create would be a no-op
 	// against an existing name (journal.Store.Create's AlreadyExists branch), silently discarding

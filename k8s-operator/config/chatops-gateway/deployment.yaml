@@ -13,6 +13,12 @@ metadata:
     app.kubernetes.io/component: chatops-gateway
 spec:
   replicas: 1
+  # Recreate, not the RollingUpdate default. main.go gates /readyz on holding the leader lease, so
+  # a rolling update would deadlock: the new pod cannot become Ready without the lease, and the
+  # old pod does not release it until Kubernetes terminates it -- which a RollingUpdate delays
+  # until the new pod is Ready. Recreate kills the old pod (and its lease) first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       control-plane: chatops-gateway

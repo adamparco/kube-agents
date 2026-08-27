@@ -38,7 +38,7 @@ import (
 // aggregate `manager-role` ClusterRole (`make manifests` scans every package), and a marker here
 // would hand the OPERATOR's manager identity read access to a CRD it does not otherwise touch. The
 // notifier's grant is hand-written, the way config/rbac/brake_role.yaml is, and lives at
-// config/rbac/chatops_gateway_role.yaml alongside the gateway's.
+// config/chatops-gateway/rbac.yaml alongside the gateway's.
 type Reconciler struct {
 	client.Client
 	Deliverers Deliverers

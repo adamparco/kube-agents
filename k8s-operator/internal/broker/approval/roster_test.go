@@ -80,6 +80,23 @@ func TestResolveRosterMissingRosterObjectIsUnusable(t *testing.T) {
 	}
 }
 
+// Belt and suspenders against admission's MinItems=1 on Spec.Approvers -- a roster edited to empty
+// after admission, or read through a cache that has not caught up with a delete-then-recreate.
+func TestResolveRosterWithNoApproversIsUnusable(t *testing.T) {
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	agent := testAgent("my-agent", testNS, &agentv1alpha1.RosterRef{Name: "roster-1"})
+	roster := testRoster("roster-1", testNS, 1, false) // no approvers
+	c := fakeClient(t, agent, roster)
+
+	got, reason := approval.ResolveRoster(context.Background(), c, ar)
+	if got != nil {
+		t.Fatalf("expected nil roster for a roster with no approvers, got %v", got)
+	}
+	if reason == "" {
+		t.Error("expected a non-empty unusable reason")
+	}
+}
+
 func TestResolveRosterCrossNamespace(t *testing.T) {
 	ar := testRecord("ar-1", testNS, "slack:U01")
 	agent := testAgent("my-agent", testNS, &agentv1alpha1.RosterRef{Name: "roster-1", Namespace: "shared"})

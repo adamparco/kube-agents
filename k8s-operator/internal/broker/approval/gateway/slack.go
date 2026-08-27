@@ -20,6 +20,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -123,31 +124,9 @@ func (h *SlackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"response_type":"ephemeral","text":%s}`, jsonString(reply))
-}
-
-func jsonString(s string) string {
-	// Slash-command replies are short, operator-authored-or-templated text with no attacker-chosen
-	// structure beyond what ParseCommand already rejected; a minimal escaper is enough and avoids
-	// pulling in encoding/json for one field for a payload that is otherwise a literal.
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\n':
-			b.WriteString(`\n`)
-		default:
-			if r < 0x20 {
-				fmt.Fprintf(&b, `\u%04x`, r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
+	raw, _ := json.Marshal(struct {
+		ResponseType string `json:"response_type"`
+		Text         string `json:"text"`
+	}{ResponseType: "ephemeral", Text: reply})
+	w.Write(raw)
 }

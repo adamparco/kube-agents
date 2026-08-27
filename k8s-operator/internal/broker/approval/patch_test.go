@@ -18,6 +18,7 @@ package approval_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -161,5 +162,57 @@ func TestWriteConflictsWithAConcurrentEdit(t *testing.T) {
 	}
 	if after.Status.Phase != agentv1alpha1.PhasePending {
 		t.Errorf("phase = %q, want Pending", after.Status.Phase)
+	}
+}
+
+// Adversarial review finding (auth-security #1 / code-quality #1): two roster members approving
+// within the same window each read status.approvals while it was still nil, so each computes a
+// merge patch touching "granted" from its own stale base. Granted/Rejected are +listType=atomic,
+// so a plain client.MergeFrom patch REPLACES the array server-side rather than merging it —
+// without retry-on-conflict and an optimistic lock, whichever patch lands second silently
+// overwrites the first approver's entry, and a roster requiring 2 distinct approvers never
+// reaches quorum no matter how many people approve. This test is the reproduction that finding
+// was built on, run against real goroutines racing the same fake client.
+func TestWriteSurvivesTwoConcurrentApprovers(t *testing.T) {
+	roster := testRoster("r", testNS, 2, false,
+		agentv1alpha1.Approver{Platform: "slack", ID: "U02"},
+		agentv1alpha1.Approver{Platform: "slack", ID: "U03"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	c := fakeClient(t, ar)
+
+	principals := []string{"slack:U02", "slack:U03"}
+	errs := make(chan error, len(principals))
+	var wg sync.WaitGroup
+	for _, p := range principals {
+		wg.Add(1)
+		go func(principal string) {
+			defer wg.Done()
+			fresh := &agentv1alpha1.ActionRecord{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(ar), fresh); err != nil {
+				errs <- err
+				return
+			}
+			errs <- approval.Write(context.Background(), c, fresh, func(ar *agentv1alpha1.ActionRecord) {
+				approval.ApplyApprove(ar, roster, principal, "", fixedNow)
+			})
+		}(p)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	after := &agentv1alpha1.ActionRecord{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ar), after); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if after.Status.Approvals == nil || len(after.Status.Approvals.Granted) != 2 {
+		t.Fatalf("granted = %+v, want both concurrent approvals to have landed", after.Status.Approvals)
+	}
+	if after.Status.Phase != agentv1alpha1.PhasePending {
+		t.Errorf("phase = %q, want Pending: both approvals landed, so minApprovals (2) is met", after.Status.Phase)
 	}
 }

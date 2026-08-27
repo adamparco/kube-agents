@@ -765,6 +765,37 @@ func TestARetriedCreateDoesNotRewindThePhase(t *testing.T) {
 	}
 }
 
+func TestUpdateForResumePersistsAFreshPreStateAndUndoPlan(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wantIntent := ar.Spec.Intent
+
+	preState := []agentv1alpha1.PreStateSnapshot{{TargetIndex: 0}}
+	undo := &agentv1alpha1.UndoPlan{Strategy: agentv1alpha1.UndoNone}
+	if err := s.UpdateForResume(ctx, ar, preState, undo); err != nil {
+		t.Fatalf("UpdateForResume: %v", err)
+	}
+
+	got, err := s.Get(ctx, "team-x", "01JZQ8X9K7M4N2P6R8T0V3W5YZ")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(got.Spec.PreState) != 1 || got.Spec.PreState[0].TargetIndex != 0 {
+		t.Errorf("PreState = %+v, want the fresh snapshot", got.Spec.PreState)
+	}
+	if got.Spec.Undo == nil || got.Spec.Undo.Strategy != agentv1alpha1.UndoNone {
+		t.Errorf("Undo = %+v, want the fresh plan", got.Spec.Undo)
+	}
+	// A merge patch of the spec, not a wholesale rewrite: nothing else on the record should move.
+	if got.Spec.Intent != wantIntent {
+		t.Errorf("Intent = %q, want %q; UpdateForResume must not touch fields it was not given", got.Spec.Intent, wantIntent)
+	}
+}
+
 func TestGetByActionID(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newFakeStore(t)

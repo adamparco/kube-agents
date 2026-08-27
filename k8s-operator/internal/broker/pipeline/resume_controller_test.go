@@ -43,7 +43,7 @@ func resumeControllerScheme(t *testing.T) *runtime.Scheme {
 }
 
 func TestResumeControllerResumesAnApprovedRecord(t *testing.T) {
-	r := newRig(t)
+	r := newRig(t, withUsableRoster)
 	ar := park(t, r, createEnvelope())
 	approve(ar)
 

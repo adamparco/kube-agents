@@ -18,11 +18,18 @@ package notify_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval/notify"
 )
@@ -46,6 +53,42 @@ func TestConfigMapStoreGetMissingIsNotAnError(t *testing.T) {
 	}
 	if found {
 		t.Error("expected found=false")
+	}
+}
+
+func TestConfigMapStoreGetSurfacesANonNotFoundError(t *testing.T) {
+	c := fake.NewClientBuilder().
+		WithScheme(storeScheme(t)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+				return apierrors.NewInternalError(errors.New("etcd is unavailable"))
+			},
+		}).
+		Build()
+	store := &notify.ConfigMapStore{Client: c, Name: "delivery-state", Namespace: "kubeagents-system"}
+
+	_, _, err := store.Get(context.Background(), "ar-1")
+	if err == nil {
+		t.Fatal("expected a transport error to surface rather than be treated as \"not found\"")
+	}
+	if !strings.Contains(err.Error(), "reading delivery state configmap") {
+		t.Errorf("error = %q, want it to name what failed", err.Error())
+	}
+}
+
+func TestConfigMapStoreGetSurfacesAnUndecodableEntry(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(storeScheme(t)).WithObjects(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "delivery-state", Namespace: "kubeagents-system"},
+		Data:       map[string]string{"ar-1": "not json"},
+	}).Build()
+	store := &notify.ConfigMapStore{Client: c, Name: "delivery-state", Namespace: "kubeagents-system"}
+
+	_, _, err := store.Get(context.Background(), "ar-1")
+	if err == nil {
+		t.Fatal("expected a decode error for a corrupt entry")
+	}
+	if !strings.Contains(err.Error(), "decoding delivery state") {
+		t.Errorf("error = %q, want it to name what failed", err.Error())
 	}
 }
 

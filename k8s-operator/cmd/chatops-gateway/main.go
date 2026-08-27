@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -140,7 +141,26 @@ func main() {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	// Leadership-gated, not a bare Ping. The dedup cache in gateway.Dispatcher and the "one socket"
+	// invariant chat-approval.md §7 documents are both per-PROCESS guarantees, but a rolling update
+	// otherwise runs the old and new pod at once for the whole time the new one is Ready — Kubernetes
+	// removes a NotReady pod from the Service's endpoints entirely, which is what actually keeps a
+	// second live writer off the wire, not the Deployment's replica count. config/chatops-gateway/
+	// deployment.yaml pairs this with strategy: Recreate, because a rolling update would otherwise
+	// deadlock: the new pod can't become Ready without the lease, and the old pod holds the lease
+	// until Kubernetes decides to terminate it, which a RollingUpdate delays until the new pod is
+	// Ready.
+	elected := &atomic.Bool{}
+	go func() {
+		<-mgr.Elected()
+		elected.Store(true)
+	}()
+	if err := mgr.AddReadyzCheck("readyz", func(*http.Request) error {
+		if !elected.Load() {
+			return fmt.Errorf("not yet the elected leader")
+		}
+		return nil
+	}); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}

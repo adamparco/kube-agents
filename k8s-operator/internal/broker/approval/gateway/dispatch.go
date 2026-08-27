@@ -124,7 +124,7 @@ func (d *Dispatcher) Handle(ctx context.Context, eventKey, principal, text strin
 // ActionRecord is namespaced, but an approver typing an ID from a chat message has no reason to
 // know which namespace the acting agent lived in, so this scans rather than requiring the caller
 // to supply one. The gateway's Role grants get/list/watch cluster-wide on actionrecords for exactly
-// this (config/rbac/chatops_gateway_role.yaml), and the fleet's PendingApproval backlog is small
+// this (config/chatops-gateway/rbac.yaml), and the fleet's PendingApproval backlog is small
 // enough that an unindexed list-and-scan is the right amount of mechanism.
 func (d *Dispatcher) lookup(ctx context.Context, idOrName string) (*agentv1alpha1.ActionRecord, error) {
 	name := approval.ActionRecordName(idOrName)

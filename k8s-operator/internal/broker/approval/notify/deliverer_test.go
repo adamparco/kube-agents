@@ -91,6 +91,66 @@ func TestSlackDelivererSurfacesAPIError(t *testing.T) {
 	}
 }
 
+func TestSlackDelivererSurfacesANonTwoXXStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("upstream unavailable"))
+	}))
+	defer srv.Close()
+
+	d := &notify.SlackDeliverer{Token: "xoxb-test", BaseURL: srv.URL}
+	_, err := d.Deliver(context.Background(), notify.Target{Platform: notify.PlatformSlack, Channel: "C01"}, askMessage())
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("expected an error naming the transport status, got: %v", err)
+	}
+}
+
+func TestSlackDelivererSurfacesAnUndecodableBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+
+	d := &notify.SlackDeliverer{Token: "xoxb-test", BaseURL: srv.URL}
+	_, err := d.Deliver(context.Background(), notify.Target{Platform: notify.PlatformSlack, Channel: "C01"}, askMessage())
+	if err == nil || !strings.Contains(err.Error(), "decoding") {
+		t.Fatalf("expected a decode error, got: %v", err)
+	}
+}
+
+func TestGoogleChatDelivererSurfacesANonTwoXXStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("permission denied"))
+	}))
+	defer srv.Close()
+
+	d := &notify.GoogleChatDeliverer{
+		TokenSource: func(context.Context) (string, error) { return "gctoken", nil },
+		BaseURL:     srv.URL,
+	}
+	_, err := d.Deliver(context.Background(), notify.Target{Platform: notify.PlatformGoogleChat, Channel: "spaces/AAA"}, askMessage())
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expected an error naming the transport status, got: %v", err)
+	}
+}
+
+func TestGoogleChatDelivererSurfacesAnUndecodableBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+
+	d := &notify.GoogleChatDeliverer{
+		TokenSource: func(context.Context) (string, error) { return "gctoken", nil },
+		BaseURL:     srv.URL,
+	}
+	_, err := d.Deliver(context.Background(), notify.Target{Platform: notify.PlatformGoogleChat, Channel: "spaces/AAA"}, askMessage())
+	if err == nil || !strings.Contains(err.Error(), "decoding") {
+		t.Fatalf("expected a decode error, got: %v", err)
+	}
+}
+
 func TestGoogleChatDelivererPostMessage(t *testing.T) {
 	var gotAuth, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

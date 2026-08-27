@@ -302,6 +302,11 @@ type state struct {
 	plan      *undo.Result
 	brakeView BrakeView
 
+	// brakeEffect is stepBrake's own verdict, kept for callers that need to distinguish "the brake
+	// raised the class" from "the classifier did" -- Resume is the one caller that does, because
+	// stepGate (the only step Submit relies on to act on either) is not on the resume path.
+	brakeEffect broker.BrakeEffect
+
 	// mayExecute is the effective execution decision, and its POLARITY IS THE POINT.
 	//
 	// It is stored as permission-to-execute rather than as a dry-run flag so that the zero value --
@@ -773,6 +778,7 @@ func (p *Pipeline) stepBrake(ctx context.Context, s *state) (*broker.Result, err
 	if err != nil {
 		return nil, err
 	}
+	s.brakeEffect = effect
 	if effect == broker.BrakeRaiseToGated || effect == broker.BrakePark {
 		s.class.Class = classify.ClassGated
 	}
