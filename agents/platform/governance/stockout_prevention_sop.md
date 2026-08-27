@@ -85,6 +85,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 - **S3 — operator-owned:** non-empty `metadata.ownerReferences`.
 - **S4 — explicit opt-out:** carries `kubeagents.x-k8s.io/stockout-audit: exempt`.
 - **S5 — not running:** `spec.replicas == 0`, or completed batch Jobs.
+- **"Non-production" — every check below that names it:** an explicit opt-out (S4), a namespace or workload name containing `test`, `staging`, `stage`, `dev`, `sandbox`, or `qa` as a `-`/`_`-delimited token, or a `resourceLabels`/label value of `environment`/`env`/`stage`/`tier` matching one of those tokens. Anything else is production for this SOP's purposes — the same name-token heuristic the Fleet Waste and GCP Networking Fabric audits already use, so a workload does not read as production in one ledger and non-production in another.
 
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
@@ -100,9 +101,9 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
-- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end, or a latency-sensitive inference workload is configured Spot-first.
+- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end.
 - **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`; workloads with explicit non-production/test opt-out.
-- **Severity:** `major`.
+- **Severity:** `major`, escalated to `critical` when a workload referencing the ComputeClass is an inference workload per the AI Workload Security audit's own discriminator (`governance/ai_security_audit_sop.md` §2: a container image naming a known inference or serving runtime, or a container requesting an accelerator) — a Spot preemption there breaches a user-facing latency SLA immediately rather than delaying a batch job, and reusing that audit's own definition means this SOP names no second "which workloads count as inference" rule for the two to drift apart on.
 - **Impact:** "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state."
 - **Remediation:** `kind: manifest`. Append an On-Demand priority rule at the lowest priority in the ComputeClass manifest to act as a guaranteed capacity floor.
 
@@ -170,7 +171,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
-- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or node pools near `autoscaling.maxNodeCount` ceilings.
+- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or a node pool's current node count is `>= 90%` of its `autoscaling.maxNodeCount` — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); regional clusters with multi-zone node pools.
 - **Severity:** `major`.
 - **Impact:** "Node pool is locked to a single zone: any zonal stockout in that zone halts all cluster auto-scaling."
@@ -180,7 +181,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `gcloud compute reservations list --project=<project> --format=json`
-- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) Substantial reservation capacity is unallocated (`inUseCount << count`) while production workloads in the same region run unreserved. (Note: CUDs are financial commitments, not physical capacity reservations).
+- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) `inUseCount / count <= 0.5` **and** `count - inUseCount >= 4` — at most half the reservation is in use, and at least four whole instances of headroom sit idle, while production workloads in the same region run unreserved. Both conditions together, not either alone: the ratio catches a large reservation nobody uses, the absolute floor keeps a tiny reservation's normal one-or-two-instance headroom from reading as a leak. (Note: CUDs are financial commitments, not physical capacity reservations).
 - **Do NOT flag:** ComputeClasses with valid targeted reservation bindings; non-production workloads.
 - **Severity:** `critical` for broken/bypassed bindings, `major` for unallocated capacity mismatches.
 - **Impact:** "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts."
