@@ -1,22 +1,27 @@
 # Fleet Audit — Procedural Collection, Native Timing, and the Status Surface
 
-> **STATUS — implemented.** All five phases in §10's work breakdown have shipped: every stream now
-> runs through a procedural collector (or names, in its own module docstring, exactly which of its
-> checks it does not cover and why), native timing rides `finish`'s exit JSON and the status
-> ConfigMap, and `make fleet-audit-view` renders it. Two pieces are deliberately not done, each
-> with its reasoning recorded where it applies rather than here: `stockout-prevention`'s two
-> beta-API/internal-log-schema checks stay prose-only (§10 phase 4), and §4.7's `AuditSpec`
-> consolidation is deferred (§10 phase 5). [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md)
+> **STATUS — implemented through phase 5.** Phases 1–5 of §10's work breakdown have shipped:
+> every stream now runs through a procedural collector (or names, in its own module docstring,
+> exactly which of its checks it does not cover and why), native timing rides `finish`'s exit
+> JSON and the status ConfigMap, and `make fleet-audit-view` renders it. Phase 6 — §4.8's local
+> report store, which also retires the ledger-body read-back — is designed here and not yet
+> started. Two pieces are deliberately not done, each with its reasoning recorded where it
+> applies rather than here: `stockout-prevention`'s two beta-API/internal-log-schema checks
+> stay prose-only (§10 phase 4), and §4.7's `AuditSpec` consolidation is deferred (§10 phase
+> 5). [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md)
 > remains the design of record for the reporting half — the ledger, delta, and promotion
-> contracts — which this document amends in exactly one place, named in **Builds on** below.
+> contracts — which this document amends in exactly two places, named in **Builds on** below.
 
 **Scope:** How the eight audit streams execute their checks, how long a run takes and where the
-time goes, how an operator sees any of it without reading eight GitHub issues, and what it costs
-to add a ninth stream.
+time goes, how an operator sees any of it without reading eight GitHub issues, what it costs to
+read a run's findings back after it publishes, and what it costs to add a ninth stream.
 **Builds on:** [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) — still authoritative
-for the ledger, delta, promotion, and rendering contracts, with one amendment this design makes
-in the same PR that needs it: its §6 "nine keys, always all nine" exit-contract sentence gains
-the duration keys of §4.4. Also builds on the status-ConfigMap pattern of the self-improvement
+for the ledger, delta, promotion, and rendering contracts, with two amendments this design
+makes, each shipping in the PR that first needs it: its §6 "nine keys, always all nine"
+exit-contract sentence gains the duration keys of §4.4, and §4.8 re-points the delta's
+previous-run memory from the ledger
+body's hidden block to the on-pod report store (the block itself keeps being published — §4.8
+says why). Also builds on the status-ConfigMap pattern of the self-improvement
 loop (PR [#965](https://github.com/gke-labs/kube-agents/pull/965) — cited as the pattern's
 provenance, not as a merge dependency; its details may move with its review).
 **Line references** are to `c0eff3d8` and will drift; identifiers are the stable handles.
@@ -96,7 +101,7 @@ Three statements the rest of the design follows from:
 
 ## 3. Target model
 
-Five changes, separable and independently shippable (§10):
+Six changes, separable and independently shippable (§10):
 
 1. **A per-stream procedural collector** executes every mechanical check itself — enumerating
    the fleet, fetching credentials, dumping state behind fail-closed gates, running the filters,
@@ -116,15 +121,20 @@ Five changes, separable and independently shippable (§10):
 5. **One stream manifest** (§4.7): the per-stream facts collapse into a single declaration the
    roster, cron entry, collector table, and generated docs all derive from, so adding a stream
    stops touching ten artifacts.
+6. **A local report store** (§4.8, not yet implemented): `finish` keeps the document it just
+   published — `latest.json` plus a short per-stream history ring on the PVC — so the chat
+   agent answers "what did the audit find?" and "what changed?" from structured local files
+   instead of a `gh issue view` and prose re-parsing, and `finish`'s own delta stops
+   round-tripping its previous-run memory through the ledger body's hidden block.
 
 What stays LLM, deliberately: triage of the 18 exception classes; GitOps declaration discovery
 and manifest authoring; the three-field `recommendation` prose the validator requires non-empty
 (`RECOMMENDATION_FIELDS`, `audit_report.py:246-254` — the validator enforces presence, the SOP
 enforces quality); `limitations` prose for failures nobody anticipated. What stays exactly as it
-is: everything in [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) except the §6
-exit-payload amendment named in the header — one ledger issue per stream, generated bodies, the
-delta marker, branch-name PR identity, hidden idempotency markers, promotion gating, `silent_ok`
-computed in code.
+is: everything in [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) except the two
+amendments named in the header — one ledger issue per stream, generated bodies, the delta
+marker as a _published_ block (§4.8 retires only its read-back), branch-name PR identity,
+hidden idempotency markers, promotion gating, `silent_ok` computed in code.
 
 ## 4. Decisions
 
@@ -277,8 +287,10 @@ suite is key-based and survives additive keys.
 _Rejected alternative:_ exporting metrics (Prometheus, OpenTelemetry) from the harness. §14 of
 the design of record rejected a metrics pipeline for run liveness because the ledger design
 "deliberately holds" the boundary that its only state store is GitHub and its only runtime is a
-subprocess. Nothing here re-litigates that: a scratch file, a JSON manifest, and two numbers in
-an exit payload add no collector daemon and no scrape target. Operators who want dashboards can
+subprocess. Nothing in this section re-litigates that: a scratch file, a JSON manifest, and two
+numbers in an exit payload add no collector daemon and no scrape target. The one deliberate
+exception in this design is §4.8's report store, which does carry the delta's memory on the
+PVC — Q5 prices that openly rather than folding it in here. Operators who want dashboards can
 build them on the ConfigMap.
 
 ### 4.5 The status ConfigMap: observability-only, sidecar-written, chart-owned
@@ -419,7 +431,8 @@ with three flags the raw data cannot be trusted without: **stale** (now is past 
 expected fire plus slack, from the schedule — a silent stream is rendered loudly, closing the
 observation hole the ledger design's §14 conceded), **died mid-run** (the latest row is a
 `started` stub _and_ now is past the next expected fire — the same staleness math, so a
-healthy in-flight run never trips it; `died`-marked rows in `runs` carry the history), and
+healthy in-flight run never trips it; the on-PVC cron executions ledger carries the history of
+dead runs, not this object, whose schema keeps a single `last` row), and
 **partial** (`⚠`, coverage gaps named below the table). Unknown status values render in the
 warning colour, never the success one. Enabled/schedule come from the checked-in seed roster
 (`agents/platform/cron/jobs.json`) with a `--roster` flag for a live runtime dump — the seed
@@ -441,6 +454,105 @@ its per-check prose, and `make docs-generate` picks up the stream tables it curr
 hand editing. The five in-flight stream PRs get a migration note, not a rebase demand: their
 SOPs and rosters port as-is; their bespoke collector scripts are re-homed onto the framework
 when each lands.
+
+### 4.8 A local report store, and the ledger read-back retired
+
+**Designed, not yet implemented — §10 phase 6.**
+
+Two costs share one cause. A user asking the chat agent "what did the last compliance audit
+find?" or "what changed since last week?" costs a `gh issue view` plus model turns re-parsing
+rendered prose back into facts the harness held in structured form seconds before it published —
+the findings document survives only until the next run overwrites `findings_<audit>.json` in
+scratch, so the prose on GitHub is the only copy left, and the ledger rewrites itself in place,
+so run-over-run comparison has no source at all. And `finish` itself re-fetches the previous
+ledger body every run to parse its own breadcrumb back out of it — the hidden
+`<!-- audit-findings: … -->` block is the delta's only memory of the previous run's ids. Both
+are the same missing thing: the run's structured output, kept where it was produced.
+
+`finish` therefore keeps what it publishes. On the exit-0 path — CLEAN and findings branches
+alike, never on `--dry-run`, never after a validation failure, and not from `remediate`, which
+changes no findings — it writes, atomically (`os.replace` from a temp file in the same
+directory), under `${HERMES_HOME:-/opt/data}/fleet-audit/reports/<audit-id>/`:
+
+- `runs/<finished-at, UTC, filename-safe>.json` — an envelope carrying the run's outcome
+  (`status`, `issue_number`, `issue_url`, `partial`, `coverage_gaps`), its three durations
+  (`collect_s`/`inspect_s`/`publish_s`, each exactly as the exit payload carried them —
+  `collect_s` is null on a manifest-less run, per §4.4), the delta as id **lists** rather than
+  counts (`new_ids`, `resolved_ids`, `current_ids`, plus `id_scheme` — `current_ids` is the
+  **rendered** set, exactly what the body's hidden block published, because the delta join is
+  rendered-vs-rendered and the full set is derivable from `document`), and the full validated
+  findings document under `document` — the exact post-validation, post-degradation document
+  the ledger rendered, so the `document` key never holds anything the public issue did not
+  publish.
+- `latest.json` — a byte-identical copy of the newest envelope. A copy, not a symlink: one
+  fewer behaviour to ask of the 9p mount, for zero saved bytes.
+
+`runs/` prunes at write time to the newest 14 — two weeks of a daily stream, a quarter of a
+weekly one; at the ledger's own 60k-character body ceiling that bounds the store near 1 MB per
+stream, ~8 MB fleet-wide, noise on the PVC. The write is best-effort under exactly the status
+writer's discipline: a store that cannot be written logs a WARNING and never changes the
+current run's exit code — the cost lands on the _next_ run's delta, which degrades as below.
+
+**Reader one: the chat path.** An agent answering a question about a stream reads
+`latest.json`, where every fact it needs is a key rather than a paragraph, and answers a "what
+changed" question by comparing two files in `runs/` — the ring is the only place run-over-run
+documents exist anywhere, because the ledger overwrites itself. The fleet-audit SKILL.md gains
+a short section naming the layout. The store is invisible off-pod by design: run _health_
+off-pod is the status ConfigMap's job (§4.5), findings off-pod are the ledger's, and this
+store is the on-pod answer for the agent that lives beside it.
+
+**Reader two: `finish`'s own delta.** The previous run's ids come from `latest.json` when it
+is trustworthy — its `issue_number` matches the ledger `find_existing_issue` just returned and
+its `id_scheme` matches the code's — and the previous body is then not fetched at all. When no
+open ledger exists, the run is genuinely first and everything present is new, exactly as
+today. The remaining case — a ledger exists but the store is absent (wiped PVC), mismatched (a
+ledger this pod did not write), or scheme-stale — keeps the distinction the code already draws
+for an unreadable body: an _unknowable_ memory is not an _empty_ one. `fetch_issue_body`'s own
+docstring refuses to conflate them ("treating it as empty would announce every live finding as
+new"), and `delta_known` carries the refusal: the run publishes its findings with **no delta
+claim at all** — `new: 0`, `resolved: 0`, the delta comment skipped, a log line saying the
+memory was lost. §4.8 re-points that existing machinery's trigger from "the body fetch failed"
+to "the store is untrusted"; the semantics of a lost memory do not change, and a wiped PVC can
+never put a wrong count in a public issue — it costs one cycle of delta annotation, restored
+by the write that same run makes. One deliberate simplification rides along: a scheme-stale
+memory today earns its own three-way special case — new findings still announced, only
+`resolved` withheld, and the CLEAN branch ignoring the scheme on purpose — which this design
+collapses into the same no-claim triad. An id-scheme bump is a rare, code-authored event, and
+one lost-memory semantics is worth more than that preserved corner, so the in-code
+`stale_scheme` machinery is deleted alongside the read-back. With the read-back gone,
+`fetch_issue_body`, `parse_finding_titles` (resolved-finding titles now ride the stored
+previous document — they name resolved findings in the delta comment and in stale-PR close
+comments, and with no trusted store both degrade exactly as today's unreadable-body path
+does), and the ledger-body `parse_delta_block` call are deleted — not kept as a fallback. Two
+memories with a precedence rule is how a divergence becomes undetectable, and the one failure
+a fallback would save — a wiped PVC's single annotation-less cycle — is cheaper than the
+second mechanism.
+
+**What the hidden block becomes — published interface, not plumbing.** The
+`audit-findings`/`audit-id-scheme` block stays in every ledger body, unchanged, because it was
+never only `finish`'s round-trip state: it is the body's machine-readable contract.
+`bench/kube_agents_bench/verifiers.py` grades every audit eval by parsing the ids out of the
+published body, `bench/CUSTOM-TASKS.md` documents that as the task-author interface, and the
+block is the one way a human or an external tool recovers a run's id set from the artifact
+itself with no pod access. What retires is the harness treating a public issue body as its own
+database — the write stays, the read-back goes. The identical block in remediation-PR bodies
+keeps both its write and its read: a pull request self-describing which findings it was opened
+for is what lets reconciliation work from the live PR list alone, and that list must come from
+GitHub regardless, because humans merge and close PRs between runs.
+
+_Rejected alternatives:_ the **status ConfigMap** as the store — findings documents at
+60k-character scale, times eight streams, times history, is the wrong side of etcd's 1 MiB
+object cap by an order of magnitude, and §4.5 pinned that surface observability-only the day
+it shipped. A **SQLite ring** beside `executions.db` — the natural unit is one whole document
+per run, a blob the agent reads with `jq`, not rows that any query would need to join, and a
+second database on the 9p-mounted PVC buys nothing but the WAL-journal corruption class such
+mounts are known to provoke. **Committing reports into the GitOps repo** — durable and
+`git diff`-able, but it writes machine telemetry into the _user's_ repository, a commit per
+stream per day with Config Sync/Argo churn on each, and a network read is what the store
+exists to remove. **Keeping the ledger read-back as a fallback** — rejected above, in the
+delta paragraph. **Removing the hidden block from bodies entirely** — breaks the bench
+verifiers and every external consumer of the published interface; the block's cost is a few
+invisible lines in a generated body, and its read-back was the only part worth retiring.
 
 ## 5. What the turn budget becomes
 
@@ -568,6 +680,15 @@ with redaction as backstop. New ones:
   rendering decision may read it, and a failed status write never changes a subcommand's exit
   code or behaviour. The moment it becomes load-bearing it is a second source of truth and the
   ledger design's §14 rejection applies in full.
+- **The report store (§4.8) carries exactly one input: the previous run's rendered ids and
+  finding titles — and nothing it carries ever gates.** Its two consumers annotate: the delta
+  (counts and comment) and the resolved-finding names in stale-PR close comments. Staleness
+  itself is judged from each PR body's own block, findings and promotion and dedup never read
+  the store, and no other rendered text comes from it. A failed store _write_ never changes
+  the current run's exit code — the cost lands on the next run's delta, which makes no claim
+  and logs why. And the ledger body's hidden block keeps being written whether or not the
+  store exists, because it is bench's grading interface and the body's published contract,
+  not a fallback memory.
 - **The status write reaches Kubernetes only through the sidecar's own internal endpoint,
   never through the agent-facing `kubectl`/`gcloud` policy.** `command_policy.py` gains no
   exception, no new verb, no resource-name awareness — this feature does not touch it, and
@@ -609,6 +730,17 @@ with redaction as backstop. New ones:
 - **A timing regression case in bench**: the eval harness already grades audits against the
   ledger; add the run-duration assertion once instrumentation lands so #985's table becomes a
   tracked number instead of a one-off.
+- **Report-store tests (§4.8, with phase 6)**: the envelope is written only on the exit-0
+  publish path — never on `--dry-run`, a validation failure, or `remediate`; the write is
+  atomic and its failure logs a WARNING without touching the exit code; `runs/` prunes to the
+  newest 14 and `latest.json` stays byte-identical to the newest ring entry; an envelope pin
+  test so a key rename fails in CI rather than in a chat session. Delta-memory tests: the
+  store is trusted only when `issue_number` and `id_scheme` both match; with no open ledger,
+  first-run semantics exactly as today; with an open ledger and an absent, mismatched, or
+  scheme-stale store, the run makes no delta claim (`delta_known` false — `new: 0`,
+  `resolved: 0`, delta comment skipped) and logs the lost memory; the happy path issues no
+  previous-body fetch at all; and the bench verifier fixtures stay untouched — the published
+  body still carries the block they parse.
 
 ## 10. Work breakdown
 
@@ -704,6 +836,20 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
    a permanent guard — the two real staleness incidents to date were both caught by inspection,
    not a missing mechanism, and a fragile heuristic guard would trade a rare manual sweep for a
    standing maintenance cost. Revisit §4.7 if a ninth stream is actually proposed.
+6. **Not started. Local report store and ledger read-back retirement** (§4.8) — the
+   `finish`-side store writer (envelope, history ring, atomic replace, best-effort
+   discipline), the delta re-pointed at the store — `delta_known`'s trigger moving from "the
+   body fetch failed" to "the store is untrusted", per §4.8 — deletion of `fetch_issue_body`,
+   `parse_finding_titles`, the `stale_scheme` machinery (§4.8's scheme-stale simplification),
+   and the ledger-body `parse_delta_block` call (the function itself
+   stays — remediation-PR bodies still use it), the SKILL.md section naming the store layout
+   for the chat path, and the ledger design doc's delta-memory amendment in the same PR, per
+   **Builds on**. The body's hidden block keeps being written — bench grades against it. One
+   deliberate rollout cost: the first run after this ships (and after any PVC loss) finds an
+   open ledger and no store, so each stream publishes once with no delta annotation —
+   `new: 0`, `resolved: 0`, comment skipped, logged — and that same run's store write restores
+   the delta from the next run on; keeping the old parse as a one-release migration seed was
+   rejected as dead code in waiting for a transition this mild.
 
 ## 11. Files touched
 
@@ -714,6 +860,7 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
 | SOPs      | all eight in `agents/platform/governance/` (shrink per §7), `agents/platform/cron/jobs.json` (prompts)                                                                                                                                                                                                                                                                                   |
 | Proxy     | `agents/platform/scripts/credential_proxy.py` — one new internal route (`_handle_fleet_audit_status`) and its tests; `command_policy.py` untouched                                                                                                                                                                                                                                       |
 | Chart     | `charts/kube-agents/templates/fleet-audit-status.yaml` (new): status ConfigMap + Role/RoleBinding on the pod's existing KSA — no new values, no operator change                                                                                                                                                                                                                          |
+| Store     | (§4.8, phase 6, not started) `audit_report.py` — store writer, delta re-pointed at the store, ledger-body read-back deleted; `test_audit_report.py`; the fleet-audit `SKILL.md` reading section; `fleet-audit-issue-ledger.md`'s delta-memory amendment                                                                                                                                  |
 | View      | `scripts/fleet_audit_status_view.py` (new), `Makefile`, tests (new)                                                                                                                                                                                                                                                                                                                      |
 | Docs      | this file's row in `docs/README.md`; `fleet-audit-issue-ledger.md` §6 exit-contract sentence; SKILL.md payload/field-count text; the stale stream-count pages named in §10 phase 5; generated regions via `make docs-generate`                                                                                                                                                           |
 
@@ -743,12 +890,28 @@ third-party module. The harness holds every field at exactly the moment they are
 `started` stub covers the died-before-finish case the harness alone would otherwise miss; the
 cron envelope itself stays on-pod (§4.4, §13).
 
+**Q5. The delta's memory moves from the ledger body to the PVC (§4.8) — is that the
+state-outside-GitHub that §14 rejected?**
+_Resolved:_ it is the nearest this design comes to it, and it is accepted with eyes open rather
+than argued away. What keeps it inside the line: findings are recomputed from live clusters
+every run, so no finding — and no false clean — can ever depend on the store; what degrades
+when the store is lost is the delta family of outputs — counts, comment, the resolved names
+in stale-close comments, and a clean run's resolved tally, which can then read silent — and
+every one degrades to silence-about-the-delta, not to a wrong claim. §4.8 reuses the
+`delta_known` semantics the code already applies to an unreadable body, so a lost memory
+publishes no delta rather than announcing everything as new (the history ring's shorter reach
+after a wipe is a chat-path cost, priced in §13, not an audit one). And the ids remain
+recoverable from GitHub by a human, because the ledger body keeps publishing the hidden block
+(§4.8): the code stops round-tripping it, the artifact stays self-describing.
+
 ## 13. Accepted risks
 
-- **Non-collector streams keep the attestation gap** until phase 4 lands. _Why accepted:_ the
-  gap is today's steady state, and the phased order front-loads the two measured streams. _What
-  it costs:_ the 2026-08-03 class stays possible on unconverted streams. _What would change it:_
-  nothing; convert the streams.
+- **The attestation gap survives where no collector reaches.** With phase 4 complete that is
+  `stockout-prevention`'s two prose-only checks and any cluster on the manual fallback after a
+  gate failure. _Why accepted:_ the two checks' API and log-schema shapes are unverified (§10
+  phase 4), and the manual fallback is deliberate (§6). _What it costs:_ the 2026-08-03 class
+  stays possible in exactly those corners. _What would change it:_ verifying the two shapes
+  against a live cluster and converting the checks.
 - **The view's schedule column can lie about runtime state.** It reads the checked-in seed
   roster by default; a stream disabled at runtime shows `enabled` until `--roster` is pointed at
   a live dump. _Why accepted:_ the alternative is the view exec-ing into the pod by default,
@@ -769,13 +932,16 @@ cron envelope itself stays on-pod (§4.4, §13).
 - **The ConfigMap can be deleted or corrupted by an operator.** _Why accepted:_ it is
   telemetry, and a wipe loses only the last recorded row per stream — the next run's write
   replaces it. _What would change it:_ nothing — that property is the argument for Q2.
-- **No per-stream run history.** Each write replaces `last` wholesale; there is no `runs` log
-  to look back through if a stream's timing regresses gradually. _Why accepted:_ nothing reads
-  history today, and building it against no consumer is exactly the kind of code this design's
-  premise (§2, point 2 — move deterministic work out where it earns its keep, not everywhere)
-  argues against. _What it costs:_ a trend question needs the ledger issues' own dated history
-  instead. _What would change it:_ a concrete reader for it — a duration-regression check in
-  bench (§9), say — landing first.
+- **No per-stream run history in the ConfigMap.** Each write replaces `last` wholesale; there
+  is no `runs` log in the status object to look back through if a stream's timing regresses
+  gradually. _Why accepted:_ nothing reads history off-pod today, and building it against no
+  consumer is exactly the kind of code this design's premise (§2, point 2 — move deterministic
+  work out where it earns its keep, not everywhere) argues against. _What it costs:_ an
+  off-pod trend question needs the ledger issues' own dated history. _What would change it:_ a
+  concrete off-pod reader landing first. On-pod, §4.8's `runs/` ring is that concrete reader
+  arriving: each envelope carries the run's three durations, so once phase 6 ships, a trend
+  question asked _of the agent_ has a structured source — the ConfigMap row itself still
+  deliberately keeps none.
 - **A write that loses a race with its own successor is simply overwritten, not detected.**
   There is no read-before-write, so two calls for the same stream in quick succession (a hung
   run's `finish` racing the next day's `start`) leave whichever POST's response the sidecar
@@ -783,3 +949,20 @@ cron envelope itself stays on-pod (§4.4, §13).
   closest observed schedule gap) and the cost of losing is one stale row for one cycle, self-
   healing at the next run — far cheaper than the read-modify-write machinery avoiding it would
   cost. _What would change it:_ evidence that this actually happens in practice.
+- **The report store dies with its PVC, and the delta forgets with it (§4.8, phase 6).** A
+  wiped or recreated PVC empties the store; each stream's next run publishes once with no
+  delta annotation (§4.8's lost-memory semantics) and repopulates the store as it does.
+  _Why accepted:_ a lost memory makes no claim rather than a wrong one, and the ledger stays
+  authoritative throughout. _What it costs:_ one annotation-less cycle per stream per wipe —
+  including a clean run that reports `resolved: 0` and can go silent on what would have been
+  its best news — and a history ring that starts over, so "what changed?" reaches back only
+  to the wipe.
+  _What would change it:_ evidence of frequent PVC loss on production installs, at which
+  point a one-time seed parsed from the ledger's still-published block is the cheap recovery
+  to add.
+- **The store shows the last published state, not the live issue (§4.8, phase 6).** A human
+  who edits the ledger body after a run changes what GitHub shows and not what the chat agent
+  quotes from `latest.json`, until the next run overwrites both. _Why accepted:_ ledger
+  bodies are generated and rewritten in place every run — a hand edit was already a one-cycle
+  artifact before this store existed, and hand-editing is not a supported workflow. _What
+  would change it:_ it becoming one, which the ledger design already rejects.
