@@ -11,6 +11,15 @@ This stream's own collector: its targets are both GKE clusters (ten
 so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 
+§1 scopes this to "every project the agent can see", so a bare invocation
+discovers every project with at least one cluster the same way
+`patch_readiness.py`'s `get_target_projects` does for its sibling stream,
+rather than auditing only the active gcloud project; `--project` overrides
+discovery for a scoped run. Project-scoped facts (live PV handles, Service
+names, referenced addresses) are unioned only across the clusters in the
+same project before that project's disk/address/LB checks run — a project
+never sees another project's cluster state.
+
 **The "hoisted sampling" this file is named for in the design's §10 work
 breakdown:** §2 requires three `kubectl top` samples five minutes apart per
 cluster — a real ten-minute wall-clock cost no amount of procedural code
@@ -41,7 +50,12 @@ from typing import Callable, NamedTuple
 MANIFEST_VERSION = 1
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
-MAX_WORKERS = 8
+# A ceiling, not a target: `collect_fleet` sizes its pool to the fleet
+# itself (one worker per cluster) up to this bound, so every cluster's
+# ~10-minute sampling window runs concurrently rather than queuing behind
+# an earlier one. This only throttles a fleet larger than this many
+# clusters.
+MAX_WORKERS = 64
 SAMPLE_COUNT = 3
 SAMPLE_INTERVAL_S = 300
 
@@ -125,6 +139,33 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
     return kc, result
 
 
+def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
+    """§1's project scope: "every project the agent can see". A `--project`
+    override skips discovery entirely, for a scoped or a test run; otherwise
+    this discovers the active project plus every other project with at
+    least one cluster, the same way `patch_readiness.py`'s
+    `get_target_projects` does for its own sibling stream."""
+    if cli_project:
+        return [cli_project]
+
+    result = run(["gcloud", "config", "get-value", "project"])
+    base = result.stdout.strip() if result.rc == 0 else ""
+    projects = [base] if base else []
+
+    _, list_result = run_and_gate(["gcloud", "projects", "list", "--format", "value(projectId)"], run=run)
+    if list_result.rc != 0:
+        return projects  # discovery unavailable; the base project is the whole scope
+
+    candidates = [p.strip() for p in (list_result.stdout or "").splitlines() if p.strip() and p.strip() != base]
+    for candidate in candidates:
+        parsed, _ = run_and_gate(
+            ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
+        )
+        if parsed:
+            projects.append(candidate)
+    return projects
+
+
 def enumerate_clusters(project: str, *, run: RunFn) -> list[dict]:
     result = run(
         ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"]
@@ -156,6 +197,7 @@ def parse_cpu_cores(s: str) -> float | None:
 
 
 MEM_UNIT_TO_MIB = {"Ki": 1 / 1024, "Mi": 1.0, "Gi": 1024.0, "Ti": 1024.0 * 1024.0}
+BYTES_PER_MIB = 1024.0 * 1024.0
 
 
 def parse_mem_mib(s: str) -> float | None:
@@ -163,7 +205,13 @@ def parse_mem_mib(s: str) -> float | None:
     if not m:
         return None
     value, unit = m.groups()
-    return float(value) * MEM_UNIT_TO_MIB.get(unit, 1.0)
+    if unit is None:
+        # A Kubernetes resource.Quantity with no suffix is a byte count
+        # (e.g. a container's `resources.requests.memory: "134217728"`),
+        # never MiB -- treating it as already-MiB overstates a bare-byte
+        # request by a factor of 2^20.
+        return float(value) / BYTES_PER_MIB
+    return float(value) * MEM_UNIT_TO_MIB[unit]
 
 
 def parse_top_pods(text: str) -> dict[tuple[str, str], tuple[float, float]]:
@@ -946,44 +994,64 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sleep: SleepFn = time.sleep, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    resolved_project = project
-    if not resolved_project:
-        result = run(["gcloud", "config", "get-value", "project"])
-        resolved_project = result.stdout.strip() if result.rc == 0 else ""
 
-    clusters = enumerate_clusters(resolved_project, run=run)
+    projects = get_target_projects(project, run=run)
+
+    clusters: list[dict] = []
+    for p in projects:
+        try:
+            clusters.extend(enumerate_clusters(p, run=run))
+        except RuntimeError as exc:
+            log(f"{p}: cluster enumeration failed, skipping project this run: {exc}")
+
     results: list[tuple[dict, dict]] = [None] * len(clusters)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    # `max_workers` is a ceiling, not a fixed pool size: every cluster's
+    # ~10-minute sampling window must run concurrently with every other
+    # cluster's, or the fleet's tail past the Nth cluster silently queues
+    # behind the front, defeating the "hoisted sampling" concurrency this
+    # file exists for. Size the pool to the fleet itself, up to that ceiling.
+    with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
         futures = {pool.submit(collect_cluster, c, run=run, sleep=sleep, now=now): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
 
-    cluster_entries = [entry for entry, _ in results]
-    all_reachable = bool(cluster_entries) and all(e["outcome"] == "collected" for e in cluster_entries)
-    # Union every cluster's live objects before running the project-scoped
-    # checks: a disk's backing PV, the Service a forwarding rule targets, or
-    # the Service an address annotation names can live on any cluster in
-    # the project, not necessarily the one whose collection happened to run
-    # first.
-    fleet_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
-    for _, facts in results:
-        for key in fleet_facts:
-            fleet_facts[key] |= facts[key]
+    # Group per project: the "all reachable" gate for orphan-lb (§3.6) and
+    # the cross-cluster fact union it and the disk/address checks read are
+    # each scoped to one project, per the SOP's own per-project Do-NOT-flag
+    # rule -- a cluster unreachable in project A must not suppress project
+    # B's checks, and a PV handle from project A's cluster must not suppress
+    # a genuinely unattached disk in project B.
+    by_project: dict[str, list[tuple[dict, dict]]] = {}
+    for cluster, result in zip(clusters, results):
+        by_project.setdefault(cluster["project"], []).append(result)
 
-    project_entry = collect_project_compute(resolved_project, all_reachable, fleet_facts, run=run, now=now)
+    cluster_entries: list[dict] = []
+    project_entries: list[dict] = []
+    for p in projects:
+        group = by_project.get(p, [])
+        group_entries = [entry for entry, _ in group]
+        cluster_entries.extend(group_entries)
+        all_reachable = bool(group_entries) and all(e["outcome"] == "collected" for e in group_entries)
+        fleet_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
+        for _, facts in group:
+            for key in fleet_facts:
+                fleet_facts[key] |= facts[key]
+        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now)
+        if project_entry:
+            project_entries.append(project_entry)
 
     return {
         "version": MANIFEST_VERSION,
         "audit": "fleet-wide-cost-analysis",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": [e for e in cluster_entries if e] + ([project_entry] if project_entry else []),
+        "clusters": cluster_entries + project_entries,
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="project to audit; omit to use the active gcloud project")
+    parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
     args = parser.parse_args(argv)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))

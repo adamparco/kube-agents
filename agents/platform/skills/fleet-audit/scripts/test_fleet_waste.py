@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,9 @@ class ParseCpuMemTest(unittest.TestCase):
 
     def test_kibibytes(self):
         self.assertAlmostEqual(fw.parse_mem_mib("2048Ki"), 2.0)
+
+    def test_bare_number_is_bytes_not_mebibytes(self):
+        self.assertAlmostEqual(fw.parse_mem_mib(str(512 * 1024 * 1024)), 512.0)
 
     def test_unparseable_is_none(self):
         self.assertIsNone(fw.parse_cpu_cores("garbage"))
@@ -639,6 +643,151 @@ class CollectClusterTest(unittest.TestCase):
         entry, facts = self.run_with(dump_items=[pv, svc])
         self.assertIn("d1", facts["pv_handles"])
         self.assertIn("default/web", facts["service_names"])
+
+
+class FleetSamplingConcurrencyTest(unittest.TestCase):
+    def test_pool_scales_to_the_fleet_not_a_fixed_cap(self):
+        """A fleet bigger than the old fixed cap of 8 must still sample
+        every cluster concurrently -- a `threading.Barrier` sized to the
+        fleet only ever releases if that many clusters are genuinely
+        in-flight at once; if the pool caps out early, the excess clusters
+        never reach the barrier and every waiter times out."""
+        cluster_count = 12
+        clusters_json = json.dumps(
+            [
+                {"name": f"c{i}", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                for i in range(cluster_count)
+            ]
+        )
+        barrier = threading.Barrier(cluster_count, timeout=2)
+
+        def sleep_fn(_seconds):
+            barrier.wait()
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if "top" in argv and "nodes" in argv:
+                return run_of(0, "")
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, sleep=sleep_fn, now=NOW)
+
+        self.assertEqual(len({c["name"] for c in manifest["clusters"]} & {f"c{i}" for i in range(cluster_count)}), cluster_count)
+
+
+class GetTargetProjectsTest(unittest.TestCase):
+    def test_project_override_skips_discovery(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"unexpected discovery call: {argv}")
+
+        self.assertEqual(fw.get_target_projects("acme-only", run=run), ["acme-only"])
+
+    def test_discovers_every_project_with_a_cluster(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nother\nempty\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                return run_of(0, json.dumps([{"name": "c1"}]) if project == "other" else "[]")
+            raise AssertionError(argv)
+
+        self.assertEqual(fw.get_target_projects(None, run=run), ["acme", "other"])
+
+    def test_project_list_failure_falls_back_to_the_base_project(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(1, "", "permission denied")
+            raise AssertionError(argv)
+
+        self.assertEqual(fw.get_target_projects(None, run=run), ["acme"])
+
+
+class MultiProjectCollectFleetTest(unittest.TestCase):
+    def test_discovers_and_audits_every_project_with_a_cluster(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                name = "c1" if project == "acme" else "c2"
+                cluster = {"name": name, "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if "top" in argv and "nodes" in argv:
+                return run_of(0, "")
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(None, run=run, sleep=lambda s: None, now=NOW)
+
+        names = {c["name"] for c in manifest["clusters"]}
+        self.assertEqual(names, {"c1", "c2", "project/acme", "project/beta"})
+
+    def test_cross_project_facts_do_not_leak(self):
+        """A PV handle live in project acme's cluster must not suppress a
+        genuinely unattached disk of the same name in project beta -- the
+        cross-cluster fact union is scoped per project, not fleet-wide.
+        Beta gets its own (PV-less) cluster so project discovery includes
+        it at all; a project with zero clusters is out of scope entirely,
+        matching `patch_readiness.py`'s sibling discovery rule."""
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                name = "c1" if project == "acme" else "c2"
+                cluster = {"name": name, "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                kc = str(kwargs.get("env", {}).get("KUBECONFIG", ""))
+                if "_acme_" in kc:
+                    pv = obj("PersistentVolume", "pv1", **{"spec.csi": {"volumeHandle": "projects/acme/disks/shared-disk-id"}})
+                    return run_of(0, json.dumps(dump_of(pv)))
+                return run_of(0, json.dumps(dump_of()))
+            if "top" in argv and "nodes" in argv:
+                return run_of(0, "")
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                project = argv[argv.index("--project") + 1]
+                if project == "beta":
+                    disk = {"name": "shared-disk-id", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "z"}
+                    return run_of(0, json.dumps([disk]))
+                return run_of(0, "[]")
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(None, run=run, sleep=lambda s: None, now=NOW)
+
+        beta_entry = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
+        self.assertIn("unattached-disk", {c["check"] for c in beta_entry["candidates"]})
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
