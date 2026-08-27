@@ -55,6 +55,8 @@ kube-agents/
 │   │                                              collapsed family's members
 │   ├── architecture/                              END-STATE spec set 01–08 + README
 │   ├── designs/                                   per-feature design documents
+│   │   └── broker/                                action-broker module design set
+│   │                                              + verbatim spec/ series (00–09)
 │   ├── contributing.md, security-requirements.md,
 │   │   credential-isolation-design.md,
 │   │   pull-request-workflow.md                   standalone docs
@@ -67,7 +69,9 @@ kube-agents/
 ├── scripts/release/                               Release Candidate automation scripts README
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
-└── tests/e2e/                                     Google Chat E2E suite README
+├── tests/e2e/                                     Google Chat E2E suite README
+└── verification/                                  action-broker test fixtures
+                                                   (envelope corpus README)
 ```
 
 The published documentation site is built from `docs/site/src/content/docs/`
@@ -273,6 +277,9 @@ pull request:
 | `docs/designs/agent-communication.md` | Feature design | How the Platform Agent and per-cluster subagents exchange information: a file-based typed handover channel plus optional kanban delegation. | Blackboard model, record envelope, `write_handover` tool | Design of record; NOT yet implemented (banner in file) |
 | `docs/designs/admin-console.md` | Feature design | Product and implementation design for the Kube Agents Console, including its shared FastAPI chat abstraction, Streamlit composition, authenticated interaction API, activity, connection, and Kanban read models. | Admin UX, asynchronous interactions, API contract, correlation, security boundaries | Local implementation; shared proxy API and production hardening planned |
 | `docs/designs/audit-logging-user-attribution.md` | Feature design | Closes the gap where audit logs identify the agent SA but not the requesting human, by carrying requester and trace/session IDs through existing telemetry. | Attribution contract per plane, correlation recipes, trust model | Draft, P0; per-plane implemented-vs-planned split declared inline |
+| `docs/designs/broker/*.md` | Feature design family | The action broker as an independent module: charter and boundary (README), the module as built on the `broker` branch (architecture), the approval-through-chat loop against the current chat stack (chat-approval), and the escalation and adoption seams into the shipping operator (integration). | Escalation model, risk classes, gated actions, `ApprovalRoster`, ChatOps gateway, credential-proxy seam | Design of record for the `broker` branch; chat approval and reconciler wiring designed, not built |
+| `docs/designs/broker/spec/*.md` | Inherited spec family | The original Phase 0–9 design series (01–09 plus its series README), preserved verbatim from the pre-reset history because broker code comments and one test cite its section numbers. | Envelope contract, risk classification, brake rows, undo strategy table, verification catalogue | Frozen; provenance and reading order in `spec/README.md`; `TestTheReservedKeyListIsTheOneTheSpecPublishes` parses 06 §4.1 as data |
+| `verification/fixtures/envelopes/README.md` | Component README | The action-broker envelope fixture corpus: valid, malformed, and spoofing envelopes whose filenames carry the exact refusal reason the broker must return. | Fixture naming convention as assertion, three fixture kinds | Read by the broker package tests; the contract itself is `docs/designs/broker/spec/06-api-and-data-contracts.md` §4.1 |
 | `docs/designs/cron-report-relay.md` | Feature design | How a scheduled job's result reaches chat with the context a follow-up question needs: the specialist reasons, hands its finished report to the Chat Agent over the Session KV server, and the Chat Agent speaks. | `deliver: "chat"`, `/v1/cron-reports`, relay turn, per-job-per-day session, `incident_context`, `report_to_chat` | Implemented; the whole Platform Agent roster delivers this way |
 | `docs/designs/design_537148738.md` | Feature design | Technical design proposal for CI/CD pipeline security scanning and dependency management (Buganizer Task 537148738). | Action SHA pinning, output encapsulation, security scanning, Dependabot | Implemented (design of record) |
 | `docs/designs/drift-detection.md` | Feature design | Design of record, not yet implemented. Splits drift into computing the diff (commoditized) and judging it (the differentiator); enters the shipped pipeline as a `gitops-drift` inject. | `managedFields` + audit-log attribution, revert-or-codify, CUJ selection | Status banner declares it unimplemented; no GitOps tool required |

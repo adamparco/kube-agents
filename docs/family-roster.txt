@@ -126,6 +126,25 @@ agents/platform/skills/*/references/*.md
   agents/platform/skills/gke-upgrades/references/runbook-template.md
   agents/platform/skills/gke-upgrades/references/troubleshooting.md
 
+docs/designs/broker/*.md
+  docs/designs/broker/README.md
+  docs/designs/broker/architecture.md
+  docs/designs/broker/chat-approval.md
+  docs/designs/broker/integration.md
+
+docs/designs/broker/spec/*.md
+  docs/designs/broker/spec/00-series-readme.md
+  docs/designs/broker/spec/01-vision-scope.md
+  docs/designs/broker/spec/02-agent-personas.md
+  docs/designs/broker/spec/03-security-model.md
+  docs/designs/broker/spec/04-workflow-model.md
+  docs/designs/broker/spec/05-system-architecture.md
+  docs/designs/broker/spec/06-api-and-data-contracts.md
+  docs/designs/broker/spec/07-implementation-roadmap.md
+  docs/designs/broker/spec/08-agent-runtime-and-identity.md
+  docs/designs/broker/spec/09-verification-and-validation.md
+  docs/designs/broker/spec/README.md
+
 examples/gitops-repo/*/**
   examples/gitops-repo/.github/branch-protection.md
   examples/gitops-repo/.github/workflows/README.md

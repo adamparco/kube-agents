@@ -309,7 +309,7 @@ func TestNoReservedKeyHasAPlaceToLand(t *testing.T) {
 // the broker does not keep, and a key added to the map and not the doc refuses callers for a reason
 // they cannot look up.
 func TestTheReservedKeyListIsTheOneTheSpecPublishes(t *testing.T) {
-	const specPath = "../../../docs/design/06-api-and-data-contracts.md"
+	const specPath = "../../../docs/designs/broker/spec/06-api-and-data-contracts.md"
 	src, err := os.ReadFile(specPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", specPath, err)
