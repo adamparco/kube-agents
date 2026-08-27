@@ -144,22 +144,6 @@ def render_body(doc, **kwargs):
     return audit_report.render_issue_body(doc, **kwargs).body
 
 
-def published_body(doc, **kwargs):
-    """The ledger text a *previous* run would have left behind.
-
-    A real ledger is only ever written after `validate_findings` has stamped
-    the derived ids into the document, so its hidden `audit-findings` block
-    carries four-segment ids. A fixture that renders an unvalidated document
-    publishes the bare handles instead — `a`, `b` — which the migration guard
-    reads as the old scheme and suppresses the delta over. A delta test
-    written against such a body would then pass without a delta ever having
-    been computed, which is the opposite of what it claims to check.
-    """
-    doc = copy.deepcopy(doc)
-    audit_report.validate_findings(doc, doc.get("audit", AUDIT))
-    return render_body(doc, **kwargs)
-
-
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
@@ -467,9 +451,66 @@ class BaseTestCase(unittest.TestCase):
         env = patch.dict(os.environ, {"GITOPS_BASE_BRANCH": ""})
         env.start()
         self.addCleanup(env.stop)
+        # Patched here rather than in HarnessTestCase so that no test anywhere
+        # can reach the real `/opt/data`. A store write is best-effort and
+        # swallows its own errors, so an unpatched path does not fail — it
+        # writes nothing and leaves every store assertion vacuously true.
+        self.patch_attr("REPORTS_DIR", str(self.tmp_path / "reports"))
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
+
+    def stored_envelope(self, audit=AUDIT, name="latest.json"):
+        """The envelope `finish` wrote, parsed. Fails loudly when absent."""
+        path = Path(audit_report.REPORTS_DIR) / audit / name
+        self.assertTrue(path.is_file(), f"no report store entry at {path}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def stored_runs(self, audit=AUDIT):
+        """The history ring's entries, oldest first."""
+        return sorted((Path(audit_report.REPORTS_DIR) / audit / "runs").glob("*.json"))
+
+    def seed_store(self, doc, *, issue_number=42, audit=AUDIT, **overrides):
+        """The store entry a previous `finish` would have left behind.
+
+        Validated first: a real store is only ever written after
+        `validate_findings` has stamped the derived four-segment ids into the
+        document, and a fixture carrying the bare handles — `a`, `b` — would
+        make every delta test a test of the id-mismatch path instead, passing
+        without a delta ever having been computed.
+
+        Written straight to disk rather than through `write_report`, which
+        swallows its own failures — a fixture that silently wrote nothing would
+        leave the test asserting against the *absent-store* path it was
+        written to avoid.
+        """
+        doc = copy.deepcopy(doc)
+        audit_report.validate_findings(doc, doc.get("audit", audit))
+        rendered = audit_report.render_issue_body(
+            doc, generated_at=NOW, audit_id=audit
+        )
+        envelope = audit_report.report_envelope(
+            audit,
+            {
+                "status": "UPDATED",
+                "issue_url": f"https://github.com/acme/fleet/issues/{issue_number}",
+                "partial": False,
+                "coverage_gaps": [],
+            },
+            doc,
+            NOW,
+            issue_number=issue_number,
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=rendered.rendered_ids,
+        )
+        envelope.update(overrides)
+        directory = Path(audit_report.REPORTS_DIR) / audit
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "latest.json").write_text(
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return envelope
 
     def patch_attr(self, name, value):
         """monkeypatch.setattr(audit_report, name, value), undone at teardown."""
@@ -890,30 +931,41 @@ class TestDeltaCommentOrdering(BaseTestCase):
         self.assertLess(comment.index("`b`"), comment.index("`ghost`"))
 
     def test_delta_across_two_rendered_runs(self):
-        run_one = render_body(
-            make_doc(
-                findings=[
-                    make_finding(fid="a", title="Alpha finding"),
-                    make_finding(fid="b", title="Bravo finding"),
-                ]
-            ),
-            generated_at=NOW,
+        run_one_doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="b", title="Bravo finding"),
+            ]
         )
+        run_one = audit_report.render_issue_body(run_one_doc, generated_at=NOW)
         run_two_doc = make_doc(
             findings=[
                 make_finding(fid="b", title="Bravo finding"),
                 make_finding(fid="c", title="Charlie finding"),
             ]
         )
-        run_two = render_body(run_two_doc, generated_at=NOW)
+        run_two = audit_report.render_issue_body(run_two_doc, generated_at=NOW)
 
-        previous_ids = audit_report.parse_delta_block(run_one)
-        current_ids = audit_report.parse_delta_block(run_two)
-        new, resolved = audit_report.compute_delta(previous_ids, current_ids)
+        # The join is between what one run *stored* and what the next one
+        # rendered, which is the same pair the ledger's hidden block used to
+        # carry on both sides.
+        stored = audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED"},
+            run_one_doc,
+            NOW,
+            issue_number=42,
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=run_one.rendered_ids,
+        )
+        new, resolved = audit_report.compute_delta(
+            stored["current_ids"], run_two.rendered_ids
+        )
         self.assertEqual(new, ["c"])
         self.assertEqual(resolved, ["a"])
 
-        titles = audit_report.parse_finding_titles(run_one)
+        titles = audit_report.report_finding_titles(stored)
         self.assertEqual(titles["a"], "Alpha finding")
 
         comment = audit_report.render_delta_comment(
@@ -922,7 +974,8 @@ class TestDeltaCommentOrdering(BaseTestCase):
         self.assertIn("**1 new**", comment)
         self.assertIn("Charlie finding", comment)
         self.assertIn("**1 resolved**", comment)
-        # Resolved findings are named by the title recovered from the old body.
+        # Resolved findings are named from the stored document, which is the
+        # only place a finding that has left findings.json still has a title.
         self.assertIn("Alpha finding", comment)
 
     def test_no_comment_when_nothing_changed(self):
@@ -1388,105 +1441,92 @@ class TestIdSchemeStamp(unittest.TestCase):
 
 
 class TestSchemeMigration(HarnessTestCase):
-    """One run of withheld `resolved`, then the guard lifts by itself."""
+    """A memory minted under another id scheme is unknowable, not empty.
 
-    def previous(self, ids, scheme=None):
-        block = json.dumps(list(ids))
-        stamp = "" if scheme is None else f"<!-- audit-id-scheme: {scheme} -->\n"
-        return f"## Findings\n\n<!-- audit-findings: {block} -->\n{stamp}"
+    The 16:34 incident, in one sentence: a previous run's ids that the current
+    scheme cannot join against, and that nevertheless look entirely ordinary.
+    A naive join calls every one of them fixed and posts "4 resolved" in prose
+    on a security ledger whose body still lists the four as open.
 
-    def test_an_unstamped_ledger_reports_no_resolutions(self):
-        # This is the 16:34 run, replayed: a previous block the current scheme
-        # cannot join against, whose ids nevertheless look entirely ordinary. A
-        # naive join calls every one of them fixed.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {
-                    "body": self.previous(
-                        [
-                            "wildcard-rbac.prod-us-east._."
-                            "clusterrolebinding-argocd-application-controller"
-                        ]
-                    )
-                }
-            ),
-        }
+    The guard used to be three-way — new findings still announced, only
+    `resolved` withheld, and one run later the republished block lifted it by
+    itself. §4.8 moved the memory out of the ledger body and into the report
+    store, and collapsed that corner into the triad every other unknowable
+    memory already used: no delta claim at all. An id-scheme bump is a rare,
+    code-authored event, and one lost-memory semantics is worth more than a
+    preserved special case.
+    """
+
+    STALE = (
+        "wildcard-rbac.prod-us-east._."
+        "clusterrolebinding-argocd-application-controller"
+    )
+
+    def previous(self, ids, scheme="current"):
+        """Seed the store a previous run left, carrying `ids` under `scheme`.
+
+        `scheme="absent"` is the envelope that lost the key altogether — a
+        hand-edited or truncated file, which is untrusted for the same reason
+        a foreign scheme is: nothing says these ids are spelled the way this
+        code spells them.
+        """
+        overrides = {"current_ids": sorted(ids)}
+        if scheme == "absent":
+            overrides["id_scheme"] = None
+        elif scheme != "current":
+            overrides["id_scheme"] = scheme
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        return self.seed_store(make_doc(findings=[]), **overrides)
+
+    def test_an_older_scheme_reports_no_resolutions(self):
+        self.previous([self.STALE], scheme=audit_report.ID_SCHEME - 1)
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        out = self.stdout_json()
-        self.assertEqual(out["resolved"], 0)
-        self.assertIn("identity scheme 0", self.err)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+        self.assertIn("identity scheme", self.err)
 
-    def test_the_comment_a_human_reads_withholds_it_too(self):
+    def test_the_comment_a_human_reads_makes_no_claim_either(self):
         # The stdout counter and the posted comment are two renderings of one
-        # claim, and the incident was the *comment*: "4 resolved" in prose, on
-        # a security ledger, under a body still listing the four as open.
-        # Guarding only the counter leaves the half a human actually reads
-        # free to say the opposite.
-        stale = (
-            "wildcard-rbac.prod-us-east._."
-            "clusterrolebinding-argocd-application-controller"
+        # claim, and the incident was the *comment*. Guarding only the counter
+        # leaves the half a human actually reads free to say the opposite.
+        self.previous([self.STALE], scheme=audit_report.ID_SCHEME - 1)
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        self.assertFalse(
+            self.harness.bodies_for("issue", "comment"),
+            "an unjoinable memory must post no delta comment at all",
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous([stale])}),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+    def test_new_findings_are_withheld_too(self):
+        # The deliberate change from the three-way guard: `new` measured
+        # against an unjoinable memory is not a smaller claim than `resolved`,
+        # it is the same claim pointed the other way, and the finding itself
+        # is still in the ledger body for anyone to read. What is lost is one
+        # run of annotation, and the store this run writes restores it.
+        self.previous(["wra-something-old"], scheme=audit_report.ID_SCHEME - 1)
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
-        self.assertTrue(bodies, "the run posted no delta comment at all")
-        for body in bodies:
-            with self.subTest(body=body):
-                self.assertNotIn(" resolved**", body)
-                self.assertNotIn(stale, body)
+        self.assertEqual(self.stdout_json()["new"], 0)
 
-    def test_the_new_findings_are_still_announced(self):
-        # `new` is noise, not a false claim of work done, so it is left alone:
-        # withholding it too would leave the stream silent about a real finding
-        # for a run, which is the failure mode the audit exists to prevent.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous(["wra-something-old"])}),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-
-        self.assertEqual(self.run_finish(make_doc()), 0)
-
-        self.assertEqual(self.stdout_json()["new"], 1)
-
-    def test_an_empty_previous_block_is_not_a_migration(self):
+    def test_an_empty_memory_is_not_a_migration(self):
         # Nothing to join against, so nothing to withhold and nothing to warn
-        # about: a first run on a fresh ledger is not a scheme change.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous([])}),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        # about: a stream whose last run was clean is not a scheme change.
+        self.previous([])
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
         self.assertNotIn("identity scheme", self.err)
+        self.assertEqual(self.stdout_json()["new"], 1)
 
-    def test_the_guard_lifts_once_the_block_is_rewritten(self):
-        # The run above republished the ledger stamped, so the next one joins
-        # normally and a real disappearance reads as resolved.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {
-                    "body": self.previous(
-                        [derived_id(), derived_id(fid="gone")],
-                        scheme=audit_report.ID_SCHEME,
-                    )
-                }
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+    def test_the_guard_lifts_once_the_store_is_rewritten(self):
+        # The run above republished the ledger and rewrote the store under the
+        # current scheme, so the next one joins normally and a real
+        # disappearance reads as resolved.
+        self.previous([derived_id(), derived_id(fid="gone")])
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
@@ -1494,25 +1534,24 @@ class TestSchemeMigration(HarnessTestCase):
         self.assertNotIn("identity scheme", self.err)
 
     def test_a_future_scheme_is_withheld_too(self):
-        # Not just "older": a ledger a newer harness wrote is equally
+        # Not just "older": a store a newer harness wrote is equally
         # unjoinable, and rolling a deployment back must not turn its findings
         # into a page of fixes.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {
-                    "body": self.previous(
-                        [derived_id(), derived_id(fid="gone")],
-                        scheme=audit_report.ID_SCHEME + 1,
-                    )
-                }
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous(
+            [derived_id(), derived_id(fid="gone")], scheme=audit_report.ID_SCHEME + 1
+        )
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
         self.assertEqual(self.stdout_json()["resolved"], 0)
+
+    def test_a_store_missing_its_scheme_is_withheld_too(self):
+        self.previous([derived_id(), derived_id(fid="gone")], scheme="absent")
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        out = self.stdout_json()
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
 
 
 # --------------------------------------------------------------------------- #
@@ -2387,19 +2426,15 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(label[0][:4], ["gh", "issue", "edit", "7"])
 
     def test_updates_in_place_and_posts_delta(self):
-        previous_body = published_body(
+        self.seed_store(
             make_doc(
                 findings=[
                     make_finding(fid="a", title="Alpha finding"),
                     make_finding(fid="b", title="Bravo finding"),
                 ]
-            ),
-            generated_at=NOW,
+            )
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(
             findings=[
@@ -2435,11 +2470,8 @@ class TestFinishWithFindings(HarnessTestCase):
 
     def test_no_comment_when_findings_unchanged(self):
         doc = make_doc()
-        previous_body = published_body(doc, generated_at=NOW)
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.seed_store(doc)
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.run_finish(doc)
@@ -2452,11 +2484,12 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
 
-    def test_unreadable_previous_body_suppresses_the_delta(self):
-        # None is not "": an unreadable body makes the delta unknowable, and
-        # announcing every live finding as new is worse than announcing none.
+    def test_a_missing_store_suppresses_the_delta(self):
+        # A wiped PVC under an open ledger. Absent is not empty: the delta is
+        # unknowable, and announcing every live finding as new is worse than
+        # announcing none. This is the cost of the store being the only
+        # memory, and it is one run long — the write below restores it.
         self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"--json body": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.assertEqual(self.run_finish(make_doc()), 0)
@@ -2466,7 +2499,39 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
-        self.assertIn("unreadable", self.err)
+        self.assertIn("no delta claim", self.err)
+        self.assertEqual(self.stored_envelope()["current_ids"], [derived_id()])
+
+    def test_a_store_written_for_another_ledger_suppresses_the_delta(self):
+        # Two ledgers, one stream: a human closed the old issue and the next
+        # run opened a new one, or two installs share a PVC. Joining the
+        # memory of one conversation against the other calls every id on the
+        # left fixed and every id on the right new.
+        self.seed_store(make_doc(), issue_number=41)
+        self.harness.replies = {"issue list": self.issue_list(number=42)}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        result = self.stdout_json()
+        self.assertEqual((result["new"], result["resolved"]), (0, 0))
+        self.assertIn("#41", self.err)
+
+    def test_the_happy_path_never_fetches_the_ledger_body(self):
+        # The whole point of §4.8: the memory is local, so the round trip that
+        # re-read a public issue body to parse this harness's own breadcrumb
+        # back out of it is gone. The block is still *written* — bench grades
+        # against it — but nothing reads it back.
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        for call in self.harness.calls:
+            with self.subTest(call=call):
+                self.assertNotIn(("--json", "body"), list(zip(call, call[1:])))
 
     def test_gcloud_only_run_still_publishes(self):
         self.harness.replies = {
@@ -2544,14 +2609,10 @@ class TestPublishedBodies(HarnessTestCase):
         )
 
     def test_the_refreshed_ledger_and_its_delta_carry_their_own_text(self):
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
-            generated_at=NOW,
+        self.seed_store(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         self.assertEqual(self.run_finish(doc), 0)
@@ -2567,13 +2628,8 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertIn(f"`{derived_id(fid='a')}`", comments[0])
 
     def test_the_clean_comment_is_published_not_just_rendered(self):
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
-        )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.harness.replies = {"issue list": self.issue_list()}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
 
         comments = self.harness.bodies_for("issue", "comment")
@@ -2602,12 +2658,9 @@ class TestPublishedBodies(HarnessTestCase):
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
         # by default rather than by somebody remembering to add a test.
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
-        )
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
         self.harness.replies = {
             "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
             "pr create": "https://github.com/acme/fleet/pull/8\n",
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
@@ -2622,14 +2675,10 @@ class TestPublishedBodies(HarnessTestCase):
 
 class TestFinishClean(HarnessTestCase):
     def test_clean_run_closes_the_open_ledger_as_completed(self):
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
-            generated_at=NOW,
+        self.seed_store(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")])
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
 
         rc = self.run_finish(make_doc(findings=[]))
         self.assertEqual(rc, 0)
@@ -3413,23 +3462,21 @@ class TestFindingAnchors(BaseTestCase):
         without_comments = re.sub(r"<!--.*?-->", "", rendered, flags=re.S)
         self.assertIn("`f-1`", without_comments)
 
-    def test_the_anchor_does_not_break_title_recovery(self):
-        """FINDING_MARKER_RE runs to end of line.
+    def test_the_marker_is_the_last_thing_on_its_heading_line(self):
+        """The `finding:` comment is a published join key, so its shape is a
+        contract with readers that did not generate the body.
 
-        Putting the anchor on the heading instead of above it would stop the
-        regex matching, and the failure would surface a run later as a resolved
-        finding the delta comment could not name.
+        The harness itself stopped parsing it when §4.8 moved resolved-finding
+        titles onto the report store's stored document, so nothing in this
+        repository fails if the anchor migrates onto the heading — which is
+        exactly why the shape is pinned here instead.
         """
-        findings = [make_finding(fid="f-1", title="A real title")]
-        titles = audit_report.parse_finding_titles(self.body(findings))
-        self.assertEqual(titles, {"f-1": "A real title"})
-
-    def test_a_recovered_title_carries_no_markup(self):
-        title = audit_report.parse_finding_titles(
-            self.body([make_finding(fid="f-1", title="A real title")])
-        )["f-1"]
-        self.assertNotIn("<a", title)
-        self.assertNotIn("href", title)
+        body = self.body([make_finding(fid="f-1", title="A real title")])
+        self.assertIn(
+            '<a id="user-content-finding-f-1"></a>\n\n'
+            "#### A real title <!-- finding:f-1 -->\n",
+            body,
+        )
 
 
 class TestIndexOverhead(BaseTestCase):
@@ -4826,6 +4873,640 @@ class TestStatusWriter(HarnessTestCase):
         self.assertIn(AUDIT, self.err)
 
 
+class TestReportStore(HarnessTestCase):
+    """§4.8's local report store: what `finish` keeps of the run it published.
+
+    Best-effort like the status writer above it — nothing here may change an
+    exit code — but unlike a status row it is read back, as the next run's
+    delta memory and as the chat path's answer to "what did the audit find?".
+    So its shape is a contract twice over, with `read_report_memory` and with
+    a reader holding nothing but the file.
+    """
+
+    def open_ledger(self, issue=7):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": f"https://github.com/acme/fleet/issues/{issue}\n",
+        }
+
+    def test_a_finishing_run_stores_the_document_it_published(self):
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["audit_id"], AUDIT)
+        self.assertEqual(stored["status"], "OPENED")
+        self.assertEqual(stored["issue_number"], 7)
+        self.assertEqual(stored["issue_url"], "https://github.com/acme/fleet/issues/7")
+        self.assertEqual(stored["id_scheme"], audit_report.ID_SCHEME)
+        # Offset-aware, so a reader comparing two runs never has to guess
+        # which clock the pod was on.
+        self.assertIsNotNone(
+            datetime.fromisoformat(stored["finished_at"]).tzinfo, stored["finished_at"]
+        )
+        # The document, not a summary of it: the chat path renders findings
+        # from this key without going near GitHub.
+        self.assertEqual(
+            [f["id"] for f in stored["document"]["findings"]], [derived_id()]
+        )
+        self.assertEqual(stored["new_ids"], [derived_id()])
+        self.assertEqual(stored["resolved_ids"], [])
+
+    def test_the_envelope_keys_are_pinned(self):
+        """A rename here breaks a chat session, not a test, unless it breaks this.
+
+        The store's reader is a person asking the agent a question — there is
+        no schema between them and this dict, so the key set is the schema.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(
+            sorted(self.stored_envelope()),
+            [
+                "audit_id",
+                "collect_s",
+                "coverage_gaps",
+                "current_ids",
+                "document",
+                "finished_at",
+                "id_scheme",
+                "inspect_s",
+                "issue_number",
+                "issue_url",
+                "new_ids",
+                "partial",
+                "publish_s",
+                "resolved_ids",
+                "status",
+            ],
+        )
+
+    def relink_drops_a_finding(self):
+        """A run whose pre-link and post-link bodies render *different* id sets.
+
+        Without that difference the two renders are identical and nothing here
+        can tell which one the store recorded — the mistake this covers would
+        be invisible. The lever is the body budget: charge it exactly what the
+        two findings cost unlinked, and the state line plus pull-request link
+        the promotion pass adds to the critical one is enough to push the
+        minor one out. Both callers assert the difference actually happened.
+        """
+        doc = make_doc(
+            findings=[
+                make_finding(),
+                make_finding(fid="wide-rbac", severity="minor",
+                             title="Wildcard RBAC verb", check="wildcard-rbac"),
+            ]
+        )
+        # Validated first: the budget is charged against the *derived* ids and
+        # the text they render into, and the fixture's bare handles are neither.
+        audit_report.validate_findings(doc, AUDIT)
+        # The budget covers the whole body, not the findings alone, so it is
+        # probed against the real renderer rather than computed: the tightest
+        # value at which the *pre-link* body still fits both findings. Anything
+        # the relink adds then costs the minor one its slot. The slack absorbs
+        # the footer timestamp, which is wall-clock in the run and fixed here.
+        plain = dict(
+            generated_at=NOW,
+            audit_id=AUDIT,
+            states={str(f["id"]): "open" for f in doc["findings"]},
+        )
+
+        def fitted(budget):
+            with patch.object(audit_report, "BODY_BUDGET", budget):
+                return len(audit_report.render_issue_body(doc, **plain).rendered_ids)
+
+        self.assertEqual(fitted(audit_report.BODY_BUDGET), 2)
+        low, high = 0, audit_report.BODY_BUDGET
+        while low < high:
+            middle = (low + high) // 2
+            if fitted(middle) == 2:
+                high = middle
+            else:
+                low = middle + 1
+        self.patch_attr("BODY_BUDGET", low + 40)
+        # The relink re-lists the repository's pull requests to pick up the one
+        # it just opened. The first listing has to come back empty or nothing
+        # is promoted and there is no relink at all, so the reply changes
+        # between the two calls the way GitHub's would.
+        groups = audit_report.remediation_groups(doc["findings"])
+        opened = json.dumps(
+            [pr(8, audit_report.group_branch_for(AUDIT, groups[0]))]
+        )
+        recorder = self.harness
+        listings = []
+
+        def once_the_pull_request_exists(cmd, **kwargs):
+            result = recorder(cmd, **kwargs)
+            if "pr list" in " ".join(cmd):
+                listings.append(1)
+                if len(listings) > 1:
+                    return CompletedProcess(list(cmd), 0, opened, "")
+            return result
+
+        self.patch_attr("run_cmd", once_the_pull_request_exists)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(doc), 0)
+        published = self.harness.bodies_for("issue")
+        self.assertGreater(len(published), 1, "the relink edit did not happen")
+        blocks = [sorted(audit_report.parse_delta_block(b)) for b in published]
+        self.assertNotEqual(
+            blocks[0],
+            blocks[-1],
+            "the fixture no longer makes the relink change the rendered set, so "
+            "this test cannot tell the two renders apart",
+        )
+        return blocks
+
+    def test_current_ids_is_what_the_last_published_body_rendered(self):
+        """Not the pre-link render: the findings branch rewrites the ledger once
+        the pull requests exist, and a link can push a finding over the body
+        budget. Storing the earlier set would announce the dropped finding as
+        new tomorrow — the bug `compute_delta`'s rendered-vs-rendered join
+        exists to prevent, reintroduced one layer down.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        blocks = self.relink_drops_a_finding()
+        self.assertEqual(self.stored_envelope()["current_ids"], blocks[-1])
+
+    def test_a_relink_that_never_landed_is_not_what_the_store_records(self):
+        """The relink edit is `check=False` — a run survives losing it. What a
+        run must not do is record the set that edit *would* have published:
+        the live body still carries the pre-link block, and a store that
+        disagrees with it calls the difference a change tomorrow.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        # Keyed tightly enough to miss `apply_severity_label`, which is also an
+        # `issue edit` and has no business failing here.
+        self.harness.failures = {"issue edit 7 -R acme/fleet --body-file": 1}
+        blocks = self.relink_drops_a_finding()
+        self.assertEqual(self.stored_envelope()["current_ids"], blocks[0])
+
+    def test_a_clean_run_that_closed_its_ledger_stores_no_rendered_ids(self):
+        """A clean run publishes no findings section, so there is nothing for
+        the next run to measure `new` against — and the next run, finding no
+        open ledger, is a first run anyway.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        stored = self.stored_envelope()
+        self.assertEqual(stored["status"], "CLEAN")
+        self.assertEqual(stored["current_ids"], [])
+        self.assertEqual(stored["document"]["findings"], [])
+        self.assertTrue(self.harness.gh_calls("issue", "close"))
+
+    def test_a_clean_run_over_gaps_stores_the_body_it_left_standing(self):
+        """The one clean path that does not rewrite the ledger.
+
+        Zero findings over incomplete coverage keeps the issue open and only
+        comments on it, so the body still renders whatever the previous run
+        put there. Recording `[]` against that still-open issue hands the next
+        run a *trusted* memory of an empty ledger, and every finding the body
+        has been carrying all along is announced as new.
+        """
+        seeded = self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+
+        self.assertFalse(self.harness.gh_calls("issue", "close"))
+        stored = self.stored_envelope()
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["current_ids"], seeded["current_ids"])
+        self.assertEqual(stored["resolved_ids"], [])
+
+    def test_a_clean_run_over_gaps_with_no_memory_claims_no_ledger(self):
+        """And when the previous set is itself unknowable there is nothing to
+        carry forward, so the envelope claims no issue at all — which is what
+        makes the next run's trust check reject it. Storing this run's number
+        beside an empty id set would be the same laundering by another route:
+        an unreadable body recorded as an empty one.
+        """
+        self.harness.replies = {"issue list": self.issue_list()}
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+
+        stored = self.stored_envelope()
+        self.assertIsNone(stored["issue_number"])
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 42))
+
+    def test_closing_a_ledger_off_an_unreadable_memory_is_not_silent(self):
+        """`silent_ok` says a scheduled run has nothing worth waking anyone for.
+
+        A run that just closed a ledger does. With no trusted memory the
+        resolved count is 0 — not because nothing was fixed but because the
+        run cannot count it — and reporting that as silent is the audit
+        swallowing the best news it ever gets to deliver.
+        """
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        payload = self.stdout_json()
+        self.assertTrue(self.harness.gh_calls("issue", "close"))
+        self.assertEqual(payload["resolved"], 0)
+        self.assertFalse(payload["silent_ok"])
+
+    def test_a_clean_run_with_no_ledger_at_all_stays_silent(self):
+        """The counterpart: nothing was open, nothing closed, nothing to say.
+        Without this the guard above could be an unconditional `False` and the
+        audit would page someone every morning it found nothing.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertTrue(self.stdout_json()["silent_ok"])
+
+    def test_a_dry_run_stores_nothing(self):
+        """`--dry-run` publishes nothing, so it must remember nothing: a store
+        written from one would make the next real run diff against a ledger
+        that was never updated.
+        """
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=("--dry-run",)), 0)
+        self.assertFalse(Path(audit_report.REPORTS_DIR).exists())
+
+    def test_a_validation_failure_stores_nothing(self):
+        self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
+        self.assertFalse(Path(audit_report.REPORTS_DIR).exists())
+
+    def test_remediate_stores_nothing(self):
+        """`remediate` promotes a fix; it changes no finding and publishes no
+        ledger, so the last `finish`'s memory has to survive it intact.
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        path = self.write_findings(make_doc())
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", path,
+             "--finding", derived_id()]
+        )
+        self.assertEqual(rc, 0)
+        self.assertFalse(Path(audit_report.REPORTS_DIR).exists())
+
+    def test_latest_is_a_byte_identical_copy_of_the_newest_ring_entry(self):
+        """`latest.json` is a copy rather than a symlink, so nothing but this
+        keeps the two from drifting — and a reader that finds them different
+        has no way to tell which one is the run that happened.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        runs = self.stored_runs()
+        self.assertEqual(len(runs), 1)
+        latest = Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json"
+        self.assertEqual(latest.read_bytes(), runs[-1].read_bytes())
+
+    def corrupt_store(self, text):
+        """Put `text` where the previous run's envelope should be."""
+        directory = Path(audit_report.REPORTS_DIR) / AUDIT
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "latest.json").write_text(text, encoding="utf-8")
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+    def assert_made_no_delta_claim(self):
+        """The triad's third state: the run published, and claimed nothing."""
+        payload = self.stdout_json()
+        self.assertEqual(payload["new"], 0)
+        self.assertEqual(payload["resolved"], 0)
+        self.assertFalse(
+            self.harness.bodies_for("issue", "comment"),
+            "an unreadable memory must post no delta comment",
+        )
+
+    def test_an_unparseable_envelope_is_unknowable_rather_than_empty(self):
+        """The failure mode this whole triad exists for, one layer down: a
+        `latest.json` that does not parse is a memory nobody can read, and
+        reading it as "the previous run found nothing" announces every live
+        finding as new.
+        """
+        self.corrupt_store("{ this is not json")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("unreadable", self.err)
+        self.assert_made_no_delta_claim()
+
+    def test_an_envelope_that_is_not_an_object_is_unknowable(self):
+        self.corrupt_store("[]\n")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("not an object", self.err)
+        self.assert_made_no_delta_claim()
+
+    def test_a_malformed_id_set_costs_a_delta_and_not_the_run(self):
+        """Well-formed JSON is not a well-formed envelope. `current_ids` is
+        iterated and `document` is walked, neither inside a try, so a file
+        that parses but holds the wrong types used to raise out of `finish` —
+        failing a run whose findings were already published. §8: a store
+        failure may cost a delta, never an exit code.
+        """
+        self.corrupt_store(
+            json.dumps(
+                {
+                    "issue_number": 42,
+                    "id_scheme": audit_report.ID_SCHEME,
+                    "current_ids": 5,
+                    "document": {"findings": 7},
+                }
+            )
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("no readable id set", self.err)
+        self.assert_made_no_delta_claim()
+        self.assertTrue(self.harness.gh_calls("issue", "edit"))
+
+    def test_a_malformed_document_costs_the_titles_and_not_the_run(self):
+        """The other half of the same rule, and it needs its own envelope: an
+        id set the trust check accepts, beside a `document` it never looks at.
+        `report_finding_titles` walks that document to name resolved findings,
+        so a non-list `findings` raises there instead — past every guard above
+        it, out of `finish`, and after the ledger has already been rewritten.
+        """
+        self.corrupt_store(
+            json.dumps(
+                {
+                    "issue_number": 42,
+                    "id_scheme": audit_report.ID_SCHEME,
+                    "current_ids": ["gone-yesterday"],
+                    "document": {"findings": 7},
+                }
+            )
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        # The delta itself is intact — only the *titles* were unreadable — so
+        # the run still reports the finding that disappeared, unnamed.
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+
+    def test_a_string_id_set_is_not_read_one_character_at_a_time(self):
+        """`current_ids: "abc"` iterates without raising, into three ids named
+        a, b and c. Silent, and every real finding then reads as new.
+        """
+        self.corrupt_store(
+            json.dumps(
+                {
+                    "issue_number": 42,
+                    "id_scheme": audit_report.ID_SCHEME,
+                    "current_ids": "abc",
+                    "document": {"findings": []},
+                }
+            )
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assert_made_no_delta_claim()
+
+    def test_the_stored_delta_is_the_delta_the_run_reported(self):
+        """Two renderings of one claim. A store that recorded a different one
+        would make the chat path's "what changed?" disagree with the comment
+        the ledger already posted, and nothing would flag the difference.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id()
+        arrived = make_finding(fid="wide-rbac", check="wildcard-rbac",
+                               title="Wildcard RBAC verb")
+        self.assertEqual(self.run_finish(make_doc(findings=[arrived])), 0)
+
+        payload = self.stdout_json()
+        stored = self.stored_envelope()
+        self.assertEqual(len(stored["new_ids"]), payload["new"])
+        self.assertEqual(len(stored["resolved_ids"]), payload["resolved"])
+        self.assertEqual(stored["resolved_ids"], [gone])
+        self.assertEqual(
+            stored["new_ids"], [derived_id(check="wildcard-rbac", fid="wide-rbac")]
+        )
+
+    def test_the_run_metadata_carries_values_and_not_just_keys(self):
+        """`test_the_envelope_keys_are_pinned` above proves the keys exist. A
+        reader asking "was this run partial, and what did it skip?" needs them
+        to be populated, and every one of these is `None`-by-default somewhere
+        upstream.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.write_phase_start(
+            AUDIT, datetime.now(timezone.utc) - timedelta(seconds=90)
+        )
+        manifest = self.tmp_path / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "clusters": [],
+                    "started_at": "2026-08-26T06:00:00Z",
+                    "finished_at": "2026-08-26T06:03:30Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        doc = make_doc(
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        )
+        rc = self.run_finish(doc, ["--manifest-file", str(manifest)])
+        self.assertEqual(rc, 0)
+
+        stored = self.stored_envelope()
+        self.assertTrue(stored["partial"])
+        self.assertEqual(len(stored["coverage_gaps"]), 1)
+        self.assertIn("dr-west", stored["coverage_gaps"][0])
+        self.assertEqual(stored["collect_s"], 210.0)
+        self.assertGreaterEqual(stored["inspect_s"], 90.0)
+        self.assertIsInstance(stored["publish_s"], (int, float))
+
+    def test_a_secret_the_body_redacted_is_not_stored_in_the_clear(self):
+        """Redaction happens at the cell on the way into the body, so the
+        document object still holds whatever the model wrote. Storing it raw
+        gives a credential a fifteen-envelope life on the volume where it
+        previously had one scratch file the next run overwrote.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        leaked = "AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY"
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(excerpt=leaked)])), 0)
+
+        raw = (Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json").read_text()
+        self.assertNotIn("wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY", raw)
+        self.assertIn(audit_report.REDACTED, raw)
+
+    def test_two_runs_leave_two_ring_entries_and_the_newer_as_latest(self):
+        """The ring's whole purpose is run-over-run comparison, and every other
+        test here drives a single `finish`. Exercised through the real command
+        twice, this is also what pins the stamp: entries are named by the
+        run's own clock, so two runs a day apart must not land on one file
+        with the second silently replacing the first.
+        """
+        moment = datetime(2026, 8, 26, 6, 0, tzinfo=timezone.utc)
+
+        class FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment
+
+        self.patch_attr("datetime", FrozenClock)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        moment = moment + timedelta(days=1)
+        self.harness.replies = {"issue list": self.issue_list(number=7)}
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        runs = self.stored_runs()
+        self.assertEqual(
+            [p.name for p in runs], ["20260826T060000Z.json", "20260827T060000Z.json"]
+        )
+        latest = Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json"
+        self.assertEqual(latest.read_bytes(), runs[-1].read_bytes())
+
+    def test_the_ring_keeps_the_newest_fourteen_runs(self):
+        for day in range(audit_report.REPORT_HISTORY + 3):
+            audit_report.write_report(
+                AUDIT, {"finished_at": day}, NOW + timedelta(days=day)
+            )
+        runs = self.stored_runs()
+        self.assertEqual(len(runs), audit_report.REPORT_HISTORY)
+        # The stamp sorts lexically in time order, so the survivors are the
+        # newest ones and the oldest three are gone.
+        self.assertEqual(
+            [json.loads(p.read_text())["finished_at"] for p in runs],
+            list(range(3, audit_report.REPORT_HISTORY + 3)),
+        )
+
+    def test_a_write_failure_logs_a_warning_and_leaves_the_exit_code_alone(self):
+        blocker = self.tmp_path / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        self.patch_attr("REPORTS_DIR", str(blocker))
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("report store write for", self.err)
+        self.assertIn(AUDIT, self.err)
+        # And the run still published: a lost store costs the next run's delta
+        # annotation, never this run's report.
+        self.assertTrue(self.harness.gh_calls("issue", "create"))
+
+    def test_a_failed_rename_raises_and_leaves_no_partial_file(self):
+        """`os.replace` is what keeps a reader from ever meeting a half-written
+        envelope — the chat path reads `latest.json` at arbitrary times,
+        including mid-write. When the rename fails, the partial goes with it
+        rather than accumulating in the stream's directory.
+        """
+        directory = self.tmp_path / "atomic"
+        directory.mkdir()
+        target = directory / "latest.json"
+        with patch.object(audit_report.os, "replace", side_effect=OSError("nospc")):
+            with self.assertRaises(OSError):
+                audit_report._atomic_write(target, "{}\n")
+        self.assertFalse(target.exists())
+        self.assertEqual(list(directory.iterdir()), [])
+
+    def test_a_failed_write_drops_the_memory_it_could_not_replace(self):
+        """Leaving the previous envelope standing is the wrong repair.
+
+        Nothing downstream can tell a stale `latest.json` from a current one —
+        same ledger, same id scheme, so `read_report_memory` trusts it — and
+        joining against a memory that predates everything this run published
+        announces all of it as new, every run, until a write succeeds. An
+        absent store is the state the failure actually left behind, and it
+        costs one delta-free run instead.
+        """
+        self.seed_store(make_doc(), issue_number=7)
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("no space left on device")
+
+        self.patch_attr("_atomic_write", refuse)
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("WARNING: report store write for", self.err)
+        self.assertFalse((Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json").exists())
+
+    def test_a_failed_prune_keeps_the_memory_it_did_write(self):
+        """The other half of the rule above: the prune runs after the envelope
+        has landed, so its failure costs disk rather than accuracy. Dropping
+        `latest.json` here would throw away a memory that is correct.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        real_glob = Path.glob
+
+        def refuse(self_path, pattern):
+            if pattern == "*.json":
+                raise OSError("stat: input/output error")
+            return real_glob(self_path, pattern)
+
+        with patch.object(Path, "glob", refuse):
+            self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("WARNING: report store prune for", self.err)
+        self.assertEqual(self.stored_envelope()["issue_number"], 7)
+
+    def test_a_successful_write_leaves_no_temp_files(self):
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        directory = Path(audit_report.REPORTS_DIR) / AUDIT
+        # Asserted first: an empty `.tmp` glob is also what a store that wrote
+        # nothing at all looks like, and this test would pass on it.
+        self.assertTrue((directory / "latest.json").is_file())
+        self.assertEqual([p.name for p in directory.rglob("*.tmp")], [])
+
+    def test_the_temp_file_is_written_beside_its_target(self):
+        """`os.replace` is only atomic within a filesystem. On the pod the
+        reports directory is the PVC and the default temp directory is not, so
+        a temp file placed anywhere else makes every write raise `EXDEV` —
+        caught, logged, and silently never storing anything.
+        """
+        directory = self.tmp_path / "atomic"
+        directory.mkdir()
+        seen = []
+        real = audit_report.tempfile.NamedTemporaryFile
+
+        def record(*args, **kwargs):
+            seen.append(kwargs.get("dir"))
+            return real(*args, **kwargs)
+
+        with patch.object(audit_report.tempfile, "NamedTemporaryFile", record):
+            audit_report._atomic_write(directory / "latest.json", "{}\n")
+        self.assertEqual(seen, [str(directory)])
+
+    def test_each_stream_gets_its_own_directory(self):
+        """One store per audit id, because the memories are per-ledger: a
+        shared `latest.json` would make every stream but the last to run find
+        a report written for another stream's issue, and claim nothing.
+        """
+        audit_report.write_report("a-audit", {"audit_id": "a-audit"}, NOW)
+        audit_report.write_report("b-audit", {"audit_id": "b-audit"}, NOW)
+        self.assertEqual(self.stored_envelope(audit="a-audit")["audit_id"], "a-audit")
+        self.assertEqual(self.stored_envelope(audit="b-audit")["audit_id"], "b-audit")
+
+
 class TestCrossCheckManifest(unittest.TestCase):
     """Manifest-scoped attestation upgrade: see
     docs/designs/fleet-audit-collectors-and-status.md §6 and
@@ -5462,7 +6143,6 @@ class TestRemediateOnACleanRun(HarnessTestCase):
     def replies(self, comments):
         return {
             "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": "prior"}),
             "--json comments": json.dumps({"comments": comments}),
         }
 
@@ -5873,13 +6553,8 @@ class TestFailurePaths(HarnessTestCase):
     def test_a_failed_delta_comment_is_survivable(self):
         # Losing the delta comment costs one notification; aborting would
         # leave the ledger correct but the run marked failed to the cron.
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
-        )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"issue comment": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
@@ -7146,17 +7821,21 @@ class TestPartialCoverageGating(HarnessTestCase):
 
     def test_a_partial_run_announces_nothing_as_resolved(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        previous = published_body(
-            make_doc(findings=[make_finding(fid="gone"), make_finding()]),
-            generated_at=NOW,
+        gone = derived_id(fid="gone", obj="Namespace/gone")
+        self.seed_store(
+            make_doc(findings=[make_finding(fid="gone"), make_finding()])
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
         self.run_finish(make_doc(skipped=self.PARTIAL))
         self.assertEqual(self.stdout_json()["resolved"], 0)
         self.assertTrue(self.stdout_json()["partial"])
+        # The counter and the comment are two renderings of one claim, and the
+        # comment is the half a human reads. A guard on the counter alone
+        # leaves the prose free to name a finding as fixed that the run never
+        # looked for.
+        for comment in self.harness.bodies_for("issue", "comment"):
+            self.assertNotIn(gone, comment)
+            self.assertNotIn("resolved", comment.lower())
 
     def test_a_truncated_body_is_not_a_coverage_gap(self):
         # `partial` used to be `bool(gaps) or rendered.partial`, which made
@@ -8081,11 +8760,8 @@ class TestSilentVerdict(HarnessTestCase):
     """
 
     def finish_json(self, doc, **replies):
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": published_body(doc, generated_at=NOW)}),
-            **replies,
-        }
+        self.seed_store(doc)
+        self.harness.replies = {"issue list": self.issue_list(), **replies}
         self.run_finish(doc)
         return self.stdout_json()
 
@@ -8112,12 +8788,8 @@ class TestSilentVerdict(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
 
     def test_new_findings_are_never_silent(self):
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {"body": published_body(make_doc(findings=[]), generated_at=NOW)}
-            ),
-        }
+        self.seed_store(make_doc(findings=[]))
+        self.harness.replies = {"issue list": self.issue_list()}
         self.run_finish(make_doc(findings=[make_finding(fid="a")]))
         out = self.stdout_json()
         self.assertEqual(out["new"], 1)

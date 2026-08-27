@@ -358,26 +358,23 @@ DELTA_RE = re.compile(
 # for a check that judges the ClusterRole; correcting the object to the role
 # leaves an id of exactly the current shape and would have read as a fix.
 #
-# A stamp needs no cleverness: a previous body whose stamp is missing or
-# different was written by a scheme this one cannot join against, whatever the
-# ids look like. `resolved` is withheld for the single run it takes to rewrite
-# the block, then the stamp matches and the guard lifts by itself.
+# A stamp needs no cleverness: a memory whose stamp is missing or different
+# was written by a scheme this one cannot join against, whatever the ids look
+# like. It costs one run: the stored report is rejected as unjoinable and the
+# run makes no delta claim at all, then the run's own write carries the
+# current stamp and the guard lifts by itself. The same stamp on a
+# remediation-PR body decides whether that pull request's findings can be
+# joined against this run's — see `close_stale_remediation_prs`.
 #
 # 2: `_shorten_id` now appends a digest when it truncates, so any id that was
 # over `MAX_FINDING_ID` before shortening is spelled differently. Only those
 # ids move, but the stamp is per-document and cannot say which — and the cost
-# of bumping is one run of withheld `resolved`, against announcing a
-# re-spelled finding as fixed.
+# of bumping is one delta-free run, against announcing a re-spelled finding as
+# fixed.
 ID_SCHEME = 2
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
-# Per-finding marker on each heading, so a *resolved* finding can still be named
-# by title when it no longer exists in the current findings.json.
-FINDING_MARKER_RE = re.compile(
-    r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
-)
-
 # Idempotency markers. Design §3.1 deliberately never mutates a `/remediate`
 # comment — a repo writer must be able to re-issue one after closing a PR — so
 # "act exactly once" is carried instead by hidden markers in the bodies this
@@ -1105,6 +1102,260 @@ def _status_row(payload: dict, data: dict, findings: list, now: datetime) -> dic
     }
 
 
+# --------------------------------------------------------------------------- #
+# Local report store — the run's structured output, kept where it was produced.
+# See docs/designs/fleet-audit-collectors-and-status.md §4.8.
+#
+# Two readers, both annotating and neither gating (§8). The chat path answers
+# "what did the audit find?" from `latest.json` instead of a `gh issue view`
+# plus a re-parse of rendered prose, and "what changed?" by comparing two
+# entries in `runs/` — the only place run-over-run documents exist anywhere,
+# because the ledger rewrites itself in place. And `finish`'s own delta reads
+# the previous run's ids from here rather than re-fetching the ledger body to
+# parse its own breadcrumb back out.
+#
+# The write shares the status writer's discipline exactly: any failure logs a
+# WARNING and returns, never changing a subcommand's exit code. The cost of a
+# failed write lands on the *next* run's delta, which makes no claim and says
+# why — and it only lands there because a failed write deletes `latest.json`
+# on its way out. Left in place, the previous run's envelope is
+# indistinguishable from a current one and the next run would join against a
+# memory that predates everything this run published.
+# --------------------------------------------------------------------------- #
+
+# Profile-scoped, because the store belongs to the agent that produced it.
+# Overridable for the suite, on the same reasoning as SCRATCH_DIR: off-cluster
+# /opt/data does not exist, and a store whose failure paths can only be
+# exercised where it is deployed is a store whose failure paths are untested.
+REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or (
+    f"{os.environ.get('HERMES_HOME') or '/opt/data'}/fleet-audit/reports"
+)
+
+# Two weeks of a daily stream, a quarter of a weekly one. At the ledger's own
+# 60k-character body ceiling that bounds the store near 1 MB per stream.
+REPORT_HISTORY = 14
+
+
+def reports_dir_for(audit_id: str) -> Path:
+    return Path(REPORTS_DIR) / audit_id
+
+
+def _redact_document(value: object) -> object:
+    """Every string in a document, through the backstop the rendered body uses.
+
+    Redaction happens at the cell on the way into the body (`clip_text`), so
+    the document object itself still holds whatever the model wrote. Storing
+    that raw would leave the store carrying a credential shape the issue it
+    copies blanked, and carrying it for longer: one scratch file the next run
+    overwrote becomes fifteen envelopes on the volume.
+    """
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {key: _redact_document(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_document(item) for item in value]
+    return value
+
+
+def report_envelope(
+    audit_id: str,
+    payload: dict,
+    document: dict,
+    now: datetime,
+    *,
+    issue_number: int | None,
+    new_ids: list[str],
+    resolved_ids: list[str],
+    rendered_ids: list[str],
+) -> dict:
+    """One run's outcome, delta and document, as keys rather than paragraphs.
+
+    `current_ids` is the **rendered** set — exactly what the body's hidden
+    block published — because the delta join is rendered-vs-rendered (see
+    `compute_delta`) and the full finding set is derivable from `document`.
+    Storing the wider set here would announce every budget-truncated finding
+    as new on the next run, which is the bug `compute_delta` exists to avoid.
+
+    `document` is the post-validation, post-degradation document the ledger
+    rendered, with the body's redaction backstop applied to every string, so
+    this key never carries a credential shape the public issue blanked. It is
+    deliberately *not* clipped or budget-selected the way the body's cells
+    are: a finding the body had no room for is still a finding the chat path
+    should be able to answer about.
+
+    `audit_id` and `finished_at` are carried in the envelope and not left to
+    the filename alone: `latest.json` is a copy of a ring entry, and a copy
+    that cannot say which stream and which run it is would need its own
+    reading rule. `finished_at` is the run's single generation timestamp — the
+    same clock reading the ledger footer prints, not a second one taken here,
+    so the envelope and the body it describes never disagree about when the
+    run happened.
+    """
+    return {
+        "audit_id": audit_id,
+        "finished_at": now.isoformat(),
+        "status": payload.get("status"),
+        "issue_number": issue_number,
+        "issue_url": payload.get("issue_url"),
+        "partial": payload.get("partial"),
+        "coverage_gaps": payload.get("coverage_gaps") or [],
+        "collect_s": payload.get("collect_s"),
+        "inspect_s": payload.get("inspect_s"),
+        "publish_s": payload.get("publish_s"),
+        "new_ids": sorted(new_ids),
+        "resolved_ids": sorted(resolved_ids),
+        "current_ids": sorted(set(rendered_ids)),
+        "id_scheme": ID_SCHEME,
+        "document": _redact_document(document),
+    }
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace `path` in one step, from a temp file in its own directory.
+
+    Same directory because `os.replace` is only atomic within a filesystem,
+    and a reader must never meet a half-written envelope — the chat path
+    reads `latest.json` at arbitrary times, including mid-write.
+    """
+    handle = tempfile.NamedTemporaryFile(
+        "w", dir=str(path.parent), suffix=".tmp", delete=False, encoding="utf-8"
+    )
+    try:
+        with handle:
+            handle.write(text)
+        os.replace(handle.name, path)
+    except OSError:
+        _unlink(handle.name)
+        raise
+
+
+def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
+    """Keep the document this run just published. Best-effort, never fatal.
+
+    Called on the exit-0 publish path only — never from `--dry-run`, never
+    after a validation failure (both return before reaching it), and never
+    from `remediate`, which changes no findings.
+    """
+    directory = reports_dir_for(audit_id)
+    runs = directory / "runs"
+    try:
+        runs.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
+        # A UTC stamp that sorts lexically in time order, so the prune below
+        # and the chat path's "the run before this one" are both a sort.
+        stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        _atomic_write(runs / f"{stamp}.json", text)
+        # A copy, not a symlink: one fewer behaviour to ask of the 9p mount,
+        # for zero saved bytes.
+        _atomic_write(directory / "latest.json", text)
+    except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
+        log(f"WARNING: report store write for {audit_id} failed: {exc}")
+        # `latest.json` now holds an *older* run, and nothing downstream can
+        # tell that from a current one: same ledger, same id scheme, so the
+        # next run trusts a memory that is missing everything this run
+        # published and announces all of it as new — every run, until a write
+        # succeeds. Drop it instead. An absent store is unknowable, which is
+        # the state the failure actually left the harness in, and it costs one
+        # delta-free run rather than a stream of false claims.
+        _unlink(str(directory / "latest.json"))
+        return
+    try:
+        for stale in sorted(runs.glob("*.json"))[:-REPORT_HISTORY]:
+            stale.unlink()
+    except Exception as exc:  # noqa: BLE001 — the memory is already written
+        # Deliberately not the invalidating path above: the envelope landed
+        # and is correct, and an over-long ring costs disk rather than
+        # accuracy.
+        log(f"WARNING: report store prune for {audit_id} failed: {exc}")
+
+
+def read_report_memory(audit_id: str, issue_number: int | None) -> dict | None:
+    """The previous run's envelope, or None when it cannot be trusted.
+
+    Trust is two equalities, both required. The envelope's `issue_number` must
+    match the ledger `find_existing_issue` just returned — a store written for
+    a different issue is a memory of a different conversation, and joining
+    against it would call every id on one side new and every id on the other
+    resolved. And its `id_scheme` must match the code's, for the same reason
+    at the level of individual ids: the same finding is spelled differently
+    across a scheme bump.
+
+    None is *unknowable*, not empty, and the caller must keep them apart —
+    treating an absent store as an empty one would announce every live finding
+    as new the first morning after a PVC is wiped.
+    """
+    if issue_number is None:
+        return None
+    path = reports_dir_for(audit_id) / "latest.json"
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log(
+            f"No stored report for {audit_id} at {path}, but issue "
+            f"#{issue_number} is open; the previous run's findings are "
+            "unknowable, so this run makes no delta claim."
+        )
+        return None
+    except (OSError, ValueError) as exc:
+        log(f"WARNING: stored report for {audit_id} is unreadable ({exc}).")
+        return None
+    if not isinstance(envelope, dict):
+        log(f"WARNING: stored report for {audit_id} is not an object.")
+        return None
+    stored_issue = envelope.get("issue_number")
+    if stored_issue != issue_number:
+        log(
+            f"Stored report for {audit_id} was written for issue "
+            f"#{stored_issue}, not the open #{issue_number}; this run makes "
+            "no delta claim rather than joining two different ledgers."
+        )
+        return None
+    if envelope.get("id_scheme") != ID_SCHEME:
+        log(
+            f"Stored report for {audit_id} carries finding-identity scheme "
+            f"{envelope.get('id_scheme')} and this run uses {ID_SCHEME}; this "
+            "run makes no delta claim rather than reporting a rename as a fix."
+        )
+        return None
+    # Well-formed JSON is not a well-formed envelope. `current_ids` is iterated
+    # by the caller and `document` is walked by `report_finding_titles`, and
+    # neither is inside a try — so a file that parses but holds a number where
+    # the id set belongs raises out of `finish` and kills a run whose findings
+    # are already published. A store failure may cost a delta; it may never
+    # cost an exit code (design §8).
+    if not isinstance(envelope.get("current_ids"), list):
+        log(
+            f"WARNING: stored report for {audit_id} has no readable id set; "
+            "this run makes no delta claim."
+        )
+        return None
+    return envelope
+
+
+def report_finding_titles(envelope: dict | None) -> dict[str, str]:
+    """{finding id: title} from a stored document, to name resolved findings.
+
+    Every finding the previous run published, not just the ones its body had
+    room to render — the delta comment and the stale-PR close comments both
+    name findings by title, and a truncated one is still a finding that got
+    fixed.
+    """
+    if not envelope:
+        return {}
+    document = envelope.get("document")
+    if not isinstance(document, dict):
+        return {}
+    findings = document.get("findings")
+    if not isinstance(findings, list):
+        return {}
+    titles: dict[str, str] = {}
+    for finding in findings:
+        if isinstance(finding, dict) and finding.get("id"):
+            titles[str(finding["id"])] = str(finding.get("title") or "").strip()
+    return titles
+
+
 def base_branch() -> str:
     """The branch remediation pull requests target: this repository's own default.
 
@@ -1475,12 +1726,16 @@ def _shorten_id(fid: str) -> str:
 def parse_id_scheme(body: str | None) -> int:
     """Which identity scheme wrote this body's delta block. 0 when unstamped.
 
-    0 is the honest answer for every ledger written before the stamp existed,
+    0 is the honest answer for every body written before the stamp existed,
     and it is also what an unparseable or hand-edited stamp collapses to — in
     both cases the correct behaviour is the same, so they need not be told
     apart. Zero can never equal `ID_SCHEME`, so an unstamped body is always
-    treated as unjoinable, which is the safe direction: the cost is one run of
-    withheld `resolved`, and the alternative is announcing a fix nobody made.
+    treated as unjoinable, which is the safe direction.
+
+    The one caller left is `close_stale_remediation_prs`, reading the block a
+    remediation pull request wrote about itself: unjoinable there means the
+    pull request stays open for a run rather than being closed on a "none of
+    these still reproduce" nobody could actually check.
     """
     body = normalise_newlines(body)
     if not body:
@@ -2167,14 +2422,6 @@ def parse_delta_block(body: str | None) -> list[str]:
     if not isinstance(ids, list):
         return []
     return [i for i in ids if isinstance(i, str)]
-
-
-def parse_finding_titles(body: str | None) -> dict[str, str]:
-    """Recover {finding id: title} from a previous issue body, to name resolved findings."""
-    body = normalise_newlines(body)
-    if not body:
-        return {}
-    return {fid: title.strip() for title, fid in FINDING_MARKER_RE.findall(body)}
 
 
 def compute_delta(
@@ -3237,10 +3484,11 @@ def render_finding(
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
 
     # The anchor is a line of its own *above* the heading rather than markup
-    # appended to it. FINDING_MARKER_RE matches the heading through to end of
-    # line, so anything after the comment stops it matching — and that regex is
-    # how a resolved finding's title is recovered from the previous body once
-    # the finding is gone from findings.json.
+    # appended to it, so the `finding:` comment stays the last thing on the
+    # heading line: it is the per-finding join key a reader or an external tool
+    # uses on a body it did not generate. The harness no longer parses it —
+    # resolved findings are named from the report store's stored document
+    # (§4.8) — but the published marker is part of the body's contract.
     lines = [
         f'<a id="{_anchor_id(fid)}"></a>',
         "",
@@ -4497,24 +4745,16 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
     return int(chosen["number"]), chosen.get("url")
 
 
-def fetch_issue_body(repo: str, number: int) -> str | None:
-    """The ledger's current body, or None when it could not be read.
+def issue_number_from_url(url: str | None) -> int | None:
+    """The trailing number of an issue URL `gh issue create` printed, if any.
 
-    None and "" are different answers. An unreadable body means the delta is
-    unknowable; treating it as empty would announce every live finding as new.
+    `gh` reports a created issue as a URL and nothing else; the number is what
+    the report store's trust check joins on next run.
     """
-    res = gh(["issue", "view", str(number), "-R", repo, "--json", "body"], check=False)
-    if res.returncode != 0:
-        log(
-            f"WARNING: could not read issue #{number} (gh exited {res.returncode}); "
-            "skipping the delta comment rather than reporting every finding as new."
-        )
+    if not url:
         return None
-    try:
-        return str(json.loads(res.stdout or "{}").get("body") or "")
-    except json.JSONDecodeError:
-        log(f"WARNING: issue #{number} body came back as non-JSON; skipping the delta.")
-        return None
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
 
 
 def fetch_issue_url(repo: str, number: int) -> str | None:
@@ -5914,28 +6154,23 @@ def handle_finish(args: argparse.Namespace) -> None:
         log(f"COVERAGE GAP: {gap}")
 
     existing_issue, existing_url = find_existing_issue(repo, audit_id)
-    previous_body = fetch_issue_body(repo, existing_issue) if existing_issue else ""
-    # None means the body was unreadable, which is not the same as empty: the
-    # delta is unknowable, so report no delta rather than a fabricated one.
-    delta_known = previous_body is not None
-    previous_ids = parse_delta_block(previous_body or "")
-    previous_titles = parse_finding_titles(previous_body or "")
-    # A block written under a different identity scheme cannot be joined
-    # against this one: the same finding is spelled differently on the two
-    # sides, so every id on the left looks fixed and every id on the right
-    # looks new. `new` is merely noisy that way and is left alone; `resolved`
-    # is a claim that somebody fixed something, so it is withheld for the one
-    # run it takes for the block to be rewritten. Self-clearing, and it costs a
-    # single run of silence on a question nothing can answer.
-    previous_scheme = parse_id_scheme(previous_body)
-    stale_scheme = bool(previous_ids) and previous_scheme != ID_SCHEME
-    if stale_scheme:
-        log(
-            f"Previous ledger's {len(previous_ids)} finding id(s) were written "
-            f"under identity scheme {previous_scheme} and this run uses "
-            f"{ID_SCHEME}; withholding 'resolved' this run rather than reporting "
-            "a rename as a fix."
-        )
+    # The previous run's ids come from the store this harness wrote (§4.8),
+    # not from a round trip that re-fetches the public issue body to parse the
+    # harness's own breadcrumb back out of it. The hidden block is still
+    # written into every body — it is bench's grading interface and the
+    # artifact's published contract — but nothing reads it back.
+    #
+    # `read_report_memory` returning None means the memory is *unknowable*,
+    # not empty, and the two must not be conflated: an absent store (a wiped
+    # PVC), one written for a different ledger, or one minted under a
+    # superseded id scheme would each announce every live finding as new if
+    # read as "the previous run found nothing". No open ledger is the one case
+    # that genuinely is empty — the run is first, and everything present is
+    # new.
+    memory = read_report_memory(audit_id, existing_issue)
+    delta_known = existing_issue is None or memory is not None
+    previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
+    previous_titles = report_finding_titles(memory)
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -6040,6 +6275,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 _unlink(body_file)
             lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
             existing_url = lines[-1] if lines else None
+            existing_issue = issue_number_from_url(existing_url)
             log(
                 f"Audit {audit_id} found nothing and had no ledger, but "
                 f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
@@ -6047,9 +6283,11 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
-        # No `stale_scheme` guard here on purpose. This branch is not a join —
-        # the run produced no findings at all, so everything the ledger knew
-        # about is gone whatever it was called. The coverage guard still
+        # This branch is not a join — the run produced no findings at all, so
+        # everything the previous run knew about is gone whatever it was
+        # called. An untrusted memory reaches here as an empty `previous_ids`
+        # and therefore claims nothing, which is the same answer the join
+        # branch reaches by way of `delta_known`. The coverage guard still
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
         clean_resolved = 0 if gaps else len(previous_ids)
@@ -6065,7 +6303,15 @@ def handle_finish(args: argparse.Namespace) -> None:
             # unconditionally: `resolved > 0` is the fleet getting
             # better and is the best news this audit ever delivers, and
             # a gap means it could not look rather than found nothing.
-            "silent_ok": not (clean_resolved or gaps or prs_closed),
+            #
+            # `delta_known` is the same guard one step further out. An
+            # untrusted memory reaches here as an empty `previous_ids`, so
+            # `clean_resolved` is 0 for a run that just closed a ledger full
+            # of findings — and staying silent about that is the audit
+            # swallowing its own good news because it could not count it. It
+            # still claims no number; it just does not claim there was
+            # nothing to say.
+            "silent_ok": not (clean_resolved or gaps or prs_closed) and delta_known,
             "partial": bool(gaps),
             "coverage_gaps": gaps,
             "inspect_s": inspect_s,
@@ -6073,6 +6319,37 @@ def handle_finish(args: argparse.Namespace) -> None:
             "collect_s": collect_s,
         }
         status_record_run(audit_id, _status_row(payload, data, findings, now))
+        # `current_ids` is a claim about what a *live ledger body* renders, so
+        # it may only be empty where a body this run wrote is empty. Two of the
+        # three clean paths qualify: the ledger was closed, or a fresh coverage
+        # ledger was opened with no findings in it. The third does not — zero
+        # findings over incomplete coverage leaves the ledger open and only
+        # comments on it, so the body still renders whatever the previous run
+        # put there. Recording `[]` against that still-open issue hands the
+        # next run a *trusted* memory of an empty ledger, and it announces
+        # every finding the body has been carrying all along as new.
+        #
+        # Carry the previous set forward instead, and where the previous set
+        # is itself unknowable, write no issue number at all: an envelope that
+        # claims no ledger fails the next run's trust check by design, which
+        # is the outcome an unreadable body should have.
+        body_untouched = bool(existing_issue) and bool(gaps)
+        write_report(
+            audit_id,
+            report_envelope(
+                audit_id,
+                payload,
+                data,
+                now,
+                issue_number=(
+                    None if body_untouched and not delta_known else existing_issue
+                ),
+                new_ids=[],
+                resolved_ids=[] if gaps else previous_ids,
+                rendered_ids=previous_ids if body_untouched else [],
+            ),
+            now,
+        )
         print(json.dumps(payload))
         return
 
@@ -6132,6 +6409,9 @@ def handle_finish(args: argparse.Namespace) -> None:
     new_ids, resolved_ids = compute_delta(
         previous_ids, rendered.rendered_ids, current_ids
     )
+    # What the published body's hidden block ends up carrying, and so what the
+    # store records as this run's memory. The relink edit below can change it.
+    published_ids = rendered.rendered_ids
     body_file = _write_temp(rendered.body)
     try:
         if existing_issue is None:
@@ -6154,10 +6434,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             status = "OPENED"
             lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
             issue_url = lines[-1] if lines else None
-            number = None
-            if issue_url:
-                tail = issue_url.rstrip("/").rsplit("/", 1)[-1]
-                number = int(tail) if tail.isdigit() else None
+            number = issue_number_from_url(issue_url)
         else:
             gh(
                 [
@@ -6237,23 +6514,31 @@ def handle_finish(args: argparse.Namespace) -> None:
         }
         # One extra edit is cheaper than making a reader wait a day.
         if number is not None:
-            relink = _write_temp(
-                render_issue_body(
-                    data,
-                    generated_at=now,
-                    audit_id=audit_id,
-                    states=states,
-                    pr_urls=pr_urls,
-                    withheld=plan.withheld,
-                ).body
+            relinked = render_issue_body(
+                data,
+                generated_at=now,
+                audit_id=audit_id,
+                states=states,
+                pr_urls=pr_urls,
+                withheld=plan.withheld,
             )
+            relink = _write_temp(relinked.body)
             try:
-                gh(
+                edit = gh(
                     ["issue", "edit", str(number), "-R", repo, "--body-file", relink],
                     check=False,
                 )
             finally:
                 _unlink(relink)
+            # Rebound only once the edit lands, so the store's `current_ids`
+            # stays exactly the hidden block the ledger ended up carrying. The
+            # pull-request links can push a finding over the body budget that
+            # fit a moment ago, so recording the pre-link set would call that
+            # finding new again tomorrow — but this edit is `check=False` and
+            # a run survives losing it, and recording a set the live body does
+            # not have is the same bug in the other direction.
+            if edit.returncode == 0:
+                published_ids = relinked.rendered_ids
 
     # A command that succeeds silently is indistinguishable from one that was
     # never read, so every accepted `/remediate` gets an answer naming what it
@@ -6271,18 +6556,19 @@ def handle_finish(args: argparse.Namespace) -> None:
     if status == "UPDATED" and number is not None:
         if not delta_known:
             log(
-                "Previous ledger body was unreadable; skipping the delta comment "
-                "rather than announcing every live finding as new."
+                "The previous run's report is unavailable (see above); skipping "
+                "the delta comment rather than announcing every live finding as "
+                "new. This run's own store write restores the delta from the "
+                "next run on."
             )
         else:
             comment = render_delta_comment(
                 audit_id,
                 new_ids,
-                # Absence is only evidence of a fix when the audit looked, and
-                # only when the two sides are comparable. Over a coverage gap
-                # absence means "not checked"; across a scheme change it means
-                # "spelled differently". Neither is a fix.
-                [] if (gaps or stale_scheme) else resolved_ids,
+                # Absence is only evidence of a fix when the audit looked. Over
+                # a coverage gap absence means "not checked", which is not a
+                # fix.
+                [] if gaps else resolved_ids,
                 findings,
                 previous_titles,
                 now,
@@ -6294,9 +6580,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 log("No new or resolved findings; body refreshed without a comment.")
 
     reported_new = len(new_ids) if delta_known else 0
-    reported_resolved = (
-        0 if (gaps or stale_scheme or not delta_known) else len(resolved_ids)
-    )
+    reported_resolved = 0 if (gaps or not delta_known) else len(resolved_ids)
     payload = {
                 "status": status,
                 "issue_url": issue_url,
@@ -6355,6 +6639,23 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "collect_s": collect_s,
     }
     status_record_run(audit_id, _status_row(payload, data, findings, now))
+    # The delta stored is the one *reported*, so a run that made no claim
+    # stores no claim — and `current_ids` is what this body rendered, which is
+    # what the next run's `new` is measured against.
+    write_report(
+        audit_id,
+        report_envelope(
+            audit_id,
+            payload,
+            data,
+            now,
+            issue_number=number,
+            new_ids=new_ids if delta_known else [],
+            resolved_ids=[] if (gaps or not delta_known) else resolved_ids,
+            rendered_ids=published_ids,
+        ),
+        now,
+    )
     print(json.dumps(payload))
 
 

@@ -82,6 +82,38 @@ is running and what each attempt did.
 stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
 own `deliver` setting; repeating them here sends the same content twice.
 
+## Answering a question about a past run
+
+"What did the last compliance audit find?" is a file read, not a run and not a `gh issue view`.
+`finish` keeps what it published, under `${HERMES_HOME:-/opt/data}/fleet-audit/reports/<audit-id>/`:
+
+- `latest.json` — the newest run's envelope.
+- `runs/<YYYYMMDDThhmmssZ>.json` — one envelope per run, newest 14 kept. Comparing two of them is
+  the only way to see what changed between runs; the ledger issue rewrites itself in place and
+  keeps no history.
+
+The envelope's keys are `audit_id`, `finished_at`, `status`, `issue_number`, `issue_url`, `partial`,
+`coverage_gaps`, `collect_s`, `inspect_s`, `publish_s`, `new_ids`, `resolved_ids`, `current_ids`,
+`id_scheme`, and `document`.
+
+- `document` is the findings document the ledger rendered — post-validation, post-degradation, with
+  the same secret redaction the body gets. It is the whole document, not the subset the body's
+  60k-character budget had room for, so it can hold a finding the issue did not print.
+- `current_ids` is the **rendered** id set, exactly what the body's hidden block published, not
+  every finding in the document. Derive the full set from `document`.
+
+Two things it is not:
+
+- **Not the live issue.** It is the last _published_ state, so a finding a human closed by hand
+  since that run, or a `/remediate` posted since, is not reflected until the next run rewrites the
+  store. Read the issue when the question is about the issue.
+- **Not written for every invocation.** Only the exit-0 publish path writes — never `--dry-run`,
+  never a run that exited 2, never `remediate`. The write is best-effort: a failure logs a
+  `WARNING` and leaves the exit code alone, so a run can be missing from `runs/`. A failed write
+  also deletes `latest.json` rather than leave a superseded envelope reading as current. **A
+  missing `latest.json` means unknown, not clean** — say the store has no record and read the
+  ledger issue.
+
 ## The two-command lifecycle
 
 Run both commands from your normal working directory — the profile directory, where `./skills/...`
@@ -167,17 +199,18 @@ about is not covered by that guarantee.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with eleven fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
-`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two timing fields, `inspect_s`
+JSON line with twelve fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
+`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and three timing fields: `inspect_s`
 (wall-clock from `start` to `finish`, i.e. the inspection phase; `null` when `start`'s
-timestamp file is missing) and `publish_s` (time `finish` itself spent publishing). The timing
+timestamp file is missing), `publish_s` (time `finish` itself spent publishing), and `collect_s`
+(the collector's own wall-clock; `null` on a run that passed no collector manifest). The timing
 fields are telemetry — read them for the report if useful, never branch on them:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":214.0,"publish_s":41.5}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":214.0,"publish_s":41.5,"collect_s":18.2}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":180.2,"publish_s":38.9}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":180.2,"publish_s":38.9,"collect_s":16.7}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":95.1,"publish_s":12.3}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":95.1,"publish_s":12.3,"collect_s":null}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -473,7 +506,9 @@ Corollaries:
 ## What the ledger says about each finding
 
 Every finding renders in exactly one state, computed fresh each run from whether it still reproduces
-and what pull request sits on its branch. Nothing is stored between runs.
+and what pull request sits on its branch. No stored state feeds it — the report store
+([Answering a question about a past run](#answering-a-question-about-a-past-run)) keeps the previous
+run's ids, not this run's states.
 
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
@@ -619,7 +654,7 @@ the files, not on a finding id, and that is load-bearing: ids are regenerated ev
 named after one of them gets renamed the day that finding resolves — orphaning the open pull request
 and opening a duplicate against the same file.
 
-The branch name is the only join key. There is no state file: `finish` reconstructs the entire
+The branch name is the only join key, and no state file backs it: `finish` reconstructs the entire
 finding-to-pull-request mapping from one `gh pr list` call.
 
 ## Size
@@ -696,12 +731,18 @@ Two clean runs come back `silent_ok: false`, and both matter:
 - **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
   nothing" and "I could not look" must not arrive as the same silence.
 
-There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
-previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
-declaring every live finding new. `silent_ok` follows the counts it can defend and comes back `true`
-on an otherwise quiet run. The run logs
-`Previous ledger body was unreadable; skipping the delta comment` to stderr and the ledger is still
-rewritten correctly — the issue carries the truth either way.
+There is one case where the harness reports `new: 0, resolved: 0` without knowing it: the stream has
+an open ledger but the previous run's stored report cannot be trusted — absent (a wiped volume),
+unreadable or not a JSON object, written for a different issue number, or carrying a superseded
+`id_scheme`. An unknowable memory is not an empty one, so all of them land in the same place: the
+delta is withheld rather than every live finding declared new. There is no partial version of it — a
+scheme mismatch withholds the whole delta, not `resolved` alone. `silent_ok` follows the counts it
+can defend and comes back `true` on an otherwise quiet run. Each trigger logs its own stderr line
+naming which one fired, and a ledger rewrite adds `The previous run's report is unavailable (see
+above); skipping the delta comment rather than announcing every live finding as new. This run's own
+store write restores the delta from the next run on.` The ledger is still rewritten correctly — the
+issue carries the truth either way. A stream with **no** open ledger is not this case: that run is
+genuinely the first, and everything in it is new.
 
 ## Red lines
 
