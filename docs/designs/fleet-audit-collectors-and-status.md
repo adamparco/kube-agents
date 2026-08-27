@@ -541,16 +541,20 @@ the collector") ahead of "Checks" instead. No stream actually grew a section tit
 itself (Autopilot ⇒ the four node-facing compliance checks) and pre-fills them with the SOP's
 canonical reasons.
 
-The cron prompts keep the line-count-geography citation style for every stream, converted or
-not, rather than dropping it for the eight in favor of directing the agent to the collector
-first as originally planned here. That citation is a tested safety net —
-`test_cron_prompts_cite_the_real_sop_geography` re-derives both numbers from the SOP file on
-every run, specifically so a read that stops early cannot report a clean fleet it never looked
-at — and it is uniform across all eight prompts today. Dropping it for only the converted
-streams would have meant carving an exemption into that shared test for a subset of streams,
-a larger and riskier change than a design-accuracy pass justifies; the geography citations for
-every converted SOP are instead kept numerically correct as each SOP shrinks. Revisit this if a
-stream-specific prompt style is deliberately proposed.
+All eight cron prompts now name each stream's collector script directly in place of the
+line-count citation: "Run the collector (`skills/fleet-audit/scripts/collect.py
+compliance-audit`) first and read its manifest before doing anything else", and the equivalent
+invocation for the other seven. `test_cron_prompts_name_the_real_collector_invocation` replaces
+`test_cron_prompts_cite_the_real_sop_geography` as the anti-skim safety net: every stream now
+runs through a collector, so `finish --manifest-file`'s cross-check of `checks_run` against the
+commands the collector actually ran (§4.1) is a stronger anti-fabrication guarantee than a
+self-reported line count ever was, which is what makes retiring the citation safe rather than
+merely convenient. The check-roster-matches-the-SOP invariant the old test also carried stays
+covered independently, by `test_check_rosters_match_the_sops`, which scans the whole SOP file
+rather than the prompt's own citation. What the new test still owes a reader: it re-derives the
+collector invocation from the SOP's own "Run the collector" fenced instruction on every run and
+asserts the prompt names that exact script, so an SOP's collector command and a prompt's
+citation of it cannot drift apart the way a hand-measured line count once could.
 
 ## 8. Red lines
 

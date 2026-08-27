@@ -27,14 +27,14 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `cluster-agent-reconcile` | Planning Agent | `11 * * * *` | Hourly at :11 | yes | `cluster_agent_reconcile.py` |
 | `bootstrap-inventory-scan` | Planning Agent | `* * * * *` | — | yes | `bootstrap_scan_gate.py` |
 | `bootstrap-inventory-delivery` | Planning Agent | `* * * * *` | — | yes | `bootstrap_delivery.py` |
-| `compliance-audit` | Platform Agent | `20 6 * * *` | Daily 06:20 | yes | Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' i... |
-| `obtainability-audit` | Platform Agent | `50 6 * * *` | Daily 06:50 | yes | Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your p... |
-| `security-patch-orchestrator` | Platform Agent | `20 7 * * 1` | Weekly, Monday 07:20 | yes | Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrat... |
-| `fleet-wide-cost-analysis` | Platform Agent | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your prof... |
-| `fleet-consistency-drift` | Platform Agent | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' i... |
-| `ai-security-audit` | Platform Agent | `50 8 * * *` | Daily 08:50 | yes | Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your pro... |
-| `stockout-prevention` | Platform Agent | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention... |
-| `gcp-networking-fabric-audit` | Platform Agent | `0 8 * * *` | — | yes | Run the daily GCP networking fabric and VPC IPAM audit. Read the SOP at 'governance/gcp_networking_fabric_s... |
+| `compliance-audit` | Platform Agent | `20 6 * * *` | Daily 06:20 | yes | Run the daily fleet security and RBAC posture audit. Run the collector (`skills/fleet-audit/scripts/collect... |
+| `obtainability-audit` | Platform Agent | `50 6 * * *` | Daily 06:50 | yes | Run the daily workload reliability audit. Run the collector (`skills/fleet-audit/scripts/collect.py obtaina... |
+| `security-patch-orchestrator` | Platform Agent | `20 7 * * 1` | Weekly, Monday 07:20 | yes | Run the weekly GKE upgrade and patch readiness audit. Run the collector (`skills/fleet-audit/scripts/patch_... |
+| `fleet-wide-cost-analysis` | Platform Agent | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Run the collector (`skills/fleet-audit/scripts/fleet_waste.py`) first and... |
+| `fleet-consistency-drift` | Platform Agent | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Run the collector (`skills/fleet-audit/scripts/fleet_drift.py... |
+| `ai-security-audit` | Platform Agent | `50 8 * * *` | Daily 08:50 | yes | Run the daily AI workload security audit. Run the collector (`skills/fleet-audit/scripts/collect.py ai-secu... |
+| `stockout-prevention` | Platform Agent | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Run the collector (`skills/fleet-audit/scripts/... |
+| `gcp-networking-fabric-audit` | Platform Agent | `0 8 * * *` | — | yes | Run the daily GCP networking fabric and VPC IPAM audit. Run the collector (`skills/gcp-networking-fabric-au... |
 | `github-repo-watcher` | Platform Agent | `*/10 * * * *` | Every 10 minutes | yes | `github_scan_gate.py` |
 | `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 
@@ -54,7 +54,7 @@ Both rosters use one schema. A governance watchdog:
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
-  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 347 lines of it, before you run anything. Its eleven checks are section 2, lines 102-252, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "prompt": "Run the daily fleet security and RBAC posture audit. Run the collector (`skills/fleet-audit/scripts/collect.py compliance-audit`) first and read its manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/compliance_audit_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": ["fleet-audit"],
   "enabled": true,
   "deliver": "chat"

@@ -132,55 +132,6 @@ SHARED_RULES = (
 # constant is checked against it once (`test_the_budget_matches_github`).
 GITHUB_BODY_LIMIT = 65_536
 
-# The cron prompts spell their check counts out ("Its eleven checks are
-# section 2"), because a numeral in that sentence reads as a section number.
-NUMBER_WORDS = {
-    word: n
-    for n, word in enumerate(
-        (
-            "zero",
-            "one",
-            "two",
-            "three",
-            "four",
-            "five",
-            "six",
-            "seven",
-            "eight",
-            "nine",
-            "ten",
-            "eleven",
-            "twelve",
-            "thirteen",
-            "fourteen",
-            "fifteen",
-            "sixteen",
-            "seventeen",
-            "eighteen",
-            "nineteen",
-            "twenty",
-        )
-    )
-}
-
-
-def _outside_fences(lines):
-    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
-
-    Every heading scan below has to skip fenced blocks. A `### ` inside one is
-    a shell comment or a JSON fragment, and counting it as a section heading
-    shifts every span derived afterwards — silently, in the direction that
-    makes a stale citation look correct.
-    """
-    fenced = False
-    for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
-            yield number, line
-
-
 def render_body(doc, **kwargs):
     """The rendered issue text.
 
@@ -2057,110 +2008,55 @@ class TestAuditCatalogue(unittest.TestCase):
                 if sop_dir.is_dir():
                     self.assertTrue((sop_dir / spec.sop).is_file())
 
-    def test_cron_prompts_cite_the_real_sop_geography(self):
-        """A stale line number is worse than no line number.
+    def test_cron_prompts_name_the_real_collector_invocation(self):
+        """A prompt pointing at a renamed or moved collector script is worse
+        than one that says nothing about it.
 
-        Each audit prompt tells the worker how long its SOP is and where the
-        checks live, because a read that stops early lands in the preamble and
-        produces a confident all-clear over an audit that never ran. That only
-        helps while the numbers are true: a citation that has drifted teaches
-        the worker it has read enough when it has not. Re-derive both from the
-        file so that editing an SOP without re-measuring fails here rather than
-        at 06:20 in production.
+        Every stream now runs through a collector, so the anti-skim
+        line-count citation this test used to check is no longer the
+        strongest anti-fabrication guarantee available: `finish
+        --manifest-file` verifies `checks_run` against commands the
+        collector actually ran, a stronger check than a self-reported line
+        count ever was (docs/designs/fleet-audit-collectors-and-status.md
+        §4.1, §7). The check-roster-matches-the-SOP invariant the old test
+        also carried is independently covered by
+        test_check_rosters_match_the_sops, which scans the whole SOP file
+        rather than the prompt's own citation. What this test still owes a
+        reader: the prompt's named collector command must be the exact one
+        the SOP's own "Run the collector" instruction documents, re-derived
+        from the SOP file each run, so an SOP edited without also updating
+        the prompt (or vice versa) fails here rather than at 06:20 in
+        production.
         """
         jobs = self.cron_jobs()
         sop_dir = self.sop_dir()
-        total = re.compile(r"all (\d+) lines of it")
-        span = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
-        # "Its eleven checks are section 2" / "Its nineteen facets are section
-        # 4" — the noun differs by stream, the count must not.
-        counted = re.compile(r"\bIts ([a-z]+) \w+ are section\b")
-        # A `#### ` check heading names its slugs in a trailing parenthesis;
-        # same anchoring as test_check_rosters_match_the_sops, and same reason.
-        trailing = re.compile(r"\((((?:`[^`]+`)(?:,\s*)?)+)\)\s*$")
-        token = re.compile(r"`([^`]+)`")
         for audit_id, spec in audit_report.AUDITS.items():
             prompt = jobs[audit_id]["prompt"]
             name = SOP_FILENAMES[audit_id]
-            lines = (sop_dir / name).read_text(encoding="utf-8").splitlines()
+            sop_text = (sop_dir / name).read_text(encoding="utf-8")
             with self.subTest(audit=audit_id):
                 self.assertIn(
                     f"governance/{spec.sop}",
                     prompt,
                     f"the {audit_id} prompt does not send the worker to "
-                    f"{spec.sop}, which is the file these numbers describe",
+                    f"{spec.sop}",
                 )
-
-                claimed = total.search(prompt)
-                self.assertIsNotNone(
-                    claimed, f"{audit_id} prompt no longer states the SOP length"
+                idx = sop_text.find("Run the collector")
+                self.assertNotEqual(
+                    idx, -1,
+                    f"{name} has no 'Run the collector' instruction for the "
+                    f"prompt to cite",
                 )
-                self.assertEqual(
-                    len(lines),
-                    int(claimed.group(1)),
-                    f"{audit_id} prompt claims {claimed.group(1)} lines but "
-                    f"{name} has {len(lines)}",
-                )
-
-                cited = span.search(prompt)
-                self.assertIsNotNone(
-                    cited, f"{audit_id} prompt no longer locates the checks"
-                )
-                section, first, last = cited.groups()
-                # Sections are `### <n>. Title`; the section ends where the next
-                # one begins, so the checks span up to the line before it. Only
-                # headings outside a fenced block count — the compliance SOP
-                # opens with a bash fence, and a `### ` inside one is a comment
-                # or a shell heredoc, not a section.
-                starts = [n for n, line in _outside_fences(lines) if line.startswith("### ")]
-                heading = f"### {section}. "
-                where = [n for n in starts if lines[n - 1].startswith(heading)]
-                self.assertEqual(
-                    1,
-                    len(where),
-                    f"{name} has {len(where)} sections headed {heading!r}; "
-                    f"the {audit_id} prompt cites one",
-                )
-                after = [n for n in starts if n > where[0]]
-                first, last = int(first), int(last)
-                self.assertEqual(
-                    (where[0], (after[0] - 1) if after else len(lines)),
-                    (first, last),
-                    f"{audit_id} prompt cites lines {first}-{last} for section "
-                    f"{section} of {name}, which has moved",
-                )
-
-                # The span being *a* real section is not the claim the prompt
-                # makes. It says the checks are in there, and a worker that
-                # reads only that range has to come out holding the whole
-                # roster. Point it at the preamble and every number above still
-                # checks out while the worker reads nothing it needs.
-                inside = [
-                    slug
-                    for n, line in _outside_fences(lines)
-                    if first <= n <= last and line.startswith("#### ")
-                    for match in [trailing.search(line)]
-                    if match
-                    for slug in token.findall(match.group(1))
-                ]
-                self.assertEqual(
-                    sorted(spec.checks),
-                    sorted(inside),
-                    f"lines {first}-{last} of {name} do not define the roster "
-                    f"the {audit_id} stream validates against",
-                )
-
-                # And the prompt's own count, which is what tells a worker
-                # mid-read whether it has found them all.
-                says = counted.search(prompt)
-                self.assertIsNotNone(
-                    says, f"{audit_id} prompt no longer counts its checks"
-                )
-                self.assertEqual(
-                    len(spec.checks),
-                    NUMBER_WORDS.get(says.group(1)),
-                    f"{audit_id} prompt says {says.group(1)!r} but the stream "
-                    f"has {len(spec.checks)} checks",
+                fence_marker = "```bash\n"
+                fence_start = sop_text.index(fence_marker, idx) + len(fence_marker)
+                fence_end = sop_text.index("\n```", fence_start)
+                invocation_line = sop_text[fence_start:fence_end].splitlines()[0].strip()
+                script_token = invocation_line.split()[0].lstrip("./")
+                self.assertIn(
+                    script_token,
+                    prompt,
+                    f"the {audit_id} prompt does not name {script_token}, the "
+                    f"collector {name} actually documents",
                 )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
