@@ -16,13 +16,13 @@ Out: agent-pod lifecycle. The module does not own its callers' Deployments. The 
 
 ## Status: built and not built
 
-Built on this branch: the six CRDs; the broker binary and pipeline steps 1–11; the classifier, undo, brake, and budget machinery; the journal (`internal/journal`); the reconcilers (`AgentReconciler`, `BrakeReconciler`, `UndoReconciler`, `JournalReconciler`, `RetentionReconciler`); and the two ValidatingAdmissionPolicies in `config/policy/vap-agent-scope-journal.yaml`. Designed, not built:
+Built on this branch: the six CRDs; the broker binary and pipeline steps 1–11; the classifier, undo, brake, and budget machinery; the journal (`internal/journal`); the reconcilers (`AgentReconciler`, `BrakeReconciler`, `UndoReconciler`, `JournalReconciler`, `RetentionReconciler`); the two ValidatingAdmissionPolicies in `config/policy/vap-agent-scope-journal.yaml`; and now the approval-through-chat loop this document set designed: the notifier (`internal/broker/approval/notify`), the ChatOps gateway (`internal/broker/approval/gateway`, `cmd/chatops-gateway`), and the broker's own resumption/expiry loop (`internal/broker/pipeline/resume.go`, polled from `cmd/broker`, not watched — see chat-approval.md §2's note on why). Designed, not built:
 
-- The entire approval-through-chat loop. No `ApprovalNotifier` implementation exists (`Approvals: nil`, `cmd/broker/wiring.go:343`), no approve/reject chat verbs exist anywhere, and the ChatOps gateway identity exists only in the VAP.
-- The reconcilers' runtime home, a module-owned controller manager. No entry point wires the reconcilers today.
+- The reconcilers' runtime home, a module-owned controller manager. No entry point wires the five Agent-lifecycle reconcilers today (unrelated to the approval loop above, which needs none of them).
+- A production Google Chat bearer verifier: v1 ships a shared-secret check (`gateway.SharedSecretVerifier`), not verification of Google's own signed JWT against its published JWKS — see `gateway.BearerVerifier`'s doc comment.
 - `BodyStore` is also nil today (`wiring.go:312`).
 
-Nothing in the shipping operator or agent path calls the module yet. What that means for a gated action, plus two smaller wiring gaps — architecture.md §8.
+Nothing in the shipping operator or agent path calls the module yet. What that means for a gated action, plus the wiring gaps above — architecture.md §8.
 
 ## The document set
 

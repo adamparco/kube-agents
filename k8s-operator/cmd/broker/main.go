@@ -226,6 +226,15 @@ func run(ctx context.Context, o options) error {
 	if err != nil {
 		return err
 	}
+
+	// The resumption loop (chat-approval.md §3-4): a poll, not a controller-runtime manager. That
+	// is deliberate, not an oversight -- "ONE listener" a few lines below is a property this file
+	// enforces on purpose, and a manager brings its own health/metrics listeners looking for a
+	// flag to turn them off. A plain List on the direct client this file already builds needs no
+	// second port and no watch cache, and the resumption loop's own latency budget (it is racing an
+	// approval TTL measured in hours) has no use for a watch's sub-second wakeup anyway.
+	go runResumeLoop(ctx, k8s, pipe, records, o.namespace)
+
 	// Before the listener opens. A broker that is accepting submissions while its brake has never
 	// been read is a broker whose first few actions were decided by a source that had nothing in
 	// it -- and startSources exits non-zero rather than degrading, for the reasons stated there.

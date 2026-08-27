@@ -233,6 +233,25 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	return nil
 }
 
+// UpdateForResume persists a fresh pre-state snapshot and undo plan onto a record that already
+// exists (chat-approval.md §3's resumption loop). It exists because Create is idempotent on
+// AlreadyExists and therefore a no-op on a record the broker parked earlier — the approval path
+// re-snapshots against live state at approval time rather than trusting a pre-state that is hours
+// old, and something has to carry that fresh snapshot onto the record Create will not touch again.
+//
+// A SPEC patch, not a status write: PreState and Undo live under spec, so nothing here is governed
+// by vap-agent-scope-journal.yaml, and this method's identity requirements are exactly the owning
+// broker's ordinary write access to its own records — no new grant for resumption to work.
+func (s *Store) UpdateForResume(ctx context.Context, ar *agentv1alpha1.ActionRecord, preState []agentv1alpha1.PreStateSnapshot, undo *agentv1alpha1.UndoPlan) error {
+	patch := client.MergeFrom(ar.DeepCopy())
+	ar.Spec.PreState = preState
+	ar.Spec.Undo = undo
+	if err := s.client.Patch(ctx, ar, patch); err != nil {
+		return fmt.Errorf("journal: updating %s/%s for resumption: %w", ar.Namespace, ar.Name, err)
+	}
+	return nil
+}
+
 // Get fetches a record by action id from a namespace.
 func (s *Store) Get(ctx context.Context, namespace, actionID string) (*agentv1alpha1.ActionRecord, error) {
 	var ar agentv1alpha1.ActionRecord

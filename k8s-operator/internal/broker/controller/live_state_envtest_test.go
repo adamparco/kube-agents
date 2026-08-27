@@ -70,7 +70,7 @@ func startLiveStateEnv(t *testing.T) (client.Client, discovery.ServerResourcesIn
 		t.Fatalf("add kube-agents scheme: %v", err)
 	}
 	testEnv := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 		Scheme:                scheme,
 	}

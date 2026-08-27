@@ -93,7 +93,7 @@ func TestJournalStatusPolicy(t *testing.T) {
 	}
 
 	testEnv := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 		Scheme:                scheme,
 	}
@@ -112,7 +112,7 @@ func TestJournalStatusPolicy(t *testing.T) {
 	grantTestWriters(ctx, t, admin)
 	// A CEL compile error in the policy surfaces here, as an apply failure or a policy that never
 	// starts enforcing -- which waitForPolicy turns into a test failure rather than a silent pass.
-	applyPolicyFile(ctx, t, admin, filepath.Join("..", "..", "config", "policy", "vap-agent-scope-journal.yaml"))
+	applyPolicyFile(ctx, t, admin, filepath.Join("..", "..", "..", "config", "policy", "vap-agent-scope-journal.yaml"))
 
 	as := func(user string) client.Client {
 		impersonated := rest.CopyConfig(cfg)

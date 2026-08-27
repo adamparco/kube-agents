@@ -1,0 +1,124 @@
+# The gateway and notifier, one Deployment, one pod, one ServiceAccount
+# (docs/designs/broker/chat-approval.md §3). Single replica plus leader election -- two gateways
+# would mean two Slack socket connections and split ingress (chat-approval.md §7's "one-socket
+# rule", 05 §1.8).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-agents-chatops-gateway
+  namespace: kubeagents-system
+  labels:
+    control-plane: chatops-gateway
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+    app.kubernetes.io/component: chatops-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: chatops-gateway
+      app.kubernetes.io/name: kube-agents-chatops-gateway
+  template:
+    metadata:
+      labels:
+        control-plane: chatops-gateway
+        app.kubernetes.io/name: kube-agents-chatops-gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: kube-agents-chatops-gateway
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: gateway
+          # Its own image, built from Dockerfile.chatops-gateway -- not the operator's or the
+          # broker's. Repointed to a digest by `kustomize edit set image chatops-gateway=...` at
+          # install time, the same way the other per-binary images are.
+          image: chatops-gateway:v0.1.0
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=0
+            - --addr=:8443
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Every credential below is optional at the process level (main.go warns and disables
+            # the affected route/platform rather than refusing to start) so that installing the
+            # gateway before either chat app is provisioned does not crash-loop it -- see
+            # docs/designs/broker/chat-approval.md §6's "provisioning is manual console steps".
+            - name: SLACK_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: chatops-gateway-slack
+                  key: signingSecret
+                  optional: true
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: chatops-gateway-slack
+                  key: botToken
+                  optional: true
+            - name: GOOGLECHAT_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: chatops-gateway-googlechat
+                  key: sharedSecret
+                  optional: true
+            - name: GOOGLECHAT_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: chatops-gateway-googlechat
+                  key: botToken
+                  optional: true
+          ports:
+            - containerPort: 8443
+              name: webhooks
+              protocol: TCP
+            - containerPort: 8081
+              name: health
+              protocol: TCP
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-agents-chatops-gateway
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+    app.kubernetes.io/component: chatops-gateway
+spec:
+  selector:
+    control-plane: chatops-gateway
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+  ports:
+    - name: webhooks
+      port: 8443
+      targetPort: 8443

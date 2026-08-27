@@ -353,6 +353,18 @@ func (f *fakeRecords) SetPhase(_ context.Context, ar *agentv1alpha1.ActionRecord
 	return nil
 }
 
+func (f *fakeRecords) UpdateForResume(_ context.Context, ar *agentv1alpha1.ActionRecord, preState []agentv1alpha1.PreStateSnapshot, undo *agentv1alpha1.UndoPlan) error {
+	ar.Spec.PreState = preState
+	ar.Spec.Undo = undo
+	for i, stored := range f.stored {
+		if stored.Spec.ActionID == ar.Spec.ActionID {
+			f.stored[i] = ar.DeepCopy()
+			break
+		}
+	}
+	return nil
+}
+
 // fakeBrake is the BrakeSource. The zero-ish view it returns is the one that ALLOWS: an agent that
 // reads, a fresh freeze list, a reachable journal. Every fault case perturbs one field of it, which
 // is the only way to be sure the perturbation is what refused.

@@ -547,6 +547,26 @@ type ActionRecordSpec struct {
 	// Retention carries the two clocks.
 	// +kubebuilder:validation:Required
 	Retention RetentionSpec `json:"retention"`
+
+	// EnvelopeJSON is the canonical JSON of the submitted envelope, preserved so the resumption
+	// loop can re-execute a gated action once approved. Populated only when an action gates:
+	// spec.targets names WHAT an operation touches, never what it would WRITE, and applying,
+	// patching or scaling needs the desired body — data that exists nowhere else once the HTTP
+	// request that carried it has completed.
+	//
+	// Opaque JSON rather than a second, CRD-typed copy of the envelope's operation shapes, because
+	// duplicating that shape as CRD types would be a second definition of the wire contract
+	// (06 §4.1) to keep in step with the first, for a value nothing outside the broker's own
+	// resumption code ever reads.
+	//
+	// Carries whatever the operation's desired state or patch body contained, UNREDACTED — unlike
+	// PreState, which the undo/sanitize path redacts Secret material out of before it is ever
+	// written here. A gated write to a Secret is a real and expected case (the code floor's
+	// RuleSecretWrite forces at least gated), and resumption needs the actual bytes to execute it;
+	// there is no redaction that survives being un-redacted at approval time. This is a deliberate,
+	// stated tradeoff, not an oversight — see docs/designs/broker/chat-approval.md's build inventory.
+	// +optional
+	EnvelopeJSON string `json:"envelopeJson,omitempty"`
 }
 
 // AppliedDiffOp is one entry of the normalized JSON-patch of what actually changed on the server.

@@ -1,0 +1,14 @@
+# Standalone: this base is NOT referenced by config/default, and that is the point (see
+# service_account.yaml's comment on why the gateway's identity name must not go through
+# config/default's `namePrefix`). Applied on its own once the module is ready to run:
+#   kubectl apply -k config/chatops-gateway
+# and the CRDs it needs (config/crd/bases/kubeagents.x-k8s.io_{actionrecords,agents,
+# approvalrosters}.yaml) and the VAP (config/policy/vap-agent-scope-journal.yaml) applied
+# alongside it -- neither is duplicated here, matching AGENTS.md's rule against a second
+# expression of a manifest that already exists.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - service_account.yaml
+  - rbac.yaml
+  - deployment.yaml

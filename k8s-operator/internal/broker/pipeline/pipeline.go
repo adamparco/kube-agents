@@ -76,6 +76,9 @@ type RecordStore interface {
 	Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) error
 	Get(ctx context.Context, namespace, actionID string) (*agentv1alpha1.ActionRecord, error)
 	SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, phase agentv1alpha1.ActionPhase, message string) error
+	// UpdateForResume persists a fresh pre-state snapshot and undo plan onto an already-created
+	// record — the resumption loop's write, since Create is a no-op past the record's first write.
+	UpdateForResume(ctx context.Context, ar *agentv1alpha1.ActionRecord, preState []agentv1alpha1.PreStateSnapshot, undo *agentv1alpha1.UndoPlan) error
 }
 
 // BrakeView is everything 06 §4.4 needs ABOUT THE AGENT, gathered in one read so the brake stays a
@@ -480,7 +483,6 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 		if err != nil {
 			return "", err
 		}
-		s.targets = targets
 
 		snaps, err := execute.CaptureAll(ctx, p.cfg.Reader, s.actionID, targets, metav1.NewTime(s.at), p.cfg.BodyStore)
 		if err != nil {
@@ -491,6 +493,26 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 				fmt.Sprintf("step 3: capturing pre-state for %d targets", len(targets)))
 		}
 		s.snaps = snaps
+
+		// Back-fill the identity CaptureAll actually observed: `Snapshot.Ref` is "re-pinned from
+		// what was actually read" (its own doc comment), and TargetRef.UID's doc comment promises
+		// exactly this ("pins the object identity at classification time") for a target that
+		// existed. Indexed by TargetIndex rather than assumed positional, matching executeOps'
+		// own byIndex construction below -- CaptureAll's return order is not a contract this file
+		// otherwise relies on. This is what lets the resumption loop (chat-approval.md §3, 06 §4.4)
+		// notice a target deleted and recreated between classification and approval: the record
+		// carries the UID an approver's roster consented to, not just a name.
+		byIndex := make(map[int]agentv1alpha1.TargetRef, len(snaps))
+		for _, snap := range snaps {
+			byIndex[snap.TargetIndex] = snap.Ref
+		}
+		for i := range targets {
+			if ref, ok := byIndex[i]; ok {
+				targets[i].UID = ref.UID
+				targets[i].ResourceVersion = ref.ResourceVersion
+			}
+		}
+		s.targets = targets
 
 		// The other pre-action read. Its window of validity is the same as the snapshot's -- once
 		// step 5 has written, "the restart count before the action" is unrecoverable, and a row that
@@ -820,6 +842,17 @@ func (p *Pipeline) stepGate(ctx context.Context, s *state) (*broker.Result, erro
 		// that restores the wrong bytes. The approval path re-snapshots. Step 8 never ran, and the
 		// record says so by omission rather than by carrying something that looks current.
 		s.record.Spec.PreState = nil
+		// The mutating payload DOES need to survive the park, unlike the pre-state: resumption
+		// re-snapshots and re-plans, but nothing re-derives what the operations would WRITE, because
+		// that never lived anywhere but the envelope the HTTP request carried (see EnvelopeJSON's
+		// own doc comment). A marshal failure here is the broker's own bug, not a caller error, and
+		// is a hard stop: a record parked without it can never resume, and reporting the park as
+		// successful anyway would hide that until the approval that arrives too late to fix it.
+		envelopeJSON, err := json.Marshal(s.env)
+		if err != nil {
+			return "", fmt.Errorf("step 7: marshaling the envelope for action %s to preserve across the approval wait: %w", s.actionID, err)
+		}
+		s.record.Spec.EnvelopeJSON = string(envelopeJSON)
 		s.record.Status.Phase = agentv1alpha1.PhasePendingApproval
 		if err := p.cfg.Records.Create(ctx, s.record); err != nil {
 			return "", fmt.Errorf("step 7: parking action %s for approval: %w", s.actionID, err)

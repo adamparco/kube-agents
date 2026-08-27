@@ -66,7 +66,7 @@ func brakeEnv(t *testing.T) (client.Client, context.Context) {
 	}
 
 	testEnv := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 		Scheme:                scheme,
 	}

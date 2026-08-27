@@ -90,7 +90,7 @@ What must survive any replacement is not the code but three properties: the two-
 
 The production wiring leaves these gaps, stated here as facts with their anchors:
 
-- `Approvals: nil` (`cmd/broker/wiring.go:343`). No `ApprovalNotifier` implementation exists. Gated actions park as `PendingApproval` and the response says so; nobody is notified. This is the gap [chat-approval.md](chat-approval.md) closes.
+- `Approvals: nil` (`cmd/broker/wiring.go:343`) — still true, and still fine: [chat-approval.md](chat-approval.md)'s notifier is built and delivers by its own watch loop over `PendingApproval` records regardless of whether the broker's synchronous step-7 nudge ever fires (`notify.Reconciler`, driven by `cmd/chatops-gateway`, not by the broker). What chat-approval.md's build inventory (§6) still names as absent is a production Google Chat JWT verifier and the two chat apps' actual provisioning, not the loop itself.
 - No entry point wires the reconcilers. Nothing outside tests imports `internal/broker/controller`; the module-owned controller manager that runs them (§1) is designed, not built.
 - `config/manager/brake_deployment.yaml` names `--controllers=brake`, a flag no binary on the branch implements — a stale artifact of the port, replaced by the module manager's own Deployment.
 - `BodyStore: nil` (`cmd/broker/wiring.go:312`). No production `journal.BlobSink` exists, so over-1MiB bodies are refused by name in `execute` rather than stored by reference. `Replayer.Sink` is nil for the same reason.

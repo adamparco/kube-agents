@@ -1,0 +1,110 @@
+# The ChatOps gateway and notifier's whole authority (chat-approval.md §2-3), hand-written and NOT
+# generated from +kubebuilder:rbac markers -- a marker on this module's reconciler would compose
+# into the OPERATOR's manager-role ClusterRole, handing the operator's own identity a grant this
+# process's separate identity exists specifically to keep away from it (the same reasoning
+# config/rbac/brake_role.yaml gives for C-BR).
+#
+# v1's write surface is exactly one verb on one subresource: patch on actionrecords/status. No
+# patch on agents (that is v2's `resume`, chat-approval.md §3) and no create/delete/update anywhere.
+# The reads are what resolving a roster needs (agents -> approvalrosters) and what a chat command
+# needs to look an action up by name (actionrecords).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-agents-chatops-gateway-role
+  labels:
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+    app.kubernetes.io/component: chatops-gateway
+rules:
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - actionrecords
+      - approvalrosters
+      - agents
+    verbs:
+      - get
+      - list
+      - watch
+  # The sanctioned write. vap-agent-scope-journal.yaml's `isChatOpsGateway` rows constrain WHICH
+  # fields this may touch (approvals, phase, contested) and which phase transitions are legal
+  # (PendingApproval -> Pending|Rejected); RBAC only grants the verb, the VAP is what makes it safe.
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - actionrecords/status
+    verbs:
+      - get
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-agents-chatops-gateway-rolebinding
+  labels:
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+    app.kubernetes.io/component: chatops-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-agents-chatops-gateway-role
+subjects:
+  - kind: ServiceAccount
+    name: kube-agents-chatops-gateway
+    namespace: kubeagents-system
+---
+# Namespaced grant: the notifier's own delivery-state ConfigMap (notify/store.go) and leader
+# election's Lease, both scoped to this pod's own namespace and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-agents-chatops-gateway-local-role
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+    app.kubernetes.io/component: chatops-gateway
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-agents-chatops-gateway-local-rolebinding
+  namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: kube-agents-chatops-gateway
+    app.kubernetes.io/component: chatops-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-agents-chatops-gateway-local-role
+subjects:
+  - kind: ServiceAccount
+    name: kube-agents-chatops-gateway
+    namespace: kubeagents-system

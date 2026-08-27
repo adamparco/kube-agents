@@ -1,0 +1,37 @@
+# Build stage for kage-chatops-gateway (docs/designs/broker/chat-approval.md §§2-3). Mirrors
+# Dockerfile.broker, but builds cmd/chatops-gateway -- its own image, not a --controllers flag on
+# the operator's manager, because this identity's whole reason for existing is that it is NOT the
+# operator's.
+FROM golang:1.25-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETPLATFORM
+ARG PREBUILT_BINARY
+
+WORKDIR /workspace
+
+COPY go.mod go.sum ./
+RUN if [ -z "$PREBUILT_BINARY" ]; then go mod download; fi
+
+COPY . .
+
+# `./cmd/chatops-gateway`, the PACKAGE, not a single file -- see Dockerfile.broker's comment on
+# why a file list silently drops sibling files in the same main package.
+RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "${TARGETPLATFORM}/${PREBUILT_BINARY}" ]; then \
+      cp "${TARGETPLATFORM}/${PREBUILT_BINARY}" chatops-gateway; \
+    else \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o chatops-gateway ./cmd/chatops-gateway; \
+    fi
+
+# distroless/static:nonroot for the same reason as the broker: this identity holds the one write
+# grant (actionrecords/status) outside the broker itself, so it gets the same no-shell posture.
+FROM gcr.io/distroless/static:nonroot
+
+WORKDIR /
+
+COPY --from=builder /workspace/chatops-gateway .
+
+USER 65532:65532
+
+ENTRYPOINT ["/chatops-gateway"]
