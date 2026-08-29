@@ -442,6 +442,85 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual(manifest["audit"], "security-patch-orchestrator")
 
 
+class AutopilotNotApplicableTest(unittest.TestCase):
+    """The four node-pool checks on an Autopilot cluster.
+
+    Every one of these passed before the collector declared anything, because
+    each `check_*` function already returned no hits on Autopilot and the tests
+    asked only about hits. Nothing asked what the *manifest* said, and the
+    manifest said the checks had run and found the cluster clean — the same
+    shape a healthy Standard cluster produces.
+    """
+
+    NA = ("pool-skew", "no-autoupgrade", "no-autorepair", "stale-image-type")
+
+    def collect(self, *, autopilot, server_config_rc=0):
+        responses = {
+            "clusters list": run_of(0, json.dumps([cluster(autopilot=autopilot)])),
+            "get-server-config": run_of(server_config_rc, json.dumps(server_config()) if server_config_rc == 0 else "", "denied"),
+        }
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            for needle, result in responses.items():
+                if needle in joined:
+                    return result
+            raise AssertionError(f"unstubbed command: {joined}")
+
+        entries = pr.collect_project("acme", run=run, now=NOW)
+        entry = entries[0]
+        return entry, {c["check"] for c in entry["commands"]}, {e["check"] for e in entry.get("checks_not_applicable") or []}
+
+    def test_autopilot_declares_all_four_with_a_reason(self):
+        entry, _, declared = self.collect(autopilot=True)
+        self.assertEqual(declared, set(self.NA))
+        for e in entry["checks_not_applicable"]:
+            self.assertIn("Autopilot", e["reason"])
+
+    def test_autopilot_claims_none_of_the_four_as_a_command_that_ran(self):
+        _, ran, _ = self.collect(autopilot=True)
+        self.assertEqual(ran & set(self.NA), set())
+
+    def test_a_standard_cluster_declares_nothing_and_runs_all_four(self):
+        entry, ran, declared = self.collect(autopilot=False)
+        self.assertEqual(declared, set())
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertTrue(set(self.NA) <= ran)
+
+    def test_no_slug_is_both_run_and_inapplicable(self):
+        """`stale-image-type` was written into `commands` from the baseline
+        branch, after the not-applicable filter had already removed it from
+        `slugs` — so the manifest asserted both at once."""
+        _, ran, declared = self.collect(autopilot=True)
+        self.assertEqual(ran & declared, set())
+
+    def test_a_missing_baseline_does_not_turn_stale_image_type_into_a_gap(self):
+        """Inapplicable beats unread: the check has no object on Autopilot
+        whether or not `get-server-config` answered."""
+        _, ran, declared = self.collect(autopilot=True, server_config_rc=1)
+        self.assertIn("stale-image-type", declared)
+        self.assertNotIn("stale-image-type", ran)
+
+    def test_master_behind_stays_a_real_check_on_autopilot(self):
+        """An Autopilot control plane has a version like any other, so this one
+        is not inapplicable — and when the baseline fails it is a genuine gap,
+        not something to excuse."""
+        _, ran, declared = self.collect(autopilot=True)
+        self.assertNotIn("master-behind", declared)
+        self.assertIn("master-behind", ran)
+        _, ran_no_baseline, declared_no_baseline = self.collect(autopilot=True, server_config_rc=1)
+        self.assertNotIn("master-behind", ran_no_baseline)
+        self.assertNotIn("master-behind", declared_no_baseline)
+
+    def test_the_two_together_account_for_the_whole_roster(self):
+        """The point of the change, stated against audit_report's own roster:
+        an Autopilot cluster owes a disposition for all ten checks, and after
+        this it has one for each without the model supplying any of them."""
+        _, ran, declared = self.collect(autopilot=True)
+        roster = set(audit_report.AUDITS["security-patch-orchestrator"].checks)
+        self.assertEqual(roster - ran - declared, set())
+
+
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
     def test_checks_run_copied_from_a_collected_cluster_survives_cross_check(self):
         import audit_report

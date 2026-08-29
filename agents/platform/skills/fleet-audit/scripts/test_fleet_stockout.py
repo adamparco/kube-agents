@@ -332,19 +332,41 @@ class QuotaTest(unittest.TestCase):
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def run_with(self, dump_items=(), pools=(), cluster=None):
+    # GKE's own answer when `node-pools list` is aimed at an Autopilot
+    # cluster. The fake returned rc=0 for it whatever the cluster was, which
+    # is why `test_autopilot_skips_single_zone_nodepool` below could pass
+    # while the collector was still issuing a read the API refuses: a fake
+    # that answers every argv successfully cannot tell a command the API runs
+    # from one it rejects.
+    AUTOPILOT_NODE_POOLS_ERROR = (
+        "ERROR: (gcloud.container.node-pools.list) ResponseError: code=400, "
+        "message=Autopilot node pools cannot be accessed or modified."
+    )
+
+    def run_with(self, dump_items=(), pools=(), cluster=None, pools_rc=0, pools_stderr="denied"):
+        target = cluster or self.CLUSTER
+        self.issued = []
+
         def run(argv, **kwargs):
+            self.issued.append(argv)
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of(*dump_items)))
             if argv[:3] == ["gcloud", "container", "node-pools"]:
+                if target.get("autopilot"):
+                    return run_of(1, "", self.AUTOPILOT_NODE_POOLS_ERROR)
+                if pools_rc:
+                    return run_of(pools_rc, "", pools_stderr)
                 return run_of(0, json.dumps(list(pools)))
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
-                return fs.collect_cluster(cluster or self.CLUSTER, run=run)
+                return fs.collect_cluster(target, run=run)
+
+    def issued_node_pools_read(self):
+        return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
 
     def test_clean_cluster_collects_with_no_candidates(self):
         cc = compute_class("cc1", [{"machineFamily": "n4", "spot": False}, {"machineFamily": "c3", "spot": True}])
@@ -407,22 +429,50 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
 
     def test_autopilot_skips_single_zone_nodepool(self):
-        cluster = {**self.CLUSTER, "autopilot": True}
-        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "initialNodeCount": 1}
-
-        def run(argv, **kwargs):
-            if "get-credentials" in argv:
-                return run_of(0)
-            if argv[:2] == ["kubectl", "get"]:
-                return run_of(0, json.dumps(dump_of()))
-            if argv[:3] == ["gcloud", "container", "node-pools"]:
-                return run_of(0, json.dumps([pool]))
-            return run_of(0, "")
-
-        with TemporaryDirectory() as tmp:
-            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
-                entry = fs.collect_cluster(cluster, run=run)
+        entry = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+
+    def test_autopilot_declares_it_rather_than_leaving_it_absent(self):
+        """Absent from `commands` is how a check nobody ran looks too, so §6
+        read this as a coverage gap unless the model happened to know GKE well
+        enough to excuse it by hand — which made a run's honesty about the gap
+        depend on the model rather than on the cluster."""
+        entry = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
+        self.assertEqual(set(declared), {"single-zone-nodepool"})
+        self.assertIn("Autopilot", declared["single-zone-nodepool"])
+
+    def test_autopilot_never_issues_the_node_pools_read(self):
+        """The API answers 400 for it, and its only consumers cannot apply to a
+        cluster with no user node pools."""
+        self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        self.assertEqual(self.issued_node_pools_read(), [])
+
+    def test_a_standard_cluster_still_issues_it_and_declares_nothing(self):
+        entry = self.run_with(pools=[{"name": "p1", "locations": ["us-central1-a", "us-central1-b"]}])
+        self.assertEqual(len(self.issued_node_pools_read()), 1)
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_pools_read_says_so_instead_of_dropping_the_check(self):
+        """`[]` meant both "no pools" and "could not read the pools", so a
+        denied read took the check out of the manifest with nothing recording
+        that it had been attempted — a coverage gap §6 could name but not
+        explain."""
+        entry = self.run_with(pools_rc=1, pools_stderr="PERMISSION_DENIED on container.nodePools.list")
+        self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("single-zone-nodepool", entry["limitations"])
+        self.assertIn("PERMISSION_DENIED", entry["limitations"])
+        self.assertIn("rc=1", entry["limitations"])
+
+    def test_a_standard_cluster_with_no_pools_ran_the_check(self):
+        """The other half of the same conflation: zero pools is an answer, and
+        recording nothing for it made an empty cluster look unaudited."""
+        entry = self.run_with(pools=[])
+        self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("limitations", entry)
+        self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
 
     def test_dangling_reference_reported(self):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "missing"})

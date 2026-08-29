@@ -428,10 +428,30 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         pool = (node.get("metadata", {}).get("labels") or {}).get("cloud.google.com/gke-nodepool", "")
         live_node_count_by_pool[pool] = live_node_count_by_pool.get(pool, 0) + 1
 
-    node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-    pools_result = run(node_pools_argv)
-    node_pools = json.loads(pools_result.stdout) if pools_result.rc == 0 and pools_result.stdout.strip() else []
-    pools_record = _record(" ".join(node_pools_argv), pools_result)
+    autopilot = bool(cluster.get("autopilot"))
+    # Not attempted on Autopilot: `node-pools list` answers HTTP 400 there
+    # ("Autopilot node pools cannot be accessed or modified"), so the record
+    # would be a guaranteed failure for a read whose only consumers -- §3.9's
+    # single-zone-nodepool and the node pool labels below -- cannot apply to a
+    # cluster with no user node pools anyway.
+    #
+    # `pools_readable` rather than testing `node_pools` for emptiness. A read
+    # that failed and a Standard cluster that genuinely holds no pools both
+    # produced `[]`, and the check downstream was skipped for either -- so a
+    # denied read silently dropped `single-zone-nodepool` from the manifest
+    # with nothing to say it had been attempted, which §6 reads as a check
+    # nobody ran and cannot explain. They are different facts and they now
+    # take different paths.
+    node_pools: list[dict] = []
+    pools_result = None
+    pools_record: dict | None = None
+    pools_readable = False
+    if not autopilot:
+        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+        pools_result = run(node_pools_argv)
+        pools_readable = pools_result.rc == 0
+        node_pools = json.loads(pools_result.stdout) if pools_readable and pools_result.stdout.strip() else []
+        pools_record = _record(" ".join(node_pools_argv), pools_result)
     has_nap = bool(cluster.get("has_nap"))
     # ComputeClass-managed pools carry the class name as this label, not as
     # their own pool name -- matching against pool names would test the
@@ -518,20 +538,55 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             if hit:
                 candidates.append(_emit("dangling-compute-class", hit))
 
-    if not cluster.get("autopilot") and node_pools:
+    not_applicable: list[dict] = []
+    limitations: list[str] = []
+    if autopilot:
+        # Declared by the collector rather than left to the model, for the
+        # reason cross_check_manifest's note on `checks_not_applicable` gives:
+        # until every collector says which checks it skipped and why, nothing
+        # can adjudicate the field, and whether a run tells the truth about it
+        # comes down to how well the model happens to know GKE. It is the same
+        # disposition on every run, and `autopilot` is a fact already in hand.
+        not_applicable.append(
+            {
+                "check": "single-zone-nodepool",
+                "reason": (
+                    "GKE Autopilot: Google places the nodes and exposes no user "
+                    "node pool whose locations could be a single zone."
+                ),
+            }
+        )
+    elif pools_readable:
+        # Recorded even when the cluster holds no pools. Zero pools is a real
+        # answer to "is any pool single-zone" -- no -- and dropping the check
+        # for it makes an empty Standard cluster indistinguishable from one
+        # whose pools nobody looked at.
         commands["single-zone-nodepool"] = pools_record
         for pool in node_pools:
             live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
             for hit in [check_single_zone_nodepool(pool, has_nap, live_count)]:
                 if hit:
                     candidates.append(_emit("single-zone-nodepool", hit))
+    else:
+        limitations.append(
+            f"single-zone-nodepool could not be measured on this cluster: "
+            f"`gcloud container node-pools list` failed (rc={pools_result.rc}) — "
+            f"{pools_result.stderr.strip()[:200] or 'no stderr'}. The same failure "
+            f"left dangling-compute-class without node pool labels, so its "
+            f"nodePoolAutoCreation arm did not run either"
+        )
 
-    return {
+    entry = {
         "name": name, "project": project, "location": location,
         "outcome": "collected",
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }
+    if not_applicable:
+        entry["checks_not_applicable"] = not_applicable
+    if limitations:
+        entry["limitations"] = "; ".join(limitations)
+    return entry
 
 
 def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> dict | None:

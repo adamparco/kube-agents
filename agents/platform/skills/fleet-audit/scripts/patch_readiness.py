@@ -24,8 +24,10 @@ the SOP's own §2 instruction.
 Two GCP surfaces, so two manifest failure shapes:
 
 - A project's `clusters list` failing means none of its clusters are known
-  at all — nothing about them appears in the manifest, the same "absent is
-  silent" contract `cross_check_manifest` already promises.
+  at all. The project gets one `gate-failed` `project/<id>` entry saying so,
+  because a project that leaves no trace in the manifest reads exactly like
+  one holding no clusters, and the document is then free to publish a
+  fleet-wide verdict over clusters nobody enumerated.
 - A location's `get-server-config` failing means its clusters are still
   fully collected for every check that does not need a baseline; the
   manifest's `commands` for that cluster simply has no entry for
@@ -34,6 +36,12 @@ Two GCP surfaces, so two manifest failure shapes:
   unreachable. `cross_check_manifest` never objects to a `checks_run` that
   is a subset of a `"collected"` cluster's `commands` — only to one that
   claims more than the manifest backs.
+
+A check being absent from `commands` is therefore ambiguous on its own, and
+`checks_not_applicable` is the half of it that is not a gap: on Autopilot the
+four node-pool checks have no object to run against, which is a property of
+the cluster rather than a read that failed. The collector declares those
+itself — see `_AUTOPILOT_NOT_APPLICABLE`.
 """
 
 from __future__ import annotations
@@ -393,11 +401,56 @@ def _emit(slug: str, hit: dict) -> dict:
     }
 
 
-def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) -> tuple[list[str], list[dict]]:
-    """The check slugs this cluster has data for, and its candidates. A slug
-    absent here (only ever `master-behind`/`stale-image-type`, when the
-    location's baseline could not be fetched) is a coverage gap the SOP
-    tells the agent to name in `limitations`, not a gate failure."""
+# The four checks whose object does not exist on Autopilot, with the reason.
+# Google owns an Autopilot cluster's nodes and exposes no user-managed node
+# pool, which is why `check_pool_skew`, `check_no_autoupgrade`,
+# `check_no_autorepair` and `check_stale_image_type` each already return no
+# hits there.
+#
+# Returning no hits was the whole of it, and that is the bug. This collector
+# issues one `clusters describe` and records it against every slug, so an
+# Autopilot cluster's manifest said `pool-skew` ran at rc=0 and found nothing
+# -- indistinguishable from a Standard cluster whose pools are all in step.
+# Whether the run then told the truth came down to whether the model happened
+# to know GKE well enough to overrule its own manifest. On 2026-08-29 it did,
+# and three Autopilot clusters came back `checks_run=6 n/a=4`; the same
+# manifest read by a model that did not would report ten checks passed on a
+# cluster where four of them were never evaluated.
+#
+# `fleet_waste.py` reached this conclusion first and its comment records the
+# other direction of the same failure: a model that remembers three of four
+# slugs publishes a coverage gap for a check the cluster does not owe. Neither
+# direction is the model's to get right. `autopilot` is a fact the collector
+# already holds, so the disposition belongs here, where it is the same on every
+# run -- and cross_check_manifest's note on `checks_not_applicable` asks for
+# exactly this, in every collector, as the prerequisite to adjudicating the
+# field at all.
+_AUTOPILOT_NOT_APPLICABLE = {
+    "pool-skew": (
+        "GKE Autopilot: Google manages the nodes and exposes no user node pool "
+        "whose version could skew from the control plane."
+    ),
+    "no-autoupgrade": (
+        "GKE Autopilot: node auto-upgrade is always on and not user-settable, "
+        "so there is no node pool management setting to inspect."
+    ),
+    "no-autorepair": (
+        "GKE Autopilot: node auto-repair is always on and not user-settable, "
+        "so there is no node pool management setting to inspect."
+    ),
+    "stale-image-type": (
+        "GKE Autopilot: Google selects the node image and exposes no user node "
+        "pool carrying a config.imageType."
+    ),
+}
+
+
+def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) -> tuple[list[str], list[dict], list[dict]]:
+    """The check slugs this cluster has data for, its candidates, and the
+    checks its shape rules out. A slug in none of the three (only ever
+    `master-behind`, when the location's baseline could not be fetched) is a
+    coverage gap the SOP tells the agent to name in `limitations`, not a gate
+    failure."""
     slugs = ["pool-skew", "no-channel", "no-autoupgrade", "no-autorepair", "no-maintenance-window", "blocking-exclusion", "no-notifications"]
     candidates = []
 
@@ -433,7 +486,18 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
             candidates.append(_emit("master-behind", master_behind_hit))
         candidates += [_emit("stale-image-type", hit) for hit in check_stale_image_type(cluster, baseline)]
 
-    return slugs, candidates
+    # Declared whether or not the baseline arrived: a check that cannot apply
+    # to this cluster is not waiting on a read. `master-behind` is the other
+    # half of that -- an Autopilot control plane has a real version, so a
+    # missing baseline leaves it a genuine gap rather than an inapplicable
+    # check, and it stays out of this table.
+    if (cluster.get("autopilot") or {}).get("enabled"):
+        not_applicable = [{"check": slug, "reason": reason} for slug, reason in _AUTOPILOT_NOT_APPLICABLE.items()]
+        slugs = [slug for slug in slugs if slug not in _AUTOPILOT_NOT_APPLICABLE]
+    else:
+        not_applicable = []
+
+    return slugs, candidates, not_applicable
 
 
 def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
@@ -480,13 +544,18 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         location = c.get("location") or c.get("zone") or ""
         baseline_pair = baselines.get(location)
         baseline = baseline_pair[0] if baseline_pair else None
-        slugs, candidates = collect_one_cluster(c, baseline, now=now)
+        slugs, candidates, not_applicable = collect_one_cluster(c, baseline, now=now)
         commands = {slug: clusters_record for slug in slugs}
         if baseline_pair is not None:
-            # collect_one_cluster only adds these two slugs when baseline is
-            # not None, so this always applies to both when it applies at all.
+            # `master-behind` unconditionally -- collect_one_cluster adds it
+            # whenever the baseline arrived, and no cluster shape rules it out.
+            # `stale-image-type` only if it survived the not-applicable filter:
+            # writing it here regardless would put the same slug in `commands`
+            # and in `checks_not_applicable` at once, which is the incoherence
+            # this declaration exists to remove.
             commands["master-behind"] = baseline_pair[1]
-            commands["stale-image-type"] = baseline_pair[1]
+            if "stale-image-type" in slugs:
+                commands["stale-image-type"] = baseline_pair[1]
         # Recorded for every cluster, not only the laggard §3.3 attaches the
         # finding to. Every cluster in `parsed` handed its minor to the spread
         # computation, so the check ran against all of them and the same
@@ -497,16 +566,17 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         commands["fleet-spread"] = clusters_record
         if c["name"] in fleet_spread_hits:
             candidates.append(_emit("fleet-spread", fleet_spread_hits[c["name"]]))
-        entries.append(
-            {
-                "name": c["name"],
-                "project": project,
-                "location": location,
-                "outcome": "collected",
-                "commands": [{"check": slug, **record} for slug, record in commands.items()],
-                "candidates": candidates,
-            }
-        )
+        entry = {
+            "name": c["name"],
+            "project": project,
+            "location": location,
+            "outcome": "collected",
+            "commands": [{"check": slug, **record} for slug, record in commands.items()],
+            "candidates": candidates,
+        }
+        if not_applicable:
+            entry["checks_not_applicable"] = not_applicable
+        entries.append(entry)
     return entries
 
 
