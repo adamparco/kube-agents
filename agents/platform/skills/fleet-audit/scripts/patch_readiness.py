@@ -472,9 +472,16 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             # not None, so this always applies to both when it applies at all.
             commands["master-behind"] = baseline_pair[1]
             commands["stale-image-type"] = baseline_pair[1]
+        # Recorded for every cluster, not only the laggard §3.3 attaches the
+        # finding to. Every cluster in `parsed` handed its minor to the spread
+        # computation, so the check ran against all of them and the same
+        # `clusters list` output is its evidence -- but §6 reads `commands` as
+        # the roster of checks that ran, so recording it only on a hit makes a
+        # tight fleet indistinguishable from one nobody measured, and every
+        # clean run reports a coverage gap it does not have.
+        commands["fleet-spread"] = clusters_record
         if c["name"] in fleet_spread_hits:
             candidates.append(_emit("fleet-spread", fleet_spread_hits[c["name"]]))
-            commands["fleet-spread"] = clusters_record
         entries.append(
             {
                 "name": c["name"],

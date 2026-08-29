@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
+import audit_report  # noqa: E402
 import patch_readiness as pr  # noqa: E402
 
 
@@ -338,7 +339,7 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["outcome"], "collected")
         self.assertEqual(entries[0]["candidates"], [])
-        self.assertEqual({c["check"] for c in entries[0]["commands"]}, set(pr.SEVERITY) - {"fleet-spread"})
+        self.assertEqual({c["check"] for c in entries[0]["commands"]}, set(pr.SEVERITY))
 
     def test_clusters_list_failure_yields_no_entries(self):
         entries = pr.collect_project("acme", run=self.fake_run({"clusters list": run_of(1, "", "denied")}), now=NOW)
@@ -368,7 +369,7 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("no-autoupgrade", slugs)
         self.assertIn("no-autorepair", slugs)
 
-    def test_fleet_spread_command_only_appears_when_it_fires(self):
+    def test_only_the_laggard_carries_the_fleet_spread_finding(self):
         clusters = [cluster(name="old", master="1.28.0-gke.1"), cluster(name="new", master="1.30.0-gke.1")]
         responses = {
             "clusters list": run_of(0, json.dumps(clusters)),
@@ -379,6 +380,37 @@ class CollectProjectTest(unittest.TestCase):
         new_entry = next(e for e in entries if e["name"] == "new")
         self.assertIn("fleet-spread", {c["check"] for c in old_entry["candidates"]})
         self.assertNotIn("fleet-spread", {c["check"] for c in new_entry["candidates"]})
+
+    def test_both_clusters_record_the_fleet_spread_command(self):
+        """§3.3 emits one finding, but it reads every cluster to get there.
+
+        The clean-fleet half of this is the one that used to be wrong: a fleet
+        with no spread produced no hit, so no cluster recorded the command, and
+        §6 scored `fleet-spread` as never run on all of them."""
+        spread = [cluster(name="old", master="1.28.0-gke.1"), cluster(name="new", master="1.30.0-gke.1")]
+        tight = [cluster(name="a", master="1.30.0-gke.1"), cluster(name="b", master="1.30.1-gke.2")]
+        for label, clusters in (("spread", spread), ("tight", tight)):
+            with self.subTest(fleet=label):
+                responses = {
+                    "clusters list": run_of(0, json.dumps(clusters)),
+                    "get-server-config": run_of(0, json.dumps(server_config())),
+                }
+                entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
+                for entry in entries:
+                    self.assertIn("fleet-spread", {c["check"] for c in entry["commands"]})
+
+    def test_a_clean_fleet_reports_no_coverage_gap_for_fleet_spread(self):
+        """End-to-end: §6's arithmetic over a tight fleet, which is the shape
+        every healthy run of this audit takes."""
+        clusters = [cluster(name="a", master="1.30.0-gke.1"), cluster(name="b", master="1.30.1-gke.2")]
+        responses = {
+            "clusters list": run_of(0, json.dumps(clusters)),
+            "get-server-config": run_of(0, json.dumps(server_config())),
+        }
+        entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
+        roster = set(audit_report.audit_target_checks("security-patch-orchestrator", "a"))
+        for entry in entries:
+            self.assertEqual(roster - {c["check"] for c in entry["commands"]}, set())
 
 
 class CollectFleetTest(unittest.TestCase):
