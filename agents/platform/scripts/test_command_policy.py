@@ -691,6 +691,52 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertEqual("gcp.read-only", decision.rule_id)
         self.assertEqual(("projects", "delete", "my-project"), decision.verb_tuple)
 
+    def test_help_on_a_write_verb_is_allowed(self):
+        """`--help` prints a synopsis; the verb after it is a topic, not an act.
+
+        The security-patch SOP tells the agent to confirm a remediation flag's
+        syntax with `--help` before writing it into a finding, and every live
+        run of that stream had the request refused as though it were the
+        update itself.
+        """
+        for argv in (
+            ["gcloud", "container", "clusters", "update", "--help"],
+            ["gcloud", "container", "clusters", "update", "my-cluster", "-h"],
+            ["gcloud", "--project", "p", "compute", "instances", "create", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_help_standing_as_a_flag_value_grants_nothing(self):
+        """`--format --help` makes `--help` a value, not the help flag."""
+        decision = evaluate(
+            ["gcloud", "container", "clusters", "delete", "--format", "--help", "c"]
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_help_after_an_unknown_flag_is_still_unreadable(self):
+        """An unknown flag's arity is unknown, so nothing after it is trusted."""
+        decision = evaluate(["gcloud", "--unknown-flag", "container", "clusters",
+                             "delete", "--help"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_help_does_not_smuggle_a_file_write_or_an_identity_change(self):
+        for argv, rule in (
+            (["gcloud", "container", "clusters", "update", "--help",
+              "--output-path", "/etc/x"], "gcp.file-write-forbidden"),
+            (["gcloud", "--impersonate-service-account", "x@y.iam.gserviceaccount.com",
+              "container", "clusters", "update", "--help"],
+             "identity.caller-supplied-impersonation"),
+            (["gcloud", "--flags-file", "/tmp/ff.yaml", "container", "clusters",
+              "update", "--help"], "gcp.flags-file-forbidden"),
+        ):
+            with self.subTest(rule=rule):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule, decision.rule_id)
+
     def test_flags_file_is_refused_outright(self):
         # --flags-file reads from a file under the agent's control. We cannot
         # safely scan that file (race condition), and it could contain hidden

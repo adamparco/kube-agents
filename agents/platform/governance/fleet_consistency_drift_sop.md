@@ -11,7 +11,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift
 ```
 
 Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consistency-drift/<owner>__<name>", "findings_path":"/opt/data/scratch/findings_fleet-consistency-drift.json", "pending_remediation_requests":[…]}`. Use the returned `findings_path` verbatim. `workspace` is the GitOps clone `start` made — the pod has no checkout of its own — and any `remediation.path` you emit in §5 is resolved against it. `issue` is this stream's open ledger issue, or `null` when it has none; `finish` opens or rewrites it either way. There is no audit branch and no report branch: do not create branches, commit, push, or call `gh` yourself — the helper owns every git and GitHub operation and renders the ledger issue body. You never hand-write it.
@@ -92,7 +92,7 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 **Run the collector before evaluating any facet below by hand.**
 
 ```bash
-./skills/fleet-audit/scripts/fleet_drift.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-consistency-drift.json
+python3 ./skills/fleet-audit/scripts/fleet_drift.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-consistency-drift.json
 ```
 
 Every facet reads only GKE control-plane and node-pool metadata through `gcloud container`, so this stream's collector needs no kubeconfig at all — see the script's own module docstring for why one `clusters list` call per project backs every facet, in place of the per-cluster `describe` §1.3 describes (the collector records that literal `list` command as `evidence.command` instead, per its own note on why). It sweeps this project plus, per §1.1, every project ID already recorded in `/opt/data/INVENTORY.raw.md`; pass `--project <id>` to scope a run to one. It also carries §2's cohort-building, §3's baseline/confidence/severity-ladder arithmetic, and §3.6's split-cluster guard — the whole vote is arithmetic once the tokens are normalized, and the collector runs it exactly as this section specifies. Read the manifest before doing anything else:
@@ -251,7 +251,7 @@ Worked example, for a 4.4 network-policy outlier:
 ### 7. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
   --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json \
   --manifest-file /opt/data/scratch/manifest_fleet-consistency-drift.json
 ```

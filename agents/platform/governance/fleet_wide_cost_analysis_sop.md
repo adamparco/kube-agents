@@ -12,7 +12,7 @@
 
 ### 0. Open the audit run
 
-Run `./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis`. It prints one JSON line:
+Run `python3 ./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis`. It prints one JSON line:
 
 ```json
 {
@@ -77,7 +77,7 @@ There is no report branch. Do not create branches, commit, push, or call `gh` yo
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-./skills/fleet-audit/scripts/fleet_waste.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-wide-cost-analysis.json
+python3 ./skills/fleet-audit/scripts/fleet_waste.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-wide-cost-analysis.json
 ```
 
 This is the tested, procedural implementation of the collection this section used to describe — see `fleet_waste.py`'s own module docstring for what it covers, including the ten `kubectl` object kinds it dumps (one more than the roster below names: it also reads StatefulSets, needed only to suppress a scaled-to-zero StatefulSet's own claim in 3.2/3.3, never surfaced as a check of its own) and how it takes the three `kubectl top` samples once per cluster, concurrently across the whole fleet, rather than one cluster's ten minutes of sampling blocking the next's. Its manifest mixes cluster-named entries with `project/<project-id>` entries for the project-scoped checks (3.4–3.6), per §3's project-scoped rule below. Read the manifest before doing anything else:
@@ -243,7 +243,7 @@ Worked example, for a 3.7 finding on an idle batch pool — a `gcloud` remediati
 
 ### 6. Close the audit run
 
-Run `./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost-analysis --findings-file <findings_path> --manifest-file /opt/data/scratch/manifest_fleet-wide-cost-analysis.json`. Omit `--manifest-file` only on a run where §2's collector never produced one — every check on every target came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`. Exit 0 means published; exit 2 means the validator rejected the document and nothing was published — fix the document and re-run, never delete the finding that tripped it; exit 1 is fatal. The helper prints one JSON line, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`).
+Run `python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost-analysis --findings-file <findings_path> --manifest-file /opt/data/scratch/manifest_fleet-wide-cost-analysis.json`. Omit `--manifest-file` only on a run where §2's collector never produced one — every check on every target came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`. Exit 0 means published; exit 2 means the validator rejected the document and nothing was published — fix the document and re-run, never delete the finding that tripped it; exit 1 is fatal. The helper prints one JSON line, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`).
 
 `partial` and `coverage_gaps` describe how much of the fleet the run can actually speak for: `partial` is `true` if any cluster is in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` states each gap in a sentence. This matters most on a cost audit, where the conclusion is usually drawn from an absence — an idle disk that stops appearing has not necessarily been released, it may sit in a project nobody could list this week. So over a partial run the helper reports `resolved: 0` and posts no resolved-delta, retires no remediation PR as stale, and keeps the ledger open even with an empty findings array: `status` is still `CLEAN`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Coverage is the only thing the flag tracks, so `partial` is `true` if and only if `coverage_gaps` is non-empty: the §5 body budget dropping findings from the description does not set it, because the audit still saw them and says as much in the body.
 

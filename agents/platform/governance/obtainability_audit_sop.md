@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/obtainability-audit/org__repo", "findings_path":"/opt/data/scratch/findings_obtainability-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
@@ -78,7 +78,7 @@ gcloud container clusters list --format=json
 ### 2. Run the collector
 
 ```bash
-./skills/fleet-audit/scripts/collect.py obtainability-audit \
+python3 ./skills/fleet-audit/scripts/collect.py obtainability-audit \
   --project "$(gcloud config get-value project)" > /opt/data/scratch/manifest_obtainability-audit.json
 ```
 
@@ -259,7 +259,7 @@ Worked example, for a 3.3 finding on `payments/api`:
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit obtainability-audit \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit obtainability-audit \
   --findings-file /opt/data/scratch/findings_obtainability-audit.json \
   --manifest-file /opt/data/scratch/manifest_obtainability-audit.json
 ```

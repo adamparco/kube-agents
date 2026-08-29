@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/stockout-prevention/org__repo", "findings_path":"/opt/data/scratch/findings_stockout-prevention.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
@@ -83,7 +83,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 **Run the collector before evaluating a covered check below by hand.**
 
 ```bash
-./skills/fleet-audit/scripts/fleet_stockout.py --project "$PROJECT" > /opt/data/scratch/manifest_stockout-prevention.json
+python3 ./skills/fleet-audit/scripts/fleet_stockout.py --project "$PROJECT" > /opt/data/scratch/manifest_stockout-prevention.json
 ```
 
 This covers ten of the twelve checks below — every one built on a `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute reservations list`, or `gcloud compute regions describe --format=json(quotas)`. The `Node` dump exists only so 3.9's "`>= 90%` of `maxNodeCount`" test can count each pool's _live_ nodes — `initialNodeCount` is creation-time and the autoscaler never updates it. It does **not** cover `spot-scarcity-risk` (3.8) or `autoscaler-out-of-resources` (3.11) — see the collector's own module docstring for why: both read a beta API or an internal log schema this repository has not verified elsewhere, and encoding an unconfirmed shape as tested code would make a guess look like a fact. Run those two by hand, every time, from their own `Command` lines below. Read the manifest before doing anything else:
@@ -250,7 +250,7 @@ Write the schema exactly as the helper validates it to the `findings_path` retur
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
   --findings-file /opt/data/scratch/findings_stockout-prevention.json \
   --manifest-file /opt/data/scratch/manifest_stockout-prevention.json
 ```

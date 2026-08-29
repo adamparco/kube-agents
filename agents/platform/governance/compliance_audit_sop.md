@@ -11,7 +11,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit
 # -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/compliance-audit/org__repo",
 #     "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
 #     "pending_remediation_requests":["<finding-id>", ...]}
@@ -104,7 +104,7 @@ Same slugs as `checks_run`, and the `reason` has to say why the check _cannot_ a
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-./skills/fleet-audit/scripts/collect.py compliance-audit \
+python3 ./skills/fleet-audit/scripts/collect.py compliance-audit \
   --project "$PROJECT" > /opt/data/scratch/manifest_compliance-audit.json
 ```
 
@@ -187,6 +187,7 @@ Intersect wildcard-carrying Roles/ClusterRoles against ClusterRoleBindings/RoleB
 - **Severity:** `major` for zero policies — unrestricted lateral movement, though the namespace boundary and RBAC still hold. `minor` for allow-all-only: the team engaged with NetworkPolicy and the fix is a one-line edit.
 - **Impact:** "Every pod in this namespace accepts traffic from every pod in the cluster; a compromise anywhere reaches these workloads unimpeded."
 - **Remediation:** the two flag conditions are two different problems, and only one of them is fixed by adding a file.
+
   - **Zero policies** — the object does not exist, so §3's create rule applies: `kind: manifest`, with §3 deciding the path by finding where this namespace is already declared. Generate **exactly one** `NetworkPolicy`, `default-deny-ingress` (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress` rules), and nothing else.
   - **Allow-all only** — the offending policy _is_ the finding, and adding a second file does not fix it. NetworkPolicy is additive: a pod is reachable if **any** policy selecting it permits the traffic, so a deny-everything policy sitting alongside an allow-all one changes nothing. Emitting it produces a pull request that merges cleanly, closes the finding for exactly one run, and leaves the namespace as open as it was — worse than no fix, because it also spends the reviewer's trust. Name the allow-all policy in `object` as `NetworkPolicy/<name>` and fix _that_ object, under §3's change-an-existing-object rule: `kind: manifest` **only** when the GitOps repo already declares it — `remediation.path` is that existing file, rewritten as the policy's complete desired manifest with the empty `ingress` rule removed (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress`) and its name unchanged — and `kind: manual` otherwise, because the harness will not edit or delete a live object it cannot find declared. Never write a second file for this branch.
 
@@ -304,7 +305,7 @@ Three `rationale`/`risk` pairs in this SOP are check-specific and must not be wr
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
   --findings-file /opt/data/scratch/findings_compliance-audit.json \
   --manifest-file /opt/data/scratch/manifest_compliance-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,

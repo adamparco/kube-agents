@@ -553,6 +553,44 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
     return words, None
 
 
+def _gcloud_asks_for_help(argv: list[str]) -> bool:
+    """Does argv carry --help or -h in flag position?
+
+    `gcloud <anything> --help` prints a synopsis and exits without contacting
+    the API, so the verb after it is a topic rather than an action -- but the
+    allowlist reads the verb and nothing else, so `container clusters update
+    --help` was refused as a write. The security-patch SOP tells the agent to
+    confirm a remediation flag's syntax with `--help` before recording it, and
+    the refusal came back worded as a denial of the *update*, which is a
+    confusing thing to read when you asked for documentation.
+
+    Walks argv exactly the way _gcloud_words_and_flag does, so a `--help`
+    standing as another flag's value (`--format --help`) is not mistaken for
+    the flag itself, and an unknown flag ends the walk rather than being
+    stepped over -- its arity is unknown, so nothing after it can be trusted
+    and the caller's unreadable-command refusal is the right answer.
+    """
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            index += 1
+            continue
+        name, separator, _ = token.partition("=")
+        if name in ("--help", "-h"):
+            return True
+        if name in _GCLOUD_BOOLEAN_FLAGS:
+            index += 1
+            continue
+        if name in _GCLOUD_FLAGS_WITH_VALUE:
+            if not separator:
+                index += 1
+            index += 1
+            continue
+        return False
+    return False
+
+
 def _gcloud_is_read_only(words: list[str]) -> bool:
     """Is the command a listed read-only gcloud command?
 
@@ -958,6 +996,12 @@ def evaluate(argv: list[str]) -> Decision:
                 ),
                 offending_flag=unknown_flag,
             )
+
+        # After the words parse, so an unknown flag is still refused, and after
+        # the three guards above, so --help cannot smuggle a file write or an
+        # identity change past them.
+        if _gcloud_asks_for_help(argv):
+            return _ALLOWED
 
         if not _gcloud_is_read_only(words):
             return Decision(

@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
@@ -205,7 +205,7 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
   --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,

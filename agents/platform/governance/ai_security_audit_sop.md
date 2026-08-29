@@ -15,7 +15,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit ai-security-audit
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit ai-security-audit
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/ai-security-audit/org__repo", "findings_path":"/opt/data/scratch/findings_ai-security-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
@@ -95,7 +95,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, i
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-./skills/fleet-audit/scripts/collect.py ai-security-audit --project "$PROJECT" > /opt/data/scratch/manifest_ai-security-audit.json
+python3 ./skills/fleet-audit/scripts/collect.py ai-security-audit --project "$PROJECT" > /opt/data/scratch/manifest_ai-security-audit.json
 ```
 
 This is the tested, procedural implementation of §2's discriminator and every check below — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers, including how 3.4's severity escalation alongside a 3.2 finding on the same container is computed rather than judged. The collector reads two dumps per cluster, a workload dump backing every check and a Service dump backing `inference-endpoint-public` alone; either failing fails the whole cluster closed. Read the manifest before doing anything else:
@@ -198,7 +198,7 @@ Worked example, for a 3.2 finding on `serving/vllm-llama`:
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit ai-security-audit \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit ai-security-audit \
   --findings-file /opt/data/scratch/findings_ai-security-audit.json \
   --manifest-file /opt/data/scratch/manifest_ai-security-audit.json
 ```

@@ -2150,7 +2150,13 @@ class TestAuditCatalogue(unittest.TestCase):
                 fence_start = sop_text.index(fence_marker, idx) + len(fence_marker)
                 fence_end = sop_text.index("\n```", fence_start)
                 invocation_line = sop_text[fence_start:fence_end].splitlines()[0].strip()
-                script_token = invocation_line.split()[0].lstrip("./")
+                # The script, not the first word: every documented invocation
+                # now names an interpreter first (see
+                # test_no_sop_invokes_the_harness_by_path), and the prompt
+                # cites the collector rather than a runnable command line.
+                script_token = next(
+                    token for token in invocation_line.split() if token.endswith(".py")
+                ).lstrip("./")
                 self.assertIn(
                     script_token,
                     prompt,
@@ -10172,6 +10178,26 @@ class TestDispatchAndHandover(unittest.TestCase):
                 text = self.read(f"governance/{audit_report.audit_sop(audit_id)}")
                 self.assertIn("silent_ok", text)
                 self.assertIn("on-demand", text.lower())
+
+    def test_no_sop_invokes_the_harness_by_path(self):
+        """Every documented invocation names an interpreter.
+
+        `./skills/fleet-audit/scripts/audit_report.py start …` -- the spelling
+        eight SOPs shipped -- is refused by the gateway's lifecycle guard,
+        which reads a by-path script's text and walks every path-shaped token
+        in it as another script to scan. Two of audit_report.py's own tokens,
+        `/opt/defaults/scripts` and `/opt/data/scripts`, are directories; the
+        guard fails closed on a reference it cannot read as a script and the
+        command comes back "cannot restart or stop the gateway". Every stream
+        burnt its first turn on that message before recovering with `python3`.
+        Naming an interpreter makes the file an argument, so nothing reads it.
+        """
+        pattern = re.compile(r"(?m)^\s*\./skills/fleet-audit/scripts/\w+\.py |Run `\./skills/")
+        docs = [f"governance/{audit_report.audit_sop(a)}" for a in audit_report.AUDITS]
+        docs.append("skills/fleet-audit/SKILL.md")
+        for doc in docs:
+            with self.subTest(doc=doc):
+                self.assertEqual([], pattern.findall(self.read(doc)))
 
 
 if __name__ == "__main__":

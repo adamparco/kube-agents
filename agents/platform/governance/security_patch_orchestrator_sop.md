@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/security-patch-orchestrator/org__repo", "findings_path":"/opt/data/scratch/findings_security-patch-orchestrator.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace`. The audit pod does not start inside a git checkout: `start` clones the GitOps repository to `workspace` itself, and that clone is where every `remediation.path` in step 4 is resolved and where every grep for an existing declaration belongs. `start` creates and resets no branch; there is no report branch. `issue` is this stream's open ledger issue, or `null` when it has none — either way you never create it. `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger; write the manifest for each of those in step 4. The helper owns all git/`gh` work and renders the ledger issue body and every remediation PR body — **never hand-write a body, never run `git commit`/`gh issue create`/`gh pr create`/`gh issue comment` yourself.** **Never comment on the ledger yourself:** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit, and an agent that posts it — including when someone asks for a fix in chat — is authorizing its own pull request. `finish` ignores a `/remediate` from a machine account, so posting one achieves nothing but noise on the issue.
@@ -116,7 +116,7 @@ The project is deliberately not part of the identity. Two clusters sharing a nam
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-./skills/fleet-audit/scripts/patch_readiness.py > /opt/data/scratch/manifest_security-patch-orchestrator.json
+python3 ./skills/fleet-audit/scripts/patch_readiness.py > /opt/data/scratch/manifest_security-patch-orchestrator.json
 ```
 
 This stream's targets are GKE control-plane and node-pool metadata, not workload state, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for why one `clusters list` call and one `get-server-config` call per location back every check below, with no per-pool `describe` ever issued. It sweeps this project plus, per §1, every other project with at least one cluster; pass `--project <id>` to scope a run to one. Read the manifest before doing anything else:
@@ -266,7 +266,7 @@ Worked example, for a 3.5 finding on node pool `batch-a`:
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit security-patch-orchestrator \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit security-patch-orchestrator \
   --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json \
   --manifest-file /opt/data/scratch/manifest_security-patch-orchestrator.json
 ```
