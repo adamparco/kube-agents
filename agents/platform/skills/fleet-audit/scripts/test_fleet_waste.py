@@ -617,6 +617,71 @@ class CollectClusterTest(unittest.TestCase):
                 entry, _ = fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
         self.assertEqual(entry["outcome"], "collected")
         self.assertNotIn("overrequest", {c["check"] for c in entry["commands"]})
+        # Dropping the check out of `commands` is only half the job: §6 raises
+        # it as a gap either way, and without this the ledger named a check
+        # nobody could explain.
+        self.assertIn("overrequest could not be measured", entry["limitations"])
+        self.assertIn("metrics-server", entry["limitations"])
+
+    def _unreadable_pools(self, cluster=None):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if "top" in argv and "nodes" in argv:
+                return run_of(0, "node-1 1 10% 1000Mi 10%")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(1, "", "PERMISSION_DENIED: container.nodePools.list")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                return fw.collect_cluster(
+                    cluster or self.CLUSTER, run=run, sleep=lambda s: None, now=NOW
+                )
+
+    def test_an_unreadable_node_pool_list_is_not_an_absence_of_idle_pools(self):
+        """The purest silent-clean shape this collector had.
+
+        `node-pools list` was run bare, so a denied or throttled read parsed to
+        `[]`, and a cluster with no node pools has no idle ones. Both 3.7 and
+        3.8 recorded their command and reported nothing found. The evidence
+        line carried `rc=1` and nothing downstream reads it.
+        """
+        entry, _ = self._unreadable_pools()
+        commands = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", commands)
+        self.assertNotIn("scaledown-blocked", commands)
+        self.assertEqual(entry["outcome"], "collected")
+
+    def test_the_unreadable_pool_list_says_why(self):
+        entry, _ = self._unreadable_pools()
+        self.assertIn("idle-nodepool and scaledown-blocked", entry["limitations"])
+        self.assertIn("rc=1", entry["limitations"])
+        self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_an_unreadable_pool_list_leaves_the_object_checks_alone(self):
+        """A degradation, not a gate failure: the object dump still backs 3.1–3.4."""
+        entry, _ = self._unreadable_pools()
+        commands = {c["check"] for c in entry["commands"]}
+        for slug in ("orphan-pv", "unconsumed-pvc", "terminal-pods", "idle-namespace", "overrequest"):
+            self.assertIn(slug, commands)
+
+    def test_autopilot_with_unreadable_pools_claims_no_pool_limitation(self):
+        """Autopilot owns its pools, so 3.7/3.8 are inapplicable rather than
+        unmeasured — naming them in `limitations` would raise a gap for a check
+        the cluster does not owe."""
+        entry, _ = self._unreadable_pools({**self.CLUSTER, "autopilot": True})
+        self.assertNotIn("limitations", entry)
+
+    def test_a_readable_empty_pool_list_still_records_the_checks(self):
+        """Zero pools is a measurement. It must not look like the failure above."""
+        entry, _ = self.run_with(pools=[])
+        commands = {c["check"] for c in entry["commands"]}
+        self.assertIn("idle-nodepool", commands)
+        self.assertIn("scaledown-blocked", commands)
+        self.assertNotIn("limitations", entry)
 
     def test_autopilot_skips_idle_nodepool_and_scaledown_blocked(self):
         cluster = {**self.CLUSTER, "autopilot": True}

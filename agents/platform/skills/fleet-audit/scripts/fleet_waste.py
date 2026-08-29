@@ -841,9 +841,17 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     fleet_facts = _fleet_facts(context)
 
     node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-    pools_result = run(node_pools_argv)
-    node_pools = json.loads(pools_result.stdout) if pools_result.rc == 0 and pools_result.stdout.strip() else []
+    # Gated, unlike the bare `run` this used to be. An unreadable node-pool
+    # list -- denied, throttled, a bad `--location` -- parsed to `[]`, and a
+    # cluster with no node pools has no idle ones, so 3.7 and 3.8 recorded
+    # their command and reported nothing found. The evidence line carried the
+    # non-zero rc, but nothing downstream reads it: the ledger said the pools
+    # were checked and were fine.
+    node_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+    pools_readable = node_pools is not None
+    node_pools = node_pools or []
     pools_record = _record(" ".join(node_pools_argv), pools_result)
+    limitations: list[str] = []
 
     pod_samples, node_samples, metrics_ok, top_result = take_usage_samples(kubeconfig, run=run, sleep=sleep)
     top_record = _record(f"KUBECONFIG={kubeconfig} kubectl top nodes --no-headers", top_result)
@@ -857,12 +865,25 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     candidates += [_emit("terminal-pods", h) for h in check_terminal_pods(context, now=now)]
     candidates += [_emit("idle-namespace", h) for h in check_idle_namespace(context, now=now)]
 
+    # Autopilot owns its node pools, so 3.7/3.8 are inapplicable there and the
+    # model says so in `checks_not_applicable`. Only a Standard cluster owes
+    # them, so only a Standard cluster can be short of them -- claiming the
+    # limitation on Autopilot too would raise a gap for a check that target
+    # does not owe, which is the double-counted disposition 7301c594 removed.
     if not cluster.get("autopilot"):
-        commands["idle-nodepool"] = pools_record
-        commands["scaledown-blocked"] = dump_record
-        idle_pool_hits = check_idle_nodepool(context, node_pools, now=now)
-        candidates += [_emit("idle-nodepool", h) for h in idle_pool_hits]
-        candidates += [_emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
+        if pools_readable:
+            commands["idle-nodepool"] = pools_record
+            commands["scaledown-blocked"] = dump_record
+            idle_pool_hits = check_idle_nodepool(context, node_pools, now=now)
+            candidates += [_emit("idle-nodepool", h) for h in idle_pool_hits]
+            candidates += [_emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
+        else:
+            limitations.append(
+                f"idle-nodepool and scaledown-blocked could not be measured on "
+                f"this cluster: `gcloud container node-pools list` failed "
+                f"(rc={pools_result.rc}) — "
+                f"{pools_result.stderr.strip()[:200] or 'no stderr'}"
+            )
 
     if metrics_ok:
         commands["overrequest"] = top_record
@@ -871,12 +892,25 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
             if hit.get("_guaranteed"):
                 emitted["needs_triage"] = "guaranteed-qos"
             candidates.append(emitted)
+    else:
+        # §2's metrics degradation. `overrequest` already dropped out of
+        # `commands` on its own, so §6 was raising it as a gap with no reason
+        # attached -- a reader saw the check named and had nothing to tell them
+        # whether it was denied, throttled, or never attempted.
+        limitations.append(
+            f"overrequest could not be measured on this cluster: "
+            f"`kubectl top nodes` failed (rc={top_result.rc}) — metrics-server "
+            f"is unavailable, so §2's usage sampling collected no data"
+        )
 
-    return {
+    entry = {
         "name": name, "project": project, "location": location, "outcome": "collected",
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
-    }, fleet_facts
+    }
+    if limitations:
+        entry["limitations"] = "; ".join(limitations)
+    return entry, fleet_facts
 
 
 # --------------------------------------------------------------------------- #
