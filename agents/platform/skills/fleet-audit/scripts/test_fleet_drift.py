@@ -131,6 +131,28 @@ class CohortStrategyTest(unittest.TestCase):
         clusters = [cluster("a", project="p1", labels={}), cluster("b", project="p1", labels={})]
         self.assertEqual(fd.decide_cohort_strategy(clusters), "mode-only")
 
+    def test_a_sparse_name_guess_does_not_select_environment(self):
+        """One `test` token in sixteen names is our inference, not the fleet's
+        convention, and acting on it costs coverage rather than buying
+        precision: the guessed cluster lands alone in a cohort of one and is
+        compared against nothing. Cohorting by mode compares all sixteen."""
+        clusters = [cluster("deploy-test", labels={})] + [cluster(f"c{i}", labels={}) for i in range(15)]
+        self.assertEqual(fd.decide_cohort_strategy(clusters), "mode-only")
+
+    def test_a_fleetwide_naming_convention_does_select_environment(self):
+        """Inference earns the strategy once it is the fleet's actual naming
+        convention rather than a guess about a couple of stragglers."""
+        clusters = [cluster(f"prod-{i}", labels={}) for i in range(3)]
+        clusters += [cluster(f"dev-{i}", labels={}) for i in range(3)]
+        self.assertEqual(fd.decide_cohort_strategy(clusters), "environment")
+
+    def test_one_real_label_settles_it_without_a_majority(self):
+        """A label is the customer declaring how they organize their fleet, so
+        it does not need numbers behind it the way a guess does."""
+        clusters = [cluster("a", labels={"environment": "prod"})]
+        clusters += [cluster(f"c{i}", labels={}) for i in range(15)]
+        self.assertEqual(fd.decide_cohort_strategy(clusters), "environment")
+
 
 class ComputeBaselineTest(unittest.TestCase):
     def test_no_baseline_under_the_floor(self):

@@ -200,8 +200,28 @@ def environment_of(c: dict) -> tuple[str, str]:
 
 
 def decide_cohort_strategy(clusters: list[dict]) -> str:
-    envs = {environment_of(c)[0] for c in clusters}
-    if envs - {"unknown"}:
+    """Which axis splits this fleet into comparable groups.
+
+    A single resolved environment used to be enough to pick `environment` for
+    the whole fleet, and on a fleet nobody has labelled that makes coverage
+    *worse* than having no signal at all. Sixteen live clusters, two of them
+    merely carrying `test` somewhere in their name: inference resolved those
+    two, the fleet switched to environment cohorts, and both landed alone in
+    cohorts of one while the other fourteen piled into `unknown`. Two clusters
+    lost all coverage. Strip those two names and the same fleet cohorts by mode
+    and compares all sixteen.
+
+    So the two signals are not interchangeable. A label is the customer
+    declaring how they organize their fleet and any one of them settles it. A
+    name token is our guess, and a guess about a couple of clusters should not
+    redraw the cohorts for everybody -- it earns the strategy only when it
+    resolves enough of the fleet to be the fleet's actual naming convention.
+    """
+    envs = [environment_of(c) for c in clusters]
+    if any(source == "label" for _, source in envs):
+        return "environment"
+    named = sum(1 for env, _ in envs if env != "unknown")
+    if named and named * 2 >= len(clusters):
         return "environment"
     if len({c.get("_project", "") for c in clusters}) > 1:
         return "project"
