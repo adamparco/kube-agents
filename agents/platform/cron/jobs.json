@@ -47,7 +47,7 @@
         "expr": "50 7 * * 1",
         "display": "50 7 * * 1"
       },
-      "prompt": "Run the weekly fleet waste audit. Run the collector (`skills/fleet-audit/scripts/fleet_waste.py`) first, redirecting its stdout to /opt/data/scratch/manifest_fleet-wide-cost-analysis.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
+      "prompt": "Run the weekly fleet waste audit. Run the collector (`/opt/hermes/.venv/bin/python3 skills/fleet-audit/scripts/fleet_waste.py`) first — that interpreter, not a bare `python3`, which cannot import the `google-auth` the overrequest check needs — redirecting its stdout to /opt/data/scratch/manifest_fleet-wide-cost-analysis.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "chat"

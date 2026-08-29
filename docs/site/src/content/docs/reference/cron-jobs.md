@@ -30,7 +30,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `compliance-audit` | Platform Agent | `20 6 * * *` | Daily 06:20 | yes | Run the daily fleet security and RBAC posture audit. Run the collector (`skills/fleet-audit/scripts/collect... |
 | `obtainability-audit` | Platform Agent | `50 6 * * *` | Daily 06:50 | yes | Run the daily workload reliability audit. Run the collector (`skills/fleet-audit/scripts/collect.py obtaina... |
 | `security-patch-orchestrator` | Platform Agent | `20 7 * * 1` | Weekly, Monday 07:20 | yes | Run the weekly GKE upgrade and patch readiness audit. Run the collector (`skills/fleet-audit/scripts/patch_... |
-| `fleet-wide-cost-analysis` | Platform Agent | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Run the collector (`skills/fleet-audit/scripts/fleet_waste.py`) first, re... |
+| `fleet-wide-cost-analysis` | Platform Agent | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Run the collector (`/opt/hermes/.venv/bin/python3 skills/fleet-audit/scri... |
 | `fleet-consistency-drift` | Platform Agent | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Run the collector (`skills/fleet-audit/scripts/fleet_drift.py... |
 | `ai-security-audit` | Platform Agent | `50 8 * * *` | Daily 08:50 | yes | Run the daily AI workload security audit. Run the collector (`skills/fleet-audit/scripts/collect.py ai-secu... |
 | `stockout-prevention` | Platform Agent | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Run the collector (`skills/fleet-audit/scripts/... |

@@ -77,8 +77,10 @@ There is no report branch. Do not create branches, commit, push, or call `gh` yo
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/fleet_waste.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-wide-cost-analysis.json
+/opt/hermes/.venv/bin/python3 ./skills/fleet-audit/scripts/fleet_waste.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-wide-cost-analysis.json
 ```
+
+Run it under that interpreter, not a bare `python3`. `google-auth` is installed in the venv only, and this is the one collector that needs it — the overrequest check reads each workload's peak from Cloud Monitoring in process. Under `/usr/bin/python3` the import fails, and it fails quietly: the collector carries on, and every cluster comes back with an overrequest coverage gap reading "ADC credentials were unavailable at startup", which describes the interpreter rather than the credentials.
 
 This is the tested, procedural implementation of the collection this section used to describe — see `fleet_waste.py`'s own module docstring for what it covers, including the ten `kubectl` object kinds it dumps (one more than the roster below names: it also reads StatefulSets, needed only to suppress a scaled-to-zero StatefulSet's own claim in 3.2/3.3, never surfaced as a check of its own) and how it reads each workload's peak CPU and memory from Cloud Monitoring over the trailing week instead of sampling `kubectl top`. Its manifest mixes cluster-named entries with `project/<project-id>` entries for the project-scoped checks (3.4–3.6), per §3's project-scoped rule below. Read the manifest before doing anything else:
 
