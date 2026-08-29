@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -7897,6 +7898,53 @@ class TestPathContainment(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(audit_report.ValidationError):
                     audit_report._require_repo_relative(path, "where")
+
+
+class TestBodyFileIsReadableByTheSidecar(unittest.TestCase):
+    """A body file the `gh` container cannot open publishes nothing.
+
+    This is the second half of the bug `_write_temp`'s docstring opens with.
+    Putting the file on the shared volume fixed *where* it lives; it did not
+    fix *who* may read it, because the sidecar running the real `gh` is a
+    different uid and `NamedTemporaryFile` creates 0600. The failure is
+    identical to the `/tmp` one — `gh` reports no such file — so a regression
+    here is easy to misread as the bug that was already fixed.
+
+    It reached production once already, as a chmod applied by hand to the
+    volume that no image and no branch carried, which the entrypoint's
+    whole-directory skills replace then wiped on the next pod roll. Hence a
+    test: the mode is the contract, not an implementation detail.
+    """
+
+    def test_the_body_file_is_group_and_world_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(audit_report, "SCRATCH_DIR", tmp):
+                path = audit_report._write_temp("# body\n")
+            self.addCleanup(audit_report._unlink, path)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), "# body\n")
+
+    def test_an_unchmodable_file_still_publishes(self):
+        """Best-effort, like every other write here.
+
+        A filesystem that refuses the chmod may well already be group-readable;
+        failing the publish over it trades a working run for a hypothetical.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(audit_report, "SCRATCH_DIR", tmp):
+                with patch.object(
+                    audit_report.os, "chmod", side_effect=OSError("read-only")
+                ):
+                    path = audit_report._write_temp("# body\n")
+            self.addCleanup(audit_report._unlink, path)
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), "# body\n")
+
+    def test_the_report_store_is_not_widened_with_it(self):
+        """The store keeps 0600 deliberately — same uid writes and reads it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "latest.json"
+            audit_report._atomic_write(target, '{"a": 1}')
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
 
 
 class TestFilesystemContainment(unittest.TestCase):

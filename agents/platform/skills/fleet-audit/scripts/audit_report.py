@@ -5074,6 +5074,19 @@ def _write_temp(text: str, suffix: str = ".md") -> str:
 
     Falls back to the system temp directory when the PVC is absent, so the unit
     tests and a local `--dry-run` still work off-cluster.
+
+    Sharing the filesystem is necessary but not sufficient: the two containers
+    are also different uids. `NamedTemporaryFile` creates 0600, and the sidecar
+    that runs the real `gh` is uid 10001 against this process's 10000, so a
+    default-mode body file is one the reader is refused — the same "no such
+    file" symptom as the `/tmp` bug above, from the other half of the problem.
+    Hence the widen. It is not a secrecy regression: the file's whole purpose is
+    to become the public body of a GitHub issue moments later, and it has
+    already been through `redact_secrets`.
+
+    This is deliberately *not* what §4.8's report store does — that writes 0600
+    and should stay there. The store is read by this same uid and never by the
+    sidecar, so it has no reason to widen and no counterpart bug to fix.
     """
     directory: str | None = SCRATCH_DIR
     try:
@@ -5085,6 +5098,14 @@ def _write_temp(text: str, suffix: str = ".md") -> str:
     )
     with handle:
         handle.write(text)
+    try:
+        os.chmod(handle.name, 0o644)
+    except OSError:
+        # Best-effort, like every other write here. A filesystem that refuses
+        # the chmod has not made the body unreadable — it may already be
+        # group-readable — so failing the publish over it would be the worse
+        # outcome. The `gh` call downstream reports its own failure.
+        pass
     return handle.name
 
 
