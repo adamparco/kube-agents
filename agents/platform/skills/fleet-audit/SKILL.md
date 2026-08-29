@@ -387,6 +387,14 @@ field, and publishes nothing:
   findings agreeing on all four are the same finding, and the document is refused rather than
   silently collapsed.
 
+  `object` is `Kind/name` and is refused without both halves. A bare `Cluster` names every cluster
+  and none in particular; a finding against the cluster itself is `Cluster/<the cluster's name>`,
+  repeating the name that is already in `cluster`. That repetition is the point — on 2026-08-29 the
+  compliance stream wrote `Cluster/kube-agents-host` one day and `Cluster` the next for four
+  unchanged public control planes, and the ledger announced all four as resolved and re-opened them
+  as new. Derivation stopped the model spelling an id three ways; it cannot stop the model spelling
+  one of the id's four inputs two ways, so this one field has a shape.
+
   The derived id still has to satisfy `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..` run and
   no `.lock` suffix, and is shortened to fit: the id is the join key of the ledger's hidden delta
   block and of the `audit-persists:<id>` marker — both line-anchored regexes a space or a newline

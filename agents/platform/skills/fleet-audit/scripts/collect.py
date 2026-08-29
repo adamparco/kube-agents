@@ -956,12 +956,31 @@ def check_default_sa_automount(context: dict) -> list[dict]:
     return hits
 
 
+def _cluster_object(context: dict) -> str:
+    """`Cluster/<name>` for a finding whose object is the cluster itself.
+
+    A bare `Cluster` was what these two checks emitted until 2026-08-29, and it
+    is not a name: the finding id derives from `object`, so the compliance
+    stream reported the same four public control planes as resolved and
+    re-opened them as new the day the collector started supplying the string.
+    `audit_report.validate_findings` now refuses a bare kind outright; this is
+    the other half, so the collector never asks for the refusal.
+    """
+    name = str(context.get("cluster_name") or "").strip()
+    if not name:
+        raise GateFailure(
+            "the collector context carries no cluster_name, so a cluster-scoped "
+            "finding cannot name its object"
+        )
+    return f"Cluster/{name}"
+
+
 def check_workload_identity_off(context: dict) -> list[dict]:
     describe = context.get("cluster_describe") or {}
     pool = ((describe.get("workloadIdentityConfig") or {}).get("workloadPool") or "").strip()
     if pool:
         return []
-    return [{"namespace": "", "object": "Cluster", "excerpt": "workloadIdentityConfig.workloadPool is empty"}]
+    return [{"namespace": "", "object": _cluster_object(context), "excerpt": "workloadIdentityConfig.workloadPool is empty"}]
 
 
 def check_legacy_metadata(context: dict) -> list[dict]:
@@ -993,7 +1012,7 @@ def check_public_control_plane(context: dict) -> list[dict]:
     unrestricted = man_cfg.get("enabled") is not True or "0.0.0.0/0" in (man_cfg.get("cidrBlocks") or [])
     if not unrestricted:
         return []
-    return [{"namespace": "", "object": "Cluster", "excerpt": "public endpoint reachable with no restrictive authorized networks"}]
+    return [{"namespace": "", "object": _cluster_object(context), "excerpt": "public endpoint reachable with no restrictive authorized networks"}]
 
 
 def _namespace_labels(context: dict, ns: str) -> dict:
@@ -1599,7 +1618,9 @@ _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
 def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
     commands: dict[str, dict] = {}
-    context: dict = {"workloads": []}
+    # `cluster_name` is here for the two cluster-scoped checks, whose object is
+    # the cluster itself and which are handed nothing else that names it.
+    context: dict = {"workloads": [], "cluster_name": name}
 
     def gated(argv: list[str]) -> tuple[dict | list | None, Run]:
         return run_and_gate(argv, kubeconfig, run=run)

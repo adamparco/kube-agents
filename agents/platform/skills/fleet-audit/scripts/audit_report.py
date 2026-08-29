@@ -2406,6 +2406,34 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "finding's identity"
                 )
 
+        # `object` must name an object, and a bare Kind does not. Deriving the
+        # id from four fields fixed the model *spelling* an id three ways; it
+        # cannot fix the model spelling one of the four ways, because a
+        # different `object` is a different finding by construction. On
+        # 2026-08-29 the compliance stream wrote `Cluster/kube-agents-host` one
+        # day and `Cluster` the next for the same four public control planes,
+        # and the ledger duly announced all four as resolved and re-opened them
+        # as new -- the identical failure SKILL.md records against 2026-08-03,
+        # arriving through the one field derivation left free.
+        #
+        # `Kind/name` is the shape every honest finding this fleet has produced
+        # already uses, across all five streams that have ever published one,
+        # and it is the shape SKILL.md asks for in prose ("name the durable
+        # object"). Requiring it turns a whole class of re-spellings into no
+        # change at all: `Cluster` alone stops being sayable, so the name that
+        # distinguishes one control plane from another cannot go missing.
+        obj = str(finding["object"])
+        kind, _, obj_name = obj.partition("/")
+        if not kind.strip() or not obj_name.strip():
+            raise ValidationError(
+                f"findings[{i}].object: {obj!r} must name an object as "
+                "'Kind/name' — a bare kind names every object of that kind and "
+                "none in particular. A cluster-scoped finding is against "
+                f"'Cluster/{finding['cluster']}', not 'Cluster'. The id is "
+                "derived from this string, so a run that spells it differently "
+                "reports the same finding as resolved and re-opens it as new."
+            )
+
         # Identity, computed now that its four components are validated. Any
         # `id` the document arrived with is discarded rather than rejected: a
         # worker running against a cached SOP would otherwise fail the whole

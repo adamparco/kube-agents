@@ -1273,6 +1273,43 @@ class TestDerivedFindingId(unittest.TestCase):
                     audit_report.validate_findings(doc, AUDIT)
                 self.assertIn(field, str(exc.exception))
 
+    def test_a_bare_kind_is_refused_because_it_names_no_object(self):
+        # The 2026-08-29 compliance run: `Cluster/kube-agents-host` on Friday,
+        # `Cluster` on Saturday, for four unchanged public control planes. The
+        # ledger reported all four resolved and re-opened them as new. Nothing
+        # downstream can tell that from a real fix, so it is refused here.
+        for value in ("Cluster", "Deployment", "Cluster/", "/kube-agents-host"):
+            with self.subTest(value=value):
+                doc = make_doc(findings=[make_finding(obj=value)])
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn("object", str(exc.exception))
+                self.assertIn("Kind/name", str(exc.exception))
+
+    def test_the_rejection_names_the_cluster_scoped_spelling_that_would_work(self):
+        # A worker told only "that is wrong" writes something else wrong. The
+        # cluster is already in the finding, so the message can name the exact
+        # string to use instead.
+        doc = make_doc(findings=[make_finding(obj="Cluster")])
+        doc["findings"][0]["cluster"] = "kube-agents-host"
+        doc["scope"]["clusters"][0]["name"] = "kube-agents-host"
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("'Cluster/kube-agents-host'", str(exc.exception))
+
+    def test_a_kind_slash_name_with_punctuation_in_the_name_still_passes(self):
+        # RBAC subjects carry colons and dots; the rule is "has a name", not a
+        # charset. `_id_segment` already flattens whatever survives.
+        for value in (
+            "ClusterRole/system:kubelet-api-admin",
+            "Deployment/argocd-repo-server",
+            "ServiceAccount/default/edge",
+        ):
+            with self.subTest(value=value):
+                doc = make_doc(findings=[make_finding(obj=value)])
+                got = audit_report.validate_findings(doc, AUDIT)
+                audit_report.validate_finding_id(got["findings"][0]["id"], "derived")
+
     def test_a_long_namespace_does_not_collapse_two_objects_into_one(self):
         # RFC 1123 allows a 63-character namespace. Trimming right-to-left —
         # what the retired SOPs asked for — spends the entire allowance on the

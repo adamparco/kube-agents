@@ -7,6 +7,7 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import inspect
 import json
 import sys
 import unittest
@@ -94,7 +95,14 @@ def context_of(dump=None, **overrides):
     """A build_context()-shaped dict with sensible empty defaults, so a test
     that only cares about one cross-reference does not have to construct the
     other three."""
-    base = {"limitranges": {}, "pdbs": {}, "hpas": {}, "services": {}, "workloads": []}
+    base = {
+        "limitranges": {},
+        "pdbs": {},
+        "hpas": {},
+        "services": {},
+        "workloads": [],
+        "cluster_name": "test-cluster",
+    }
     if dump is not None:
         base.update(
             limitranges=collect.limitranges_by_namespace(dump),
@@ -1348,6 +1356,48 @@ class TestWorkloadIdentityOff(unittest.TestCase):
     def test_a_set_workload_pool_is_never_flagged(self):
         ctx = context_of(cluster_describe={"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}})
         self.assertEqual(collect.check_workload_identity_off(ctx), [])
+
+
+class TestClusterScopedObject(unittest.TestCase):
+    """The object of a cluster-scoped finding is `Cluster/<name>`, never `Cluster`.
+
+    Both checks below emitted the bare kind until 2026-08-29. The finding id
+    derives from `object`, so the day the collector started supplying it the
+    compliance ledger announced four unchanged public control planes as
+    resolved and re-opened them as new.
+    """
+
+    def test_both_cluster_scoped_checks_name_the_cluster(self):
+        cases = (
+            (
+                collect.check_workload_identity_off,
+                {"workloadIdentityConfig": {}},
+            ),
+            (
+                collect.check_public_control_plane,
+                {"privateClusterConfig": {}, "masterAuthorizedNetworksConfig": {}},
+            ),
+        )
+        for check, describe in cases:
+            with self.subTest(check=check.__name__):
+                ctx = context_of(cluster_describe=describe)
+                ctx["cluster_name"] = "kube-agents-host"
+                (hit,) = check(ctx)
+                self.assertEqual(hit["object"], "Cluster/kube-agents-host")
+
+    def test_a_context_with_no_cluster_name_fails_the_cluster_closed(self):
+        # Rather than emitting a nameless object that `audit_report` would
+        # refuse at publish time, fifty minutes later.
+        ctx = context_of(cluster_describe={"workloadIdentityConfig": {}})
+        ctx["cluster_name"] = ""
+        with self.assertRaises(collect.GateFailure):
+            collect.check_workload_identity_off(ctx)
+
+    def test_the_real_context_builder_supplies_it(self):
+        # `context_of` is a test double; the assertion above is only worth
+        # anything if the production builder sets the same key.
+        source = inspect.getsource(collect._collect_compliance)
+        self.assertIn('"cluster_name": name', source)
 
 
 class TestLegacyMetadata(unittest.TestCase):
