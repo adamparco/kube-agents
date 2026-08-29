@@ -915,6 +915,31 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
             if hit.get("_guaranteed"):
                 emitted["needs_triage"] = "guaranteed-qos"
             candidates.append(emitted)
+    elif not context["nodes"]:
+        # A cluster with no nodes cannot be over-requesting: there is no
+        # capacity for a reservation to waste, and nothing has run for a
+        # request to be measured against. `kubectl top nodes` fails there for
+        # the same reason the cluster is empty -- an Autopilot cluster with
+        # nothing scheduled scales metrics-server to zero along with every
+        # other workload -- so the branch below would read a vacuum as a
+        # degradation. On 2026-08-29 it did: `fleet-wide-cost-analysis`
+        # published `partial: true` over two freshly created Autopilot peers
+        # whose whole object set was fifteen Pending pods and no nodes. That is
+        # 7301c594's failure again from the other side. A `partial` that fires
+        # on every empty cluster is one operators learn to scroll past, and the
+        # gap it hides next time will be a real one.
+        not_applicable.append(
+            {
+                "check": "overrequest",
+                "reason": (
+                    "This cluster has no nodes, so no workload is scheduled and "
+                    "no reservation is holding capacity: there is nothing for a "
+                    "request to be over against. `kubectl top nodes` reports no "
+                    "Metrics API for the same reason -- metrics-server is one of "
+                    "the workloads with nowhere to run."
+                ),
+            }
+        )
     else:
         # §2's metrics degradation. `overrequest` already dropped out of
         # `commands` on its own, so §6 was raising it as a gap with no reason

@@ -675,19 +675,27 @@ class CollectClusterTest(unittest.TestCase):
                 entry, _ = fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
         self.assertEqual(entry["outcome"], "gate-failed")
 
-    def test_metrics_unavailable_still_collects_object_checks(self):
+    def _metrics_down(self, *dump_items):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
-                return run_of(0, json.dumps(dump_of()))
+                return run_of(0, json.dumps(dump_of(*dump_items)))
             if "top" in argv and "nodes" in argv:
                 return run_of(1, "", "metrics-server unavailable")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 entry, _ = fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
+        return entry
+
+    def test_metrics_unavailable_still_collects_object_checks(self):
+        # The node matters: without one this is the empty-cluster case below,
+        # where the check is not applicable rather than degraded.
+        entry = self._metrics_down(obj("Node", "node-1"))
         self.assertEqual(entry["outcome"], "collected")
         self.assertNotIn("overrequest", {c["check"] for c in entry["commands"]})
         # Dropping the check out of `commands` is only half the job: §6 raises
@@ -695,6 +703,20 @@ class CollectClusterTest(unittest.TestCase):
         # nobody could explain.
         self.assertIn("overrequest could not be measured", entry["limitations"])
         self.assertIn("metrics-server", entry["limitations"])
+
+    def test_a_cluster_with_no_nodes_cannot_be_over_requesting(self):
+        # An empty cluster is not a degraded one. `kubectl top nodes` fails
+        # there because metrics-server has nowhere to run, and reading that as
+        # lost coverage published `partial: true` over two freshly created
+        # Autopilot peers on 2026-08-29 -- a gap naming a check that had no
+        # object to run against.
+        entry = self._metrics_down()
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertNotIn("limitations", entry)
+        self.assertEqual(
+            {na["check"] for na in entry["checks_not_applicable"]}, {"overrequest"}
+        )
+        self.assertIn("no nodes", entry["checks_not_applicable"][0]["reason"])
 
     def _unreadable_pools(self, cluster=None):
         def run(argv, **kwargs):
