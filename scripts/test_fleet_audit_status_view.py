@@ -511,6 +511,40 @@ class TestDashboard(unittest.TestCase):
         self.assertIn("60", out)  # 57 + 3 findings across both
         self.assertIn("2 critical", out)
 
+    def test_the_header_reports_the_widest_scope_not_the_sum(self):
+        """Seven of the eight streams audit the same fleet, so adding their
+        scopes together would report one 16-cluster fleet as a hundred and
+        fifty clusters audited."""
+        streams = {
+            "compliance-audit": stream(last=latest(clusters=16)),
+            "cost-audit": stream(last=latest(audit_id="cost-audit", clusters=43)),
+        }
+        out = self.render(streams)
+        self.assertIn("43 units", out)
+        self.assertIn("widest", out)
+        self.assertNotIn("59 units", out)
+
+    def test_the_header_says_nothing_about_scope_when_no_stream_has_run(self):
+        self.assertNotIn("units", self.render({"compliance-audit": stream(liveness="never")}))
+
+    def test_a_skipped_cluster_is_surfaced_in_the_header(self):
+        out = self.render({"compliance-audit": stream(last=latest(clusters=15, skipped=2))})
+        self.assertIn("2 skipped", out)
+
+    def test_a_stream_that_skipped_nothing_shows_a_bare_count(self):
+        """The denominator is reserved for the case worth interrupting for.
+        A `16/16` on every row is noise that teaches the reader to skip the
+        column."""
+        row = self.body_rows(self.render({"compliance-audit": stream(last=latest(clusters=16))}))[0]
+        self.assertIn("16", row)
+        self.assertNotIn("16/16", row)
+
+    def test_a_stream_that_skipped_a_cluster_shows_the_denominator(self):
+        """A stream that could not read a cluster still reports every
+        remaining one as clean, so the count alone reads as full coverage."""
+        row = self.body_rows(self.render({"compliance-audit": stream(last=latest(clusters=15, skipped=2))}))[0]
+        self.assertIn("15/17", row)
+
     def test_a_flagged_stream_is_counted_in_the_lead(self):
         streams = self.two()
         streams["cost-audit"] = stream(liveness="never")

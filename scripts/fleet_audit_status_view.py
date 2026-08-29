@@ -424,6 +424,28 @@ def count_cell(value: object) -> str:
     return str(value) if isinstance(value, int) else "—"
 
 
+def scope_cell(latest: dict) -> tuple[str, str | None]:
+    """How many scope units the run covered, and whether it missed any.
+
+    "Units" rather than "clusters" because `scope.clusters` is not always a
+    cluster: `gcp-networking-fabric-audit` puts 42 subnets and a project entry
+    there, and labelling that column CLUSTERS would misreport it by a factor
+    of three.
+
+    The denominator only appears when something was skipped. A stream that
+    could not read a cluster still reports every remaining one as clean, so
+    `16/17` is the shape worth interrupting the reader for; a bare `16` on
+    every other row is not.
+    """
+    audited = latest.get("clusters")
+    if not isinstance(audited, int):
+        return "—", "dim"
+    skipped = latest.get("skipped")
+    if isinstance(skipped, int) and skipped > 0:
+        return "%d/%d" % (audited, audited + skipped), "yellow"
+    return str(audited), None
+
+
 def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list[str]:
     """The four flags, in severity order.
 
@@ -581,6 +603,7 @@ def row_for(
         (ago(at, now) if at else "—", "dim"),
         (status, status_style),
         (findings_text, findings_style),
+        scope_cell(latest),
         (delta_text, delta_style),
         (pr_text, "dim" if pr_text in ("0", "—") else None, pr_url),
         (
@@ -610,6 +633,7 @@ COLUMNS = [
     Column("AGE", align="r", expendable=6),
     Column("STATUS", wrap=True, min_width=11),
     Column("FINDINGS", align="r"),
+    Column("SCOPE", align="r", expendable=2),
     Column("Δ", align="r", expendable=2),
     Column("PRS", align="r", expendable=5),
     Column("TIMING", align="r", expendable=1),
@@ -820,6 +844,40 @@ def header_lines(
             ),
         )
     )
+    scopes = [
+        e["latest"]["clusters"]
+        for e in ran
+        if isinstance(e["latest"].get("clusters"), int)
+    ]
+    if scopes:
+        skipped = sum(
+            e["latest"].get("skipped") or 0
+            for e in ran
+            if isinstance(e["latest"].get("skipped"), int)
+        )
+        # Widest, not summed: the streams overlap almost entirely -- seven of
+        # the eight audit the same fleet -- so a total would report one
+        # 16-cluster fleet as 150 clusters audited. The widest run is the
+        # closest honest read of how much there is to cover, and the median
+        # says whether the rest keep up with it.
+        tail = "widest · %d median across %d run stream%s" % (
+            sorted(scopes)[len(scopes) // 2],
+            len(scopes),
+            "" if len(scopes) == 1 else "s",
+        )
+        lines.append(
+            field(
+                "scope",
+                "%s %s"
+                % (
+                    palette("%d units" % max(scopes), "bold"),
+                    palette(
+                        tail + (" · %d skipped" % skipped if skipped else ""),
+                        "yellow" if skipped else "dim",
+                    ),
+                ),
+            )
+        )
     if total:
         clean = total - len(attention)
         cells = 18
