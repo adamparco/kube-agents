@@ -69,8 +69,10 @@ gcloud compute reservations list --project=<project> --format=json > /opt/data/s
 # 3. Inspect GCP Regional Quotas for the cluster's region (e.g. us-central1)
 gcloud compute regions describe <region> --project=<project> --format="json(quotas)"
 
-# 4. Check Spot Capacity & Preemption Advice History
-gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json
+# 4. Check Spot Capacity & Preemption Advice History.
+#    One machine type per call -- `--machine-type` is singular. Repeat for each
+#    shape the fleet's Spot ComputeClasses actually request.
+gcloud beta compute advice capacity-history --region=<region> --machine-type=g2-standard-4 --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json
 
 # 5. Autoscaler Visibility Logs (Stage 1 Triage Query)
 gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format="value(timestamp,resource.labels.cluster_name,jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[0].napFailureReasons[0].messageId)"
@@ -175,7 +177,7 @@ This covers ten of the twelve checks below — every one built on a `ComputeClas
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
-- **Command:** `gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json`
+- **Command:** `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
 - **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
 - **Severity:** `major`.

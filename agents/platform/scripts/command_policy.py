@@ -316,6 +316,17 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "networks", "subnets", "list-usable"),
         ("compute", "project-info", "describe"),
         ("compute", "routers", "get-nat-mapping-info"),
+        # get-nat-mapping-info alone was not enough to run cloud-nat-exhaustion.
+        # networking_audit.py reads all three -- `routers list` for each NAT's
+        # natIpAllocateOption/maxPortsPerVm, `routers get-status` for
+        # result.natStatus[].autoAllocatedNatIps -- and the SOP's own Command
+        # line names them as the corroborating reads. Unlisted, `routers list`
+        # failed the gate first, which took the collector's whole project-level
+        # target down with it and skipped three further checks that had nothing
+        # to do with Cloud NAT. Both are pure reads; `routers create`/`update`/
+        # `delete`/`add-interface` stay refused, and the tests assert it.
+        ("compute", "routers", "get-status"),
+        ("compute", "routers", "list"),
         ("compute", "security-policies", "list"),
         # The daily `stockout-prevention` cron reads these three and nothing
         # else can stand in for them: reservations list is the committed
@@ -388,10 +399,24 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # events yet", so the refusal was silent — the poll loop slept forever.
         "--order", "--start-time", "--end-time",
         # The spellings the stockout SOP actually passes to the two entries
-        # added for it: capacity-history carries the first three, and
-        # machine-types list uses --zones (plural; --zone alone was listed).
-        # An allowlist entry whose flags are not here is unreachable.
+        # added for it, and `machine-types list` uses --zones (plural; --zone
+        # alone was listed). An allowlist entry whose flags are not here is
+        # unreachable.
         "--instance-selection-machine-types", "--size", "--types", "--zones",
+        # capacity-history's own required flags, which the two above are not:
+        # `--instance-selection-machine-types` and `--size` belong to the
+        # sibling `beta compute advice capacity`, and the SOP had been
+        # documenting one command's flags against the other's name. Real
+        # `capacity-history` takes `--machine-type` (singular, one type per
+        # call), `--provisioning-model`, and `--types`, plus --region/--zone.
+        # Only --types of those was listed, so the correct spelling was
+        # refused as gcp.unreadable-command before the allowlist entry for
+        # capacity-history was ever reached -- and every stockout run recorded
+        # spot-scarcity-risk as "did not run" against all four clusters.
+        "--machine-type", "--provisioning-model",
+        # `compute routers list` takes --regions (plural). Same trap as
+        # --zones above: the singular was listed and the plural was not.
+        "--regions",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud

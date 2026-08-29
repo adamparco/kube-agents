@@ -963,8 +963,9 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         # were consulted. These are the SOP's spellings (lines 73 and 220).
         for argv, desc in (
             (["gcloud", "beta", "compute", "advice", "capacity-history",
-              "--region=r", "--instance-selection-machine-types=g2-standard-4",
-              "--size=1", "--types=PREEMPTION,PRICE", "--format=json"],
+              "--region=r", "--machine-type=g2-standard-4",
+              "--provisioning-model=SPOT", "--types=PREEMPTION,PRICE",
+              "--format=json"],
              "capacity forecast as the SOP spells it"),
             (["gcloud", "compute", "machine-types", "list", "--zones=z"],
              "machine-types with --zones (plural)"),
@@ -975,6 +976,69 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_the_reads_two_live_fleet_audits_were_refused_now_pass(self):
+        # Both of these were found in the report store on the deployed volume,
+        # written by scheduled runs that recorded the check as "did not run".
+        # Neither was a wrong idea about GCP; each was one missing table entry.
+        #
+        # capacity-history: the SOP documented the sibling `advice capacity`'s
+        # flags (`--instance-selection-machine-types`, `--size`) against
+        # capacity-history's name. The real required flags are --machine-type
+        # (singular), --provisioning-model and --types, and only the last was
+        # in the arity table -- so the *correct* spelling refused as
+        # gcp.unreadable-command while the incorrect one gcloud itself rejects
+        # sailed through the gate. Four clusters x every run, skipped.
+        #
+        # routers list/get-status: allowlisting only get-nat-mapping-info left
+        # networking_audit.py's cloud-nat-exhaustion with no way to enumerate
+        # routers at all, and the gate failure took three unrelated checks in
+        # the same project-level target down with it.
+        for argv, desc in (
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--machine-type=n2-standard-32", "--provisioning-model=SPOT",
+              "--types=PREEMPTION,PRICE", "--zone=us-central1-a",
+              "--format=json"],
+             "capacity-history, zonal, gcloud's own --help example"),
+            (["gcloud", "beta", "compute", "advice", "capacity-history",
+              "--provisioning-model=SPOT", "--machine-type=g2-standard-4",
+              "--types=PRICE", "--region=us-east4"],
+             "capacity-history, regional, flags reordered"),
+            (["gcloud", "compute", "routers", "list", "--project=p",
+              "--format=json"],
+             "networking SOP:59 router inventory"),
+            (["gcloud", "compute", "routers", "list", "--regions=us-east4",
+              "--format=json"],
+             "routers list with --regions (plural)"),
+            (["gcloud", "compute", "routers", "get-status", "rtr",
+              "--region=us-east4", "--project=p", "--format=json"],
+             "networking SOP:59 NAT autoAllocatedNatIps"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_an_unknown_flag_is_still_unreadable_after_the_additions(self):
+        # The additions are individual arity entries, not a relaxation of the
+        # fail-closed rule -- that rule is the reason the refusals above were
+        # correct behaviour from a table that was merely incomplete. A flag
+        # nobody has enumerated must still take the whole command down.
+        decision = evaluate([
+            "gcloud", "compute", "routers", "list", "--not-a-real-flag", "v",
+        ])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_routers_mutations_are_not_swept_in_with_get_status(self):
+        # `routers get-status` reads; `routers add-interface`/`set-nat` and
+        # friends do not, and they sit one word away in the same noun.
+        for verb in ("add-interface", "add-bgp-peer", "set-nat",
+                     "update-interface", "remove-interface", "nats"):
+            with self.subTest(verb=verb):
+                self.assertFalse(
+                    evaluate(["gcloud", "compute", "routers", verb, "r"]).allowed,
+                    verb,
+                )
 
     def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
         # Each new entry has a mutating sibling that shares all but the last
