@@ -6,10 +6,9 @@
 > renders the fleet, and §4.8's local report store is `finish`'s delta memory in place of the
 > retired ledger-body read-back. **§4.5's status ConfigMap shipped but never worked on a real
 > install and is being deleted** — the status surface moves into the report store, which §4.5
-> now specifies and §10 phase 7 tracks. Two further pieces are deliberately not done, each with
-> its reasoning recorded where it applies rather than here: `stockout-prevention`'s two
-> beta-API/internal-log-schema checks stay prose-only (§10 phase 4), and §4.7's `AuditSpec`
-> consolidation is deferred (§10 phase 5).
+> now specifies and §10 phase 7 tracks. One further piece is deliberately not done, with its
+> reasoning recorded where it applies rather than here: §4.7's `AuditSpec` consolidation is
+> deferred (§10 phase 5).
 > [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) remains the design of record for
 > the reporting half — the ledger, delta, and promotion contracts — which this document amends
 > in exactly two places, named in **Builds on** below.
@@ -1200,14 +1199,18 @@ Each phase is one PR, independently valuable, in this order:
    escalation reusing `ai-security-audit`'s own §2 discriminator; `substantial`/`inUseCount <<
 count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a shared
    name-token "non-production" definition for the three checks that used the term undefined) —
-   and even then only a **partial** conversion, deliberately: its own script (`fleet_stockout.py`)
-   covers ten of twelve checks, built on the same `ComputeClass`/`Deployment`/`StatefulSet`/
-   `StorageClass`/node-pool/reservation/quota reads every other collector already reads with
-   confidence. `spot-scarcity-risk` and `autoscaler-out-of-resources` stay prose-only: the first
-   reads a beta Spot capacity-advice API, the second parses `jsonPayload` fields out of an
-   internal autoscaler-visibility log schema, and neither shape is one this repository has
-   verified anywhere else — encoding a guess as tested code would make the guess look like a
-   fact. Phase 4 is otherwise complete.
+   and its own script (`fleet_stockout.py`) now covers all twelve. Ten are built on the same
+   `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass`/node-pool/reservation/quota reads
+   every other collector already reads with confidence. The remaining two held out longer:
+   `spot-scarcity-risk` reads a beta Spot capacity-advice API and `autoscaler-out-of-resources`
+   parses `jsonPayload` out of an internal autoscaler-visibility log schema, and while neither
+   shape had been verified anywhere in this repository, encoding a guess as tested code would
+   have made the guess look like a fact. Both were read live against `adamparco-kage` on
+   2026-08-29 and converted against captured responses — which immediately paid for itself: the
+   log schema turned out to write a stockout under **two** `jsonPayload` shapes, and the
+   `value(...)` projection the SOP had been carrying reads only one of them. What remains
+   uncovered is two sub-conditions, 3.10(b) and 3.12(b), named in the SOP and in the collector's
+   own docstring. Phase 4 is complete.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'
@@ -1332,11 +1335,12 @@ recoverable from GitHub by a human, because the ledger body keeps publishing the
 ## 13. Accepted risks
 
 - **The attestation gap survives where no collector reaches.** With phase 4 complete that is
-  `stockout-prevention`'s two prose-only checks and any cluster on the manual fallback after a
-  gate failure. _Why accepted:_ the two checks' API and log-schema shapes are unverified (§10
-  phase 4), and the manual fallback is deliberate (§6). _What it costs:_ the 2026-08-03 class
-  stays possible in exactly those corners. _What would change it:_ verifying the two shapes
-  against a live cluster and converting the checks.
+  `stockout-prevention`'s 3.10(b) and 3.12(b) sub-conditions, and any cluster on the manual
+  fallback after a gate failure. _Why accepted:_ both sub-conditions turn on GKE CRD and
+  reservation state this repository has not exercised, the same bar the stream's other two
+  holdouts cleared on 2026-08-29 before they were converted; the manual fallback is deliberate
+  (§6). _What it costs:_ the 2026-08-03 class stays possible in exactly those corners. _What
+  would change it:_ verifying those shapes against a live cluster and converting them too.
 - **The view's schedule column can lie about runtime state.** It reads the checked-in seed
   roster by default; a stream disabled at runtime shows `enabled` until `--roster` is pointed at
   a live dump. _Why accepted:_ the alternative is the view exec-ing into the pod by default,

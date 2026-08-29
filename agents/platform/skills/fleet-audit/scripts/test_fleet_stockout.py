@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for fleet_stockout.py, the stockout-prevention collector (partial:
-the ten checks this collector covers, per its own module docstring)."""
+"""Tests for fleet_stockout.py, the stockout-prevention collector.
+
+The `capacity-history` and `cluster-autoscaler-visibility` fixtures below are
+trimmed copies of real responses read against `adamparco-kage` on 2026-08-29,
+not shapes invented to match the parser. Both APIs were the reason those two
+checks stayed prose-only, so a hand-written fixture would re-create exactly the
+problem converting them was meant to solve."""
 
 import json
 import os
@@ -53,6 +58,80 @@ def storage_class(name, provisioner="pd.csi.storage.gke.io", params=None):
 
 def node(name, pool):
     return {"kind": "Node", "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": pool}}}
+
+
+def capacity_history(rates, machine_type="n2-standard-8", price=None):
+    """A `gcloud beta compute advice capacity-history` response.
+
+    The frame is verbatim from the live read: a bare object rather than a list,
+    `preemptionRate` as a fraction, and a `listPrice` carrying `nanos` with no
+    `units` — 0.110192 USD/h, which is what a Spot n2-standard-8 in us-east4
+    actually cost that day and is under one currency unit, the case that made
+    reading `units` alone wrong."""
+    return {
+        "location": "https://www.googleapis.com/compute/beta/projects/acme/regions/us-central1",
+        "machineType": machine_type,
+        "preemptionHistory": [
+            {
+                "interval": {"startTime": f"2026-08-{i + 1:02d}T07:00:00Z", "endTime": f"2026-08-{i + 2:02d}T07:00:00Z"},
+                "preemptionRate": rate,
+            }
+            for i, rate in enumerate(rates)
+        ],
+        "priceHistory": [
+            {
+                "interval": {"startTime": "2026-08-24T07:00:00Z", "endTime": "2026-08-29T07:00:00Z"},
+                "listPrice": price if price is not None else {"currencyCode": "USD", "nanos": 110192000},
+            }
+        ],
+    }
+
+
+# The `errorMsg` arm, verbatim from the entry `adam-new-cluster` logged on
+# 2026-08-14 — the affected instance group arrives as a full resource URL in
+# `parameters[0]`, which is why the excerpt reports only its last segment.
+ERROR_MSG_ENTRY = {
+    "timestamp": "2026-08-14T00:05:02.817419660Z",
+    "jsonPayload": {
+        "resultInfo": {
+            "measureTime": "1786665900",
+            "results": [
+                {
+                    "eventId": "63b7917e-ed60-4c15-98d1-0f74797b4c8f",
+                    "errorMsg": {
+                        "messageId": "scale.up.error.out.of.resources",
+                        "parameters": [
+                            "https://www.googleapis.com/compute/v1/projects/acme/zones/"
+                            "us-central1-b/instanceGroups/gk3-prod-usc1-pool-3-b07eba62-grp"
+                        ],
+                    },
+                }
+            ],
+        }
+    },
+}
+
+# The node-auto-provisioning arm. A cluster failing this way never gets as far
+# as a scale-up attempt, so it writes nothing under `resultInfo` at all.
+NAP_ENTRY = {
+    "timestamp": "2026-08-14T01:00:00Z",
+    "jsonPayload": {
+        "noDecisionStatus": {
+            "noScaleUp": {
+                "unhandledPodGroups": [
+                    {
+                        "napFailureReasons": [
+                            {"messageId": "scale.up.error.quota.exceeded", "parameters": ["CPUS"]}
+                        ]
+                    }
+                ]
+            }
+        }
+    },
+}
+
+# A healthy tick. Matched by the SOP's log filter, carries neither arm.
+HEALTHY_ENTRY = {"timestamp": "2026-08-14T02:00:00Z", "jsonPayload": {"status": "ok"}}
 
 
 class EnumerateClustersTest(unittest.TestCase):
@@ -354,6 +433,190 @@ class QuotaTest(unittest.TestCase):
         self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 0, "usage": 0}))
 
 
+class AutoscalerVisibilityTest(unittest.TestCase):
+    def test_the_error_msg_arm_is_read(self):
+        found = fs.autoscaler_message_ids([ERROR_MSG_ENTRY])
+        self.assertEqual(set(found), {"scale.up.error.out.of.resources"})
+        self.assertEqual(found["scale.up.error.out.of.resources"]["count"], 1)
+
+    def test_the_nap_arm_is_read(self):
+        """The SOP's own `--format` reads only this arm. A collector that
+        copied it would pass every cluster that failed under the other one."""
+        found = fs.autoscaler_message_ids([NAP_ENTRY])
+        self.assertEqual(set(found), {"scale.up.error.quota.exceeded"})
+
+    def test_both_arms_in_one_window_are_both_reported(self):
+        found = fs.autoscaler_message_ids([ERROR_MSG_ENTRY, NAP_ENTRY, HEALTHY_ENTRY])
+        self.assertEqual(
+            set(found), {"scale.up.error.out.of.resources", "scale.up.error.quota.exceeded"}
+        )
+
+    def test_a_healthy_tick_is_not_a_finding(self):
+        self.assertEqual(fs.autoscaler_message_ids([HEALTHY_ENTRY]), {})
+
+    def test_an_unrelated_message_id_is_not_a_stockout(self):
+        """`waiting.for.instances.timeout` is an ordinary busy cluster. Matching
+        every id the autoscaler emits would turn the whole fleet critical."""
+        entry = json.loads(json.dumps(ERROR_MSG_ENTRY))
+        entry["jsonPayload"]["resultInfo"]["results"][0]["errorMsg"]["messageId"] = (
+            "scale.up.error.waiting.for.instances.timeout"
+        )
+        self.assertEqual(fs.autoscaler_message_ids([entry]), {})
+
+    def test_an_empty_read_is_not_a_crash(self):
+        self.assertEqual(fs.autoscaler_message_ids(None), {})
+        self.assertEqual(fs.autoscaler_message_ids([]), {})
+
+    def test_repeats_of_one_id_collapse_to_one_finding(self):
+        """A wedged cluster emits the same id every autoscaler tick, and the
+        remediation branches on the id rather than the occurrence."""
+        second = json.loads(json.dumps(ERROR_MSG_ENTRY))
+        second["timestamp"] = "2026-08-14T06:00:00Z"
+        found = fs.autoscaler_message_ids([ERROR_MSG_ENTRY, second])
+        hits = fs.check_autoscaler_out_of_resources(found, "prod-usc1")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("2 occurrences", hits[0]["excerpt"])
+        self.assertIn("2026-08-14T00:05:02 .. 2026-08-14T06:00:00", hits[0]["excerpt"])
+
+    def test_the_excerpt_does_not_claim_a_window_it_did_not_choose(self):
+        """The read's `--freshness` belongs to the caller. Printing it here put
+        "over the last 24h" next to timestamps thirteen days apart."""
+        hits = fs.check_autoscaler_out_of_resources(
+            fs.autoscaler_message_ids([ERROR_MSG_ENTRY]), "prod-usc1"
+        )
+        self.assertNotIn("24h", hits[0]["excerpt"])
+
+    def test_the_excerpt_names_the_instance_group_not_its_url(self):
+        hits = fs.check_autoscaler_out_of_resources(
+            fs.autoscaler_message_ids([ERROR_MSG_ENTRY]), "prod-usc1"
+        )
+        self.assertIn("gk3-prod-usc1-pool-3-b07eba62-grp", hits[0]["excerpt"])
+        self.assertNotIn("googleapis.com", hits[0]["excerpt"])
+        self.assertEqual(hits[0]["object"], "Cluster/prod-usc1")
+
+
+class SpotScarcityTest(unittest.TestCase):
+    SHAPE = {"owners": ["ComputeClass/cc1"], "families": 1}
+
+    def test_the_live_us_east4_response_is_not_a_finding(self):
+        """26 daily intervals averaging 8.4%, which is what a healthy Spot
+        shape looks like. If this ever flags, the ceiling moved."""
+        hit, limitation = fs.check_spot_scarcity(
+            "n2-standard-8", self.SHAPE, "us-east4", capacity_history([0.05, 0.06, 0.04, 0.05, 0.07, 0.09, 0.1, 0.07])
+        )
+        self.assertIsNone(hit)
+        self.assertIsNone(limitation)
+
+    def test_a_shape_over_the_ceiling_with_no_fallback_is_flagged(self):
+        hit, limitation = fs.check_spot_scarcity(
+            "a2-highgpu-1g", self.SHAPE, "us-central1", capacity_history([0.3] * 10)
+        )
+        self.assertIsNone(limitation)
+        self.assertIn("30.0% per day over 10 days", hit["excerpt"])
+        self.assertEqual(hit["object"], "ComputeClass/cc1")
+
+    def test_a_multi_family_chain_over_the_ceiling_is_not_flagged(self):
+        """§3.8's "without alternative family fallbacks" — a chain spanning two
+        families survives its worst shape being preempted."""
+        shape = {"owners": ["ComputeClass/cc1"], "families": 3}
+        hit, limitation = fs.check_spot_scarcity(
+            "a2-highgpu-1g", shape, "us-central1", capacity_history([0.3] * 10)
+        )
+        self.assertIsNone(hit)
+        self.assertIsNone(limitation)
+
+    def test_one_bad_day_inside_a_calm_month_is_not_a_finding(self):
+        """The mean, not the maximum. A 90% afternoon is a zonal incident that
+        already resolved; flagging the peak turns the fleet critical after it."""
+        hit, _ = fs.check_spot_scarcity(
+            "n2-standard-8", self.SHAPE, "us-central1", capacity_history([0.9] + [0.02] * 20)
+        )
+        self.assertIsNone(hit)
+
+    def test_too_short_a_history_is_unmeasured_rather_than_clean(self):
+        hit, limitation = fs.check_spot_scarcity(
+            "n2-standard-8", self.SHAPE, "us-central1", capacity_history([0.01, 0.01])
+        )
+        self.assertIsNone(hit)
+        self.assertIn("2 daily interval", limitation)
+
+    def test_a_response_with_no_history_is_unmeasured_rather_than_clean(self):
+        hit, limitation = fs.check_spot_scarcity("n2-standard-8", self.SHAPE, "us-central1", {})
+        self.assertIsNone(hit)
+        self.assertIn("no preemptionHistory", limitation)
+
+    def test_the_price_below_one_dollar_survives_the_missing_units_field(self):
+        self.assertEqual(fs.spot_list_price(capacity_history([0.3] * 10)), "0.1102 USD")
+
+    def test_a_price_above_one_unit_reads_both_halves(self):
+        advice = capacity_history([0.3] * 10, price={"currencyCode": "USD", "units": "3", "nanos": 500000000})
+        self.assertEqual(fs.spot_list_price(advice), "3.5000 USD")
+
+    def test_no_price_history_is_an_empty_string_not_a_crash(self):
+        self.assertEqual(fs.spot_list_price({"preemptionHistory": []}), "")
+
+
+class SpotShapeEnumerationTest(unittest.TestCase):
+    def test_a_spot_priority_with_a_machine_type_is_a_shape(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        self.assertEqual(set(fs.spot_shapes([cc], [])), {"n2-standard-8"})
+
+    def test_an_on_demand_priority_is_not(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8"}])
+        self.assertEqual(fs.spot_shapes([cc], []), {})
+
+    def test_a_spot_node_pool_is_a_shape_with_no_fallback_by_construction(self):
+        """A node pool has no priority chain at all: when its shape runs out,
+        nothing else is tried."""
+        pools = [{"name": "p1", "config": {"spot": True, "machineType": "c3-standard-4"}}]
+        shapes = fs.spot_shapes([], pools)
+        self.assertEqual(shapes["c3-standard-4"]["families"], 1)
+        self.assertEqual(shapes["c3-standard-4"]["owners"], ["NodePool/p1"])
+
+    def test_the_family_count_spans_the_whole_chain_not_just_its_spot_arm(self):
+        """The on-demand tail is exactly the fallback §3.8 asks about."""
+        cc = compute_class(
+            "cc1",
+            [
+                {"machineType": "a2-highgpu-1g", "spot": True},
+                {"machineType": "n2-standard-8"},
+                {"machineFamily": "c3"},
+            ],
+        )
+        self.assertEqual(fs.spot_shapes([cc], [])["a2-highgpu-1g"]["families"], 3)
+
+    def test_one_shape_requested_twice_is_read_once_and_names_both_owners(self):
+        cc1 = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        cc2 = compute_class("cc2", [{"machineType": "n2-standard-8", "spot": True}])
+        shapes = fs.spot_shapes([cc1, cc2], [])
+        self.assertEqual(list(shapes), ["n2-standard-8"])
+        self.assertEqual(shapes["n2-standard-8"]["owners"], ["ComputeClass/cc1", "ComputeClass/cc2"])
+
+    def test_a_family_only_spot_priority_is_unqueryable_not_absent(self):
+        """`capacity-history --machine-type` is singular and required, so this
+        legal configuration has no shape to ask about. Silence would read as a
+        cluster with no Spot at all."""
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        self.assertEqual(fs.spot_shapes([cc], []), {})
+        self.assertEqual(fs.spot_without_a_shape([cc], []), (["cc1:c3"], []))
+
+    def test_a_priority_with_a_machine_type_is_not_also_reported_unqueryable(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        self.assertEqual(fs.spot_without_a_shape([cc], []), ([], []))
+
+    def test_a_shape_free_spot_priority_is_unpinned_rather_than_unqueryable(self):
+        """GKE's own `autopilot-spot`, which ships on every Autopilot cluster:
+        it pins neither family nor type, so every family is available to it and
+        no shape can be scarce for it. Counting it as an unmeasurable gap put a
+        permanent false coverage gap on every Autopilot cluster in the fleet."""
+        cc = compute_class("autopilot-spot", [{"spot": True}])
+        self.assertEqual(fs.spot_without_a_shape([cc], []), ([], ["ComputeClass/autopilot-spot"]))
+
+    def test_a_spot_pool_with_no_machine_type_is_unqueryable(self):
+        pools = [{"name": "p1", "config": {"spot": True}}]
+        self.assertEqual(fs.spot_without_a_shape([], pools), (["NodePool/p1"], []))
+
+
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
@@ -368,7 +631,20 @@ class CollectClusterTest(unittest.TestCase):
         "message=Autopilot node pools cannot be accessed or modified."
     )
 
-    def run_with(self, dump_items=(), pools=(), cluster=None, pools_rc=0, pools_stderr="denied"):
+    def run_with(
+        self,
+        dump_items=(),
+        pools=(),
+        cluster=None,
+        pools_rc=0,
+        pools_stderr="denied",
+        log_entries=None,
+        log_rc=0,
+        log_stderr="denied",
+        advice=None,
+        advice_rc=0,
+        advice_stderr="denied",
+    ):
         target = cluster or self.CLUSTER
         self.issued = []
 
@@ -384,6 +660,18 @@ class CollectClusterTest(unittest.TestCase):
                 if pools_rc:
                     return run_of(pools_rc, "", pools_stderr)
                 return run_of(0, json.dumps(list(pools)))
+            if argv[:3] == ["gcloud", "logging", "read"]:
+                if log_rc:
+                    return run_of(log_rc, "", log_stderr)
+                # gcloud prints nothing at all when nothing matched, which is
+                # what the bare `run_of(0, "")` below stands in for elsewhere.
+                return run_of(0, json.dumps(log_entries) if log_entries else "")
+            if argv[:5] == ["gcloud", "beta", "compute", "advice", "capacity-history"]:
+                if advice_rc:
+                    return run_of(advice_rc, "", advice_stderr)
+                machine_type = argv[argv.index("--machine-type") + 1]
+                body = advice(machine_type) if callable(advice) else advice
+                return run_of(0, json.dumps(body) if body is not None else "")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
@@ -392,6 +680,9 @@ class CollectClusterTest(unittest.TestCase):
 
     def issued_node_pools_read(self):
         return [a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]]
+
+    def declared_not_applicable(self, entry):
+        return {e["check"] for e in entry.get("checks_not_applicable") or []}
 
     def test_clean_cluster_collects_with_no_candidates(self):
         cc = compute_class("cc1", [{"machineFamily": "n4", "spot": False}, {"machineFamily": "c3", "spot": True}])
@@ -464,7 +755,9 @@ class CollectClusterTest(unittest.TestCase):
         depend on the model rather than on the cluster."""
         entry = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
-        self.assertEqual(set(declared), {"single-zone-nodepool"})
+        # `spot-scarcity-risk` rides along because this fixture's cluster asks
+        # for no Spot capacity at all, which is its own declared non-applicability.
+        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk"})
         self.assertIn("Autopilot", declared["single-zone-nodepool"])
 
     def test_autopilot_never_issues_the_node_pools_read(self):
@@ -476,7 +769,7 @@ class CollectClusterTest(unittest.TestCase):
     def test_a_standard_cluster_still_issues_it_and_declares_nothing(self):
         entry = self.run_with(pools=[{"name": "p1", "locations": ["us-central1-a", "us-central1-b"]}])
         self.assertEqual(len(self.issued_node_pools_read()), 1)
-        self.assertNotIn("checks_not_applicable", entry)
+        self.assertNotIn("single-zone-nodepool", self.declared_not_applicable(entry))
         self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
 
     def test_a_failed_pools_read_says_so_instead_of_dropping_the_check(self):
@@ -486,7 +779,9 @@ class CollectClusterTest(unittest.TestCase):
         explain."""
         entry = self.run_with(pools_rc=1, pools_stderr="PERMISSION_DENIED on container.nodePools.list")
         self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
-        self.assertNotIn("checks_not_applicable", entry)
+        # A read that was refused is a limitation, never a non-applicability:
+        # the check applies, nobody could run it.
+        self.assertNotIn("single-zone-nodepool", self.declared_not_applicable(entry))
         self.assertIn("single-zone-nodepool", entry["limitations"])
         self.assertIn("PERMISSION_DENIED", entry["limitations"])
         self.assertIn("rc=1", entry["limitations"])
@@ -498,6 +793,98 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
         self.assertNotIn("limitations", entry)
         self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
+
+    def issued_advice_reads(self):
+        return [a for a in self.issued if a[:5] == ["gcloud", "beta", "compute", "advice", "capacity-history"]]
+
+    def test_a_clean_autoscaler_window_records_the_read_it_made(self):
+        """"Nothing in 24h" is the answer this check exists to give. Recording
+        nothing for it makes a healthy cluster look unaudited."""
+        entry = self.run_with()
+        self.assertIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["candidates"]})
+
+    def test_a_stockout_in_the_window_is_reported(self):
+        entry = self.run_with(log_entries=[ERROR_MSG_ENTRY, HEALTHY_ENTRY])
+        hits = [c for c in entry["candidates"] if c["check"] == "autoscaler-out-of-resources"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertIn("scale.up.error.out.of.resources", hits[0]["excerpt"])
+
+    def test_a_refused_logging_read_is_a_limitation_not_a_clean_cluster(self):
+        entry = self.run_with(log_rc=1, log_stderr="PERMISSION_DENIED on logging.logEntries.list")
+        self.assertNotIn("autoscaler-out-of-resources", {c["check"] for c in entry["commands"]})
+        self.assertIn("autoscaler-out-of-resources", entry["limitations"])
+        self.assertIn("PERMISSION_DENIED", entry["limitations"])
+
+    def test_no_spot_anywhere_asks_no_capacity_history_and_declares_why(self):
+        entry = self.run_with()
+        self.assertEqual(self.issued_advice_reads(), [])
+        self.assertIn("spot-scarcity-risk", self.declared_not_applicable(entry))
+
+    def test_a_spot_shape_is_read_in_the_cluster_region(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        entry = self.run_with(dump_items=[cc], advice=lambda mt: capacity_history([0.05] * 10, mt))
+        reads = self.issued_advice_reads()
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(reads[0][reads[0].index("--region") + 1], "us-central1")
+        self.assertIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["candidates"]})
+
+    def test_a_zonal_cluster_reads_its_region_not_its_zone(self):
+        """`capacity-history` takes `--region` and rejects a zone."""
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        self.run_with(
+            dump_items=[cc],
+            cluster={**self.CLUSTER, "location": "us-central1-a"},
+            advice=lambda mt: capacity_history([0.05] * 10, mt),
+        )
+        read = self.issued_advice_reads()[0]
+        self.assertEqual(read[read.index("--region") + 1], "us-central1")
+
+    def test_a_scarce_spot_shape_is_reported(self):
+        cc = compute_class("cc1", [{"machineType": "a2-highgpu-1g", "spot": True}])
+        entry = self.run_with(dump_items=[cc], advice=lambda mt: capacity_history([0.4] * 10, mt))
+        hits = [c for c in entry["candidates"] if c["check"] == "spot-scarcity-risk"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_the_shape_ceiling_names_what_it_did_not_read(self):
+        """A collector that quietly stops looking is the failure this whole
+        stream reports on."""
+        many = [{"machineType": f"n2-standard-{n}", "spot": True} for n in (2, 4, 8, 16, 32, 48, 64, 80, 96)]
+        cc = compute_class("cc1", many)
+        entry = self.run_with(dump_items=[cc], advice=lambda mt: capacity_history([0.05] * 10, mt))
+        self.assertEqual(len(self.issued_advice_reads()), fs.SPOT_MAX_SHAPES)
+        self.assertIn("8 of this cluster's 9 distinct Spot machine shapes", entry["limitations"])
+
+    def test_a_refused_advice_read_is_a_limitation_not_a_clean_shape(self):
+        cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
+        entry = self.run_with(dump_items=[cc], advice_rc=1, advice_stderr="API [compute.googleapis.com] not enabled")
+        self.assertNotIn("spot-scarcity-risk", {c["check"] for c in entry["commands"]})
+        self.assertIn("n2-standard-8", entry["limitations"])
+        self.assertIn("not enabled", entry["limitations"])
+
+    def test_a_family_only_spot_chain_is_a_limitation_not_a_non_applicability(self):
+        """The cluster does ask for Spot; the API just cannot be asked about it."""
+        cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        entry = self.run_with(dump_items=[cc])
+        self.assertEqual(self.issued_advice_reads(), [])
+        self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
+        self.assertIn("cc1:c3", entry["limitations"])
+
+    def test_a_shape_free_spot_chain_says_so_rather_than_denying_the_cluster_uses_spot(self):
+        """The live fleet is sixteen Autopilot-flavoured clusters all carrying
+        GKE's `autopilot-spot`, so the wrong reason here is the one an operator
+        reads sixteen times."""
+        cc = compute_class("autopilot-spot", [{"spot": True}])
+        entry = self.run_with(dump_items=[cc])
+        reason = next(
+            e["reason"] for e in entry["checks_not_applicable"] if e["check"] == "spot-scarcity-risk"
+        )
+        self.assertIn("ComputeClass/autopilot-spot", reason)
+        self.assertIn("leaves the machine shape entirely to GKE", reason)
+        self.assertNotIn("limitations", entry)
 
     def test_dangling_reference_reported(self):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "missing"})

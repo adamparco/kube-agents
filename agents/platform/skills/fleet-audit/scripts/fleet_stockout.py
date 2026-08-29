@@ -5,36 +5,52 @@ Prevention & Capacity Audit (`stockout-prevention`).
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §10 phase 4, and
 governance/stockout_prevention_sop.md.
 
-**Partial conversion, deliberately.** This stream's twelve checks split
-into two groups by how confident this collector can be in the field it is
-reading. Ten read structures this repository's other collectors already
-read with confidence — a `ComputeClass`/`Deployment`/`StatefulSet`/
-`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute
-reservations list`, `gcloud compute regions describe --format=json(quotas)`
-— and are converted here: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
+**All twelve checks are converted.** Ten read structures this repository's
+other collectors already read with confidence — a `ComputeClass`/`Deployment`/
+`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`,
+`gcloud compute reservations list`, `gcloud compute regions describe
+--format=json(quotas)`: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
 `ccc-mixed-disk-generations`, `ccc-hyperdisk-incompatible`,
 `quota-exhaustion-risk`, `single-zone-nodepool`, `reservation-mismatch-risk`,
-`dangling-compute-class`. Two do not: `spot-scarcity-risk` reads a beta
-Spot capacity-advice API (`gcloud beta compute advice capacity-history`)
-whose response shape this repository has not exercised anywhere else, and
-`autoscaler-out-of-resources` parses `jsonPayload` fields out of a Cloud
-Logging query against an internal autoscaler-visibility log schema. Neither
-is a case of "closed-form severity rule" (design §2) the way the other ten
-are — encoding an unverified schema as tested code would make a wrong guess
-look like a fact, which is worse than leaving the SOP's own manual
-instructions in place. They stay prose-only until someone can confirm the
-real response shape against a live cluster.
+`dangling-compute-class`.
 
-`dangling-compute-class` (3.12) is one of the ten, but only three of its
-four sub-conditions are covered: (a) a dangling `nodeSelector` reference,
-(c) `nodePoolAutoCreation.enabled: false` with no matching pool label, and
-(d) a GPU workload missing its toleration. 3.12(b) — a ComputeClass whose
-own `status.conditions` reports invalid configuration — is not: this
-repository has not exercised that CRD's condition `type`/`reason` values
-anywhere else, the same reason `spot-scarcity-risk` and
-`autoscaler-out-of-resources` stay prose-only. Check 3.12(b) by hand
-alongside 3.8 and 3.11.
+The other two — `spot-scarcity-risk`, off the beta Spot capacity-advice API
+(`gcloud beta compute advice capacity-history`), and
+`autoscaler-out-of-resources`, off a Cloud Logging query against the
+`cluster-autoscaler-visibility` schema — were prose-only for one reason: this
+repository had not exercised either response shape anywhere else, and encoding
+an unverified schema as tested code makes a wrong guess look like a fact. Both
+shapes were read live against `adamparco-kage` on 2026-08-29 and are now
+pinned by `test_fleet_stockout.py` against captured responses:
+
+- `capacity-history` returns `{location, machineType, preemptionHistory:
+  [{interval: {startTime, endTime}, preemptionRate: <float>}], priceHistory:
+  [{interval, listPrice: {currencyCode, nanos, units?}}]}`. `preemptionRate`
+  is a fraction, one entry per daily interval, 28 of them on a 30-day window.
+  `listPrice.units` is absent below one currency unit, which is why
+  `spot_list_price` reads both halves rather than `units` alone.
+- `cluster-autoscaler-visibility` writes a stockout under *two* schemas, and a
+  filter reading one silently passes a cluster failing under the other.
+  `jsonPayload.resultInfo.results[].errorMsg.{messageId, parameters[]}` is a
+  scale-up that was attempted and failed — the live sample carried
+  `scale.up.error.out.of.resources` with the affected instance group in
+  `parameters[0]`. `jsonPayload.noDecisionStatus.noScaleUp
+  .unhandledPodGroups[].napFailureReasons[].messageId` is the
+  node-auto-provisioning side, which never gets as far as an attempt. Healthy
+  ticks carry neither and write `jsonPayload.status` instead.
+
+Two sub-conditions are still uncovered, both for the reason the two checks
+above used to have — this repository has not exercised the shape anywhere, and
+a guess encoded as tested code looks like a fact. Check both by hand:
+
+- **3.10(b)**, a `ComputeClass` targeting a reservation that does not exist or
+  sits in an unreachable zone. `check_reservation_affinity` covers 3.10(a) and
+  `check_reservation` covers 3.10(c); resolving a named reservation against the
+  zones a cluster can actually reach is the part nothing here does.
+- **3.12(b)**, a ComputeClass whose own `status.conditions` reports invalid
+  configuration. `check_dangling_compute_class` covers 3.12(a), (c) and (d);
+  that CRD's condition `type`/`reason` values are the unexercised shape.
 
 The ComputeClass field names and family-generation lists below (Gen 2 vs
 Gen 4/Hyperdisk-compatible in `ccc-mixed-disk-generations`, the
@@ -68,6 +84,34 @@ GEN2_FAMILIES = {"n2", "n2d", "c2"}
 GEN4_HYPERDISK_FAMILIES = {"c4", "n4", "c3"}  # §3.5's list, exactly -- §3.6 lists a different, wider set for its own check
 HYPERDISK_INCOMPATIBLE_FAMILIES = {"c2", "n2", "e2"}
 HYPERDISK_TYPES = {"hyperdisk-balanced", "hyperdisk-throughput", "hyperdisk-extreme"}
+
+# §3.11. The three message ids that mean a scale-up failed for want of
+# capacity, quota or pod IPs. Every other id the autoscaler emits is a
+# scheduling decision rather than a stockout -- `scale.up.error.waiting.for
+# .instances.timeout` and the `no.scale.up.in.backoff` family are the common
+# ones -- and matching them would turn an ordinary busy cluster critical.
+AUTOSCALER_LOG_ID = "container.googleapis.com/cluster-autoscaler-visibility"
+AUTOSCALER_FRESHNESS = "24h"
+AUTOSCALER_LOG_LIMIT = 1000
+AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
+    "scale.up.error.out.of.resources",
+    "scale.up.error.quota.exceeded",
+    "scale.up.error.ip.space.exhausted",
+}
+
+# §3.8's ">20%", as a fraction, against the mean of the daily preemption
+# rates the API returns.
+SPOT_PREEMPTION_CEILING = 0.20
+# Below this many daily intervals the mean is one bad day wide. A shape with
+# fewer is reported as unmeasured rather than clean: a new machine type in a
+# new region is exactly where a stockout hides, and it is also exactly where
+# the history is too short to prove one.
+SPOT_MIN_INTERVALS = 7
+# Per cluster. A ComputeClass chain can name a dozen shapes and each is its own
+# API round trip; past this the rest are named in `limitations` rather than
+# read, because a collector that quietly stops looking is the failure this
+# whole stream reports on.
+SPOT_MAX_SHAPES = 8
 
 
 def log(msg: str) -> None:
@@ -366,6 +410,234 @@ def check_quota(quota: dict) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
+# §3.8 Spot capacity advice, §3.11 autoscaler visibility
+# --------------------------------------------------------------------------- #
+
+
+def autoscaler_message_ids(entries: object) -> dict[str, dict]:
+    """§3.11's stockout message ids out of a `cluster-autoscaler-visibility` read.
+
+    Both schemas, keyed by id, each carrying how many entries named it, the
+    window it spanned, and whatever `parameters` the autoscaler attached — for
+    `scale.up.error.out.of.resources` that is the instance group it could not
+    grow, which is the one thing a reader needs to act on.
+    """
+    found: dict[str, dict] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("jsonPayload") or {}
+        errors = [
+            result.get("errorMsg") or {}
+            for result in ((payload.get("resultInfo") or {}).get("results") or [])
+            if isinstance(result, dict)
+        ]
+        no_scale_up = (payload.get("noDecisionStatus") or {}).get("noScaleUp") or {}
+        for group in no_scale_up.get("unhandledPodGroups") or []:
+            if isinstance(group, dict):
+                errors += [
+                    reason
+                    for reason in (group.get("napFailureReasons") or [])
+                    if isinstance(reason, dict)
+                ]
+        stamp = str(entry.get("timestamp") or "")
+        for err in errors:
+            message_id = err.get("messageId")
+            if message_id not in AUTOSCALER_STOCKOUT_MESSAGE_IDS:
+                continue
+            slot = found.setdefault(
+                message_id, {"count": 0, "parameters": [], "first_seen": "", "last_seen": ""}
+            )
+            slot["count"] += 1
+            for param in err.get("parameters") or []:
+                if str(param) not in slot["parameters"]:
+                    slot["parameters"].append(str(param))
+            if stamp:
+                slot["first_seen"] = min(slot["first_seen"] or stamp, stamp)
+                slot["last_seen"] = max(slot["last_seen"], stamp)
+    return found
+
+
+def check_autoscaler_out_of_resources(message_ids: dict[str, dict], cluster: str) -> list[dict]:
+    """One finding per distinct message id, not per log entry.
+
+    A cluster wedged against a regional stockout emits the same id every
+    autoscaler tick, and the SOP's remediation branches on the id rather than
+    on the occurrence — three hundred findings saying `out.of.resources` are
+    one problem written three hundred times.
+    """
+    hits = []
+    for message_id in sorted(message_ids):
+        seen = message_ids[message_id]
+        where = (
+            seen["parameters"][0].rsplit("/", 1)[-1]
+            if seen["parameters"]
+            else "no instance group named"
+        )
+        # The window comes from the entries themselves rather than from
+        # `AUTOSCALER_FRESHNESS`: this function does not issue the read and
+        # cannot know what window it asked for, and a hardcoded "over the last
+        # 24h" beside timestamps that say otherwise is worse than no claim.
+        window = (
+            f", {seen['first_seen'][:19]} .. {seen['last_seen'][:19]}"
+            if seen["first_seen"]
+            else ""
+        )
+        hits.append(
+            {
+                "object": f"Cluster/{cluster}",
+                "excerpt": (
+                    f"{message_id}, {seen['count']} occurrence"
+                    f"{'' if seen['count'] == 1 else 's'} in the autoscaler "
+                    f"visibility log{window}; first affected: {where}"
+                ),
+            }
+        )
+    return hits
+
+
+def spot_shapes(compute_classes: list[dict], node_pools: list[dict]) -> dict[str, dict]:
+    """The concrete Spot machine types this cluster asks for, and who asks.
+
+    `capacity-history` takes one `--machine-type` and nothing coarser, so a
+    priority naming only `machineFamily` has no shape to query — those are
+    counted here and reported as unmeasured rather than dropped.
+
+    `families` is what §3.8's "without alternative family fallbacks" tests. A
+    node pool has no fallback chain at all, so it carries 1 by construction:
+    when its shape runs out, nothing else is tried.
+    """
+    shapes: dict[str, dict] = {}
+
+    def add(machine_type: str, owner: str, families: int) -> None:
+        slot = shapes.setdefault(machine_type, {"owners": [], "families": families})
+        if owner not in slot["owners"]:
+            slot["owners"].append(owner)
+        slot["families"] = max(slot["families"], families)
+
+    for cc in compute_classes:
+        priorities = (cc.get("spec") or {}).get("priorities") or []
+        families = len({_priority_family(p) for p in priorities if _priority_family(p)})
+        owner = f"ComputeClass/{cc.get('metadata', {}).get('name', '')}"
+        for priority in priorities:
+            if _priority_is_spot(priority) and priority.get("machineType"):
+                add(str(priority["machineType"]), owner, families)
+    for pool in node_pools:
+        config = pool.get("config") or {}
+        if config.get("spot") and config.get("machineType"):
+            add(str(config["machineType"]), f"NodePool/{pool.get('name', '')}", 1)
+    return shapes
+
+
+def spot_without_a_shape(
+    compute_classes: list[dict], node_pools: list[dict]
+) -> tuple[list[str], list[str]]:
+    """Spot requests `capacity-history` cannot be asked about, split by why.
+
+    `(unqueryable, unpinned)`, and the split is the whole point. A priority
+    naming a machine family but no machine type is a real gap: the shape exists,
+    the API takes one `--machine-type` and has no way to be asked about a
+    family. A priority pinning *neither* — GKE's own `autopilot-spot`, which
+    ships on every Autopilot cluster — has no shape to be scarce, because every
+    family is available to it; §3.8's "without alternative family fallbacks"
+    cannot be true of it by construction.
+
+    One belongs in `limitations` and the other in `checks_not_applicable`, and
+    reporting both as "this cluster does not use Spot" was wrong about both.
+    """
+    unqueryable, unpinned = [], []
+    for cc in compute_classes:
+        name = cc.get("metadata", {}).get("name", "")
+        for priority in (cc.get("spec") or {}).get("priorities") or []:
+            if not _priority_is_spot(priority) or priority.get("machineType"):
+                continue
+            family = _priority_family(priority)
+            bucket, label = (unqueryable, f"{name}:{family}") if family else (unpinned, f"ComputeClass/{name}")
+            if label not in bucket:
+                bucket.append(label)
+    for pool in node_pools:
+        config = pool.get("config") or {}
+        if config.get("spot") and not config.get("machineType"):
+            unqueryable.append(f"NodePool/{pool.get('name', '')}")
+    return unqueryable, unpinned
+
+
+def mean_preemption_rate(advice: object) -> tuple[float | None, int]:
+    """The mean daily preemption rate and how many intervals it averages.
+
+    The mean rather than the maximum, deliberately. §3.8 is about a shape being
+    a bad bet, and one 60% afternoon inside a month of 5% is a zonal incident
+    that already resolved — flagging on the peak turns every shape in the fleet
+    critical after any bad day.
+    """
+    history = (advice or {}).get("preemptionHistory") or [] if isinstance(advice, dict) else []
+    rates = [
+        float(entry["preemptionRate"])
+        for entry in history
+        if isinstance(entry, dict) and isinstance(entry.get("preemptionRate"), (int, float))
+    ]
+    if not rates:
+        return None, 0
+    return sum(rates) / len(rates), len(rates)
+
+
+def spot_list_price(advice: object) -> str:
+    """The most recent list price, as a display string, or `""`.
+
+    `units` is absent below one currency unit and `nanos` is absent above a
+    whole one, so both halves are read. Context for the excerpt only — no
+    check branches on it.
+    """
+    history = (advice or {}).get("priceHistory") or [] if isinstance(advice, dict) else []
+    prices = [entry for entry in history if isinstance(entry, dict) and entry.get("listPrice")]
+    if not prices:
+        return ""
+    price = prices[-1]["listPrice"]
+    amount = float(price.get("units") or 0) + float(price.get("nanos") or 0) / 1e9
+    return f"{amount:.4f} {price.get('currencyCode') or ''}".strip()
+
+
+def check_spot_scarcity(
+    machine_type: str, shape: dict, region: str, advice: object
+) -> tuple[dict | None, str | None]:
+    """§3.8 for one shape: `(finding, limitation)`, at most one of them set.
+
+    The SOP's two halves are both required — a preemption rate above the
+    ceiling *and* no alternative family to fall back to. A chain that already
+    spans two families survives its worst shape being preempted, which is
+    exactly what "Do NOT flag: comprehensive multi-family fallbacks" means.
+    """
+    rate, intervals = mean_preemption_rate(advice)
+    owners = ", ".join(shape["owners"])
+    if rate is None:
+        return None, (
+            f"spot-scarcity-risk could not be measured for {machine_type} in "
+            f"{region}: capacity-history returned no preemptionHistory "
+            f"(requested by {owners})"
+        )
+    if intervals < SPOT_MIN_INTERVALS:
+        return None, (
+            f"spot-scarcity-risk for {machine_type} in {region} rests on "
+            f"{intervals} daily interval(s), under the {SPOT_MIN_INTERVALS} this "
+            f"check needs to mean anything (requested by {owners})"
+        )
+    if rate <= SPOT_PREEMPTION_CEILING or shape["families"] >= 2:
+        return None, None
+    price = spot_list_price(advice)
+    return {
+        "object": owners.split(", ")[0],
+        "excerpt": (
+            f"Spot {machine_type} in {region} preempted at a mean "
+            f"{rate * 100:.1f}% per day over {intervals} days (ceiling "
+            f"{SPOT_PREEMPTION_CEILING * 100:.0f}%), and the requesting chain "
+            f"names {shape['families']} machine famil"
+            f"{'y' if shape['families'] == 1 else 'ies'} — no alternative to fall "
+            f"back to" + (f"; list price {price}/h" if price else "")
+        ),
+    }, None
+
+
+# --------------------------------------------------------------------------- #
 # Assembly
 # --------------------------------------------------------------------------- #
 
@@ -380,6 +652,8 @@ IMPACT = {
     "single-zone-nodepool": "Node pool is locked to a single zone or near its scaling ceiling: any zonal stockout or scale event halts cluster auto-scaling.",
     "reservation-mismatch-risk": "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts.",
     "dangling-compute-class": "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state.",
+    "spot-scarcity-risk": "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk.",
+    "autoscaler-out-of-resources": "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion.",
 }
 SEVERITY = {
     "ccc-missing-fallbacks": "critical",
@@ -392,6 +666,8 @@ SEVERITY = {
     "single-zone-nodepool": "major",
     "reservation-mismatch-risk": "major",  # overridden to critical for a broken/bypassed binding
     "dangling-compute-class": "critical",
+    "spot-scarcity-risk": "major",
+    "autoscaler-out-of-resources": "critical",
 }
 
 
@@ -586,6 +862,96 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"{pools_result.stderr.strip()[:200] or 'no stderr'}. The same failure "
             f"left dangling-compute-class without node pool labels, so its "
             f"nodePoolAutoCreation arm did not run either"
+        )
+
+    # §3.11. One read per cluster, and it is recorded whether or not it found
+    # anything: "the autoscaler logged no stockout in 24h" is the answer this
+    # check exists to give, and a clean cluster that never records the read is
+    # indistinguishable from one nobody looked at.
+    logging_argv = [
+        "gcloud", "logging", "read",
+        f'log_id("{AUTOSCALER_LOG_ID}") AND resource.labels.cluster_name="{name}" '
+        f"AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)",
+        "--project", project, "--freshness", AUTOSCALER_FRESHNESS,
+        "--limit", str(AUTOSCALER_LOG_LIMIT), "--format", "json",
+    ]
+    entries, logging_result = run_and_gate(logging_argv, run=run)
+    if logging_result.rc == 0:
+        commands["autoscaler-out-of-resources"] = _record(" ".join(logging_argv), logging_result)
+        # `entries` is None for an empty result set as well as for unparseable
+        # output, because gcloud prints nothing at all when nothing matched.
+        # rc == 0 already told us the read succeeded, so an empty window is a
+        # clean cluster rather than a gap.
+        for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries), name):
+            candidates.append(_emit("autoscaler-out-of-resources", hit))
+    else:
+        limitations.append(
+            f"autoscaler-out-of-resources could not be measured on this cluster: "
+            f"`gcloud logging read` failed (rc={logging_result.rc}) — "
+            f"{logging_result.stderr.strip()[:200] or 'no stderr'}"
+        )
+
+    # §3.8. `capacity-history` takes one machine type per call, so the cost is
+    # one read per distinct Spot shape rather than one per cluster. Ordered so
+    # the ceiling, when it bites, drops the same shapes on every run instead of
+    # whichever ones a dict happened to yield first.
+    shapes = spot_shapes(compute_classes, node_pools if pools_readable else [])
+    region = region_of(location)
+    for machine_type in sorted(shapes)[:SPOT_MAX_SHAPES]:
+        advice_argv = [
+            "gcloud", "beta", "compute", "advice", "capacity-history",
+            "--region", region, "--machine-type", machine_type,
+            "--provisioning-model", "SPOT", "--types", "PREEMPTION,PRICE",
+            "--project", project, "--format", "json",
+        ]
+        advice, advice_result = run_and_gate(advice_argv, run=run)
+        if advice_result.rc != 0:
+            limitations.append(
+                f"spot-scarcity-risk could not be measured for {machine_type} in "
+                f"{region}: `gcloud beta compute advice capacity-history` failed "
+                f"(rc={advice_result.rc}) — {advice_result.stderr.strip()[:200] or 'no stderr'}"
+            )
+            continue
+        commands["spot-scarcity-risk"] = _record(" ".join(advice_argv), advice_result)
+        # A list of one, on every response seen so far. Unwrapped here rather
+        # than in the helpers so they take the shape the API documents.
+        first = advice[0] if isinstance(advice, list) and advice else advice
+        hit, limitation = check_spot_scarcity(machine_type, shapes[machine_type], region, first)
+        if hit:
+            candidates.append(_emit("spot-scarcity-risk", hit))
+        if limitation:
+            limitations.append(limitation)
+    if len(shapes) > SPOT_MAX_SHAPES:
+        limitations.append(
+            f"spot-scarcity-risk read {SPOT_MAX_SHAPES} of this cluster's "
+            f"{len(shapes)} distinct Spot machine shapes; the rest were not "
+            f"measured: {', '.join(sorted(shapes)[SPOT_MAX_SHAPES:])}"
+        )
+    unqueryable, unpinned = spot_without_a_shape(compute_classes, node_pools if pools_readable else [])
+    if unqueryable:
+        limitations.append(
+            f"spot-scarcity-risk could not be measured for Spot requests that "
+            f"name no machine type, which `capacity-history` has no way to "
+            f"query: {', '.join(unqueryable)}"
+        )
+    elif not shapes:
+        # No command to record, so §6 would otherwise read the missing record as
+        # a check nobody ran. Declared not-applicable for the same reason the
+        # Autopilot branch above declares one: it is a fact already in hand.
+        not_applicable.append(
+            {
+                "check": "spot-scarcity-risk",
+                "reason": (
+                    f"Every Spot request on this cluster leaves the machine shape "
+                    f"entirely to GKE ({', '.join(unpinned)}), so no shape can be "
+                    f"scarce for it — every family is available to it, which is "
+                    f"what this check tests for."
+                    if unpinned
+                    else "No ComputeClass priority or node pool on this cluster "
+                    "requests Spot capacity, so there is no Spot machine shape "
+                    "to ask `capacity-history` about."
+                ),
+            }
         )
 
     entry = {

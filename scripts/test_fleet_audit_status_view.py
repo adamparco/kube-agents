@@ -233,12 +233,18 @@ class TestFlags(unittest.TestCase):
 class TestRender(unittest.TestCase):
     ROSTER = {"compliance-audit": {"enabled": True, "expr": "20 6 * * *"}}
 
+    # Absolute, because `short_path` resolves a relative one against the
+    # working directory: passing a bare "jobs.json" made the rendered header
+    # depend on where the suite was started from, so this file passed on its
+    # own and failed under `make test-python`.
+    ROSTER_PATH = str(view.REPO_ROOT / "scripts" / "jobs.json")
+
     def render(self, streams, roster=None, root_exists=True, **kwargs):
         return view.render(
             projection(streams, root_exists=root_exists),
             self.ROSTER if roster is None else roster,
             NOW,
-            "jobs.json",
+            self.ROSTER_PATH,
             "ns/agent-0 [platform-agent]",
             **kwargs,
         )
@@ -262,7 +268,9 @@ class TestRender(unittest.TestCase):
         out = self.render({})
         self.assertIn("/opt/data/fleet-audit/reports", out)
         self.assertIn("ns/agent-0 [platform-agent]", out)
-        self.assertRegex(out, r"roster\s+jobs\.json")
+        # Shortened to repo-relative: the real default is an absolute path
+        # eighty characters long on a worktree checkout.
+        self.assertRegex(out, r"roster\s+scripts/jobs\.json")
 
     def test_a_rostered_stream_with_no_files_reads_never_ran(self):
         out = self.render({})
@@ -417,7 +425,7 @@ class TestDashboard(unittest.TestCase):
             projection(streams),
             self.ROSTER if roster is None else roster,
             NOW,
-            "jobs.json",
+            str(view.REPO_ROOT / "scripts" / "jobs.json"),
             "src",
             **kwargs,
         )
