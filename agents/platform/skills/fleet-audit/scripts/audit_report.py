@@ -2713,6 +2713,20 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
     partially converted to a collector, or a manifest built for a narrower
     scope) — `coverage_gaps` and the ordinary roster checks already govern
     clusters the manifest says nothing about.
+
+    The reverse is not silent, and that asymmetry is the point. Everything
+    above reads the document and asks the manifest to confirm it, which cannot
+    see a cluster the document simply left out. On 2026-08-29 the
+    security-patch collector read all four clusters and recorded nine
+    successful checks against each; the findings document named one, and this
+    function had nothing to say about the other three. `finish` published "0
+    findings across 1 audited cluster(s)", declared the run CLEAN, and closed
+    the ledger — a full-fleet all-clear off a quarter of the fleet, with no gap
+    reported anywhere, because a cluster that is absent has no `checks_run` to
+    contradict. So a `collected` cluster missing from `scope.clusters` is a
+    rejection rather than a coverage gap: the collector already proved the
+    cluster readable, so its absence is a defect in the document and not a
+    condition of the fleet, and a gap would still let the run publish.
     """
     audit_id = str(data.get("audit") or "")
     manifest_clusters = {
@@ -2720,6 +2734,25 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
         for c in (manifest.get("clusters") or [])
         if isinstance(c, dict) and c.get("name")
     }
+    documented = {
+        str(c.get("name", ""))
+        for c in data.get("scope", {}).get("clusters") or []
+        if isinstance(c, dict)
+    }
+    missing = sorted(
+        name
+        for name, c in manifest_clusters.items()
+        if c.get("outcome") == "collected" and name not in documented
+    )
+    if missing:
+        raise ValidationError(
+            f"scope.clusters omits {', '.join(repr(n) for n in missing)}, which the "
+            f"collect.py manifest for {audit_id} marks 'collected'. Every cluster the "
+            "collector read must appear in the document — a run that drops one "
+            "publishes as an all-clear over a fleet it did not report on. Add the "
+            "cluster with its checks_run, or re-run collect.py if the manifest is "
+            "from a different scope."
+        )
     for cluster in data.get("scope", {}).get("clusters") or []:
         name = str(cluster.get("name", ""))
         manifest_cluster = manifest_clusters.get(name)
@@ -2739,6 +2772,24 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                     "collected cluster's checks_run must match the manifest that "
                     "collected it — see collect.py's manifest and "
                     "cross_check_manifest."
+                )
+        # `checks_not_applicable` is the one field in the document whose
+        # contents nothing else can contradict: it is free text, it leaves the
+        # coverage denominator, and a check moved into it turns a partial run
+        # into a clean one. Watching the security-patch stream walk the three
+        # states in twenty minutes -- name the check and be rejected, drop it
+        # and go partial, declare it inapplicable and go clean -- is watching
+        # the only door that opens. Nothing here reads the reason, but for a
+        # check the collector ran at rc == 0 the reason cannot be true whatever
+        # it says: the run is the proof the cluster's shape permits it.
+        for slug in checks_na(cluster):
+            if slug in ok_checks:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_not_applicable names {slug!r}, "
+                    f"but the collect.py manifest for {audit_id} records a successful "
+                    f"command for that check against {name!r}. A check the collector "
+                    "ran is not one the cluster's shape forbids — put it in "
+                    "checks_run, or leave it out and let the run report the gap."
                 )
 
 

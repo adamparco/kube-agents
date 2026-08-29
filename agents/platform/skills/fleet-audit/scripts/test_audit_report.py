@@ -6299,13 +6299,81 @@ class TestCrossCheckManifest(unittest.TestCase):
 
     def test_a_cluster_absent_from_the_manifest_is_ignored(self):
         # A stream only partially covered, or a manifest scoped narrower than
-        # the findings document -- not this function's concern.
+        # the findings document -- not this function's concern. The manifest's
+        # own cluster stays in the document, so this isolates the extra one
+        # rather than also tripping the omitted-cluster rule below.
         doc = self.doc(["no-requests"])
-        doc["scope"]["clusters"][0]["name"] = "some-other-cluster"
+        doc["scope"]["clusters"].append(
+            {"name": "some-other-cluster", "checks_run": [{"check": "no-pdb", "command": "x"}]}
+        )
         audit_report.cross_check_manifest(doc, self.manifest())
 
     def test_an_empty_manifest_cross_checks_nothing(self):
         audit_report.cross_check_manifest(self.doc(["no-requests"]), {"clusters": []})
+
+    def test_a_collected_cluster_the_document_omits_is_rejected(self):
+        """The direction the cross-check could not see, and the one that published.
+
+        On 2026-08-29 the security-patch collector read all four clusters and
+        recorded nine successful checks against each. The findings document
+        named one. Every rule above reads the document and asks the manifest to
+        confirm it, so the three absent clusters contradicted nothing, and
+        `finish` published "0 findings across 1 audited cluster(s)", called the
+        run CLEAN, and closed the ledger -- a full-fleet all-clear over a
+        quarter of the fleet, with no coverage gap reported anywhere.
+        """
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": "collected", "commands": [{"check": "no-requests", "rc": 0}]},
+            ]
+        }
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("prod-eu-west", str(ctx.exception))
+        self.assertNotIn("prod-us-east", str(ctx.exception))
+
+    def test_a_cluster_the_collector_could_not_read_may_be_omitted(self):
+        # `unreachable` and `gate-failed` are fleet conditions the ordinary
+        # roster and coverage rules already govern; only `collected` is proof
+        # the document had something to report.
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                manifest = {
+                    "clusters": [
+                        self.manifest()["clusters"][0],
+                        {"name": "prod-eu-west", "outcome": outcome, "commands": []},
+                    ]
+                }
+                audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+
+    def test_a_check_the_collector_ran_cannot_be_declared_inapplicable(self):
+        """The one field nothing else contradicts.
+
+        `checks_not_applicable` is free text, it leaves the coverage
+        denominator, and a check moved into it turns a partial run clean. The
+        security-patch stream walked all three states in twenty minutes: named
+        the check and was rejected, dropped it and went partial, declared it
+        inapplicable with a hand-written reason and went clean. For a check the
+        collector ran at rc == 0 the reason cannot be true whatever it says.
+        """
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [
+            {"check": "no-memory-limit", "reason": "not meaningful on this cluster"}
+        ]
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, self.manifest())
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("checks_not_applicable", str(ctx.exception))
+
+    def test_a_check_the_collector_did_not_run_may_still_be_inapplicable(self):
+        # Autopilot node-pool checks are the standing case: the collector never
+        # issues them, and the cluster's shape really does forbid them.
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [
+            {"check": "no-pdb", "reason": "Autopilot cluster; Google owns the node pools"}
+        ]
+        audit_report.cross_check_manifest(doc, self.manifest())
 
 
 class TestFinishManifestFlag(HarnessTestCase):
@@ -10198,6 +10266,40 @@ class TestDispatchAndHandover(unittest.TestCase):
         for doc in docs:
             with self.subTest(doc=doc):
                 self.assertEqual([], pattern.findall(self.read(doc)))
+
+    def test_every_sop_passes_the_manifest_to_finish(self):
+        """`--manifest-file` is optional to the parser and mandatory in practice.
+
+        Every cross-check `cross_check_manifest` performs -- a fabricated
+        `checks_run` entry, a cluster the collector read and the document
+        dropped, a check declared inapplicable that the collector ran -- is
+        reachable only through this flag, and omitting it is silent: `finish`
+        publishes, and nothing in the output says the run went unverified. The
+        SOP text is what actually requires it, so this test is what keeps the
+        SOP text honest. Every stream has a collector
+        (test_cron_prompts_name_the_real_collector_invocation re-derives the
+        invocation from each SOP), so there is no stream for which the flag is
+        genuinely optional.
+        """
+        for audit_id in audit_report.AUDITS:
+            doc = f"governance/{audit_report.audit_sop(audit_id)}"
+            with self.subTest(audit=audit_id):
+                text = self.read(doc)
+                index = text.find(f"audit_report.py finish --audit {audit_id}")
+                self.assertNotEqual(index, -1, f"{doc} documents no `finish` invocation")
+                # Most SOPs wrap the invocation across backslash-continued
+                # lines; take the whole command, not its first line.
+                command = ""
+                for line in text[index:].splitlines():
+                    command += line
+                    if not line.rstrip().endswith("\\"):
+                        break
+                self.assertIn(
+                    "--manifest-file",
+                    command,
+                    f"{doc}'s `finish` invocation omits --manifest-file, which "
+                    "turns every manifest cross-check off without saying so",
+                )
 
 
 if __name__ == "__main__":
