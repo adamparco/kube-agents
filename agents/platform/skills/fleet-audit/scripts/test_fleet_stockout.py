@@ -212,6 +212,31 @@ class CccMissingFallbacksTest(unittest.TestCase):
     def test_no_priorities_is_not_a_crash(self):
         self.assertIsNone(fs.check_ccc_missing_fallbacks(compute_class("cc1", [])))
 
+    def test_does_not_flag_a_pod_family_chain(self):
+        """GKE's built-in `autopilot`, verbatim: one priority, no machine family.
+
+        It pins nothing -- GKE picks the shape -- but `_priority_family` cannot
+        read `podFamily`, so `families` used to come back empty and the empty set
+        scored 0/4 varied, the same as a chain genuinely pinned to one family.
+        """
+        cc = compute_class("cc1", [{"podFamily": "general-purpose"}])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
+
+    def test_does_not_flag_a_spot_pod_family_chain(self):
+        """`autopilot-spot`. §3.2 is what has something to say about the Spot-ness."""
+        cc = compute_class("cc1", [{"podFamily": "general-purpose", "spot": True}])
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
+
+    def test_still_flags_a_chain_that_only_partly_delegates(self):
+        """A mixed chain was hand-authored and its machine-typed entry is a real pin."""
+        cc = compute_class("cc1", [{"podFamily": "general-purpose"}, {"machineFamily": "c3"}])
+        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc))
+
+    def test_a_pod_family_naming_a_machine_type_is_still_a_pin(self):
+        """`podFamily` alongside an explicit shape delegates nothing."""
+        cc = compute_class("cc1", [{"podFamily": "general-purpose", "machineType": "c3-standard-4"}])
+        self.assertIsNotNone(fs.check_ccc_missing_fallbacks(cc))
+
 
 class CccNoOndemandFloorTest(unittest.TestCase):
     def test_flags_all_spot(self):

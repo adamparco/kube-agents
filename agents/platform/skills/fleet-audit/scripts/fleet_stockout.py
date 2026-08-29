@@ -256,9 +256,40 @@ def _priority_size_class(p: dict) -> str:
     return m.group(1) if m else ""
 
 
+def _priority_is_pod_family(p: dict) -> bool:
+    """Does this priority delegate the machine shape to GKE rather than name one?
+
+    An Autopilot-mode ComputeClass (`spec.autopilot.enabled`) writes its chain as
+    `podFamily: general-purpose` instead of a `machineFamily`/`machineType`. GKE's
+    own capacity broker then chooses the shape at scale-up time, across families
+    and zones.
+    """
+    return bool(p.get("podFamily")) and not p.get("machineFamily") and not p.get("machineType")
+
+
 def check_ccc_missing_fallbacks(cc: dict) -> dict | None:
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities:
+        return None
+    # §3.1 flags a chain "pinned to a single machine family". A pod-family
+    # priority is pinned to no machine family at all -- it hands the choice to
+    # GKE, which is the broadest fallback the API can express, so there is
+    # nothing here to flag.
+    #
+    # Scoring the dimensions anyway is what made this the fleet's loudest false
+    # positive. `_priority_family` reads only `machineFamily`/`machineType`, so
+    # every pod-family entry returned "", `families` came back *empty*, and an
+    # unreadable chain scored the same 0/4 as a genuinely pinned one. That fired
+    # `critical` against `autopilot`, `autopilot-arm` and `autopilot-spot` -- the
+    # classes GKE pre-installs and reconciles on every Autopilot cluster -- so
+    # each cluster contributed three findings whose own remediation had to
+    # conclude `kind: manual`, because a GKE-managed object has no manifest in
+    # the GitOps clone to write to. 49 of one run's 67 findings were this.
+    #
+    # `all()`, not `any()`: a chain mixing pod-family and machine-typed entries
+    # was hand-authored, its machine-typed entries are real pins, and a finding
+    # against it is something an operator can act on.
+    if all(_priority_is_pod_family(p) for p in priorities):
         return None
     families = {_priority_family(p) for p in priorities if _priority_family(p)}
     spots = {_priority_is_spot(p) for p in priorities}

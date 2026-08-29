@@ -110,7 +110,7 @@ This covers all twelve checks below — the ten built on a `ComputeClass`/`Deplo
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count).
-- **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); standard exclusions.
+- **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); ComputeClasses whose every priority names a `podFamily` rather than a `machineFamily`/`machineType`, which pins no machine family at all and leaves the shape to GKE's capacity broker — this is what the built-in Autopilot classes (`autopilot`, `autopilot-arm`, `autopilot-spot`) do, and they are GKE-managed besides, so a finding against one has no manifest to remediate; standard exclusions.
 - **Severity:** `critical`. When GCE encounters a zonal shortage or stockout on that machine family, Cluster Autoscaler has no fallback path and scale-up fails completely.
 - **Impact:** "Pinned to a single machine family or narrow configuration: any zonal capacity exhaustion causes scale-up to fail and leaves pods unschedulable."
 - **Remediation:** `kind: manifest`. Add multi-zone distribution and secondary fallback machine families (e.g., fallback from `c3` to `n4` and `n2`) to the ComputeClass manifest in GitOps.
