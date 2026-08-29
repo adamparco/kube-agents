@@ -82,12 +82,32 @@ class AuditSpec(NamedTuple):
     ledger open forever. `fleet-consistency-drift`'s split-cluster guard is the
     standing example: it fires when a cluster is an outlier on six or more
     facets, which is not something you can run against a cluster in isolation.
+
+    `scopes` partitions the roster by the *kind* of target a check runs against,
+    for the streams whose SOPs enumerate more than clusters. Three SOPs do: a
+    `project/<id>` entry carries the checks that read project-level GCP objects,
+    and networking additionally gives every subnet its own entry. Without the
+    partition the denominator is the whole roster for every target, so a project
+    entry is charged with the ten cluster checks it was never meant to run and
+    each cluster is charged with the project ones — `stockout-prevention`
+    reported "10 of 12 applicable checks did not run" against a target that ran
+    both of its two, on every run, and stayed `partial` forever on the strength
+    of it. A slug may appear under two kinds when the SOP defines a form of the
+    check for each, as `reservation-mismatch-risk` does. Streams that leave this
+    empty measure every target against the whole roster, which is what every
+    stream did before the partition existed.
+
+    `test_scopes_partition_the_roster` asserts the union across kinds is exactly
+    `checks`, so a check added to a partitioned stream cannot land in the roster
+    without an owning target kind — it would otherwise be a check the harness
+    silently stops requiring of anyone.
     """
 
     title: str
     sop: str
     checks: tuple[str, ...]
     derived: tuple[str, ...] = ()
+    scopes: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
@@ -163,6 +183,24 @@ AUDITS: dict[str, AuditSpec] = {
             "terminal-pods",
             "idle-namespace",
         ),
+        # §3.4–3.6 read Compute Engine objects that belong to a project, not to
+        # a cluster; the SOP's §3 project-scoped rule puts them on their own
+        # `project/<id>` entry.
+        scopes=(
+            (
+                "cluster",
+                (
+                    "overrequest",
+                    "orphan-pv",
+                    "unconsumed-pvc",
+                    "idle-nodepool",
+                    "scaledown-blocked",
+                    "terminal-pods",
+                    "idle-namespace",
+                ),
+            ),
+            ("project", ("unattached-disk", "idle-address", "orphan-lb")),
+        ),
     ),
     "fleet-consistency-drift": AuditSpec(
         "Fleet Consistency Drift Audit",
@@ -223,6 +261,29 @@ AUDITS: dict[str, AuditSpec] = {
             "autoscaler-out-of-resources",
             "dangling-compute-class",
         ),
+        # §4's manifest note: the `project/<id>` entry carries the two
+        # project-scoped checks. `reservation-mismatch-risk` sits under both
+        # kinds because the SOP gives it a cluster form and a project
+        # idle-capacity form.
+        scopes=(
+            (
+                "cluster",
+                (
+                    "ccc-missing-fallbacks",
+                    "ccc-no-ondemand-floor",
+                    "ccc-large-vm-scarcity",
+                    "ccc-priority-starvation",
+                    "ccc-mixed-disk-generations",
+                    "ccc-hyperdisk-incompatible",
+                    "spot-scarcity-risk",
+                    "single-zone-nodepool",
+                    "reservation-mismatch-risk",
+                    "autoscaler-out-of-resources",
+                    "dangling-compute-class",
+                ),
+            ),
+            ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
+        ),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
         "GCP Networking Fabric & VPC IPAM Audit",
@@ -233,6 +294,21 @@ AUDITS: dict[str, AuditSpec] = {
             "psc-routing-deadlock",
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
+        ),
+        # §2's target rule: one entry per subnet for the IPAM check, one
+        # `project/<id>` entry for the other four. This stream enumerates no
+        # clusters at all.
+        scopes=(
+            ("subnet", ("subnet-ip-exhaustion",)),
+            (
+                "project",
+                (
+                    "cloud-nat-exhaustion",
+                    "psc-routing-deadlock",
+                    "mtu-packet-fragmentation",
+                    "cloud-armor-false-positive",
+                ),
+            ),
         ),
     ),
 }
@@ -896,6 +972,40 @@ def audit_checks(audit_id: str) -> tuple[str, ...]:
     """
     spec = AUDITS.get(audit_id)
     return spec.checks if spec else ()
+
+
+def target_kind(name: str) -> str:
+    """Which kind of thing a `scope.clusters` entry names.
+
+    The SOPs already encode this in the name they ask for, so nothing new has to
+    be carried per entry: `project/<id>` is the project-scoped entry, a name with
+    a `/` in it is one of networking's `<project>/<region>/<subnet>` targets, and
+    a bare name is a cluster.
+    """
+    if name.startswith("project/"):
+        return "project"
+    return "subnet" if "/" in name else "cluster"
+
+
+def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
+    """The roster subset `target_name` is answerable for.
+
+    The whole roster for an unpartitioned stream, and for a target whose kind a
+    partitioned stream does not declare. That second case is deliberate: an
+    unexpected target reads as answerable for everything and so shows up as a
+    coverage gap, which is the loud failure. Narrowing it to nothing would
+    excuse the target from the audit and report the result as complete.
+    """
+    spec = AUDITS.get(audit_id)
+    if not spec:
+        return ()
+    if not spec.scopes:
+        return spec.checks
+    kind = target_kind(str(target_name).strip())
+    for declared, checks in spec.scopes:
+        if declared == kind:
+            return checks
+    return spec.checks
 
 
 def audit_finding_checks(audit_id: str) -> frozenset[str]:
@@ -2472,9 +2582,12 @@ def coverage_gaps(data: dict) -> list[str]:
     the roster for that cluster rather than counting as unread. Without that,
     "this check cannot exist here" and "nobody looked" were the same state, and
     two Autopilot clusters were enough to keep a stream partial in perpetuity.
+
+    The roster is per target, not per stream, because three SOPs enumerate
+    project and subnet entries alongside clusters — see `AuditSpec.scopes`.
     """
     scope = data.get("scope") or {}
-    roster = audit_checks(str(data.get("audit") or ""))
+    audit_id = str(data.get("audit") or "")
     gaps: list[str] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
@@ -2486,13 +2599,14 @@ def coverage_gaps(data: dict) -> list[str]:
         gaps.append(f"{cluster}: not audited — {reason}")
     for cluster in scope.get("clusters") or []:
         limitation = redact_secrets(cluster.get("limitations", "")).strip()
+        name = str(cluster.get("name", "")).strip() or "(unnamed)"
         ran = set(checks_ran(cluster))
         na = set(checks_na(cluster))
+        roster = audit_target_checks(audit_id, name)
         applicable = [check for check in roster if check not in na]
         missing = [check for check in applicable if check not in ran]
         if not limitation and not missing:
             continue
-        name = str(cluster.get("name", "")).strip() or "(unnamed)"
         # One line per cluster, not one per gap: the same cluster explaining
         # itself twice reads as two broken clusters in the ledger comment.
         reasons: list[str] = []
@@ -2504,6 +2618,37 @@ def coverage_gaps(data: dict) -> list[str]:
         if limitation:
             reasons.append(limitation)
         gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
+    gaps.extend(_unenumerated_kind_gaps(audit_id, scope.get("clusters") or []))
+    return gaps
+
+
+def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
+    """A target kind the run enumerated none of, and the checks it stranded.
+
+    Scoping the denominator per target (`AuditSpec.scopes`) opens a hole that
+    the whole-roster denominator did not have: a check owed only by subnets is
+    owed by nobody in a run that produced no subnet entries, so it drops out of
+    every count and the report reads as complete without it having run anywhere.
+    A live `gcp-networking-fabric-audit` run did exactly this — one
+    `project/<id>` entry, no subnets, and `subnet-ip-exhaustion` unperformed
+    against a fleet of 42 subnets.
+
+    An empty `scope.clusters` is left alone. That run has bigger problems and
+    `validate_findings` already speaks to them; naming every kind here as well
+    would bury the real error under a gap per kind.
+    """
+    spec = AUDITS.get(audit_id)
+    if not spec or not spec.scopes or not targets:
+        return []
+    seen = {target_kind(str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
+    gaps = []
+    for kind, checks in spec.scopes:
+        if kind in seen:
+            continue
+        gaps.append(
+            f"no {kind} targets were audited — {len(checks)} check(s) ran "
+            f"against nothing ({', '.join(checks)})"
+        )
     return gaps
 
 
@@ -3974,14 +4119,18 @@ def _render_scope(
             f"| `{_cell(cluster.get('project', ''))}` "
         )
         if roster:
+            # Per target, not per stream: a `project/<id>` row is answerable for
+            # the project-scoped checks alone, and rating it against the whole
+            # roster printed "2/12 ⚠" beside a row that ran everything it owed.
+            owed = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
             ran = set(checks_ran(cluster))
-            na = set(checks_na(cluster)) & set(roster)
+            na = set(checks_na(cluster)) & owed
             # The denominator is what *could* have run here, so the ⚠ means
             # "unread", not "inapplicable". The n/a count stays visible beside
             # it: a cluster excusing itself from half the roster is something a
             # reader should see, even when its coverage is technically complete.
-            applicable = len(roster) - len(na)
-            complete = len(ran & set(roster))
+            applicable = len(owed) - len(na)
+            complete = len(ran & owed)
             flag = "" if complete >= applicable else " ⚠"
             note = f" ({len(na)} n/a)" if na else ""
             row += f"| {complete}/{applicable}{note}{flag} "

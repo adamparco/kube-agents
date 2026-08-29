@@ -1960,6 +1960,53 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{sop.name}. The SOP defines {found}",
                 )
 
+    def test_scopes_partition_the_roster(self):
+        """Every check a partitioned stream defines is owed by some target kind.
+
+        The union has to be exactly `checks`. A slug in the roster and in no
+        kind is owed by nobody: it would drop out of every denominator and the
+        stream would report full coverage without it ever running — the same
+        silent hole `checks` itself exists to close, reintroduced one level
+        down. A slug in a kind and not the roster is a typo that would quietly
+        widen that kind's denominator by a check no SOP defines.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            if not spec.scopes:
+                continue
+            with self.subTest(audit=audit_id):
+                kinds = [kind for kind, _ in spec.scopes]
+                self.assertEqual(
+                    sorted(kinds),
+                    sorted(set(kinds)),
+                    f"{audit_id} declares a target kind twice: {kinds}",
+                )
+                owned: set[str] = set()
+                for kind, checks in spec.scopes:
+                    self.assertTrue(checks, f"{audit_id}/{kind} owns no checks")
+                    owned |= set(checks)
+                self.assertEqual(
+                    owned,
+                    set(spec.checks),
+                    f"AUDITS[{audit_id!r}].scopes and .checks disagree: "
+                    f"unowned={sorted(set(spec.checks) - owned)} "
+                    f"unknown={sorted(owned - set(spec.checks))}",
+                )
+
+    def test_every_scope_kind_is_one_target_kind_can_produce(self):
+        """A kind no `scope.clusters` name can ever resolve to owns nothing.
+
+        `audit_target_checks` maps a name to a kind with `target_kind`, so a
+        `scopes` entry keyed anything else is dead data — and worse than dead,
+        because the checks parked under it are absent from the kinds that do
+        resolve, leaving them owed by nobody in practice while
+        `test_scopes_partition_the_roster` still sees them in the union.
+        """
+        reachable = {"cluster", "project", "subnet"}
+        for audit_id, spec in audit_report.AUDITS.items():
+            for kind, _ in spec.scopes:
+                with self.subTest(audit=audit_id, kind=kind):
+                    self.assertIn(kind, reachable)
+
     def test_one_system_namespace_set_spelled_three_ways(self):
         """Three SOPs suppress "system namespaces"; they must mean one set.
 
@@ -8110,6 +8157,236 @@ class TestCoverageGaps(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("1 of 11 applicable checks did not run", gaps[0])
         self.assertIn("Autopilot", gaps[0])
+
+
+class TestScopedCoverage(unittest.TestCase):
+    """Coverage is measured against what a target owes, not the whole roster.
+
+    Three SOPs enumerate `project/<id>` and subnet entries beside clusters, and
+    before the partition every one of those entries was rated against every
+    check in the stream. A live `stockout-prevention` run showed both halves of
+    the error at once: the `project/adamparco-kage` entry, which ran both of the
+    checks the SOP gives it, was reported as "10 of 12 applicable checks did not
+    run", and all four clusters were charged with `quota-exhaustion-risk` — a
+    check the SOP scopes to the project. Eleven fabricated gaps, and the stream
+    was `partial` on every run because of them.
+    """
+
+    STOCKOUT = "stockout-prevention"
+
+    def _doc(self, clusters):
+        return make_doc(findings=[], audit=self.STOCKOUT, clusters=clusters)
+
+    def _project(self, **extra):
+        base = {
+            "name": "project/acme-prod",
+            "location": "-",
+            "project": "acme-prod",
+        }
+        base.update(extra)
+        return base
+
+    def _clean_project(self):
+        """A project entry that owes nothing, so a cluster test isolates itself.
+
+        Every test here supplies both of `stockout-prevention`'s target kinds.
+        Omitting one is a gap in its own right — see `test_a_kind_with_no_targets_
+        is_a_gap` — and would leave these assertions counting that instead of
+        the thing under test.
+        """
+        return self._project(
+            checks_run=["quota-exhaustion-risk", "reservation-mismatch-risk"]
+        )
+
+    def _clean_cluster(self, name="stage-eu"):
+        return {
+            "name": name,
+            "location": "europe-west1",
+            "project": "acme-stage",
+            "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, name)),
+        }
+
+    def test_a_project_target_owes_only_the_project_scoped_checks(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc([self._clean_project(), self._clean_cluster()])
+        )
+        self.assertEqual(gaps, [])
+
+    def test_a_project_target_missing_a_project_scoped_check_is_still_a_gap(self):
+        """Narrowing the denominator must not excuse the checks that remain."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._project(checks_run=["reservation-mismatch-risk"]),
+                    self._clean_cluster(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("1 of 2 applicable checks did not run", gaps[0])
+        self.assertIn("quota-exhaustion-risk", gaps[0])
+
+    def test_a_cluster_is_not_charged_with_a_project_scoped_check(self):
+        cluster_owed = audit_report.audit_target_checks(self.STOCKOUT, "prod-us-east")
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": list(cluster_owed),
+                    },
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+        self.assertNotIn("quota-exhaustion-risk", cluster_owed)
+
+    def test_a_check_the_sop_gives_both_kinds_is_owed_by_both(self):
+        """`reservation-mismatch-risk` has a cluster form and a project form.
+
+        A partition that made every slug exclusive would silently drop one of
+        the two, and the check would go unrun against that kind for good.
+        """
+        for name in ("prod-us-east", "project/acme-prod"):
+            with self.subTest(target=name):
+                self.assertIn(
+                    "reservation-mismatch-risk",
+                    audit_report.audit_target_checks(self.STOCKOUT, name),
+                )
+
+    def test_a_subnet_target_owes_the_ipam_check_alone(self):
+        owed = audit_report.audit_target_checks(
+            "gcp-networking-fabric-audit", "acme-prod/us-east4/gke-nodes"
+        )
+        self.assertEqual(owed, ("subnet-ip-exhaustion",))
+
+    def test_networkings_project_target_owes_the_other_four(self):
+        owed = audit_report.audit_target_checks(
+            "gcp-networking-fabric-audit", "project/acme-prod"
+        )
+        self.assertNotIn("subnet-ip-exhaustion", owed)
+        self.assertEqual(len(owed), 4)
+
+    def test_an_unpartitioned_stream_still_owes_its_whole_roster(self):
+        """The streams that enumerate only clusters must be untouched by this."""
+        for audit_id in ("compliance-audit", "obtainability-audit"):
+            with self.subTest(audit=audit_id):
+                self.assertEqual(
+                    audit_report.audit_target_checks(audit_id, "prod-us-east"),
+                    audit_report.audit_checks(audit_id),
+                )
+
+    def test_an_undeclared_target_kind_owes_everything(self):
+        """A partitioned stream that meets an unexpected target must not go quiet.
+
+        `stockout-prevention` declares `cluster` and `project`. A subnet-shaped
+        name is not something its SOP asks for, so the safe reading is that the
+        target owes the whole roster and shows up as a gap — the alternative,
+        an empty denominator, reports the target as fully audited.
+        """
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
+
+    def test_a_kind_with_no_targets_is_a_gap(self):
+        """The hole the partition itself opens, and the guard that closes it.
+
+        This is the live `gcp-networking-fabric-audit` run: one project entry,
+        no subnet entries, `subnet-ip-exhaustion` owed by nobody. Before the
+        partition it surfaced — wrongly, as the project target's failing — and
+        the narrowed denominator would have made it vanish instead of fixing it.
+        """
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                findings=[],
+                audit="gcp-networking-fabric-audit",
+                clusters=[
+                    {
+                        "name": "project/acme-prod",
+                        "location": "-",
+                        "project": "acme-prod",
+                        "checks_run": [
+                            "cloud-nat-exhaustion",
+                            "psc-routing-deadlock",
+                            "mtu-packet-fragmentation",
+                            "cloud-armor-false-positive",
+                        ],
+                    }
+                ],
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no subnet targets were audited", gaps[0])
+        self.assertIn("subnet-ip-exhaustion", gaps[0])
+
+    def test_a_run_that_enumerates_every_kind_has_no_kind_gap(self):
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                findings=[],
+                audit="gcp-networking-fabric-audit",
+                clusters=[
+                    {
+                        "name": "project/acme-prod",
+                        "location": "-",
+                        "project": "acme-prod",
+                        "checks_run": [
+                            "cloud-nat-exhaustion",
+                            "psc-routing-deadlock",
+                            "mtu-packet-fragmentation",
+                            "cloud-armor-false-positive",
+                        ],
+                    },
+                    {
+                        "name": "acme-prod/us-east4/gke-nodes",
+                        "location": "us-east4",
+                        "project": "acme-prod",
+                        "checks_run": ["subnet-ip-exhaustion"],
+                    },
+                ],
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
+        """Streams with no `scopes` keep exactly the behaviour they had."""
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(
+                "compliance-audit", [{"name": "prod-us-east"}]
+            ),
+            [],
+        )
+
+    def test_an_empty_scope_does_not_trigger_a_gap_per_kind(self):
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("gcp-networking-fabric-audit", []),
+            [],
+        )
+
+    def test_the_scope_table_rates_a_project_row_against_its_own_checks(self):
+        """The rendered `Checks` column had the same scope-blind denominator."""
+        out = "\n".join(
+            audit_report._render_scope(
+                [
+                    self._project(
+                        checks_run=[
+                            {"check": "quota-exhaustion-risk", "command": "gcloud x"},
+                            {
+                                "check": "reservation-mismatch-risk",
+                                "command": "gcloud y",
+                            },
+                        ]
+                    )
+                ],
+                [],
+                NOW,
+                self.STOCKOUT,
+            )
+        )
+        self.assertIn("2/2", out)
+        self.assertNotIn("2/12", out)
+        self.assertNotIn("⚠", out)
 
 
 class TestChecksRun(unittest.TestCase):
