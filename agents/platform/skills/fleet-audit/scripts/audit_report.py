@@ -2850,6 +2850,13 @@ def coverage_issue_title(audit_id: str, gaps: list[str]) -> str:
     )
 
 
+# Recognises a title the function above minted, so a later run can correct its
+# gap count without touching a findings ledger's title. Anchored at the end and
+# tolerant of the audit name, which is the only part that varies between
+# streams.
+COVERAGE_TITLE_RE = re.compile(r"— coverage incomplete \(\d+ gaps?, 0 findings\)$")
+
+
 def delta_block(ids: list[str]) -> str:
     """The hidden, machine-read block that carries this run's finding ids.
 
@@ -5230,6 +5237,41 @@ def fetch_issue_url(repo: str, number: int) -> str | None:
         return None
 
 
+def fetch_issue_title(repo: str, number: int) -> str | None:
+    res = gh(["issue", "view", str(number), "-R", repo, "--json", "title"], check=False)
+    if res.returncode != 0:
+        return None
+    try:
+        return json.loads(res.stdout or "{}").get("title")
+    except json.JSONDecodeError:
+        return None
+
+
+def retitle_coverage_ledger(repo: str, number: int, audit_id: str, gaps: list[str]) -> None:
+    """Keep an open coverage ledger's gap count honest across runs.
+
+    The findings path retitles on every update. This one never did, so a
+    ledger opened the morning one target was unreadable still read `1 gap`
+    after a later run could not read forty-one — and the title is the
+    daily-visible artifact, the thing someone scanning the issue list decides
+    on before opening anything. A frozen count there is the same lie the body
+    is careful never to tell.
+
+    Only a title this code minted is rewritten. A findings ledger that has
+    since gone clean-with-gaps keeps its own: this branch deliberately leaves
+    the body alone, so a title claiming `0 findings` over a body still listing
+    seven would trade a stale number for a contradictory one.
+    """
+    current = fetch_issue_title(repo, number)
+    if current is None or not COVERAGE_TITLE_RE.search(current):
+        return
+    wanted = coverage_issue_title(audit_id, gaps)
+    if current == wanted:
+        return
+    gh(["issue", "edit", str(number), "-R", repo, "--title", wanted], check=False)
+    log(f"Retitled coverage ledger #{number} to: {wanted}")
+
+
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
     """Comments on the ledger, for `/remediate` parsing. Empty on failure.
 
@@ -6692,6 +6734,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 render_clean_comment(audit_id, data, now),
                 what="partial all-clear comment",
             )
+            retitle_coverage_ledger(repo, existing_issue, audit_id, gaps)
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "

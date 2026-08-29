@@ -9037,6 +9037,78 @@ class TestPartialCoverageGating(HarnessTestCase):
             "2 gaps", audit_report.coverage_issue_title(AUDIT, ["a", "b"])
         )
 
+    def _coverage_ledger(self, title):
+        return {
+            "issue list": self.issue_list(),
+            "--json title": json.dumps({"title": title}),
+        }
+
+    def _retitles(self):
+        edits = [c for c in self.harness.gh_calls("issue", "edit") if "--title" in c]
+        return [c[c.index("--title") + 1] for c in edits]
+
+    def test_a_coverage_ledger_is_retitled_when_the_gap_count_moves(self):
+        """The findings path retitles on every update; this one used to never.
+
+        Live issue #112 was opened the morning one target was unreadable and
+        still read `1 gap` after a later run could not read forty-one. The
+        title is what someone scanning the issue list decides on.
+        """
+        self.harness.replies = self._coverage_ledger(
+            "[audit] Security & RBAC Posture Audit — coverage incomplete (1 gap, 0 findings)"
+        )
+        self.run_finish(
+            make_doc(
+                findings=[],
+                skipped=[
+                    {"cluster": "dr-west", "reason": "unreachable"},
+                    {"cluster": "dr-east", "reason": "unreachable"},
+                ],
+            )
+        )
+        self.assertEqual(
+            [t for t in self._retitles() if "coverage incomplete" in t],
+            [audit_report.coverage_issue_title(AUDIT, ["a", "b"])],
+        )
+
+    def test_an_unchanged_gap_count_is_not_rewritten(self):
+        """One `gh` call per run that changes nothing is one too many."""
+        self.harness.replies = self._coverage_ledger(
+            audit_report.coverage_issue_title(AUDIT, ["only"])
+        )
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self._retitles(), [])
+
+    def test_a_findings_ledger_gone_gapped_keeps_its_own_title(self):
+        """This branch leaves the body alone, so retitling it to `0 findings`
+        over a body still listing seven trades a stale number for a
+        contradictory one."""
+        self.harness.replies = self._coverage_ledger(
+            "[audit] Security & RBAC Posture Audit — 7 findings (6 critical)"
+        )
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self._retitles(), [])
+
+    def test_an_unreadable_title_is_left_alone(self):
+        """`gh issue view` failing is not evidence the title is wrong."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json title": 1}
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self._retitles(), [])
+
+    def test_the_coverage_title_pattern_matches_only_its_own_output(self):
+        for gaps in (["a"], ["a", "b"], list("abcdefghijkl")):
+            with self.subTest(n=len(gaps)):
+                title = audit_report.coverage_issue_title(AUDIT, gaps)
+                self.assertRegex(title, audit_report.COVERAGE_TITLE_RE)
+        for other in (
+            audit_report.issue_title(AUDIT, []),
+            "[audit] Security & RBAC Posture Audit — 7 findings (6 critical)",
+            "coverage incomplete (1 gap, 0 findings) — but not at the end",
+        ):
+            with self.subTest(title=other):
+                self.assertIsNone(audit_report.COVERAGE_TITLE_RE.search(other))
+
     def test_a_gapped_clean_body_does_not_call_the_fleet_compliant(self):
         body = render_body(make_doc(findings=[], skipped=self.PARTIAL), generated_at=NOW)
         self.assertNotIn("Every audited cluster is compliant", body)
