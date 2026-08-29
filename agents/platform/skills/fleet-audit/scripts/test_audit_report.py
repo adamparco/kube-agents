@@ -14,12 +14,14 @@ import contextlib
 import copy
 import io
 import json
+import multiprocessing
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
 import gitops_workspace  # noqa: E402
+
+try:  # `report_status` projects the files this suite writes; see TestLiveness.
+    import report_status  # noqa: E402
+except Exception:  # noqa: BLE001 — this suite owns audit_report, not the reader
+    report_status = None
 
 AUDIT = "compliance-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
@@ -446,6 +453,11 @@ class BaseTestCase(unittest.TestCase):
         # tests ran before it.
         audit_report.set_workspace(None)
         self.addCleanup(audit_report.set_workspace, None)
+        # A third global in the same category: `take_run_lock` records the claim
+        # this process wrote so the failure path can give exactly that one back,
+        # and a test that takes a lock would otherwise leave the next one
+        # believing it holds a stream in a temp directory that no longer exists.
+        self.patch_attr("_HELD_LOCK", None)
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
         env = patch.dict(os.environ, {"GITOPS_BASE_BRANCH": ""})
@@ -2930,10 +2942,63 @@ class TestStart(HarnessTestCase):
         self.unclone()
         self.harness.replies = {"issue list": "[]"}
         self.run_main(["start", "--audit", AUDIT])
+        # The run in between. `start` holds the stream until a `finish`
+        # releases it (§4.3), so without this the second dispatch is refused
+        # before it reaches git at all — which is the next test.
+        audit_report.release_run_lock(AUDIT)
         self.harness.calls.clear()
         self.run_main(["start", "--audit", AUDIT])
         self.assertFalse([c for c in self.harness.calls if c[:2] == ["git", "clone"]])
         self.assertTrue(self.harness.matching("git", "fetch"))
+
+    def test_a_second_start_is_refused_while_a_live_run_holds_the_stream(self):
+        """A stream has two dispatchers, so this is an ordinary Tuesday.
+
+        The refusal has to land before `ensure_workspace(..., reset=True)`,
+        which scrubs the stream's GitOps tree: a second dispatch that got that
+        far would delete the live run's manifests on its way to being told no.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        holder = json.loads(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        )
+        self.harness.calls.clear()
+
+        # 3, not 1 or 2: a double dispatch is a normal outcome and a caller
+        # must be able to tell it from a rejected document or a crash.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 3)
+        self.assertIn("RUN IN PROGRESS", self.err)
+        self.assertIn(str(holder["pid"]), self.err)
+        self.assertIn(holder["t0"], self.err)
+        self.assertIn(str(audit_report.started_path_for(AUDIT)), self.err)
+        self.assertEqual(self.harness.calls, [])
+
+    def test_start_proceeds_once_the_held_claim_is_past_the_ceiling(self):
+        """The stream must recover on its own from a run that never finished."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        path = audit_report.started_path_for(AUDIT)
+        claim = json.loads(path.read_text(encoding="utf-8"))
+        dead = time.time() - audit_report.RUN_LOCK_CEILING_S - 60
+        claim["epoch"] = dead
+        claim["t0"] = datetime.fromtimestamp(dead, timezone.utc).isoformat()
+        path.write_text(json.dumps(claim), encoding="utf-8")
+
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertNotEqual(
+            json.loads(path.read_text(encoding="utf-8"))["nonce"], claim["nonce"]
+        )
+
+    def test_steal_lock_takes_the_stream_from_a_live_claim(self):
+        """The operator override, for a run known dead before its expiry."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        path = audit_report.started_path_for(AUDIT)
+        held = json.loads(path.read_text(encoding="utf-8"))["nonce"]
+
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--steal-lock"]), 0)
+        self.assertNotEqual(json.loads(path.read_text(encoding="utf-8"))["nonce"], held)
 
     def test_a_stale_findings_file_is_removed(self):
         # A crashed run must not leave a document for the next one to publish.
@@ -4714,29 +4779,24 @@ class TestTiming(HarnessTestCase):
     """`inspect_s`/`publish_s`/`duration_s` are telemetry: measured when
     possible, null when not, and never able to fail a run."""
 
-    def scratch(self):
-        path = Path(audit_report.SCRATCH_DIR)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
     def test_start_writes_a_parseable_t0(self):
-        self.scratch()
         self.harness.replies = {"issue list": "[]"}
-        with patch.object(audit_report.os, "makedirs", lambda *a, **k: None):
-            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         t0 = audit_report.read_phase_t0(AUDIT)
         self.assertIsNotNone(t0)
         self.assertIsNotNone(t0.tzinfo)
 
-    def test_phase_file_records_the_writing_process_pid(self):
-        self.scratch()
-        audit_report.write_phase_start(AUDIT, datetime.now(timezone.utc))
-        raw = json.loads(Path(audit_report.phase_path_for(AUDIT)).read_text(encoding="utf-8"))
+    def test_the_claim_records_the_writing_process_pid(self):
+        # The pid is what a refusal names, so a person can go and look at the
+        # run that is holding the stream.
+        audit_report.take_run_lock(AUDIT, datetime.now(timezone.utc))
+        raw = json.loads(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        )
         self.assertEqual(raw["pid"], os.getpid())
 
     def test_finish_measures_inspect_s_from_start_s_t0(self):
-        self.scratch()
-        audit_report.write_phase_start(
+        audit_report.take_run_lock(
             AUDIT, datetime.now(timezone.utc) - timedelta(seconds=90)
         )
         self.harness.replies = {"issue list": "[]"}
@@ -4745,14 +4805,15 @@ class TestTiming(HarnessTestCase):
         self.assertGreaterEqual(payload["inspect_s"], 90.0)
         self.assertIsInstance(payload["publish_s"], (int, float))
 
-    def test_finish_without_a_phase_file_reports_null_not_an_error(self):
+    def test_finish_without_a_start_record_reports_null_not_an_error(self):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         self.assertIsNone(self.stdout_json()["inspect_s"])
 
-    def test_a_garbage_phase_file_degrades_to_null(self):
-        scratch = self.scratch()
-        (scratch / f"phase_{AUDIT}.json").write_text("not json", encoding="utf-8")
+    def test_a_garbage_start_record_degrades_to_null(self):
+        started = audit_report.started_path_for(AUDIT)
+        started.parent.mkdir(parents=True, exist_ok=True)
+        started.write_text("not json", encoding="utf-8")
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         self.assertIsNone(self.stdout_json()["inspect_s"])
@@ -4760,13 +4821,41 @@ class TestTiming(HarnessTestCase):
     def test_a_t0_in_the_future_degrades_to_null(self):
         # A clock that moved backwards between the two processes reads as "no
         # measurement", never as a negative duration.
-        self.scratch()
-        audit_report.write_phase_start(
+        audit_report.take_run_lock(
             AUDIT, datetime.now(timezone.utc) + timedelta(hours=1)
         )
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_read_phase_t0_reads_the_claim_start_wrote(self):
+        t0 = datetime(2026, 8, 26, 6, 0, 30, tzinfo=timezone.utc)
+        audit_report.take_run_lock(AUDIT, t0)
+        self.assertEqual(audit_report.read_phase_t0(AUDIT), t0)
+
+    def test_read_phase_t0_is_none_on_every_unusable_claim(self):
+        """Timing is telemetry: a t0 `finish` cannot use degrades, never raises.
+
+        A naive timestamp is in here because it is the one that does not look
+        broken. Subtracting it from an aware `now` raises `TypeError` deep
+        inside `inspect_seconds`, which no caller catches — so the whole
+        publish would fail over a telemetry field.
+        """
+        started = audit_report.started_path_for(AUDIT)
+        started.parent.mkdir(parents=True, exist_ok=True)
+        cases = {
+            "unparseable": "{ not json",
+            "not an object": '["a-claim"]',
+            "no t0": json.dumps({"pid": 7, "nonce": "abc", "epoch": 0.0}),
+            "naive t0": json.dumps({"t0": "2026-08-26T06:00:00", "pid": 7}),
+        }
+        # Asserted first so the loop below cannot pass by never writing a file.
+        audit_report._unlink(str(started))
+        self.assertIsNone(audit_report.read_phase_t0(AUDIT))
+        for label, body in cases.items():
+            with self.subTest(claim=label):
+                started.write_text(body, encoding="utf-8")
+                self.assertIsNone(audit_report.read_phase_t0(AUDIT))
 
     def test_collector_seconds_from_a_manifests_endpoints(self):
         manifest = {"started_at": "2026-08-26T06:00:00Z", "finished_at": "2026-08-26T06:03:30Z"}
@@ -4779,108 +4868,614 @@ class TestTiming(HarnessTestCase):
         self.assertIsNone(audit_report.collector_seconds({"started_at": "not-a-time", "finished_at": "also-not"}))
 
     def test_an_unwritable_scratch_dir_does_not_fail_start(self):
-        # SCRATCH_DIR is left uncreated and makedirs is a no-op, so the phase
-        # write raises OSError inside write_phase_start — which must degrade
-        # to a stderr warning, not an exit code.
+        # Nothing `start` needs lives in SCRATCH_DIR any more — t0 moved into
+        # the lock's claim (§4.5) and the body-file writer falls back to the
+        # system temp directory — so a scratch directory it cannot create must
+        # cost nothing at all, not even a non-zero exit.
         self.harness.replies = {"issue list": "[]"}
-        with patch.object(audit_report.os, "makedirs", lambda *a, **k: None):
+        with patch.object(
+            audit_report.os, "makedirs", side_effect=OSError("read-only file system")
+        ):
             self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
-        self.assertIn("could not write", self.err)
+        self.assertIsNotNone(audit_report.read_phase_t0(AUDIT))
 
 
-class TestStatusWriter(HarnessTestCase):
-    """The status writer: one best-effort HTTP POST to the credential-proxy
-    sidecar's internal endpoint, never `kubectl`, never `command_policy`. See
-    `_handle_fleet_audit_status` in credential_proxy.py for the other end.
-    Observability only — nothing here may change an exit code, and nothing
-    issues a request at all unless the pod set CREDENTIAL_PROXY_URL.
+# --------------------------------------------------------------------------- #
+# The run lock (§4.3)
+# --------------------------------------------------------------------------- #
+
+# Four racers over three rounds: enough that every property below fails if the
+# protocol is wrong, cheap enough to run on every pull request. The exhaustive
+# version — 16 processes x 60 rounds against the deployed 9p/gVisor PVC — is
+# what found the steal-token bug, and it ran out of band (§4.3).
+LOCK_RACERS = 4
+LOCK_ROUNDS = 3
+# A racer that cannot make progress reports it instead of hanging the suite.
+LOCK_DEADLINE_S = 60
+
+
+def _race_for_the_lock(reports_dir, audit_id, barrier, results, steal):
+    """One racer, in its own process, released with the others at the barrier.
+
+    Spawned rather than forked, so it re-points the store itself: `REPORTS_DIR`
+    is a module global and the parent's `patch.object` does not cross a process
+    boundary.
     """
+    audit_report.REPORTS_DIR = reports_dir
+    barrier.wait()
+    try:
+        nonce = audit_report.acquire_run_lock(
+            audit_id, datetime.now(timezone.utc), steal=steal
+        )
+    except audit_report.RunInProgress:
+        results.put(("refused", None))
+    except BaseException as exc:  # noqa: BLE001 — anything else *is* the finding
+        results.put(("raised", f"{type(exc).__name__}: {exc}"))
+    else:
+        results.put(("won", nonce))
 
-    PROXY = "http://127.0.0.1:8765"
+
+def _churn_the_lock(reports_dir, audit_id, barrier, results, rounds):
+    """Acquire, hold, release — `rounds` times, against every other racer.
+
+    Reports the first violation it sees rather than asserting: a failed
+    assertion in a child is an exit code the parent has to guess at.
+    """
+    audit_report.REPORTS_DIR = reports_dir
+    barrier.wait()
+    deadline = time.monotonic() + LOCK_DEADLINE_S
+    for _ in range(rounds):
+        while True:
+            if time.monotonic() > deadline:
+                results.put(("starved", None))
+                return
+            try:
+                nonce = audit_report.acquire_run_lock(
+                    audit_id, datetime.now(timezone.utc)
+                )
+                break
+            except audit_report.RunInProgress:
+                time.sleep(0.005)
+            except BaseException as exc:  # noqa: BLE001
+                results.put(("raised", f"{type(exc).__name__}: {exc}"))
+                return
+        # Nobody else may be admitted while this claim is young, so the file
+        # has to still name this nonce at both ends of the round. A second
+        # admission can only arrive as a steal, which replaces the nonce.
+        held = (audit_report.read_run_claim(audit_id) or {}).get("nonce")
+        time.sleep(0.005)
+        still = (audit_report.read_run_claim(audit_id) or {}).get("nonce")
+        if (held, still) != (nonce, nonce):
+            results.put(("double-admitted", f"{nonce}: saw {held} then {still}"))
+            return
+        audit_report.release_run_lock(audit_id)
+    results.put(("ok", None))
+
+
+class TestRunLock(BaseTestCase):
+    """§4.3's mutual exclusion, raced by real processes.
+
+    Threads share one file-descriptor table and one interpreter, so a protocol
+    that separate processes break can still pass under them. These therefore
+    spawn: N children, one barrier, one directory, and the parent counts who
+    got in.
+    """
 
     def setUp(self):
         super().setUp()
-        self.patch_attr("STATUS_PROXY_URL", self.PROXY)
-        self.requests = []
+        self.store = Path(audit_report.REPORTS_DIR) / AUDIT
+        self.store.mkdir(parents=True)
 
-        def fake_urlopen(request, timeout=None):
-            self.requests.append(request)
-            if self.status_fails:
-                raise self.status_fails
-            return io.BytesIO(b"{}")
+    def held_nonce(self):
+        return (audit_report.read_run_claim(AUDIT) or {}).get("nonce")
 
-        self.status_fails = None
-        patcher = patch.object(audit_report.urllib.request, "urlopen", fake_urlopen)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    def plant_claim(self, age_s, *, nonce="planted", **extra):
+        """The `started.json` a run started `age_s` ago would have left behind.
 
-    def call_captured(self, fn, *args):
-        """Direct writer calls log to real stderr; capture it like run_main does."""
+        `instance` is None deliberately. The container-identity rule (§4.3)
+        would otherwise call every planted claim dead on a Linux runner and
+        alive on a developer's machine, and these tests are about the ceiling;
+        the identity rule has its own test below.
+        """
+        epoch = time.time() - age_s
+        claim = {
+            "audit": AUDIT,
+            "t0": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+            "epoch": epoch,
+            "pid": 4242,
+            "nonce": nonce,
+            "instance": None,
+        }
+        claim.update(extra)
+        audit_report.started_path_for(AUDIT).write_text(
+            json.dumps(claim), encoding="utf-8"
+        )
+        return claim
+
+    def race(self, worker, *args, racers=LOCK_RACERS):
+        """Release `racers` processes at one barrier; return what each reported."""
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(racers)
+        results = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=worker,
+                args=(str(audit_report.REPORTS_DIR), AUDIT, barrier, results, *args),
+            )
+            for _ in range(racers)
+        ]
+        for proc in procs:
+            proc.start()
+        try:
+            # Drained before the join, never after: a child blocks writing to a
+            # full pipe until somebody reads it, so joining first can deadlock.
+            outcomes = [results.get(timeout=LOCK_DEADLINE_S) for _ in procs]
+            for proc in procs:
+                proc.join(timeout=LOCK_DEADLINE_S)
+                self.assertEqual(proc.exitcode, 0, "a racer died instead of reporting")
+        finally:
+            for proc in procs:
+                if proc.is_alive():
+                    proc.terminate()
+                proc.join(timeout=LOCK_DEADLINE_S)
+        return outcomes
+
+    def winners(self, outcomes):
+        """The nonces that were admitted, having failed on anything unexpected."""
+        self.assertEqual([o for o in outcomes if o[0] == "raised"], [], outcomes)
+        self.assertEqual(
+            {state for state, _ in outcomes} - {"won", "refused"}, set(), outcomes
+        )
+        return [nonce for state, nonce in outcomes if state == "won"]
+
+    def test_a_cold_race_on_an_empty_store_admits_exactly_one(self):
+        winners = self.winners(self.race(_race_for_the_lock, False))
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.held_nonce(), winners[0])
+        # And the losers took their claim files with them. A `.claim-*` left
+        # behind is one file per refused dispatch, for the life of the volume.
+        self.assertEqual([p.name for p in self.store.iterdir()], ["started.json"])
+
+    def test_a_fresh_claim_is_never_stolen(self):
+        planted = self.plant_claim(0.0)
+        outcomes = self.race(_race_for_the_lock, False)
+        self.assertEqual(self.winners(outcomes), [])
+        self.assertEqual(self.held_nonce(), planted["nonce"])
+
+    def test_exactly_one_process_steals_a_claim_past_the_ceiling(self):
+        """The property whose first implementation was wrong.
+
+        The stealer used to unlink its `.steal-<nonce>` token in a `finally`,
+        so a racer that had read the same dead claim found the token free and
+        replaced the new owner — two winners on 5 of 25 rounds. The token now
+        survives its own steal, and this is the test that says so.
+        """
+        planted = self.plant_claim(audit_report.RUN_LOCK_CEILING_S + 60)
+        winners = self.winners(self.race(_race_for_the_lock, False))
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.held_nonce(), winners[0])
+        # Named for the dead claim rather than for the winner, and still here:
+        # deleting it is what let the second stealer in.
+        self.assertTrue((self.store / f".steal-{planted['nonce']}").exists())
+
+    def test_a_forced_steal_of_a_live_holder_has_one_winner(self):
+        """`--steal-lock` declares the holder observed at entry dead, so two
+        operators overriding at once still resolve to one run rather than
+        stealing past each other."""
+        self.plant_claim(0.0)
+        winners = self.winners(self.race(_race_for_the_lock, True))
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.held_nonce(), winners[0])
+
+    def test_acquire_release_churn_never_double_admits(self):
+        outcomes = self.race(_churn_the_lock, LOCK_ROUNDS)
+        self.assertEqual([o for o in outcomes if o != ("ok", None)], [], outcomes)
+        # Every round released, so the stream is free at the end.
+        self.assertFalse(audit_report.started_path_for(AUDIT).exists())
+
+
+class TestRunLockAntiWedge(BaseTestCase):
+    """Every way a claim is dead on sight, and each is its own test.
+
+    A lock that can block real work forever is worse than no lock at all — the
+    stream stops auditing and says nothing — so each of these is a route out
+    of a wedge rather than a variation on one theme.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = Path(audit_report.REPORTS_DIR) / AUDIT
+        self.store.mkdir(parents=True)
+        self.started = audit_report.started_path_for(AUDIT)
+
+    def plant(self, claim):
+        self.started.write_text(json.dumps(claim), encoding="utf-8")
+
+    def live_claim(self, **extra):
+        now = time.time()
+        claim = {
+            "audit": AUDIT,
+            "t0": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "epoch": now,
+            "pid": 4242,
+            "nonce": "planted",
+        }
+        claim.update(extra)
+        return claim
+
+    def acquired_nonce(self):
+        nonce = audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+        self.assertEqual(
+            json.loads(self.started.read_text(encoding="utf-8"))["nonce"], nonce
+        )
+        return nonce
+
+    def test_a_claim_from_another_container_is_dead_on_sight(self):
+        """The most common death is the pod: OOM-killed, evicted, or rolled.
+
+        No amount of waiting revives that claim, so the ceiling is collapsed to
+        zero rather than made to expire. `pod_instance` is patched so this runs
+        everywhere — CI has no `/proc/1/stat`, and a cover only exercised on a
+        cluster is a cover nothing gates on. The test below covers the reading.
+        """
+        self.patch_attr("pod_instance", lambda: "the-container-running-now")
+        self.plant(self.live_claim(instance="a-container-that-no-longer-runs"))
+        self.assertNotEqual(self.acquired_nonce(), "planted")
+
+    def test_a_claim_from_this_container_is_left_alone(self):
+        # The other side of the same rule, and the one that matters more: this
+        # signal may only ever make a claim *more* stealable. A bug here steals
+        # the lock out from under the run that is holding it.
+        self.patch_attr("pod_instance", lambda: "the-container-running-now")
+        self.plant(self.live_claim(instance="the-container-running-now"))
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    def test_a_claim_carrying_no_instance_is_judged_on_age_alone(self):
+        # Claims written before this field existed, and every off-cluster run.
+        # Abstaining is the safe direction; treating "absent" as "foreign" would
+        # make every such claim instantly stealable.
+        self.patch_attr("pod_instance", lambda: "the-container-running-now")
+        self.plant(self.live_claim())
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    @unittest.skipIf(
+        audit_report.pod_instance() is None,
+        "no /proc/1/stat here, so container identity cannot be read",
+    )
+    def test_the_container_identity_is_readable_and_stable(self):
+        # The reading half, which only a container can check: `/proc/1/stat`'s
+        # comm field can contain spaces and parentheses, so the parse splits on
+        # the last ") " rather than on whitespace. Verified on the live gVisor
+        # pod too (§4.3) — there /proc is node-scoped, so it is the start ticks
+        # rather than the boot id that turn over when the pod restarts.
+        first = audit_report.pod_instance()
+        self.assertTrue(first)
+        self.assertEqual(first, audit_report.pod_instance())
+
+    def test_a_future_dated_claim_is_dead_rather_than_immortal(self):
+        # A clock stepped backwards on the reader, or a bad write, dates a
+        # claim ahead of now — and a claim that never ages holds the stream
+        # for good. Past the ceiling in that direction it is not credible.
+        ahead = time.time() + audit_report.RUN_LOCK_CEILING_S + 60
+        self.plant(
+            self.live_claim(
+                epoch=ahead, t0=datetime.fromtimestamp(ahead, timezone.utc).isoformat()
+            )
+        )
+        self.assertNotEqual(self.acquired_nonce(), "planted")
+
+    def test_a_claim_just_inside_the_ceiling_is_still_live(self):
+        # The live side of the ceiling, bracketing
+        # `test_exactly_one_process_steals_a_claim_past_the_ceiling` above:
+        # without this pair, a ceiling quietly shortened to minutes reads as a
+        # working lock while every long audit gets stolen out from under
+        # itself. The slowest observed run is ~20 minutes.
+        inside = time.time() - audit_report.RUN_LOCK_CEILING_S + 60
+        self.plant(
+            self.live_claim(
+                epoch=inside,
+                t0=datetime.fromtimestamp(inside, timezone.utc).isoformat(),
+            )
+        )
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    def test_a_claim_dated_slightly_ahead_is_still_live(self):
+        # The other side of the same rule: a few seconds of skew between two
+        # pods is ordinary, and must not make a running audit stealable.
+        ahead = time.time() + 60
+        self.plant(
+            self.live_claim(
+                epoch=ahead, t0=datetime.fromtimestamp(ahead, timezone.utc).isoformat()
+            )
+        )
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    def test_an_unreadable_claim_is_dead_rather_than_a_permanent_wedge(self):
+        """One bad write must not cost the stream every future run.
+
+        A file nobody can parse carries no evidence that a run is in flight,
+        so it is treated as a holder already past its ceiling — the direction
+        that recovers rather than the one that stops the audit for good.
+        """
+        for label, body in {
+            "truncated json": '{"audit": "compliance-au',
+            "not json at all": "\x00\x01binary",
+            "a list": '["a-claim"]',
+            "empty": "",
+        }.items():
+            with self.subTest(claim=label):
+                # A fresh store per shape: each is its own incident, and a
+                # shared directory would carry the previous shape's steal
+                # token into the next one — see the test below, which is what
+                # that collision is.
+                shutil.rmtree(self.store)
+                self.store.mkdir(parents=True)
+                self.started.write_text(body, encoding="utf-8")
+                self.assertTrue(self.acquired_nonce())
+                audit_report.release_run_lock(AUDIT)
+
+    def test_a_second_corrupt_claim_is_not_wedged_by_the_first_steal_token(self):
+        """Two torn writes to one stream, hours apart, must both be stealable.
+
+        The prune-by-age rule is safe "unconditionally" only because a stolen
+        nonce can never be asked for again (§4.3), and an unparseable claim has
+        no nonce of its own to make that true. Stub every one of them with the
+        same literal and the second incident asks for the token the first left
+        behind, the link fails, and the stream is refused until the token ages
+        out — with `--steal-lock`, the override that exists for exactly this,
+        unable to clear it either. `_corrupt_claim_nonce` is why it does not:
+        the identity comes from the file's inode and mtime, so two torn writes
+        name two tokens, while two processes racing *one* torn write still name
+        the same one and only one of them steals.
+        """
+        self.started.write_text('{"audit": "compliance-au', encoding="utf-8")
+        audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+        audit_report.release_run_lock(AUDIT)
+
+        self.started.write_text("also { truncated", encoding="utf-8")
+        self.assertTrue(self.acquired_nonce())
+
+    def test_two_racers_on_one_corrupt_claim_still_yield_one_stealer(self):
+        """The other half of the rule above, and the one it must not break.
+
+        A per-file nonce fixes the wedge; a per-*reader* one would trade it for
+        the double-steal the 16-process torture run caught, because two racers
+        would name two tokens and both would link. Same file, two reads, one
+        name.
+        """
+        self.started.write_text("{ torn", encoding="utf-8")
+        first = audit_report.read_run_claim(AUDIT)["nonce"]
+        second = audit_report.read_run_claim(AUDIT)["nonce"]
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, "corrupt")
+
+    def test_a_start_that_fails_after_taking_the_lock_gives_it_back(self):
+        """The cover that fires most often, and the ceiling is wrong for it.
+
+        `start` claims the stream on its first line and holds it until `finish`,
+        so a `start` that dies on the next one — Minty unreachable, the clone
+        refused — has claimed a run that will never happen. Left in place that
+        claim costs the stream two hours for a minute of outage, and the status
+        surface shows a run that never began as running and then as DIED.
+        """
+        self.patch_attr("resolve_repo", lambda: 1 / 0)
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 1)
+        self.assertFalse(self.started.exists())
+        # The point of giving it back: the retry is not refused. Exit 3 here
+        # would mean the stream had been wedged by its own failed dispatch.
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 1)
+
+    def test_a_failed_start_does_not_release_a_claim_that_was_stolen_from_it(self):
+        """Give back your own claim, not whatever happens to be there.
+
+        A `start` slow enough to fail past the ceiling can have its claim stolen
+        while it fails, and an unconditional unlink on the way out would then
+        drop a live run's lock — turning one broken dispatch into two runs
+        publishing over each other, which is the failure the lock exists for.
+        """
+        audit_report.take_run_lock(AUDIT, datetime.now(timezone.utc))
+        self.plant(self.live_claim(nonce="stole-it-mid-failure"))
+        audit_report.release_own_lock()
+        self.assertEqual(
+            json.loads(self.started.read_text(encoding="utf-8"))["nonce"],
+            "stole-it-mid-failure",
+        )
+
+    def test_a_refused_start_does_not_release_the_holders_claim(self):
+        """The `RunInProgress` path took no lock, so it gives none back."""
+        self.plant(self.live_claim())
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 3)
+        self.assertEqual(
+            json.loads(self.started.read_text(encoding="utf-8"))["nonce"], "planted"
+        )
+
+    def test_an_unwritable_store_degrades_to_an_unlocked_run(self):
+        """A telemetry directory must not be able to stop the audit.
+
+        This is the ConfigMap's lesson (§4.5) applied to the lock itself: a
+        store that cannot be written at all costs the mutual exclusion and a
+        WARNING, never the fleet's audit. A *live holder* is still a refusal —
+        that is the point of the lock — and that is the test above.
+        """
+        blocker = self.tmp_path / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        self.patch_attr("REPORTS_DIR", str(blocker))
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            fn(*args)
-        self.err = err.getvalue()
+            self.assertIsNone(
+                audit_report.take_run_lock(AUDIT, datetime.now(timezone.utc))
+            )
+        self.assertIn("running unlocked", err.getvalue())
+        self.assertIn(AUDIT, err.getvalue())
 
-    def posted(self):
-        """The (stream, row) of the last status POST."""
-        self.assertTrue(self.requests, "no status request was issued")
-        body = json.loads(self.requests[-1].data)
-        return body["stream"], json.loads(body["data"])["last"]
 
-    def test_off_without_a_proxy_url_issues_no_request_at_all(self):
-        self.patch_attr("STATUS_PROXY_URL", "")
-        audit_report.status_record_run(AUDIT, {"status": "CLEAN"})
-        self.assertEqual(self.requests, [])
+class TestStealTokenPruning(BaseTestCase):
+    """The steal token is litter by design, and pruned by age (§4.3).
 
-    def test_started_stub_names_the_stream_and_phase(self):
-        self.call_captured(audit_report.status_record_started, AUDIT, NOW)
-        stream, row = self.posted()
-        self.assertEqual(stream, AUDIT)
-        self.assertEqual(row["phase"], "started")
-        self.assertEqual(row["at"], NOW.isoformat())
+    Both halves are load-bearing: removed on success it lets a late racer
+    replace the new owner, kept forever it is one file per dead run for the
+    life of the volume.
+    """
 
-    def test_finish_records_the_row(self):
-        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
-        stream, row = self.posted()
-        self.assertEqual(stream, AUDIT)
-        self.assertEqual(row["phase"], "finished")
-        self.assertEqual(row["status"], "CLEAN")
-        self.assertEqual(row["findings"], 0)
-        self.assertEqual(row["clusters"], 2)
-        self.assertIsInstance(row["publish_s"], (int, float))
+    def setUp(self):
+        super().setUp()
+        self.store = Path(audit_report.REPORTS_DIR) / AUDIT
+        self.store.mkdir(parents=True)
 
-    def test_remediate_records_counts_not_urls(self):
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+    def test_old_tokens_go_young_ones_stay_and_nothing_else_is_touched(self):
+        now = time.time()
+        expired = self.store / ".steal-2f9c"
+        young = self.store / ".steal-7a11"
+        # Everything else the directory holds, aged past the ceiling too, so
+        # what selects a file for deletion is provably the name and not the
+        # mtime.
+        bystanders = [
+            self.store / "started.json",
+            self.store / "latest.json",
+            self.store / ".claim-2f9c.json",
+            self.store / "steal-2f9c",
+        ]
+        for path in (expired, young, *bystanders):
+            path.write_text("{}", encoding="utf-8")
+        stale = now - audit_report.RUN_LOCK_CEILING_S - 60
+        for path in (expired, *bystanders):
+            os.utime(path, (stale, stale))
+
+        audit_report.prune_steal_tokens(AUDIT, now=now)
+
+        self.assertFalse(expired.exists())
+        self.assertTrue(young.exists())
+        for path in bystanders:
+            self.assertTrue(path.exists(), path.name)
+
+    def test_a_stream_with_no_store_yet_is_not_an_error(self):
+        # `start` prunes before the first run of a stream has written anything.
+        audit_report.prune_steal_tokens("obtainability-audit")
+
+
+# --------------------------------------------------------------------------- #
+# The status surface: two files, and liveness read off them (§4.5)
+# --------------------------------------------------------------------------- #
+
+
+LIVENESS_ROWS = (
+    # started.json age in seconds (None: no claim), latest.json present, state
+    (None, False, "never"),
+    (None, True, "completed"),
+    (0.0, False, "running"),
+    (0.0, True, "running"),
+    # Just inside the ceiling. Without this row a ceiling shortened to minutes
+    # still reads as a working table.
+    (audit_report.RUN_LOCK_CEILING_S - 60, False, "running"),
+    (audit_report.RUN_LOCK_CEILING_S + 60, False, "died"),
+    (audit_report.RUN_LOCK_CEILING_S + 60, True, "died"),
+)
+
+
+def _liveness(audit_id, now):
+    """§4.5's truth table, evaluated against the store.
+
+    Restated here rather than imported: `report_status.py` projects these files
+    for the view, and this suite owns the files it projects. The rule is short
+    enough to restate because it is two presence checks and one ceiling — and
+    it uses the lock's own `_claim_is_dead`, so what the surface calls DIED and
+    what the next `start` is allowed to steal cannot disagree.
+    """
+    claim = audit_report.read_run_claim(audit_id)
+    if claim is None:
+        latest = audit_report.reports_dir_for(audit_id) / "latest.json"
+        return "completed" if latest.exists() else "never"
+    if audit_report._claim_is_dead(claim, now, audit_report.RUN_LOCK_CEILING_S):
+        return "died"
+    return "running"
+
+
+class TestLiveness(HarnessTestCase):
+    """Which of §4.5's four states the two files describe.
+
+    Presence beats timestamp comparison here, and the ceiling is wall-clock
+    rather than schedule-derived: the retired rule computed staleness from a
+    cron expression `next_fire` could parse two shapes of, so DIED arrived a
+    day late on a daily stream and never at all on any other shape.
+    """
+
+    def store(self):
+        return Path(audit_report.REPORTS_DIR) / AUDIT
+
+    def build(self, age, published):
+        """One stream in a known state: a claim of a given age, a report or not."""
+        shutil.rmtree(self.store(), ignore_errors=True)
+        if published:
+            audit_report.write_report(AUDIT, {"audit_id": AUDIT}, NOW)
+        if age is not None:
+            # The real acquire, not a hand-written file: the surface reads what
+            # the lock writes.
+            audit_report.take_run_lock(
+                AUDIT, datetime.now(timezone.utc) - timedelta(seconds=age)
+            )
+        self.assertEqual(audit_report.started_path_for(AUDIT).exists(), age is not None)
+        self.assertEqual((self.store() / "latest.json").exists(), published)
+
+    def test_the_truth_table(self):
+        for age, published, expected in LIVENESS_ROWS:
+            with self.subTest(started=age, latest=published, expect=expected):
+                self.build(age, published)
+                self.assertEqual(_liveness(AUDIT, time.time()), expected)
+
+    @unittest.skipIf(report_status is None, "report_status.py not importable here")
+    def test_the_projection_reads_the_same_table_off_the_same_files(self):
+        """`report_status.py` re-derives §4.5; it may not derive it differently.
+
+        The reader parses the two files itself rather than calling the lock, so
+        nothing but this test stops the two from drifting — and the shape that
+        drift takes is a stream the view shows as RUNNING that the next `start`
+        is already entitled to steal.
+        """
+        root = str(audit_report.REPORTS_DIR)
+        for age, published, expected in LIVENESS_ROWS:
+            with self.subTest(started=age, latest=published, expect=expected):
+                self.build(age, published)
+                self.assertEqual(
+                    report_status.liveness(
+                        report_status.load_started(root, AUDIT),
+                        report_status.load_latest(root, AUDIT),
+                        time.time(),
+                    ),
+                    expected,
+                )
+
+    def test_a_real_run_moves_the_stream_from_running_to_completed(self):
+        """The two commands, in order, against one store.
+
+        `finish` releasing the claim is what makes "a start record exists" and
+        "a run holds the stream" the same fact — so the status surface and the
+        mutual exclusion cannot disagree about what is in flight.
+        """
+        self.assertEqual(_liveness(AUDIT, time.time()), "never")
         self.harness.replies = {
-            "issue list": self.issue_list(),
-            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
         }
-        path = self.write_findings(make_doc())
-        rc = self.run_main(
-            ["remediate", "--audit", AUDIT, "--findings-file", path,
-             "--finding", derived_id()]
-        )
-        self.assertEqual(rc, 0)
-        _, row = self.posted()
-        self.assertEqual(row["status"], "REMEDIATED")
-        self.assertEqual(row["prs_opened"], 1)
-        self.assertNotIn("github.com", json.dumps(row))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(_liveness(AUDIT, time.time()), "running")
 
-    def test_write_failures_never_touch_the_exit_code(self):
-        self.status_fails = OSError("connection refused")
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
-        self.assertIn("status write for", self.err)
-        self.assertIn(AUDIT, self.err)
+        self.assertEqual(_liveness(AUDIT, time.time()), "completed")
+        self.assertFalse(audit_report.started_path_for(AUDIT).exists())
+        self.assertEqual(self.stored_envelope()["status"], "CLEAN")
 
 
 class TestReportStore(HarnessTestCase):
     """§4.8's local report store: what `finish` keeps of the run it published.
 
-    Best-effort like the status writer above it — nothing here may change an
-    exit code — but unlike a status row it is read back, as the next run's
-    delta memory and as the chat path's answer to "what did the audit find?".
-    So its shape is a contract twice over, with `read_report_memory` and with
-    a reader holding nothing but the file.
+    Best-effort — nothing here may change an exit code — and read back twice
+    over: as the next run's delta memory, and as the chat path's answer to
+    "what did the audit find?". So its shape is a contract with
+    `read_report_memory` and with a reader holding nothing but the file.
     """
 
     def open_ledger(self, issue=7):
@@ -4981,11 +5576,35 @@ class TestReportStore(HarnessTestCase):
                 "issue_url",
                 "new_ids",
                 "partial",
+                # The three the retired status ConfigMap's row carried and the
+                # envelope did not (§4.5). Dropping the object loses no
+                # recorded fact only if these are here.
+                "prs_closed",
+                "prs_opened",
                 "publish_s",
                 "resolved_ids",
+                "silent_ok",
                 "status",
             ],
         )
+
+    def test_the_pr_keys_are_urls_and_silent_ok_is_a_verdict(self):
+        """The row carried counts because etcd rations bytes; a file does not.
+
+        A count cannot be clicked, and the reader here is a person asking the
+        agent what the audit did — so `prs_opened` has to be the pull request
+        itself, not the number 1.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/8\n"
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(stored["prs_closed"], [])
+        # A run that opened a pull request said something, so it is not silent.
+        self.assertIs(stored["silent_ok"], False)
 
     def relink_drops_a_finding(self):
         """A run whose pre-link and post-link bodies render *different* id sets.
@@ -5348,8 +5967,7 @@ class TestReportStore(HarnessTestCase):
             "issue create": "https://github.com/acme/fleet/issues/7\n",
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-        audit_report.write_phase_start(
+        audit_report.take_run_lock(
             AUDIT, datetime.now(timezone.utc) - timedelta(seconds=90)
         )
         manifest = self.tmp_path / "manifest.json"
@@ -5423,10 +6041,34 @@ class TestReportStore(HarnessTestCase):
 
         runs = self.stored_runs()
         self.assertEqual(
-            [p.name for p in runs], ["20260826T060000Z.json", "20260827T060000Z.json"]
+            [p.name for p in runs],
+            ["20260826T060000.000000Z.json", "20260827T060000.000000Z.json"],
         )
         latest = Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json"
         self.assertEqual(latest.read_bytes(), runs[-1].read_bytes())
+
+    def test_two_runs_in_the_same_second_leave_two_ring_entries(self):
+        """The stamp is `%Y%m%dT%H%M%S.%fZ`, and the microseconds are the point.
+
+        At second granularity two runs finishing inside the same second name
+        the same file and the second silently replaces the first — the ring
+        loses a run and nothing anywhere says so. The lock makes that near
+        impossible for one stream; the six digits cost nothing.
+        """
+        moment = datetime(2026, 8, 26, 6, 0, 0, tzinfo=timezone.utc)
+        audit_report.write_report(AUDIT, {"finished_at": "first"}, moment)
+        audit_report.write_report(
+            AUDIT, {"finished_at": "second"}, moment.replace(microsecond=1)
+        )
+        runs = self.stored_runs()
+        self.assertEqual(
+            [p.name for p in runs],
+            ["20260826T060000.000000Z.json", "20260826T060000.000001Z.json"],
+        )
+        self.assertEqual(
+            [json.loads(p.read_text())["finished_at"] for p in runs],
+            ["first", "second"],
+        )
 
     def test_the_ring_keeps_the_newest_fourteen_runs(self):
         for day in range(audit_report.REPORT_HISTORY + 3):

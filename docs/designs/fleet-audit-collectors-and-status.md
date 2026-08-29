@@ -308,18 +308,88 @@ answers.
   the same dead claim _before_ the steal would find the token free and replace the new owner. The
   token is pruned by age instead, which is safe unconditionally — once a claim is stolen its nonce
   is gone from `started.json` for good, so no later acquire can ask for that token again.
+- **A claim with no nonce of its own gets one from the file**, because the sentence above is the
+  premise the whole rule rests on and an unparseable `started.json` is the case that breaks it.
+  Naming every torn write `corrupt` makes `.steal-corrupt` a one-shot: the first bad write on a
+  stream is stealable and every later one is refused until the token ages out — cover 4 defeating
+  cover 1, with `--steal-lock` unable to clear it either, which a test caught. Naming each one
+  uniquely is worse, because two processes racing the same torn write would name two tokens and
+  both would steal. So the identity is the file's — inode, mtime, size — which two racers agree on
+  and two successive writes do not share.
 - **`finish` releases**, and the liveness states fall out of presence rather than a timestamp
   comparison (§4.5). A `finish` that crashes after publishing leaves the lock held until the
   ceiling — a stream that reads DIED for two hours and then recovers on its own, which is the
   right failure direction.
 
-**This was verified on the real filesystem, not assumed.** The PVC is a 9p mount under gVisor, and
-whether it gives true atomicity is exactly the kind of thing a design should not take on faith.
+**Six covers, because a lock that wedges a stream is worse than no lock.** The failure this
+design must not introduce is a claim file nothing will ever clear, and the age ceiling alone
+does not rule one out — it only bounds the common case. Each cover below is a distinct state a
+real pod reaches, and each makes a claim _more_ stealable, never less:
+
+1. **Age past the ceiling**, as above: the ordinary recovery, bounded at 2 h.
+2. **The container that wrote the claim is gone.** The claim records a pod instance — the boot
+   id plus PID 1's start ticks, read from `/proc`, which changes on every container restart —
+   and a claim whose instance does not match the reader's is dead on sight. This collapses the
+   two-hour window to zero for the death that actually happens: an OOM-killed or evicted run
+   whose replacement pod starts minutes later. It is a one-way signal by construction; off
+   cluster, where `/proc/1/stat` is absent, it abstains rather than guessing. Measured on the
+   live agent pod rather than assumed, because `/proc` under gVisor is not obviously the shape
+   this reads: it is node-scoped, so the boot id is the node's and does not turn over with the
+   pod, and the start ticks are counted from node boot — 8,947,590 of them at 100 Hz against a
+   54.2 h node uptime puts PID 1's start 29.35 h ago, which is the pod's age. The ticks are
+   therefore the half that changes on every container restart, and the boot id is doing the job
+   the code claims for it: separating two nodes that happen to agree on a tick count.
+3. **A future-dated claim.** `now - epoch` is negative for a claim written under a clock that
+   later jumped backwards, and a negative age never reaches a positive ceiling — the stream
+   would be locked until the clock caught up, which for a badly-set clock is never. An age more
+   negative than the ceiling is therefore dead too.
+4. **A corrupt claim.** A truncated, empty, or non-JSON `started.json` is unparseable, so no
+   rule can age it out. It is dead by definition: a claim nobody can read is a claim nobody can
+   be shown to hold.
+5. **A `start` that fails after taking the lock releases it.** This is the one that fires most
+   often, and the ceiling is the wrong answer to it: `start` claims the stream on its first line
+   and holds it until `finish`, so a `start` that dies on the next line — Minty unreachable, the
+   clone refused, the workspace unwritable — has claimed a run that will never happen. A minute
+   of a credential broker being down would otherwise cost two hours of the stream. Every
+   abnormal exit gives the claim back, and only the claim this process wrote: the release checks
+   the nonce, so a run that did age out and get stolen mid-failure cannot take the new owner's
+   lock down with it.
+6. **`start --steal-lock`**, the operator override for the case the automatic rules miss. It goes
+   through the same atomic steal rather than around it, scoped to the nonce observed when the
+   command entered, so it cannot displace a run that started between that read and the link —
+   an override of a specific holder, not a blanket right to the stream.
+
+   Concurrent overrides are the one place this reads oddly, and the shape is worth stating
+   because the honest version is not the tidy one. Twelve simultaneous `--steal-lock` runs on
+   the live volume ended with the stream owned by exactly one of them every round, but two to
+   five of the twelve **each reported success**: a late starter reads `started.json` after an
+   earlier stealer has already installed its claim, adopts _that_ as its target, and takes the
+   stream from it. Chain-stealing is the override behaving correctly — each run overrode the
+   holder it actually observed — but it means a returned nonce is not by itself proof of
+   ownership when two operators fire at once. One at a time, or read the claim back.
+
+One more direction of failure is worth naming because it is the opposite mistake: **an
+unwritable store must not stop an audit.** Taking the lock is best-effort in exactly the sense
+§4.5's writer discipline means — an `OSError` from the store directory logs a warning naming the
+degradation and the run proceeds unlocked. The lock exists to stop two runs corrupting each
+other's telemetry; it must never be the reason a fleet goes unaudited.
+
+**This was verified on the real filesystem, not assumed.** The store sits on the PVC, which the
+agent reaches through gVisor's gofer rather than directly, and whether that gives true atomicity is
+exactly the kind of thing a design should not take on faith. Do not describe the mount from
+memory either: inside the container `/proc/mounts` reports `/opt/data` as **`ext4` on `/dev/sdb`**
+and lists no 9p mount at all, so the "9p PVC" this document used to say was wrong on its face.
 `O_CREAT|O_EXCL`, `os.link`, and `os.mkdir` were each raced by 12 threads over 60 rounds on the
-live volume: exactly one winner every round for all three. The protocol above was then raced by 16
+live volume: exactly one winner every round for all three. `os.replace` over an existing name was
+added to that set later, because the steal path ends in one and a reader-visible gap there would
+admit a second holder — 2,000 replaces against four concurrent readers, and the name was never
+observed missing and never once won by a reader's `os.link`. The protocol above was then raced by 16
 **separate processes** over 60 rounds per property. The first version failed — two stealers both
 won on 5 of 25 rounds — and that is what identified the delete-the-token bug; the corrected
-protocol holds cold-race, live-holder, dead-steal, churn, and prune properties at 16 × 60.
+protocol holds cold-race, live-holder, dead-steal, churn, and prune properties at 16 × 60. The
+shipped implementation, not the prototype, was then raced again on the same twelve properties
+plus the six covers above — including the ones that assert a wedge is _impossible_, which a
+passing lock cannot demonstrate on its own.
 
 **The ring stamp also gets sub-second resolution.** `%Y%m%dT%H%M%SZ` collides when two runs finish
 in the same second, one silently replacing the other in `runs/`. The lock makes that near
@@ -491,7 +561,7 @@ writer, key already in the pod's env, and `intercepted_events` is a working prec
 durable run record. It loses on cost: a new table, two new routes, a TTL exemption in
 `cleanup_old_records`, and their tests and docs, all in a service this feature otherwise does
 not touch, to store what a file already stores. It also adds a second SQLite writer to a
-gVisor/9p mount with a WAL-corruption history, and needs a `GET` route only because `sqlite3` is
+sandboxed PVC mount with a WAL-corruption history, and needs a `GET` route only because `sqlite3` is
 absent from the image — opacity the design would be introducing and then paying to undo.
 
 _Rejected alternative:_ the Hermes-owned databases (`cron/executions.db`, `cron/notepad.db`,
@@ -631,7 +701,7 @@ the only symptom is a chat path that never finds a report:
   about. The body's redaction backstop is applied to every string on the way in, so the
   envelope never holds a credential shape the public issue blanked.
 - `latest.json` — a byte-identical copy of the newest envelope. A copy, not a symlink: one
-  fewer behaviour to ask of the 9p mount, for zero saved bytes.
+  fewer behaviour to ask of the sandboxed mount, for zero saved bytes.
 
 `runs/` prunes at write time to the newest 14 — two weeks of a daily stream, a quarter of a
 weekly one; at the ledger's own 60k-character body ceiling that bounds the store near 1 MB per
@@ -716,7 +786,7 @@ object cap by an order of magnitude. That reasoning held; what changed since is 
 of travel, because §4.5 has now moved the small status row _into_ this store rather than the
 documents into the ConfigMap. A **SQLite ring** beside `executions.db` — the natural unit is one whole document
 per run, a blob the agent reads with `jq`, not rows that any query would need to join, and a
-second database on the 9p-mounted PVC buys nothing but the WAL-journal corruption class such
+second database on the PVC buys nothing but the WAL-journal corruption class such
 mounts are known to provoke. **Committing reports into the GitOps repo** — durable and
 `git diff`-able, but it writes machine telemetry into the _user's_ repository, a commit per
 stream per day with Config Sync/Argo churn on each, and a network read is what the store
@@ -984,8 +1054,17 @@ with redaction as backstop. New ones:
   owner — by asserting the token survives its own steal, and a second asserts it is pruned once
   older than the ceiling. At the command surface, `start` refuses while a live claim is held and
   says whose pid and start time hold it, and proceeds once that claim ages past the ceiling.
-  These run against `tmp_path` in CI; the same properties were verified on the live 9p PVC at
-  16 processes × 60 rounds (§4.3).
+  Each of §4.3's six covers gets its own test, because a cover is an assertion that a wedge is
+  _impossible_ and a lock that merely works cannot demonstrate one: a claim from a departed
+  container is stolen, a future-dated claim is stolen rather than waited out, a corrupt claim
+  does not refuse forever, a `start` that fails after taking the lock leaves no claim behind and
+  a second attempt is not refused — while one whose claim was stolen while it failed leaves the
+  new owner's alone — N concurrent `--steal-lock` runs leave the stream owned by exactly one of
+  them, and an unwritable store returns an unlocked run rather than raising. These run
+  against `tmp_path` in CI; the protocol was separately verified on the live volume at 16
+  processes × 60 rounds, and the shipped implementation re-raced there at 12 processes × 20
+  rounds across all nine properties, including the two covers a macOS CI host cannot reach —
+  the departed-container steal and the atomicity of the rename the steal path ends in (§4.3).
 - **Query-script tests** (§4.9): each subcommand's output is JSON and bounded — `show` must not
   contain `document`, `findings` must not contain finding bodies — and a store with a missing,
   empty, or corrupt `latest.json` produces a stated error rather than an empty success. One test
@@ -1135,9 +1214,12 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
    absence caused the failure it fixes.
 8. **The run lock** (§4.3) — `acquire`/`release`/`prune_tokens` on `started.json`, `start`
    wired to acquire and exit non-zero on a live holder, `finish` wired to release, the
-   sub-second ring stamp, and the multi-process lock tests. Separable from 7 and shipped after
-   it, because it changes when a run _refuses to start_ and deserves its own review and its own
-   live validation rather than riding along with a deletion PR.
+   sub-second ring stamp, §4.3's six anti-wedge covers with `start --steal-lock` as the
+   operator override and a nonce-checked release on every abnormal exit from `main`,
+   the degradation to an unlocked run when the store cannot be written, and
+   the multi-process lock tests. Separable from 7 and shipped after it, because it changes when
+   a run _refuses to start_ and deserves its own review and its own live validation rather than
+   riding along with a deletion PR.
 9. **The reader skill** (§4.9) — `agents/platform/skills/fleet-audit-reports/` with its
    `SKILL.md` and `report_query.py`, the reading section moved out of `fleet-audit`'s SKILL.md
    and replaced by a pointer, one line in `generate_docs.py`'s `SKILL_GROUPS`, and
@@ -1154,7 +1236,7 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
 | Proxy     | `agents/platform/scripts/credential_proxy.py` — the `_handle_fleet_audit_status` route added in phase 2 and **removed again in phase 7**, with its tests; `command_policy.py` untouched throughout                                                                                                                                                                                       |
 | Chart     | `charts/kube-agents/templates/fleet-audit-status.yaml` — added in phase 2, **deleted in phase 7**. No chart object, no RBAC, and no operator change survives this design                                                                                                                                                                                                                 |
 | Status    | (§4.5, phase 7) `audit_report.py` — `started.json` relocation, three envelope keys, `_status_post` deleted; `agents/platform/skills/fleet-audit/scripts/report_status.py` (new projection); `test_audit_report.py`                                                                                                                                                                       |
-| Lock      | (§4.3, phase 8) `audit_report.py` — `acquire`/`release`/`prune_tokens` over `started.json`, `start` wired to acquire and `finish` to release, sub-second ring stamp; the multi-process lock tests in `test_audit_report.py`                                                                                                                                                              |
+| Lock      | (§4.3, phase 8) `audit_report.py` — `acquire`/`release`/`prune_tokens` over `started.json`, `start` wired to acquire and `finish` to release, the six anti-wedge covers and the `--steal-lock` override, sub-second ring stamp; the multi-process lock tests in `test_audit_report.py`                                                                                                   |
 | Store     | (§4.8, phase 6) `audit_report.py` — store writer, delta re-pointed at the store, ledger-body read-back deleted; `test_audit_report.py`; the fleet-audit `SKILL.md` reading section; `fleet-audit-issue-ledger.md`'s delta-memory amendment; `concepts/declarative-workflow.md`'s computable-delta bullet                                                                                 |
 | View      | `scripts/fleet_audit_status_view.py` (new), `Makefile`, tests (new)                                                                                                                                                                                                                                                                                                                      |
 | Skills    | (§4.9, phase 9) `agents/platform/skills/fleet-audit-reports/SKILL.md` and its `scripts/report_query.py` (both new); the reading section cut from `fleet-audit`'s `SKILL.md` and replaced by a pointer; one line in `scripts/generate_docs.py`'s `SKILL_GROUPS`; `tests/` coverage for the query script                                                                                   |
@@ -1244,17 +1326,21 @@ recoverable from GitHub by a human, because the ledger body keeps publishing the
   liveness stamps go together, so a wiped store reads as "never ran" for every stream until each
   next run. _What limits it:_ §4.6's `NEVER` and `NO STORE` flags exist so that state is
   rendered as a distinct condition rather than as a calm empty table.
-- **A dead run holds its stream for up to two hours.** The lock is real — `os.link` onto
+- **A dead run can hold its stream for up to two hours.** The lock is real — `os.link` onto
   `started.json`, verified atomic on this PVC and proved at 16 processes × 60 rounds (§4.3) — so
   the concurrency this replaces is no longer a risk. What replaces it is the ceiling: a run
-  killed by an OOM or a pod eviction leaves a claim that nothing releases, and the next dispatch
-  is refused until the claim ages past `CEILING_S`. _Why accepted:_ two hours is longer than any
-  observed run and shorter than every stream's schedule, so the window closes on its own before
-  the next scheduled dispatch; and a refusal that names the dead holder's pid and start time is
-  a better failure than two runs publishing over each other. _What it costs:_ a manual retry
-  inside that window fails, and clearing it early means deleting `started.json` by hand. _What
-  would change it:_ a pod-lifetime token in the claim — a holder whose boot id no longer matches
-  the running pod is dead on the spot, with no ceiling to wait out.
+  killed by an OOM or a pod eviction leaves a claim that nothing releases. Five of §4.3's six
+  covers narrow the window to nothing for the deaths that actually happen — a claim written by a
+  container that has since restarted is dead on sight, as are a future-dated and an unreadable
+  one, and a `start` that fails after claiming the stream hands it straight back — so the full
+  two hours is only reached when the run died _inside a pod that is still running_ and _past
+  `start`_, which is the case where a concurrent dispatch is genuinely dangerous. _Why
+  accepted:_ two hours is longer than any observed run and shorter than every stream's schedule,
+  so the window closes on its own before the next scheduled dispatch, and a refusal that names
+  the dead holder's pid and start time is a better failure than two runs publishing over each
+  other. _What it costs:_ a manual retry inside that window is refused. _What limits it:_
+  `start --steal-lock`, the sixth cover — an operator override that runs through the same atomic
+  steal, so it cannot itself admit two runs, and the refusal message names it.
 - **Steal tokens are litter by design.** A stolen dead claim leaves `.steal-<nonce>` behind
   permanently, because deleting it on success is exactly the bug the torture test caught: a
   racer holding the same dead claim would find the token free and replace the new owner (§4.3).
