@@ -386,6 +386,57 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                 "error": f"subnet-ip-exhaustion: {' '.join(argv)} failed (rc={result.rc}): {result.stderr.strip()[:300]}",
             }
         ]
+    if not parsed:
+        # rc=0 and a valid `[]`, so the gate above is satisfied -- and the
+        # scope would be reported fully covered with zero subnets in it. That
+        # is the exact outcome the comment above says must not happen; the
+        # gate simply never saw this shape, because `list-usable` answers
+        # "none you may use" with success rather than a permission error.
+        #
+        # The two readings are "this project has no subnets" and "this
+        # identity lacks compute.subnetworks.use", and `subnets list` tells
+        # them apart: it needs only compute.subnetworks.list, which the
+        # read-only role set already grants. On the deployed install it
+        # returns 42 while `list-usable` returns 0 -- so every run reported
+        # subnet-ip-exhaustion as covered and measured nothing.
+        listing, list_result = run_and_gate(
+            ["gcloud", "compute", "networks", "subnets", "list",
+             "--project", project, "--format", "json"],
+            run=run,
+        )
+        if listing is None:
+            # The tie-breaker itself gated closed, so the ambiguity stands.
+            # Fail closed rather than pick the cheerful reading.
+            why = (
+                f"and the corroborating `subnets list` also failed "
+                f"(rc={list_result.rc}): {list_result.stderr.strip()[:200]}"
+            )
+        elif listing:
+            why = (
+                f"but `subnets list` sees {len(listing)} in this project. "
+                f"list-usable reports only subnets the caller holds "
+                f"compute.subnetworks.use on, and its ipUtilization is the sole "
+                f"field source for this check, so the check cannot run under the "
+                f"current identity. Grant compute.subnetworks.use to the audit "
+                f"service account or accept the gap."
+            )
+        else:
+            # Both reads agree the project has no subnets. A real empty scope,
+            # not a hidden one -- nothing to audit and nothing to surface.
+            log(f"{project}: no subnets in this project (list-usable and list both empty)")
+            return []
+        return [
+            {
+                "name": f"project/{project}/subnets",
+                "project": project,
+                "location": "global",
+                "outcome": "gate-failed",
+                "error": (
+                    f"subnet-ip-exhaustion: {' '.join(argv)} returned 0 usable "
+                    f"subnets (rc=0, valid empty JSON) {why}"
+                ),
+            }
+        ]
     record = _record(" ".join(argv), result)
     out = []
     for item in parsed:

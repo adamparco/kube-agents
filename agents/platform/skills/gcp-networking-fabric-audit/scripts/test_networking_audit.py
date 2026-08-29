@@ -261,9 +261,70 @@ class CollectProjectTest(unittest.TestCase):
         project_entry = next(e for e in entries if e["name"] == "project/proj-1")
         self.assertEqual(project_entry["outcome"], "collected")
 
+    def test_an_empty_list_usable_with_visible_subnets_surfaces_a_gap(self):
+        # The production shape. On the deployed install `list-usable` answers
+        # rc=0 with `[]` because the audit identity lacks
+        # compute.subnetworks.use, while `subnets list` sees 42. rc=0 and
+        # valid JSON satisfy run_and_gate, so before this the scope was
+        # reported fully covered with zero subnets in it -- subnet-ip-
+        # exhaustion silently measured nothing on every run.
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(0, '[{"name": "s1"}, {"name": "s2"}]'),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("subnet-ip-exhaustion", subnet_entry["error"])
+        self.assertIn("compute.subnetworks.use", subnet_entry["error"])
+        self.assertIn("2", subnet_entry["error"])
+
+    def test_an_empty_list_usable_with_no_subnets_at_all_is_not_a_gap(self):
+        # The other reading of the same `[]`, and it must stay quiet: a
+        # project with no subnets is a real empty scope, and reporting a
+        # coverage gap for it would cry wolf on every run.
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(0, "[]"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertEqual([e for e in entries if e["name"].endswith("/subnets")], [])
+
+    def test_an_empty_list_usable_gates_closed_when_the_tie_breaker_also_fails(self):
+        # Neither reading can be ruled out, so fail closed rather than pick
+        # the cheerful one -- the whole point of the gate.
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(1, "", "permission denied"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("corroborating", subnet_entry["error"])
+        self.assertIn("permission denied", subnet_entry["error"])
+
     def test_one_failed_project_level_read_gates_the_whole_project_target_closed(self):
         responses = {
             "subnets list-usable": run_of(0, "[]"),
+            # Must follow the -usable key: first match wins in insertion
+            # order and "subnets list" is a prefix of it. Empty here means
+            # the project really has no subnets, so no coverage gap.
+            "subnets list": run_of(0, "[]"),
             "routers list": run_of(0, "[]"),
             "forwarding-rules list": run_of(0, "[]"),
             "networks list": run_of(1, "", "permission denied"),
@@ -278,6 +339,10 @@ class CollectProjectTest(unittest.TestCase):
     def test_router_with_nat_pulls_status_and_mapping(self):
         responses = {
             "subnets list-usable": run_of(0, "[]"),
+            # Must follow the -usable key: first match wins in insertion
+            # order and "subnets list" is a prefix of it. Empty here means
+            # the project really has no subnets, so no coverage gap.
+            "subnets list": run_of(0, "[]"),
             "routers list": run_of(
                 0,
                 '[{"name": "r1", "region": ".../regions/us-central1", '
@@ -298,6 +363,10 @@ class CollectProjectTest(unittest.TestCase):
     def test_router_without_nats_skips_status_and_mapping_calls(self):
         responses = {
             "subnets list-usable": run_of(0, "[]"),
+            # Must follow the -usable key: first match wins in insertion
+            # order and "subnets list" is a prefix of it. Empty here means
+            # the project really has no subnets, so no coverage gap.
+            "subnets list": run_of(0, "[]"),
             "routers list": run_of(0, '[{"name": "r1", "region": ".../regions/us-central1", "nats": []}]'),
             "forwarding-rules list": run_of(0, "[]"),
             "networks list": run_of(0, "[]"),
