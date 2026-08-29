@@ -826,8 +826,16 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if not any(requests):
             continue  # obtainability-audit's `no-requests` owns this
         owner_key = (owners[0]["kind"], owners[0]["name"]) if owners else ("Pod", name)
-        entry = by_owner.setdefault(owner_key, {"ns": ns, "pods": []})
+        entry = by_owner.setdefault(owner_key, {"ns": ns, "pods": [], "oldest_h": None})
         entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits})
+        # A peak is only as long as the pod that reported it. Monitoring keeps a
+        # week of history, but a Deployment rolled an hour ago has an hour of it,
+        # and a finding that says "over the trailing 168h" about that controller
+        # is claiming to have watched something that did not exist. Carry the
+        # longest-lived pod's age so the excerpt can state the window it really
+        # measured.
+        if age is not None:
+            entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * 24)
 
     hits = []
     for (kind, name), entry in by_owner.items():
@@ -859,6 +867,8 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if delta_cpu < 2 and delta_mem_gib < 4:
             continue
 
+        oldest_h = entry["oldest_h"]
+        window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
         severity = "major" if delta_cpu >= 8 or delta_mem_gib >= 32 else "minor"
         if autopilot and severity == "minor":
             severity = "major"
@@ -867,7 +877,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             {
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
-                "excerpt": f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB over the trailing {USAGE_WINDOW_HOURS}h (Cloud Monitoring)",
+                "excerpt": f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB over the trailing {window_h}h (Cloud Monitoring)",
                 "severity": severity,
                 "_guaranteed": guaranteed,
             }

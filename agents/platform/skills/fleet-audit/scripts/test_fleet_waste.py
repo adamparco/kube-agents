@@ -621,6 +621,26 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
         self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
 
+    def test_the_window_shrinks_to_a_controller_younger_than_it(self):
+        # Monitoring holds a week of history; a Deployment rolled six hours ago
+        # has six hours of it. Reporting "over the trailing 168h" there claims
+        # to have watched something that did not exist for 162 of them.
+        pod = self.deployment_pod(started="2026-07-31T18:00:00Z")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertIn("trailing 6h", hits[0]["excerpt"])
+
+    def test_the_window_follows_the_longest_lived_pod_of_the_controller(self):
+        old = self.deployment_pod(name="api-1", started="2026-07-01T00:00:00Z")
+        fresh = self.deployment_pod(name="api-2", started="2026-07-31T18:00:00Z")
+        peaks = {("default", "api-1"): (0.4, 1536.0), ("default", "api-2"): (0.5, 1536.0)}
+        hits = fw.check_overrequest({"pods": [old, fresh]}, peaks, now=NOW, autopilot=False)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
+
+    def test_an_unknown_start_time_falls_back_to_the_full_window(self):
+        pod = self.deployment_pod(started="")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
+
     def test_pending_pod_is_never_flagged(self):
         pod = self.deployment_pod()
         pod["status"]["phase"] = "Pending"
