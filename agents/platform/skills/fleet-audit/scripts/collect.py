@@ -139,11 +139,40 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         return Run(argv, 124, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
 
 
-def enumerate_clusters(project: str, *, run: RunFn = default_run) -> list[dict]:
+def not_running_entry(c: dict, project: str) -> dict:
+    """A manifest target for a cluster whose state rules out auditing it.
+
+    Every collector here filters `clusters list` down to `RUNNING`, which is
+    right — a PROVISIONING cluster has no API server to read and a STOPPING one
+    is on its way out. Dropping the rest on the floor is what is wrong. The
+    manifest is the run's only account of the fleet it saw, so a cluster that
+    never reaches it is indistinguishable from a cluster that does not exist,
+    and the document is free to publish a fleet-wide all-clear over a fleet
+    quietly missing it. DEGRADED is the case that makes this bite: the state
+    likeliest to be worth a finding is the one the filter throws away silently.
+
+    Recorded as a non-`collected` target, it becomes something the document has
+    to place in `scope.skipped` with a reason, and `coverage_gaps` renders it as
+    "not audited". `fleet_drift.py` reaches the same conclusion through
+    `cluster_eligibility`; it enumerates every cluster and carries the reason as
+    a limitation instead, because its checks compare clusters against each other
+    rather than reading inside them.
+    """
+    return {
+        "name": c.get("name", ""),
+        "project": project,
+        "location": c.get("location") or c.get("zone") or "",
+        "outcome": "unreachable",
+        "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
+    }
+
+
+def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[dict], list[dict]]:
     """Every `RUNNING` cluster in `project`, as `{name, location, project,
-    autopilot}`. Raises on a `gcloud` failure — an audit that could not
-    enumerate the fleet has nothing to report against, the same rule
-    `handle_start`'s callers already follow for a bare `gcloud` failure.
+    autopilot}`, plus a manifest target for each cluster that is not RUNNING.
+    Raises on a `gcloud` failure — an audit that could not enumerate the fleet
+    has nothing to report against, the same rule `handle_start`'s callers
+    already follow for a bare `gcloud` failure.
     """
     result = run(["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"])
     if result.rc != 0:
@@ -152,7 +181,7 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> list[dict]:
         clusters = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"cluster enumeration returned non-JSON: {exc}") from exc
-    return [
+    running = [
         {
             "name": c["name"],
             "location": c.get("location") or c.get("zone"),
@@ -162,6 +191,7 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> list[dict]:
         for c in clusters
         if c.get("status") == "RUNNING"
     ]
+    return running, [not_running_entry(c, project) for c in clusters if c.get("status") != "RUNNING"]
 
 
 def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
@@ -1839,7 +1869,7 @@ def collect_fleet(
         raise ValueError(f"no check table for {audit_id!r} yet — see this file's module docstring")
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    clusters = enumerate_clusters(project, run=run)
+    clusters, not_running = enumerate_clusters(project, run=run)
 
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1855,7 +1885,7 @@ def collect_fleet(
         "audit": audit_id,
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": results,
+        "clusters": results + not_running,
     }
 
 

@@ -1188,6 +1188,68 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         beta_entry = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
         self.assertIn("unattached-disk", {c["check"] for c in beta_entry["candidates"]})
 
+    def test_a_project_whose_clusters_cannot_be_listed_is_recorded_not_skipped(self):
+        # `project/beta`'s compute entry still arrives as `collected`, so
+        # without a second entry for the enumeration itself the document sees a
+        # project with two of three checks and no clusters -- exactly what a
+        # genuinely cluster-free project looks like.
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "acme\nbeta\n")
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                project = argv[argv.index("--project") + 1]
+                if project == "beta":
+                    return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+                cluster = {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
+
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("project/beta/clusters", by_name)
+        self.assertEqual(by_name["project/beta/clusters"]["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", by_name["project/beta/clusters"]["error"])
+
+    def test_a_cluster_that_is_not_running_is_recorded_as_an_unreachable_target(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(
+                    0,
+                    json.dumps(
+                        [
+                            {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}},
+                            {"name": "sick", "location": "us-east4", "status": "DEGRADED"},
+                        ]
+                    ),
+                )
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["sick"]["outcome"], "unreachable")
+        self.assertIn("DEGRADED", by_name["sick"]["error"])
+        self.assertEqual(by_name["c1"]["outcome"], "collected")
+
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
     def test_checks_run_copied_from_a_collected_cluster_survives_cross_check(self):

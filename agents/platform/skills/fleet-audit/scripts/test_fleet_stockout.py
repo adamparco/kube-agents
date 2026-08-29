@@ -146,9 +146,32 @@ class EnumerateClustersTest(unittest.TestCase):
         def run(argv, **kwargs):
             return run_of(0, clusters_json)
 
-        clusters = fs.enumerate_clusters("acme", run=run)
+        clusters, not_running = fs.enumerate_clusters("acme", run=run)
         self.assertTrue(next(c for c in clusters if c["name"] == "c1")["has_nap"])
         self.assertFalse(next(c for c in clusters if c["name"] == "c2")["has_nap"])
+        self.assertEqual(not_running, [])
+
+    def test_a_cluster_that_is_not_running_comes_back_as_an_unreachable_target(self):
+        # Dropped rather than recorded, a DEGRADED cluster is indistinguishable
+        # from one that does not exist, and the run can publish a fleet-wide
+        # all-clear over a fleet quietly missing it.
+        clusters_json = json.dumps(
+            [
+                {"name": "c1", "location": "us-central1-a", "status": "RUNNING"},
+                {"name": "sick", "location": "us-east4", "status": "DEGRADED"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            return run_of(0, clusters_json)
+
+        clusters, not_running = fs.enumerate_clusters("acme", run=run)
+        self.assertEqual([c["name"] for c in clusters], ["c1"])
+        self.assertEqual(len(not_running), 1)
+        self.assertEqual(not_running[0]["name"], "sick")
+        self.assertEqual(not_running[0]["outcome"], "unreachable")
+        self.assertEqual(not_running[0]["location"], "us-east4")
+        self.assertIn("DEGRADED", not_running[0]["error"])
 
 
 class RegionOfTest(unittest.TestCase):

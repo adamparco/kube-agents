@@ -814,7 +814,12 @@ class TestCollectFleet(unittest.TestCase):
         names = {c["name"]: c["outcome"] for c in manifest["clusters"]}
         self.assertEqual(names, {"c1": "collected", "c2": "unreachable", "c3": "collected"})
 
-    def test_a_non_running_cluster_is_never_enumerated(self):
+    def test_a_non_running_cluster_is_recorded_rather_than_audited(self):
+        # No check runs against it -- a STOPPING cluster has no API server to
+        # read. But it stays in the manifest as a target the document has to
+        # account for: dropped entirely it reads exactly like a cluster that
+        # does not exist, and the run publishes a fleet-wide verdict over a
+        # fleet quietly one cluster short.
         clusters_json = json.dumps(
             [
                 {"name": "c1", "location": "us-central1", "status": "RUNNING"},
@@ -835,7 +840,11 @@ class TestCollectFleet(unittest.TestCase):
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
                     patch.object(collect, "SCRATCH_DIR", tmp):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
-        self.assertEqual([c["name"] for c in manifest["clusters"]], ["c1"])
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
+        self.assertEqual(outcomes, {"c1": "collected", "stopping": "unreachable"})
+        stopping = next(c for c in manifest["clusters"] if c["name"] == "stopping")
+        self.assertIn("STOPPING", stopping["error"])
+        self.assertNotIn("commands", stopping)
 
     def test_an_unknown_audit_id_refuses_rather_than_collecting_nothing(self):
         with self.assertRaises(ValueError):

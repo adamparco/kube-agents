@@ -191,23 +191,51 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
         parsed, _ = run_and_gate(
             ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
         )
-        if parsed:
+        # `[]` and `None` are different answers and only the first one means the
+        # project owes this audit nothing. A project this probe could not read
+        # stays in scope so `collect_fleet` records the loss as a `gate-failed`
+        # target; dropped here it leaves no trace in the manifest at all, and a
+        # project nobody could enumerate then reads exactly like one holding no
+        # clusters. `patch_readiness.py` carries the same guard.
+        if parsed is None or parsed:
             projects.append(candidate)
     return projects
 
 
-def enumerate_clusters(project: str, *, run: RunFn) -> list[dict]:
+def not_running_entry(c: dict, project: str) -> dict:
+    """A manifest target for a cluster whose state rules out auditing it.
+
+    Filtering `clusters list` down to RUNNING is right -- a PROVISIONING
+    cluster has no API server to read. Dropping the rest without a trace is
+    not: the manifest is the run's only account of the fleet it saw, so a
+    cluster absent from it reads exactly like a cluster that does not exist,
+    and the document can publish a fleet-wide all-clear over a fleet quietly
+    missing it. DEGRADED is the case that makes this bite. Recorded as a
+    non-`collected` target, the loss is something the document has to place in
+    `scope.skipped` with a reason. `collect.py` carries the same helper.
+    """
+    return {
+        "name": c.get("name", ""),
+        "project": project,
+        "location": c.get("location") or c.get("zone") or "",
+        "outcome": "unreachable",
+        "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
+    }
+
+
+def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled)"]
     )
     if result.rc != 0:
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
     clusters = json.loads(result.stdout or "[]")
-    return [
+    running = [
         {"name": c["name"], "location": c.get("location"), "project": project, "autopilot": bool((c.get("autopilot") or {}).get("enabled"))}
         for c in clusters
         if c.get("status") == "RUNNING"
     ]
+    return running, [not_running_entry(c, project) for c in clusters if c.get("status") != "RUNNING"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1240,11 +1268,31 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     projects = get_target_projects(project, run=run)
 
     clusters: list[dict] = []
+    unaudited: list[dict] = []
     for p in projects:
         try:
-            clusters.extend(enumerate_clusters(p, run=run))
+            running, not_running = enumerate_clusters(p, run=run)
+            clusters.extend(running)
+            unaudited.extend(not_running)
         except RuntimeError as exc:
-            log(f"{p}: cluster enumeration failed, skipping project this run: {exc}")
+            # A log line is not a record. The manifest is the only account of
+            # what this run managed to read, and a project whose clusters could
+            # not be listed used to leave nothing in it -- its `project/<p>`
+            # compute entry still arrived as `collected`, so the document saw a
+            # project with two of three checks and zero clusters, which is
+            # exactly what a genuinely cluster-free project looks like. Recorded
+            # as a target, the loss is something the document has to account for
+            # and §6 turns it into a coverage gap.
+            log(f"{p}: cluster enumeration failed, no clusters known from this project: {exc}")
+            unaudited.append(
+                {
+                    "name": f"project/{p}/clusters",
+                    "project": p,
+                    "location": "global",
+                    "outcome": "gate-failed",
+                    "error": str(exc),
+                }
+            )
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
@@ -1282,7 +1330,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         "audit": "fleet-wide-cost-analysis",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": cluster_entries + project_entries,
+        "clusters": cluster_entries + project_entries + unaudited,
     }
 
 

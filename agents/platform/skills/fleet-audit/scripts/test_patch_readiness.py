@@ -441,6 +441,50 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual({c["project"] for c in manifest["clusters"]}, {"acme-only"})
         self.assertEqual(manifest["audit"], "security-patch-orchestrator")
 
+    def test_a_project_the_probe_cannot_read_stays_in_scope_as_gate_failed(self):
+        # The discovery probe runs the same `clusters list` that
+        # `collect_project` gates on. Dropping the project when it fails means
+        # the gate-failed entry can never be written, and a project nobody
+        # could enumerate leaves no trace in the manifest at all.
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return run_of(0, "base\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "base\nforbidden\n")
+            if "clusters" in argv and "list" in argv:
+                if "forbidden" in argv:
+                    return run_of(1, "", "PERMISSION_DENIED: container.clusters.list")
+                return run_of(0, json.dumps([cluster()]))
+            if "get-server-config" in argv:
+                return run_of(0, json.dumps(server_config()))
+            raise AssertionError(f"unexpected call: {argv}")
+
+        manifest = pr.collect_fleet(run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("project/forbidden", by_name)
+        self.assertEqual(by_name["project/forbidden"]["outcome"], "gate-failed")
+        self.assertIn("PERMISSION_DENIED", by_name["project/forbidden"]["error"])
+
+    def test_a_project_with_no_clusters_is_left_out_rather_than_gate_failed(self):
+        # The other half of the same distinction: an empty list is an answer,
+        # and a project that genuinely holds no clusters owes this audit
+        # nothing. Only a failed read is a loss worth recording.
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return run_of(0, "base\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "base\nempty\n")
+            if "clusters" in argv and "list" in argv:
+                if "empty" in argv:
+                    return run_of(0, "[]")
+                return run_of(0, json.dumps([cluster()]))
+            if "get-server-config" in argv:
+                return run_of(0, json.dumps(server_config()))
+            raise AssertionError(f"unexpected call: {argv}")
+
+        manifest = pr.collect_fleet(run=run, now=NOW)
+        self.assertEqual({c["project"] for c in manifest["clusters"]}, {"base"})
+
 
 class AutopilotNotApplicableTest(unittest.TestCase):
     """The four node-pool checks on an Autopilot cluster.

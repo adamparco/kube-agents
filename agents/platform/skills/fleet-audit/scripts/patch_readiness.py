@@ -137,7 +137,15 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
         parsed, _ = run_and_gate(
             ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
         )
-        if parsed:
+        # `[]` and `None` are different answers and only the first one means the
+        # project owes this audit nothing. Dropping the second here is what makes
+        # the loss invisible: `collect_project` already writes a `gate-failed`
+        # `project/<id>` entry when this exact command fails, and that entry is
+        # the manifest's only record that a project existed and could not be
+        # read -- but a probe that filters the project out of scope first means
+        # it is never written, and the run publishes a fleet-wide verdict over a
+        # fleet quietly one project short. Keep it and let the gate fire.
+        if parsed is None or parsed:
             projects.append(candidate)
     return projects
 

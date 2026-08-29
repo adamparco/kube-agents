@@ -178,7 +178,28 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
     return kc, result
 
 
-def enumerate_clusters(project: str, *, run: RunFn) -> list[dict]:
+def not_running_entry(c: dict, project: str) -> dict:
+    """A manifest target for a cluster whose state rules out auditing it.
+
+    Filtering `clusters list` down to RUNNING is right -- a PROVISIONING
+    cluster has no API server to read. Dropping the rest without a trace is
+    not: the manifest is the run's only account of the fleet it saw, so a
+    cluster absent from it reads exactly like a cluster that does not exist,
+    and the document can publish a fleet-wide all-clear over a fleet quietly
+    missing it. DEGRADED is the case that makes this bite. Recorded as a
+    non-`collected` target, the loss is something the document has to place in
+    `scope.skipped` with a reason. `collect.py` carries the same helper.
+    """
+    return {
+        "name": c.get("name", ""),
+        "project": project,
+        "location": c.get("location") or c.get("zone") or "",
+        "outcome": "unreachable",
+        "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
+    }
+
+
+def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
     result = run(
         [
             "gcloud", "container", "clusters", "list", "--project", project,
@@ -188,7 +209,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> list[dict]:
     if result.rc != 0:
         raise RuntimeError(f"cluster enumeration failed (rc={result.rc}): {result.stderr.strip()[:500]}")
     clusters = json.loads(result.stdout or "[]")
-    return [
+    running = [
         {
             "name": c["name"],
             "location": c.get("location"),
@@ -201,6 +222,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> list[dict]:
         for c in clusters
         if c.get("status") == "RUNNING"
     ]
+    return running, [not_running_entry(c, project) for c in clusters if c.get("status") != "RUNNING"]
 
 
 def region_of(location: str) -> str:
@@ -1017,7 +1039,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         result = run(["gcloud", "config", "get-value", "project"])
         resolved_project = result.stdout.strip() if result.rc == 0 else ""
 
-    clusters = enumerate_clusters(resolved_project, run=run)
+    clusters, not_running = enumerate_clusters(resolved_project, run=run)
     cluster_entries = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_cluster, c, run=run): i for i, c in enumerate(clusters)}
@@ -1032,7 +1054,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         "audit": "stockout-prevention",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": [e for e in cluster_entries if e] + ([project_entry] if project_entry else []),
+        "clusters": [e for e in cluster_entries if e] + ([project_entry] if project_entry else []) + not_running,
     }
 
 
