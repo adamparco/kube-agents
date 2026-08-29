@@ -8,6 +8,9 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
+    # The third read-only telemetry signal. roles/cloudtrace.viewer is granted
+    # in both permission sets, and a role on a disabled API is inert.
+    "cloudtrace.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -54,6 +57,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
@@ -66,6 +70,7 @@ locals {
     # The agent can query logs for diagnostics but must not administer the
     # audit-log sink.
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",

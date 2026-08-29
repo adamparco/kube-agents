@@ -68,6 +68,7 @@ The **gke-admin** set binds:
 - `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
 - `roles/monitoring.admin` — manage monitoring configuration.
 - `roles/logging.viewer` — read logs only (the agent must **not** administer the audit-log sink).
+- `roles/cloudtrace.viewer` — read traces only, for the same reason.
 - `roles/iam.serviceAccountUser` — act as service accounts when running jobs.
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
@@ -76,7 +77,7 @@ The default **read-only** set swaps the admin roles for viewers:
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
 - `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
-- `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
+- `roles/monitoring.viewer`, `roles/logging.viewer`, `roles/cloudtrace.viewer` — read-only telemetry: metrics, logs, and traces. Trace uses the viewer role rather than `roles/cloudtrace.user`, which also carries `cloudtrace.tasks.create` and the trace-scope writes.
 - `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, `roles/mcp.toolUser` — unchanged.
 
 The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
@@ -152,7 +153,7 @@ Weigh two things before switching a mode on. A classic token carries `repo` — 
   done
   ```
 
-  Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
+  Leave `roles/logging.viewer`, `roles/cloudtrace.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
 
 The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 
@@ -188,6 +189,7 @@ The agent never has direct write access to running infrastructure — see [Decla
 - **`AgentPlugin` create/update is an administrative privilege.** Treat the permission to create an `AgentPlugin` as equivalent to running code inside the agent pod, because that is what it does. The plugin's OCI image is mounted into the agent container and Hermes imports it, so the plugin executes with the agent's ServiceAccount, its Workload Identity binding, and its access to the credential proxy. The controls below constrain what a plugin can declare _in the CR_; none of them sandbox the plugin code itself. Restrict `agentplugins` RBAC to the same set of principals you would trust to change the agent's container image.
 
   The controls that do apply, and their exact scope:
+
   - **Opt-in `agentRef` targeting.** A plugin must set `spec.agentRef` to a `PlatformAgent.metadata.name` in its own namespace. Plugins whose `agentRef` does not match are ignored — a plugin cannot attach itself to every agent by omitting the field.
   - **`spec.targetProfile` chooses which agent's toolset the plugin sits beside.** It does not widen the trust boundary — plugin code already runs in the agent pod with its ServiceAccount, whichever profile loads it — but it does decide the company it keeps. A plugin left on the default profile loads into the Planning Agent, which is deliberately stripped of terminal, file, and code-execution tools. Targeting `platform` loads it into the Platform Agent instead, alongside `gcloud`, `kubectl`, and the GitOps write path, and makes its skills resolvable to the agent that holds them. Review a plugin that targets a privileged profile with that in mind, and note that `spec.config` cannot reach the `agent` subtree from either place, so a plugin still cannot raise its own retry or iteration budget.
   - **Name restriction.** `metadata.name` must match `^[a-z][a-z0-9]*$` (max 56 characters), enforced by a CEL rule on the CRD. The name becomes both the mount directory and the module identifier Hermes imports.
