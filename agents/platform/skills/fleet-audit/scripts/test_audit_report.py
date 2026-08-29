@@ -8389,6 +8389,217 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertNotIn("⚠", out)
 
 
+class TestLimitationRestatingNotApplicable(unittest.TestCase):
+    """A disposition written twice must not count as a gap twice.
+
+    The live case: `gcp-networking-fabric-audit` against an auto-mode network.
+    42 subnets, one holding allocations and 41 empty. Network Analyzer
+    publishes no utilization for a subnet with nothing allocated, so the
+    collector declared `subnet-ip-exhaustion` not-applicable on each of the 41
+    with that reason — correctly, because a subnet holding no addresses cannot
+    exhaust them. The model then wrote the same reason into `limitations` as
+    well, and 41 targets that had refused nothing produced 41 coverage gaps and
+    a `partial: True` on a run whose every target came back `collected`.
+    """
+
+    NET = "gcp-networking-fabric-audit"
+    REASON = (
+        "subnet-ip-exhaustion could not be measured on this subnet: gcloud's "
+        "UsableSubnetwork omits ipUtilization and Network Analyzer's "
+        "ipAddressInsight published no stats for it (no allocations recorded)."
+    )
+
+    def _doc(self, clusters):
+        return make_doc(findings=[], audit=self.NET, clusters=clusters)
+
+    def _subnet(self, name="acme-prod/us-east4/default", **extra):
+        base = {"name": name, "location": "us-east4", "project": "acme-prod"}
+        base.update(extra)
+        return base
+
+    def _clean_project(self):
+        """Keeps `_unenumerated_kind_gaps` out of these assertions."""
+        return {
+            "name": "project/acme-prod",
+            "location": "global",
+            "project": "acme-prod",
+            "checks_run": list(
+                audit_report.audit_target_checks(self.NET, "project/acme-prod")
+            ),
+        }
+
+    def _measured_subnet(self):
+        return self._subnet(
+            name="acme-prod/us-east4/measured",
+            checks_run=["subnet-ip-exhaustion"],
+        )
+
+    def test_a_limitation_restating_the_na_reason_is_not_a_gap(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                        ],
+                        limitations=self.REASON,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_forty_one_empty_subnets_do_not_make_the_run_partial(self):
+        """The live shape, at its live size."""
+        subnets = [
+            self._subnet(
+                name=f"acme-prod/region-{i}/default",
+                checks_not_applicable=[
+                    {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                ],
+                limitations=self.REASON,
+            )
+            for i in range(41)
+        ]
+        gaps = audit_report.coverage_gaps(
+            self._doc([self._clean_project(), self._measured_subnet(), *subnets])
+        )
+        self.assertEqual(gaps, [])
+
+    def test_a_limitation_naming_no_check_stays_a_gap(self):
+        """Degradation prose the not-applicable entry cannot have dispositioned.
+
+        This is the reason the rule requires a slug rather than treating any
+        limitation on a target with an N/A entry as already answered: a check
+        that ran against less than it should have is exactly what `limitations`
+        is for, and nothing here suppresses it.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                        ],
+                        limitations="only 2 of 5 ranges on this subnet were readable",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("only 2 of 5 ranges", gaps[0])
+
+    def test_a_limitation_naming_a_check_that_ran_stays_a_gap(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    {
+                        "name": "project/acme-prod",
+                        "location": "global",
+                        "project": "acme-prod",
+                        "checks_run": list(
+                            audit_report.audit_target_checks(
+                                self.NET, "project/acme-prod"
+                            )
+                        ),
+                        "checks_not_applicable": [
+                            {"check": "subnet-ip-exhaustion", "reason": "n/a here"}
+                        ],
+                        "limitations": (
+                            "cloud-armor-false-positive saw 2 of 5 policies"
+                        ),
+                    },
+                    self._measured_subnet(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("cloud-armor-false-positive", gaps[0])
+
+    def test_a_limitation_naming_both_kinds_of_check_stays_a_gap(self):
+        """One slug outside `na` keeps the whole string.
+
+        Suppressing the mixed case would drop the half that describes a check
+        that ran, which is the half no other field records.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    {
+                        "name": "project/acme-prod",
+                        "location": "global",
+                        "project": "acme-prod",
+                        "checks_run": list(
+                            audit_report.audit_target_checks(
+                                self.NET, "project/acme-prod"
+                            )
+                        ),
+                        "checks_not_applicable": [
+                            {"check": "subnet-ip-exhaustion", "reason": "n/a here"}
+                        ],
+                        "limitations": (
+                            "subnet-ip-exhaustion has no data source and "
+                            "cloud-armor-false-positive saw 2 of 5 policies"
+                        ),
+                    },
+                    self._measured_subnet(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("cloud-armor-false-positive", gaps[0])
+
+    def test_a_limitation_with_no_na_entries_at_all_stays_a_gap(self):
+        """Nothing was dispositioned, so there is nothing to have said twice."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_run=["subnet-ip-exhaustion"],
+                        limitations="subnet-ip-exhaustion read a stale cache",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("stale cache", gaps[0])
+
+    def test_a_missing_check_is_still_reported_alongside_a_suppressed_string(self):
+        """Suppressing the prose must not suppress the roster half with it."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    {
+                        "name": "project/acme-prod",
+                        "location": "global",
+                        "project": "acme-prod",
+                        "checks_run": ["cloud-nat-exhaustion"],
+                        "checks_not_applicable": [
+                            {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                        ],
+                        "limitations": self.REASON,
+                    },
+                    self._measured_subnet(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("applicable checks did not run", gaps[0])
+        self.assertNotIn("no allocations recorded", gaps[0])
+
+    def test_the_helper_is_false_without_a_limitation_or_without_na(self):
+        roster = audit_report.audit_target_checks(self.NET, "a/b/c")
+        self.assertFalse(
+            audit_report._limitation_restates_na("", {"subnet-ip-exhaustion"}, roster)
+        )
+        self.assertFalse(
+            audit_report._limitation_restates_na(self.REASON, set(), roster)
+        )
+
+
 class TestChecksRun(unittest.TestCase):
     """The field that tells an audit that ran from one that merely finished.
 

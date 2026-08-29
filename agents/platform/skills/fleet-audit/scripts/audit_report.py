@@ -2605,6 +2605,8 @@ def coverage_gaps(data: dict) -> list[str]:
         roster = audit_target_checks(audit_id, name)
         applicable = [check for check in roster if check not in na]
         missing = [check for check in applicable if check not in ran]
+        if _limitation_restates_na(limitation, na, roster):
+            limitation = ""
         if not limitation and not missing:
             continue
         # One line per cluster, not one per gap: the same cluster explaining
@@ -2620,6 +2622,46 @@ def coverage_gaps(data: dict) -> list[str]:
         gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
     gaps.extend(_unenumerated_kind_gaps(audit_id, scope.get("clusters") or []))
     return gaps
+
+
+def _limitation_restates_na(limitation: str, na: set, roster: tuple) -> bool:
+    """Is this `limitations` string just the not-applicable reason said twice?
+
+    A limitation normally means a check ran against less than it should have —
+    two of five Cloud Armor policies readable, so the check's silence covers
+    three it never saw. That is a real gap and stays one.
+
+    What this catches is the other thing a collector produces: a check it
+    already declared inapplicable, whose reason the model then also writes into
+    `limitations`. Both halves are correct in isolation and together they
+    double-count, because the entry is dispositioned twice and only the prose
+    half reaches this function's caller as an uncovered check. A live
+    `gcp-networking-fabric-audit` run turned 41 empty auto-mode subnets — every
+    one of them with `subnet-ip-exhaustion` properly declared not-applicable
+    because a subnet holding no allocations has no utilization to read — into
+    41 gaps and a `partial: True` on a run that had refused nothing.
+
+    Conservative on both edges, because a false negative here hides an
+    uncovered check:
+
+    - The limitation must name at least one check by slug. Prose naming no
+      check is the degradation case above, which no `checks_not_applicable`
+      entry can have dispositioned, so it stays a gap.
+    - Every slug it names must be one this target declared not-applicable. One
+      slug outside `na` means the prose is also talking about a check that ran,
+      and the whole string stays.
+
+    Slugs are looked for in the roster *and* in `na`, because a target
+    routinely declares a check it does not owe: the live project entry above
+    carries `subnet-ip-exhaustion` as not-applicable, and that check belongs to
+    the subnet kind, not the project one. Searching the roster alone would find
+    no slug in that entry's prose and call it degradation.
+    """
+    if not limitation or not na:
+        return False
+    na = set(na)
+    named = {check for check in set(roster) | na if check in limitation}
+    return bool(named) and named <= na
 
 
 def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
