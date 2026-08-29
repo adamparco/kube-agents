@@ -368,6 +368,21 @@ def _emit(slug: str, hit: dict) -> dict:
     }
 
 
+def _carries_utilization(subnet: dict) -> bool:
+    """Does this subnet expose the one field `check_subnet_ip_exhaustion`
+    reads, on its primary range or any secondary one?
+
+    Presence, not truthiness: a subnet sitting at `ipUtilization: 0.0` is
+    measured and empty, which is the opposite of unmeasured.
+    """
+    if isinstance(subnet.get("ipUtilization"), (int, float)):
+        return True
+    return any(
+        isinstance(sec.get("ipUtilization"), (int, float))
+        for sec in subnet.get("secondaryIpRanges") or []
+    )
+
+
 def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
     argv = ["gcloud", "compute", "networks", "subnets", "list-usable", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
@@ -434,6 +449,40 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                 "error": (
                     f"subnet-ip-exhaustion: {' '.join(argv)} returned 0 usable "
                     f"subnets (rc=0, valid empty JSON) {why}"
+                ),
+            }
+        ]
+    if not any(_carries_utilization(item) for item in parsed):
+        # Subnets came back, but not one carries the only field this check
+        # reads. `check_subnet_ip_exhaustion` returns None for every one of
+        # them, which is indistinguishable from "measured, all healthy" --
+        # the same silent-clean failure as the empty list above, one layer in.
+        #
+        # This is what the deployed install actually does once
+        # compute.subnetworks.use is granted: `list-usable` returns 42 subnets
+        # and none has ipUtilization, in v1, beta and alpha alike. The field
+        # is simply not part of gcloud's UsableSubnetwork today, so the check
+        # has no data source on this surface and saying so is the only honest
+        # outcome. `recommender ... google.compute.subnetwork.
+        # IpUtilizationInsight` is GCP's supported answer and would need the
+        # Recommender API enabled plus its own role and allowlist entry.
+        log(f"{project}: {len(parsed)} usable subnets, none carrying ipUtilization")
+        return [
+            {
+                "name": f"project/{project}/subnets",
+                "project": project,
+                "location": "global",
+                "outcome": "gate-failed",
+                "error": (
+                    f"subnet-ip-exhaustion: {' '.join(argv)} returned "
+                    f"{len(parsed)} subnets but none carries `ipUtilization` on "
+                    f"its primary range or any secondary range, and that field "
+                    f"is the check's sole data source. Not a permission problem "
+                    f"-- gcloud's UsableSubnetwork does not expose utilization "
+                    f"in v1, beta or alpha. The check cannot run against this "
+                    f"surface; enabling the Recommender API and reading "
+                    f"google.compute.subnetwork.IpUtilizationInsight is the "
+                    f"supported alternative."
                 ),
             }
         ]

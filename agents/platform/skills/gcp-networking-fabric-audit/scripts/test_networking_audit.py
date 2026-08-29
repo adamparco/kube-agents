@@ -284,6 +284,51 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("compute.subnetworks.use", subnet_entry["error"])
         self.assertIn("2", subnet_entry["error"])
 
+    def test_subnets_without_the_utilization_field_are_a_gap_not_a_clean_pass(self):
+        # What the deployed install returns once compute.subnetworks.use is
+        # granted: real subnets, and not one carries ipUtilization -- the
+        # field is absent from gcloud's UsableSubnetwork in v1, beta and
+        # alpha. check_subnet_ip_exhaustion returns None for each, which
+        # reads exactly like "measured, all healthy" unless it is caught here.
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/20"}, '
+                '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+                '"ipCidrRange": "10.1.0.0/20", '
+                '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}]',
+            ),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entries = [e for e in entries if e["name"].endswith("/subnets")]
+        self.assertEqual(len(subnet_entries), 1)
+        self.assertEqual(subnet_entries[0]["outcome"], "gate-failed")
+        self.assertIn("ipUtilization", subnet_entries[0]["error"])
+        self.assertIn("2 subnets", subnet_entries[0]["error"])
+        # And no per-subnet target claiming it was collected.
+        self.assertEqual([e for e in entries if e["name"].startswith("proj-1/")], [])
+
+    def test_a_subnet_measured_at_zero_utilization_is_not_treated_as_unmeasured(self):
+        # 0.0 is a measurement. Testing presence rather than truthiness is the
+        # difference between "this subnet is empty" and "nobody looked".
+        self.assertTrue(na._carries_utilization({"ipUtilization": 0.0}))
+        self.assertTrue(
+            na._carries_utilization(
+                {"secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.0}]}
+            )
+        )
+        self.assertFalse(na._carries_utilization({"ipCidrRange": "10.0.0.0/20"}))
+        self.assertFalse(
+            na._carries_utilization({"secondaryIpRanges": [{"rangeName": "pods"}]})
+        )
+        self.assertFalse(na._carries_utilization({"ipUtilization": None}))
+
     def test_an_empty_list_usable_with_no_subnets_at_all_is_not_a_gap(self):
         # The other reading of the same `[]`, and it must stay quiet: a
         # project with no subnets is a real empty scope, and reporting a

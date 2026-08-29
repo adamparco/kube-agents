@@ -49,6 +49,7 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 
 - **Command:** `gcloud compute networks subnets list-usable --project=$PROJECT --format=json`
 - **Flag when:** the subnet's primary range, or any entry in `secondaryIpRanges`, carries `ipUtilization > 0.85` — under 15% of that range's addresses remain.
+- **If no subnet in the response carries `ipUtilization` at all, this check did not run — report it as a coverage gap and flag nothing.** The field is the only source for the threshold above, and it is absent from gcloud's `UsableSubnetwork` in v1, `beta` and `alpha`, so an install can return every subnet and still have nothing to measure. The collector already emits that gap; do not paper over it by reading `ipCidrRange` alone, which gives a range's size and says nothing about how much of it is used. GCP's supported source for this signal is the Recommender insight `google.compute.subnetwork.IpUtilizationInsight`, which needs the Recommender API enabled.
 - **Do NOT flag:** a primary or secondary range at or under 85% utilization.
 - **Severity:** `critical`.
 - **Impact:** "New pods or nodes cannot be scheduled once this range's addresses run out, and GKE has no way to expand a live cluster's Pod CIDR after creation."
