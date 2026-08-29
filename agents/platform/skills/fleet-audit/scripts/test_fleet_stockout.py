@@ -244,6 +244,31 @@ class DanglingComputeClassTest(unittest.TestCase):
         d = deployment("api")
         self.assertIsNone(fs.check_dangling_compute_class(d, {}, set()))
 
+    def test_flags_when_no_pool_carries_the_label_at_all(self):
+        """The arm's own target case, and an empty set used to turn it off. A
+        Standard cluster whose pools carry no `cloud.google.com/compute-class`
+        label has no pool the class can land on, which is exactly what
+        `nodePoolAutoCreation: false` makes fatal."""
+        cc = compute_class("cc1", [], node_pool_auto_creation=False)
+        d = deployment("api", node_selector={"cloud.google.com/compute-class": "cc1"})
+        hit = fs.check_dangling_compute_class(d, {"cc1": cc}, set())
+        self.assertIsNotNone(hit)
+        self.assertIn("no matching node pool", hit["excerpt"])
+
+    def test_stays_quiet_when_the_labels_are_unknown(self):
+        """`None`, not an empty set: the pools could not be read, or there are
+        no user pools to read. Flagging there would accuse every workload on a
+        cluster nobody could look at."""
+        cc = compute_class("cc1", [], node_pool_auto_creation=False)
+        d = deployment("api", node_selector={"cloud.google.com/compute-class": "cc1"})
+        self.assertIsNone(fs.check_dangling_compute_class(d, {"cc1": cc}, None))
+
+    def test_a_nonexistent_class_is_still_flagged_with_labels_unknown(self):
+        """Arm one needs no pool labels, so an unreadable `node-pools list`
+        must not take it down with arm two."""
+        d = deployment("api", node_selector={"cloud.google.com/compute-class": "missing"})
+        self.assertIsNotNone(fs.check_dangling_compute_class(d, {}, None))
+
 
 class SingleZoneNodepoolTest(unittest.TestCase):
     def test_flags_single_zone_autoscaling_no_nap(self):

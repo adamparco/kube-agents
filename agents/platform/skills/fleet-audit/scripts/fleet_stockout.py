@@ -266,7 +266,17 @@ def check_ccc_hyperdisk_incompatible(cc: dict, uses_hyperdisk: bool) -> dict | N
     return None
 
 
-def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[str, dict], node_pool_labels: set[str]) -> dict | None:
+def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[str, dict], node_pool_labels: set[str] | None) -> dict | None:
+    """`node_pool_labels` is `None` when the pool labels are unknown -- an
+    Autopilot cluster with no user node pools, or a `node-pools list` the
+    caller could not read -- and a set, possibly empty, when they are known.
+
+    The second arm used to test the set for truthiness, which silently
+    conflated the two: a Standard cluster whose pools carry no
+    `cloud.google.com/compute-class` label at all is the arm's own target case,
+    and an empty set turned it off there. Only `None` turns it off now, and
+    §3.9's `limitations` sentence is what says the read failed.
+    """
     spec = workload.get("spec") or {}
     template_spec = ((spec.get("template") or {}).get("spec")) or spec
     selector = (template_spec.get("nodeSelector") or {}).get("cloud.google.com/compute-class")
@@ -275,7 +285,7 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
     if selector:
         cc = compute_classes_by_name[selector]
         auto_create = ((cc.get("spec") or {}).get("nodePoolAutoCreation") or {}).get("enabled")
-        if auto_create is False and node_pool_labels and selector not in node_pool_labels:
+        if auto_create is False and node_pool_labels is not None and selector not in node_pool_labels:
             return {"object": f"{workload['kind']}/{workload['metadata']['name']}", "excerpt": f"references ComputeClass {selector!r} with nodePoolAutoCreation disabled and no matching node pool label/taint"}
     if selector:
         requests_gpu = any("nvidia.com/gpu" in ((c.get("resources") or {}).get("requests") or {}) for c in template_spec.get("containers") or [])
@@ -456,9 +466,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # ComputeClass-managed pools carry the class name as this label, not as
     # their own pool name -- matching against pool names would test the
     # wrong field and never actually find the reference.
-    node_pool_labels = {
-        v for p in node_pools for v in [((p.get("config") or {}).get("labels") or {}).get("cloud.google.com/compute-class")] if v
-    }
+    node_pool_labels = (
+        {v for p in node_pools for v in [((p.get("config") or {}).get("labels") or {}).get("cloud.google.com/compute-class")] if v}
+        if pools_readable
+        else None
+    )
 
     candidates: list[dict] = []
     commands: dict[str, dict] = {}
