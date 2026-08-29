@@ -6684,6 +6684,23 @@ def handle_finish(args: argparse.Namespace) -> None:
                 f"--manifest-file: {args.manifest_file} is not valid JSON: {exc}"
             ) from exc
         cross_check_manifest(data, manifest)
+    # Every cross-check above is reachable only through --manifest-file, and
+    # until now omitting it was silent. The security-patch run on 2026-08-29
+    # is what that costs: four dry-runs carrying the flag, then a fifth,
+    # publishing call without it. Nothing verified the document that actually
+    # shipped, and nothing in the output said so. Documenting the flag in eight
+    # SOPs did not hold -- the agent simply did not repeat it on the last line
+    # -- so the omission has to be refused rather than described.
+    waiver = str(getattr(args, "no_collector_manifest", "") or "").strip()
+    if manifest is None and not waiver:
+        raise ValidationError(
+            "--manifest-file is required: without it nothing checks the document "
+            "against what the collector actually ran, and a fabricated or "
+            "truncated scope publishes unchallenged. Pass the manifest the "
+            "collector wrote, or, on a run where the collector produced none, "
+            "--no-collector-manifest '<why>' — which publishes but reports the "
+            "run as partial."
+        )
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
     # Timing: `inspect_s` is t0 → here (the LLM-inclusive inspection phase),
@@ -6717,6 +6734,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     # announced as resolved, no remediation pull request is retired, and the
     # ledger is not closed.
     gaps = coverage_gaps(data)
+    # A waived run is a run whose scope nothing checked, which is the same
+    # thing coverage gaps already describe: the audit cannot fully vouch for
+    # what it saw. Carrying it as a gap rather than a quiet flag is what stops
+    # it closing a ledger or retiring a remediation pull request on the
+    # strength of an absence.
+    if waiver:
+        gaps.append(f"the collector manifest was waived — {waiver}")
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
 
@@ -7275,11 +7299,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--manifest-file",
         default=None,
         help=(
-            "Optional collect.py run manifest (see collect.py's module "
-            "docstring). When given, checks_run entries for a manifest "
-            "cluster marked 'collected' are cross-checked against the "
-            "manifest's own rc=0 commands — see cross_check_manifest. "
-            "Streams without a collector never pass this."
+            "The collect.py run manifest (see collect.py's module docstring). "
+            "checks_run entries for a manifest cluster marked 'collected' are "
+            "cross-checked against the manifest's own rc=0 commands, and a "
+            "'collected' cluster the document omits is refused — see "
+            "cross_check_manifest. Required unless --no-collector-manifest is "
+            "given."
+        ),
+    )
+    finish_parser.add_argument(
+        "--no-collector-manifest",
+        default=None,
+        metavar="REASON",
+        help=(
+            "Publish without a manifest, on a run where the collector produced "
+            "none and every check came from the manual fallback. REASON is "
+            "reported as a coverage gap, so the run is partial and closes no "
+            "ledger."
         ),
     )
 

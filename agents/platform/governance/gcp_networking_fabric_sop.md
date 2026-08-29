@@ -213,7 +213,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networki
 #     "silent_ok":true,"inspect_s":214.0,"publish_s":41.5}
 ```
 
-Omit `--manifest-file` only on a run where §2's collector never produced one. Given one, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`.
+`--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §2's collector never produced one, pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` target the document leaves out of `scope.clusters` altogether.
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
 - **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.

@@ -573,6 +573,20 @@ class BaseTestCase(unittest.TestCase):
 
     def run_finish(self, doc, argv_extra=(), audit=AUDIT):
         findings_file = self.write_findings(doc)
+        argv_extra = list(argv_extra)
+        # `finish` refuses to publish unverified (see handle_finish's
+        # --manifest-file guard). A manifest enumerating no clusters
+        # cross-checks nothing and adds no coverage gap, so it satisfies the
+        # guard while leaving every test here measuring what it measured
+        # before. Tests about the guard itself, or about a real cross-check,
+        # pass their own flag and get it instead.
+        if not any(
+            a.startswith("--manifest-file") or a.startswith("--no-collector-manifest")
+            for a in argv_extra
+        ):
+            empty = self.tmp_path / "empty-manifest.json"
+            empty.write_text(json.dumps({"clusters": []}), encoding="utf-8")
+            argv_extra += ["--manifest-file", str(empty)]
         return self.run_main(
             ["finish", "--audit", audit, "--findings-file", findings_file, *argv_extra]
         )
@@ -6406,12 +6420,64 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
         self.assertEqual(rc, 2)
 
-    def test_no_manifest_flag_means_no_cross_check_at_all(self):
-        # Every existing test in this file relies on this: unconverted
-        # streams keep today's attestation semantics unchanged.
+    def bare_finish(self, doc, argv_extra=()):
+        """`finish` with exactly the flags given — no manifest injected.
+
+        `run_finish` supplies an empty manifest so the 600-odd tests that
+        predate the guard keep measuring what they measured. These three are
+        about the guard, so they go around it.
+        """
+        return self.run_main(
+            [
+                "finish",
+                "--audit",
+                AUDIT,
+                "--findings-file",
+                self.write_findings(doc),
+                *argv_extra,
+            ]
+        )
+
+    def test_publishing_without_a_manifest_is_refused(self):
+        """The flag four dry-runs carried and the publishing call did not.
+
+        On 2026-08-29 the security-patch stream ran `finish --dry-run
+        --manifest-file …` four times while it worked the document into shape,
+        then made the real call without the flag. Nothing cross-checked the
+        document that actually shipped, and the only trace was `collect_s:
+        null` in the stored record. Eight SOPs document the flag; that was not
+        enough, because the failure is dropping it from one line rather than
+        never knowing about it.
+        """
         self.harness.replies = {"issue list": "[]"}
-        rc = self.run_finish(make_doc(findings=[]))
+        rc = self.bare_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
+        self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_a_waived_manifest_publishes_but_reports_a_coverage_gap(self):
+        # The cost SOP's documented exemption: a run where the collector
+        # produced nothing and every check came from the manual fallback. It
+        # publishes, but it cannot pass itself off as verified.
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.bare_finish(
+            make_doc(findings=[]),
+            ["--no-collector-manifest", "collector found no readable project"],
+        )
         self.assertEqual(rc, 0)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertIn(
+            "the collector manifest was waived — collector found no readable project",
+            payload["coverage_gaps"],
+        )
+
+    def test_a_blank_waiver_reason_does_not_satisfy_the_guard(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.bare_finish(make_doc(findings=[]), ["--no-collector-manifest", "   "])
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
 
     def test_a_passing_manifest_surfaces_collect_s_in_the_exit_payload(self):
         self.harness.replies = {"issue list": "[]"}

@@ -264,7 +264,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit obtainabilit
   --manifest-file /opt/data/scratch/manifest_obtainability-audit.json
 ```
 
-Omit `--manifest-file` only on a run where Step 2's collector never produced one — every check on every cluster came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`; a cluster the manifest marked `"unreachable"` or `"gate-failed"` is left to this SOP's ordinary attestation rules.
+`--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where Step 2's collector never produced one — every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether; a cluster the manifest marked `"unreachable"` or `"gate-failed"` is left to this SOP's ordinary attestation rules.
 
 One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
