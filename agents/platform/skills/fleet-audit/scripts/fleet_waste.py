@@ -852,6 +852,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     node_pools = node_pools or []
     pools_record = _record(" ".join(node_pools_argv), pools_result)
     limitations: list[str] = []
+    not_applicable: list[dict] = []
 
     pod_samples, node_samples, metrics_ok, top_result = take_usage_samples(kubeconfig, run=run, sleep=sleep)
     top_record = _record(f"KUBECONFIG={kubeconfig} kubectl top nodes --no-headers", top_result)
@@ -865,11 +866,21 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     candidates += [_emit("terminal-pods", h) for h in check_terminal_pods(context, now=now)]
     candidates += [_emit("idle-namespace", h) for h in check_idle_namespace(context, now=now)]
 
-    # Autopilot owns its node pools, so 3.7/3.8 are inapplicable there and the
-    # model says so in `checks_not_applicable`. Only a Standard cluster owes
-    # them, so only a Standard cluster can be short of them -- claiming the
-    # limitation on Autopilot too would raise a gap for a check that target
-    # does not owe, which is the double-counted disposition 7301c594 removed.
+    # Autopilot owns its node pools, so 3.7/3.8 are inapplicable there. Only a
+    # Standard cluster owes them, so only a Standard cluster can be short of
+    # them -- claiming the limitation on Autopilot too would raise a gap for a
+    # check that target does not owe, which is the double-counted disposition
+    # 7301c594 removed.
+    #
+    # The collector declares that itself rather than leaving it to the model,
+    # because the model has to remember *both* slugs and on 2026-08-29 it
+    # remembered one: three Autopilot clusters came back with `idle-nodepool`
+    # not-applicable and `scaledown-blocked` simply absent, which §6 reads --
+    # correctly, on what it was given -- as a check nobody ran. The weekly
+    # `fleet-wide-cost-analysis` published `partial: true` with three coverage
+    # gaps naming a check that cannot exist on those clusters. `autopilot` is a
+    # fact the collector already holds, so the disposition belongs here where it
+    # is the same on every run.
     if not cluster.get("autopilot"):
         if pools_readable:
             commands["idle-nodepool"] = pools_record
@@ -884,6 +895,18 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
                 f"(rc={pools_result.rc}) — "
                 f"{pools_result.stderr.strip()[:200] or 'no stderr'}"
             )
+    else:
+        not_applicable += [
+            {
+                "check": slug,
+                "reason": (
+                    "Autopilot manages this cluster's nodes and exposes no node "
+                    "pools to size or to find scaledown-blocked, so the check has "
+                    "no object to run against."
+                ),
+            }
+            for slug in ("idle-nodepool", "scaledown-blocked")
+        ]
 
     if metrics_ok:
         commands["overrequest"] = top_record
@@ -910,6 +933,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     }
     if limitations:
         entry["limitations"] = "; ".join(limitations)
+    if not_applicable:
+        entry["checks_not_applicable"] = not_applicable
     return entry, fleet_facts
 
 
@@ -992,7 +1017,15 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
 
 
 def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime) -> dict | None:
-    disks_argv = ["gcloud", "compute", "disks", "list", "--project", project, "--filter", "-users:*", "--format", "json"]
+    # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
+    # starting with `-` reads as a flag to gcloud's own argument parser, which
+    # then rejects the command for the argument it thinks is missing
+    # (`argument --filter: expected one argument`, rc=2). This read therefore
+    # failed on every run since it was written, and because the five reads below
+    # gate as one it took the whole project target down with it -- every weekly
+    # `fleet-wide-cost-analysis` published `project/<p>` as `gate-failed`, so
+    # `unattached-disk` has never once been evaluated by the collector.
+    disks_argv = ["gcloud", "compute", "disks", "list", "--project", project, "--filter=-users:*", "--format", "json"]
     disks_parsed, disks_result = run_and_gate(disks_argv, run=run)
     addr_argv = ["gcloud", "compute", "addresses", "list", "--project", project, "--filter", "status!=IN_USE", "--format", "json"]
     addr_parsed, addr_result = run_and_gate(addr_argv, run=run)
@@ -1003,8 +1036,30 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     bs_argv = ["gcloud", "compute", "backend-services", "list", "--project", project, "--format", "json"]
     bs_parsed, bs_result = run_and_gate(bs_argv, run=run)
 
-    if disks_parsed is None or addr_parsed is None or fwd_parsed is None or tp_parsed is None or bs_parsed is None:
-        return {"name": f"project/{project}", "project": project, "location": "global", "outcome": "gate-failed", "error": "one or more compute list reads failed"}
+    # Name the read that failed and what it said. "one or more compute list
+    # reads failed" was what this returned for as long as the disks filter was
+    # broken, and it is the reason nobody noticed: five reads gate as one, the
+    # message fingers none of them, and the only way to learn which had been
+    # failing all along was to run all five by hand against a live project.
+    failed = [
+        f"{' '.join(argv)} rc={result.rc}: {result.stderr.strip()[:200] or 'no stderr'}"
+        for argv, parsed, result in (
+            (disks_argv, disks_parsed, disks_result),
+            (addr_argv, addr_parsed, addr_result),
+            (fwd_argv, fwd_parsed, fwd_result),
+            (tp_argv, tp_parsed, tp_result),
+            (bs_argv, bs_parsed, bs_result),
+        )
+        if parsed is None
+    ]
+    if failed:
+        return {
+            "name": f"project/{project}",
+            "project": project,
+            "location": "global",
+            "outcome": "gate-failed",
+            "error": f"{len(failed)} of 5 compute list reads failed -- " + "; ".join(failed),
+        }
 
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now)]
     candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], now=now)]

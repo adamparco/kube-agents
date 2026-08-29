@@ -6337,16 +6337,58 @@ class TestCrossCheckManifest(unittest.TestCase):
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
 
-    def test_an_unreachable_cluster_is_not_cross_checked_at_all(self):
+    def with_limitations(self, checks_run, text="collector gate-failed; re-read by hand"):
+        doc = self.doc(checks_run)
+        doc["scope"]["clusters"][0]["limitations"] = text
+        return doc
+
+    def test_an_unreachable_clusters_checks_are_not_matched_against_commands(self):
         # The SOP's manual fallback applies here -- attestation, not
         # manifest-verification, exactly as it does for streams with no
-        # collector at all.
+        # collector at all. `no-pdb` and `no-hpa` appear in no manifest command
+        # and are accepted anyway; the declared limitation is what buys that.
         manifest = self.manifest(outcome="unreachable", commands=[])
-        audit_report.cross_check_manifest(self.doc(["no-requests", "no-pdb", "no-hpa"]), manifest)
+        audit_report.cross_check_manifest(self.with_limitations(["no-requests", "no-pdb", "no-hpa"]), manifest)
 
-    def test_a_gate_failed_cluster_is_not_cross_checked_either(self):
+    def test_a_gate_failed_clusters_checks_are_not_matched_either(self):
         manifest = self.manifest(outcome="gate-failed", commands=[])
-        audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        audit_report.cross_check_manifest(self.with_limitations(["no-requests"]), manifest)
+
+    def test_a_target_the_collector_could_not_read_cannot_report_a_clean_full_read(self):
+        """The hole the `collected`-only cross-check left open, and what fell in.
+
+        On 2026-08-29 `fleet-wide-cost-analysis` published
+        `project/adamparco-kage` with three checks run, no limitations and no
+        coverage gap, over a manifest marking that same target `gate-failed` --
+        five compute reads gated as one and the disks read had never parsed.
+        Every rule here asks the manifest to confirm the document, and the one
+        target the manifest actively contradicted was the one it skipped.
+        """
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                manifest = self.manifest(outcome=outcome, commands=[], error="disks list rc=2")
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+                self.assertIn("prod-us-east", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_the_refusal_quotes_the_collectors_own_error(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[], error="PERMISSION_DENIED on compute.disks.list")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("PERMISSION_DENIED", str(ctx.exception))
+
+    def test_an_unreadable_target_claiming_nothing_is_left_alone(self):
+        """No claim, no contradiction. A target the collector could not read and
+        the document does not say it checked needs no limitation -- the roster
+        rules in §6 already count it as uncovered."""
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        audit_report.cross_check_manifest(self.doc([]), manifest)
+
+    def test_whitespace_does_not_pass_for_a_limitation(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(self.with_limitations(["no-requests"], text="   "), manifest)
 
     def test_a_cluster_absent_from_the_manifest_is_ignored(self):
         # A stream only partially covered, or a manifest scoped narrower than

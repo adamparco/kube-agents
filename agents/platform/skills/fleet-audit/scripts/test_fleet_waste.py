@@ -550,6 +550,79 @@ class OrphanLbTest(unittest.TestCase):
         self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
 
 
+class CollectProjectComputeTest(unittest.TestCase):
+    """The five project-scope reads, and what happens when one of them fails.
+
+    The `run` here emulates gcloud's *argument parser*, not just its API, which
+    is the whole point: the disks read spent its entire life failing on a filter
+    value gcloud would not accept, and a fake that answers every argv with `[]`
+    cannot tell the difference between a command gcloud runs and one it rejects.
+    """
+
+    FACTS = {"pv_handles": set(), "referenced_addresses": set(), "service_names": set()}
+
+    def run_with(self, fail: dict | None = None):
+        fail = fail or {}
+
+        def run(argv, **kwargs):
+            # gcloud reads `--filter` followed by a token starting with `-` as
+            # two flags and rejects the command for the argument it thinks is
+            # missing. `--filter=-users:*` is one token and parses fine.
+            for i, tok in enumerate(argv):
+                if tok == "--filter" and (i + 1 >= len(argv) or argv[i + 1].startswith("-")):
+                    return run_of(2, "", f"ERROR: (gcloud.compute.{argv[2]}.list) argument --filter: expected one argument")
+            resource = argv[2] if len(argv) > 2 else ""
+            if resource in fail:
+                return run_of(1, "", fail[resource])
+            return run_of(0, "[]")
+
+        return run
+
+    def test_the_disks_read_survives_gcloud_argument_parsing(self):
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
+        self.assertEqual(target["outcome"], "collected")
+
+    def test_the_collector_does_not_pass_a_filter_gcloud_would_reject(self):
+        """Guards the fake as much as the collector. If the parser emulation
+        above stopped rejecting the old spelling it would pass everything, and
+        the test above would go green against a disks read that never ran."""
+        broken = ["gcloud", "compute", "disks", "list", "--project", "acme", "--filter", "-users:*", "--format", "json"]
+        self.assertEqual(self.run_with()(broken).rc, 2)
+
+        seen = []
+
+        def recording(argv, **kwargs):
+            seen.append(argv)
+            return self.run_with()(argv, **kwargs)
+
+        fw.collect_project_compute("acme", True, self.FACTS, run=recording, now=NOW)
+        disks = next(argv for argv in seen if argv[2] == "disks")
+        self.assertIn("--filter=-users:*", disks)
+        self.assertNotIn("--filter", disks)
+
+    def test_a_failed_read_names_the_command_and_what_it_said(self):
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "gate-failed")
+        self.assertIn("1 of 5", target["error"])
+        self.assertIn("gcloud compute addresses list", target["error"])
+        self.assertIn("PERMISSION_DENIED", target["error"])
+
+    def test_the_error_names_every_read_that_failed_not_just_the_first(self):
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "denied-a", "target-pools": "denied-t"}), now=NOW
+        )
+        self.assertIn("2 of 5", target["error"])
+        self.assertIn("denied-a", target["error"])
+        self.assertIn("denied-t", target["error"])
+
+    def test_a_read_that_returns_no_stderr_still_names_its_command(self):
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(fail={"disks": ""}), now=NOW)
+        self.assertIn("gcloud compute disks list", target["error"])
+        self.assertIn("no stderr", target["error"])
+
+
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
@@ -708,6 +781,60 @@ class CollectClusterTest(unittest.TestCase):
         entry, facts = self.run_with(dump_items=[pv, svc])
         self.assertIn("d1", facts["pv_handles"])
         self.assertIn("default/web", facts["service_names"])
+
+
+class AutopilotNotApplicableTest(unittest.TestCase):
+    """The two node-pool checks Autopilot cannot owe, declared by the collector.
+
+    Leaving this to the model cost three false coverage gaps a week: it declared
+    `idle-nodepool` not-applicable and forgot `scaledown-blocked`, and a check
+    that is neither run nor dispositioned reads as one nobody performed.
+    """
+
+    def collect(self, autopilot: bool):
+        cluster = {"name": "ap-1", "project": "acme", "location": "us-central1", "autopilot": autopilot}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if "top" in argv:
+                return run_of(0, "node-1 1 10% 1000Mi 10%")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(cluster, run=run, sleep=lambda s: None, now=NOW)
+        return entry
+
+    def test_autopilot_declares_both_node_pool_checks_not_applicable(self):
+        entry = self.collect(autopilot=True)
+        self.assertEqual(
+            {na["check"] for na in entry["checks_not_applicable"]},
+            {"idle-nodepool", "scaledown-blocked"},
+        )
+
+    def test_neither_check_is_also_reported_as_having_run(self):
+        """A check cannot be both dispositioned and performed -- that is the
+        double-count `_limitation_restates_na` exists to catch downstream."""
+        entry = self.collect(autopilot=True)
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", ran)
+        self.assertNotIn("scaledown-blocked", ran)
+
+    def test_every_not_applicable_entry_carries_a_reason(self):
+        for na in self.collect(autopilot=True)["checks_not_applicable"]:
+            self.assertTrue(na.get("reason", "").strip(), na)
+
+    def test_a_standard_cluster_declares_nothing_not_applicable(self):
+        """The disposition is Autopilot's alone. A Standard cluster owes both
+        checks, so declaring them here would hide a real gap."""
+        entry = self.collect(autopilot=False)
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
 
 
 class FleetSamplingConcurrencyTest(unittest.TestCase):

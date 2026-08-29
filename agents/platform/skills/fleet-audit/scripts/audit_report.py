@@ -2784,7 +2784,46 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
     for cluster in data.get("scope", {}).get("clusters") or []:
         name = str(cluster.get("name", ""))
         manifest_cluster = manifest_clusters.get(name)
-        if not manifest_cluster or manifest_cluster.get("outcome") != "collected":
+        if not manifest_cluster:
+            continue
+        if manifest_cluster.get("outcome") != "collected":
+            # The collector could not read this target, and the document says it
+            # was checked anyway. That is allowed -- falling back to manual
+            # commands is what an agent is supposed to do with a gate-failed
+            # target -- but it cannot be reported as an ordinary full read,
+            # because nothing corroborates it. The `collected` cross-check below
+            # is the only thing standing between `checks_run` and free text, and
+            # it does not reach here by construction.
+            #
+            # On 2026-08-29 `fleet-wide-cost-analysis` published
+            # `project/adamparco-kage` with three checks run, no limitations and
+            # no coverage gap, over a manifest that marks that same target
+            # `gate-failed` -- the disks read had been failing since it was
+            # written. The document was the only surface saying the project was
+            # fully audited, and it was the one surface with nothing behind it.
+            #
+            # Requiring `limitations` rather than refusing outright keeps the
+            # fallback legal and makes it visible: §6 turns the limitation into
+            # a coverage gap, so the run reports itself partial and names the
+            # target whose coverage rests on work the manifest cannot check.
+            if checks_ran(cluster) and not str(cluster.get("limitations", "")).strip():
+                raise ValidationError(
+                    f"scope.clusters: {name!r} claims "
+                    f"{len(checks_ran(cluster))} check(s) ran, but the collect.py "
+                    f"manifest for {audit_id} marks it "
+                    f"{str(manifest_cluster.get('outcome'))!r}"
+                    + (
+                        f" ({str(manifest_cluster.get('error'))[:200]})"
+                        if manifest_cluster.get("error")
+                        else ""
+                    )
+                    + ". A target the collector could not read may still be "
+                    "checked by hand, but it cannot be reported as a clean full "
+                    "read: nothing corroborates those checks. Put what you ran "
+                    "and what the collector could not into this target's "
+                    "`limitations`, so the run reports the gap instead of "
+                    "publishing over it."
+                )
             continue
         verified = {
             (entry.get("check"), entry.get("rc"))
