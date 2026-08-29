@@ -1822,6 +1822,24 @@ NON_INSPECTING_COMMAND_RE = re.compile(
 # binary adds it here and `test_check_commands_use_an_inspection_binary` says so.
 INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl")
 
+# The same bar, met by a check that read the cloud API directly instead of
+# shelling out to a CLI. `fleet_waste.py`'s overrequest check holds ADC
+# credentials and issues the Monitoring GET in process -- it has to, because
+# the credential proxy refuses `gcloud auth print-access-token` and a token on
+# stdout is a token in the model's context. What it records is therefore the
+# request rather than a shell line:
+#
+#   GET monitoring.googleapis.com/v3/projects/<p>/timeSeries filter=... window=168h
+#
+# Every property the binary list is defending survives that form. It is as
+# expensive to fabricate per cluster, it is published in the ledger, and a
+# reader can re-issue it -- which is the whole argument in
+# `validate_check_command`'s docstring. Requiring a binary name here would
+# instead push the collector toward recording a `curl` it never ran, and a
+# command that did not execute is the one thing this file exists to keep out
+# of the document.
+INSPECTION_ENDPOINTS = ("googleapis.com",)
+
 MIN_CHECK_COMMAND_CHARS = 8
 
 
@@ -1870,11 +1888,12 @@ def validate_check_command(value: object, where: str, check: str) -> str:
             f"cannot be how check {check!r} ran. Give the kubectl or gcloud "
             "command you actually issued."
         )
-    if not any(binary in text for binary in INSPECTION_BINARIES):
+    if not any(probe in text for probe in INSPECTION_BINARIES + INSPECTION_ENDPOINTS):
         raise ValidationError(
             f"{where}: the command for {check!r} names none of "
-            f"{', '.join(INSPECTION_BINARIES)}, so it did not read a cluster or "
-            "the cloud API. A check is only 'run' if something was queried."
+            f"{', '.join(INSPECTION_BINARIES)}, nor an API host "
+            f"({', '.join(INSPECTION_ENDPOINTS)}), so it did not read a cluster "
+            "or the cloud API. A check is only 'run' if something was queried."
         )
     return command
 

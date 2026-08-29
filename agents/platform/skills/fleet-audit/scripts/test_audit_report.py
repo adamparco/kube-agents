@@ -9177,6 +9177,38 @@ class TestCheckCommands(unittest.TestCase):
             "names none of",
         )
 
+    def test_an_in_process_cloud_api_read_counts_as_having_inspected(self):
+        """`fleet_waste.py`'s overrequest check issues the Monitoring GET itself.
+
+        It records the request rather than a shell line, because there is no
+        shell line -- the credential proxy refuses to hand out an access token,
+        so the read happens in process under ADC. Rejecting that shape cost a
+        live run 14 minutes of the agent improvising around the validator.
+        """
+        audit_report.validate_findings(
+            self._with(
+                {
+                    "check": "netpol-missing",
+                    "command": (
+                        "GET monitoring.googleapis.com/v3/projects/acme/timeSeries "
+                        'filter=resource.labels.cluster_name="prod-1" '
+                        "metrics=kubernetes.io/container/cpu/core_usage_time window=168h"
+                    ),
+                }
+            ),
+            AUDIT,
+        )
+
+    def test_naming_an_api_host_does_not_excuse_a_command_that_reads_nothing(self):
+        """The endpoint list widens what counts as inspecting, not what counts as a command."""
+        self._reject(
+            {
+                "check": "netpol-missing",
+                "command": "echo googleapis.com",
+            },
+            "cannot inspect",
+        )
+
     def test_calling_this_harness_is_not_inspecting_the_fleet(self):
         """`checks_run` records how the fleet was read, not how it was reported."""
         self._reject(
