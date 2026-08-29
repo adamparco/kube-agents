@@ -1692,12 +1692,32 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     for slug in ("workload-identity-off", "public-control-plane"):
         commands[slug] = _record(describe_command, result)
 
-    node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
-    parsed, result = gated(node_pools_argv)
-    if parsed is None:
-        raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
-    context["node_pools"] = parsed if isinstance(parsed, list) else []
-    commands["legacy-metadata"] = _record(" ".join(node_pools_argv), result)
+    # Not attempted on Autopilot, where the API refuses it outright:
+    # `node-pools list` answers HTTP 400 "Autopilot node pools cannot be
+    # accessed or modified". Gating on that read anyway threw the whole
+    # cluster away for the single check it backs -- and that check is
+    # `legacy-metadata`, which `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE` above
+    # already declares inapplicable on Autopilot for the reason the API
+    # itself gives. The table was simply unreachable: the gate raises here,
+    # `collect_cluster` returns `gate-failed`, and the not-applicable block
+    # that would have said so never runs. Three of this fleet's four clusters
+    # are Autopilot, so every daily `compliance-audit` collected one cluster
+    # and gate-failed the rest -- eleven checks per cluster that had already
+    # succeeded, discarded on the twelfth, which could not have run.
+    #
+    # `context["node_pools"]` stays defined so `legacy-metadata` evaluates to
+    # no hits rather than raising, and `commands` gets no entry: the slug is
+    # in `not_applicable_slugs` by the time `collect_cluster` builds the
+    # manifest, which skips it there.
+    if cluster.get("autopilot"):
+        context["node_pools"] = []
+    else:
+        node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+        parsed, result = gated(node_pools_argv)
+        if parsed is None:
+            raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+        context["node_pools"] = parsed if isinstance(parsed, list) else []
+        commands["legacy-metadata"] = _record(" ".join(node_pools_argv), result)
 
     return CollectedContext(context, context["workloads"], commands)
 

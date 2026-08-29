@@ -2755,6 +2755,14 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
     rejection rather than a coverage gap: the collector already proved the
     cluster readable, so its absence is a defect in the document and not a
     condition of the fleet, and a gap would still let the run publish.
+
+    A target the collector could *not* read is missing just as loudly, for a
+    reason that took a second incident to see. The rule below — an unreadable
+    target claiming checks must carry `limitations` — only reaches a target the
+    document mentions, and omitting it entirely evades that as thoroughly as it
+    evades everything else. A collector failure is also the likeliest place for
+    a finding to be hiding, so of the two ways to lose a target this is the
+    worse one to lose silently.
     """
     audit_id = str(data.get("audit") or "")
     manifest_clusters = {
@@ -2767,11 +2775,10 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
         for c in data.get("scope", {}).get("clusters") or []
         if isinstance(c, dict)
     }
-    missing = sorted(
-        name
-        for name, c in manifest_clusters.items()
-        if c.get("outcome") == "collected" and name not in documented
-    )
+    undocumented = [
+        (name, c) for name, c in sorted(manifest_clusters.items()) if name not in documented
+    ]
+    missing = [name for name, c in undocumented if c.get("outcome") == "collected"]
     if missing:
         raise ValidationError(
             f"scope.clusters omits {', '.join(repr(n) for n in missing)}, which the "
@@ -2780,6 +2787,37 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             "publishes as an all-clear over a fleet it did not report on. Add the "
             "cluster with its checks_run, or re-run collect.py if the manifest is "
             "from a different scope."
+        )
+    # `scope.skipped` is the other honest home for a target the collector could
+    # not read, and it is the *better* one when nobody checked it by hand:
+    # `coverage_gaps` already turns a skipped entry into "not audited — <reason>"
+    # without the target having to claim any checks. So an unreadable target is
+    # accounted for by either surface, and only by neither is it missing.
+    skipped = {
+        str(entry.get("cluster", ""))
+        for entry in data.get("scope", {}).get("skipped") or []
+        if isinstance(entry, dict)
+    }
+    unread = [
+        (name, c)
+        for name, c in undocumented
+        if c.get("outcome") != "collected" and name not in skipped
+    ]
+    if unread:
+        detail = "; ".join(
+            f"{name}: {str(c.get('outcome'))}"
+            + (f" ({str(c.get('error'))[:150]})" if c.get("error") else "")
+            for name, c in unread
+        )
+        raise ValidationError(
+            f"scope.clusters omits {', '.join(repr(n) for n, _ in unread)}, which the "
+            f"collect.py manifest for {audit_id} enumerated but could not read "
+            f"({detail}). A target the collector failed on is the one this document "
+            "least gets to be quiet about: nothing else in the run mentions it, so "
+            "leaving it out reports the fleet as covered without it. Put it in "
+            "scope.skipped with the reason if nobody covered it, or in scope.clusters "
+            "with `limitations` naming what the collector could not read and what you "
+            "checked by hand — either way the run reports the gap."
         )
     for cluster in data.get("scope", {}).get("clusters") or []:
         name = str(cluster.get("name", ""))

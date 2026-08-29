@@ -139,20 +139,21 @@ def discover_projects(base_project: str | None, *, run: RunFn, read_text: Callab
     return projects
 
 
-def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict], dict | None]:
+def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict], dict | None, str | None]:
     """One `clusters list` call, the full Cluster resources this collector
-    reads every facet from. Returns `(clusters, command_record)` --
-    `clusters` is `[]` and `command_record` is `None` when the call itself
-    failed, so the caller knows this project contributed nothing rather
-    than that it genuinely has no clusters."""
+    reads every facet from. Returns `(clusters, command_record, error)` --
+    `clusters` is `[]`, `command_record` is `None` and `error` carries what
+    gcloud said when the call itself failed, so the caller knows this project
+    contributed nothing rather than that it genuinely has no clusters, and can
+    say so in the manifest rather than only in a log line."""
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
         log(f"{project}: clusters list gate failed (rc={result.rc}); no clusters known from this project")
-        return [], None
+        return [], None, f"clusters list rc={result.rc}: {result.stderr.strip()[:300] or 'no stderr'}"
     for c in parsed:
         c["_project"] = project
-    return parsed, _record(" ".join(argv), result)
+    return parsed, _record(" ".join(argv), result), None
 
 
 def cluster_eligibility(c: dict, *, now: datetime) -> str | None:
@@ -606,7 +607,7 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[str, lis
     return checks_run, candidates
 
 
-def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[dict], dict | None]:
+def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[dict], dict | None, str | None]:
     return enumerate_project_clusters(project, run=run)
 
 
@@ -617,13 +618,16 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_
 
     all_clusters: list[dict] = []
     command_by_project: dict[str, dict] = {}
+    failed_projects: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_project, p, run=run, now=now): p for p in projects}
         for future in as_completed(futures):
-            clusters, record = future.result()
+            clusters, record, error = future.result()
             all_clusters.extend(clusters)
             if record is not None:
                 command_by_project[futures[future]] = record
+            elif error:
+                failed_projects[futures[future]] = error
 
     checks_run, candidates = compute_drift(all_clusters, now=now)
     limitations = cohort_limitations(all_clusters, now=now)
@@ -650,6 +654,27 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_
         if note:
             entry["limitations"] = note
         entries.append(entry)
+
+    # A project whose `clusters list` failed contributed no clusters, and with
+    # no entry of its own it contributes no evidence of that either -- the
+    # manifest then reads exactly like a fleet that never had those clusters in
+    # it. That is worse here than in a per-cluster stream: drift compares each
+    # cluster against its cohort peers, so clusters missing from the comparison
+    # quietly change what counts as an outlier, and every surviving cluster's
+    # verdict is computed against a fleet nobody knows is short. Recording the
+    # project as a gate-failed target is what makes the loss say so --
+    # cross_check_manifest requires the document to account for it, and §6
+    # turns that into a coverage gap.
+    entries += [
+        {
+            "name": f"project/{project_name}",
+            "project": project_name,
+            "location": "global",
+            "outcome": "gate-failed",
+            "error": error,
+        }
+        for project_name, error in sorted(failed_projects.items())
+    ]
 
     return {
         "version": MANIFEST_VERSION,

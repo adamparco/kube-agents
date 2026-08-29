@@ -73,14 +73,19 @@ class DiscoverProjectsTest(unittest.TestCase):
 class EnumerateProjectClustersTest(unittest.TestCase):
     def test_tags_each_cluster_with_its_project(self):
         clusters_json = json.dumps([{"name": "c1"}])
-        clusters, record = fd.enumerate_project_clusters("acme", run=lambda a: run_of(0, clusters_json))
+        clusters, record, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(0, clusters_json))
         self.assertEqual(clusters[0]["_project"], "acme")
         self.assertIsNotNone(record)
+        self.assertIsNone(error)
 
-    def test_failed_list_returns_empty_with_no_record(self):
-        clusters, record = fd.enumerate_project_clusters("acme", run=lambda a: run_of(1, "", "denied"))
+    def test_failed_list_returns_empty_with_no_record_and_says_why(self):
+        clusters, record, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(1, "", "denied"))
         self.assertEqual(clusters, [])
         self.assertIsNone(record)
+        # The error travels back so `collect_fleet` can put it in the manifest.
+        # A log line alone leaves the failure nowhere a validator can read it.
+        self.assertIn("denied", error)
+        self.assertIn("rc=1", error)
 
 
 class ClusterEligibilityTest(unittest.TestCase):
@@ -479,12 +484,33 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual(len(manifest["clusters"]), 4)
         self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
 
-    def test_a_project_that_fails_to_list_contributes_no_clusters(self):
+    def test_a_project_that_fails_to_list_is_recorded_not_dropped(self):
+        """Returning nothing made a project whose `clusters list` failed
+        indistinguishable from one holding no clusters, so the manifest read
+        complete and the document was held to nothing. It matters more here
+        than in a per-cluster stream: drift ranks each cluster against its
+        cohort, and clusters missing from the comparison silently change what
+        counts as an outlier."""
+
         def run(argv, **kwargs):
             return run_of(1, "", "denied")
 
         manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
-        self.assertEqual(manifest["clusters"], [])
+        self.assertEqual([c["name"] for c in manifest["clusters"]], ["project/acme"])
+        entry = manifest["clusters"][0]
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn("denied", entry["error"])
+
+    def test_a_project_that_lists_cleanly_adds_no_project_entry(self):
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)])
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        self.assertEqual([c for c in manifest["clusters"] if c["name"].startswith("project/")], [])
 
 
 class CohortLimitationsTest(unittest.TestCase):

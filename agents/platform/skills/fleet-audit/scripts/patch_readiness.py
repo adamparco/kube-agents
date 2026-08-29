@@ -441,7 +441,22 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
     parsed, result = run_and_gate(argv, run=run)
     if parsed is None:
         log(f"{project}: clusters list gate failed (rc={result.rc}); no clusters known this run")
-        return []
+        # One `project/<p>` entry rather than nothing at all. The manifest is
+        # the only record of what the collector managed to read, and a project
+        # that drops out of it entirely is indistinguishable from one that
+        # holds no clusters -- so cross_check_manifest has nothing to hold the
+        # document to, and the run publishes a fleet-wide verdict over clusters
+        # nobody enumerated. Recorded as `gate-failed`, the loss is a target the
+        # document has to account for, and §6 turns that into a coverage gap.
+        return [
+            {
+                "name": f"project/{project}",
+                "project": project,
+                "location": "global",
+                "outcome": "gate-failed",
+                "error": f"clusters list rc={result.rc}: {result.stderr.strip()[:300] or 'no stderr'}",
+            }
+        ]
     clusters_record = _record(" ".join(argv), result)
 
     by_location: dict[str, list[dict]] = {}

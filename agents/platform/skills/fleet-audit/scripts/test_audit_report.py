@@ -6426,19 +6426,75 @@ class TestCrossCheckManifest(unittest.TestCase):
         self.assertIn("prod-eu-west", str(ctx.exception))
         self.assertNotIn("prod-us-east", str(ctx.exception))
 
-    def test_a_cluster_the_collector_could_not_read_may_be_omitted(self):
-        # `unreachable` and `gate-failed` are fleet conditions the ordinary
-        # roster and coverage rules already govern; only `collected` is proof
-        # the document had something to report.
+    def unreadable(self, outcome, error="boom"):
+        return {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": outcome, "error": error, "commands": []},
+            ]
+        }
+
+    def test_a_cluster_the_collector_could_not_read_may_not_be_omitted(self):
+        """The rule that an unreadable target claiming checks must carry
+        `limitations` only reaches a target the document mentions. Omitting it
+        evades that as thoroughly as it evades everything else, and a collector
+        failure is the likeliest place for a finding to be hiding.
+        """
         for outcome in ("unreachable", "gate-failed"):
             with self.subTest(outcome=outcome):
-                manifest = {
-                    "clusters": [
-                        self.manifest()["clusters"][0],
-                        {"name": "prod-eu-west", "outcome": outcome, "commands": []},
-                    ]
-                }
-                audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(
+                        self.doc(["no-requests"]), self.unreadable(outcome)
+                    )
+                self.assertIn("prod-eu-west", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_the_refusal_to_omit_quotes_the_collectors_error(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(
+                self.doc(["no-requests"]),
+                self.unreadable("gate-failed", error="node-pools list rc=1: code=400"),
+            )
+        self.assertIn("code=400", str(ctx.exception))
+
+    def test_scope_skipped_accounts_for_an_unreadable_cluster(self):
+        """The honest shape when nobody covered it by hand: `coverage_gaps`
+        already renders a skipped entry as "not audited — <reason>", which is
+        the gap this rule exists to force. Requiring `scope.clusters`
+        specifically would reject it and push the run toward claiming checks."""
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                doc = self.doc(["no-requests"])
+                doc["scope"]["skipped"] = [
+                    {"cluster": "prod-eu-west", "reason": "collector could not reach it"}
+                ]
+                audit_report.cross_check_manifest(doc, self.unreadable(outcome))
+
+    def test_scope_clusters_with_limitations_also_accounts_for_it(self):
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"].append(
+            {
+                "name": "prod-eu-west",
+                "checks_run": ["no-requests"],
+                "limitations": "collector gate-failed; no-requests checked by hand, the rest unread",
+            }
+        )
+        audit_report.cross_check_manifest(doc, self.unreadable("gate-failed"))
+
+    def test_a_collected_cluster_is_still_reported_as_the_collected_case(self):
+        """The two refusals must not collapse into one: a `collected` cluster
+        omitted from the document is a defect in the document, and its message
+        says so rather than telling the author to declare a gap they do not
+        have."""
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": "collected", "commands": []},
+            ]
+        }
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("marks 'collected'", str(ctx.exception))
 
     def test_a_check_the_manifest_ran_may_still_be_declared_inapplicable(self):
         """The cross-check the manifest cannot make, pinned so nobody adds it.

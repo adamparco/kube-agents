@@ -1500,10 +1500,23 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
+    # GKE's own answer when `node-pools list` is aimed at an Autopilot
+    # cluster. The fake used to return rc=0 here whatever the cluster was,
+    # which is why the gate failure this class is supposed to cover survived
+    # a test named for exactly that case: a fake that answers every argv
+    # successfully cannot tell a command the API runs from one it refuses.
+    AUTOPILOT_NODE_POOLS_ERROR = (
+        "ERROR: (gcloud.container.node-pools.list) ResponseError: code=400, "
+        "message=Autopilot node pools cannot be accessed or modified."
+    )
+
     def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None):
         describe = describe if describe is not None else {}
+        target = cluster or self.CLUSTER
+        self.issued = []
 
         def run(argv, **kwargs):
+            self.issued.append(list(argv))
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.05)
             if argv[:2] == ["kubectl", "get"]:
@@ -1521,12 +1534,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
             if argv[:3] == ["gcloud", "container", "clusters"]:
                 return Run(argv, 0, json.dumps(describe), "", 0.1)
             if argv[:3] == ["gcloud", "container", "node-pools"]:
+                if target.get("autopilot"):
+                    return Run(argv, 1, "", self.AUTOPILOT_NODE_POOLS_ERROR, 0.1)
                 return Run(argv, 0, json.dumps(list(node_pools)), "", 0.1)
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
-                return collect.collect_cluster(cluster or self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+                return collect.collect_cluster(target, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
 
     def test_a_clean_cluster_reports_nothing(self):
         result = self.run_with(
@@ -1610,6 +1625,62 @@ class TestComplianceCollectCluster(unittest.TestCase):
     def test_standard_cluster_carries_no_checks_not_applicable_key(self):
         result = self.run_with()
         self.assertNotIn("checks_not_applicable", result)
+
+    def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
+        """The live regression: `node-pools list` 400s on Autopilot, and it was
+        the last read in the compliance collector, so eleven checks that had
+        already succeeded were discarded on the twelfth -- which could not have
+        run. Three of the four clusters in the validation fleet are Autopilot,
+        so every daily run of this stream collected one and gate-failed the
+        rest."""
+        result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        self.assertEqual(result["outcome"], "collected")
+        self.assertNotIn("error", result)
+
+    def test_autopilot_never_issues_the_node_pools_read_at_all(self):
+        """Not merely tolerating the failure -- not making the call. The check
+        it backs is already declared inapplicable here, so the read has nothing
+        to inform, and issuing it spends a round trip to be told 400."""
+        self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        self.assertEqual([a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]], [])
+
+    def test_a_standard_cluster_still_issues_it(self):
+        self.run_with()
+        self.assertTrue([a for a in self.issued if a[:3] == ["gcloud", "container", "node-pools"]])
+
+    def test_a_standard_cluster_still_gate_fails_when_node_pools_fails(self):
+        """The skip is Autopilot-specific. On a Standard cluster the read backs
+        a check that genuinely applies, so losing it still fails closed."""
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 1, "", "permission denied", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "gate-failed")
+        self.assertIn("node-pools", result["error"])
+
+    def test_autopilot_records_every_check_it_could_run(self):
+        """The point of not gate-failing: the other checks reach the manifest.
+        Eleven checks minus the four Autopilot rules out is seven, each with a
+        command behind it, and `legacy-metadata` dispositioned rather than
+        silently absent -- absent is what §6 reads as a coverage gap."""
+        result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        command_slugs = {c["check"] for c in result["commands"]}
+        na_slugs = {e["check"] for e in result["checks_not_applicable"]}
+        self.assertEqual(len(command_slugs), 7)
+        self.assertIn("legacy-metadata", na_slugs)
+        self.assertNotIn("legacy-metadata", command_slugs)
+        self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
 
 # --------------------------------------------------------------------------- #

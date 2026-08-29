@@ -341,9 +341,24 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual(entries[0]["candidates"], [])
         self.assertEqual({c["check"] for c in entries[0]["commands"]}, set(pr.SEVERITY))
 
-    def test_clusters_list_failure_yields_no_entries(self):
+    def test_clusters_list_failure_is_recorded_as_a_gate_failed_project(self):
+        """Returning [] dropped the project out of the manifest, where it read
+        as a project holding no clusters rather than one nobody could
+        enumerate — so nothing held the document to those clusters and the run
+        published a fleet verdict over a fleet it had not seen."""
         entries = pr.collect_project("acme", run=self.fake_run({"clusters list": run_of(1, "", "denied")}), now=NOW)
-        self.assertEqual(entries, [])
+        self.assertEqual([e["name"] for e in entries], ["project/acme"])
+        self.assertEqual(entries[0]["outcome"], "gate-failed")
+        self.assertIn("denied", entries[0]["error"])
+        self.assertIn("rc=1", entries[0]["error"])
+
+    def test_a_readable_project_adds_no_project_entry(self):
+        responses = {
+            "clusters list": run_of(0, json.dumps([cluster()])),
+            "get-server-config": run_of(0, json.dumps(server_config())),
+        }
+        entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
+        self.assertEqual([e for e in entries if e["name"].startswith("project/")], [])
 
     def test_get_server_config_failure_drops_only_the_baseline_checks(self):
         c = cluster()
