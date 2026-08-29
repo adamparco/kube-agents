@@ -3483,6 +3483,29 @@ class TestRenderBudget(BaseTestCase):
         body = self.render(make_doc(findings=bulk_findings(250)))
         self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
 
+    def test_truncation_notice_breaks_the_omitted_set_down_by_severity(self):
+        # A count alone leaves the reader to guess what fell off, and the
+        # sentence that used to guess for them ("the omitted findings are the
+        # least severe") is wrong whenever one severity overflows the budget
+        # by itself. Live run 2026-08-29 omitted 31 criticals under it.
+        findings = bulk_findings(250, severity="critical") + bulk_findings(
+            40, severity="major", prefix="m"
+        )
+        body = self.render(make_doc(findings=findings))
+        self.assertRegex(body, r"are omitted from this description[^_]*\d+ critical")
+        self.assertRegex(body, r"are omitted from this description[^_]*\d+ major")
+        self.assertNotIn("the omitted findings are the least severe", body)
+
+    def test_truncation_notice_omits_severities_that_all_rendered(self):
+        # The breakdown lists only what was actually dropped: a "0 major" in a
+        # notice about omissions reads as a fourth thing to go and check.
+        body = self.render(make_doc(findings=bulk_findings(250, severity="critical")))
+        notice = re.search(r"_\d+ further finding\(s\) are omitted.*?_", body, re.S)
+        self.assertIsNotNone(notice)
+        self.assertIn("critical", notice.group(0))
+        self.assertNotIn("major", notice.group(0))
+        self.assertNotIn("minor", notice.group(0))
+
     def test_title_carries_the_true_total_even_when_truncated(self):
         findings = bulk_findings(250)
         body = self.render(make_doc(findings=findings))

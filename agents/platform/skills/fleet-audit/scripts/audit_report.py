@@ -4238,10 +4238,14 @@ def select_rendered_findings(
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
     Selection walks the severity-first order and stops at the first finding that
-    does not fit, so the rendered set is always a prefix: truncation only ever
-    eats the least-severe end, and criticals are structurally safe. At least one
-    finding always renders — a body with a single oversized finding is still
-    more useful than a body with none.
+    does not fit, so the rendered set is always a prefix and truncation only ever
+    eats the least-severe end. That is a statement about the *cut*, not about the
+    findings: when one severity overflows the budget on its own the end of the
+    list is that same severity, and criticals are dropped like anything else. A
+    live `stockout-prevention` run rendered 18 of 49 criticals. Callers that
+    describe the omitted set must read its severities rather than assume. At
+    least one finding always renders — a body with a single oversized finding is
+    still more useful than a body with none.
 
     Each finding is charged for its own rendered text *and* for the slot its id
     occupies in the hidden delta block, because that block is itself unbounded:
@@ -4474,12 +4478,27 @@ def _render_findings(
             )
 
     if omitted:
+        # "The omitted findings are the least severe" described the cut and was
+        # read as a description of the findings. They are not the same claim:
+        # `select_rendered_findings` walks a severity-ordered list, so when one
+        # severity is large enough to overflow the budget by itself, the tail it
+        # cuts is that severity. Live run 2026-08-29 rendered 18 of 49 criticals
+        # and closed with a sentence telling the reader the other 31 were the
+        # least severe ones. Name the breakdown; it cannot be read wrong.
+        omitted_counts = severity_counts(omitted)
+        breakdown = ", ".join(
+            f"{omitted_counts[severity]} {severity}"
+            for severity in SEVERITIES
+            if omitted_counts[severity]
+        )
         out += [
             "",
-            f"_{len(omitted)} further finding(s) are omitted from this description to "
-            "stay inside GitHub's body limit. The counts in the title and in the "
-            "summary above are the true totals; the omitted findings are the "
-            "least severe._",
+            f"_{len(omitted)} further finding(s) are omitted from this description "
+            f"to stay inside GitHub's body limit: {breakdown}. The counts in the "
+            "title and in the summary above are the true totals. Findings are cut "
+            "from the least-severe end of the list, which is not the same as the "
+            "omitted ones being less severe than those shown — the per-severity "
+            "headings above give how many of each made it._",
         ]
     return out, omitted
 
