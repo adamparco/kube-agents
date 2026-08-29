@@ -369,6 +369,13 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("projects", "describe"),
         ("projects", "get-iam-policy"),
         ("projects", "list"),
+        # Network Analyzer's IP-utilization insight, the only surface that
+        # carries per-subnet utilization: gcloud's UsableSubnetwork omits the
+        # field in v1, beta and alpha alike, so `subnet-ip-exhaustion` has no
+        # other data source. `insights list` is a read; the mutating verbs on
+        # this surface are `mark-*` (mark-accepted, mark-dismissed, ...) and
+        # `update`, none of which this entry reaches.
+        ("recommender", "insights", "list"),
         ("version",),
     }
 )
@@ -417,6 +424,8 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # `compute routers list` takes --regions (plural). Same trap as
         # --zones above: the singular was listed and the plural was not.
         "--regions",
+        # `recommender insights list` requires it. --location is already above.
+        "--insight-type",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud

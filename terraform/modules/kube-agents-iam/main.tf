@@ -33,9 +33,20 @@ resource "google_project_iam_custom_role" "subnet_utilization_reader" {
   project     = var.project_id
   role_id     = "kubeagentsSubnetUtilizationReader"
   title       = "Kube-Agents Subnet Utilization Reader"
-  description = "Grants only compute.subnetworks.use, which 'gcloud compute networks subnets list-usable' requires before it reports a subnet ipUtilization."
-  permissions = ["compute.subnetworks.use"]
-  stage       = "GA"
+  description = "Grants only the two permissions the fleet audit's subnet-ip-exhaustion check needs: compute.subnetworks.use to see subnets at all, and the Network Analyzer insight read that carries their utilization."
+  permissions = [
+    "compute.subnetworks.use",
+    # `list-usable` turned out to answer only half the question: it reports
+    # which subnets exist but carries no ipUtilization field on any API
+    # version, so the check still had nothing to measure. Network Analyzer
+    # publishes that measurement as google.networkanalyzer.vpcnetwork.
+    # ipAddressInsight, and only roles/recommender.viewer carries the read --
+    # a role that grants viewer on every recommender in the project, far
+    # wider than one check needs.
+    "recommender.networkAnalyzerIpAddressInsights.list",
+    "recommender.networkAnalyzerIpAddressInsights.get",
+  ]
+  stage = "GA"
 }
 
 resource "google_project_iam_member" "subnet_utilization_reader" {

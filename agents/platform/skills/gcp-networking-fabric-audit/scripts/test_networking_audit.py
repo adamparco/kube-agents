@@ -290,6 +290,8 @@ class CollectProjectTest(unittest.TestCase):
         # field is absent from gcloud's UsableSubnetwork in v1, beta and
         # alpha. check_subnet_ip_exhaustion returns None for each, which
         # reads exactly like "measured, all healthy" unless it is caught here.
+        # With the Network Analyzer fallback also unavailable (API off, or the
+        # insight read refused), the gap is the only honest outcome.
         responses = {
             "subnets list-usable": run_of(
                 0,
@@ -299,6 +301,7 @@ class CollectProjectTest(unittest.TestCase):
                 '"ipCidrRange": "10.1.0.0/20", '
                 '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}]',
             ),
+            "recommender insights list": run_of(1, "", "PERMISSION_DENIED"),
             "routers list": run_of(0, "[]"),
             "forwarding-rules list": run_of(0, "[]"),
             "networks list": run_of(0, "[]"),
@@ -311,8 +314,174 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual(subnet_entries[0]["outcome"], "gate-failed")
         self.assertIn("ipUtilization", subnet_entries[0]["error"])
         self.assertIn("2 subnets", subnet_entries[0]["error"])
+        # Name the permission an operator has to grant, not just the symptom.
+        self.assertIn("networkAnalyzerIpAddressInsights.list", subnet_entries[0]["error"])
         # And no per-subnet target claiming it was collected.
         self.assertEqual([e for e in entries if e["name"].startswith("proj-1/")], [])
+
+    # --- Network Analyzer fallback ------------------------------------- #
+    #
+    # gcloud's UsableSubnetwork carries no utilization field on any API
+    # version, so `list-usable` alone can never run subnet-ip-exhaustion. The
+    # measurement lives in google.networkanalyzer.vpcnetwork.ipAddressInsight
+    # -- not google.compute.subnetwork.IpUtilizationInsight, which is not a
+    # real insight type and which the API rejects with INVALID_ARGUMENT.
+
+    INSIGHT = (
+        '[{"content": {"ipUtilizationSummaryInfo": [{'
+        '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+        '"networkStats": [{'
+        '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+        '"subnetStats": [{'
+        '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/s1", '
+        '"subnetRangeStats": ['
+        '{"allocationRatio": 0.9, "subnetRangePrefix": "10.0.0.0/20"}, '
+        '{"allocationRatio": 0.95, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}'
+        ']}]}]}]}}]'
+    )
+
+    def _two_subnets(self) -> str:
+        return (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
+            '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+
+    def test_the_insight_backfills_utilization_and_the_check_then_fires(self):
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        # No gate-failed target: the fallback supplied the missing field.
+        self.assertEqual([e for e in entries if e["name"].endswith("/subnets")], [])
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertEqual(s1["outcome"], "collected")
+        # 0.9 primary and 0.95 secondary are both over the 0.85 threshold.
+        excerpt = s1["candidates"][0]["excerpt"]
+        self.assertIn("primary range 10.0.0.0/20", excerpt)
+        self.assertIn("secondary range pods", excerpt)
+
+    def test_a_subnet_the_insight_does_not_cover_is_not_applicable_not_clean(self):
+        # Network Analyzer omits subnets holding no allocations, which on an
+        # auto-mode network means it reports 1 of 42. Running the check
+        # against the other 41 would return None for each -- "nothing wrong
+        # here" -- so they have to be declared unmeasured instead.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        not_applicable = {na_entry["check"] for na_entry in s2["checks_not_applicable"]}
+        self.assertIn("subnet-ip-exhaustion", not_applicable)
+        self.assertEqual(s2["candidates"], [])
+        # The covered one must NOT carry the not-applicable marker.
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertNotIn(
+            "subnet-ip-exhaustion",
+            {na_entry["check"] for na_entry in s1["checks_not_applicable"]},
+        )
+
+    def test_an_insight_that_covers_nothing_is_a_gap(self):
+        # Reads cleanly, publishes nothing that matches. Distinct from the
+        # read failing, and the message has to say so -- Network Analyzer
+        # takes about a day to publish after the API is switched on.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, "[]"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("published stats for 0", subnet_entry["error"])
+        self.assertEqual([e for e in entries if e["name"].startswith("proj-1/")], [])
+
+    def test_the_insight_is_not_consulted_when_list_usable_already_answers(self):
+        # If a future gcloud starts populating the field, the extra API call
+        # is waste -- and an unstubbed `recommender` here would raise.
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/20", "ipUtilization": 0.1}]',
+            ),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertEqual(
+            next(e for e in entries if e["name"] == "proj-1/us-east4/s1")["outcome"],
+            "collected",
+        )
+
+    def test_utilization_by_subnet_splits_primary_from_secondary(self):
+        # The insight marks the primary range by omitting subnetRangeName.
+        # Reading a named entry as the primary would attribute a pod range's
+        # utilization to the node range.
+        by_subnet = na._utilization_by_subnet(
+            "proj-1", run=self.fake_run({"recommender insights list": run_of(0, self.INSIGHT)})
+        )
+        self.assertEqual(list(by_subnet), ["us-east4/s1"])
+        self.assertEqual(by_subnet["us-east4/s1"]["primary"], 0.9)
+        self.assertEqual(by_subnet["us-east4/s1"]["secondary"], {"pods": 0.95})
+
+    def test_utilization_key_matches_across_the_two_uri_forms(self):
+        # `list-usable` returns an https:// self-link and the insight returns
+        # a //compute.googleapis.com/ resource URI. Keying on the bare name
+        # would also collide: an auto-mode network calls a subnet `default` in
+        # every one of its 42 regions.
+        self.assertEqual(
+            na._utilization_key("https://www.googleapis.com/compute/v1/projects/p/regions/us-east4/subnetworks/default"),
+            na._utilization_key("//compute.googleapis.com/projects/p/regions/us-east4/subnetworks/default"),
+        )
+        self.assertNotEqual(
+            na._utilization_key("//compute.googleapis.com/projects/p/regions/us-east4/subnetworks/default"),
+            na._utilization_key("//compute.googleapis.com/projects/p/regions/us-west1/subnetworks/default"),
+        )
+
+    def test_backfill_does_not_overwrite_a_first_party_reading(self):
+        subnets = [
+            {
+                "subnetwork": "https://x/projects/p/regions/us-east4/subnetworks/s1",
+                "ipUtilization": 0.2,
+                "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.3}],
+            }
+        ]
+        by_subnet = {"us-east4/s1": {"primary": 0.9, "secondary": {"pods": 0.95}}}
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet), 0)
+        self.assertEqual(subnets[0]["ipUtilization"], 0.2)
+        self.assertEqual(subnets[0]["secondaryIpRanges"][0]["ipUtilization"], 0.3)
+
+    def test_backfill_reports_how_many_subnets_it_reached(self):
+        subnets = [
+            {"subnetwork": "https://x/projects/p/regions/us-east4/subnetworks/s1"},
+            {"subnetwork": "https://x/projects/p/regions/us-west1/subnetworks/s2"},
+        ]
+        by_subnet = {"us-east4/s1": {"primary": 0.4, "secondary": {}}}
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet), 1)
+        self.assertEqual(subnets[0]["ipUtilization"], 0.4)
+        self.assertNotIn("ipUtilization", subnets[1])
 
     def test_a_subnet_measured_at_zero_utilization_is_not_treated_as_unmeasured(self):
         # 0.0 is a measurement. Testing presence rather than truthiness is the

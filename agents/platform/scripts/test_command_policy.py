@@ -1029,6 +1029,42 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.unreadable-command", decision.rule_id)
 
+    def test_the_network_analyzer_insight_read_is_allowed(self):
+        # subnet-ip-exhaustion's only data source. gcloud's UsableSubnetwork
+        # carries no ipUtilization field in v1, beta or alpha, so `list-usable`
+        # can enumerate subnets but never measure them; the figure lives in
+        # this insight. Note the type name: google.compute.subnetwork.
+        # IpUtilizationInsight reads plausibly and appears in plenty of prose,
+        # but it is not a real insight type and the API rejects it.
+        decision = evaluate([
+            "gcloud", "recommender", "insights", "list",
+            "--project", "p", "--location", "global",
+            "--insight-type", "google.networkanalyzer.vpcnetwork.ipAddressInsight",
+            "--format", "json",
+        ])
+        self.assertTrue(decision.allowed, decision.message)
+
+    def test_recommender_mutations_stay_refused(self):
+        # `insights list` reads. The mark-* verbs change an insight's state and
+        # sit one word away, and `recommender-config update` rewrites how the
+        # recommenders themselves run.
+        for argv, desc in (
+            (["gcloud", "recommender", "insights", "mark-accepted", "i"],
+             "insights mark-accepted"),
+            (["gcloud", "recommender", "insights", "mark-dismissed", "i"],
+             "insights mark-dismissed"),
+            (["gcloud", "recommender", "insights", "describe", "i"],
+             "insights describe -- a read, but not one anything here needs"),
+            (["gcloud", "recommender", "recommendations", "mark-claimed", "r"],
+             "recommendations mark-claimed"),
+            (["gcloud", "recommender", "recommender-config", "update"],
+             "recommender-config update"),
+            (["gcloud", "recommender", "insight-type-config", "update"],
+             "insight-type-config update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
     def test_routers_mutations_are_not_swept_in_with_get_status(self):
         # `routers get-status` reads; `routers add-interface`/`set-nat` and
         # friends do not, and they sit one word away in the same noun.

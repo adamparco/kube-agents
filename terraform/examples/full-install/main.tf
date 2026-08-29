@@ -12,6 +12,12 @@ locals {
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
     "gkebackup.googleapis.com",
+    # Network Analyzer, which publishes the only per-subnet IP-utilization
+    # figure the fleet audit's subnet-ip-exhaustion check can read: gcloud's
+    # UsableSubnetwork carries no such field on any API version. Without this
+    # the check reports a coverage gap on every run rather than failing, so
+    # the install still works -- it just cannot measure subnet exhaustion.
+    "recommender.googleapis.com",
   ]
   chat_apis = var.enable_google_chat ? [
     "pubsub.googleapis.com",

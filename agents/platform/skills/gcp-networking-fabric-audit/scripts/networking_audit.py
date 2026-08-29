@@ -383,6 +383,93 @@ def _carries_utilization(subnet: dict) -> bool:
     )
 
 
+# Network Analyzer's IP-utilization insight, which is where the measurement
+# `check_subnet_ip_exhaustion` needs actually lives. Not
+# `google.compute.subnetwork.IpUtilizationInsight` -- that name appears in
+# plenty of prose but is not a real insight type, and the API rejects it with
+# INVALID_ARGUMENT.
+_IP_INSIGHT_TYPE = "google.networkanalyzer.vpcnetwork.ipAddressInsight"
+
+
+def _utilization_key(link: str) -> str:
+    """`region/name` for a subnet, from either surface's URI form.
+
+    `list-usable` gives `https://www.googleapis.com/compute/v1/projects/P/
+    regions/R/subnetworks/N` and the insight gives
+    `//compute.googleapis.com/projects/P/regions/R/subnetworks/N`; the tails
+    agree. Region is part of the key because auto-mode networks name a subnet
+    `default` in every region, so the bare name collides 42 ways.
+    """
+    return f"{_region_of_subnet_link(link)}/{_last_segment(link)}"
+
+
+def _utilization_by_subnet(project: str, *, run: RunFn) -> dict[str, dict] | None:
+    """Per-subnet IP utilization from Network Analyzer, keyed by `region/name`.
+
+    Each value is `{"primary": ratio|None, "secondary": {range_name: ratio}}`.
+    The insight marks the primary range by *omitting* `subnetRangeName`; every
+    named entry is a secondary range.
+
+    Returns None when the read gates closed, so the caller can tell "could not
+    read" from "read fine, covers nothing".
+    """
+    argv = [
+        "gcloud", "recommender", "insights", "list",
+        "--project", project, "--location", "global",
+        "--insight-type", _IP_INSIGHT_TYPE, "--format", "json",
+    ]
+    parsed, result = run_and_gate(argv, run=run)
+    if parsed is None:
+        log(f"{project}: ipAddressInsight gate failed (rc={result.rc}); subnet utilization unavailable")
+        return None
+    by_subnet: dict[str, dict] = {}
+    for insight in parsed:
+        for summary in (insight.get("content") or {}).get("ipUtilizationSummaryInfo") or []:
+            for network in summary.get("networkStats") or []:
+                for subnet in network.get("subnetStats") or []:
+                    uri = subnet.get("subnetUri") or ""
+                    if not uri:
+                        continue
+                    slot = by_subnet.setdefault(_utilization_key(uri), {"primary": None, "secondary": {}})
+                    for rng in subnet.get("subnetRangeStats") or []:
+                        ratio = rng.get("allocationRatio")
+                        if not isinstance(ratio, (int, float)):
+                            continue
+                        name = rng.get("subnetRangeName")
+                        if name:
+                            slot["secondary"][name] = ratio
+                        else:
+                            slot["primary"] = ratio
+    return by_subnet
+
+
+def _backfill_utilization(parsed: list[dict], by_subnet: dict[str, dict]) -> int:
+    """Write insight ratios onto the `ipUtilization` field the check already
+    reads, so `check_subnet_ip_exhaustion` itself needs no change.
+
+    Only fills where the field is absent -- if a future gcloud starts
+    populating it, the first-party value wins. Returns the number of subnets
+    that gained at least one reading.
+    """
+    filled = 0
+    for item in parsed:
+        slot = by_subnet.get(_utilization_key(item.get("subnetwork", "")))
+        if not slot:
+            continue
+        touched = False
+        if isinstance(slot["primary"], (int, float)) and not isinstance(item.get("ipUtilization"), (int, float)):
+            item["ipUtilization"] = slot["primary"]
+            touched = True
+        for sec in item.get("secondaryIpRanges") or []:
+            ratio = slot["secondary"].get(sec.get("rangeName"))
+            if isinstance(ratio, (int, float)) and not isinstance(sec.get("ipUtilization"), (int, float)):
+                sec["ipUtilization"] = ratio
+                touched = True
+        if touched:
+            filled += 1
+    return filled
+
+
 def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
     argv = ["gcloud", "compute", "networks", "subnets", "list-usable", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
@@ -460,38 +547,77 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
         #
         # This is what the deployed install actually does once
         # compute.subnetworks.use is granted: `list-usable` returns 42 subnets
-        # and none has ipUtilization, in v1, beta and alpha alike. The field
-        # is simply not part of gcloud's UsableSubnetwork today, so the check
-        # has no data source on this surface and saying so is the only honest
-        # outcome. `recommender ... google.compute.subnetwork.
-        # IpUtilizationInsight` is GCP's supported answer and would need the
-        # Recommender API enabled plus its own role and allowlist entry.
-        log(f"{project}: {len(parsed)} usable subnets, none carrying ipUtilization")
-        return [
-            {
-                "name": f"project/{project}/subnets",
-                "project": project,
-                "location": "global",
-                "outcome": "gate-failed",
-                "error": (
-                    f"subnet-ip-exhaustion: {' '.join(argv)} returned "
-                    f"{len(parsed)} subnets but none carries `ipUtilization` on "
-                    f"its primary range or any secondary range, and that field "
-                    f"is the check's sole data source. Not a permission problem "
-                    f"-- gcloud's UsableSubnetwork does not expose utilization "
-                    f"in v1, beta or alpha. The check cannot run against this "
-                    f"surface; enabling the Recommender API and reading "
-                    f"google.compute.subnetwork.IpUtilizationInsight is the "
-                    f"supported alternative."
-                ),
-            }
-        ]
+        # and none has ipUtilization, in v1, beta and alpha alike. The field is
+        # simply not part of gcloud's UsableSubnetwork. Network Analyzer
+        # publishes the same measurement as a Recommender insight, so read it
+        # from there and write it onto the field the check already reads.
+        log(f"{project}: {len(parsed)} usable subnets, none carrying ipUtilization; trying Network Analyzer")
+        by_subnet = _utilization_by_subnet(project, run=run)
+        if by_subnet is None:
+            return [
+                {
+                    "name": f"project/{project}/subnets",
+                    "project": project,
+                    "location": "global",
+                    "outcome": "gate-failed",
+                    "error": (
+                        f"subnet-ip-exhaustion: {' '.join(argv)} returned "
+                        f"{len(parsed)} subnets but none carries `ipUtilization` "
+                        f"-- gcloud's UsableSubnetwork does not expose it in v1, "
+                        f"beta or alpha -- and the fallback read of "
+                        f"{_IP_INSIGHT_TYPE} also failed. Enable "
+                        f"recommender.googleapis.com and grant "
+                        f"recommender.networkAnalyzerIpAddressInsights.list to "
+                        f"the audit service account."
+                    ),
+                }
+            ]
+        covered = _backfill_utilization(parsed, by_subnet)
+        log(f"{project}: Network Analyzer covered {covered}/{len(parsed)} subnets")
+        if not covered:
+            return [
+                {
+                    "name": f"project/{project}/subnets",
+                    "project": project,
+                    "location": "global",
+                    "outcome": "gate-failed",
+                    "error": (
+                        f"subnet-ip-exhaustion: neither surface yields "
+                        f"utilization for any of the {len(parsed)} subnets. "
+                        f"`list-usable` never carries `ipUtilization`, and "
+                        f"{_IP_INSIGHT_TYPE} read cleanly but published stats "
+                        f"for {len(by_subnet)} subnet(s), none of them matching. "
+                        f"Network Analyzer needs a day or so after the API is "
+                        f"enabled before it publishes."
+                    ),
+                }
+            ]
     record = _record(" ".join(argv), result)
     out = []
     for item in parsed:
         name = _last_segment(item.get("subnetwork", ""))
         region = _region_of_subnet_link(item.get("subnetwork", ""))
-        hit = check_subnet_ip_exhaustion(item)
+        # A subnet the backfill did not reach has no utilization figure from
+        # either surface. Running the check against it would return None --
+        # "nothing wrong here" -- so declare it not-applicable instead, which
+        # §6's manifest surfaces rather than silently counting as clean.
+        # Network Analyzer omits subnets with no allocations, which is why an
+        # auto-mode network shows 1 measured subnet and 41 untouched ones.
+        measured = _carries_utilization(item)
+        not_applicable = [{"check": slug, "reason": reason} for slug, reason in SUBNET_SCOPE_NOT_APPLICABLE]
+        if not measured:
+            not_applicable.append(
+                {
+                    "check": "subnet-ip-exhaustion",
+                    "reason": (
+                        "No IP-utilization figure for this subnet on either "
+                        "surface: gcloud's UsableSubnetwork omits the field, and "
+                        f"{_IP_INSIGHT_TYPE} published no stats for it, which "
+                        "Network Analyzer does for subnets holding no allocations."
+                    ),
+                }
+            )
+        hit = check_subnet_ip_exhaustion(item) if measured else None
         out.append(
             {
                 "name": f"{project}/{region}/{name}",
@@ -500,7 +626,7 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                 "outcome": "collected",
                 "commands": [{"check": "subnet-ip-exhaustion", **record}],
                 "candidates": [_emit("subnet-ip-exhaustion", hit)] if hit else [],
-                "checks_not_applicable": [{"check": slug, "reason": reason} for slug, reason in SUBNET_SCOPE_NOT_APPLICABLE],
+                "checks_not_applicable": not_applicable,
             }
         )
     return out
