@@ -281,25 +281,56 @@ because there is no shared mutable state in the collectors beyond the filesystem
   interleaved bytes. It is the right primitive here precisely because the losing writer's content
   is not wanted — a whole envelope, superseded by a whole envelope.
 
-**One run per stream at a time is an invariant, and it needs stating because nothing enforces
-it.** The store's paths — `latest.json`, `started.json`, `findings_<audit>.json` — are keyed by
-_stream_, not by run, so a second concurrent run of the same audit overwrites the first's
-in-flight state rather than racing safely alongside it. Within a run the keying above makes that
-impossible; across runs it is real, because a stream has two dispatchers (the cron scheduler and
-a kanban card), and a manual dispatch while a scheduled run is in flight is an ordinary Tuesday.
-Two mitigations, both cheap:
+**One run per stream at a time is enforced, by a real lock.** The store's paths —
+`latest.json`, `started.json`, `findings_<audit>.json` — are keyed by _stream_, not by run, so a
+second concurrent run of the same audit would overwrite the first's in-flight state. Within a run
+the keying above makes that impossible; across runs it is real, because a stream has two
+dispatchers (the cron scheduler and a kanban card), and a manual dispatch while a scheduled run is
+in flight is an ordinary Tuesday. An advisory check-then-act guard is not enough here: the check
+and the write are two syscalls, and two `start`s inside that window both pass.
 
-- **`start` refuses to clobber a live run.** If `started.json` exists with `S > F` and `now − S`
-  is inside the 2 h ceiling, `start` exits non-zero naming the running run's `pid` and start
-  time. Past the ceiling it proceeds — the previous run is DIED by §4.5's own rule, and a dead
-  run must not wedge the stream forever.
-- **The ring stamp gets sub-second resolution.** `%Y%m%dT%H%M%SZ` collides when two runs finish
-  in the same second, one silently replacing the other in `runs/`. Microseconds cost nothing and
-  make the ring's filenames total-ordered.
+**`started.json` is the lock and the liveness record at once.** One file, because the question the
+lock asks — "is a run in flight, and since when" — is exactly the question the status surface
+answers.
 
-Neither is a lock, and deliberately so: a lock file on a 9p mount with a crashed holder is a new
-stuck-stream failure mode, and the guard above already reads the liveness state §4.5 needs to
-maintain anyway.
+- **Acquire is `os.link` from a uniquely-named claim file onto `started.json`.** The link is
+  atomic and fails `EEXIST`, so exactly one racer wins. `O_CREAT|O_EXCL` would do as well;
+  `os.link` is used because the same claim file is also what the steal below swaps in.
+- **A live holder is never disturbed.** A racer that loses the link reads the holder and exits
+  non-zero naming its `pid` and `t0`.
+- **A dead holder is stolen, atomically, exactly once.** Past the 2 h ceiling the holder is DIED
+  by §4.5's rule and the stream must not stay wedged. The stealer first links its claim onto
+  `.steal-<holder-nonce>` — a second atomic gate, named for the _dead claim's_ identity, so only
+  one process can ever steal that particular claim — and only then `os.replace`s itself into
+  `started.json`.
+- **The steal token is deliberately not deleted on success.** This is the part that has to be
+  written down, because it reads like litter and removing it is silently wrong: a racer that read
+  the same dead claim _before_ the steal would find the token free and replace the new owner. The
+  token is pruned by age instead, which is safe unconditionally — once a claim is stolen its nonce
+  is gone from `started.json` for good, so no later acquire can ask for that token again.
+- **`finish` releases**, and the liveness states fall out of presence rather than a timestamp
+  comparison (§4.5). A `finish` that crashes after publishing leaves the lock held until the
+  ceiling — a stream that reads DIED for two hours and then recovers on its own, which is the
+  right failure direction.
+
+**This was verified on the real filesystem, not assumed.** The PVC is a 9p mount under gVisor, and
+whether it gives true atomicity is exactly the kind of thing a design should not take on faith.
+`O_CREAT|O_EXCL`, `os.link`, and `os.mkdir` were each raced by 12 threads over 60 rounds on the
+live volume: exactly one winner every round for all three. The protocol above was then raced by 16
+**separate processes** over 60 rounds per property. The first version failed — two stealers both
+won on 5 of 25 rounds — and that is what identified the delete-the-token bug; the corrected
+protocol holds cold-race, live-holder, dead-steal, churn, and prune properties at 16 × 60.
+
+**The ring stamp also gets sub-second resolution.** `%Y%m%dT%H%M%SZ` collides when two runs finish
+in the same second, one silently replacing the other in `runs/`. The lock makes that near
+impossible for one stream, but microseconds cost nothing and make the ring's filenames
+total-ordered.
+
+_Rejected alternative:_ `flock`/`fcntl` advisory locking. It releases on process exit, which sounds
+like an advantage until the holder is a container that was OOM-killed on a node whose kubelet has
+not yet reaped it, and it carries no record of _who_ holds it or _since when_ — so the status
+surface would need a second file anyway. A self-expiring claim file gives liveness and mutual
+exclusion from one artifact, and its recovery rule is a wall-clock ceiling any reader can evaluate.
 
 The cost stream's sampling changes sequence, not shape: today three `kubectl top` rounds with
 `sleep 300` between are written inside the per-cluster block — a literal reading sleeps 600 s
@@ -317,10 +348,10 @@ win without betting on it.
 
 ### 4.4 Timing is recorded by the harness and the collector, joined by the view
 
-- `start` writes a phase file (t0, stream, pid) as `started.json` in the stream's report
-  directory (§4.5), where it doubles as the liveness stamp. It is deliberately _not_ cleaned up
-  the way `findings_<audit>.json` is: a start record deleted at `finish` cannot answer "did this
-  stream ever run", and the next `start` overwrites it anyway.
+- `start` writes a phase file (t0, stream, pid, nonce) as `started.json` in the stream's report
+  directory, where it is simultaneously the run lock (§4.3) and the liveness stamp (§4.5).
+  `finish` reads t0 from it and then releases it; "did this stream ever run" is answered by
+  `latest.json`, not by a start record left lying around.
 - The collector manifest records per-cluster and per-check durations and the collection
   totals — it is a subprocess, so this is `time.monotonic()` around `subprocess.run`, not
   estimation.
@@ -383,23 +414,28 @@ same volume the report already lands on.
 
 **Two files per stream, both in `reports/<audit-id>/`** (§4.8 owns the directory):
 
-- **`started.json`** — written by `start`. This file already exists: `write_phase_start` writes
-  `{audit, t0, pid}` unconditionally on every start so `finish` can compute `inspect_s`. Only
-  `phase_path_for`'s return value changes, from `SCRATCH_DIR/phase_<audit>.json` to
-  `reports_dir_for(audit_id)/started.json`; `read_phase_t0` and `inspect_seconds` are untouched.
-  Nothing deletes it, so it survives `finish` and remains readable as the run's start stamp.
+- **`started.json`** — written by `start`, removed by `finish`. Its presence means "a run holds
+  this stream". The file mostly exists already: `write_phase_start` writes `{audit, t0, pid}` on
+  every start so `finish` can compute `inspect_s`. What changes is where it lives
+  (`SCRATCH_DIR/phase_<audit>.json` → `reports_dir_for(audit_id)/started.json`), that it gains a
+  `nonce`, that it is created through the atomic acquire of §4.3 rather than an unconditional
+  overwrite, and that `finish` releases it.
 - **`latest.json`** — written by `finish`, and already the store's envelope. It gains the three
   keys the envelope lacked and the status row had: `prs_opened`, `prs_closed`, `silent_ok`.
 
-Liveness is then two timestamps in one directory — `S` = `started.json.t0`, `F` =
-`latest.json.finished_at`:
+Liveness then reads off which files are present, with one wall-clock ceiling:
 
-| Condition                    | State                                 |
-| ---------------------------- | ------------------------------------- |
-| no `started.json`            | never ran                             |
-| `S > F`, and `now − S` ≤ 2 h | running                               |
-| `S > F`, and `now − S` > 2 h | **DIED** — started, never finished    |
-| `S < F`                      | completed; `latest.json` describes it |
+| `started.json` | `latest.json` | State                                              |
+| -------------- | ------------- | -------------------------------------------------- |
+| absent         | absent        | never ran                                          |
+| absent         | present       | completed; `latest.json` describes it              |
+| age ≤ 2 h      | either        | running                                            |
+| age > 2 h      | either        | **DIED** — started, never finished; lock stealable |
+
+Presence beats timestamp comparison here, and the reason is the lock: because `finish` releases,
+"a start record exists" and "a run holds the stream" are the same fact, so the status surface and
+the mutual exclusion cannot disagree with each other. There is no ordering to get wrong and no
+clock skew between two files to reason about.
 
 This is **roster-independent**, which the ConfigMap's rule was not. The view's `next_fire`
 parses only `M H * * *` and `M H * * D` and returns `None` for anything else, and DIED was
@@ -494,10 +530,26 @@ history takes `at is None` → `expected is None` → `stale is False`, and DIED
 `stale` — no flag can fire. Every failure therefore converged on the same calm table of
 `never ran` with an empty FLAGS column and exit 0: store missing, pod unreachable, and a genuinely
 never-scheduled stream were indistinguishable. Under the file model the view distinguishes
-**never ran** (roster-enabled, no `started.json`, and the store readable — flag `NEVER`, not
+**never ran** (roster-enabled, neither file present, and the store readable — flag `NEVER`, not
 blank), **unreadable** (`root_exists` false or a per-stream `error` — flag `NO STORE`), and
 **stale/died** (the §4.5 rule). Exit is non-zero when the store cannot be read, because "I could
 not look" must not render as "nothing is wrong".
+
+**What changes at the command surface**, since the view no longer reads a namespaced object:
+
+- **`--pod` and `--container`, with discovery as the default.** The target is found by label
+  rather than named, so the ordinary invocation stays argument-free; `--pod` overrides it when
+  more than one agent pod is running, and `--container` defaults to the agent container rather
+  than the sidecar. `--namespace` keeps its current meaning and its current default.
+- **`--file`/stdin becomes more useful, not less.** It now takes the projection's JSON, so the
+  offline mode is a real reproduction of the online one — `--json` on a live run produces exactly
+  what `--file` consumes, which is what makes the view testable without a cluster.
+- **The Makefile target's help text changes.** It currently reads "Render the fleet-audit status
+  ConfigMap", which `make help` prints; leaving it would document an object that no longer
+  exists. The recipe itself keeps passing `$(ARGS)` through unchanged.
+- **The failure message names the reason.** "No agent pod found in namespace X", "pod found but
+  exec denied", and "store directory absent on the pod" are three different problems and read as
+  three different lines; the old path could only say nothing at all.
 
 The default render is one table, eight rows — the per-stream fleet at a glance:
 
@@ -510,16 +562,16 @@ obtainability-audit        yes      50 6 * * *   Aug 26  7:05 am    CLEAN ⚠   
 
 with the flags the raw data cannot be trusted without: **stale** (now is past the next expected
 fire plus slack, from the schedule — a silent stream is rendered loudly, closing the observation
-hole the ledger design's §14 conceded), **died mid-run** (`started.json` is newer than
-`latest.json` and the start is more than two hours old, so a healthy in-flight run never trips
-it), **never** (roster-enabled, store readable, no start record), **no store** (the read itself
+hole the ledger design's §14 conceded), **died mid-run** (`started.json` is still present and its
+`t0` is more than two hours old, so a healthy in-flight run never trips it), **never**
+(roster-enabled, store readable, neither file present), **no store** (the read itself
 failed), and **partial** (`⚠`, coverage gaps named below the table). Unknown status values render
 in the warning colour, never the success one.
 
 DIED is the flag that changes character here. It previously required the staleness computation
 to have produced an expectation, and `next_fire` handles only `M H * * *` and `M H * * D` — so on
 a daily stream the flag arrived roughly a day after the death, and on any other cron shape it
-never arrived. Reading it from two file timestamps and a wall-clock ceiling makes it fire within
+never arrived. Reading it from one file's presence and a wall-clock ceiling makes it fire within
 two hours on every schedule shape, including streams dispatched from a kanban card that have no
 schedule at all. Enabled/schedule still come from the checked-in seed roster
 (`agents/platform/cron/jobs.json`) with a `--roster` flag for a live runtime dump — the seed can
@@ -610,10 +662,13 @@ by design — which is the outcome an unreadable memory is supposed to have.
 `latest.json`, where every fact it needs is a key rather than a paragraph, and answers a "what
 changed" question by comparing two files in `runs/` — the ring is the only place run-over-run
 documents exist anywhere, because the ledger overwrites itself. The fleet-audit SKILL.md gains
-a short section naming the layout. Findings off-pod remain the ledger's job; the store is the
-on-pod answer for the agent that lives beside it, and — since §4.5 — the on-pod answer for run
-health too, which `make fleet-audit-view` projects off-pod through a single `kubectl exec`
-(§4.6) rather than through a second write path.
+a short section naming the layout — which §4.9 turns into its own reader skill and a bounded
+query script, because a description advertising only publishing is not discoverable from "what
+did last night's audit find", and reading a whole envelope to answer a one-number question is not
+affordable. Findings off-pod remain the ledger's job; the store is the on-pod answer for the agent
+that lives beside it, and — since §4.5 — the on-pod answer for run health too, which
+`make fleet-audit-view` projects off-pod through a single `kubectl exec` (§4.6) rather than
+through a second write path.
 
 **Reader two: `finish`'s own delta.** The previous run's ids come from `latest.json` when it
 is trustworthy — its `issue_number` matches the ledger `find_existing_issue` just returned and
@@ -669,6 +724,71 @@ exists to remove. **Keeping the ledger read-back as a fallback** — rejected ab
 delta paragraph. **Removing the hidden block from bodies entirely** — breaks the bench
 verifiers and every external consumer of the published interface; the block's cost is a few
 invisible lines in a generated body, and its read-back was the only part worth retiring.
+
+### 4.9 Answering a chat user's question about a run
+
+§4.8 named the chat path as the store's first reader and left it at "the fleet-audit SKILL.md
+gains a short section naming the layout". That section exists and is accurate, and it is still
+not enough for a user who types "what did last night's compliance audit find?". Three things sit
+between the question and the files, and each needs a different fix.
+
+**The Planning Agent cannot read the store, and must not be taught to.** The `default` profile
+that receives chat ingress holds no file tools at all — its tools are `list_agents`,
+`kanban_create`, the `kanban_list`/`show`/`comment`/`unblock` board reads, and the `memory_*`
+family. Every substantive question is delegated with `kanban_create`, and its own instructions
+already say to default to `platform` for fleet and knowledge questions. So the routing works
+today and this design changes nothing about it. What is worth writing down is the consequence:
+**the reader is the platform specialist spawned by the kanban dispatcher**, not the conversational
+front door, and the store's fixed `/opt/data` root (rather than `$HERMES_HOME`) is what makes the
+same path resolve for both the cron worker that wrote it and the specialist that reads it.
+
+**The skill that documents the store advertises only writing.** `fleet-audit`'s frontmatter
+description is "Publish the findings of an autonomous fleet audit as one continuously-rewritten
+GitHub issue per audit stream, and propose fixes as narrow remediation pull requests." Skill
+selection runs off that sentence, and it contains no signal that the skill also answers questions
+about past runs — the reading section is at line 85 of 798. An agent handed "what did the audit
+find" has to already know to open a skill about publishing. **The reader therefore splits into its
+own skill, `fleet-audit-reports`**, whose description names the questions it answers: what a
+stream last found, what changed between runs, which clusters were skipped, when each stream last
+ran. The writer skill keeps the lifecycle and loses the reading section to a pointer. The split is
+also the cheaper context: a read question stops pulling 798 lines of publish/remediate procedure
+into the window to reach one paragraph.
+
+**Reading the files directly does not scale to the context window.** `latest.json` embeds the
+whole findings document — deliberately un-clipped, so it can exceed the 60k-character budget the
+issue body is held to — and there are eight streams with a fourteen-run ring behind each. An agent
+that answers "how many criticals are open on compliance?" by reading `latest.json` spends tens of
+thousands of tokens to produce a number. So the reader skill's real content is a query script,
+`report_query.py`, with subcommands that each return a small JSON document:
+
+| Subcommand                      | Answers                                                                    |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `streams`                       | one line per stream: last run, status, counts, liveness (§4.5)             |
+| `show <stream>`                 | one run's envelope **without** `document` — status, delta, durations, gaps |
+| `findings <stream>`             | finding titles/severities/clusters, filterable, never full bodies          |
+| `finding <stream> <id>`         | one finding in full — the only path that returns prose                     |
+| `diff <stream> [--from] [--to]` | ids and titles added/resolved between two runs in the ring                 |
+| `runs <stream>`                 | what the ring holds, so a diff can name real stamps                        |
+
+The discipline is one rule: **every subcommand's output is bounded and the full document is
+opt-in.** `show` omits `document` precisely because including it would make the cheap call the
+expensive one, and `finding` exists so the expensive call is still available at the granularity
+someone actually asked for.
+
+This is the same projection idea §4.6 uses for the view, and the two deliberately share
+`report_status.py`'s reading helpers rather than growing a second parser of the same files. The
+difference is the consumer: §4.6 renders a fixed operator table off-pod, while `report_query.py`
+runs on-pod for an agent that has already been asked something specific.
+
+_Rejected alternative:_ giving the Planning Agent file tools so it can answer directly and skip a
+delegation hop. It would turn the one profile with no infrastructure access into one with
+filesystem access, for latency on a question that is already asynchronous by design, and every
+other specialist capability has resisted exactly this. The delegation hop is the architecture, not
+an obstacle to route around.
+
+_Rejected alternative:_ a single `report_query.py summary` that returns everything and lets the
+model pick. That is the behaviour the subcommands exist to prevent — it reintroduces the
+whole-document read with extra steps, and it is the shape that makes a cheap question expensive.
 
 ## 5. What the turn budget becomes
 
@@ -793,7 +913,7 @@ that sees each argv), never report an unread or unchecked cluster as clean, cred
 with redaction as backstop. New ones:
 
 - **No audit decision ever consumes the status files.** `started.json` is read by exactly two
-  things: `finish`, for `inspect_s`, and the concurrent-start guard (§4.3). No delta, dedup,
+  things: `finish`, for `inspect_s`, and the run lock (§4.3). No delta, dedup,
   gating, or rendering decision may read either file _for its status content_, and a failed
   status write never changes a subcommand's exit code. `latest.json`'s separate role as the
   delta's memory is bounded by the next red line, which is narrower than this one and governs
@@ -842,20 +962,35 @@ with redaction as backstop. New ones:
   `start`'s `test_emits_one_json_line`, SKILL.md's field-count sentence, each SOP's payload
   comment, and the ledger design doc's §6 exit-contract sentence.
 - **Status file tests** (`test_audit_report.py`): `start` writes `started.json` into the
-  stream's report directory and `finish` leaves it in place; a `finish` with no `started.json`
-  still writes `latest.json` and reports `inspect_s` as unknown rather than failing; an
-  unwritable report directory logs and exits 0; and the concurrent-start guard refuses inside
-  the 2 h window, naming the live pid, but proceeds past it.
+  stream's report directory and `finish` removes it; a `finish` with no `started.json` still
+  writes `latest.json` and reports `inspect_s` as unknown rather than failing; an unwritable
+  report directory logs and exits 0.
 - **Liveness truth table**: each of §4.5's four states asserted directly against fixture
-  directories — no `started.json`; `S > F` inside the ceiling; `S > F` past it; `S < F` — plus
-  the case that motivated the redesign, a stream whose cron expression `next_fire` cannot parse,
-  which must still report DIED.
+  directories — neither file; `latest.json` with no `started.json`; a `started.json` inside the
+  ceiling; one past it — plus the case that motivated the redesign, a stream whose cron
+  expression `next_fire` cannot parse, which must still report DIED.
 - **Concurrency tests**: a collector run against N fake clusters asserts the pool is capped at
   `MAX_WORKERS`, that a 3-cluster fleet spawns 3 threads rather than 8, and that every
   per-cluster artefact path is distinct; a direct test drives concurrent `_atomic_write` calls
   on one path and asserts every read observes a complete document and the final content is one
   writer's whole output, never a splice; a ring test writes two envelopes in the same second and
   asserts two files.
+- **Lock tests, with real processes.** Threads share a file-descriptor table and would pass a
+  protocol that separate processes break, so these fork: N processes released from a barrier
+  against one directory assert exactly one acquires; a fresh holder is never stolen; N processes
+  racing a planted dead holder assert exactly one steals it _and_ that `started.json` ends up
+  holding the winner's nonce; acquire/release churn never double-admits. One test pins the bug
+  the torture run found — a steal token deleted on success lets a late racer replace the new
+  owner — by asserting the token survives its own steal, and a second asserts it is pruned once
+  older than the ceiling. At the command surface, `start` refuses while a live claim is held and
+  says whose pid and start time hold it, and proceeds once that claim ages past the ceiling.
+  These run against `tmp_path` in CI; the same properties were verified on the live 9p PVC at
+  16 processes × 60 rounds (§4.3).
+- **Query-script tests** (§4.9): each subcommand's output is JSON and bounded — `show` must not
+  contain `document`, `findings` must not contain finding bodies — and a store with a missing,
+  empty, or corrupt `latest.json` produces a stated error rather than an empty success. One test
+  asserts the skill's frontmatter description mentions reading past runs, since that sentence is
+  the entire discovery mechanism.
 - **View tests to the selfimprove view's bar**: width/ANSI invariants, scrub boundary,
   `--file` mode, degradation to `?`, stale/died/never/no-store flags,
   unknown-status-is-warning, and — the regression that hid the ConfigMap failure — a
@@ -993,11 +1128,21 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
    the three status keys added to the envelope, `_status_post` and its callers removed. Proxy:
    `_handle_fleet_audit_status` and its `do_POST` wiring removed. Chart:
    `templates/fleet-audit-status.yaml` deleted whole — ConfigMap and RBAC together. View:
-   re-pointed at the `kubectl exec` projection, with the never/no-store flags and the non-zero
-   exit that make an unreadable store legible. Adds the new `report_status.py` projection and
-   the §4.3 concurrency guards (start guard, sub-second ring stamp). Net negative outside
-   fleet-audit's own directory, and it needs no `helm upgrade` to take effect — which is the
-   property whose absence caused the failure it fixes.
+   re-pointed at the `kubectl exec` projection, with `--pod`/`--container`, the corrected
+   Makefile help text, the never/no-store flags, and the non-zero exit that make an unreadable
+   store legible. Adds the new `report_status.py` projection. Net negative outside fleet-audit's
+   own directory, and it needs no `helm upgrade` to take effect — which is the property whose
+   absence caused the failure it fixes.
+8. **The run lock** (§4.3) — `acquire`/`release`/`prune_tokens` on `started.json`, `start`
+   wired to acquire and exit non-zero on a live holder, `finish` wired to release, the
+   sub-second ring stamp, and the multi-process lock tests. Separable from 7 and shipped after
+   it, because it changes when a run _refuses to start_ and deserves its own review and its own
+   live validation rather than riding along with a deletion PR.
+9. **The reader skill** (§4.9) — `agents/platform/skills/fleet-audit-reports/` with its
+   `SKILL.md` and `report_query.py`, the reading section moved out of `fleet-audit`'s SKILL.md
+   and replaced by a pointer, one line in `generate_docs.py`'s `SKILL_GROUPS`, and
+   `make docs-generate` for the skill catalogue. No harness change at all — it reads files
+   phases 6 and 7 already write.
 
 ## 11. Files touched
 
@@ -1008,9 +1153,11 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
 | SOPs      | all eight in `agents/platform/governance/` (shrink per §7), `agents/platform/cron/jobs.json` (prompts)                                                                                                                                                                                                                                                                                   |
 | Proxy     | `agents/platform/scripts/credential_proxy.py` — the `_handle_fleet_audit_status` route added in phase 2 and **removed again in phase 7**, with its tests; `command_policy.py` untouched throughout                                                                                                                                                                                       |
 | Chart     | `charts/kube-agents/templates/fleet-audit-status.yaml` — added in phase 2, **deleted in phase 7**. No chart object, no RBAC, and no operator change survives this design                                                                                                                                                                                                                 |
-| Status    | (§4.5, phase 7) `audit_report.py` — `started.json` relocation, three envelope keys, `_status_post` deleted, start guard, sub-second ring stamp; `agents/platform/skills/fleet-audit/scripts/report_status.py` (new projection); `test_audit_report.py`                                                                                                                                   |
+| Status    | (§4.5, phase 7) `audit_report.py` — `started.json` relocation, three envelope keys, `_status_post` deleted; `agents/platform/skills/fleet-audit/scripts/report_status.py` (new projection); `test_audit_report.py`                                                                                                                                                                       |
+| Lock      | (§4.3, phase 8) `audit_report.py` — `acquire`/`release`/`prune_tokens` over `started.json`, `start` wired to acquire and `finish` to release, sub-second ring stamp; the multi-process lock tests in `test_audit_report.py`                                                                                                                                                              |
 | Store     | (§4.8, phase 6) `audit_report.py` — store writer, delta re-pointed at the store, ledger-body read-back deleted; `test_audit_report.py`; the fleet-audit `SKILL.md` reading section; `fleet-audit-issue-ledger.md`'s delta-memory amendment; `concepts/declarative-workflow.md`'s computable-delta bullet                                                                                 |
 | View      | `scripts/fleet_audit_status_view.py` (new), `Makefile`, tests (new)                                                                                                                                                                                                                                                                                                                      |
+| Skills    | (§4.9, phase 9) `agents/platform/skills/fleet-audit-reports/SKILL.md` and its `scripts/report_query.py` (both new); the reading section cut from `fleet-audit`'s `SKILL.md` and replaced by a pointer; one line in `scripts/generate_docs.py`'s `SKILL_GROUPS`; `tests/` coverage for the query script                                                                                   |
 | Docs      | this file's row in `docs/README.md`; `fleet-audit-issue-ledger.md` §6 exit-contract sentence; SKILL.md payload/field-count text; the stale stream-count pages named in §10 phase 5; generated regions via `make docs-generate`                                                                                                                                                           |
 
 ## 12. Questions, resolved
@@ -1097,15 +1244,23 @@ recoverable from GitHub by a human, because the ledger body keeps publishing the
   liveness stamps go together, so a wiped store reads as "never ran" for every stream until each
   next run. _What limits it:_ §4.6's `NEVER` and `NO STORE` flags exist so that state is
   rendered as a distinct condition rather than as a calm empty table.
-- **A second concurrent run of one stream corrupts the first's view of itself.** The store's
-  paths are stream-keyed, so overlapping runs interleave `started.json`, `findings_<audit>.json`
-  and `latest.json` (§4.3). _Why accepted:_ §4.3's start guard makes the common case — a manual
-  dispatch on top of a scheduled one — fail fast and legibly, and a true lock on a 9p mount
-  trades this for a stuck-stream failure mode that needs manual clearing. _What it costs:_ the
-  guard is advisory, not atomic: two `start`s inside the same instant can both pass it, and the
-  loser's run then publishes over the winner's state. _What would change it:_ evidence of
-  simultaneous dispatch in practice, at which point `O_EXCL` on `started.json` with an explicit
-  staleness override is the next step, not a lock file.
+- **A dead run holds its stream for up to two hours.** The lock is real — `os.link` onto
+  `started.json`, verified atomic on this PVC and proved at 16 processes × 60 rounds (§4.3) — so
+  the concurrency this replaces is no longer a risk. What replaces it is the ceiling: a run
+  killed by an OOM or a pod eviction leaves a claim that nothing releases, and the next dispatch
+  is refused until the claim ages past `CEILING_S`. _Why accepted:_ two hours is longer than any
+  observed run and shorter than every stream's schedule, so the window closes on its own before
+  the next scheduled dispatch; and a refusal that names the dead holder's pid and start time is
+  a better failure than two runs publishing over each other. _What it costs:_ a manual retry
+  inside that window fails, and clearing it early means deleting `started.json` by hand. _What
+  would change it:_ a pod-lifetime token in the claim — a holder whose boot id no longer matches
+  the running pod is dead on the spot, with no ceiling to wait out.
+- **Steal tokens are litter by design.** A stolen dead claim leaves `.steal-<nonce>` behind
+  permanently, because deleting it on success is exactly the bug the torture test caught: a
+  racer holding the same dead claim would find the token free and replace the new owner (§4.3).
+  _Why accepted:_ correctness beats tidiness, and the file is empty-ish and one per steal.
+  _What it costs:_ a few dozen bytes per crashed run, pruned by `prune_tokens` once older than
+  the ceiling. _What would change it:_ nothing — the prune is the answer, and it is in phase 8.
 - **The report store dies with its PVC, and the delta forgets with it (§4.8, phase 6).** A
   wiped or recreated PVC empties the store; each stream's next run publishes once with no
   delta annotation (§4.8's lost-memory semantics) and repopulates the store as it does.
