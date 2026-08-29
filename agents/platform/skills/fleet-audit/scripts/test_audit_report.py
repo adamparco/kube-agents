@@ -6496,25 +6496,54 @@ class TestCrossCheckManifest(unittest.TestCase):
             audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
         self.assertIn("marks 'collected'", str(ctx.exception))
 
-    def test_a_check_the_manifest_ran_may_still_be_declared_inapplicable(self):
-        """The cross-check the manifest cannot make, pinned so nobody adds it.
+    def not_applicable(self, checks_run, slug, reason="Autopilot cluster; Google owns the node pools"):
+        doc = self.doc(checks_run)
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [{"check": slug, "reason": reason}]
+        return doc
 
-        "A check the collector ran at rc == 0 cannot be inapplicable" is the
-        obvious way to close the `checks_not_applicable` escape hatch, and it
-        is wrong: a `commands` entry records that the *command* ran, not that
-        the *check* was evaluable. patch_readiness issues one `clusters
-        describe` and records it against all nine slugs, then returns [] for
-        the four node-pool checks on an Autopilot cluster. Three of the four
-        clusters in the live fleet are Autopilot and declare exactly those four
-        inapplicable, so the rule rejects every honest run of that stream.
-        Adjudicating this needs the collector to report its own skips, in every
-        collector at once.
-        """
-        doc = self.doc(["no-requests"])
-        doc["scope"]["clusters"][0]["checks_not_applicable"] = [
-            {"check": "no-memory-limit", "reason": "Autopilot cluster; Google owns the node pools"}
-        ]
-        audit_report.cross_check_manifest(doc, self.manifest())
+    def test_an_inapplicable_check_the_collector_declared_is_accepted(self):
+        """The corroborated path. Until every collector emitted its own
+        `checks_not_applicable` this could not be told from a padded one, and
+        the rule below rejected every honest Autopilot run of
+        `security-patch-orchestrator`: patch_readiness issues one `clusters
+        describe` and records it against all nine slugs while returning [] for
+        the four node-pool checks. It now declares those four, so the manifest
+        answers for them."""
+        manifest = self.manifest(
+            checks_not_applicable=[{"check": "no-memory-limit", "reason": "no user node pools"}]
+        )
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), manifest)
+
+    def test_an_inapplicable_check_the_collector_never_ran_is_accepted(self):
+        """Nothing to contradict. A slug the collector does not carry, or a
+        target it could not read, still takes the model's judgment."""
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-pdb"), self.manifest())
+
+    def test_a_check_the_manifest_ran_cleanly_cannot_be_declared_inapplicable(self):
+        """The contradiction: the collector ran the check and completed it,
+        and the document takes it out of the coverage denominator anyway. That
+        reports the cluster as more fully audited than it was, and it is the
+        shape a padded `checks_not_applicable` has."""
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), self.manifest())
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_a_check_the_manifest_ran_and_failed_may_be_declared_inapplicable(self):
+        """rc != 0 is not a successful command, so there is no claim to
+        contradict — and a collector that tried and failed has said nothing
+        about whether the check applies."""
+        manifest = self.manifest(commands=[{"check": "no-requests", "rc": 0}, {"check": "no-memory-limit", "rc": 1}])
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), manifest)
+
+    def test_an_unreachable_cluster_may_declare_anything_inapplicable(self):
+        """A `gate-failed` target never reaches the corroboration rule: the
+        manual fallback above returns before it, and there are no successful
+        commands to contradict in any case."""
+        manifest = self.manifest(outcome="gate-failed", commands=[], error="denied")
+        doc = self.not_applicable([], "no-memory-limit")
+        doc["scope"]["clusters"][0]["limitations"] = "collector gate-failed; re-read by hand"
+        audit_report.cross_check_manifest(doc, manifest)
 
 
 class TestFinishManifestFlag(HarnessTestCase):

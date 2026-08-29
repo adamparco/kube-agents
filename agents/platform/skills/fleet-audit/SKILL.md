@@ -368,6 +368,14 @@ field, and publishes nothing:
   entry is published in the ledger under _Not applicable_, with its reason, where a reviewer who
   knows the cluster can call an excuse for what it is.
 
+  In most cases you will not write this field at all: the collector declares its own skips, and what
+  it declares is carried through for you. What the harness rejects is the contradiction — a slug the
+  manifest records as a successful command on that cluster, which the collector did not itself
+  declare inapplicable. The collector ran that check and completed it, so it was covered. "The
+  command ran and found zero objects of that kind" is a clean result, not an inapplicable check.
+  Where the collector never reached the check — a target it could not read, a slug it does not carry
+  — the judgment is still yours.
+
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
 - **Do not write an `id`.** The harness derives it as `<check>.<cluster>.<namespace>.<object>` — one
@@ -453,17 +461,21 @@ that skipped eight of eleven checks and found nothing has not found nothing; it 
 before this field existed it published as `CLEAN` and closed the ledger.
 
 Which means the two ways to defeat all of this are to claim a check you did not run, or to park one
-in `checks_not_applicable` that you simply did not get to. The harness runs as a subprocess of you;
-it cannot see your tool calls, so it cannot verify either claim — an inflated `checks_run` converts
-a partial audit straight back into a false all-clear, and a padded `checks_not_applicable` does the
-same by shrinking the denominator until the shortfall disappears. Publication is what makes both
-expensive and, more importantly, **falsifiable**: every command you name is published under _How
-this run checked the fleet_, and every exclusion with its reason under _Not applicable_, where a
-reviewer or the next run can re-run the one and contest the other. Record each entry as its check
-completes and paste the command you actually issued. Never add entries in advance, never round the
-list up to the roster because the SOP happens to define that many, never write a command you did not
-run, and never write a `reason` that does not name a property of the cluster — a fabricated one is a
-lie with your name on it in a public issue, which is a worse outcome for you than an honest `7/11`.
+in `checks_not_applicable` that you simply did not get to. An inflated `checks_run` converts a
+partial audit straight back into a false all-clear, and a padded `checks_not_applicable` does the
+same by shrinking the denominator until the shortfall disappears. The collector's manifest catches
+both where it reaches: `checks_run` must match a successful command it recorded, and a check it
+recorded as run and clean cannot be declared inapplicable over the top of it. Neither rule reaches
+the checks you ran by hand on a target the collector could not read — the harness runs as a
+subprocess of you and cannot see your tool calls.
+
+Publication is what makes the rest falsifiable: every command you name is published under _How this
+run checked the fleet_, and every exclusion with its reason under _Not applicable_, where a reviewer
+or the next run can re-run the one and contest the other. Record each entry as its check completes
+and paste the command you actually issued. Never add entries in advance, never round the list up to
+the roster because the SOP happens to define that many, never write a command you did not run, and
+never write a `reason` that does not name a property of the cluster — a fabricated one is a lie with
+your name on it in a public issue, which is a worse outcome for you than an honest `7/11`.
 
 An honest shortfall costs you nothing. It marks the run `partial`, keeps the ledger open, and gets
 picked up next run. That is the system working.

@@ -2878,22 +2878,56 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                     "collected it — see collect.py's manifest and "
                     "cross_check_manifest."
                 )
-        # `checks_not_applicable` is deliberately NOT cross-checked, and the
-        # reason is worth writing down because the rule that suggests itself is
-        # wrong. It is the one field nothing else can contradict -- free text,
-        # outside the coverage denominator, and a check moved into it turns a
-        # partial run clean -- so "a check the manifest ran at rc == 0 cannot be
-        # inapplicable" looks like the closing move. It is not: a manifest
-        # `commands` entry records that the *command* ran, not that the *check*
-        # was evaluable. patch_readiness issues one `clusters describe` and
-        # records it against all nine slugs, then returns [] for `pool-skew`,
-        # `no-autoupgrade`, `no-autorepair`, and `stale-image-type` on an
-        # Autopilot cluster, where Google owns the node pools and there is
-        # nothing to inspect. Three of this fleet's four clusters are Autopilot
-        # and declare exactly those four inapplicable, so the rule rejects every
-        # honest run of this stream. Adjudicating this needs the collector to
-        # say which checks it skipped and why, in every collector at once --
-        # a manifest schema change, not a validator one.
+        # `checks_not_applicable` is the one field that used to be
+        # uncontradictable -- free text, outside the coverage denominator, and a
+        # check moved into it turns a partial run clean. The obvious rule, "a
+        # check the manifest ran at rc == 0 cannot be inapplicable", was wrong
+        # for as long as a `commands` entry recorded that the *command* ran
+        # rather than that the *check* was evaluable: patch_readiness issued one
+        # `clusters describe` and recorded it against all nine slugs while
+        # returning [] for four of them on Autopilot, so the rule rejected every
+        # honest run of that stream against this fleet.
+        #
+        # What it needed was the collector saying which checks it skipped and
+        # why, in every collector at once. That now holds -- collect.py,
+        # fleet_waste, patch_readiness, fleet_stockout and fleet_drift each emit
+        # `checks_not_applicable` for the checks their target's shape rules out
+        # -- so the manifest can finally be asked.
+        #
+        # The rule is therefore corroboration, not prohibition: a slug is
+        # inapplicable if the collector said so, or if the collector never
+        # claimed a successful command for it. Only the contradiction is
+        # rejected -- the manifest recording a check as run and clean while the
+        # document takes it out of the denominator. That is the shape a padded
+        # `checks_not_applicable` has, and it is the one this cannot tell from
+        # an honest one by any other means.
+        #
+        # It stays legal to declare a check the collector never reached: a
+        # target it could not read, or one whose slug it does not carry, still
+        # takes the model's judgment. "The command ran, found zero objects of
+        # that kind, so the check does not apply" is the case this deliberately
+        # rejects -- zero objects is a clean result, and reporting it as
+        # inapplicable shrinks the denominator over a check that was covered.
+        collector_not_applicable = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("checks_not_applicable") or []
+        }
+        for entry in cluster.get("checks_not_applicable") or []:
+            slug = str((entry or {}).get("check", ""))
+            if slug in ok_checks and slug not in collector_not_applicable:
+                raise ValidationError(
+                    f"scope.clusters: {name!r} reports {slug!r} as not applicable, "
+                    f"but the collect.py manifest for {audit_id} records a "
+                    f"successful command for it on {name!r} and does not itself "
+                    "declare it inapplicable. A check the collector ran and "
+                    "completed was covered, so moving it out of the coverage "
+                    "denominator reports the cluster as more fully audited than "
+                    "it was. If the check genuinely cannot apply to this target, "
+                    "the collector is where that belongs — it is the same answer "
+                    "on every run. If it applies but you could not evaluate it, "
+                    "that is this target's `limitations`, which §6 turns into a "
+                    "coverage gap."
+                )
 
 
 class ContainmentError(ValidationError):
