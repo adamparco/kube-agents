@@ -85,34 +85,10 @@ own `deliver` setting; repeating them here sends the same content twice.
 ## Answering a question about a past run
 
 "What did the last compliance audit find?" is a file read, not a run and not a `gh issue view`.
-`finish` keeps what it published, under `${HERMES_HOME:-/opt/data}/fleet-audit/reports/<audit-id>/`:
-
-- `latest.json` — the newest run's envelope.
-- `runs/<YYYYMMDDThhmmssZ>.json` — one envelope per run, newest 14 kept. Comparing two of them is
-  the only way to see what changed between runs; the ledger issue rewrites itself in place and
-  keeps no history.
-
-The envelope's keys are `audit_id`, `finished_at`, `status`, `issue_number`, `issue_url`, `partial`,
-`coverage_gaps`, `collect_s`, `inspect_s`, `publish_s`, `new_ids`, `resolved_ids`, `current_ids`,
-`id_scheme`, and `document`.
-
-- `document` is the findings document the ledger rendered — post-validation, post-degradation, with
-  the same secret redaction the body gets. It is the whole document, not the subset the body's
-  60k-character budget had room for, so it can hold a finding the issue did not print.
-- `current_ids` is the **rendered** id set, exactly what the body's hidden block published, not
-  every finding in the document. Derive the full set from `document`.
-
-Two things it is not:
-
-- **Not the live issue.** It is the last _published_ state, so a finding a human closed by hand
-  since that run, or a `/remediate` posted since, is not reflected until the next run rewrites the
-  store. Read the issue when the question is about the issue.
-- **Not written for every invocation.** Only the exit-0 publish path writes — never `--dry-run`,
-  never a run that exited 2, never `remediate`. The write is best-effort: a failure logs a
-  `WARNING` and leaves the exit code alone, so a run can be missing from `runs/`. A failed write
-  also deletes `latest.json` rather than leave a superseded envelope reading as current. **A
-  missing `latest.json` means unknown, not clean** — say the store has no record and read the
-  ledger issue.
+`finish` keeps what it published under `/opt/data/fleet-audit/reports/<audit-id>/`, and reading that
+store belongs to the `fleet-audit-reports` skill
+([SKILL.md](../fleet-audit-reports/SKILL.md)) — the layout, the bounded query script, and what a
+missing record means. Nothing in this skill reads it.
 
 ## The two-command lifecycle
 
@@ -153,6 +129,14 @@ stream's open ledger issue, and clears any findings document a crashed run left 
 ```
 
 Write your findings to the `findings_path` it gives you. Do not pick your own path.
+
+**Exit code 3 is not a crash — it is another run of this stream already holding it.** `start` prints
+`RUN IN PROGRESS` with the holding pid and start time and writes no JSON. Stop; do not retry, do not
+route around it, and do not start inspecting without a workspace. Say the stream is busy and give
+the pid and start time from the message. A holder is released when its run finishes and is judged
+dead automatically if the pod restarted under it, its clock is nonsense, or two hours pass — so
+this clears itself. `--steal-lock` overrides a holder you have confirmed is gone; it is an operator
+command, not a retry, so do not reach for it on your own.
 
 `checks` is your stream's full roster, handed over so coverage never depends on how far into the SOP
 you read. **It is the work list, not a substitute for the SOP** — the slug says which check, the SOP

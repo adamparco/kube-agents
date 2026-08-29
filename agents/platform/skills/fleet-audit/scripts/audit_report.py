@@ -36,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
@@ -959,36 +959,23 @@ def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
 
 
-def phase_path_for(audit_id: str) -> str:
-    """Where `start` records the run's t0 for `finish` to compute `inspect_s`.
+def read_phase_t0(audit_id: str) -> datetime | None:
+    """The t0 `start` recorded in `started.json`, or None if unusable.
 
     `start` and `finish` are separate processes with the whole LLM inspection
     phase between them, so the only way `finish` can time that phase is a
-    timestamp `start` left behind. Same crashed-run rule as the findings file:
-    `start` overwrites it unconditionally, so a stale one can only be read by a
-    `finish` whose `start` crashed before writing — and a missing or
-    unparseable file degrades to `inspect_s: null`, never to an error. Timing
-    is telemetry; it must not be able to fail a run.
+    timestamp `start` left behind. That timestamp is the run lock's own claim
+    (`started_path_for`, §4.3): one file is the lock, the liveness record, and
+    the t0, because "is a run in flight, and since when" is the same question
+    all three ask. A missing or unparseable file degrades to `inspect_s: null`,
+    never to an error — timing is telemetry and must not be able to fail a run.
     """
-    return f"{SCRATCH_DIR}/phase_{audit_id}.json"
-
-
-def write_phase_start(audit_id: str, t0: datetime) -> None:
-    """Best-effort: a phase file that cannot be written costs a metric, not a run."""
+    holder = read_run_claim(audit_id)
+    if holder is None:
+        return None
     try:
-        Path(phase_path_for(audit_id)).write_text(
-            json.dumps({"audit": audit_id, "t0": t0.isoformat(), "pid": os.getpid()}), encoding="utf-8"
-        )
-    except OSError as exc:
-        log(f"WARNING: could not write {phase_path_for(audit_id)}: {exc}")
-
-
-def read_phase_t0(audit_id: str) -> datetime | None:
-    """The t0 `start` recorded, or None when there is nothing usable to read."""
-    try:
-        raw = json.loads(Path(phase_path_for(audit_id)).read_text(encoding="utf-8"))
-        t0 = datetime.fromisoformat(str(raw.get("t0", "")))
-    except (OSError, ValueError):
+        t0 = datetime.fromisoformat(str(holder.get("t0", "")))
+    except (TypeError, ValueError):
         return None
     if t0.tzinfo is None:
         return None
@@ -1028,81 +1015,6 @@ def collector_seconds(manifest: dict | None) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
-# Status surface — observability only, never a read input to any audit
-# decision. See docs/designs/fleet-audit-collectors-and-status.md §4.5.
-#
-# The write is one best-effort HTTP call to the credential-proxy sidecar's
-# internal endpoint (`_handle_fleet_audit_status` in credential_proxy.py),
-# which patches a chart-created ConfigMap using its own in-cluster identity —
-# never this process's `kubectl`, and never `command_policy.py`. Any failure
-# (the sidecar unreachable, the chart not rendering the ConfigMap, no RBAC)
-# logs a WARNING and returns; nothing here may raise past its own boundary or
-# change a subcommand's exit code. There is no read-before-write: each call
-# replaces the stream's `last` row wholesale, so a stale value only ever
-# lasts until the next run overwrites it, and the view (§4.6) derives every
-# flag it needs — including a died-mid-run stream — from that one row.
-# --------------------------------------------------------------------------- #
-
-STATUS_PROXY_URL = os.environ.get("CREDENTIAL_PROXY_URL") or ""
-
-
-def _status_post(audit_id: str, row: dict) -> None:
-    if not STATUS_PROXY_URL:
-        return
-    try:
-        request = urllib.request.Request(
-            f"{STATUS_PROXY_URL}/v1/internal/fleet-audit-status",
-            method="POST",
-            data=json.dumps(
-                {"stream": audit_id, "data": json.dumps({"last": row})}
-            ).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=10) as resp:
-            resp.read()
-    except Exception as exc:  # noqa: BLE001 — telemetry must never fail a run
-        log(f"WARNING: status write for {audit_id} failed: {exc}")
-
-
-def status_record_started(audit_id: str, t0: datetime) -> None:
-    _status_post(audit_id, {"at": t0.isoformat(), "phase": "started"})
-
-
-def status_record_run(audit_id: str, row: dict) -> None:
-    _status_post(audit_id, {**row, "phase": "finished"})
-
-
-def _status_row(payload: dict, data: dict, findings: list, now: datetime) -> dict:
-    """The status row `finish` records: the exit payload's semantic fields,
-    with PR lists reshaped into counts (the URLs' durable home is the ledger
-    and the PR labels; the row stays row-sized) plus the totals the payload
-    does not carry. `note` is the first coverage gap, already redacted where
-    `coverage_gaps` was assembled."""
-    scope = data.get("scope") or {}
-    gaps = payload.get("coverage_gaps") or []
-    return {
-        "at": now.isoformat(),
-        "status": payload.get("status"),
-        "partial": payload.get("partial"),
-        "silent_ok": payload.get("silent_ok"),
-        "new": payload.get("new"),
-        "resolved": payload.get("resolved"),
-        "findings": len(findings),
-        "critical": sum(1 for f in findings if f.get("severity") == "critical"),
-        "prs_opened": len(payload.get("prs_opened") or []),
-        "prs_closed": len(payload.get("prs_closed") or []),
-        "issue_url": payload.get("issue_url"),
-        "inspect_s": payload.get("inspect_s"),
-        "publish_s": payload.get("publish_s"),
-        "collect_s": payload.get("collect_s"),
-        "clusters": len(scope.get("clusters") or []),
-        "skipped": len(scope.get("skipped") or []),
-        "coverage_gaps": len(gaps),
-        "note": str(gaps[0])[:200] if gaps else "",
-    }
-
-
-# --------------------------------------------------------------------------- #
 # Local report store — the run's structured output, kept where it was produced.
 # See docs/designs/fleet-audit-collectors-and-status.md §4.8.
 #
@@ -1123,13 +1035,21 @@ def _status_row(payload: dict, data: dict, findings: list, now: datetime) -> dic
 # memory that predates everything this run published.
 # --------------------------------------------------------------------------- #
 
-# Profile-scoped, because the store belongs to the agent that produced it.
+# A fixed root, not $HERMES_HOME, and the distinction is the whole feature.
+# `finish` only ever runs under a cron or kanban worker, which the dispatcher
+# spawns with HERMES_HOME pointed at the profile directory
+# (kanban_db.py: env["HERMES_HOME"] = resolve_profile_env(...)), while the chat
+# session that reads the store back runs in the gateway process, whose
+# HERMES_HOME is the container's /opt/data. Interpolating it therefore wrote to
+# profiles/platform/fleet-audit/reports and read from /opt/data/fleet-audit/
+# reports — and the failure is silent in the direction that would catch it,
+# because the run-to-run delta is worker-to-worker and agrees with itself. Chat
+# just sees a store that is permanently empty, which is the one job it has.
+#
 # Overridable for the suite, on the same reasoning as SCRATCH_DIR: off-cluster
 # /opt/data does not exist, and a store whose failure paths can only be
 # exercised where it is deployed is a store whose failure paths are untested.
-REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or (
-    f"{os.environ.get('HERMES_HOME') or '/opt/data'}/fleet-audit/reports"
-)
+REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or "/opt/data/fleet-audit/reports"
 
 # Two weeks of a daily stream, a quarter of a weekly one. At the ledger's own
 # 60k-character body ceiling that bounds the store near 1 MB per stream.
@@ -1138,6 +1058,347 @@ REPORT_HISTORY = 14
 
 def reports_dir_for(audit_id: str) -> Path:
     return Path(REPORTS_DIR) / audit_id
+
+
+# --------------------------------------------------------------------------- #
+# The run lock — one run of a stream at a time, enforced. See §4.3.
+#
+# Every path in the store is keyed by *stream*, not by run, so two concurrent
+# runs of the same audit overwrite each other's in-flight state. Within a run
+# that cannot happen (per-cluster path keys plus `_atomic_write`); across runs
+# it is ordinary, because a stream has two dispatchers — the cron scheduler and
+# a kanban card — and a manual dispatch on top of a scheduled one is a normal
+# Tuesday.
+#
+# `started.json` is the lock and the liveness record at once, because "is a run
+# in flight, and since when" is the same question both ask. Acquire is an
+# atomic `os.link` of a uniquely-named claim onto it. A holder past the ceiling
+# is dead by §4.5's rule and is stolen through a *second* atomic link, named
+# for the dead claim's own nonce, so exactly one process can ever steal that
+# particular claim.
+#
+# Every primitive was raced on the deployed PVC before this was written —
+# `O_CREAT|O_EXCL`, `os.link`, `os.mkdir`, 12 threads x 60 rounds, one winner
+# every round; `os.replace` over a live name, 2000 rounds against 4 readers,
+# never a visible gap — and the protocol itself at 16 separate processes x 60
+# rounds per property. It is not assumed atomic; it was measured, on a mount
+# the container reports as ext4 rather than the 9p this comment used to claim.
+# --------------------------------------------------------------------------- #
+
+# Longer than any observed run (the slowest is ~20 minutes) and shorter than
+# every stream's schedule, so a claim left by an OOM-killed run expires on its
+# own before the next scheduled dispatch meets it.
+RUN_LOCK_CEILING_S = 7200
+
+
+# `(audit_id, nonce)` once this process has taken a lock, so the failure path
+# can tell "the claim I wrote" from "the claim I found". Only `take_run_lock`
+# writes it, and only `release_own_lock` reads it.
+_HELD_LOCK: tuple[str, str] | None = None
+
+
+class RunInProgress(Exception):
+    """Another run holds this stream. Carries the holder so the caller can name it."""
+
+    def __init__(self, audit_id: str, holder: dict) -> None:
+        self.audit_id = audit_id
+        self.holder = holder
+        super().__init__(
+            f"{audit_id}: a run started {holder.get('t0') or 'at an unknown time'} "
+            f"(pid {holder.get('pid')}) still holds this stream. It expires on its "
+            f"own {RUN_LOCK_CEILING_S // 3600}h after it started. To override now, "
+            f"re-run `start --steal-lock`; the file itself is "
+            f"{started_path_for(audit_id)}."
+        )
+
+
+def started_path_for(audit_id: str) -> Path:
+    """The lock file, the liveness stamp, and `finish`'s t0: one file (§4.5)."""
+    return reports_dir_for(audit_id) / "started.json"
+
+
+def pod_instance() -> str | None:
+    """An id that changes whenever this container restarts, or None off-cluster.
+
+    A claim written by a container that is no longer running cannot be revived
+    by waiting, so this collapses the ceiling to zero for the most common death
+    — the pod was OOM-killed, evicted, or rolled mid-run. pid 1 is the
+    container's entrypoint, so its start time is the container's start time;
+    the boot id disambiguates the same tick across two nodes.
+
+    None whenever /proc is not the shape this expects (a dev machine, the test
+    suite), and the caller then falls back to the ceiling alone. This signal may
+    only ever make a claim *more* stealable, never less.
+    """
+    try:
+        with open("/proc/1/stat", encoding="utf-8") as handle:
+            # `pid (comm) state ppid ...` — comm can contain spaces and
+            # parentheses, so split after the last ") ". starttime is field 22
+            # overall, index 19 of what remains.
+            fields = handle.read().rsplit(") ", 1)[-1].split()
+        starttime = fields[19]
+    except (OSError, IndexError):
+        return None
+    boot = ""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as handle:
+            boot = handle.read().strip()
+    except OSError:
+        pass
+    return f"{boot}:{starttime}"
+
+
+def _corrupt_claim_nonce(path: str) -> str:
+    """A nonce for an unreadable claim: same in every reader, different per file.
+
+    Both halves are load-bearing, and they pull in opposite directions. The
+    steal token is named for the holder's nonce and is deliberately never
+    deleted on success (see `acquire_run_lock`), so a *constant* here makes
+    `.steal-corrupt` a one-shot — the first bad write on a stream is stealable
+    and every later one is wedged until the token ages out, which is the
+    permanent-wedge this whole section exists to rule out. A *unique* one is
+    worse: two processes racing the same corrupt claim would name two different
+    tokens, both would link, and both would steal.
+
+    So the identity comes from the file. `os.replace` from a fresh `.claim-*`
+    temp gives every new claim its own inode, and a later write its own mtime,
+    while two racers stat'ing one file agree exactly.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        # Not even stat'able. Keep the constant: a shared token name costs at
+        # worst a wedge the ceiling and `prune_steal_tokens` clear on their own,
+        # and that is the cheaper of the two failures above.
+        return "corrupt"
+    return f"corrupt-{stat.st_ino:x}-{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
+def read_run_claim(audit_id: str) -> dict | None:
+    """The current holder's claim, None if absent, a dead stub if corrupt.
+
+    A file that cannot be parsed is treated as a holder whose start time is
+    zero — i.e. already dead — because the alternative is a stream wedged for
+    good by one bad write. Its nonce comes from the file rather than from its
+    contents, for the reason `_corrupt_claim_nonce` gives.
+    """
+    path = str(started_path_for(audit_id))
+    try:
+        with open(path, encoding="utf-8") as handle:
+            claim = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        claim = None
+    if not isinstance(claim, dict):
+        return {"nonce": _corrupt_claim_nonce(path), "t0": None, "epoch": 0.0, "pid": None}
+    if not isinstance(claim.get("nonce"), str) or not claim["nonce"]:
+        # Parsed, but with nothing to name a steal token after — a partial
+        # write, or a hand-edited file. Same treatment: an identity from the
+        # file, so that two such claims on one stream do not share a token.
+        return dict(claim, nonce=_corrupt_claim_nonce(path))
+    return claim
+
+
+def _claim_is_dead(
+    claim: dict, now: float, ceiling: float, steal_nonce: str | None = None
+) -> bool:
+    """Is this claim safe to steal? Three independent ways to say yes.
+
+    Every one of them exists so that a lock cannot wedge a stream permanently,
+    which is the failure this whole mechanism has to avoid being.
+    """
+    # 1. An operator named this exact holder dead (`start --steal-lock`). Scoped
+    #    to the nonce observed at entry, not to "whatever holds it now", so two
+    #    simultaneous overrides still resolve to one winner rather than both
+    #    stealing past each other.
+    if steal_nonce is not None and claim.get("nonce") == steal_nonce:
+        return True
+    # 2. The container that wrote it is gone. No amount of waiting revives it.
+    recorded, current = claim.get("instance"), pod_instance()
+    if current and recorded and recorded != current:
+        return True
+    try:
+        epoch = float(claim.get("epoch") or 0)
+    except (TypeError, ValueError):
+        epoch = 0.0
+    age = now - epoch
+    # 3. Age. Including *negative* age past the ceiling: a claim dated in the
+    #    future — a clock stepped backwards on the reader, a bad write — would
+    #    otherwise never age out and would hold the stream for good. A start
+    #    time two hours in the future is not credible, so it is not honoured.
+    if age <= -ceiling:
+        return True
+    return age >= ceiling
+
+
+def acquire_run_lock(
+    audit_id: str,
+    t0: datetime,
+    *,
+    ceiling: float = RUN_LOCK_CEILING_S,
+    attempts: int = 8,
+    steal: bool = False,
+) -> str:
+    """Claim the stream for this run, or raise RunInProgress. Returns the nonce.
+
+    `epoch` rides alongside the ISO `t0` deliberately: staleness is arithmetic
+    on a wall clock, and doing it on a float avoids re-parsing a timestamp
+    written by a process that may have had a different idea of the timezone.
+
+    `steal` is the operator override. It does not unlink anything by hand — it
+    declares the holder *observed right now* dead and then goes through the
+    ordinary atomic steal, so a forced dispatch is exactly as race-safe as an
+    expiry-driven one, and two of them still produce one winner.
+    """
+    now = t0.timestamp()
+    directory = reports_dir_for(audit_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    started = str(started_path_for(audit_id))
+    steal_nonce = None
+    if steal:
+        observed = read_run_claim(audit_id) or {}
+        steal_nonce = observed.get("nonce")
+    nonce = uuid.uuid4().hex
+    claim = str(directory / f".claim-{nonce}.json")
+    with open(claim, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "audit": audit_id,
+                "t0": t0.isoformat(),
+                "epoch": now,
+                "pid": os.getpid(),
+                "nonce": nonce,
+                "instance": pod_instance(),
+            },
+            handle,
+        )
+    try:
+        for _ in range(attempts):
+            try:
+                os.link(claim, started)  # atomic: exactly one winner
+                return nonce
+            except FileExistsError:
+                pass
+            holder = read_run_claim(audit_id)
+            if holder is None:
+                continue  # released underneath us; retry the link
+            if not _claim_is_dead(holder, now, ceiling, steal_nonce):
+                raise RunInProgress(audit_id, holder)
+            # A dead holder, and the stream must not stay wedged. Exactly one
+            # process may steal THIS claim: the token is named for the dead
+            # claim's nonce, so the link is the gate.
+            #
+            # The token is NOT removed on success, and that is load-bearing
+            # rather than sloppy. A racer that read the same dead claim before
+            # the steal would otherwise find the token free and replace the new
+            # owner — which is exactly what a 16-process torture run caught.
+            # It is pruned by age instead (`prune_steal_tokens`), which is safe
+            # unconditionally: once a claim is stolen its nonce is gone from
+            # `started.json` for good, so no later acquire can ask for it again.
+            token = str(directory / f".steal-{holder.get('nonce')}")
+            try:
+                os.link(claim, token)
+            except FileExistsError:
+                time.sleep(0.02)  # another stealer got there first
+                continue
+            os.replace(claim, started)  # safe: we hold the only steal right
+            return nonce
+        raise RunInProgress(audit_id, read_run_claim(audit_id) or {})
+    finally:
+        _unlink(claim)
+
+
+def take_run_lock(audit_id: str, t0: datetime, *, steal: bool = False) -> str | None:
+    """`start`'s entry point to the lock. Refuses a live run; never blocks on I/O.
+
+    A stream held by a live run is a refusal — that is the whole point. A store
+    that cannot be written *at all* is not: refusing to audit the fleet because
+    a telemetry directory is full or read-only would make the observability
+    surface able to stop the work it exists to observe, which is precisely the
+    property the ConfigMap was deleted for (§4.5). So an OSError degrades to a
+    warning and an unlocked run — exactly the behaviour every run had before
+    this lock existed — and returns None.
+    """
+    global _HELD_LOCK
+    try:
+        nonce = acquire_run_lock(audit_id, t0, steal=steal)
+    except RunInProgress:
+        raise
+    except OSError as exc:
+        log(
+            f"WARNING: could not take the run lock for {audit_id} ({exc}); "
+            "running unlocked. A concurrent run of this stream would now "
+            "overwrite this one's state."
+        )
+        return None
+    _HELD_LOCK = (audit_id, nonce)
+    return nonce
+
+
+def release_run_lock(audit_id: str) -> None:
+    """`finish` drops the lock; `latest.json` becomes the record of the run.
+
+    Because release is an unlink, "a start record exists" and "a run holds the
+    stream" are the same fact — so the status surface (§4.5) and the mutual
+    exclusion cannot disagree with each other, and liveness needs no comparison
+    between two files' timestamps.
+    """
+    _unlink(str(started_path_for(audit_id)))
+
+
+def release_own_lock() -> None:
+    """Drop the claim *this process* took, if it still holds it. Never raises.
+
+    The sixth anti-wedge cover, and the one that fires most often. `start` takes
+    the lock on its first line and hands it to the agent — nothing between there
+    and `finish` releases it — so a `start` that dies partway has claimed a run
+    that will never happen, and the stream would sit unavailable until the
+    ceiling for work nobody is doing. A minute of Minty being unreachable would
+    cost two hours of the stream. So every exit from `main` that is not a
+    successful command releases what this process took.
+
+    Ownership is checked rather than assumed, which is the difference between
+    this and `release_run_lock`: that one is unconditional because `finish`
+    legitimately releases a claim a *different* process wrote. Here an
+    unconditional unlink could drop a live holder's lock, if this run's claim
+    aged past the ceiling and was stolen while it was failing. The nonce is the
+    proof, and a mismatch is a no-op.
+
+    Between that read and the unlink another process could still steal, and no
+    filesystem here offers an atomic unlink-if-unchanged. The window is the
+    handful of microseconds between two syscalls, and it can only open at all if
+    this run has already been alive for the full two-hour ceiling — by which
+    point leaving the claim in place is the worse of the two outcomes.
+    """
+    global _HELD_LOCK
+    held, _HELD_LOCK = _HELD_LOCK, None
+    if held is None:
+        return
+    audit_id, nonce = held
+    if (read_run_claim(audit_id) or {}).get("nonce") == nonce:
+        release_run_lock(audit_id)
+
+
+def prune_steal_tokens(
+    audit_id: str, now: float | None = None, ceiling: float = RUN_LOCK_CEILING_S
+) -> None:
+    """Drop steal tokens older than the ceiling. Never fatal, never load-bearing."""
+    now = time.time() if now is None else now
+    directory = reports_dir_for(audit_id)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(".steal-"):
+            continue
+        path = directory / name
+        try:
+            if now - path.stat().st_mtime >= ceiling:
+                path.unlink()
+        except OSError:
+            pass
 
 
 def _redact_document(value: object) -> object:
@@ -1203,6 +1464,13 @@ def report_envelope(
         "collect_s": payload.get("collect_s"),
         "inspect_s": payload.get("inspect_s"),
         "publish_s": payload.get("publish_s"),
+        # The three keys the retired status ConfigMap's row carried and the
+        # envelope did not (§4.5). `prs_opened`/`prs_closed` are URL lists
+        # rather than the row's counts — a file has no 1 MiB etcd ceiling to
+        # ration bytes against, and a count cannot be clicked.
+        "prs_opened": list(payload.get("prs_opened") or []),
+        "prs_closed": list(payload.get("prs_closed") or []),
+        "silent_ok": payload.get("silent_ok"),
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
@@ -1244,9 +1512,13 @@ def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
         text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
         # A UTC stamp that sorts lexically in time order, so the prune below
         # and the chat path's "the run before this one" are both a sort.
-        stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # Microseconds, not seconds: at second granularity two runs finishing
+        # in the same second collide and one silently replaces the other in the
+        # ring. The lock makes that near impossible for one stream, but the
+        # extra six digits cost nothing and make the filenames total-ordered.
+        stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         _atomic_write(runs / f"{stamp}.json", text)
-        # A copy, not a symlink: one fewer behaviour to ask of the 9p mount,
+        # A copy, not a symlink: one fewer behaviour to ask of the mount,
         # for zero saved bytes.
         _atomic_write(directory / "latest.json", text)
     except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
@@ -4802,6 +5074,19 @@ def _write_temp(text: str, suffix: str = ".md") -> str:
 
     Falls back to the system temp directory when the PVC is absent, so the unit
     tests and a local `--dry-run` still work off-cluster.
+
+    Sharing the filesystem is necessary but not sufficient: the two containers
+    are also different uids. `NamedTemporaryFile` creates 0600, and the sidecar
+    that runs the real `gh` is uid 10001 against this process's 10000, so a
+    default-mode body file is one the reader is refused — the same "no such
+    file" symptom as the `/tmp` bug above, from the other half of the problem.
+    Hence the widen. It is not a secrecy regression: the file's whole purpose is
+    to become the public body of a GitHub issue moments later, and it has
+    already been through `redact_secrets`.
+
+    This is deliberately *not* what §4.8's report store does — that writes 0600
+    and should stay there. The store is read by this same uid and never by the
+    sidecar, so it has no reason to widen and no counterpart bug to fix.
     """
     directory: str | None = SCRATCH_DIR
     try:
@@ -4813,16 +5098,13 @@ def _write_temp(text: str, suffix: str = ".md") -> str:
     )
     with handle:
         handle.write(text)
-    # NamedTemporaryFile always creates the file mode 0600, ignoring umask --
-    # a Python security default, not a mistake here. But `gh` for this project
-    # runs in a separate sidecar container that reads this same PVC path under
-    # a different uid, so a 0600 file this process can read is one the sidecar
-    # is refused: every issue/PR create, edit, and comment fails with
-    # "permission denied" despite the path resolving correctly on both sides.
-    # Widen to a shared-readable mode so the sidecar's uid can open it too.
     try:
         os.chmod(handle.name, 0o644)
     except OSError:
+        # Best-effort, like every other write here. A filesystem that refuses
+        # the chmod has not made the body unreadable — it may already be
+        # group-readable — so failing the publish over it would be the worse
+        # outcome. The `gh` call downstream reports its own failure.
         pass
     return handle.name
 
@@ -5622,6 +5904,14 @@ def _workspace_runner(
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
+    # Take the lock before anything else this run does. `ensure_workspace(...,
+    # reset=True)` below scrubs the stream's GitOps tree, so a second dispatch
+    # that reached it would delete a live run's working files — the refusal has
+    # to come first, not after the damage.
+    t0 = datetime.now(timezone.utc)
+    take_run_lock(audit_id, t0, steal=bool(getattr(args, "steal_lock", False)))
+    prune_steal_tokens(audit_id, now=t0.timestamp())
+
     # Resolve first, then mint: the token is repo-scoped, and the repository
     # cannot be read off a clone that does not exist yet.
     repo = resolve_repo()
@@ -5648,13 +5938,6 @@ def handle_start(args: argparse.Namespace) -> None:
     # publish as if it were fresh.
     findings_path = findings_path_for(audit_id)
     Path(findings_path).unlink(missing_ok=True)
-
-    # t0 for `finish`'s `inspect_s`. Written after the scrub so a crash between
-    # the two lines leaves a fresh t0 and a missing findings file — the safe
-    # combination — rather than the reverse.
-    t0 = datetime.now(timezone.utc)
-    write_phase_start(audit_id, t0)
-    status_record_started(audit_id, t0)
 
     print(
         json.dumps(
@@ -6098,18 +6381,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
         "refused": refused,
         "duration_s": round(time.monotonic() - entry_mono, 1),
     }
-    status_record_run(
-        audit_id,
-        {
-            "at": now.isoformat(),
-            "status": "REMEDIATED",
-            "prs_opened": len(opened),
-            "already_open": len(plan.already_open),
-            "superseded": len(plan.superseded),
-            "refused": len(refused),
-            "duration_s": payload["duration_s"],
-        },
-    )
+    # No store write and no status write. `remediate` changes no findings, and
+    # the ConfigMap row it used to patch is what made a `/remediate` blank the
+    # preceding audit's row: one slot, two writers, a sparse row winning.
     print(json.dumps(payload))
 
 
@@ -6134,7 +6408,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     # `publish_s` is here → the exit payload, and `collect_s` — present only
     # when a manifest was given — is the collector's own wall-clock. All
     # three ride the payload as telemetry; none can fail the run (see
-    # phase_path_for).
+    # read_phase_t0).
     inspect_s = inspect_seconds(audit_id, now)
     collect_s = collector_seconds(manifest)
     entry_mono = time.monotonic()
@@ -6329,7 +6603,6 @@ def handle_finish(args: argparse.Namespace) -> None:
             "publish_s": round(time.monotonic() - entry_mono, 1),
             "collect_s": collect_s,
         }
-        status_record_run(audit_id, _status_row(payload, data, findings, now))
         # `current_ids` is a claim about what a *live ledger body* renders, so
         # it may only be empty where a body this run wrote is empty. Two of the
         # three clean paths qualify: the ledger was closed, or a fresh coverage
@@ -6361,6 +6634,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             ),
             now,
         )
+        release_run_lock(audit_id)
         print(json.dumps(payload))
         return
 
@@ -6649,7 +6923,6 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "publish_s": round(time.monotonic() - entry_mono, 1),
                 "collect_s": collect_s,
     }
-    status_record_run(audit_id, _status_row(payload, data, findings, now))
     # The delta stored is the one *reported*, so a run that made no claim
     # stores no claim — and `current_ids` is what this body rendered, which is
     # what the next run's `new` is measured against.
@@ -6667,6 +6940,11 @@ def handle_finish(args: argparse.Namespace) -> None:
         ),
         now,
     )
+    # Release last, and only on the publish path. A `finish` that raised before
+    # here keeps the lock, which is right: the agent fixes its findings.json and
+    # re-runs `finish` — which never acquires — while a *fresh* `start` stays
+    # refused until the run is genuinely over or the ceiling expires.
+    release_run_lock(audit_id)
     print(json.dumps(payload))
 
 
@@ -6688,6 +6966,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     start_parser.add_argument(
         "--audit", required=True, help=f"Audit id: one of {', '.join(sorted(AUDITS))}."
+    )
+    start_parser.add_argument(
+        "--steal-lock",
+        action="store_true",
+        help="Take this stream's run lock even though another run holds it. For "
+        "a run you know is dead but that has not yet reached its "
+        f"{RUN_LOCK_CEILING_S // 3600}h expiry; the running audit, if there is "
+        "one, will overwrite this one's state or be overwritten by it.",
     )
 
     finish_parser = subparsers.add_parser(
@@ -6757,12 +7043,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.subcommand == "start":
-            handle_start(args)
-        elif args.subcommand == "remediate":
-            handle_remediate(args)
-        else:
-            handle_finish(args)
+        try:
+            if args.subcommand == "start":
+                handle_start(args)
+            elif args.subcommand == "remediate":
+                handle_remediate(args)
+            else:
+                handle_finish(args)
+        except BaseException:
+            # Every abnormal exit, Ctrl-C included, gives back a lock this
+            # process took and no longer has any run to use it for. A no-op
+            # unless `start` got as far as claiming the stream — which is why
+            # this can sit outside the dispatch rather than inside `handle_start`
+            # and why the `RunInProgress` path below does not drop somebody
+            # else's claim: that failure never wrote one.
+            release_own_lock()
+            raise
+    except RunInProgress as exc:
+        # Its own exit code, distinct from a rejected document and from a
+        # crash: "someone else is already doing this" is a normal outcome of a
+        # double dispatch, and a caller should be able to tell it apart from a
+        # broken run without reading prose.
+        log(f"RUN IN PROGRESS: {exc}")
+        return 3
     except ValidationError as exc:
         log(f"FINDINGS REJECTED: {exc}")
         return 2
