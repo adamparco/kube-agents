@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the fleet-audit report store as one table, eight rows.
+"""Render the fleet-audit report store as an operator dashboard.
 
 Read side of docs/designs/fleet-audit-collectors-and-status.md §4.6. The store
 lives on the agent pod's PVC (`/opt/data/fleet-audit/reports/<audit-id>/`), so
@@ -31,23 +31,55 @@ Four flags the raw rows cannot be trusted without:
     rendered loudly — this is the whole reason the surface exists.
 
 Only STALE and NEVER consult the roster, so roster drift can no longer suppress
-a death. `⚠` on STATUS marks a partial run; its coverage gaps print below the
-table. Unknown status values render as themselves with the warning marker,
+a death. `⚠` on STATUS marks a partial run; the default view counts its coverage
+gaps below the table and `--gaps` spells them out, so the fact that a run read
+less than the fleet is never off-screen even when the text of it is.
+Unknown status values render as themselves with the warning marker,
 never as success. Model-influenced text is scrubbed of terminal control
 characters at exactly one boundary, `scrub()`.
+
+The presentation half -- the box table, the palette, OSC 8 links, the width
+fitting -- is imported from `selfimprove_ledger_view` rather than reimplemented.
+Two terminal tables in one repository that disagree about how to measure a
+coloured cell is two bugs, and this view is not the place to grow a second
+copy of that code.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    from selfimprove_ledger_view import (  # noqa: E402
+        BOX_ASCII,
+        BOX_UNICODE,
+        Column,
+        Palette,
+        ago,
+        hyperlink,
+        plain,
+        pr_ref,
+        render_table,
+        want_colour,
+    )
+except ImportError as exc:  # pragma: no cover - a checked-in sibling file
+    raise SystemExit(
+        "fleet-audit view: scripts/selfimprove_ledger_view.py must sit beside "
+        "this script; it owns the table, colour and hyperlink primitives (%s)" % exc
+    )
+
 DEFAULT_ROSTER = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 PROJECTION_SCRIPT = (
     REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" /
@@ -63,11 +95,49 @@ POD_SELECTOR = "app.kubernetes.io/name=platform-agent"
 # real silence without paging on a slow morning.
 STALE_SLACK = timedelta(hours=1)
 
+#: How many kubeconfig contexts the "no agent pod" path will probe looking for
+#: the install, and how long it gives each. A laptop that has collected forty
+#: contexts should not turn one wrong `--context` into a forty-second wait.
+CONTEXT_PROBE_LIMIT = 12
+CONTEXT_PROBE_TIMEOUT = 6
+
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x9b\x90\x9d]")
+
+#: Every outcome the audit skill writes. Anything else is styled as a warning
+#: rather than as a success -- an outcome this view has never heard of is
+#: exactly the one a reader should look at, and green would hide it.
+STATUS_STYLE = {
+    "CLEAN": "green",
+    "REMEDIATED": "green",
+    "OPENED": "cyan",
+    "UPDATED": "cyan",
+    "running…": "yellow",
+    "never ran": "dim",
+}
+KNOWN_STATUS = frozenset(STATUS_STYLE)
+
+FLAG_STYLE = {"NO STORE": "crit", "DIED": "crit", "NEVER": "yellow", "STALE": "yellow"}
+
+SORTS = ("stream", "last", "findings", "flags")
 
 
 class ProjectionError(RuntimeError):
-    """The projection could not be run at all — exit 2, never a blank table."""
+    """The projection could not be run at all — exit 2, never a blank table.
+
+    `search_namespace` is set only for "nothing is here" rather than "I could
+    not ask", which is the one failure a wrong `kubectl` context produces. It
+    tells `main` it is worth looking through the other contexts for the
+    install before giving up, because the message that failure deserves is
+    "your context points somewhere else, try this one".
+    """
+
+    def __init__(self, message: str, search_namespace: str | None = None) -> None:
+        super().__init__(message)
+        self.search_namespace = search_namespace
+        #: Contexts the fallback probe found an agent pod on, once it has run.
+        #: None means it has not; a list of two or more is why this error was
+        #: raised rather than one of them being picked.
+        self.candidates: list[str] | None = None
 
 
 def scrub(text: object) -> str:
@@ -79,35 +149,151 @@ def _oneline(text: object) -> str:
     return " ".join(str(text or "").split())
 
 
-def discover_pod(namespace: str) -> list[str]:
+def _kubectl(args: list[str], context: str | None) -> list[str]:
+    return ["kubectl"] + (["--context", context] if context else []) + args
+
+
+def _pods_query(namespace: str) -> list[str]:
+    return [
+        "get", "pods", "-n", namespace,
+        "-l", POD_SELECTOR,
+        "--field-selector", "status.phase=Running",
+        "-o", "jsonpath={.items[*].metadata.name}",
+    ]
+
+
+def discover_pod(namespace: str, context: str | None = None) -> list[str]:
     """Running agent pods in the namespace, sorted. Never empty — an empty
     result is the "no agent pod" failure, which the caller must not render as
     an empty fleet."""
     res = subprocess.run(
-        [
-            "kubectl", "get", "pods", "-n", namespace,
-            "-l", POD_SELECTOR,
-            "--field-selector", "status.phase=Running",
-            "-o", "jsonpath={.items[*].metadata.name}",
-        ],
-        capture_output=True,
-        text=True,
+        _kubectl(_pods_query(namespace), context), capture_output=True, text=True
     )
+    where = context or "the current context"
     if res.returncode != 0:
         raise ProjectionError(
-            f"no agent pod found in namespace {namespace}: "
-            f"{_oneline(res.stderr) or 'kubectl get pods failed'}"
+            f"no agent pod found in namespace {namespace} on {where}: "
+            f"{_oneline(res.stderr) or 'kubectl get pods failed'}",
+            search_namespace=namespace,
         )
     names = sorted((res.stdout or "").split())
     if not names:
         raise ProjectionError(
-            f"no agent pod found in namespace {namespace} "
-            f"(label {POD_SELECTOR}, phase Running)"
+            f"no agent pod found in namespace {namespace} on {where} "
+            f"(label {POD_SELECTOR}, phase Running)",
+            search_namespace=namespace,
         )
     return names
 
 
-def fetch_projection(pod: str, container: str, namespace: str) -> dict:
+def kubeconfig_contexts() -> list[str]:
+    try:
+        res = subprocess.run(
+            ["kubectl", "config", "get-contexts", "-o", "name"],
+            capture_output=True,
+            text=True,
+            timeout=CONTEXT_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted(res.stdout.split()) if res.returncode == 0 else []
+
+
+def current_context() -> str:
+    try:
+        res = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            capture_output=True,
+            text=True,
+            timeout=CONTEXT_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def contexts_with_agent(namespace: str, skip: str) -> list[str]:
+    """Which other kubeconfig contexts do hold an agent pod in `namespace`.
+
+    The commonest way this view "breaks" is not a broken install: it is a
+    kubeconfig whose current context is one of the clusters the fleet audit
+    *manages* rather than the hub it runs on, which every parallel session
+    that runs `kubectl config use-context` can cause. Printing the answer
+    beats printing the symptom, so the failure path spends a couple of seconds
+    finding out. Probed in parallel and time-boxed, because a context pointing
+    at a cluster that no longer exists blocks until its own timeout.
+    """
+    candidates = [c for c in kubeconfig_contexts() if c != skip][:CONTEXT_PROBE_LIMIT]
+    if not candidates:
+        return []
+
+    def probe(context: str) -> str:
+        try:
+            res = subprocess.run(
+                _kubectl(_pods_query(namespace), context),
+                capture_output=True,
+                text=True,
+                timeout=CONTEXT_PROBE_TIMEOUT,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return context if res.returncode == 0 and res.stdout.split() else ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        return [hit for hit in pool.map(probe, candidates) if hit]
+
+
+def resolve_target(namespace: str, context: str | None) -> tuple[list[str], str | None]:
+    """Running agent pods, and the context they were actually found on.
+
+    A wrong current context is the commonest way this view "does not work",
+    and it is a question with an answer rather than one to hand back: if
+    exactly one context in the kubeconfig has an agent pod in the namespace,
+    read that one and say so. Two or more is genuinely ambiguous -- a fleet
+    with a second install in it -- and gets the error and the list.
+
+    An explicit `--context` is never overridden. Someone who named a cluster
+    and got nothing wants to know that, not to be quietly redirected.
+    """
+    try:
+        return discover_pod(namespace, context), context
+    except ProjectionError as exc:
+        if context or not exc.search_namespace:
+            raise
+        found = contexts_with_agent(namespace, current_context())
+        exc.candidates = found
+        if len(found) != 1:
+            raise
+        # Silently, because the header's `context` field already says which
+        # cluster was read and a note saying the same thing on stderr is one
+        # more line between the operator and the table.
+        return discover_pod(namespace, found[0]), found[0]
+
+
+def context_hint(exc: ProjectionError, context: str | None) -> list[str]:
+    """The stderr lines that turn "not found" into "here is where it is"."""
+    namespace = exc.search_namespace or DEFAULT_NAMESPACE
+    here = context or current_context()
+    lines = []
+    if here:
+        lines.append(f"  the context read was {here}")
+    found = exc.candidates
+    if found is None:
+        found = contexts_with_agent(namespace, here)
+    if found:
+        lines.append("  an agent pod is running on more than one context:")
+        lines += [f"    --context {name}" for name in found]
+    elif kubeconfig_contexts():
+        lines.append(
+            f"  no context in the kubeconfig has one in {namespace}; "
+            "--namespace, or the install is down"
+        )
+    return lines
+
+
+def fetch_projection(
+    pod: str, container: str, namespace: str, context: str | None = None
+) -> dict:
     """Run report_status.py inside the pod and parse its one JSON document.
 
     The script is piped in on stdin rather than invoked by path so the view
@@ -120,11 +306,10 @@ def fetch_projection(pod: str, container: str, namespace: str) -> dict:
             f"projection script unreadable at {PROJECTION_SCRIPT}: {_oneline(exc)}"
         ) from exc
     res = subprocess.run(
-        [
-            "kubectl", "exec", "-i", pod,
-            "-c", container, "-n", namespace,
-            "--", "python3", "-",
-        ],
+        _kubectl(
+            ["exec", "-i", pod, "-c", container, "-n", namespace, "--", "python3", "-"],
+            context,
+        ),
         input=script,
         capture_output=True,
         text=True,
@@ -217,6 +402,12 @@ def local_time(at: datetime | None, tz: timezone | None = None) -> str:
     return text[:-2] + text[-2:].lower()
 
 
+def when_cell(at: datetime | None, utc: bool) -> str:
+    if at is None:
+        return "—"
+    return at.astimezone(timezone.utc).strftime("%b %d %H:%M") if utc else local_time(at)
+
+
 def duration(seconds: object) -> str:
     if not isinstance(seconds, (int, float)):
         return "?"
@@ -284,19 +475,160 @@ def unreadable_reason(projection: dict) -> str | None:
     return f"unreadable stream files: {', '.join(bad)}" if bad else None
 
 
-GAP_WIDTH = 160
+GAP_WIDTH = 400
 
 
 def clip_gap(text: str, width: int = GAP_WIDTH) -> str:
-    """One line per gap, because a collector writes these at whatever length.
+    """A ceiling on one gap, because a collector writes these at whatever length.
 
-    The live install's are four-sentence paragraphs explaining a refused
-    `gcloud` flag, and six of them push the table off the top of the terminal —
-    the one thing this view exists to show. The whole text is still in the
-    envelope, which is what `fleet-audit-reports` reads; this is the index.
+    Generous — `--gaps` is asked for, so a reader who opened it wants the
+    sentences — but not unbounded: a collector that dumps a stack trace into the
+    field would otherwise scroll the nine gaps around it off the terminal. The
+    whole text is still in the envelope, which is what `fleet-audit-reports`
+    reads; this is the index.
     """
     line = " ".join(str(text).split())
     return line if len(line) <= width else line[: width - 1].rstrip() + "…"
+
+
+def gap_parts(text: str) -> tuple[str, str]:
+    """Split `prod-eu-1: the api server refused the read` into its two halves.
+
+    Collectors write a gap either way round — some name the cluster they could
+    not read, some describe a check that ran nowhere — so the scope is taken
+    only when the prefix reads like one rather than like a sentence that happens
+    to contain a colon.
+    """
+    line = " ".join(str(text).split())
+    scope, sep, rest = line.partition(": ")
+    if sep and rest and len(scope) <= 40 and " " not in scope.strip():
+        return scope, rest
+    return "", line
+
+
+def short_path(path: str) -> str:
+    """Repo-relative when it is in the repo. The roster's default is an
+    absolute path eighty characters long on a worktree checkout, which pushes
+    the one interesting part of it -- which file was read -- off the line."""
+    try:
+        return str(Path(path).resolve().relative_to(REPO_ROOT))
+    except (OSError, ValueError):
+        return path
+
+
+def status_cell(stream: dict, latest: dict) -> tuple[str, str]:
+    """The STATUS text and the style it earns.
+
+    A partial run keeps its own outcome and gains `⚠`; it is not a failure, it
+    is a result computed over less than the whole fleet, and rendering it as
+    an error would train a reader to ignore the marker that says so.
+    """
+    text = scrub(latest.get("status") or stream.get("error") or "never ran")
+    if stream.get("liveness") == "running":
+        text = "running…"
+    style = STATUS_STYLE.get(text, "yellow")
+    if stream.get("error") and not latest.get("status"):
+        style = "red"
+    if latest.get("partial"):
+        return text + " ⚠", "yellow"
+    if text not in KNOWN_STATUS:
+        return text + " ?", style  # unknown outcome renders as a warning, never green
+    return text, style
+
+
+def row_for(
+    audit_id: str,
+    stream: dict,
+    job: dict,
+    now: datetime,
+    root_exists: bool,
+    utc: bool,
+) -> tuple[list[tuple], list[str], dict]:
+    """One table row, its flags, and the `latest` envelope behind it."""
+    latest = stream.get("latest") or {}
+    flags = flags_for(stream, job, now, root_exists)
+    status, status_style = status_cell(stream, latest)
+
+    findings = latest.get("findings")
+    crit = latest.get("critical")
+    if isinstance(findings, int):
+        findings_text = f"{findings} ({crit} c)" if crit else str(findings)
+        findings_style = "crit" if crit else ("dim" if not findings else None)
+    else:
+        findings_text, findings_style = "—", "dim"
+
+    new, resolved = latest.get("new"), latest.get("resolved")
+    if isinstance(new, int) and isinstance(resolved, int):
+        delta_text = f"+{new} / −{resolved}"
+        delta_style = "yellow" if new else ("green" if resolved else "dim")
+    else:
+        delta_text, delta_style = "—", "dim"
+
+    prs = latest.get("prs_opened")
+    pr_text = count_cell(prs)
+    # Linked only when there is exactly one, because a count of three cannot
+    # honestly point at whichever URL happens to be first. The rest are listed
+    # in full under the table.
+    pr_url = prs[0] if isinstance(prs, list) and len(prs) == 1 else ""
+    at = parse_iso(latest.get("finished_at"))
+
+    enabled = "yes" if job.get("enabled") else ("no" if job else "?")
+    row = [
+        (audit_id, "bold" if flags else None),
+        (enabled, {"yes": "green", "no": "dim"}.get(enabled, "yellow")),
+        (job.get("expr", "?"), "dim"),
+        (when_cell(at, utc), None),
+        (ago(at, now) if at else "—", "dim"),
+        (status, status_style),
+        (findings_text, findings_style),
+        (delta_text, delta_style),
+        (pr_text, "dim" if pr_text in ("0", "—") else None, pr_url),
+        (
+            "·".join(
+                duration(latest.get(k)) for k in ("collect_s", "inspect_s", "publish_s")
+            ),
+            "dim",
+        ),
+        (
+            issue_ref(latest.get("issue_url")),
+            "dim" if not latest.get("issue_url") else "cyan",
+            str(latest.get("issue_url") or ""),
+        ),
+        (
+            " ".join(flags),
+            "crit" if {"NO STORE", "DIED"} & set(flags) else ("yellow" if flags else None),
+        ),
+    ]
+    return row, flags, latest
+
+
+COLUMNS = [
+    Column("STREAM"),
+    Column("ON", align="c", expendable=4),
+    Column("SCHEDULE", expendable=3),
+    Column("LAST RUN"),
+    Column("AGE", align="r", expendable=6),
+    Column("STATUS", wrap=True, min_width=11),
+    Column("FINDINGS", align="r"),
+    Column("Δ", align="r", expendable=2),
+    Column("PRS", align="r", expendable=5),
+    Column("TIMING", align="r", expendable=1),
+    Column("ISSUE", align="r"),
+    Column("FLAGS"),
+]
+
+#: `--gaps`. Wrapped rather than clipped: the reader asked for the text, so the
+#: column that holds it is the one that gets the terminal's spare width.
+GAP_COLUMNS = [
+    Column("STREAM"),
+    Column("SCOPE", expendable=1),
+    Column("GAP", wrap=True, min_width=28),
+]
+
+#: `render_table` is given this when the caller asked for no width limit, which
+#: is the default for `render()` used as a library function and what `--width 0`
+#: means: draw every column at its natural width and drop nothing.
+UNBOUNDED = 10_000
 
 
 def render(
@@ -305,86 +637,220 @@ def render(
     now: datetime,
     roster_path: str,
     source: str,
+    *,
+    palette: Palette | None = None,
+    width: int = 0,
+    box: dict | None = None,
+    utc: bool = False,
+    context: str = "",
+    sort: str = "stream",
+    patterns: tuple[str, ...] = (),
+    flagged_only: bool = False,
+    show_gaps: bool = False,
 ) -> str:
+    palette = palette or Palette(False)
+    box = box or BOX_UNICODE
     streams = projection.get("streams") or {}
     root_exists = bool(projection.get("root_exists"))
     ids = sorted(set(roster) | set(streams))
-    header = [
-        "STREAM", "ENABLED", "SCHEDULE", "LAST RUN (local)", "STATUS",
-        "FINDINGS", "Δ", "PRS", "COLLECT", "INSPECT", "PUBLISH", "ISSUE", "FLAGS",
-    ]
-    rows = [header]
-    gaps: list[str] = []
+
+    built = []
     for audit_id in ids:
         stream = streams.get(audit_id) or {}
-        job = roster.get(audit_id) or {}
-        latest = stream.get("latest") or {}
-        status = scrub(latest.get("status") or stream.get("error") or "never ran")
-        if stream.get("liveness") == "running":
-            status = "running…"
-        known = {"CLEAN", "OPENED", "UPDATED", "REMEDIATED", "running…", "never ran"}
-        if latest.get("partial"):
-            status += " ⚠"
-        elif status not in known:
-            status += " ?"  # unknown outcome renders as a warning, never green
-        delta = (
-            f"+{latest['new']} / −{latest['resolved']}"
-            if isinstance(latest.get("new"), int)
-            and isinstance(latest.get("resolved"), int)
-            else "—"
+        row, flags, latest = row_for(
+            audit_id, stream, roster.get(audit_id) or {}, now, root_exists, utc
         )
-        findings = latest.get("findings")
-        crit = latest.get("critical")
-        findings_cell = (
-            f"{findings} ({crit} c)" if isinstance(findings, int) and crit else
-            str(findings) if isinstance(findings, int) else "—"
-        )
-        rows.append([
-            audit_id,
-            "yes" if job.get("enabled") else ("no" if job else "?"),
-            job.get("expr", "?"),
-            local_time(parse_iso(latest.get("finished_at"))),
-            status,
-            findings_cell,
-            delta,
-            count_cell(latest.get("prs_opened")),
-            duration(latest.get("collect_s")),
-            duration(latest.get("inspect_s")),
-            duration(latest.get("publish_s")),
-            issue_ref(latest.get("issue_url")),
-            ",".join(flags_for(stream, job, now, root_exists)) or "",
-        ])
-        for gap in latest.get("coverage_gaps") or []:
-            gaps.append(f"{audit_id}: {scrub(gap)}")
-    widths = [max(len(str(r[i])) for r in rows) for i in range(len(header))]
-    lines = ["  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows]
-    out = [
-        f"fleet-audit status — store: {scrub(projection.get('root'))} ({source})",
-        f"roster: {roster_path}",
-        "",
+        built.append({"id": audit_id, "row": row, "flags": flags, "latest": latest})
+
+    shown = [
+        entry for entry in built
+        if (not patterns or any(p.lower() in entry["id"].lower() for p in patterns))
+        and (not flagged_only or entry["flags"] or entry["latest"].get("partial"))
     ]
-    out += lines
+
+    def key(entry: dict):
+        latest = entry["latest"]
+        at = parse_iso(latest.get("finished_at"))
+        if sort == "last":
+            return (0 if at else 1, -(at.timestamp() if at else 0), entry["id"])
+        if sort == "findings":
+            crit = latest.get("critical") if isinstance(latest.get("critical"), int) else 0
+            total = latest.get("findings") if isinstance(latest.get("findings"), int) else -1
+            return (-crit, -total, entry["id"])
+        if sort == "flags":
+            return (0 if entry["flags"] else 1, entry["id"])
+        return (entry["id"],)
+
+    shown.sort(key=key)
+
+    out = header_lines(projection, built, source, roster_path, context, palette, now, utc)
+    out += ["", palette("STREAMS", "head")]
+    out += render_table(
+        COLUMNS, [entry["row"] for entry in shown], palette,
+        width if width else UNBOUNDED, box,
+    )
+    if len(shown) != len(built):
+        out.append(
+            palette(
+                "  %d of %d streams shown; drop --stream/--flagged for the rest"
+                % (len(shown), len(built)),
+                "dim",
+            )
+        )
+
+    gaps = [
+        (entry["id"], gap_parts(scrub(gap)))
+        for entry in shown
+        for gap in entry["latest"].get("coverage_gaps") or []
+    ]
     if gaps:
-        out += ["", "coverage gaps:"] + [f"  {clip_gap(g)}" for g in gaps]
+        streams_with = len({audit_id for audit_id, _ in gaps})
+        count = "%d coverage gap%s in %d stream%s" % (
+            len(gaps), "" if len(gaps) == 1 else "s",
+            streams_with, "" if streams_with == 1 else "s",
+        )
+        if show_gaps:
+            out += ["", palette("COVERAGE GAPS", "head")]
+            out.append(
+                palette("  " + count + " — what each run did not read, in its own words", "dim")
+            )
+            out += render_table(
+                GAP_COLUMNS,
+                [
+                    [(audit_id, "dim"), (scope, "yellow"), (clip_gap(text),)]
+                    for audit_id, (scope, text) in gaps
+                ],
+                palette, width if width else UNBOUNDED, box, separator="blank",
+            )
+        else:
+            out.append(palette("  " + count + "; --gaps for the text", "yellow"))
+
+    prs = [
+        (entry["id"], url)
+        for entry in shown
+        for url in entry["latest"].get("prs_opened") or []
+    ]
+    if prs:
+        out += ["", palette("PULL REQUESTS OPENED", "head")]
+        width_id = max(len(audit_id) for audit_id, _ in prs)
+        out += [
+            "  %s  %s"
+            % (
+                palette(audit_id.ljust(width_id), "dim"),
+                hyperlink(palette(pr_ref(scrub(url)), "cyan"), scrub(url), palette),
+            )
+            for audit_id, url in prs
+        ]
+
     reason = unreadable_reason(projection)
     if reason:
-        out += ["", f"! {scrub(reason)}"]
+        out += ["", palette("! " + scrub(reason), "crit")]
+    out += ["", palette("  --sort last · --flagged · --gaps · --stream <name> · --help for the rest", "dim")]
     return "\n".join(out)
 
 
-def load_projection(args: argparse.Namespace) -> tuple[dict, str]:
-    """The projection and a one-line description of where it came from."""
+def header_lines(
+    projection: dict,
+    built: list[dict],
+    source: str,
+    roster_path: str,
+    context: str,
+    palette: Palette,
+    now: datetime,
+    utc: bool,
+) -> list[str]:
+    total = len(built)
+    attention = [e for e in built if e["flags"] or e["latest"].get("partial")]
+    findings = sum(
+        e["latest"].get("findings") or 0
+        for e in built
+        if isinstance(e["latest"].get("findings"), int)
+    )
+    critical = sum(
+        e["latest"].get("critical") or 0
+        for e in built
+        if isinstance(e["latest"].get("critical"), int)
+    )
+    ran = [e for e in built if e["latest"].get("finished_at")]
+    newest = max(
+        (parse_iso(e["latest"].get("finished_at")) for e in ran),
+        default=None,
+        key=lambda at: at.timestamp() if at else 0,
+    )
+
+    lead = "%s  %s  %s" % (
+        palette("fleet-audit", "bold"),
+        palette("·", "dim"),
+        palette(
+            "%d stream%s" % (total, "" if total == 1 else "s"), "bold"
+        ),
+    )
+    lead += "  %s  %s" % (
+        palette("·", "dim"),
+        palette("%d need attention" % len(attention), "yellow")
+        if attention
+        else palette("all clear", "green"),
+    )
+    if newest:
+        lead += "  %s  %s" % (
+            palette("·", "dim"),
+            palette("last run %s" % ago(newest, now), "dim"),
+        )
+    lines = [lead, ""]
+
+    def field(label: str, value: str) -> str:
+        return "  %s %s" % (palette(label.ljust(9), "dim"), value)
+
+    lines.append(field("store", scrub(projection.get("root"))))
+    lines.append(field("source", scrub(source)))
+    if context:
+        lines.append(field("context", scrub(context)))
+    lines.append(field("roster", short_path(roster_path)))
+    lines.append(
+        field(
+            "findings",
+            "%s %s"
+            % (
+                palette(str(findings), "bold"),
+                palette(
+                    "across %d run stream%s · %d critical"
+                    % (len(ran), "" if len(ran) == 1 else "s", critical),
+                    "crit" if critical else "dim",
+                ),
+            ),
+        )
+    )
+    if total:
+        clean = total - len(attention)
+        cells = 18
+        filled = int(round(cells * clean / float(total)))
+        bar = "█" * filled + "░" * (cells - filled)
+        lines.append(
+            field(
+                "health",
+                "%s %s"
+                % (
+                    palette(bar, "green" if clean == total else "yellow"),
+                    palette("%d of %d streams clean" % (clean, total), "dim"),
+                ),
+            )
+        )
+    return lines
+
+
+def load_projection(args: argparse.Namespace) -> tuple[dict, str, str]:
+    """The projection, where it came from, and the context it was read on."""
     if args.file:
         if args.file == "-":
-            return as_projection(sys.stdin.read(), "stdin"), "stdin"
+            return as_projection(sys.stdin.read(), "stdin"), "stdin", ""
         try:
             text = Path(args.file).read_text(encoding="utf-8")
         except OSError as exc:
             raise ProjectionError(f"could not read {args.file}: {_oneline(exc)}") from exc
-        return as_projection(text, args.file), f"file {args.file}"
-    pod = args.pod
+        return as_projection(text, args.file), f"file {args.file}", ""
+    pod, context = args.pod, args.context
     if not pod:
-        pods = discover_pod(args.namespace)
+        pods, context = resolve_target(args.namespace, args.context)
         pod = pods[0]
         if len(pods) > 1:
             print(
@@ -393,14 +859,34 @@ def load_projection(args: argparse.Namespace) -> tuple[dict, str]:
                 file=sys.stderr,
             )
     return (
-        fetch_projection(pod, args.container, args.namespace),
+        fetch_projection(pod, args.container, args.namespace, context),
         f"{args.namespace}/{pod} [{args.container}]",
+        context or current_context(),
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fleet_audit_status_view.py",
+        description="Render the fleet-audit report store as an operator dashboard.",
+        epilog=(
+            "examples:\n"
+            "  scripts/fleet_audit_status_view.py\n"
+            "  scripts/fleet_audit_status_view.py --sort findings --flagged\n"
+            "  scripts/fleet_audit_status_view.py --stream drift --stream cost\n"
+            "  scripts/fleet_audit_status_view.py --watch 60\n"
+            "  scripts/fleet_audit_status_view.py --json > store.json\n"
+            "  scripts/fleet_audit_status_view.py --file store.json\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--namespace", "-n", default=DEFAULT_NAMESPACE)
+    parser.add_argument(
+        "--context",
+        default=None,
+        help="kubectl context; defaults to the current one, which on a shared "
+             "kubeconfig is often a managed cluster rather than the hub",
+    )
     parser.add_argument(
         "--pod",
         help=f"agent pod to read (default: discover by {POD_SELECTOR})",
@@ -420,25 +906,95 @@ def main(argv: list[str] | None = None) -> int:
         help="cron roster for ENABLED/SCHEDULE (default: the checked-in seed)",
     )
     parser.add_argument(
+        "--stream", "-s", action="append", default=[], metavar="NAME",
+        help="only streams whose id contains this; repeatable",
+    )
+    parser.add_argument(
+        "--flagged", action="store_true",
+        help="only streams carrying a flag or a partial run",
+    )
+    parser.add_argument(
+        "--gaps", action="store_true",
+        help="spell out what each partial run did not read, instead of counting it",
+    )
+    parser.add_argument("--sort", choices=SORTS, default="stream")
+    parser.add_argument(
         "--json",
         action="store_true",
         help="emit the projection as JSON — exactly what --file consumes",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument(
+        "--ascii", action="store_true", help="ASCII borders instead of box-drawing characters"
+    )
+    parser.add_argument("--utc", action="store_true", help="timestamps in UTC, not local time")
+    parser.add_argument("--width", type=int, default=0, help="output width; 0 detects the terminal")
+    parser.add_argument(
+        "--watch", type=int, default=0, metavar="SECONDS",
+        help="redraw every SECONDS until interrupted",
+    )
+    return parser
 
-    try:
-        projection, source = load_projection(args)
-    except ProjectionError as exc:
-        print(f"fleet-audit view: {exc}", file=sys.stderr)
-        return 2
 
+def draw(args: argparse.Namespace, palette: Palette, box: dict, width: int) -> tuple[str, int]:
+    projection, source, context = load_projection(args)
     if args.json:
-        print(json.dumps(projection, indent=2, sort_keys=True))
-        return exit_code(projection)
-    roster = load_roster(Path(args.roster))
-    print(render(projection, roster, datetime.now(timezone.utc), args.roster, source))
-    return exit_code(projection)
+        return json.dumps(projection, indent=2, sort_keys=True), exit_code(projection)
+    text = render(
+        projection,
+        load_roster(Path(args.roster)),
+        datetime.now(timezone.utc),
+        args.roster,
+        source,
+        palette=palette,
+        width=width,
+        box=box,
+        utc=args.utc,
+        context=context,
+        sort=args.sort,
+        patterns=tuple(args.stream),
+        flagged_only=args.flagged,
+        show_gaps=args.gaps,
+    )
+    return text, exit_code(projection)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    palette = Palette(want_colour(args.color))
+    box = BOX_ASCII if args.ascii else BOX_UNICODE
+    width = args.width if args.width else max(
+        80, min(shutil.get_terminal_size((160, 40)).columns, 220)
+    )
+
+    while True:
+        try:
+            text, code = draw(args, palette, box, width)
+        except ProjectionError as exc:
+            print(f"fleet-audit view: {exc}", file=sys.stderr)
+            if exc.search_namespace:
+                for line in context_hint(exc, args.context):
+                    print(line, file=sys.stderr)
+            return 2
+        if not args.watch:
+            print(text)
+            return code
+        # Home then erase, so the frame is drawn over the old one rather than
+        # after a scroll: a dashboard that walks down the scrollback is not one
+        # anybody leaves open.
+        sys.stdout.write("\x1b[H\x1b[2J" + text + "\n")
+        sys.stdout.write(
+            palette("  refreshing every %ds · ctrl-c to stop\n" % args.watch, "dim")
+        )
+        sys.stdout.flush()
+        try:
+            time.sleep(args.watch)
+        except KeyboardInterrupt:
+            return code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

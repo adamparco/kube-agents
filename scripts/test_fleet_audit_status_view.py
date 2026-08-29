@@ -91,7 +91,8 @@ def started(age_s=300.0):
 
 class FakeKubectl:
     """The subprocess boundary, recorded and canned. `get pods` answers with
-    the pod list; `exec` answers with the projection."""
+    the pod list, `config` with the kubeconfig probes, `exec` with the
+    projection."""
 
     def __init__(
         self,
@@ -101,6 +102,8 @@ class FakeKubectl:
         exec_rc=0,
         exec_stdout=None,
         exec_stderr="",
+        contexts=(),
+        current="hub",
     ):
         self.pods = list(pods)
         self.get_rc = get_rc
@@ -110,10 +113,15 @@ class FakeKubectl:
             json.dumps(projection()) if exec_stdout is None else exec_stdout
         )
         self.exec_stderr = exec_stderr
+        self.contexts = list(contexts)
+        self.current = current
         self.calls = []
 
-    def __call__(self, cmd, capture_output=False, text=False, input=None):
+    def __call__(self, cmd, capture_output=False, text=False, input=None, timeout=None):
         self.calls.append({"cmd": list(cmd), "input": input})
+        if "config" in cmd:
+            answer = self.current if "current-context" in cmd else "\n".join(self.contexts)
+            return CompletedProcess(cmd, 0, answer, "")
         if "get" in cmd:
             return CompletedProcess(cmd, self.get_rc, " ".join(self.pods), self.get_stderr)
         return CompletedProcess(cmd, self.exec_rc, self.exec_stdout, self.exec_stderr)
@@ -121,6 +129,9 @@ class FakeKubectl:
     @property
     def exec_call(self):
         return next(c for c in self.calls if "exec" in c["cmd"])
+
+    def cmds(self, needle):
+        return [c["cmd"] for c in self.calls if needle in c["cmd"]]
 
 
 def run_main(argv, fake=None):
@@ -222,13 +233,14 @@ class TestFlags(unittest.TestCase):
 class TestRender(unittest.TestCase):
     ROSTER = {"compliance-audit": {"enabled": True, "expr": "20 6 * * *"}}
 
-    def render(self, streams, roster=None, root_exists=True):
+    def render(self, streams, roster=None, root_exists=True, **kwargs):
         return view.render(
             projection(streams, root_exists=root_exists),
             self.ROSTER if roster is None else roster,
             NOW,
             "jobs.json",
             "ns/agent-0 [platform-agent]",
+            **kwargs,
         )
 
     def test_a_full_row_renders_its_fields(self):
@@ -250,7 +262,7 @@ class TestRender(unittest.TestCase):
         out = self.render({})
         self.assertIn("/opt/data/fleet-audit/reports", out)
         self.assertIn("ns/agent-0 [platform-agent]", out)
-        self.assertIn("roster: jobs.json", out)
+        self.assertRegex(out, r"roster\s+jobs\.json")
 
     def test_a_rostered_stream_with_no_files_reads_never_ran(self):
         out = self.render({})
@@ -260,11 +272,58 @@ class TestRender(unittest.TestCase):
     def test_partial_runs_warn_and_print_their_gaps(self):
         gaps = ["prod-eu-1: API server unreachable"]
         out = self.render(
-            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=gaps))}
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=gaps))},
+            show_gaps=True,
         )
         self.assertIn("⚠", out)
-        self.assertIn("coverage gaps:", out)
+        self.assertIn("COVERAGE GAPS", out)
         self.assertIn("prod-eu-1", out)
+
+    def test_the_default_view_counts_the_gaps_it_is_not_printing(self):
+        """Behind a flag, but never off-screen.
+
+        A run that read less than the fleet has to say so in the view an
+        operator gets with no arguments; what `--gaps` buys is the collector's
+        own wording, not the existence of the gap.
+        """
+        gaps = ["prod-eu-1: API server unreachable", "prod-us-2: quota exhausted"]
+        out = self.render(
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=gaps))}
+        )
+        self.assertIn("2 coverage gaps in 1 stream; --gaps for the text", out)
+        self.assertNotIn("API server unreachable", out)
+        self.assertNotIn("COVERAGE GAPS", out)
+
+    def test_the_gap_count_is_singular_for_one(self):
+        out = self.render(
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=["a: b"]))}
+        )
+        self.assertIn("1 coverage gap in 1 stream;", out)
+
+    def test_a_filtered_out_stream_does_not_contribute_its_gaps(self):
+        # The count sits under the table and has to describe the same rows.
+        doc = {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=["a: b"]))}
+        self.assertNotIn("coverage gap", self.render(doc, patterns=("cost",)))
+
+    def test_the_scope_is_split_out_of_a_gap_that_has_one(self):
+        out = self.render(
+            {
+                "compliance-audit": stream(
+                    last=latest(partial=True, coverage_gaps=["prod-eu-1: quota exhausted"])
+                )
+            },
+            show_gaps=True,
+        )
+        printed = next(line for line in out.splitlines() if "quota exhausted" in line)
+        self.assertRegex(view.plain(printed), r"prod-eu-1\s+│\s+quota exhausted")
+
+    def test_a_gap_that_is_a_sentence_is_not_split_at_its_colon(self):
+        gap = "partially audited — 3 checks did not run: release-channel, node-image"
+        out = self.render(
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))},
+            show_gaps=True,
+        )
+        self.assertIn("partially audited — 3 checks did not run: release-channel", out)
 
     def test_an_unknown_status_renders_as_a_warning_not_success(self):
         out = self.render({"compliance-audit": stream(last=latest(status="SOMETHING_NEW"))})
@@ -284,43 +343,47 @@ class TestRender(unittest.TestCase):
         out = self.render({}, root_exists=False)
         self.assertIn("store directory absent on the pod", out)
 
-    def test_a_long_coverage_gap_is_clipped_to_one_line(self):
-        """The table is what this view exists to show, and gaps can bury it.
+    def test_a_long_coverage_gap_is_clipped(self):
+        """Even opened deliberately, the section has a ceiling.
 
         The live install writes four-sentence gaps explaining a refused `gcloud`
-        flag; six of those scroll the table off the terminal. The full text
-        stays in the envelope for `fleet-audit-reports` to read.
+        flag; six of those unclipped scroll everything above them off the
+        terminal. The full text stays in the envelope for `fleet-audit-reports`.
         """
         gap = "prod-eu-1: " + "the api server refused the read. " * 20
         out = self.render(
-            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))}
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))},
+            show_gaps=True,
         )
         printed = next(line for line in out.splitlines() if "prod-eu-1" in line)
-        self.assertLessEqual(len(printed.strip()), view.GAP_WIDTH)
-        self.assertTrue(printed.endswith("…"))
-        self.assertIn("prod-eu-1", printed)
+        cell = view.plain(printed).split("│")[3].strip()
+        self.assertLessEqual(len(cell), view.GAP_WIDTH)
+        self.assertTrue(cell.endswith("…"))
 
     def test_a_multi_line_coverage_gap_stays_on_one_line(self):
         # A collector that writes a newline into a gap would otherwise split the
-        # cell across two lines and misalign nothing but read as two gaps.
+        # cell across two paragraphs and read as two gaps.
         gap = "prod-eu-1:\nthe api server\nrefused the read"
         out = self.render(
-            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))}
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))},
+            show_gaps=True,
         )
-        self.assertIn("  compliance-audit: prod-eu-1: the api server refused the read", out)
+        self.assertIn("the api server refused the read", out)
 
     def test_a_short_coverage_gap_is_printed_whole(self):
         gap = "prod-eu-1: API server unreachable"
         out = self.render(
-            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))}
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=[gap]))},
+            show_gaps=True,
         )
-        self.assertIn(f"  compliance-audit: {gap}", out)
+        self.assertIn("API server unreachable", out)
         self.assertNotIn("…", out)
 
     def test_coverage_gaps_are_scrubbed(self):
         gaps = ["bad\x1b]8;;x\x07gap"]
         out = self.render(
-            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=gaps))}
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=gaps))},
+            show_gaps=True,
         )
         self.assertNotIn("\x1b", out)
 
@@ -339,6 +402,196 @@ class TestRender(unittest.TestCase):
         self.assertEqual(
             view.local_time(at, timezone(timedelta(hours=-4))), "Aug 26 2:31 am"
         )
+
+
+class TestDashboard(unittest.TestCase):
+    """The presentation half: borders, colour, links, filters, sort."""
+
+    ROSTER = {
+        "compliance-audit": {"enabled": True, "expr": "20 6 * * *"},
+        "cost-audit": {"enabled": True, "expr": "20 6 * * *"},
+    }
+
+    def render(self, streams, roster=None, **kwargs):
+        return view.render(
+            projection(streams),
+            self.ROSTER if roster is None else roster,
+            NOW,
+            "jobs.json",
+            "src",
+            **kwargs,
+        )
+
+    def body_rows(self, out):
+        return [
+            line for line in out.splitlines()
+            if line.startswith("│") and "STREAM" not in line
+        ]
+
+    def two(self):
+        return {
+            "compliance-audit": stream(last=latest(findings=57, critical=2)),
+            "cost-audit": stream(
+                last=latest(audit_id="cost-audit", findings=3, critical=0, issue_number=8)
+            ),
+        }
+
+    def test_the_table_is_drawn_with_box_borders(self):
+        out = self.render(self.two())
+        self.assertIn("┌", out)
+        self.assertIn("│", out)
+        self.assertIn("└", out)
+
+    def test_ascii_swaps_the_box_characters_out(self):
+        out = self.render(self.two(), box=view.BOX_ASCII)
+        self.assertNotIn("┌", out)
+        self.assertIn("+-", out)
+
+    def test_every_border_line_is_the_same_width(self):
+        # The one failure a coloured table produces silently: a cell measured
+        # with its escape sequences included pads short and the column below
+        # it steps sideways.
+        out = self.render(self.two(), palette=view.Palette(True))
+        widths = {
+            len(view.plain(line))
+            for line in out.splitlines()
+            if view.plain(line).startswith(("┌", "│", "├", "└"))
+        }
+        self.assertEqual(len(widths), 1, widths)
+
+    def test_colour_is_off_unless_asked_for(self):
+        self.assertNotIn("\x1b[", self.render(self.two()))
+
+    def test_the_issue_cell_is_a_hyperlink_when_colour_is_on(self):
+        out = self.render(self.two(), palette=view.Palette(True))
+        self.assertIn("\x1b]8;;https://github.com/acme/fleet/issues/12\x1b\\", out)
+
+    def test_a_lone_pull_request_is_linked_and_the_list_is_printed(self):
+        out = self.render(self.two())
+        self.assertIn("PULL REQUESTS OPENED", out)
+        self.assertIn("acme/fleet#9", out)
+
+    def test_stream_filters_by_substring_and_says_what_it_hid(self):
+        out = self.render(self.two(), patterns=("cost",))
+        self.assertIn("cost-audit", out)
+        self.assertNotIn("compliance-audit", out)
+        self.assertIn("1 of 2 streams shown", out)
+
+    def test_flagged_keeps_only_the_rows_worth_looking_at(self):
+        streams = self.two()
+        streams["cost-audit"] = stream(liveness="never")
+        out = self.render(streams, flagged_only=True)
+        self.assertIn("cost-audit", out)
+        self.assertNotIn("compliance-audit", out)
+
+    def test_sort_findings_puts_the_worst_stream_first(self):
+        streams = self.two()
+        streams["cost-audit"] = stream(last=latest(findings=900, critical=9))
+        out = self.render(streams, sort="findings")
+        self.assertIn("cost-audit", self.body_rows(out)[0])
+
+    def test_sort_stream_is_alphabetical(self):
+        streams = self.two()
+        streams["cost-audit"] = stream(last=latest(findings=900, critical=9))
+        out = self.render(streams, sort="stream")
+        self.assertIn("compliance-audit", self.body_rows(out)[0])
+
+    def test_the_header_counts_findings_and_streams_needing_attention(self):
+        out = self.render(self.two())
+        self.assertIn("2 streams", out)
+        self.assertIn("all clear", out)
+        self.assertIn("60", out)  # 57 + 3 findings across both
+        self.assertIn("2 critical", out)
+
+    def test_a_flagged_stream_is_counted_in_the_lead(self):
+        streams = self.two()
+        streams["cost-audit"] = stream(liveness="never")
+        self.assertIn("1 need attention", self.render(streams))
+
+    def test_the_context_is_named_when_one_was_read(self):
+        self.assertIn("gke_p_z_hub", self.render({}, context="gke_p_z_hub"))
+
+    def test_utc_swaps_the_clock_out_of_local_time(self):
+        out = self.render(self.two(), utc=True)
+        self.assertIn("Aug 26 06:31", out)
+
+    def test_a_narrow_width_drops_columns_and_says_which(self):
+        out = self.render(self.two(), width=100)
+        self.assertIn("dropped to fit 100 columns", out)
+
+
+class TestContextDiscovery(unittest.TestCase):
+    """The commonest reason this view "does not work": the kubeconfig's
+    current context is one of the managed clusters, not the hub."""
+
+    class Probing(FakeKubectl):
+        """A kubeconfig where only `hubs` hold an agent pod."""
+
+        hubs = ()
+
+        def __call__(self, cmd, **kwargs):
+            if "--context" in cmd and cmd[cmd.index("--context") + 1] in self.hubs:
+                self.calls.append({"cmd": list(cmd), "input": None})
+                if "exec" in cmd:
+                    return CompletedProcess(cmd, 0, self.exec_stdout, "")
+                return CompletedProcess(cmd, 0, "agent-0", "")
+            return super().__call__(cmd, **kwargs)
+
+    def probing(self, hubs, **kwargs):
+        fake = self.Probing(pods=(), current="managed", **kwargs)
+        fake.hubs = hubs
+        return fake
+
+    def test_the_failure_names_the_context_it_read(self):
+        fake = FakeKubectl(pods=(), current="gke_p_z_managed")
+        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        self.assertEqual(rc, 2)
+        self.assertIn("the context read was gke_p_z_managed", err)
+
+    def test_the_one_context_holding_the_pod_is_used_and_named(self):
+        fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
+        rc, out, err = run_main(["--roster", "/nonexistent"], fake)
+        self.assertEqual(rc, 0)
+        # Read there, not merely suggested: the exec has to carry the context.
+        self.assertEqual(fake.exec_call["cmd"][1:3], ["--context", "hub-b"])
+        # Named in the header, and only there. A note on stderr saying the same
+        # thing is one more line between the operator and the table.
+        self.assertIn("hub-b", out)
+        self.assertEqual(err, "")
+
+    def test_two_contexts_holding_a_pod_is_ambiguous_and_stops(self):
+        fake = self.probing(("hub-a", "hub-b"), contexts=("hub-a", "hub-b"))
+        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        self.assertEqual(rc, 2)
+        self.assertIn("--context hub-a", err)
+        self.assertIn("--context hub-b", err)
+
+    def test_an_explicit_context_is_never_second_guessed(self):
+        fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
+        rc, _, err = run_main(["--roster", "/nonexistent", "--context", "hub-a"], fake)
+        self.assertEqual(rc, 2)
+        self.assertNotIn("reading hub-b", err)
+
+    def test_no_context_anywhere_says_so_rather_than_offering_nothing(self):
+        fake = FakeKubectl(pods=(), contexts=("hub-a",), current="managed")
+        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        self.assertEqual(rc, 2)
+        self.assertIn("no context in the kubeconfig has one", err)
+
+    def test_an_explicit_context_reaches_both_kubectl_calls(self):
+        fake = FakeKubectl()
+        run_main(["--roster", "/nonexistent", "--context", "hub"], fake)
+        for cmd in (fake.calls[0]["cmd"], fake.exec_call["cmd"]):
+            self.assertEqual(cmd[1:3], ["--context", "hub"])
+
+    def test_file_mode_asks_the_kubeconfig_nothing(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "p.json"
+            path.write_text(json.dumps(projection()), encoding="utf-8")
+            fake = FakeKubectl(pods=())
+            rc, _, _ = run_main(["--roster", "/nonexistent", "--file", str(path)], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.calls, [])
 
 
 class TestProjectionRead(unittest.TestCase):
@@ -382,7 +635,7 @@ class TestProjectionRead(unittest.TestCase):
     def test_an_explicit_pod_skips_discovery(self):
         fake = FakeKubectl()
         run_main(["--roster", "/nonexistent", "--pod", "agent-9"], fake)
-        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.cmds("pods"), [])
         self.assertIn("agent-9", fake.exec_call["cmd"])
 
 

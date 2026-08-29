@@ -430,7 +430,11 @@ tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a pre
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
 	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
 
-fleet-audit-view: ## Render the fleet-audit report store from the agent pod (e.g. make fleet-audit-view ARGS="--namespace kubeagents-system").
+# Read-only. Run `python3 scripts/fleet_audit_status_view.py --help` for the
+# filters, the sort keys and --watch, and pass them through here as ARGS (e.g.
+# ARGS="--sort findings --flagged"). If it reports no agent pod, it names the
+# context that has one -- pass that as ARGS="--context <name>".
+fleet-audit-view: ## Render the fleet-audit report store from the agent pod (e.g. make fleet-audit-view ARGS="--sort findings").
 	@python3 scripts/fleet_audit_status_view.py $(ARGS)
 
 validate: ## Fail if any skill sits under agents/*/defaults/skills/.

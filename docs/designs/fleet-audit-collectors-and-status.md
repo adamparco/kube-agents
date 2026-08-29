@@ -620,15 +620,57 @@ not look" must not render as "nothing is wrong".
 - **The failure message names the reason.** "No agent pod found in namespace X", "pod found but
   exec denied", and "store directory absent on the pod" are three different problems and read as
   three different lines; the old path could only say nothing at all.
+- **The context is found rather than demanded.** The commonest cause of "no agent pod" is not a
+  broken install but a current context pointing at one of the clusters the audit _manages_,
+  which any parallel session running `kubectl config use-context` leaves behind. So when the
+  current context has none, the view probes the rest of the kubeconfig in parallel — time-boxed,
+  because a context naming a deleted cluster blocks until its own timeout — and reads the one
+  that does. Silently: the header's `context` field already names what was read, and a note on
+  stderr saying the same thing is one more line between the operator and the table. Two or more
+  is genuinely ambiguous and gets the error and the list. An explicit `--context` is never
+  overridden: someone who named a cluster and got nothing wants to know that, not to be quietly
+  redirected. `--context` also exists so that pinning the hub does not mean repointing a
+  kubeconfig other sessions are using.
 
-The default render is one table, eight rows — the per-stream fleet at a glance:
+The default render is a header and one table, eight rows — the per-stream fleet at a glance:
 
 ```
-STREAM                     ENABLED  SCHEDULE     LAST RUN (ET)      STATUS    FINDINGS  Δ        PRS  INSPECT  PUBLISH  ISSUE
-compliance-audit           yes      20 6 * * *   Aug 26  6:31 am    UPDATED   57 (2 c)  +3 / −1  1    3m34s    42s      #12
-obtainability-audit        yes      50 6 * * *   Aug 26  7:05 am    CLEAN ⚠   0         —        0    15m2s    38s      #14
-…
+fleet-audit  ·  8 streams  ·  2 need attention  ·  last run 6m ago
+
+  store     /opt/data/fleet-audit/reports
+  source    kubeagents-system/platform-agent-gateway-5959464c4f-t4lvq [platform-agent]
+  context   gke_adamparco-kage_us-east4_kube-agents-host
+  roster    agents/platform/cron/jobs.json
+  findings  68 across 8 run streams · 18 critical
+  health    ██████████████░░░░ 6 of 8 streams clean
+
+STREAMS
+┌──────────────────────┬─────┬────────────┬─────────────────┬───────────┬───────────┬───────────┬───────┐
+│ STREAM               │ ON  │ SCHEDULE   │ LAST RUN        │       AGE │ STATUS    │  FINDINGS │ ISSUE │
+├──────────────────────┼─────┼────────────┼─────────────────┼───────────┼───────────┼───────────┼───────┤
+│ compliance-audit     │ yes │ 20 6 * * * │ Aug 29 7:24 am  │ 2h47m ago │ UPDATED   │   6 (5 c) │   #57 │
+│ stockout-prevention  │ yes │ 20 9 * * * │ Aug 29 8:20 am  │ 1h51m ago │ UPDATED ⚠ │ 16 (12 c) │  #110 │
+└──────────────────────┴─────┴────────────┴─────────────────┴───────────┴───────────┴───────────┴───────┘
 ```
+
+The table, the palette, OSC 8 links and the width fitting are imported from
+`scripts/selfimprove_ledger_view.py` rather than reimplemented; two terminal tables in one
+repository that disagree about how to measure a coloured cell is two bugs. `--color`, `--ascii`,
+`--utc` and `--width` carry the same meanings there as here, joined by `--sort`,
+`--stream`/`--flagged` to narrow the rows, `--gaps` to open the coverage-gap detail, and
+`--watch N` to redraw in place. A filter that hides rows says how many it hid, a width that
+drops columns names them, and the default view counts the coverage gaps it is not printing —
+something the surface quietly omits is the silent-clean failure this section exists to close,
+in a new place.
+
+`--gaps` is where that rule and readability had to be traded against each other. The live
+install's gaps are four-sentence paragraphs — nine of them, most differing only in the cluster
+name — and printing all nine under the table pushes the table itself off the terminal, which is
+the one thing the view exists to show. So the default keeps only the count (`9 coverage gaps in
+2 streams; --gaps for the text`) and the flag opens a second table: stream, the scope the gap
+names, and the text, wrapped rather than clipped to the terminal's spare width. The scope is
+split off only when the prefix reads like one — short and unspaced — so a gap whose prose
+happens to contain a colon stays whole.
 
 with the flags the raw data cannot be trusted without: **stale** (now is past the next expected
 fire plus slack, from the schedule — a silent stream is rendered loudly, closing the observation
