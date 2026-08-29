@@ -2912,6 +2912,39 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             str(entry.get("check"))
             for entry in manifest_cluster.get("checks_not_applicable") or []
         }
+        # The mirror of the rule below, and the hole the `commands` convention
+        # leaves open. A `commands` entry records that a *command* ran, not that
+        # a check reached a verdict on this target -- one `gcloud` call is
+        # routinely recorded against every slug it feeds. So `ok_checks` alone
+        # cannot refuse a document that claims one of those slugs ran on a
+        # target the collector had already declared it inapplicable for: the
+        # manifest corroborates the claim, because the command really did run.
+        #
+        # `gcp-networking-fabric-audit` on 2026-08-29 is the live shape. One
+        # project-wide `subnets list-usable` is recorded against all 43 subnet
+        # units, and the collector separately declares `subnet-ip-exhaustion`
+        # inapplicable on the 41 Network Analyzer published no figures for. The
+        # document that run published put those 41 in `checks_not_applicable`
+        # and was honest. A document that instead listed `subnet-ip-exhaustion`
+        # under `checks_run` for all 43 passes every other rule here and claims
+        # IP-exhaustion coverage over 41 subnets nobody measured.
+        #
+        # The collector is the authority on applicability -- that is what the
+        # rule below rests on -- so a document contradicting it in this
+        # direction is the same error in the same field, and is refused the same
+        # way.
+        for entry in checks_ran(cluster):
+            if entry in collector_not_applicable:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_run names {entry!r}, but the "
+                    f"collect.py manifest for {audit_id} declares {entry!r} not "
+                    f"applicable on {name!r}. The collector knows this target's "
+                    "shape and already said the check has nothing to run against "
+                    "there; a command recorded for it covers some other target the "
+                    "same call served. Reporting it as run counts coverage this "
+                    "run does not have — carry the collector's disposition into "
+                    "checks_not_applicable instead."
+                )
         for entry in cluster.get("checks_not_applicable") or []:
             slug = str((entry or {}).get("check", ""))
             if slug in ok_checks and slug not in collector_not_applicable:

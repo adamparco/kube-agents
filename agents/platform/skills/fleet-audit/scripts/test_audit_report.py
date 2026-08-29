@@ -6568,6 +6568,25 @@ class TestCrossCheckManifest(unittest.TestCase):
         doc["scope"]["clusters"][0]["limitations"] = "collector gate-failed; re-read by hand"
         audit_report.cross_check_manifest(doc, manifest)
 
+    def test_a_check_the_collector_declared_inapplicable_cannot_be_reported_as_run(self):
+        """The mirror of the rule above, and the hole `commands` leaves. One
+        command is routinely recorded against every slug it feeds, so
+        `ok_checks` corroborates a claim that `no-memory-limit` ran here --
+        the command really did run, for some other slug's benefit. Only the
+        collector's own `checks_not_applicable` can tell the two apart, and it
+        says the check had nothing to run against on this target."""
+        manifest = self.manifest(
+            checks_not_applicable=[{"check": "no-memory-limit", "reason": "no user node pools"}]
+        )
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests", "no-memory-limit"]), manifest)
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+        # The honest counterpart -- same manifest, the disposition carried into
+        # `checks_not_applicable` instead -- is
+        # `test_an_inapplicable_check_the_collector_declared_is_accepted` above,
+        # which runs against this exact manifest shape.
+
 
 class TestFinishManifestFlag(HarnessTestCase):
     """The --manifest-file CLI wiring in handle_finish."""
