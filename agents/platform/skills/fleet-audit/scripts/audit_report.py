@@ -2773,24 +2773,22 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                     "collected it — see collect.py's manifest and "
                     "cross_check_manifest."
                 )
-        # `checks_not_applicable` is the one field in the document whose
-        # contents nothing else can contradict: it is free text, it leaves the
-        # coverage denominator, and a check moved into it turns a partial run
-        # into a clean one. Watching the security-patch stream walk the three
-        # states in twenty minutes -- name the check and be rejected, drop it
-        # and go partial, declare it inapplicable and go clean -- is watching
-        # the only door that opens. Nothing here reads the reason, but for a
-        # check the collector ran at rc == 0 the reason cannot be true whatever
-        # it says: the run is the proof the cluster's shape permits it.
-        for slug in checks_na(cluster):
-            if slug in ok_checks:
-                raise ValidationError(
-                    f"scope.clusters: {name!r}.checks_not_applicable names {slug!r}, "
-                    f"but the collect.py manifest for {audit_id} records a successful "
-                    f"command for that check against {name!r}. A check the collector "
-                    "ran is not one the cluster's shape forbids — put it in "
-                    "checks_run, or leave it out and let the run report the gap."
-                )
+        # `checks_not_applicable` is deliberately NOT cross-checked, and the
+        # reason is worth writing down because the rule that suggests itself is
+        # wrong. It is the one field nothing else can contradict -- free text,
+        # outside the coverage denominator, and a check moved into it turns a
+        # partial run clean -- so "a check the manifest ran at rc == 0 cannot be
+        # inapplicable" looks like the closing move. It is not: a manifest
+        # `commands` entry records that the *command* ran, not that the *check*
+        # was evaluable. patch_readiness issues one `clusters describe` and
+        # records it against all nine slugs, then returns [] for `pool-skew`,
+        # `no-autoupgrade`, `no-autorepair`, and `stale-image-type` on an
+        # Autopilot cluster, where Google owns the node pools and there is
+        # nothing to inspect. Three of this fleet's four clusters are Autopilot
+        # and declare exactly those four inapplicable, so the rule rejects every
+        # honest run of this stream. Adjudicating this needs the collector to
+        # say which checks it skipped and why, in every collector at once --
+        # a manifest schema change, not a validator one.
 
 
 class ContainmentError(ValidationError):

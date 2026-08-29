@@ -6347,31 +6347,23 @@ class TestCrossCheckManifest(unittest.TestCase):
                 }
                 audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
 
-    def test_a_check_the_collector_ran_cannot_be_declared_inapplicable(self):
-        """The one field nothing else contradicts.
+    def test_a_check_the_manifest_ran_may_still_be_declared_inapplicable(self):
+        """The cross-check the manifest cannot make, pinned so nobody adds it.
 
-        `checks_not_applicable` is free text, it leaves the coverage
-        denominator, and a check moved into it turns a partial run clean. The
-        security-patch stream walked all three states in twenty minutes: named
-        the check and was rejected, dropped it and went partial, declared it
-        inapplicable with a hand-written reason and went clean. For a check the
-        collector ran at rc == 0 the reason cannot be true whatever it says.
+        "A check the collector ran at rc == 0 cannot be inapplicable" is the
+        obvious way to close the `checks_not_applicable` escape hatch, and it
+        is wrong: a `commands` entry records that the *command* ran, not that
+        the *check* was evaluable. patch_readiness issues one `clusters
+        describe` and records it against all nine slugs, then returns [] for
+        the four node-pool checks on an Autopilot cluster. Three of the four
+        clusters in the live fleet are Autopilot and declare exactly those four
+        inapplicable, so the rule rejects every honest run of that stream.
+        Adjudicating this needs the collector to report its own skips, in every
+        collector at once.
         """
         doc = self.doc(["no-requests"])
         doc["scope"]["clusters"][0]["checks_not_applicable"] = [
-            {"check": "no-memory-limit", "reason": "not meaningful on this cluster"}
-        ]
-        with self.assertRaises(audit_report.ValidationError) as ctx:
-            audit_report.cross_check_manifest(doc, self.manifest())
-        self.assertIn("no-memory-limit", str(ctx.exception))
-        self.assertIn("checks_not_applicable", str(ctx.exception))
-
-    def test_a_check_the_collector_did_not_run_may_still_be_inapplicable(self):
-        # Autopilot node-pool checks are the standing case: the collector never
-        # issues them, and the cluster's shape really does forbid them.
-        doc = self.doc(["no-requests"])
-        doc["scope"]["clusters"][0]["checks_not_applicable"] = [
-            {"check": "no-pdb", "reason": "Autopilot cluster; Google owns the node pools"}
+            {"check": "no-memory-limit", "reason": "Autopilot cluster; Google owns the node pools"}
         ]
         audit_report.cross_check_manifest(doc, self.manifest())
 
