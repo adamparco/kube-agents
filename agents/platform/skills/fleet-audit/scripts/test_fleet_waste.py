@@ -63,49 +63,180 @@ class ParseCpuMemTest(unittest.TestCase):
         self.assertIsNone(fw.parse_mem_mib("garbage"))
 
 
-class ParseTopOutputTest(unittest.TestCase):
-    def test_parses_pods(self):
-        text = "default   api-abc123   150m   256Mi\nkube-system   kp   5m   10Mi\n"
-        out = fw.parse_top_pods(text)
-        self.assertEqual(out[("default", "api-abc123")], (0.15, 256.0))
-
-    def test_parses_nodes(self):
-        text = "gke-prod-a1   500m   25%   2000Mi   40%\n"
-        out = fw.parse_top_nodes(text)
-        self.assertEqual(out["gke-prod-a1"], (0.5, 2000.0))
-
-    def test_short_lines_are_skipped(self):
-        self.assertEqual(fw.parse_top_pods("not enough cols"), {})
-        self.assertEqual(fw.parse_top_nodes("too few"), {})
+MIB = 1024 * 1024
 
 
-class TakeUsageSamplesTest(unittest.TestCase):
-    def test_three_samples_two_sleeps(self):
-        sleeps = []
-        calls = {"n": 0}
+def series_of(ns, pod, *values, key="doubleValue"):
+    return {
+        "resource": {"labels": {"namespace_name": ns, "pod_name": pod}},
+        "points": [{"value": {key: v}} for v in values],
+    }
 
-        def run(argv, **kwargs):
-            calls["n"] += 1
-            if "pods" in argv:
-                return run_of(0, "default pod-1 100m 100Mi")
-            return run_of(0, "node-1 1 10% 1000Mi 10%")
 
-        pod_samples, node_samples, ok, _ = fw.take_usage_samples(Path("/kc"), run=run, sleep=sleeps.append)
+class FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code, self._payload, self.text = status_code, payload, text
+
+    def json(self):
+        return self._payload
+
+
+class FakeSession:
+    """Answers the two metric queries `fetch_usage_peaks` issues."""
+
+    def __init__(self, cpu=(), mem=(), status=200, text="", raises=None):
+        self.cpu, self.mem, self.status, self.text, self.raises = list(cpu), list(mem), status, text, raises
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+        if self.raises:
+            raise self.raises
+        if self.status != 200:
+            return FakeResponse(self.status, text=self.text)
+        is_cpu = "cpu/core_usage_time" in params["filter"]
+        return FakeResponse(200, {"timeSeries": self.cpu if is_cpu else self.mem})
+
+
+def usage_session(*pods, **kwargs):
+    """A `FakeSession` answering with one series per `(ns, pod, cores, mib)`.
+
+    Collector tests need *some* usage data or `overrequest` reads as degraded,
+    which is a different code path from the one they are exercising.
+    """
+    pods = pods or (("default", "idle-1", 0.01, 8.0),)
+    return FakeSession(
+        cpu=[series_of(ns, pod, cores) for ns, pod, cores, _ in pods],
+        mem=[series_of(ns, pod, mib * MIB) for ns, pod, _, mib in pods],
+        **kwargs,
+    )
+
+
+NO_USAGE = dict(cpu=[], mem=[])
+
+
+class FetchUsagePeaksTest(unittest.TestCase):
+    def fetch(self, session, **kwargs):
+        return fw.fetch_usage_peaks("acme", "prod-usc1", session=session, now=NOW, **kwargs)
+
+    def test_cpu_and_memory_merge_into_one_peak_per_pod(self):
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", 0.15)],
+            mem=[series_of("default", "api-1", 256 * MIB)],
+        )
+        peaks, ok, result = self.fetch(session)
         self.assertTrue(ok)
-        self.assertEqual(len(pod_samples), 3)
-        self.assertEqual(len(node_samples), 3)
-        self.assertEqual(sleeps, [300, 300])  # n-1 sleeps between n samples
+        self.assertEqual(result.rc, 0)
+        # Cores and MiB -- the units `check_overrequest` compares against
+        # parsed `resources.requests`, not the API's cores and raw bytes.
+        self.assertEqual(peaks[("default", "api-1")], (0.15, 256.0))
 
-    def test_metrics_unavailable_short_circuits(self):
-        def run(argv, **kwargs):
-            if "nodes" in argv:
-                return run_of(1, "", "metrics not available")
-            return run_of(0, "")
+    def test_the_peak_is_the_max_not_the_last_or_the_mean(self):
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", 0.1, 4.0, 0.2)],
+            mem=[series_of("default", "api-1", MIB, 8 * MIB, 2 * MIB)],
+        )
+        peaks, _, _ = self.fetch(session)
+        self.assertEqual(peaks[("default", "api-1")], (4.0, 8.0))
 
-        pod_samples, node_samples, ok, result = fw.take_usage_samples(Path("/kc"), run=run, sleep=lambda s: None)
+    def test_int64_values_are_read_as_well_as_double(self):
+        # Monitoring returns memory as an integer type; a reader that only
+        # understood doubleValue would see every pod using zero bytes.
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", 0.5)],
+            mem=[series_of("default", "api-1", str(512 * MIB), key="int64Value")],
+        )
+        peaks, _, _ = self.fetch(session)
+        self.assertEqual(peaks[("default", "api-1")], (0.5, 512.0))
+
+    def test_a_pod_in_one_metric_only_still_appears(self):
+        session = FakeSession(cpu=[series_of("default", "api-1", 0.3)], mem=[])
+        peaks, ok, _ = self.fetch(session)
+        self.assertTrue(ok)
+        self.assertEqual(peaks[("default", "api-1")], (0.3, 0.0))
+
+    def test_an_empty_answer_is_unavailable_rather_than_zero_usage(self):
+        # The one failure mode that turns this check into a fleet-wide false
+        # positive. An empty result read as "every pod used nothing" flags
+        # every workload on the cluster as pure waste, with a plausible-looking
+        # peak of 0.00 vCPU behind it.
+        peaks, ok, result = self.fetch(FakeSession(cpu=[], mem=[]))
+        self.assertEqual(peaks, {})
         self.assertFalse(ok)
-        self.assertEqual(pod_samples, [])
-        self.assertEqual(result.rc, 1)
+        self.assertIn("no time series", result.stderr)
+
+    def test_an_api_error_is_unavailable_and_keeps_the_status(self):
+        peaks, ok, result = self.fetch(FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"))
+        self.assertFalse(ok)
+        self.assertEqual(peaks, {})
+        self.assertEqual(result.rc, 403)
+        self.assertIn("monitoring.timeSeries.list", result.stderr)
+
+    def test_a_transport_exception_is_unavailable_not_a_crash(self):
+        peaks, ok, result = self.fetch(FakeSession(raises=OSError("connection reset")))
+        self.assertFalse(ok)
+        self.assertEqual(result.rc, -1)
+        self.assertIn("connection reset", result.stderr)
+
+    def test_no_session_degrades_instead_of_raising(self):
+        # `collect_fleet` passes None when ADC could not be resolved. Every
+        # object-state check still has to run.
+        peaks, ok, result = self.fetch(None)
+        self.assertFalse(ok)
+        self.assertEqual(peaks, {})
+        self.assertIn("ADC", result.stderr)
+
+    def test_pagination_follows_the_next_page_token(self):
+        pages = {
+            "cpu": [
+                {"timeSeries": [series_of("default", "api-1", 0.1)], "nextPageToken": "more"},
+                {"timeSeries": [series_of("default", "api-2", 0.2)]},
+            ],
+            "mem": [{"timeSeries": [series_of("default", "api-1", MIB)]}],
+        }
+        seen = []
+
+        class Paged:
+            def get(self, url, params=None, timeout=None):
+                seen.append(params.get("pageToken"))
+                key = "cpu" if "cpu/core_usage_time" in params["filter"] else "mem"
+                queue = pages[key]
+                return FakeResponse(200, queue.pop(0))
+
+        peaks, ok, _ = self.fetch(Paged())
+        self.assertTrue(ok)
+        self.assertEqual(sorted(peaks), [("default", "api-1"), ("default", "api-2")])
+        self.assertEqual(seen, [None, "more", None])
+
+    def test_the_query_asks_for_a_peak_per_pod_over_the_whole_window(self):
+        # These four parameters are the whole method. Without the secondary
+        # ALIGN_MAX the response is one point per alignment period and the
+        # caller would have to reduce it itself; without REDUCE_SUM grouped by
+        # namespace and pod the figures stay per-container and compare against
+        # a pod's summed requests as if each container were the whole pod.
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        self.fetch(session, window_hours=24)
+        params = session.calls[0]
+        self.assertEqual(params["secondaryAggregation.perSeriesAligner"], "ALIGN_MAX")
+        self.assertEqual(params["secondaryAggregation.alignmentPeriod"], "86400s")
+        self.assertEqual(params["aggregation.crossSeriesReducer"], "REDUCE_SUM")
+        self.assertEqual(
+            params["aggregation.groupByFields"],
+            ["resource.labels.namespace_name", "resource.labels.pod_name"],
+        )
+        self.assertIn('resource.labels.cluster_name="prod-usc1"', params["filter"])
+        self.assertEqual(params["interval.startTime"], "2026-07-31T00:00:00Z")
+        self.assertEqual(params["interval.endTime"], "2026-08-01T00:00:00Z")
+
+    def test_cpu_is_a_rate_and_memory_is_not(self):
+        # `core_usage_time` is a cumulative counter in core-seconds: aligned
+        # any way but ALIGN_RATE it reports seconds of CPU consumed since the
+        # container started, which is not cores and grows without bound.
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        self.fetch(session)
+        aligners = {c["filter"].split('"')[1]: c["aggregation.perSeriesAligner"] for c in session.calls}
+        self.assertEqual(aligners[fw.CPU_METRIC], "ALIGN_RATE")
+        self.assertEqual(aligners[fw.MEM_METRIC], "ALIGN_MAX")
 
 
 class OrphanPvTest(unittest.TestCase):
@@ -426,57 +557,74 @@ class OverrequestTest(unittest.TestCase):
             },
         )
 
+    IDLE = {("default", "api-1"): (0.0, 0.0)}
+
     def test_flags_gross_overrequest(self):
         pod = self.deployment_pod()
-        samples = [{("default", "api-1"): (0.9, 3072.0)}] * 3  # 0.9 vCPU / 3 GiB peak vs 12/48 requested
-        hits = fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False)
+        peaks = {("default", "api-1"): (0.9, 3072.0)}  # 0.9 vCPU / 3 GiB peak vs 12/48 requested
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
 
-    def test_does_not_flag_when_one_sample_disagrees(self):
+    def test_does_not_flag_when_the_peak_clears_the_bar(self):
+        # The window used to be three ten-minute samples and this rule used to
+        # be "every one of them agrees". A week-long peak is the same rule
+        # without the sampling error: a workload that reached 11 vCPU once is
+        # not over-requesting at 12, however idle it looked when we last
+        # happened to run `kubectl top`.
         pod = self.deployment_pod()
-        samples = [{("default", "api-1"): (0.9, 3072.0)}, {("default", "api-1"): (0.9, 3072.0)}, {("default", "api-1"): (11.0, 40000.0)}]
-        self.assertEqual(fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False), [])
+        peaks = {("default", "api-1"): (11.0, 40000.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
     def test_does_not_flag_below_the_absolute_floor(self):
         pod = self.deployment_pod(cpu_req="100m", mem_req="256Mi")
-        samples = [{("default", "api-1"): (0.0, 0.0)}] * 3
-        self.assertEqual(fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False), [])
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
 
     def test_does_not_flag_daemonset(self):
         pod = self.deployment_pod(owner_kind="DaemonSet", owner_name="ds")
-        samples = [{("default", "api-1"): (0.0, 0.0)}] * 3
-        self.assertEqual(fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False), [])
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
 
     def test_does_not_flag_job_owned_pod(self):
         pod = self.deployment_pod(owner_kind="Job", owner_name="batch")
-        samples = [{("default", "api-1"): (0.0, 0.0)}] * 3
-        self.assertEqual(fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False), [])
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
 
     def test_does_not_flag_a_pod_with_no_requests_at_all(self):
         pod = self.deployment_pod(cpu_req="0", mem_req="0")
         pod["spec"]["containers"][0]["resources"] = {}
-        samples = [{}] * 3
-        self.assertEqual(fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False), [])
+        # Peaks for some *other* pod, so the no-requests skip is what makes
+        # this pass rather than the empty-usage guard at the top.
+        peaks = {("default", "unrelated"): (0.0, 0.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
+
+    def test_no_usage_data_flags_nothing_rather_than_everything(self):
+        # `fetch_usage_peaks` returns `{}` for a cluster it could not read.
+        # Reading that as "this Deployment used no CPU and no memory" would
+        # flag every workload in the fleet as reclaimable waste.
+        pod = self.deployment_pod()
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, {}, now=NOW, autopilot=False), [])
 
     def test_guaranteed_qos_is_marked_for_manual_remediation(self):
         pod = self.deployment_pod(cpu_lim="12", mem_lim="48Gi")
-        samples = [{("default", "api-1"): (0.9, 3072.0)}] * 3
-        hits = fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False)
+        peaks = {("default", "api-1"): (0.9, 3072.0)}
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
         self.assertTrue(hits[0]["_guaranteed"])
 
     def test_autopilot_bumps_minor_to_major(self):
         pod = self.deployment_pod(cpu_req="3", mem_req="6Gi")
-        samples = [{("default", "api-1"): (0.1, 100.0)}] * 3
-        hits = fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=True)
+        peaks = {("default", "api-1"): (0.1, 100.0)}
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=True)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
+
+    def test_the_excerpt_names_the_window_it_rests_on(self):
+        pod = self.deployment_pod()
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", hits[0]["excerpt"])
 
     def test_pending_pod_is_never_flagged(self):
         pod = self.deployment_pod()
         pod["status"]["phase"] = "Pending"
-        samples = [{("default", "api-1"): (0.0, 0.0)}] * 3
-        self.assertEqual(fw.check_overrequest({"pods": [pod]}, samples, now=NOW, autopilot=False), [])
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
 
 
 class UnattachedDiskTest(unittest.TestCase):
@@ -626,23 +774,19 @@ class CollectProjectComputeTest(unittest.TestCase):
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def run_with(self, dump_items=(), pools=(), top_pods_out="", top_nodes_out="node-1 1 10% 1000Mi 10%"):
+    def run_with(self, dump_items=(), pools=(), session=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of(*dump_items)))
-            if "top" in argv and "pods" in argv:
-                return run_of(0, top_pods_out)
-            if "top" in argv and "nodes" in argv:
-                return run_of(0, top_nodes_out)
             if argv[:3] == ["gcloud", "container", "node-pools"]:
                 return run_of(0, json.dumps(list(pools)))
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                return fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
+                return fw.collect_cluster(self.CLUSTER, run=run, session=session or usage_session(), now=NOW)
 
     def test_clean_cluster_collects_with_no_candidates(self):
         entry, facts = self.run_with()
@@ -658,7 +802,7 @@ class CollectClusterTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                entry, facts = fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
+                entry, facts = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
         self.assertEqual(entry["outcome"], "unreachable")
         self.assertEqual(facts, {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()})
 
@@ -672,24 +816,24 @@ class CollectClusterTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                entry, _ = fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
+                entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
         self.assertEqual(entry["outcome"], "gate-failed")
 
-    def _metrics_down(self, *dump_items):
+    def _metrics_down(self, *dump_items, session=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of(*dump_items)))
-            if "top" in argv and "nodes" in argv:
-                return run_of(1, "", "metrics-server unavailable")
             if argv[:3] == ["gcloud", "container", "node-pools"]:
                 return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                entry, _ = fw.collect_cluster(self.CLUSTER, run=run, sleep=lambda s: None, now=NOW)
+                entry, _ = fw.collect_cluster(
+                    self.CLUSTER, run=run, session=session or FakeSession(**NO_USAGE), now=NOW
+                )
         return entry
 
     def test_metrics_unavailable_still_collects_object_checks(self):
@@ -702,11 +846,22 @@ class CollectClusterTest(unittest.TestCase):
         # it as a gap either way, and without this the ledger named a check
         # nobody could explain.
         self.assertIn("overrequest could not be measured", entry["limitations"])
-        self.assertIn("metrics-server", entry["limitations"])
+        self.assertIn("Cloud Monitoring", entry["limitations"])
+
+    def test_a_denied_usage_read_says_so_rather_than_saying_no_data(self):
+        # An IAM gap and a cluster that ships no metrics both stop the check,
+        # but only one of them is something an operator can fix, so the
+        # limitation has to carry which it was.
+        entry = self._metrics_down(
+            obj("Node", "node-1"),
+            session=FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"),
+        )
+        self.assertIn("rc=403", entry["limitations"])
+        self.assertIn("monitoring.timeSeries.list", entry["limitations"])
 
     def test_a_cluster_with_no_nodes_cannot_be_over_requesting(self):
-        # An empty cluster is not a degraded one. `kubectl top nodes` fails
-        # there because metrics-server has nowhere to run, and reading that as
+        # An empty cluster is not a degraded one. The usage read comes back
+        # empty there because nothing ran to report any, and reading that as
         # lost coverage published `partial: true` over two freshly created
         # Autopilot peers on 2026-08-29 -- a gap naming a check that had no
         # object to run against.
@@ -724,8 +879,6 @@ class CollectClusterTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv and "nodes" in argv:
-                return run_of(0, "node-1 1 10% 1000Mi 10%")
             if argv[:3] == ["gcloud", "container", "node-pools"]:
                 return run_of(1, "", "PERMISSION_DENIED: container.nodePools.list")
             return run_of(0, "")
@@ -733,7 +886,7 @@ class CollectClusterTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 return fw.collect_cluster(
-                    cluster or self.CLUSTER, run=run, sleep=lambda s: None, now=NOW
+                    cluster or self.CLUSTER, run=run, session=usage_session(), now=NOW
                 )
 
     def test_an_unreadable_node_pool_list_is_not_an_absence_of_idle_pools(self):
@@ -786,13 +939,11 @@ class CollectClusterTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv:
-                return run_of(0, "")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                entry, _ = fw.collect_cluster(cluster, run=run, sleep=lambda s: None, now=NOW)
+                entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW)
         commands = {c["check"] for c in entry["commands"]}
         self.assertNotIn("idle-nodepool", commands)
         self.assertNotIn("scaledown-blocked", commands)
@@ -821,15 +972,13 @@ class AutopilotNotApplicableTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv:
-                return run_of(0, "node-1 1 10% 1000Mi 10%")
             if argv[:3] == ["gcloud", "container", "node-pools"]:
                 return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                entry, _ = fw.collect_cluster(cluster, run=run, sleep=lambda s: None, now=NOW)
+                entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW)
         return entry
 
     def test_autopilot_declares_both_node_pool_checks_not_applicable(self):
@@ -859,24 +1008,44 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
 
 
-class FleetSamplingConcurrencyTest(unittest.TestCase):
-    def test_pool_scales_to_the_fleet_not_a_fixed_cap(self):
-        """A fleet bigger than the old fixed cap of 8 must still sample
-        every cluster concurrently -- a `threading.Barrier` sized to the
-        fleet only ever releases if that many clusters are genuinely
-        in-flight at once; if the pool caps out early, the excess clusters
-        never reach the barrier and every waiter times out."""
-        cluster_count = 12
+class FleetConcurrencyTest(unittest.TestCase):
+    def test_clusters_are_collected_in_parallel_up_to_the_pool_size(self):
+        """Per-cluster work runs concurrently, not one cluster after another.
+
+        This used to rendezvous on the injected `sleep` and assert the pool
+        grew to the whole fleet, because each cluster held a ten-minute
+        sampling window and serializing those would have taken hours. Nothing
+        sleeps now, so the pool is back to the stream's usual 8 and the
+        invariant worth holding is the plain one: a fleet larger than the pool
+        still saturates it.
+
+        The gate counts callers inside the Monitoring read and releases them
+        once `max_workers` are in flight at once, so it cannot deadlock on an
+        uneven split of clusters across workers the way a `threading.Barrier`
+        sized to a wave would.
+        """
+        cluster_count, workers = 12, 4
         clusters_json = json.dumps(
             [
                 {"name": f"c{i}", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
                 for i in range(cluster_count)
             ]
         )
-        barrier = threading.Barrier(cluster_count, timeout=2)
+        lock, saturated = threading.Lock(), threading.Event()
+        state = {"live": 0, "peak": 0}
 
-        def sleep_fn(_seconds):
-            barrier.wait()
+        class GatedSession:
+            def get(self, url, params=None, timeout=None):
+                with lock:
+                    state["live"] += 1
+                    state["peak"] = max(state["peak"], state["live"])
+                    if state["live"] >= workers:
+                        saturated.set()
+                saturated.wait(timeout=10)
+                with lock:
+                    state["live"] -= 1
+                is_cpu = "cpu/core_usage_time" in params["filter"]
+                return FakeResponse(200, {"timeSeries": [series_of("d", "p", 1.0 if is_cpu else MIB)]})
 
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
@@ -885,16 +1054,16 @@ class FleetSamplingConcurrencyTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv and "nodes" in argv:
-                return run_of(0, "")
             if argv[:2] == ["gcloud", "compute"]:
                 return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                manifest = fw.collect_fleet("acme", run=run, sleep=sleep_fn, now=NOW)
+                manifest = fw.collect_fleet("acme", run=run, session=GatedSession(), max_workers=workers, now=NOW)
 
+        self.assertTrue(saturated.is_set(), "never reached the pool size; collection was serialized")
+        self.assertGreaterEqual(state["peak"], workers)
         self.assertEqual(len({c["name"] for c in manifest["clusters"]} & {f"c{i}" for i in range(cluster_count)}), cluster_count)
 
 
@@ -945,15 +1114,13 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv and "nodes" in argv:
-                return run_of(0, "")
             if argv[:2] == ["gcloud", "compute"]:
                 return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                manifest = fw.collect_fleet(None, run=run, sleep=lambda s: None, now=NOW)
+                manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
 
         names = {c["name"] for c in manifest["clusters"]}
         self.assertEqual(names, {"c1", "c2", "project/acme", "project/beta"})
@@ -984,8 +1151,6 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                     pv = obj("PersistentVolume", "pv1", **{"spec.csi": {"volumeHandle": "projects/acme/disks/shared-disk-id"}})
                     return run_of(0, json.dumps(dump_of(pv)))
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv and "nodes" in argv:
-                return run_of(0, "")
             if argv[:3] == ["gcloud", "compute", "disks"]:
                 project = argv[argv.index("--project") + 1]
                 if project == "beta":
@@ -998,7 +1163,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                manifest = fw.collect_fleet(None, run=run, sleep=lambda s: None, now=NOW)
+                manifest = fw.collect_fleet(None, run=run, session=usage_session(), now=NOW)
 
         beta_entry = next(c for c in manifest["clusters"] if c["name"] == "project/beta")
         self.assertIn("unattached-disk", {c["check"] for c in beta_entry["candidates"]})
@@ -1017,15 +1182,13 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv and "nodes" in argv:
-                return run_of(0, "")
             if argv[:2] == ["gcloud", "compute"]:
                 return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                manifest = fw.collect_fleet("acme", run=run, sleep=lambda s: None, now=NOW)
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
         cluster_entry = next(c for c in manifest["clusters"] if c["name"] == "c1")
         project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
@@ -1053,15 +1216,13 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if "top" in argv and "nodes" in argv:
-                return run_of(1, "", "metrics unavailable")
             if argv[:2] == ["gcloud", "compute"]:
                 return run_of(0, "[]")
             return run_of(0, "")
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                manifest = fw.collect_fleet("acme", run=run, sleep=lambda s: None, now=NOW)
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
 
         data = {
             "audit": "fleet-wide-cost-analysis",

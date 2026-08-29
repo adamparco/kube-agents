@@ -6,7 +6,7 @@ See docs/designs/fleet-audit-collectors-and-status.md §4.2, §10 phase 4, and
 governance/fleet_wide_cost_analysis_sop.md.
 
 This stream's own collector: its targets are both GKE clusters (ten
-`kubectl` object kinds plus three `kubectl top` samples) and GCP projects
+`kubectl` object kinds plus a Cloud Monitoring usage read) and GCP projects
 (`gcloud compute disks/addresses/forwarding-rules/target-pools/backend-services`),
 so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
@@ -20,16 +20,24 @@ names, referenced addresses) are unioned only across the clusters in the
 same project before that project's disk/address/LB checks run — a project
 never sees another project's cluster state.
 
-**The "hoisted sampling" this file is named for in the design's §10 work
-breakdown:** §2 requires three `kubectl top` samples five minutes apart per
-cluster — a real ten-minute wall-clock cost no amount of procedural code
-removes, because the metrics genuinely have not changed yet. What the SOP's
-own prose could not do is take that ten minutes *once per cluster,
-concurrently across every cluster in the fleet*, the way `collect_fleet`'s
-thread pool already runs every other stream's per-cluster work — a run that
-was issuing three sequential `sleep 300`s per cluster now issues them once,
-in parallel, across the whole fleet's threads. The wait itself is injectable
-(`sleep`) so tests never actually wait ten minutes.
+**Usage comes from Cloud Monitoring, not from sampling.** §2 used to require
+three `kubectl top` reads five minutes apart per cluster, and the ten minutes
+of wall clock that bought was the smaller of its two costs. The larger one was
+what a ten-minute Monday-morning window cannot see: a nightly batch peak, a
+weekday traffic curve, anything that makes a workload look idle at the moment
+you happen to look at it. Every caveat §2 carried — require all three samples
+to agree, take the peak and never the mean, keep an absolute floor, never
+propose a request below 2x the observed peak — was scaffolding around that
+blind spot.
+
+GKE already ships per-container CPU and memory to Cloud Monitoring on every
+cluster, retained for weeks. `fetch_usage_peaks` asks it for the peak over the
+trailing `USAGE_WINDOW_HOURS` instead, which is both faster (two HTTP reads
+per cluster, no sleeping at all) and strictly better evidence: a week-long
+peak has already seen the batch job the sample window missed. It reads through
+in-process ADC on the agent's own service account, so no token is ever
+materialized for a subprocess, and `roles/monitoring.viewer` is the only grant
+it needs.
 """
 
 from __future__ import annotations
@@ -43,21 +51,40 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 MANIFEST_VERSION = 1
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
-# A ceiling, not a target: `collect_fleet` sizes its pool to the fleet
-# itself (one worker per cluster) up to this bound, so every cluster's
-# ~10-minute sampling window runs concurrently rather than queuing behind
-# an earlier one. This only throttles a fleet larger than this many
-# clusters.
-MAX_WORKERS = 64
-SAMPLE_COUNT = 3
-SAMPLE_INTERVAL_S = 300
+# Was 64, sized so every cluster's ten-minute sampling window ran
+# concurrently rather than queuing behind an earlier one. Nothing sleeps any
+# more -- per-cluster work is a handful of subprocess reads and two HTTP
+# reads -- so this drops back to the 8 every other collector in the stream
+# uses, which also keeps the shared Monitoring session inside urllib3's
+# default connection pool.
+MAX_WORKERS = 8
+
+# How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
+# match this stream's weekly cadence: every finding is then "this controller
+# has not needed that reservation since the last time we said so", and the
+# window covers the weekday traffic curve and the weekly batch job that §2's
+# ten-minute sample was blind to. Monitoring retains these metrics well past
+# this, so the bound is a judgement about relevance, not availability.
+USAGE_WINDOW_HOURS = 168
+# Alignment happens twice. The primary period buckets each container's raw
+# points before they are summed across the containers of a pod -- it has to
+# be short enough that a spike stays a spike, since a wide bucket averages
+# one away and understates the peak. The secondary pass then takes the max
+# across those buckets, which is the number we want, and collapses the
+# response to one point per pod: measured on a 137-pod cluster, one page and
+# 0.3s rather than ten pages and 3.3s, with both routes agreeing on all 137.
+USAGE_ALIGNMENT_S = 300
+MONITORING_SCOPE = "https://www.googleapis.com/auth/monitoring.read"
+MONITORING_TIMEOUT_S = 120
+CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
+MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 
 SYSTEM_NAMESPACES = frozenset(
     {
@@ -85,7 +112,10 @@ class Run(NamedTuple):
 
 
 RunFn = Callable[..., Run]
-SleepFn = Callable[[float], None]
+# Anything with a `requests`-shaped `.get(url, params=..., timeout=...)`. Kept
+# structural rather than typed to `AuthorizedSession` so tests can hand in a
+# stub without importing google.auth, which is not a test-time dependency.
+SessionFn = Any
 
 
 def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
@@ -214,57 +244,131 @@ def parse_mem_mib(s: str) -> float | None:
     return float(value) * MEM_UNIT_TO_MIB[unit]
 
 
-def parse_top_pods(text: str) -> dict[tuple[str, str], tuple[float, float]]:
-    """`kubectl top pods -A --no-headers`: `NAMESPACE NAME CPU MEMORY`."""
-    out = {}
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        ns, name, cpu, mem = parts[0], parts[1], parts[2], parts[3]
-        cpu_v, mem_v = parse_cpu_cores(cpu), parse_mem_mib(mem)
-        if cpu_v is not None and mem_v is not None:
-            out[(ns, name)] = (cpu_v, mem_v)
-    return out
+def default_monitoring_session() -> SessionFn:
+    """An ADC-authenticated session for the Monitoring read API.
+
+    Imported lazily: `google.auth` ships in the agent image but is not a
+    test-time dependency, and a module-level import would make every unit test
+    in this file unrunnable outside the pod.
+
+    This is the whole reason the usage read does not go through `run`. The
+    credential proxy that fronts `gcloud` refuses `auth print-access-token`
+    outright (policy rule `gcp.access-token-disclosure`), and rightly so -- a
+    token printed to stdout is a token in the model's context. Reading in
+    process never materializes one.
+    """
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    credentials, _ = google.auth.default(scopes=[MONITORING_SCOPE])
+    return AuthorizedSession(credentials)
 
 
-def parse_top_nodes(text: str) -> dict[str, tuple[float, float]]:
-    """`kubectl top nodes --no-headers`: `NAME CPU CPU% MEMORY MEMORY%`."""
-    out = {}
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 5:
-            continue
-        name, cpu, mem = parts[0], parts[1], parts[3]
-        cpu_v, mem_v = parse_cpu_cores(cpu), parse_mem_mib(mem)
-        if cpu_v is not None and mem_v is not None:
-            out[name] = (cpu_v, mem_v)
-    return out
+def _point_value(point: dict) -> float | None:
+    value = point.get("value") or {}
+    if value.get("doubleValue") is not None:
+        return float(value["doubleValue"])
+    if value.get("int64Value") is not None:
+        return float(value["int64Value"])
+    return None
 
 
-def take_usage_samples(
-    kubeconfig: Path, *, run: RunFn, sleep: SleepFn, count: int = SAMPLE_COUNT, interval_s: int = SAMPLE_INTERVAL_S
-) -> tuple[list[dict], list[dict], bool, Run]:
-    """§2's usage samples: `count` pairs of `kubectl top pods`/`top nodes`,
-    `interval_s` apart. Returns `(pod_samples, node_samples, available,
-    last_result)` — `available=False` means the metrics degradation §2
-    describes: every 3.1/3.7 read that needs usage is skipped for this
-    cluster, and every other check still runs from object state alone."""
+def fetch_usage_peaks(
+    project: str,
+    cluster: str,
+    *,
+    session: SessionFn,
+    now: datetime,
+    window_hours: int = USAGE_WINDOW_HOURS,
+) -> tuple[dict[tuple[str, str], tuple[float, float]], bool, Run]:
+    """§2's usage figures, read from Cloud Monitoring rather than sampled.
 
-    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    pod_samples, node_samples = [], []
-    last_result = None
-    for i in range(count):
-        pods_result = run(["kubectl", "top", "pods", "-A", "--no-headers"], env=env)
-        nodes_result = run(["kubectl", "top", "nodes", "--no-headers"], env=env)
-        last_result = nodes_result
-        if nodes_result.rc != 0:
-            return [], [], False, nodes_result
-        pod_samples.append(parse_top_pods(pods_result.stdout))
-        node_samples.append(parse_top_nodes(nodes_result.stdout))
-        if i < count - 1:
-            sleep(interval_s)
-    return pod_samples, node_samples, True, last_result
+    Returns `(peaks, available, result)`. `peaks` maps `(namespace, pod)` to
+    that pod's `(peak_cpu_cores, peak_mem_mib)` over the trailing
+    `window_hours` -- deliberately the same key and the same two units the
+    `kubectl top pods` parse produced, so `check_overrequest` reads it
+    unchanged.
+
+    `available=False` is §2's metrics degradation and reaches the manifest as
+    a limitation rather than a silent zero. It covers the empty answer as well
+    as the failed one: a 200 carrying no time series means this cluster is not
+    shipping system metrics, and treating that as "usage was zero" would read
+    every workload on it as pure waste.
+
+    Both metrics are per-*container*. `REDUCE_SUM` over
+    `(namespace_name, pod_name)` adds a pod's containers back together -- and,
+    for memory, its `memory_type` breakdown, so the figure is comparable to
+    the pod's summed requests.
+    """
+    started = time.monotonic()
+    start = now - timedelta(hours=window_hours)
+    url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+    # Recorded in the manifest in place of an argv. Not runnable as-is, but it
+    # names the project, the cluster, both metrics and the window, which is
+    # what a reader checking the evidence behind a finding needs.
+    label = (
+        f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+        f' filter=resource.labels.cluster_name="{cluster}"'
+        f" metrics={CPU_METRIC},{MEM_METRIC} window={window_hours}h"
+    )
+
+    def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
+        return {}, False, Run([label], rc, "", message[:300], time.monotonic() - started)
+
+    if session is None:
+        return fail(-1, "no Cloud Monitoring session: ADC credentials were unavailable at startup")
+
+    peaks: dict[str, dict[tuple[str, str], float]] = {"cpu": {}, "mem": {}}
+    for metric, aligner, key in ((CPU_METRIC, "ALIGN_RATE", "cpu"), (MEM_METRIC, "ALIGN_MAX", "mem")):
+        sink = peaks[key]
+        page_token = None
+        while True:
+            params = {
+                "filter": f'metric.type="{metric}" AND resource.labels.cluster_name="{cluster}"',
+                "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
+                "aggregation.perSeriesAligner": aligner,
+                "aggregation.crossSeriesReducer": "REDUCE_SUM",
+                "aggregation.groupByFields": ["resource.labels.namespace_name", "resource.labels.pod_name"],
+                "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
+                "secondaryAggregation.perSeriesAligner": "ALIGN_MAX",
+                "pageSize": "2000",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            try:
+                response = session.get(url, params=params, timeout=MONITORING_TIMEOUT_S)
+            except Exception as exc:
+                return fail(-1, f"{metric}: {type(exc).__name__}: {exc}")
+            if response.status_code != 200:
+                return fail(response.status_code, f"{metric}: {response.text}")
+            body = response.json()
+            for series in body.get("timeSeries") or []:
+                labels = (series.get("resource") or {}).get("labels") or {}
+                pod_key = (labels.get("namespace_name", ""), labels.get("pod_name", ""))
+                for point in series.get("points") or []:
+                    value = _point_value(point)
+                    if value is not None:
+                        sink[pod_key] = max(sink.get(pod_key, 0.0), value)
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                break
+
+    merged = {
+        pod_key: (peaks["cpu"].get(pod_key, 0.0), peaks["mem"].get(pod_key, 0.0) / BYTES_PER_MIB)
+        for pod_key in set(peaks["cpu"]) | set(peaks["mem"])
+    }
+    if not merged:
+        return fail(0, f'no time series for cluster_name="{cluster}" over the trailing {window_hours}h')
+
+    # The manifest digests a command's stdout to prove two runs saw the same
+    # thing. There is no stdout here, so stand in the parsed answer, rounded
+    # so a digest tracks a real change in usage rather than float noise.
+    rendered = json.dumps(
+        sorted((ns, pod, round(cpu, 4), round(mem, 1)) for (ns, pod), (cpu, mem) in merged.items())
+    )
+    return merged, True, Run([label], 0, rendered, "", time.monotonic() - started)
 
 
 # --------------------------------------------------------------------------- #
@@ -688,8 +792,17 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def check_overrequest(context: dict, pod_samples: list[dict], *, now: datetime, autopilot: bool) -> list[dict]:
-    if not pod_samples:
+def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
+    """`usage_peaks` is `fetch_usage_peaks`'s `(ns, pod) -> (cores, MiB)`.
+
+    It used to be a list of three `kubectl top` samples, and the flag rule
+    used to be "every sample agrees usage is under 20% of requests, and the
+    reclaimable delta is measured against the highest of them". One peak over
+    a week is the same rule with the sampling error taken out: the max across
+    samples *is* the peak, and a run of samples all agreeing is exactly the
+    condition that the peak clears the bar.
+    """
+    if not usage_peaks:
         return []
     by_owner: dict[tuple, dict] = {}
     for pod in context["pods"]:
@@ -732,19 +845,13 @@ def check_overrequest(context: dict, pod_samples: list[dict], *, now: datetime, 
         guaranteed = cpu_req_total == cpu_lim_total and mem_req_total == mem_lim_total and cpu_lim_total > 0
 
         peak_cpu = peak_mem = 0.0
-        agree = True
-        for sample in pod_samples:
-            sample_cpu = sample_mem = 0.0
-            for pod in entry["pods"]:
-                cpu, mem = sample.get((pod["ns"], pod["name"]), (0.0, 0.0))
-                sample_cpu += cpu
-                sample_mem += mem
-            if cpu_req_total and sample_cpu / cpu_req_total > 0.2:
-                agree = False
-            if mem_req_total and sample_mem / mem_req_total > 0.2:
-                agree = False
-            peak_cpu, peak_mem = max(peak_cpu, sample_cpu), max(peak_mem, sample_mem)
-        if not agree:
+        for pod in entry["pods"]:
+            cpu, mem = usage_peaks.get((pod["ns"], pod["name"]), (0.0, 0.0))
+            peak_cpu += cpu
+            peak_mem += mem
+        if cpu_req_total and peak_cpu / cpu_req_total > 0.2:
+            continue
+        if mem_req_total and peak_mem / mem_req_total > 0.2:
             continue
 
         delta_cpu = cpu_req_total - peak_cpu
@@ -760,7 +867,7 @@ def check_overrequest(context: dict, pod_samples: list[dict], *, now: datetime, 
             {
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
-                "excerpt": f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB across {len(pod_samples)} samples",
+                "excerpt": f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB over the trailing {USAGE_WINDOW_HOURS}h (Cloud Monitoring)",
                 "severity": severity,
                 "_guaranteed": guaranteed,
             }
@@ -819,7 +926,7 @@ def _fleet_facts(context: dict) -> dict:
     return {"pv_handles": pv_handles, "service_names": service_names, "referenced_addresses": referenced_addresses}
 
 
-def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime) -> tuple[dict, dict]:
+def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime) -> tuple[dict, dict]:
     """Returns `(manifest_entry, fleet_facts)` — the second only populated
     when the object dump succeeded; `collect_fleet` unions it across every
     cluster before running the project-scoped checks that need it."""
@@ -854,8 +961,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     limitations: list[str] = []
     not_applicable: list[dict] = []
 
-    pod_samples, node_samples, metrics_ok, top_result = take_usage_samples(kubeconfig, run=run, sleep=sleep)
-    top_record = _record(f"KUBECONFIG={kubeconfig} kubectl top nodes --no-headers", top_result)
+    usage_peaks, metrics_ok, usage_result = fetch_usage_peaks(project, name, session=session, now=now)
+    usage_record = _record(usage_result.argv[0], usage_result)
 
     candidates = []
     commands = {
@@ -909,8 +1016,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
         ]
 
     if metrics_ok:
-        commands["overrequest"] = top_record
-        for hit in check_overrequest(context, pod_samples, now=now, autopilot=bool(cluster.get("autopilot"))):
+        commands["overrequest"] = usage_record
+        for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
             emitted = _emit("overrequest", hit)
             if hit.get("_guaranteed"):
                 emitted["needs_triage"] = "guaranteed-qos"
@@ -918,10 +1025,9 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
     elif not context["nodes"]:
         # A cluster with no nodes cannot be over-requesting: there is no
         # capacity for a reservation to waste, and nothing has run for a
-        # request to be measured against. `kubectl top nodes` fails there for
-        # the same reason the cluster is empty -- an Autopilot cluster with
-        # nothing scheduled scales metrics-server to zero along with every
-        # other workload -- so the branch below would read a vacuum as a
+        # request to be measured against. The usage read comes back empty
+        # there for the same reason the cluster is empty -- no containers ran,
+        # so none reported -- so the branch below would read a vacuum as a
         # degradation. On 2026-08-29 it did: `fleet-wide-cost-analysis`
         # published `partial: true` over two freshly created Autopilot peers
         # whose whole object set was fifteen Pending pods and no nodes. That is
@@ -934,9 +1040,9 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
                 "reason": (
                     "This cluster has no nodes, so no workload is scheduled and "
                     "no reservation is holding capacity: there is nothing for a "
-                    "request to be over against. `kubectl top nodes` reports no "
-                    "Metrics API for the same reason -- metrics-server is one of "
-                    "the workloads with nowhere to run."
+                    "request to be over against. Cloud Monitoring returns no "
+                    "container time series for it for the same reason -- nothing "
+                    "ran to report any."
                 ),
             }
         )
@@ -946,9 +1052,9 @@ def collect_cluster(cluster: dict, *, run: RunFn, sleep: SleepFn, now: datetime)
         # attached -- a reader saw the check named and had nothing to tell them
         # whether it was denied, throttled, or never attempted.
         limitations.append(
-            f"overrequest could not be measured on this cluster: "
-            f"`kubectl top nodes` failed (rc={top_result.rc}) — metrics-server "
-            f"is unavailable, so §2's usage sampling collected no data"
+            f"overrequest could not be measured on this cluster: the Cloud "
+            f"Monitoring usage read failed (rc={usage_result.rc}) — "
+            f"{usage_result.stderr.strip()[:200] or 'no detail'}"
         )
 
     entry = {
@@ -1105,9 +1211,21 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     }
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sleep: SleepFn = time.sleep, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    if session is None:
+        # One session for the fleet: `AuthorizedSession` locks around token
+        # refresh and its connection pool is thread-safe, and building one per
+        # cluster would re-resolve ADC against the metadata server every time.
+        # Failing to build one is not fatal -- `fetch_usage_peaks` turns a
+        # `None` session into the same honest per-cluster limitation an API
+        # error produces, and every check that reads object state still runs.
+        try:
+            session = default_monitoring_session()
+        except Exception as exc:
+            log(f"Cloud Monitoring credentials unavailable, overrequest will be skipped fleet-wide: {exc}")
 
     projects = get_target_projects(project, run=run)
 
@@ -1119,13 +1237,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sleep
             log(f"{p}: cluster enumeration failed, skipping project this run: {exc}")
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
-    # `max_workers` is a ceiling, not a fixed pool size: every cluster's
-    # ~10-minute sampling window must run concurrently with every other
-    # cluster's, or the fleet's tail past the Nth cluster silently queues
-    # behind the front, defeating the "hoisted sampling" concurrency this
-    # file exists for. Size the pool to the fleet itself, up to that ceiling.
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
-        futures = {pool.submit(collect_cluster, c, run=run, sleep=sleep, now=now): i for i, c in enumerate(clusters)}
+        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
 
