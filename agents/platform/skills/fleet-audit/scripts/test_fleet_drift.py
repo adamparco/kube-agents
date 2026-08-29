@@ -487,6 +487,113 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual(manifest["clusters"], [])
 
 
+class CohortLimitationsTest(unittest.TestCase):
+    """A cluster no facet compared has to say so.
+
+    The live four-cluster fleet: two autopilot clusters with no environment
+    label, one autopilot labelled `test`, one standard. Cohorts of 2, 1 and 1
+    against a floor of 3, so every cohort abstained and not one facet was
+    compared — and the manifest called all four `collected` with an empty
+    `commands` list, four seconds after it started. `collected` is what tells
+    the model the target needs no manual fallback, so nothing downstream had
+    any way to know the comparison never happened.
+    """
+
+    def _floored_fleet(self):
+        return [
+            cluster("auto-a", autopilot=True),
+            cluster("auto-b", autopilot=True),
+            cluster("auto-test", autopilot=True, labels={"environment": "test"}),
+            cluster("std-a"),
+        ]
+
+    def test_every_member_of_an_undersized_cohort_is_explained(self):
+        lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
+        self.assertEqual(len(lim), 4)
+        self.assertIn("only 2 comparable clusters", lim["auto-a"])
+        self.assertIn("only 2 comparable clusters", lim["auto-b"])
+        self.assertIn("only 1 comparable clusters", lim["auto-test"])
+        self.assertIn("only 1 comparable clusters", lim["std-a"])
+        for text in lim.values():
+            self.assertIn(f"minimum {fd.COHORT_FLOOR}", text)
+            self.assertIn("no facet compared", text)
+
+    def test_the_sentence_names_the_cohort_it_floored_out_of(self):
+        lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
+        self.assertIn("cohort autopilot/prod", lim["auto-a"])
+        self.assertIn("cohort autopilot/test", lim["auto-test"])
+        self.assertIn("cohort standard/prod", lim["std-a"])
+
+    def test_a_cohort_that_reaches_the_floor_explains_nothing(self):
+        """A compared cluster must not carry a limitation — it would read as a
+        coverage gap on a cluster that was in fact fully voted on."""
+        fleet = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)]
+        self.assertEqual(fd.cohort_limitations(fleet, now=NOW), {})
+
+    def test_an_ineligible_cluster_carries_its_eligibility_reason(self):
+        fleet = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)]
+        fleet.append(cluster("broken", labels={"environment": "prod"}, status="DEGRADED"))
+        lim = fd.cohort_limitations(fleet, now=NOW)
+        self.assertEqual(set(lim), {"broken"})
+        self.assertIn("status DEGRADED", lim["broken"])
+
+    def test_the_manifest_carries_the_sentence(self):
+        clusters_json = json.dumps(self._floored_fleet())
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        self.assertEqual(len(manifest["clusters"]), 4)
+        for entry in manifest["clusters"]:
+            self.assertEqual(entry["commands"], [])
+            self.assertIn("no facet compared", entry["limitations"])
+
+    def test_a_compared_fleet_gets_no_limitations_key_at_all(self):
+        clusters_json = json.dumps(
+            [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)]
+        )
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        for entry in manifest["clusters"]:
+            self.assertNotIn("limitations", entry)
+            self.assertTrue(entry["commands"])
+
+    def test_the_limitation_reaches_the_coverage_arithmetic(self):
+        """End to end: the sentence has to become a coverage gap, or the run
+        still reports a fleet nobody compared as a clean one."""
+        import audit_report
+
+        lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
+        doc = {
+            "audit": "fleet-consistency-drift",
+            "scope": {
+                "clusters": [
+                    {
+                        "name": name,
+                        "location": "us-central1",
+                        "project": "acme",
+                        "checks_run": [],
+                        "limitations": text,
+                    }
+                    for name, text in sorted(lim.items())
+                ],
+                "skipped": [],
+            },
+            "findings": [],
+        }
+        gaps = audit_report.coverage_gaps(doc)
+        self.assertEqual(len(gaps), 4)
+        self.assertTrue(all("no facet compared" in g for g in gaps))
+
+
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
     def test_checks_run_copied_from_a_collected_cluster_survives_cross_check(self):
         import audit_report

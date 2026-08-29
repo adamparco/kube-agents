@@ -483,6 +483,68 @@ def _emit(slug: str, cluster_name: str, excerpt: str, severity: str) -> dict:
     }
 
 
+def cohort_layout(clusters: list[dict], *, now: datetime) -> tuple[dict[str, str], dict[tuple, list[dict]], dict[str, tuple[str, str]]]:
+    """§1's eligibility and §2's cohorting, as `(ineligible, cohorts, env_of)`.
+
+    Shared by the vote and by `cohort_limitations`, which has to agree with it
+    exactly: a cluster the vote skipped and the limitations did not explain is
+    the silent-clean failure this stream is most prone to.
+    """
+    ineligible: dict[str, str] = {}
+    eligible: list[dict] = []
+    for c in clusters:
+        why = cluster_eligibility(c, now=now)
+        if why is None:
+            eligible.append(c)
+        else:
+            ineligible[c["name"]] = why
+
+    strategy = decide_cohort_strategy(eligible)
+    env_of: dict[str, tuple[str, str]] = {c["name"]: environment_of(c) for c in eligible}
+
+    cohorts: dict[tuple, list[dict]] = {}
+    for c in eligible:
+        env, _ = env_of[c["name"]]
+        cohorts.setdefault(cohort_key(c, strategy, env), []).append(c)
+    return ineligible, cohorts, env_of
+
+
+def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]:
+    """§2.4's `limitations` sentence for every cluster no facet could compare.
+
+    Drift is comparative, so a cluster with too few peers has nothing to drift
+    from and every facet abstains for it. That is a legitimate outcome and the
+    SOP says so — but until this function existed the manifest recorded it as
+    `outcome: "collected"` with an empty `commands` list, and `"collected"`
+    tells the model that every applicable check already ran and it must not
+    re-run the cluster by hand. A live four-cluster fleet split into cohorts of
+    2, 1 and 1, every one under the floor, and the collector reported four
+    clusters fully collected four seconds after it started, having compared
+    nothing.
+
+    Two exclusions, both named by the SOP. `cluster_eligibility` already
+    returns its sentence and only ever needed plumbing; the undersized-cohort
+    sentence is §2.4's own wording.
+
+    A cluster whose cohort did reach the floor is absent from the result even
+    if some individual facet abstained for it — that cluster was compared, and
+    §4 is explicit that a facet returning no token excludes the cluster from
+    that facet's vote alone.
+    """
+    ineligible, cohorts, _ = cohort_layout(clusters, now=now)
+    out = dict(ineligible)
+    for key, members in cohorts.items():
+        if len(members) >= COHORT_FLOOR:
+            continue
+        label = "/".join(str(k) for k in key)
+        for c in members:
+            out[c["name"]] = (
+                f"cohort {label} has only {len(members)} comparable clusters "
+                f"(minimum {COHORT_FLOOR}), no facet compared"
+            )
+    return out
+
+
 def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[str, list[str]], dict[str, list[dict]]]:
     """Returns `(checks_run_by_cluster, candidates_by_cluster)` -- the
     facets actually voted on for each cluster, and the outlier findings
@@ -491,14 +553,7 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[str, lis
     candidates: dict[str, list[dict]] = {c["name"]: [] for c in clusters}
     outlier_facet_count: dict[str, int] = {c["name"]: 0 for c in clusters}
 
-    eligible = [c for c in clusters if cluster_eligibility(c, now=now) is None]
-    strategy = decide_cohort_strategy(eligible)
-    env_of: dict[str, tuple[str, str]] = {c["name"]: environment_of(c) for c in eligible}
-
-    cohorts: dict[tuple, list[dict]] = {}
-    for c in eligible:
-        env, _ = env_of[c["name"]]
-        cohorts.setdefault(cohort_key(c, strategy, env), []).append(c)
+    _, cohorts, env_of = cohort_layout(clusters, now=now)
 
     for key, members in cohorts.items():
         if len(members) < COHORT_FLOOR:
@@ -571,22 +626,30 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_
                 command_by_project[futures[future]] = record
 
     checks_run, candidates = compute_drift(all_clusters, now=now)
+    limitations = cohort_limitations(all_clusters, now=now)
 
     entries = []
     for c in all_clusters:
         project_name = c.get("_project", "")
         record = command_by_project.get(project_name)
         commands = [{"check": slug, **record} for slug in checks_run.get(c["name"], [])] if record else []
-        entries.append(
-            {
-                "name": c["name"],
-                "project": project_name,
-                "location": c.get("location") or c.get("zone") or "",
-                "outcome": "collected",
-                "commands": commands,
-                "candidates": candidates.get(c["name"], []),
-            }
-        )
+        entry = {
+            "name": c["name"],
+            "project": project_name,
+            "location": c.get("location") or c.get("zone") or "",
+            # Still `collected` when a cohort floored out. Nothing was
+            # compared, but nothing the model can run by hand would compare it
+            # either -- the peers do not exist -- and `gate-failed` asks for
+            # exactly that retry. The `limitations` sentence beside it is what
+            # carries the truth, and §6's coverage arithmetic reads it.
+            "outcome": "collected",
+            "commands": commands,
+            "candidates": candidates.get(c["name"], []),
+        }
+        note = limitations.get(c["name"])
+        if note:
+            entry["limitations"] = note
+        entries.append(entry)
 
     return {
         "version": MANIFEST_VERSION,
