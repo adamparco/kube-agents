@@ -513,6 +513,76 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual([c for c in manifest["clusters"] if c["name"].startswith("project/")], [])
 
 
+class AutopilotNotApplicableTest(unittest.TestCase):
+    """The five `standard_only` facets have to be declared, not just dropped.
+
+    `compute_drift` skips them for an Autopilot cohort, which is right — each
+    reads a `.nodePools[]` field or a node-management setting Google owns. But
+    dropping a slug leaves it missing from `commands`, which is also how a check
+    nobody ran looks, so §6 counts it as a coverage gap unless the model excuses
+    it by hand.
+    """
+
+    NA = ("secure-boot", "integrity-monitoring", "node-autoprovisioning", "pool-autoscaling", "image-type")
+
+    def manifest(self, clusters):
+        clusters_json = json.dumps(clusters)
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        return fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+
+    def autopilot_cohort(self, n=4):
+        return [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(n)]
+
+    def test_the_five_are_declared_with_a_reason(self):
+        entry = self.manifest(self.autopilot_cohort())["clusters"][0]
+        declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
+        self.assertEqual(sorted(declared), sorted(self.NA))
+        for reason in declared.values():
+            self.assertIn("Autopilot", reason)
+
+    def test_none_of_the_five_is_also_claimed_as_a_check_that_ran(self):
+        entry = self.manifest(self.autopilot_cohort())["clusters"][0]
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertEqual(ran & set(self.NA), set())
+
+    def test_a_standard_cluster_declares_nothing_and_runs_them(self):
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)]
+        entry = self.manifest(clusters)["clusters"][0]
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertLessEqual(set(self.NA), {c["check"] for c in entry["commands"]})
+
+    def test_an_undersized_autopilot_cohort_still_declares_them(self):
+        """The live fleet's shape: two Autopilot clusters in one cohort against
+        a floor of three, so no facet compared and every slug is missing from
+        `commands`. The `limitations` sentence covers the ones that could have
+        run; these five could not have, cohort or no cohort, and belong out of
+        the denominator rather than inside the sentence."""
+        entry = self.manifest(self.autopilot_cohort(n=2))["clusters"][0]
+        self.assertEqual(entry["commands"], [])
+        self.assertIn("no facet compared", entry["limitations"])
+        self.assertEqual(sorted(n["check"] for n in entry["checks_not_applicable"]), sorted(self.NA))
+
+    def test_datapath_provider_is_not_declared(self):
+        """It carries `autopilot_excluded`, not `standard_only`: the facet is
+        computed and recorded in `checks_run`, and only the flagging is
+        suppressed. Declaring it too would have the manifest assert both."""
+        entry = self.manifest(self.autopilot_cohort())["clusters"][0]
+        self.assertNotIn("datapath-provider", [n["check"] for n in entry["checks_not_applicable"]])
+        self.assertIn("datapath-provider", {c["check"] for c in entry["commands"]})
+
+    def test_the_two_together_account_for_the_whole_roster(self):
+        entry = self.manifest(self.autopilot_cohort())["clusters"][0]
+        ran = {c["check"] for c in entry["commands"]}
+        declared = {n["check"] for n in entry["checks_not_applicable"]}
+        self.assertEqual({f.slug for f in fd.FACETS} - ran - declared, set())
+        self.assertEqual(ran & declared, set())
+
+
 class CohortLimitationsTest(unittest.TestCase):
     """A cluster no facet compared has to say so.
 

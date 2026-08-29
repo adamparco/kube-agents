@@ -546,6 +546,51 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]
     return out
 
 
+def autopilot_not_applicable(clusters: list[dict]) -> dict[str, list[dict]]:
+    """§6's `checks_not_applicable` for the facets `compute_drift` refuses to
+    compute on Autopilot.
+
+    Five facets carry `standard_only`, and line 565 drops each of them for an
+    Autopilot cohort. Dropping them is right — every one reads a field under
+    `.nodePools[]` or names a node-management setting Google owns there — but
+    until this function existed the collector said nothing about having done
+    it. A slug missing from `commands` is also exactly how a check nobody ran
+    looks, so §6 counts it as a coverage gap unless the model happens to know
+    which GKE settings Autopilot withholds and excuses it by hand. `fleet_waste`
+    already ran that experiment: a model that remembered one of two slugs
+    published three coverage gaps for a check those clusters do not owe.
+
+    Keyed off the cluster's own mode rather than its cohort's. The two agree
+    wherever line 565 fires — an Autopilot cohort's members are all Autopilot —
+    but the roster arithmetic in §6 is per-cluster, so an Autopilot cluster
+    whose cohort floored out has the same five inapplicable checks and should
+    have the same fourteen in its denominator. Its `limitations` sentence then
+    accounts for those fourteen instead of overstating nineteen.
+
+    `datapath-provider` is deliberately absent. It carries `autopilot_excluded`
+    rather than `standard_only`: the facet is computed and recorded in
+    `checks_run`, and only the flagging is suppressed, so the manifest already
+    makes a claim about it that this table would contradict.
+    """
+    standard_only_slugs = [f.slug for f in FACETS if f.standard_only]
+    out: dict[str, list[dict]] = {}
+    for c in clusters:
+        if cluster_mode(c) != "autopilot":
+            continue
+        out[c["name"]] = [
+            {
+                "check": slug,
+                "reason": (
+                    "GKE Autopilot: Google manages the nodes and exposes no user node pool, "
+                    f"so `{FACETS_BY_SLUG[slug].field_path}` has no value to compare against "
+                    "the cohort."
+                ),
+            }
+            for slug in standard_only_slugs
+        ]
+    return out
+
+
 def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[str, list[str]], dict[str, list[dict]]]:
     """Returns `(checks_run_by_cluster, candidates_by_cluster)` -- the
     facets actually voted on for each cluster, and the outlier findings
@@ -631,6 +676,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_
 
     checks_run, candidates = compute_drift(all_clusters, now=now)
     limitations = cohort_limitations(all_clusters, now=now)
+    not_applicable = autopilot_not_applicable(all_clusters)
 
     entries = []
     for c in all_clusters:
@@ -653,6 +699,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_
         note = limitations.get(c["name"])
         if note:
             entry["limitations"] = note
+        skipped = not_applicable.get(c["name"])
+        if skipped:
+            entry["checks_not_applicable"] = skipped
         entries.append(entry)
 
     # A project whose `clusters list` failed contributed no clusters, and with
