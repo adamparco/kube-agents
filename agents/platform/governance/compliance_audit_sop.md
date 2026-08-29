@@ -104,8 +104,7 @@ Same slugs as `checks_run`, and the `reason` has to say why the check _cannot_ a
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/collect.py compliance-audit \
-  --project "$PROJECT" > /opt/data/scratch/manifest_compliance-audit.json
+python3 ./skills/fleet-audit/scripts/collect.py compliance-audit --project "$PROJECT" > /opt/data/scratch/manifest_compliance-audit.json
 ```
 
 This is the tested, procedural implementation of every check below — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers. Unlike a single-dump stream, compliance-audit's collector issues five distinct reads per cluster (the workload dump, RBAC, NetworkPolicy plus Namespace, ServiceAccount, and two `gcloud` calls) and fails the whole cluster closed if any one of them cannot be gated. Read the manifest before doing anything else:

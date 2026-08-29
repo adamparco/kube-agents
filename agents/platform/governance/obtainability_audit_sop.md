@@ -78,8 +78,7 @@ gcloud container clusters list --format=json
 ### 2. Run the collector
 
 ```bash
-python3 ./skills/fleet-audit/scripts/collect.py obtainability-audit \
-  --project "$(gcloud config get-value project)" > /opt/data/scratch/manifest_obtainability-audit.json
+python3 ./skills/fleet-audit/scripts/collect.py obtainability-audit --project "$(gcloud config get-value project)" > /opt/data/scratch/manifest_obtainability-audit.json
 ```
 
 This is the tested, procedural implementation of every check in Step 3 — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers. It enumerates the fleet itself, dumps workload state once per cluster behind a fail-closed gate, and evaluates all eleven checks against that one dump. Read the manifest it prints before doing anything else:
