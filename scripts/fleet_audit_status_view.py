@@ -424,28 +424,6 @@ def count_cell(value: object) -> str:
     return str(value) if isinstance(value, int) else "—"
 
 
-def scope_cell(latest: dict) -> tuple[str, str | None]:
-    """How many scope units the run covered, and whether it missed any.
-
-    "Units" rather than "clusters" because `scope.clusters` is not always a
-    cluster: `gcp-networking-fabric-audit` puts 42 subnets and a project entry
-    there, and labelling that column CLUSTERS would misreport it by a factor
-    of three.
-
-    The denominator only appears when something was skipped. A stream that
-    could not read a cluster still reports every remaining one as clean, so
-    `16/17` is the shape worth interrupting the reader for; a bare `16` on
-    every other row is not.
-    """
-    audited = latest.get("clusters")
-    if not isinstance(audited, int):
-        return "—", "dim"
-    skipped = latest.get("skipped")
-    if isinstance(skipped, int) and skipped > 0:
-        return "%d/%d" % (audited, audited + skipped), "yellow"
-    return str(audited), None
-
-
 def flags_for(stream: dict, job: dict, now: datetime, root_exists: bool) -> list[str]:
     """The four flags, in severity order.
 
@@ -603,7 +581,6 @@ def row_for(
         (ago(at, now) if at else "—", "dim"),
         (status, status_style),
         (findings_text, findings_style),
-        scope_cell(latest),
         (delta_text, delta_style),
         (pr_text, "dim" if pr_text in ("0", "—") else None, pr_url),
         (
@@ -633,7 +610,6 @@ COLUMNS = [
     Column("AGE", align="r", expendable=6),
     Column("STATUS", wrap=True, min_width=11),
     Column("FINDINGS", align="r"),
-    Column("SCOPE", align="r", expendable=2),
     Column("Δ", align="r", expendable=2),
     Column("PRS", align="r", expendable=5),
     Column("TIMING", align="r", expendable=1),

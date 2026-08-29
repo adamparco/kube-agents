@@ -531,19 +531,13 @@ class TestDashboard(unittest.TestCase):
         out = self.render({"compliance-audit": stream(last=latest(clusters=15, skipped=2))})
         self.assertIn("2 skipped", out)
 
-    def test_a_stream_that_skipped_nothing_shows_a_bare_count(self):
-        """The denominator is reserved for the case worth interrupting for.
-        A `16/16` on every row is noise that teaches the reader to skip the
-        column."""
-        row = self.body_rows(self.render({"compliance-audit": stream(last=latest(clusters=16))}))[0]
-        self.assertIn("16", row)
-        self.assertNotIn("16/16", row)
-
-    def test_a_stream_that_skipped_a_cluster_shows_the_denominator(self):
-        """A stream that could not read a cluster still reports every
-        remaining one as clean, so the count alone reads as full coverage."""
-        row = self.body_rows(self.render({"compliance-audit": stream(last=latest(clusters=15, skipped=2))}))[0]
-        self.assertIn("15/17", row)
+    def test_scope_stays_out_of_the_per_stream_row(self):
+        """It is a header fact, not a row fact: a reader scanning for what
+        broke does not need every row to restate how many clusters the fleet
+        has."""
+        out = self.render({"compliance-audit": stream(last=latest(clusters=16, skipped=2))})
+        self.assertNotIn("SCOPE", out)
+        self.assertNotIn("16/18", out)
 
     def test_a_flagged_stream_is_counted_in_the_lead(self):
         streams = self.two()
