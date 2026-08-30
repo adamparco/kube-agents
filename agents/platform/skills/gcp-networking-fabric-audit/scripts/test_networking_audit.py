@@ -435,6 +435,58 @@ class CollectProjectTest(unittest.TestCase):
             "collected",
         )
 
+    def test_the_published_command_names_the_read_that_produced_the_figure(self):
+        # `list-usable` enumerated the subnets; the insight measured them. A
+        # reader handed only the enumeration re-runs it, finds no
+        # `ipUtilization` anywhere in the output, and cannot check the verdict
+        # against anything -- so the recorded command has to name both.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        command = next(c for c in s1["commands"] if c["check"] == "subnet-ip-exhaustion")["command"]
+        self.assertTrue(command.startswith("gcloud compute networks subnets list-usable"))
+        self.assertIn(f"--insight-type {na._IP_INSIGHT_TYPE}", command)
+        # Both halves run, in order, from one shell -- not two lines a reader
+        # has to reassemble. The appendix caps a command at 2000 characters.
+        self.assertIn(" && gcloud recommender insights list", command)
+        self.assertLess(len(command), 2000)
+        # Every subnet in the run carries it, including the unmeasured one:
+        # the same pair of reads is what established it as unmeasured.
+        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        self.assertEqual(
+            next(c for c in s2["commands"] if c["check"] == "subnet-ip-exhaustion")["command"],
+            command,
+        )
+
+    def test_the_published_command_is_the_enumeration_alone_when_it_answers(self):
+        # The mirror of the test above: no backfill ran, so naming the insight
+        # would credit a read this run never made.
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/20", "ipUtilization": 0.1}]',
+            ),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        command = next(c for c in s1["commands"] if c["check"] == "subnet-ip-exhaustion")["command"]
+        self.assertNotIn("recommender", command)
+        self.assertNotIn("&&", command)
+
     def test_utilization_by_subnet_splits_primary_from_secondary(self):
         # The insight marks the primary range by omitting subnetRangeName.
         # Reading a named entry as the primary would attribute a pod range's

@@ -403,6 +403,19 @@ def _utilization_key(link: str) -> str:
     return f"{_region_of_subnet_link(link)}/{_last_segment(link)}"
 
 
+def _ip_insight_argv(project: str) -> list[str]:
+    """The Network Analyzer read, built in one place.
+
+    `_collect_subnet_targets` publishes this command alongside the enumeration
+    whenever the backfill supplied the reading, so the two must not drift.
+    """
+    return [
+        "gcloud", "recommender", "insights", "list",
+        "--project", project, "--location", "global",
+        "--insight-type", _IP_INSIGHT_TYPE, "--format", "json",
+    ]
+
+
 def _utilization_by_subnet(project: str, *, run: RunFn) -> dict[str, dict] | None:
     """Per-subnet IP utilization from Network Analyzer, keyed by `region/name`.
 
@@ -413,12 +426,7 @@ def _utilization_by_subnet(project: str, *, run: RunFn) -> dict[str, dict] | Non
     Returns None when the read gates closed, so the caller can tell "could not
     read" from "read fine, covers nothing".
     """
-    argv = [
-        "gcloud", "recommender", "insights", "list",
-        "--project", project, "--location", "global",
-        "--insight-type", _IP_INSIGHT_TYPE, "--format", "json",
-    ]
-    parsed, result = run_and_gate(argv, run=run)
+    parsed, result = run_and_gate(_ip_insight_argv(project), run=run)
     if parsed is None:
         log(f"{project}: ipAddressInsight gate failed (rc={result.rc}); subnet utilization unavailable")
         return None
@@ -539,6 +547,7 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                 ),
             }
         ]
+    measured_by_insight = False
     if not any(_carries_utilization(item) for item in parsed):
         # Subnets came back, but not one carries the only field this check
         # reads. `check_subnet_ip_exhaustion` returns None for every one of
@@ -592,7 +601,16 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                     ),
                 }
             ]
-    record = _record(" ".join(argv), result)
+        measured_by_insight = True
+    # Publish the commands that produced the reading, in the order they ran.
+    # On the backfill path `list-usable` only enumerated the subnets -- the
+    # figure every verdict below turns on came from the insight -- so naming
+    # the enumeration alone hands the reader a command that cannot reproduce
+    # the finding, which is the one thing this field exists to allow.
+    published = " ".join(argv)
+    if measured_by_insight:
+        published = f"{published} && {' '.join(_ip_insight_argv(project))}"
+    record = _record(published, result)
     out = []
     for item in parsed:
         name = _last_segment(item.get("subnetwork", ""))

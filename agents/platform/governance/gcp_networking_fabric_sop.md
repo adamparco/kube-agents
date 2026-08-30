@@ -47,7 +47,7 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 
 #### 2.1 Subnet primary and secondary IP range exhaustion (`subnet-ip-exhaustion`)
 
-- **Command:** `gcloud compute networks subnets list-usable --project=$PROJECT --format=json`
+- **Command:** `gcloud compute networks subnets list-usable --project=$PROJECT --format=json` to enumerate the subnets, and the Network Analyzer read below to measure them. Record both, joined with `&&`, as this check's command on every subnet target — the enumeration on its own reproduces nothing (see the next bullet), and a command a reader cannot re-run to reach the same figure is the one thing `checks_run` exists to prevent.
 - **Flag when:** the subnet's primary range, or any entry in `secondaryIpRanges`, carries `ipUtilization > 0.85` — under 15% of that range's addresses remain.
 - **`list-usable` never carries `ipUtilization`, so it cannot answer this check on its own.** The field is absent from gcloud's `UsableSubnetwork` in v1, `beta` and `alpha` alike — an install can return every subnet and still have nothing to measure. The measurement lives in Network Analyzer, and the collector reads it from there, writing each ratio onto the `ipUtilization` field above so the threshold is unchanged:
   `gcloud recommender insights list --project=$PROJECT --location=global --insight-type=google.networkanalyzer.vpcnetwork.ipAddressInsight --format=json`
@@ -121,7 +121,7 @@ Every finding must conform to the full findings schema:
         "checks_run": [
           {
             "check": "subnet-ip-exhaustion",
-            "command": "gcloud compute networks subnets list-usable --project=proj-1 --format=json"
+            "command": "gcloud compute networks subnets list-usable --project=proj-1 --format=json && gcloud recommender insights list --project=proj-1 --location=global --insight-type=google.networkanalyzer.vpcnetwork.ipAddressInsight --format=json"
           }
         ],
         "checks_not_applicable": [
