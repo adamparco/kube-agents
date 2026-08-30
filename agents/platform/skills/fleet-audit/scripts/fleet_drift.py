@@ -559,9 +559,13 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]
         if len(members) >= COHORT_FLOOR:
             continue
         label = "/".join(str(k) for k in key)
+        # A floored-out cohort is 1 or 2 members, so this line reads "only 1
+        # comparable clusters" in the single-member case that kube-agents-host
+        # hits on every run -- the most-read sentence the stream emits.
+        noun = "cluster" if len(members) == 1 else "clusters"
         for c in members:
             out[c["name"]] = (
-                f"cohort {label} has only {len(members)} comparable clusters "
+                f"cohort {label} has only {len(members)} comparable {noun} "
                 f"(minimum {COHORT_FLOOR}), no facet compared"
             )
     return out

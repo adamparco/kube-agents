@@ -630,8 +630,10 @@ class CohortLimitationsTest(unittest.TestCase):
         self.assertEqual(len(lim), 4)
         self.assertIn("only 2 comparable clusters", lim["auto-a"])
         self.assertIn("only 2 comparable clusters", lim["auto-b"])
-        self.assertIn("only 1 comparable clusters", lim["auto-test"])
-        self.assertIn("only 1 comparable clusters", lim["std-a"])
+        # Singular for a one-member cohort: the sentence a lone cluster like
+        # kube-agents-host gets on every run.
+        self.assertIn("only 1 comparable cluster ", lim["auto-test"])
+        self.assertIn("only 1 comparable cluster ", lim["std-a"])
         for text in lim.values():
             self.assertIn(f"minimum {fd.COHORT_FLOOR}", text)
             self.assertIn("no facet compared", text)
