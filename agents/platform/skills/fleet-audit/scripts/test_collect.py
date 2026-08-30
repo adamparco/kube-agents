@@ -1335,6 +1335,30 @@ class TestWildcardRbac(unittest.TestCase):
         )
         self.assertEqual(len(collect.check_wildcard_rbac(ctx)), 1)
 
+    # The live shape: GKE's `kubelet-api-admin`, bound to the API server's own
+    # user so it can reach kubelets. Neither of the check's own two
+    # suppressions sees it -- the label is not `rbac-defaults` and the name has
+    # no `system:` prefix -- so before S2 it was one `critical` per cluster.
+    GKE_ADDON = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+
+    def test_a_gke_managed_addon_role_is_never_flagged(self):
+        ctx = context_of(
+            roles=[cluster_role("kubelet-api-admin", self.WILDCARD_RULE, labels=self.GKE_ADDON)],
+            clusterrolebindings=[
+                role_binding("ClusterRole", "kubelet-api-admin", [subject("User", "kube-apiserver")])
+            ],
+        )
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
+    def test_the_addon_suppression_keys_on_the_label_and_not_the_name(self):
+        ctx = context_of(
+            roles=[cluster_role("kubelet-api-admin", self.WILDCARD_RULE)],
+            clusterrolebindings=[
+                role_binding("ClusterRole", "kubelet-api-admin", [subject("User", "kube-apiserver")])
+            ],
+        )
+        self.assertEqual(len(collect.check_wildcard_rbac(ctx)), 1)
+
 
 class TestNetpolMissing(unittest.TestCase):
     def test_zero_policies_with_workloads_is_major(self):

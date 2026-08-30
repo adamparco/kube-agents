@@ -895,6 +895,26 @@ _WILDCARD_BOOTSTRAP_LABEL = "kubernetes.io/bootstrapping"
 
 
 def check_wildcard_rbac(context: dict) -> list[dict]:
+    """The universal suppressions on line 126 of the SOP say "every check in
+    this section", and this is the check that never applied them: it has two
+    suppressions of its own -- the `rbac-defaults` label and the `system:` name
+    prefix -- and neither covers a GKE add-on.
+
+    `kubelet-api-admin` is the one that costs. GKE ships it on every cluster
+    with `verbs: ["*"]` over five `nodes/*` subresources in the core group,
+    bound to `User/kube-apiserver` so the API server can reach kubelets for
+    `kubectl logs` and `kubectl exec`. The subject test reads that user as
+    non-system because the name carries no `system:` prefix, so the role
+    counted as bound, and every cluster in the fleet reported one `critical`.
+    Sixteen of the eighteen findings in the last compliance run were this one
+    object. It is also unfixable: the label is `Reconcile`, so the add-on
+    manager reverts an edit, and a server-side dry-run patch is refused
+    outright.
+
+    The label test is the same S2 rung the workload checks use, and the SOP
+    names this exact failure -- "flagging these is the fastest way to get this
+    audit switched off".
+    """
     bound_non_system = set()
     for kind_key in ("clusterrolebindings", "rolebindings"):
         for binding in context.get(kind_key) or []:
@@ -910,6 +930,8 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
         if (meta.get("labels") or {}).get(_WILDCARD_BOOTSTRAP_LABEL) == "rbac-defaults":
             continue
         if meta.get("name", "").startswith("system:"):
+            continue
+        if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):  # S2
             continue
         wildcard_rules = [
             rule
