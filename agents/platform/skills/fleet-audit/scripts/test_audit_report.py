@@ -469,6 +469,19 @@ class BaseTestCase(unittest.TestCase):
         # swallows its own errors, so an unpatched path does not fail — it
         # writes nothing and leaves every store assertion vacuously true.
         self.patch_attr("REPORTS_DIR", str(self.tmp_path / "reports"))
+        # The same guarantee, for the other root that reaches `/opt/data`.
+        # `dry_run_repo_root` prefers the real GitOps clone and falls back to
+        # `repo_root_best_effort` only when it is absent — correct in
+        # production, and the reason the two `--dry-run` body tests below pass
+        # on a laptop for the wrong reason. They patch `repo_root_best_effort`
+        # and write their manifest under `tmp_path`; that is only the root the
+        # code consults because no laptop has `/opt/data/gitops`. Run the same
+        # tests in the agent pod, where the clone does exist, and they resolve
+        # `clusters/prod-us-east/payments-netpol.yaml` against this install's
+        # live infrastructure repository, find nothing, and fail. Rooting the
+        # workspace in the sandbox makes the fallback the deterministic answer
+        # everywhere instead of an accident of the host.
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -2468,7 +2481,19 @@ class TestStaging(unittest.TestCase):
                     [git, *args], cwd=root, check=True, capture_output=True, text=True, **kw
                 )
 
-            run("init", "-q", "-b", "main")
+            # On PATH is not the same as usable here. In the agent pod `git` is
+            # the credential proxy's shim, which refuses any working directory
+            # outside `/opt/data` — so the `which` check above passes and the
+            # first real command fails. This test is about git's own pathspec
+            # behaviour and has nothing to say about a sandbox that will not run
+            # it, so probe once and skip with the reason rather than erroring.
+            try:
+                run("init", "-q", "-b", "main")
+            except subprocess.CalledProcessError as exc:  # pragma: no cover
+                self.skipTest(
+                    "git will not run in a temp directory here: "
+                    f"{(exc.stderr or exc.stdout or '').strip()[:200]}"
+                )
             run("config", "user.email", "audit@example.invalid")
             run("config", "user.name", "audit")
             for name in ("*.yaml", "one.yaml", "two.yaml"):
