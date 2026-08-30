@@ -690,6 +690,35 @@ class IdleAddressTest(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
 
+    def test_a_regional_address_carries_the_region_scope_flag(self):
+        hits = fw.check_idle_address([self.address()], set(), now=NOW)
+        self.assertIn("--region=us-central1", hits[0]["excerpt"])
+
+    def test_a_global_address_carries_the_global_scope_flag(self):
+        """gcloud omits `region` entirely for a global address.
+
+        Left to infer it, an agent writes the remediation with no scope flag at
+        all, gcloud resolves it against its configured default region, and the
+        command answers `was not found` on an address that is really there.
+        """
+        hits = fw.check_idle_address([self.address(region=None)], set(), now=NOW)
+        self.assertIn("--global", hits[0]["excerpt"])
+        self.assertNotIn("--region", hits[0]["excerpt"])
+
+    def test_a_region_selflink_is_reduced_to_its_name(self):
+        """The list API returns `region` as a full URL, not `us-central1`."""
+        url = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+        hits = fw.check_idle_address([self.address(region=url)], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_the_rollup_names_a_location_not_a_url(self):
+        url = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+        addrs = [self.address(name=f"a{i}", region=url) for i in range(10)]
+        hits = fw.check_idle_address(addrs, set(), now=NOW)
+        self.assertEqual(hits[0]["object"], "Address/rollup-us-east4")
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
 
 class OrphanLbTest(unittest.TestCase):
     def test_flags_forwarding_rule_targeting_deleted_service(self):

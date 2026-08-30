@@ -1139,6 +1139,23 @@ def check_unattached_disk(disks: list[dict], live_pv_handles: set[str], *, now: 
     return hits
 
 
+def _address_location(addr: dict) -> str:
+    """`us-east4` or `global` for an address, from gcloud's two shapes for it.
+
+    gcloud returns `region` as a full selfLink URL for a regional address and
+    omits the key entirely for a global one, so a candidate that passes the
+    field through carries a URL where a location belongs and nothing at all for
+    the global case. Both matter downstream: every remediation command for an
+    address needs a scope flag, and the wrong one fails the same way the missing
+    one does -- `was not found`, which reads as a finding somebody has already
+    remediated rather than a command written wrong, so the waste stays on the
+    bill. Handles a bare region name too, which is what the API returns for some
+    projections.
+    """
+    region = addr.get("region") or ""
+    return region.rsplit("/", 1)[-1] if region else "global"
+
+
 def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *, now: datetime) -> list[dict]:
     hits = []
     idle = []
@@ -1154,10 +1171,12 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
             continue
         idle.append(addr)
     if len(idle) >= 10:
-        region = idle[0].get("region", "")
-        return [{"object": f"Address/rollup-{region}", "excerpt": f"{len(idle)} external addresses RESERVED and unattached in {region}", "severity": "major"}]
+        location = _address_location(idle[0])
+        return [{"object": f"Address/rollup-{location}", "excerpt": f"{len(idle)} external addresses RESERVED and unattached in {location}", "severity": "major"}]
     for addr in idle:
-        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')}", "severity": "minor"})
+        location = _address_location(addr)
+        scope = "--global" if location == "global" else f"--region={location}"
+        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')} ({scope})", "severity": "minor"})
     return hits
 
 
