@@ -9621,6 +9621,57 @@ class TestCheckCommands(unittest.TestCase):
         if "How this run checked the fleet" in body:
             self.assertIn("kubectl get netpol -A", body)
 
+    def _crowded_out(self, na=()):
+        """A run whose evidence table cannot fit: 30 long commands, 24 findings.
+
+        The live shape, not a synthetic one — obtainability-audit's run of
+        2026-08-30 carried 37 findings and a 49,965-character appendix into a
+        60,000-character budget, and the appendix lost.
+        """
+        doc = self._with({"check": "netpol-missing", "command": "kubectl get netpol -A"})
+        doc["scope"]["clusters"][0]["checks_run"] = [
+            {
+                "check": "netpol-missing",
+                "command": f"kubectl --context c{i} get networkpolicy -A "
+                + "--selector=x " * 200,
+            }
+            for i in range(30)
+        ]
+        doc["scope"]["clusters"][1]["checks_run"] = []
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = list(na)
+        doc["findings"] = [
+            make_finding(
+                fid=f"finding-{i}",
+                title=f"Finding {i} " + "padding " * 20,
+                impact="x" * 1400,
+            )
+            for i in range(24)
+        ]
+        return render_body(doc, generated_at=NOW)
+
+    def test_a_crowded_out_evidence_table_says_so_instead_of_vanishing(self):
+        """The falsifiability promise is broken silently, on the runs that most need it.
+
+        `validate_check_command` makes the model invent a re-runnable command
+        for every check on the stated promise that they are published here, and
+        this section is last in line for the body budget — so it disappears on
+        exactly the runs whose findings crowded it out. Three of the eight live
+        streams dropped it on 2026-08-30, none of them saying so; the reader
+        gets a document that looks complete.
+        """
+        body = self._crowded_out()
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertNotIn("How this run checked the fleet", body)
+        self.assertIn("The 30 command(s) behind this run's checks do not fit", body)
+        self.assertIn("kept in full in this run's stored report", body)
+
+    def test_the_dropped_table_notice_counts_the_exclusions_too(self):
+        """A check declared inapplicable leaves the coverage denominator, so its absence counts."""
+        body = self._crowded_out(
+            na=[{"check": "idle-nodepool", "reason": "Autopilot has no node pools"}]
+        )
+        self.assertIn("and the 1 exclusion(s) do not fit", body)
+
 
 class TestPartialCoverageGating(HarnessTestCase):
     """A run that could not look must not conclude anything from absence."""
