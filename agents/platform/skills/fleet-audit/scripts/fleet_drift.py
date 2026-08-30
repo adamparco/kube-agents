@@ -553,8 +553,9 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]
     §4 is explicit that a facet returning no token excludes the cluster from
     that facet's vote alone.
     """
-    ineligible, cohorts, _ = cohort_layout(clusters, now=now)
+    ineligible, cohorts, env_of = cohort_layout(clusters, now=now)
     out = dict(ineligible)
+    labelled = sum(1 for _, source in env_of.values() if source == "label")
     for key, members in cohorts.items():
         if len(members) >= COHORT_FLOOR:
             continue
@@ -567,8 +568,40 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]
             out[c["name"]] = (
                 f"cohort {label} has only {len(members)} comparable {noun} "
                 f"(minimum {COHORT_FLOOR}), no facet compared"
+                f"{_unlabelled_cause(key, labelled, len(env_of))}"
             )
     return out
+
+
+def _unlabelled_cause(key: tuple, labelled: int, total: int) -> str:
+    """Why the `unknown` cohort floored out, when the rest of the fleet did not.
+
+    The floor sentence is true and gives the reader nothing to do with it. On
+    the live fleet fifteen of sixteen clusters carry `environment=test` and
+    kube-agents-host carries no environment label at all, so it cohorts alone
+    under §2.3's rule that `unknown` never merges into a named cohort -- and
+    the install's own host cluster is the one cluster this stream can never
+    compare, on this run or any future one. Nothing in "cohort
+    standard/unknown has only 1 comparable cluster" says that a label is the
+    difference, so the gap reads as a quirk of fleet size and gets waited out
+    rather than fixed.
+
+    Counted by label rather than by resolved environment, because the sentence
+    claims the other clusters carry one. Under the inferred strategy they do
+    not -- their environment came from a name token -- and "12 of 16 do" would
+    then be false. Counting the source keeps it literally true, and doubles as
+    the guard on the `unknown` test: `decide_cohort_strategy` returns
+    `environment` for any label at all, so a non-zero count means the key's
+    last element really is an environment and not a project that happens to be
+    named `unknown`.
+    """
+    if key[-1:] != ("unknown",) or not labelled:
+        return ""
+    return (
+        f"; it carries no environment label while {labelled} of {total} do,"
+        " and an unlabelled cluster never joins a named cohort -- label it"
+        " to compare it"
+    )
 
 
 def autopilot_not_applicable(clusters: list[dict]) -> dict[str, list[dict]]:

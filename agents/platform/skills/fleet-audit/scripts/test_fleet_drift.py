@@ -644,6 +644,33 @@ class CohortLimitationsTest(unittest.TestCase):
         self.assertIn("cohort autopilot/test", lim["auto-test"])
         self.assertIn("cohort standard/prod", lim["std-a"])
 
+    def test_the_lone_unlabelled_cluster_is_told_a_label_is_the_difference(self):
+        # The live fleet's shape: fifteen of sixteen carry `environment=test`,
+        # kube-agents-host carries none, so it cohorts alone under 2.3 and is
+        # the one cluster drift can never compare -- on this run or any later
+        # one. The floor sentence alone reads as a fleet-size quirk and gets
+        # waited out; the cause is what makes it fixable.
+        fleet = [cluster(f"c{i}", labels={"environment": "test"}) for i in range(3)]
+        fleet.append(cluster("host", labels={}))
+        lim = fd.cohort_limitations(fleet, now=NOW)
+        self.assertEqual(list(lim), ["host"])
+        self.assertIn("cohort standard/unknown has only 1 comparable cluster",
+                      lim["host"])
+        self.assertIn("no environment label while 3 of 4 do", lim["host"])
+
+    def test_a_fleet_nobody_labelled_is_not_told_to_add_a_label(self):
+        # Every cluster unknown together cohorts by mode alone, so there is no
+        # named cohort being kept out of and nothing to point at. Counting the
+        # label source rather than the resolved environment is what keeps the
+        # inferred strategy out too: those clusters carry no label either, and
+        # a count of them would make the sentence false.
+        fleet = [cluster(f"c{i}", labels={}) for i in range(2)]
+        lim = fd.cohort_limitations(fleet, now=NOW)
+        self.assertEqual(len(lim), 2)
+        for text in lim.values():
+            self.assertIn("no facet compared", text)
+            self.assertNotIn("environment label", text)
+
     def test_a_cohort_that_reaches_the_floor_explains_nothing(self):
         """A compared cluster must not carry a limitation — it would read as a
         coverage gap on a cluster that was in fact fully voted on."""
