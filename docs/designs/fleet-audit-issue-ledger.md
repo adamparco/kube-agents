@@ -565,14 +565,19 @@ headroom for the trailing marker and for anything a later section appends.
   the cap is per check per cluster, six streams run against a fleet of unknown size, and a size
   term that grows with the fleet and is invisible in the rendered body is the worst kind to leave
   unbounded.
-- **The two halves of the delta are measured against different sets**, because "appeared" and "was
-  fixed" are different claims and truncation breaks them apart. `new` is _rendered minus previous_:
-  the previous run's stored ids record what the last body rendered, so comparing them to anything
-  wider announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
-  minus **every** current finding, rendered or not_: a finding cut for space still reproduces, and
-  calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
-  to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
-  one is chosen.
+- **Both halves of the delta are measured against what the previous run _knew_**, which is wider
+  than what its body had room to show: its stored `current_ids` union every finding in its stored
+  `document`. `new` is _rendered minus that union_; `resolved` is _that union minus **every**
+  current finding, rendered or not_. A finding cut for space still reproduces, so calling it
+  resolved puts a fix that never happened in writing, on the one finding nobody can see to
+  contradict it — and a finding that loses one budget contest and wins the next is not new either,
+  which the rendered-minus-rendered rule this replaces could not express. On 2026-08-30
+  stockout-prevention published "18 new, 15 resolved" for a run that had in truth found nothing new
+  and seen 49 findings fixed: the previous body had rendered 15 of its 67 findings, so the 18 that
+  survived into the next run all read as new and 34 real fixes went unannounced. The union is taken
+  rather than the document alone because a stored document that is absent or malformed yields an
+  empty set, which would announce every live finding as new — the failure the rendered-only rule
+  existed to prevent, let back in through the wider set.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -780,8 +785,9 @@ tempting generalisation — also raising it when the body budget (§7.1) dropped
 description — was implemented and then removed, because the two are not the same kind of incomplete
 and the flag has one job. A coverage gap means the audit did not look, which is precisely why it
 suppresses the resolved count. Truncation means it looked, found everything, counted it all in the
-title, and could not print the tail; resolution accounting is untouched, because the stored id set
-already carries only the ids the body rendered (§2). Folding them together produced
+title, and could not print the tail; delta accounting is untouched, because the store carries both
+the rendered ids and the full document and §7.1 measures against the union of the two. Folding them
+together produced
 `partial: true` with an empty `coverage_gaps` — a flag six SOPs instruct the agent to explain to a
 human, with nothing to explain it with. Truncation is surfaced where it belongs: a line in the body
 naming the count it dropped, and a `WARNING` in the run log.

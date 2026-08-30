@@ -1589,10 +1589,11 @@ def report_envelope(
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
     `current_ids` is the **rendered** set — exactly what the body's hidden
-    block published — because the delta join is rendered-vs-rendered (see
-    `compute_delta`) and the full finding set is derivable from `document`.
-    Storing the wider set here would announce every budget-truncated finding
-    as new on the next run, which is the bug `compute_delta` exists to avoid.
+    block published — because that is the claim the key makes, and its other
+    readers take it literally: `report_status` counts it as what the ledger
+    shows, and the clean-run path feeds it back as the body it left untouched.
+    The wider set is not lost by keeping this one narrow; it is derivable from
+    `document`, and `compute_delta` reads both, one for each half of the delta.
 
     `document` is the post-validation, post-degradation document the ledger
     rendered, with the body's redaction backstop applied to every string, so
@@ -3180,28 +3181,39 @@ def compute_delta(
     previous_ids: list[str],
     rendered_ids: list[str],
     all_current_ids: list[str] | None = None,
+    all_previous_ids: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Return (newly appeared ids, newly resolved ids), both sorted.
 
-    The two halves are deliberately measured against *different* sets, because
-    "appeared" and "was fixed" are different claims and the body budget breaks
-    them apart.
+    Both halves turn on what the previous run *knew*, which is wider than what
+    its body had room to show: `previous_ids` is what that body rendered,
+    `all_previous_ids` is every finding in its stored document, and the union
+    of the two is the yardstick.
 
-    `previous_ids` comes out of the last run's hidden block, which records what
-    that body **rendered** — so `new` has to be measured against what this body
-    rendered too. Compare a rendered set to a full finding set and every
-    finding the budget dropped is announced as new, every run, forever.
+    Measuring `new` against the rendered set alone announces a finding that
+    merely lost one budget contest and won the next. On 2026-08-30
+    obtainability-audit did exactly that — seventeen false `hpa-cannot-scale`
+    findings crowded six real `probes-liveness` ones out of the body, and when
+    the false ones were fixed the six came back and the comment called all six
+    new, pointing "look now" at findings two earlier runs had already reported.
+    A reader who cannot see a truncated finding is told so by the comment's own
+    `omitted` line, which claims partial coverage and nothing about novelty.
 
-    `all_current_ids` is every finding in the document, rendered or not, and
+    The union rather than `all_previous_ids` on its own, because a stored
+    document that is absent or malformed yields an empty set, and measuring
+    `new` against that would announce every live finding as new — the failure
+    this function exists to prevent, let back in through the wider set.
+
+    `all_current_ids` is every finding in this document, rendered or not, and
     resolution is judged against it alone. A finding cut for space still
     reproduces; calling it resolved claims a fix that never happened, in
     writing, on a finding nobody can see. It defaults to `rendered_ids` for
     callers where nothing was truncated.
     """
-    previous = set(previous_ids)
+    known = set(previous_ids) | set(all_previous_ids or ())
     rendered = set(rendered_ids)
     current = set(rendered_ids if all_current_ids is None else all_current_ids)
-    return sorted(rendered - previous), sorted(previous - current)
+    return sorted(rendered - known), sorted(known - current)
 
 
 # --------------------------------------------------------------------------- #
@@ -7303,13 +7315,16 @@ def handle_finish(args: argparse.Namespace) -> None:
             "the true totals."
         )
 
-    # Now, and not before: `new` is measured against what this body rendered,
-    # because that is what the hidden block records and what the next run will
-    # read back. Measured against the full finding set instead, every finding
-    # the budget dropped is announced as new every single morning. `resolved`
-    # keeps its own, wider yardstick — see `compute_delta`.
+    # Now, and not before: both halves need this body's rendered set, which
+    # does not exist until it is rendered. What they are measured *against* is
+    # `compute_delta`'s business — the previous run's rendered ids widened by
+    # the findings its body had no room for, which `previous_titles` already
+    # carries because the resolved half needs their titles anyway.
     new_ids, resolved_ids = compute_delta(
-        previous_ids, rendered.rendered_ids, current_ids
+        previous_ids,
+        rendered.rendered_ids,
+        current_ids,
+        all_previous_ids=sorted(previous_titles),
     )
     # What the published body's hidden block ends up carrying, and so what the
     # store records as this run's memory. The relink edit below can change it.

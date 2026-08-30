@@ -697,10 +697,11 @@ emits the **first** finding whatever it costs, so before those three were clippe
 identifier on one finding could overflow the whole body and publish nothing at all, every morning,
 until that finding stopped reproducing.
 
-Resolution accounting is unaffected by truncation, because the two halves of the delta are measured
-against different sets: **new** is judged against what the body rendered, and **resolved** against
-every finding in the document, rendered or not. A finding cut for space still reproduces and is
-never reported as fixed.
+Delta accounting is unaffected by truncation, because both halves are measured against what the
+previous run knew — the ids its body rendered plus every finding in its stored document — and
+judged against every finding in this document, rendered or not. A finding cut for space still
+reproduces and is never reported as fixed; one that loses a budget contest and wins the next is not
+reported as new.
 
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
 `checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the

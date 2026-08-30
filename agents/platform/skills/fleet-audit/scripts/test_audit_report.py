@@ -905,7 +905,8 @@ class TestDeltaBlock(unittest.TestCase):
         )
         self.assertEqual(resolved, ["gone"])
 
-    def test_a_finding_that_becomes_renderable_is_announced_then(self):
+    def test_a_finding_that_becomes_renderable_is_announced_when_it_is_new(self):
+        # Nothing says the previous run knew about `b`, so it is new.
         new, resolved = audit_report.compute_delta(
             previous_ids=["a"],
             rendered_ids=["a", "b"],
@@ -913,6 +914,44 @@ class TestDeltaBlock(unittest.TestCase):
         )
         self.assertEqual(new, ["b"])
         self.assertEqual(resolved, [])
+
+    def test_a_finding_that_only_lost_a_budget_contest_is_not_new(self):
+        # `b` was found last run and cut from that body for space. Announcing
+        # it now points "look now" at something already reported. Live on
+        # 2026-08-30: seventeen false hpa-cannot-scale findings evicted six real
+        # probes-liveness ones, and their return was published as six new.
+        new, _ = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a", "b"],
+            all_current_ids=["a", "b"],
+            all_previous_ids=["a", "b"],
+        )
+        self.assertEqual(new, [])
+
+    def test_a_finding_cut_for_space_and_then_fixed_is_still_announced_resolved(self):
+        # The mirror of the case above, and the reason the wider set feeds both
+        # halves: `gone` never rendered, so a rendered-only yardstick can never
+        # credit the fix and the reader is never told it landed.
+        _, resolved = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a"],
+            all_current_ids=["a"],
+            all_previous_ids=["a", "gone"],
+        )
+        self.assertEqual(resolved, ["gone"])
+
+    def test_an_unreadable_previous_document_does_not_announce_everything_new(self):
+        # A missing or malformed stored document yields no wider set. Measured
+        # against that alone every live finding reads as new, so the union with
+        # the rendered ids is what keeps the old floor under this.
+        for wider in ([], None):
+            new, _ = audit_report.compute_delta(
+                previous_ids=["a", "b"],
+                rendered_ids=["a", "b"],
+                all_current_ids=["a", "b"],
+                all_previous_ids=wider,
+            )
+            self.assertEqual(new, [])
 
 
 class TestDeltaCommentOrdering(BaseTestCase):
