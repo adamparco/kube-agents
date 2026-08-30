@@ -604,6 +604,7 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             "name": c["name"],
             "project": project,
             "location": location,
+            "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
             "outcome": "collected",
             "commands": [{"check": slug, **record} for slug, record in commands.items()],
             "candidates": candidates,

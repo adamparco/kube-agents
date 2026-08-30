@@ -1023,6 +1023,16 @@ once, transcribed the sixteen booleans into a Python literal, and re-typed that 
 three separate blocks — a hand-copied fleet map that is silently wrong the moment a cluster is
 added, renamed, or converted, and whose cost is paid in output tokens on every run.
 
+All five collectors publish it, and on cluster entries only. `patch_readiness`, `fleet_drift`,
+and `fleet_waste` also write a `project/<name>` row when a project's `clusters list` never
+answered; that row stands for a project rather than a cluster, so it carries no mode, and a
+`false` there would read as a fleet of Standard clusters. `fleet_stockout` publishes `has_nap`
+beside `autopilot` on the same terms — node auto-provisioning is the other cluster-level fact
+it resolves during enumeration, and withholding it cost five `gcloud container clusters
+describe` round-trips against a single cluster in one measured run, three of them the identical
+`--format='value(autoscaling.enableNodeAutoprovisioning)'` projection re-issued because an
+empty projection reads as unreadable rather than as false.
+
 ## 7. SOP and prompt changes
 
 Per converted stream: §"Checks" keeps each `####` heading (the roster contract and the

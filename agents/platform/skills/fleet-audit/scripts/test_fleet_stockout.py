@@ -792,6 +792,53 @@ class CollectClusterTest(unittest.TestCase):
                 entry = fs.collect_cluster(self.CLUSTER, run=run)
         self.assertEqual(entry["outcome"], "gate-failed")
 
+    def test_every_outcome_publishes_the_mode_and_nap(self):
+        # `enumerate_clusters` asks `clusters list` for both fields and derives
+        # `autopilot`/`has_nap` from them, then used to drop both before
+        # writing the manifest -- so a live run spent five `clusters describe`
+        # round trips re-deriving them, three of those the identical
+        # `value(autoscaling.enableNodeAutoprovisioning)` projection that comes
+        # back empty and reads as "my projection is wrong" rather than "false".
+        cluster = {**self.CLUSTER, "autopilot": True, "has_nap": True}
+
+        def denied(argv, **kwargs):
+            return run_of(1, "", "denied") if "get-credentials" in argv else run_of(0, "")
+
+        def gated(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(1, "", "forbidden")
+            return run_of(0, "")
+
+        entries = [self.run_with(dump_items=[], cluster=cluster)]
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                entries.append(fs.collect_cluster(cluster, run=denied))
+                entries.append(fs.collect_cluster(cluster, run=gated))
+        self.assertEqual(
+            [e["outcome"] for e in entries], ["collected", "unreachable", "gate-failed"]
+        )
+        for entry in entries:
+            with self.subTest(outcome=entry["outcome"]):
+                self.assertIs(entry["autopilot"], True)
+                self.assertIs(entry["has_nap"], True)
+
+    def test_a_cluster_that_never_ran_still_publishes_the_mode_and_nap(self):
+        entry = fs.not_running_entry(
+            {"name": "dr-west", "location": "us-west1", "status": "DEGRADED",
+             "autopilot": {"enabled": True},
+             "autoscaling": {"enableNodeAutoprovisioning": True}},
+            "acme",
+        )
+        self.assertEqual(entry["outcome"], "unreachable")
+        self.assertIs(entry["autopilot"], True)
+        self.assertIs(entry["has_nap"], True)
+        # Absent in the gcloud payload means false, not unknown.
+        bare = fs.not_running_entry({"name": "c", "status": "STOPPING"}, "acme")
+        self.assertIs(bare["autopilot"], False)
+        self.assertIs(bare["has_nap"], False)
+
     def test_a_dirty_compute_class_is_reported(self):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
         entry = self.run_with(dump_items=[cc])

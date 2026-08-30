@@ -219,6 +219,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "name": c.get("name", ""),
         "project": project,
         "location": c.get("location") or c.get("zone") or "",
+        "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": "unreachable",
         "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
     }
@@ -970,10 +971,14 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     when the object dump succeeded; `collect_fleet` unions it across every
     cluster before running the project-scoped checks that need it."""
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
+    # A cluster property `enumerate_clusters` already resolved, so it rides on
+    # every shape below: the mode does not stop being true because this run
+    # failed to read inside the cluster.
+    mode = {"autopilot": bool(cluster.get("autopilot"))}
     empty_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
-        return {"name": name, "project": project, "location": location, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
+        return {"name": name, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
 
     dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts"
 
@@ -981,7 +986,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     dump_argv = ["kubectl", "get", dump_kinds, "-A", "-o", "json"]
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
-        return {"name": name, "project": project, "location": location, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
+        return {"name": name, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
@@ -1097,7 +1102,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         )
 
     entry = {
-        "name": name, "project": project, "location": location, "outcome": "collected",
+        "name": name, "project": project, "location": location, **mode, "outcome": "collected",
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }

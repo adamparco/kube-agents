@@ -658,6 +658,36 @@ class CollectFleetTest(unittest.TestCase):
         manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
         self.assertEqual([c for c in manifest["clusters"] if c["name"].startswith("project/")], [])
 
+    def test_every_cluster_publishes_the_mode(self):
+        """`cluster_mode` is part of the cohort key here and it silences five
+        facets, so this collector knows the mode before it writes a line — and
+        withheld it, leaving each stream to re-derive a fact already resolved."""
+        clusters = [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(2)]
+        clusters += [cluster(f"s{i}", labels={"environment": "prod"}) for i in range(2)]
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, json.dumps(clusters))
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        self.assertEqual(
+            {c["name"]: c["autopilot"] for c in manifest["clusters"]},
+            {"a0": True, "a1": True, "s0": False, "s1": False},
+        )
+
+    def test_the_project_level_entry_claims_no_mode(self):
+        """A project is not a cluster. The gate-failed entry stands for a whole
+        `clusters list` that never answered, so there is no mode to publish and
+        a `false` there would read as a fleet of Standard clusters."""
+
+        def run(argv, **kwargs):
+            return run_of(1, "", "denied")
+
+        entry = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)["clusters"][0]
+        self.assertEqual(entry["name"], "project/acme")
+        self.assertNotIn("autopilot", entry)
+
 
 class AutopilotNotApplicableTest(unittest.TestCase):
     """The five `standard_only` facets have to be declared, not just dropped.

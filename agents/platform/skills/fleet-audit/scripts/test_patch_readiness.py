@@ -389,6 +389,24 @@ class CollectProjectTest(unittest.TestCase):
         entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
         self.assertEqual([e for e in entries if e["name"].startswith("project/")], [])
 
+    def test_every_cluster_publishes_the_mode(self):
+        """The mode already silences four of the ten checks here, so this
+        collector resolves it before writing a line — and then withheld it,
+        leaving each stream to re-derive a fact it was holding."""
+        responses = {
+            "clusters list": run_of(0, json.dumps([cluster("ap", autopilot=True), cluster("std")])),
+            "get-server-config": run_of(0, json.dumps(server_config())),
+        }
+        entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
+        self.assertEqual({e["name"]: e["autopilot"] for e in entries}, {"ap": True, "std": False})
+
+    def test_the_project_level_entry_claims_no_mode(self):
+        """A project is not a cluster. The gate-failed entry stands for a
+        `clusters list` that never answered, so there is no mode to publish and
+        a `false` there would read as a fleet of Standard clusters."""
+        entries = pr.collect_project("acme", run=self.fake_run({"clusters list": run_of(1, "", "denied")}), now=NOW)
+        self.assertNotIn("autopilot", entries[0])
+
     def test_get_server_config_failure_drops_only_the_baseline_checks(self):
         c = cluster()
         responses = {

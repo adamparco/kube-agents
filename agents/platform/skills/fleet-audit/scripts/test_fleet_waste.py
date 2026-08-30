@@ -892,7 +892,7 @@ class CollectProjectComputeTest(unittest.TestCase):
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def run_with(self, dump_items=(), pools=(), session=None):
+    def run_with(self, dump_items=(), pools=(), session=None, cluster=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
                 return run_of(0)
@@ -904,7 +904,49 @@ class CollectClusterTest(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
-                return fw.collect_cluster(self.CLUSTER, run=run, session=session or usage_session(), now=NOW)
+                return fw.collect_cluster(cluster or self.CLUSTER, run=run, session=session or usage_session(), now=NOW)
+
+    def test_every_outcome_publishes_the_mode(self):
+        # The mode is a cluster property `enumerate_clusters` already resolved,
+        # so it rides on the error shapes too: a cluster does not stop being
+        # Autopilot because this run failed to read inside it.
+        cluster = {**self.CLUSTER, "autopilot": True}
+
+        def denied(argv, **kwargs):
+            return run_of(1, "", "denied") if "get-credentials" in argv else run_of(0, "")
+
+        def gated(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(1, "", "forbidden")
+            return run_of(0, "")
+
+        entries = [self.run_with(cluster=cluster)[0]]
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                for runner in (denied, gated):
+                    entries.append(
+                        fw.collect_cluster(cluster, run=runner, session=usage_session(), now=NOW)[0]
+                    )
+        self.assertEqual(
+            [e["outcome"] for e in entries], ["collected", "unreachable", "gate-failed"]
+        )
+        for entry in entries:
+            with self.subTest(outcome=entry["outcome"]):
+                self.assertIs(entry["autopilot"], True)
+
+    def test_a_cluster_that_never_ran_still_publishes_the_mode(self):
+        entry = fw.not_running_entry(
+            {"name": "dr-west", "location": "us-west1", "status": "DEGRADED",
+             "autopilot": {"enabled": True}},
+            "acme",
+        )
+        self.assertEqual(entry["outcome"], "unreachable")
+        self.assertIs(entry["autopilot"], True)
+        self.assertIs(
+            fw.not_running_entry({"name": "c", "status": "STOPPING"}, "acme")["autopilot"], False
+        )
 
     def test_clean_cluster_collects_with_no_candidates(self):
         entry, facts = self.run_with()
