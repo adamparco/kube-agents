@@ -163,6 +163,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "name": c.get("name", ""),
         "project": project,
         "location": c.get("location") or c.get("zone") or "",
+        "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": "unreachable",
         "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
     }
@@ -1940,10 +1941,12 @@ def collect_cluster(
     one, whatever happened — `outcome` says which of the three shapes it is.
     """
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
+    autopilot = bool(cluster.get("autopilot"))
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
         return {
             "name": name, "project": project, "location": location,
+            "autopilot": autopilot,
             "outcome": "unreachable",
             "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}",
         }
@@ -1953,6 +1956,7 @@ def collect_cluster(
     except GateFailure as exc:
         return {
             "name": name, "project": project, "location": location,
+            "autopilot": autopilot,
             "outcome": "gate-failed",
             "error": str(exc),
         }
@@ -1996,6 +2000,7 @@ def collect_cluster(
 
     result = {
         "name": name, "project": project, "location": location,
+        "autopilot": autopilot,
         "outcome": "collected",
         "commands": [{"check": spec.slug, **collected.commands[spec.slug]} for spec in checks if spec.slug not in not_applicable_slugs],
         "candidates": candidates,

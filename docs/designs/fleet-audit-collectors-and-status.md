@@ -963,6 +963,7 @@ The manifest is the new machine boundary between collector and harness, so it ge
       "name": "prod-usc1",
       "project": "acme-prod",
       "location": "us-central1",
+      "autopilot": false,
       "outcome": "collected",
       "commands": [
         {
@@ -987,6 +988,7 @@ The manifest is the new machine boundary between collector and harness, so it ge
     },
     {
       "name": "dr-west",
+      "autopilot": true,
       "outcome": "unreachable",
       "error": "get-credentials rc=1: …"
     }
@@ -994,7 +996,7 @@ The manifest is the new machine boundary between collector and harness, so it ge
 }
 ```
 
-Rules: every enumerated cluster appears with an `outcome`; a gate failure (zero-byte or
+Rules: every enumerated cluster appears with an `outcome` and an `autopilot` flag; a gate failure (zero-byte or
 truncated dump) is `outcome: "gate-failed"`, never a shorter candidate list; `excerpt` is cut
 from the dump under the same credential-projection rules the SOPs mandate, and the harness
 redactor remains the backstop. `finish` ingests the manifest when present: it cross-checks
@@ -1008,6 +1010,18 @@ The two regimes coexist in one run by cluster, never by check: a `collected` clu
 are all manifest-checked, so a fabricated extra check cannot hide behind a real manual
 fallback. Streams without a collector keep today's attestation semantics unchanged; the
 cross-check activates per stream as collectors ship.
+
+`autopilot` rides on every shape, including the two error ones, because the mode is a property
+of the cluster rather than of whether this run managed to read inside it. Six SOPs branch on
+the mode — it sets `checks_not_applicable`, it moves severities, and `fleet_consistency_drift`
+makes it part of the cohort key — yet `enumerate_clusters` computed it and the manifest threw
+it away, leaving each stream to find the mode for itself. Measured over one run of each of the
+eight streams, most cope cheaply: `compliance-audit` infers it from the `checks_not_applicable`
+the collector pre-fills, and four others fold it into a fleet-level `clusters list` they issue
+for other fields anyway. `obtainability-audit` is the one that goes wrong. It read the fleet
+once, transcribed the sixteen booleans into a Python literal, and re-typed that literal in
+three separate blocks — a hand-copied fleet map that is silently wrong the moment a cluster is
+added, renamed, or converted, and whose cost is paid in output tokens on every run.
 
 ## 7. SOP and prompt changes
 

@@ -748,7 +748,7 @@ class TestDumpStateGate(unittest.TestCase):
 class TestCollectCluster(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def collect(self, dump_items, cred_rc=0, dump_rc=0, checks=None):
+    def collect(self, dump_items, cred_rc=0, dump_rc=0, checks=None, cluster=None):
         calls = []
 
         def run(argv, **kwargs):
@@ -763,7 +763,8 @@ class TestCollectCluster(unittest.TestCase):
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
                     patch.object(collect, "SCRATCH_DIR", tmp):
                 result = collect.collect_cluster(
-                    self.CLUSTER, "obtainability-audit", checks or collect.OBTAINABILITY_CHECKS, run=run
+                    cluster or self.CLUSTER, "obtainability-audit",
+                    checks or collect.OBTAINABILITY_CHECKS, run=run
                 )
         return result, calls
 
@@ -823,6 +824,41 @@ class TestCollectCluster(unittest.TestCase):
         result, _ = self.collect([deployment("api")], dump_rc=1)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
+
+    def test_every_outcome_publishes_the_mode(self):
+        # Six SOPs branch on Autopilot and one keys its cohorts on it, so a
+        # manifest that withholds the mode sends the model back to
+        # `clusters list` for a fact the collector already computed. It rides
+        # on every shape, not just `collected`: a mode is a property of the
+        # cluster, not of whether this run managed to read inside it.
+        for kwargs, outcome in (
+            ({}, "collected"),
+            ({"cred_rc": 1}, "unreachable"),
+            ({"dump_rc": 1}, "gate-failed"),
+        ):
+            for mode in (True, False):
+                with self.subTest(outcome=outcome, autopilot=mode):
+                    result, _ = self.collect(
+                        [deployment("api")],
+                        cluster={**self.CLUSTER, "autopilot": mode},
+                        **kwargs,
+                    )
+                    self.assertEqual(result["outcome"], outcome)
+                    self.assertIs(result["autopilot"], mode)
+
+    def test_a_cluster_that_never_ran_still_publishes_the_mode(self):
+        entry = collect.not_running_entry(
+            {"name": "dr-west", "location": "us-west1", "status": "DEGRADED",
+             "autopilot": {"enabled": True}},
+            "acme",
+        )
+        self.assertEqual(entry["outcome"], "unreachable")
+        self.assertIs(entry["autopilot"], True)
+        # Absent `autopilot` in the gcloud payload means Standard, not unknown.
+        self.assertIs(
+            collect.not_running_entry({"name": "c", "status": "STOPPING"}, "acme")["autopilot"],
+            False,
+        )
 
     def test_autopilot_downgrades_no_requests_but_not_no_memory_limit(self):
         cluster = {**self.CLUSTER, "autopilot": True}
