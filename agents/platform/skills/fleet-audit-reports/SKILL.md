@@ -43,6 +43,7 @@ per call:
 | `show <stream>`                     | one run's envelope **without** `document`                 |
 | `findings <stream>`                 | finding id, severity, title, cluster, check — filterable  |
 | `finding <stream> <id>`             | one finding in full; the only call that returns prose     |
+| `checks <stream>`                   | the command behind each check that ran, plus exclusions   |
 | `diff <stream> [--from S] [--to S]` | ids and titles added and resolved between two runs        |
 | `runs <stream>`                     | the stamps the ring holds, so a `diff` can name real ones |
 
@@ -50,12 +51,14 @@ per call:
   `error` says why — absent store, absent stream, absent stamp, a file that would not parse. Every
   answer carries an `error` key, null on success.
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run.
-- `--severity`, `--cluster` and `--check` on `findings` are exact matches, case-insensitive.
-- `findings` and `diff` cap at 100 rows and report `matched`, `returned` and `truncated`. Findings
-  sort severity-first, so a cap only ever drops the least severe.
+- `--severity`, `--cluster` and `--check` on `findings`, and `--cluster` and `--check` on `checks`,
+  are exact matches, case-insensitive.
+- `findings`, `checks` and `diff` cap at 100 rows and report `matched`, `returned` and `truncated`.
+  Findings sort severity-first, so a cap only ever drops the least severe; `checks` keeps the
+  document's order, so a capped answer lines up with the issue's table rather than a re-sort of it.
 - `--root` overrides the store root. In the pod, leave it alone.
 
-## The three questions this gets asked
+## The four questions this gets asked
 
 **"What did last night's compliance audit find?"**
 
@@ -90,6 +93,18 @@ span, list the ring first and name two stamps:
 
 The evidence command and excerpt, the impact, and all three `recommendation` fields. This is the
 expensive call, so make it for the finding that was asked about and not for the list.
+
+**"The issue says the commands were omitted for space — what were they?"**
+
+```bash
+./skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
+```
+
+The ledger's evidence table is last in line for the body budget, so on a finding-heavy run it is
+dropped whole and a notice points the reader here. `checks` is what that notice promises: one row
+per check the run says it performed, with the command that performed it, plus every
+`checks_not_applicable` exclusion and its reason. Filter by cluster or check rather than asking for
+all of them — a 16-cluster stream carries upwards of 150.
 
 Fleet-wide, `streams` is the whole answer: one row per stream with its liveness, so "when did each
 last run" and "is anything stuck" come back in one call. Coverage questions read `show`'s

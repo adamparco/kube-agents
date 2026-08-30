@@ -887,19 +887,28 @@ that answers "how many criticals are open on compliance?" by reading `latest.jso
 thousands of tokens to produce a number. So the reader skill's real content is a query script,
 `report_query.py`, with subcommands that each return a small JSON document:
 
-| Subcommand                      | Answers                                                                    |
-| ------------------------------- | -------------------------------------------------------------------------- |
-| `streams`                       | one line per stream: last run, status, counts, liveness (§4.5)             |
-| `show <stream>`                 | one run's envelope **without** `document` — status, delta, durations, gaps |
-| `findings <stream>`             | finding titles/severities/clusters, filterable, never full bodies          |
-| `finding <stream> <id>`         | one finding in full — the only path that returns prose                     |
-| `diff <stream> [--from] [--to]` | ids and titles added/resolved between two runs in the ring                 |
-| `runs <stream>`                 | what the ring holds, so a diff can name real stamps                        |
+| Subcommand                      | Answers                                                                     |
+| ------------------------------- | --------------------------------------------------------------------------- |
+| `streams`                       | one line per stream: last run, status, counts, liveness (§4.5)              |
+| `show <stream>`                 | one run's envelope **without** `document` — status, delta, durations, gaps  |
+| `findings <stream>`             | finding titles/severities/clusters, filterable, never full bodies           |
+| `finding <stream> <id>`         | one finding in full — the only path that returns prose                      |
+| `checks <stream>`               | the command behind each check the run performed, and the checks it excluded |
+| `diff <stream> [--from] [--to]` | ids and titles added/resolved between two runs in the ring                  |
+| `runs <stream>`                 | what the ring holds, so a diff can name real stamps                         |
 
 The discipline is one rule: **every subcommand's output is bounded and the full document is
 opt-in.** `show` omits `document` precisely because including it would make the cheap call the
 expensive one, and `finding` exists so the expensive call is still available at the granularity
 someone actually asked for.
+
+`checks` reads `document.scope` for the same reason, against a promise the ledger has already
+published. The issue body's evidence table is last in line for the body budget, so a finding-heavy
+run drops it whole and prints a notice saying the commands survive in the stored report and to ask
+the agent for that report to re-run any of them. Without a subcommand that reaches
+`scope.clusters[].checks_run[]`, the only way to keep that promise was to open the envelope with a
+file tool — which is the one thing this skill's red lines forbid, so the notice pointed at a door
+the reader was told not to use.
 
 This is the same projection idea §4.6 uses for the view, and the two deliberately share
 `report_status.py`'s reading helpers rather than growing a second parser of the same files. The

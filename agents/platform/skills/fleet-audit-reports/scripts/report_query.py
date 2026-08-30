@@ -1,12 +1,12 @@
 #!/opt/hermes/.venv/bin/python3
 """report_query.py — bounded answers out of the fleet-audit report store.
 
-Six subcommands, one small JSON document each, so that a question about a past
-run costs a number instead of a findings document. Design of record:
+Seven subcommands, one small JSON document each, so that a question about a
+past run costs a number instead of a findings document. Design of record:
 docs/designs/fleet-audit-collectors-and-status.md §4.9, over the store §4.8
 defines.
 
-One rule holds all six together: **every output is bounded and the full
+One rule holds all seven together: **every output is bounded and the full
 document is opt-in.** `latest.json` embeds the whole findings document,
 deliberately un-clipped, so it can run past the 60k characters the ledger body
 is held to — times eight streams, times a fourteen-run ring. An agent that
@@ -14,7 +14,8 @@ answers "how many criticals are open on compliance?" by reading that file
 spends tens of thousands of tokens on an integer. So `show` omits `document`,
 `findings` returns identity columns and no prose, and `finding` is the one path
 that returns a finding whole: the expensive read, at the granularity somebody
-actually asked for.
+actually asked for. `checks` is the same bargain over `document.scope`, for the
+one part of a run the ledger issue is expected to be missing.
 
 The files are read through `report_status.py`'s helpers rather than parsed a
 second time here. Two parsers of one envelope is one more thing to keep in step
@@ -185,6 +186,21 @@ def _findings_of(audit_id: str, name: str, envelope: dict) -> list[dict]:
     return findings
 
 
+def _scope_clusters(audit_id: str, name: str, envelope: dict) -> list[dict]:
+    document = envelope.get("document")
+    if not isinstance(document, dict):
+        raise QueryError(f"{audit_id}/{name} carries no findings document")
+    scope = document.get("scope")
+    if not isinstance(scope, dict):
+        raise QueryError(f"{audit_id}/{name}: document.scope is not an object")
+    clusters = scope.get("clusters")
+    if not isinstance(clusters, list):
+        raise QueryError(f"{audit_id}/{name}: document.scope.clusters is not a list")
+    if not all(isinstance(entry, dict) for entry in clusters):
+        raise QueryError(f"{audit_id}/{name}: document.scope.clusters holds a non-object entry")
+    return clusters
+
+
 def _severity_key(finding: dict) -> tuple[int, str]:
     severity = str(finding.get("severity", "")).strip().lower()
     return (SEVERITY_ORDER.get(severity, len(SEVERITY_ORDER)), str(finding.get("id", "")))
@@ -347,6 +363,76 @@ def cmd_finding(args: argparse.Namespace) -> dict:
     )
 
 
+def cmd_checks(args: argparse.Namespace) -> dict:
+    """The command behind every check one run says it performed.
+
+    The ledger publishes these itself, in a collapsed table that is last in line
+    for the body budget — so on a finding-heavy run it is dropped whole and
+    replaced by a notice saying the commands are kept in the stored report and
+    to ask the agent for that report to re-run any of them. This subcommand is
+    what makes that sentence true: the alternative on offer was opening a
+    138 KB envelope with a file tool, which the skill forbids for good reason.
+
+    Rows come back in the document's own order, so a truncated answer lines up
+    with the published table rather than a re-sort of it. `--cluster` and
+    `--check` narrow before `--limit` bites.
+
+    `checks_not_applicable` comes back alongside, because the notice counts
+    those too and they are the claims most worth a second reader: an excluded
+    check leaves the coverage denominator, which is the one way a partial run
+    can read as complete.
+    """
+    root = _root_of(args)
+    name, envelope = load_envelope(root, args.stream, args.run)
+    clusters = _scope_clusters(args.stream, name, envelope)
+    ran: list[dict] = []
+    excluded: list[dict] = []
+    for cluster in clusters:
+        where = cluster.get("name")
+        for entry in cluster.get("checks_run") or []:
+            if isinstance(entry, dict):
+                ran.append(
+                    {
+                        "cluster": where,
+                        "check": entry.get("check"),
+                        "command": entry.get("command"),
+                    }
+                )
+        for entry in cluster.get("checks_not_applicable") or []:
+            if isinstance(entry, dict):
+                excluded.append(
+                    {
+                        "cluster": where,
+                        "check": entry.get("check"),
+                        "reason": entry.get("reason"),
+                    }
+                )
+    matched = [row for row in ran if _matches(row, None, args.cluster, args.check)]
+    na_matched = [row for row in excluded if _matches(row, None, args.cluster, args.check)]
+    shown = matched[: args.limit]
+    na_shown = na_matched[: args.limit]
+    return {
+        "root": root,
+        "audit_id": args.stream,
+        "run": name,
+        "finished_at": envelope.get("finished_at"),
+        "status": envelope.get("status"),
+        "filters": {"cluster": args.cluster, "check": args.check},
+        "scope_entries": len(clusters),
+        "total": len(ran),
+        "matched": len(matched),
+        "returned": len(shown),
+        "truncated": len(shown) < len(matched),
+        "checks": shown,
+        "not_applicable_total": len(excluded),
+        "not_applicable_matched": len(na_matched),
+        "not_applicable_returned": len(na_shown),
+        "not_applicable_truncated": len(na_shown) < len(na_matched),
+        "not_applicable": na_shown,
+        "error": None,
+    }
+
+
 def cmd_diff(args: argparse.Namespace) -> dict:
     """What two ring entries disagree about: ids and titles added and resolved.
 
@@ -477,6 +563,17 @@ def build_parser() -> argparse.ArgumentParser:
     finding.add_argument("stream")
     finding.add_argument("id")
     finding.set_defaults(handler=cmd_finding)
+
+    checks = subcommands.add_parser(
+        "checks",
+        parents=[shared, run_flag],
+        help="the command behind each check a run ran, and the checks it excluded",
+    )
+    checks.add_argument("stream")
+    checks.add_argument("--cluster")
+    checks.add_argument("--check")
+    checks.add_argument("--limit", type=_positive, default=DEFAULT_LIMIT)
+    checks.set_defaults(handler=cmd_checks)
 
     diff = subcommands.add_parser(
         "diff", parents=[shared], help="what changed between two runs in the ring"

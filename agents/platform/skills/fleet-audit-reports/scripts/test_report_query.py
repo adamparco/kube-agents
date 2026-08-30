@@ -79,6 +79,15 @@ def finding(fid, severity="critical", cluster="prod-us-east", check="netpol-miss
     }
 
 
+def scope_document(audit_id, findings, clusters):
+    """A document whose scope carries the check commands the ledger publishes."""
+    return {
+        "audit": audit_id,
+        "scope": {"clusters": clusters, "skipped": []},
+        "findings": findings,
+    }
+
+
 def envelope(audit_id, finished_at, findings, **overrides):
     """One run's envelope, the keys `audit_report.report_envelope` writes."""
     body = {
@@ -531,6 +540,156 @@ class TestRuns(StoreTestCase):
         self.assertEqual(self.refused("runs", AUDIT)["streams"], [])
 
 
+class TestChecks(StoreTestCase):
+    """The ledger drops its evidence table when the body runs out of room and
+    tells the reader to ask the agent for the stored report instead. This is the
+    path that sentence promises."""
+
+    CLUSTERS = [
+        {
+            "name": "prod-us-east",
+            "location": "us-east4",
+            "project": "acme-prod",
+            "checks_run": [
+                {
+                    "check": "netpol-missing",
+                    "command": "kubectl --context prod-us-east get netpol -A -o json",
+                },
+                {
+                    "check": "wildcard-rbac",
+                    "command": "kubectl --context prod-us-east get clusterrole -o json",
+                },
+            ],
+        },
+        {
+            "name": "prod-autopilot",
+            "location": "us-central1",
+            "project": "acme-prod",
+            "checks_run": [
+                {
+                    "check": "netpol-missing",
+                    "command": "kubectl --context prod-autopilot get netpol -A -o json",
+                },
+            ],
+            "checks_not_applicable": [
+                {
+                    "check": "secure-boot",
+                    "reason": "Autopilot owns the node pool, so there is none to read",
+                },
+            ],
+        },
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.findings = [finding("a"), finding("b", severity="minor")]
+        self.write_run(
+            AUDIT,
+            "20260826T063100.000000Z",
+            self.findings,
+            document=scope_document(AUDIT, self.findings, self.CLUSTERS),
+        )
+
+    def test_every_command_comes_back_in_the_order_the_table_published_them(self):
+        payload = self.ok("checks", AUDIT)
+        self.assertEqual(payload["scope_entries"], 2)
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual(payload["matched"], 3)
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(
+            [(row["cluster"], row["check"]) for row in payload["checks"]],
+            [
+                ("prod-us-east", "netpol-missing"),
+                ("prod-us-east", "wildcard-rbac"),
+                ("prod-autopilot", "netpol-missing"),
+            ],
+        )
+        self.assertEqual(
+            payload["checks"][0]["command"],
+            "kubectl --context prod-us-east get netpol -A -o json",
+        )
+
+    def test_the_filters_are_exact_and_case_insensitive(self):
+        self.assertEqual(self.ok("checks", AUDIT, "--cluster", "PROD-US-EAST")["matched"], 2)
+        self.assertEqual(self.ok("checks", AUDIT, "--check", "Netpol-Missing")["matched"], 2)
+        both = self.ok("checks", AUDIT, "--cluster", "prod-autopilot", "--check", "netpol-missing")
+        self.assertEqual(both["matched"], 1)
+        self.assertEqual(both["filters"], {"cluster": "prod-autopilot", "check": "netpol-missing"})
+        # A near miss is zero rows and not a substring match.
+        self.assertEqual(self.ok("checks", AUDIT, "--cluster", "prod")["matched"], 0)
+
+    def test_the_list_is_bounded_and_says_when_it_bit(self):
+        payload = self.ok("checks", AUDIT, "--limit", "2")
+        self.assertEqual(payload["returned"], 2)
+        self.assertEqual(payload["matched"], 3)
+        self.assertEqual(payload["total"], 3)
+        self.assertTrue(payload["truncated"])
+
+    def test_the_exclusions_come_back_too(self):
+        """The notice counts them, and an excluded check is the one claim that
+        can make a partial run read as complete."""
+        payload = self.ok("checks", AUDIT)
+        self.assertEqual(payload["not_applicable_total"], 1)
+        self.assertEqual(payload["not_applicable_returned"], 1)
+        self.assertFalse(payload["not_applicable_truncated"])
+        self.assertEqual(
+            payload["not_applicable"],
+            [
+                {
+                    "cluster": "prod-autopilot",
+                    "check": "secure-boot",
+                    "reason": "Autopilot owns the node pool, so there is none to read",
+                }
+            ],
+        )
+        # The filters narrow the exclusions with the commands, not around them.
+        self.assertEqual(
+            self.ok("checks", AUDIT, "--cluster", "prod-us-east")["not_applicable_matched"], 0
+        )
+
+    def test_a_named_stamp_reads_that_run(self):
+        stamp = self.write_run(
+            AUDIT,
+            "20260825T063100.000000Z",
+            self.findings,
+            latest=False,
+            document=scope_document(AUDIT, self.findings, self.CLUSTERS[:1]),
+        )
+        payload = self.ok("checks", AUDIT, "--run", stamp)
+        self.assertEqual(payload["run"], stamp)
+        self.assertEqual(payload["total"], 2)
+
+    def test_a_scope_that_carries_no_commands_is_zero_rows_and_not_an_error(self):
+        """`envelope`'s default scope names its clusters and nothing else. A run
+        shaped that way has no evidence table to reproduce, which is an answer."""
+        self.write_run(OTHER, "20260826T063100.000000Z", [finding("a")])
+        payload = self.ok("checks", OTHER)
+        self.assertEqual(payload["scope_entries"], 2)
+        self.assertEqual(payload["total"], 0)
+        self.assertEqual(payload["checks"], [])
+        self.assertEqual(payload["not_applicable_total"], 0)
+
+    def test_a_scope_that_is_not_a_scope_is_refused(self):
+        self.write_run(
+            OTHER,
+            "20260826T063100.000000Z",
+            [finding("a")],
+            document={"audit": OTHER, "scope": [], "findings": [finding("a")]},
+        )
+        self.assertIn("document.scope is not an object", self.refused("checks", OTHER)["error"])
+
+    def test_a_clusters_list_that_is_not_a_list_is_refused(self):
+        self.write_run(
+            OTHER,
+            "20260826T063100.000000Z",
+            [finding("a")],
+            document={"audit": OTHER, "scope": {"clusters": {}}, "findings": []},
+        )
+        self.assertIn(
+            "document.scope.clusters is not a list", self.refused("checks", OTHER)["error"]
+        )
+
+
 class TestBoundedOutput(StoreTestCase):
     """The rule §4.9 exists for: only `finding` returns prose."""
 
@@ -541,6 +700,7 @@ class TestBoundedOutput(StoreTestCase):
             ("streams",),
             ("show", AUDIT),
             ("findings", AUDIT),
+            ("checks", AUDIT),
             ("diff", AUDIT),
             ("runs", AUDIT),
         ):
