@@ -1268,7 +1268,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
 
-    return {
+    entry = {
         "name": f"project/{project}",
         "project": project,
         "location": "global",
@@ -1280,6 +1280,27 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else []),
         "candidates": candidates,
     }
+    if not all_reachable:
+        # §6 already reports the missing check -- `orphan-lb` drops out of
+        # `commands`, so the roster half of `coverage_gaps` names it whatever
+        # this entry says in prose. What it cannot supply is why, and a gap
+        # reading "orphan-lb did not run" sends a reader looking for a broken
+        # gcloud read that is not there: the three compute reads all succeeded
+        # and the check was withheld on purpose. §3.6 needs every cluster in
+        # the project to say which Services exist, because a forwarding rule is
+        # only orphaned if *no* cluster claims it -- so one unreadable cluster
+        # would turn every load balancer it serves into a false positive. The
+        # unreadable clusters are their own manifest entries, carrying the
+        # stderr that explains each one.
+        entry["limitations"] = (
+            "orphan-lb was not evaluated for this project: §3.6 compares "
+            "forwarding rules against the Service names of every cluster in "
+            "the project, and at least one of them could not be read, so a "
+            "rule its Services reference would read as orphaned. See the "
+            "unreachable cluster entries in this manifest for the reason each "
+            "one failed."
+        )
+    return entry
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:

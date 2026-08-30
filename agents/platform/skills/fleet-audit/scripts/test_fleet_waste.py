@@ -871,6 +871,23 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("gcloud compute disks list", target["error"])
         self.assertIn("no stderr", target["error"])
 
+    def test_withholding_orphan_lb_says_why_rather_than_just_dropping_it(self):
+        """§6's roster half names the missing check on its own, so the gap reads
+        "orphan-lb did not run" whatever this entry says. Without a reason that
+        sends a reader hunting a broken gcloud read: all three compute reads
+        succeeded here and the check was withheld deliberately."""
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=self.run_with(), now=NOW)
+        self.assertEqual(target["outcome"], "collected")
+        self.assertNotIn("orphan-lb", [c["check"] for c in target["commands"]])
+        self.assertIn("orphan-lb", target["limitations"])
+
+    def test_a_project_whose_clusters_all_read_carries_no_limitation(self):
+        """The other half of the pair. A limitation set unconditionally would
+        make every healthy run partial, which costs more than the silence did."""
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
+        self.assertIn("orphan-lb", [c["check"] for c in target["commands"]])
+        self.assertNotIn("limitations", target)
+
 
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
