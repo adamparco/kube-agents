@@ -3474,6 +3474,57 @@ def coverage_issue_title(audit_id: str, gaps: list[str]) -> str:
 # streams.
 COVERAGE_TITLE_RE = re.compile(r"— coverage incomplete \(\d+ gaps?, 0 findings\)$")
 
+SILENT_MARKER = "[SILENT]"
+
+
+def chat_summary(audit_id: str, payload: dict, findings: list[dict]) -> str:
+    """The one line a scheduled run puts in the home channel.
+
+    Rendered here for the reason `silent_ok` is computed here. Every SOP has
+    asked for "one line: counts by severity, new vs. resolved, and the
+    `issue_url`" since the first stream shipped, and on 2026-08-30 a scheduled
+    run answered it with sixteen hundred characters — its own exit codes, a
+    markdown heading, and every finding in the ledger restated underneath a
+    link to the ledger. The numbers were all in this payload. Asking the model
+    to reassemble them into a sentence was asking it to reproduce a
+    computation, and what came back was a second copy of the issue.
+
+    The delta is the parenthesis, and it is what an operator reads: a stream
+    that found the same eleven things it found last week says `(no change)`
+    where one that fixed two says `(2 resolved)`.
+    """
+    if payload.get("silent_ok"):
+        return SILENT_MARKER
+    gaps = len(payload.get("coverage_gaps") or [])
+    if findings:
+        counts = severity_counts(findings)
+        state = (
+            f"{counts['critical']} critical, {counts['major']} major, "
+            f"{counts['minor']} minor"
+        )
+    elif gaps:
+        # Not "clean": a gap is why this run found nothing on some target, and
+        # it is why the ledger is still open. Read `coverage_gaps` rather than
+        # `partial` — the two are set from each other one line apart, and one
+        # source of truth per sentence is what keeps them from drifting.
+        state = "nothing found, coverage incomplete"
+    else:
+        state = "clean, ledger closed"
+    delta = [
+        f"{count} {one if count == 1 else many}"
+        for count, one, many in (
+            (payload.get("new") or 0, "new", "new"),
+            (payload.get("resolved") or 0, "resolved", "resolved"),
+            (len(payload.get("prs_opened") or []), "PR opened", "PRs opened"),
+            (len(payload.get("prs_closed") or []), "PR closed", "PRs closed"),
+            (gaps, "gap", "gaps"),
+        )
+        if count
+    ]
+    line = f"{audit_name(audit_id)}: {state} ({', '.join(delta) or 'no change'})"
+    url = payload.get("issue_url")
+    return f"{line} — {url}" if url else line
+
 
 def delta_block(ids: list[str]) -> str:
     """The hidden, machine-read block that carries this run's finding ids.
@@ -7622,6 +7673,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             "publish_s": round(time.monotonic() - entry_mono, 1),
             "collect_s": collect_s,
         }
+        payload["chat_summary"] = chat_summary(audit_id, payload, findings)
         # `current_ids` is a claim about what a *live ledger body* renders, so
         # it may only be empty where a body this run wrote is empty. Two of the
         # three clean paths qualify: the ledger was closed, or a fresh coverage
@@ -7961,6 +8013,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "publish_s": round(time.monotonic() - entry_mono, 1),
                 "collect_s": collect_s,
     }
+    payload["chat_summary"] = chat_summary(audit_id, payload, findings)
     # The delta stored is the one *reported*, so a run that made no claim
     # stores no claim — and `current_ids` is what this body rendered, which is
     # what the next run's `new` is measured against.

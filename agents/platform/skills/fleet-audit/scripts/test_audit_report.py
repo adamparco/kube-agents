@@ -2592,6 +2592,10 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": (
+                    "Security & RBAC Posture Audit: 1 critical, 0 major, 0 minor "
+                    "(1 new) — https://github.com/acme/fleet/issues/7"
+                ),
             },
         )
 
@@ -2646,6 +2650,10 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": (
+                    "Security & RBAC Posture Audit: 2 critical, 0 major, 0 minor "
+                    "(1 new, 1 resolved) — https://github.com/acme/fleet/issues/42"
+                ),
             },
         )
 
@@ -3010,6 +3018,10 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": (
+                    "Security & RBAC Posture Audit: clean, ledger closed "
+                    "(2 resolved) — https://github.com/acme/fleet/issues/42"
+                ),
             },
         )
 
@@ -3041,6 +3053,7 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": "[SILENT]",
             },
         )
 
@@ -11521,6 +11534,163 @@ class TestSilentVerdict(HarnessTestCase):
                         or out["prs_closed"]
                     ),
                 )
+
+
+class TestChatSummary(HarnessTestCase):
+    """`chat_summary` is the whole message, so `finish` renders it.
+
+    The SOPs asked for "one line: counts by severity, new vs. resolved, and the
+    `issue_url`" and got sixteen hundred characters on 2026-08-30 — the run's
+    own exit codes, then every finding in the ledger restated under a link to
+    the ledger. Prose was not holding the line, and every number it asked the
+    model to reassemble was already in the payload.
+    """
+
+    def finish_json(self, doc, **replies):
+        self.seed_store(doc)
+        self.harness.replies = {"issue list": self.issue_list(), **replies}
+        self.run_finish(doc)
+        return self.stdout_json()
+
+    def test_a_silent_run_summarises_to_the_marker_alone(self):
+        out = self.finish_json(make_doc(findings=[]))
+        self.assertTrue(out["silent_ok"])
+        self.assertEqual(out["chat_summary"], "[SILENT]")
+
+    def test_the_marker_and_the_flag_never_disagree(self):
+        """Copying the field verbatim has to be the same as obeying the flag."""
+        for findings in ([], [make_finding(fid="a")]):
+            with self.subTest(findings=len(findings)):
+                out = self.finish_json(make_doc(findings=findings))
+                self.assertEqual(
+                    out["chat_summary"] == "[SILENT]", bool(out["silent_ok"])
+                )
+
+    def test_a_reporting_run_is_one_line_carrying_the_ledger_url(self):
+        self.seed_store(make_doc(findings=[]))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(make_doc(findings=[make_finding(fid="a")]))
+        out = self.stdout_json()
+        summary = out["chat_summary"]
+        self.assertNotIn("\n", summary)
+        self.assertIn(out["issue_url"], summary)
+        self.assertIn("1 new", summary)
+
+    def test_the_summary_never_restates_the_findings(self):
+        """The link is the report; the line is the notification."""
+        self.seed_store(make_doc(findings=[]))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(
+            make_doc(
+                findings=[
+                    make_finding(fid="a", title="Privileged container in kube-system"),
+                    make_finding(fid="b", title="Public control plane endpoint"),
+                ]
+            )
+        )
+        summary = self.stdout_json()["chat_summary"]
+        self.assertNotIn("Privileged container", summary)
+        self.assertNotIn("Public control plane", summary)
+        self.assertLess(len(summary), 200)
+
+    def test_severity_counts_lead_and_the_delta_follows(self):
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 2,
+                "resolved": 1,
+                "prs_opened": ["https://example.invalid/pull/1"],
+                "prs_closed": [],
+                "coverage_gaps": [],
+                "issue_url": "https://example.invalid/issues/7",
+            },
+            [
+                make_finding(fid="a", severity="critical"),
+                make_finding(fid="b", severity="major"),
+                make_finding(fid="c", severity="major"),
+            ],
+        )
+        self.assertEqual(
+            summary,
+            f"{audit_report.audit_name('compliance-audit')}: "
+            "1 critical, 2 major, 0 minor (2 new, 1 resolved, 1 PR opened) "
+            "— https://example.invalid/issues/7",
+        )
+
+    def test_a_run_that_moved_nothing_but_speaks_says_so(self):
+        """`silent_ok: false` with an empty delta still owes a reason to read."""
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 0,
+                "prs_opened": [],
+                "prs_closed": [],
+                "coverage_gaps": [],
+                "issue_url": "https://example.invalid/issues/7",
+            },
+            [make_finding(fid="a", severity="minor")],
+        )
+        self.assertIn("(no change)", summary)
+
+    def test_a_gap_is_named_in_the_delta_and_counted_not_quoted(self):
+        summary = audit_report.chat_summary(
+            "fleet-consistency-drift",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 1,
+                "prs_opened": [],
+                "prs_closed": [],
+                "coverage_gaps": [
+                    "cluster kube-agents-host: nodes unreadable (RBAC)",
+                    "cluster drift-peer-std-2: skipped",
+                ],
+                "issue_url": "https://example.invalid/issues/9",
+            },
+            [],
+        )
+        self.assertIn("nothing found, coverage incomplete", summary)
+        self.assertIn("2 gaps", summary)
+        self.assertNotIn("RBAC", summary)
+
+    def test_a_closed_ledger_says_so_rather_than_counting_to_zero(self):
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 4,
+                "prs_opened": [],
+                "prs_closed": ["https://example.invalid/pull/2"],
+                "coverage_gaps": [],
+                "issue_url": "https://example.invalid/issues/7",
+            },
+            [],
+        )
+        self.assertIn("clean, ledger closed", summary)
+        self.assertIn("4 resolved", summary)
+        self.assertIn("1 PR closed", summary)
+
+    def test_a_stream_with_no_ledger_still_renders_a_line(self):
+        """`issue_url` is `None` on a clean stream that never had an issue."""
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 2,
+                "prs_opened": [],
+                "prs_closed": [],
+                "coverage_gaps": [],
+                "issue_url": None,
+            },
+            [],
+        )
+        self.assertNotIn("None", summary)
+        self.assertIn("2 resolved", summary)
 
 
 class TestDispatchAndHandover(unittest.TestCase):

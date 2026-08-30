@@ -309,7 +309,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-a
   --manifest-file /opt/data/scratch/manifest_compliance-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
-#     "silent_ok":true,"inspect_s":214.0,"publish_s":41.5}
+#     "silent_ok":true,"chat_summary":"...","inspect_s":214.0,"publish_s":41.5}
 ```
 
 `--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §2's collector never produced one — every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether; a cluster the manifest marked `"unreachable"` or `"gate-failed"` is left to this SOP's ordinary attestation rules.
@@ -322,10 +322,10 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-a
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling the conditions from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → your final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
+- On a **scheduled** run, your entire final response is `chat_summary`, copied verbatim from the JSON with nothing before it and nothing after it. On `silent_ok: true` that string is exactly `[SILENT]`, so obeying the flag and copying the field are the same act; on anything else it is the one line, already carrying the counts, the delta, and `issue_url`.
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
 
-What to report in each case:
+What to say when a person dispatched the run — a scheduled one sends `chat_summary` and nothing else:
 
 - `silent_ok: true` → `[SILENT]` on a scheduled run. No preamble, no "no issues found"; a clean fleet is a silent fleet. On `CLEAN` the ledger issue closed as completed; on `UPDATED` nothing moved and the ledger already says everything you would. Dispatched on demand, say so in one line and give the issue URL.
 - `status == "CLEAN"` with `resolved: > 0` → the fleet was carrying findings and is not any more. Report it: the issue URL, and how many findings closed with it. This is the one piece of good news the audit produces, and swallowing it while reporting every failure teaches the operator that the audit only ever brings problems.

@@ -198,18 +198,19 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> -
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with twelve fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
-`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and three timing fields: `inspect_s`
+JSON line with thirteen fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
+`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled
+run replies; see [The clean run](#the-clean-run)), and three timing fields: `inspect_s`
 (wall-clock from `start` to `finish`, i.e. the inspection phase; `null` when `start`'s
 timestamp file is missing), `publish_s` (time `finish` itself spent publishing), and `collect_s`
 (the collector's own wall-clock; `null` on a run that passed no collector manifest). The timing
 fields are telemetry — read them for the report if useful, never branch on them:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":214.0,"publish_s":41.5,"collect_s":18.2}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: 2 critical, 4 major, 1 minor (7 new, 1 PR opened) — …","inspect_s":214.0,"publish_s":41.5,"collect_s":18.2}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":180.2,"publish_s":38.9,"collect_s":16.7}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: 0 critical, 5 major, 2 minor (2 new, 3 resolved, 1 PR closed) — …","inspect_s":180.2,"publish_s":38.9,"collect_s":16.7}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"inspect_s":95.1,"publish_s":12.3,"collect_s":null}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: clean, ledger closed (5 resolved, 1 PR closed) — …","inspect_s":95.1,"publish_s":12.3,"collect_s":null}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -258,8 +259,10 @@ did read. Over a partial run the harness:
 Two gaps are wider than one cluster and hold everything back: a waived collector manifest, and a
 gap that belongs to no target at all — a whole kind of object nobody enumerated.
 
-A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
-and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
+A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it, and counts the gaps
+in the `chat_summary` line it hands you to send. The gaps themselves are named in the ledger, which
+is what the link is for; name them in your answer too when a person asked for the run. See
+[The clean run](#the-clean-run) for the full rule.
 
 ## The findings document
 
@@ -745,12 +748,23 @@ ledger URL never reached the operator who had asked for it.
 
 Two rules follow, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
-  report, and every report carries `issue_url` in full.
+- On a **scheduled** run, your entire final response is `chat_summary` — the string `finish`
+  returned, copied out of the JSON with nothing before it and nothing after it. On `silent_ok: true`
+  that string is exactly `[SILENT]`, so obeying the flag and copying the field are the same act. On
+  anything else it is the one line, already carrying the severity counts, the delta, and `issue_url`.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
+
+**`chat_summary` is copied, not composed.** A scheduled run's answer goes straight to the home
+channel, so the response _is_ the message — there is no operator on the other end to skim past a
+preamble. The line is rendered from this payload for the reason `silent_ok` is computed from it: the
+instruction "reply with one line: counts by severity, new vs. resolved, and the `issue_url`" was
+prose, and on 2026-08-30 a scheduled run answered it with sixteen hundred characters — its own exit
+codes, a markdown heading, and every finding in the ledger restated underneath a link to the ledger.
+The numbers were all in the JSON. Reassembling them was the step that went wrong, so the harness
+does it. Send the string; the link is the report.
 
 Two clean runs come back `silent_ok: false`, and both matter:
 

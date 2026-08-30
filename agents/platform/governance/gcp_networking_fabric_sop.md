@@ -211,12 +211,12 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networki
   --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
-#     "silent_ok":true,"inspect_s":214.0,"publish_s":41.5}
+#     "silent_ok":true,"chat_summary":"...","inspect_s":214.0,"publish_s":41.5}
 ```
 
 `--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §2's collector never produced one, pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` target the document leaves out of `scope.clusters` altogether.
 
-- On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
+- On a **scheduled** run, your entire final response is `chat_summary`, copied verbatim from the JSON with nothing before it and nothing after it. On `silent_ok: true` that string is exactly `[SILENT]`, so obeying the flag and copying the field are the same act; on anything else it is the one line, already carrying the counts, the delta, and `issue_url`.
 - **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
 
