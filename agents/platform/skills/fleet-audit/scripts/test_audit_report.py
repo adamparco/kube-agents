@@ -9579,6 +9579,31 @@ class TestCheckCommands(unittest.TestCase):
         self.assertIn("netpol-missing", body)
         self.assertIn("prod-us-east", body)
 
+    def test_the_appendix_says_which_of_its_rows_a_shell_will_not_take(self):
+        """"Re-runnable" is unqualified, and one row shape is not.
+
+        `fleet_waste.py` records the Monitoring read as `GET <host>/<path>`
+        because the credential proxy refuses to hand out an access token, so
+        there is no shell line to record. Sixteen such rows shipped in the
+        cost stream's last run under a sentence promising every row could be
+        re-run; pasted into a shell they answer `command not found: GET`, and
+        a reader who tries concludes the finding is junk rather than the
+        rendering.
+        """
+        doc = self._with(
+            {
+                "check": "netpol-missing",
+                "command": (
+                    "GET monitoring.googleapis.com/v3/projects/acme/timeSeries "
+                    'filter=resource.labels.cluster_name="prod-1" '
+                    "metrics=kubernetes.io/container/cpu/core_usage_time window=168h"
+                ),
+            }
+        )
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("beginning with an HTTP verb", body)
+        self.assertIn("rather than pasting the row into a shell", body)
+
     def test_the_evidence_table_is_dropped_whole_or_not_at_all(self):
         """Half a table reads as a short one, and "we ran three checks" is a worse lie than silence."""
         findings = [

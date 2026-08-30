@@ -4762,7 +4762,10 @@ def _render_check_evidence(
         "",
         "One row per check that ran, with the command that ran it, as reported "
         "by the audit. The harness cannot confirm a command was issued — these "
-        "are re-runnable so that it does not have to be taken on trust.",
+        "are re-runnable so that it does not have to be taken on trust. A row "
+        "beginning with an HTTP verb is the exception: the collector issued "
+        "that request in-process against the API it names, so re-running it "
+        "means calling that API rather than pasting the row into a shell.",
         "",
         "| Cluster | Check | Command |",
         "| ------- | ----- | ------- |",
