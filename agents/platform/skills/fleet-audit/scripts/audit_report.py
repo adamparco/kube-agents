@@ -2412,6 +2412,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
         raise ValidationError(
             "scope.skipped: must be a list (use [] when nothing was skipped)"
         )
+    # Write the default back. A collector that skipped nothing may leave the
+    # key off, and every reader here copes -- but the document this returns is
+    # what the report store keeps, and `report_status` projects an absent list
+    # as `None` rather than 0 on purpose, so that "did not say" stays apart
+    # from "nothing". Omitting it makes a stream that skipped nothing read as
+    # one that does not report skips at all: of the eight live streams only
+    # `stockout-prevention` published a scope without the key, and it was the
+    # only one whose `skipped` came back `None` instead of 0.
+    scope["skipped"] = skipped
     skipped_names: set[str] = set()
     for i, entry in enumerate(skipped):
         if not isinstance(entry, dict):

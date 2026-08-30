@@ -3939,6 +3939,25 @@ class TestScopeLimitations(BaseTestCase):
         with self.assertRaises(audit_report.ValidationError):
             audit_report.validate_findings(doc, AUDIT)
 
+    def test_an_omitted_skipped_list_is_written_back_as_empty(self):
+        # Omitting the key is allowed, and the document that comes back is what
+        # the report store keeps. `report_status` projects an absent list as
+        # `None` and an empty one as 0, on purpose -- so a run that skipped
+        # nothing has to say so, or it reads as a run that does not report
+        # skips. Live, `stockout-prevention` was the one stream of eight whose
+        # published scope had no `skipped`, and the only one whose count came
+        # back `None`.
+        doc = make_doc(findings=[])
+        del doc["scope"]["skipped"]
+        out = audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(out["scope"]["skipped"], [])
+
+    def test_a_declared_skipped_list_survives_validation(self):
+        entries = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        doc = make_doc(findings=[], skipped=entries)
+        out = audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(out["scope"]["skipped"], entries)
+
 
 class TestFindingIdCharset(BaseTestCase):
     def test_usable_ids_are_accepted(self):
