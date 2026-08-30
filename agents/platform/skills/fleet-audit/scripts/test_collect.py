@@ -1552,10 +1552,22 @@ class TestPublicControlPlane(unittest.TestCase):
         self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
 
     def test_public_endpoint_with_unrestricted_cidr_is_flagged(self):
+        """`cidrBlocks` carries CidrBlock objects, so a string fixture proves nothing.
+
+        The GKE discovery document types this array as `CidrBlock`
+        (`{displayName, cidrBlock}`) and the API never emits bare strings. A
+        membership test for the string therefore could not match, and a cluster
+        that turned authorized networks on and then allowed the whole internet
+        -- the single configuration this branch exists to catch -- was reported
+        as restricted.
+        """
         ctx = context_of(
             cluster_describe={
                 "privateClusterConfig": {},
-                "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": ["0.0.0.0/0"]},
+                "masterAuthorizedNetworksConfig": {
+                    "enabled": True,
+                    "cidrBlocks": [{"displayName": "everywhere", "cidrBlock": "0.0.0.0/0"}],
+                },
             }
         )
         self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
@@ -1568,10 +1580,56 @@ class TestPublicControlPlane(unittest.TestCase):
         ctx = context_of(
             cluster_describe={
                 "privateClusterConfig": {},
-                "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": ["10.0.0.0/8"]},
+                "masterAuthorizedNetworksConfig": {
+                    "enabled": True,
+                    "cidrBlocks": [{"displayName": "corp", "cidrBlock": "10.0.0.0/8"}],
+                },
             }
         )
         self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+    def test_authorized_networks_on_the_ip_endpoints_surface_are_honoured(self):
+        """Setting both surfaces is invalid, so the newer one has to be read too.
+
+        `IPEndpointsConfig.authorizedNetworksConfig` is where a cluster on the
+        current API surface keeps this, and the discovery document says
+        specifying it alongside `Cluster.masterAuthorizedNetworksConfig` is
+        invalid. Reading only the legacy field reported every such cluster as
+        having no restriction at all -- a critical raised against a control
+        plane that is in fact closed.
+        """
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {},
+                "controlPlaneEndpointsConfig": {
+                    "ipEndpointsConfig": {
+                        "enablePublicEndpoint": True,
+                        "authorizedNetworksConfig": {
+                            "enabled": True,
+                            "cidrBlocks": [{"displayName": "corp", "cidrBlock": "10.0.0.0/8"}],
+                        },
+                    }
+                },
+            }
+        )
+        self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+    def test_an_unrestricted_cidr_on_the_ip_endpoints_surface_is_flagged(self):
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {},
+                "controlPlaneEndpointsConfig": {
+                    "ipEndpointsConfig": {
+                        "enablePublicEndpoint": True,
+                        "authorizedNetworksConfig": {
+                            "enabled": True,
+                            "cidrBlocks": [{"displayName": "everywhere", "cidrBlock": "0.0.0.0/0"}],
+                        },
+                    }
+                },
+            }
+        )
+        self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
 
 
 class TestPodSecurityGaps(unittest.TestCase):

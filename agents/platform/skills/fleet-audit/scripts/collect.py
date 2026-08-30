@@ -1107,6 +1107,27 @@ def check_legacy_metadata(context: dict) -> list[dict]:
     return hits
 
 
+def _has_restrictive_authorized_networks(describe: dict) -> bool:
+    """Whether some authorized-networks surface narrows control-plane access.
+
+    GKE carries the config on either `masterAuthorizedNetworksConfig` or
+    `controlPlaneEndpointsConfig.ipEndpointsConfig.authorizedNetworksConfig` and
+    rejects a cluster that sets both, so reading one field alone calls a cluster
+    restricted through the other wide open. `cidrBlocks` holds CidrBlock objects
+    (`{displayName, cidrBlock}`), never bare strings, so the allow-all entry is
+    matched on the field rather than by membership in the list.
+    """
+    ip_cfg = (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
+    for cfg in (describe.get("masterAuthorizedNetworksConfig"), ip_cfg.get("authorizedNetworksConfig")):
+        cfg = cfg or {}
+        if cfg.get("enabled") is not True:
+            continue
+        blocks = [b.get("cidrBlock") if isinstance(b, dict) else b for b in (cfg.get("cidrBlocks") or [])]
+        if "0.0.0.0/0" not in [str(b or "").strip() for b in blocks]:
+            return True
+    return False
+
+
 def check_public_control_plane(context: dict) -> list[dict]:
     describe = context.get("cluster_describe") or {}
     private_cfg = describe.get("privateClusterConfig") or {}
@@ -1116,9 +1137,7 @@ def check_public_control_plane(context: dict) -> list[dict]:
     reachable = private_cfg.get("enablePrivateEndpoint") is not True or public_endpoint_enabled is True
     if not reachable:
         return []
-    man_cfg = describe.get("masterAuthorizedNetworksConfig") or {}
-    unrestricted = man_cfg.get("enabled") is not True or "0.0.0.0/0" in (man_cfg.get("cidrBlocks") or [])
-    if not unrestricted:
+    if _has_restrictive_authorized_networks(describe):
         return []
     return [{"namespace": "", "object": _cluster_object(context), "excerpt": "public endpoint reachable with no restrictive authorized networks"}]
 

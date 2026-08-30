@@ -302,8 +302,15 @@ def norm_private_endpoint(c: dict) -> str:
 
 
 def norm_authorized_networks(c: dict) -> str:
-    manc = c.get("masterAuthorizedNetworksConfig") or {}
-    return "ON" if manc.get("enabled") and manc.get("cidrBlocks") else "OFF"
+    # GKE carries this on `masterAuthorizedNetworksConfig` or, for clusters on the
+    # newer surface, `controlPlaneEndpointsConfig.ipEndpointsConfig`, and rejects
+    # both at once -- so reading one field alone drifts the other's clusters OFF.
+    ip_cfg = (c.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
+    for manc in (c.get("masterAuthorizedNetworksConfig"), ip_cfg.get("authorizedNetworksConfig")):
+        manc = manc or {}
+        if manc.get("enabled") and manc.get("cidrBlocks"):
+            return "ON"
+    return "OFF"
 
 
 def _component_set(cfg: dict | None) -> str:
@@ -403,8 +410,8 @@ FACETS: tuple[Facet, ...] = (
     Facet("integrity-monitoring", ".nodePools[].config.shieldedInstanceConfig.enableIntegrityMonitoring", "minor", True, False, norm_integrity_monitoring, _flag_ne),
     Facet("network-policy", ".networkConfig.datapathProvider / .networkPolicy.enabled", "major", False, False, norm_network_policy, _flag_off_only),
     Facet("private-nodes", ".privateClusterConfig.enablePrivateNodes", "critical", False, False, norm_private_nodes, _flag_ne),
-    Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint", "major", False, False, norm_private_endpoint, _flag_ne),
-    Facet("authorized-networks", ".masterAuthorizedNetworksConfig.enabled/.cidrBlocks", "critical", False, False, norm_authorized_networks, _flag_ne),
+    Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint / .controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint", "major", False, False, norm_private_endpoint, _flag_ne),
+    Facet("authorized-networks", ".masterAuthorizedNetworksConfig / .controlPlaneEndpointsConfig.ipEndpointsConfig.authorizedNetworksConfig", "critical", False, False, norm_authorized_networks, _flag_ne),
     Facet("logging-components", ".loggingConfig.componentConfig.enableComponents", _logging_severity, False, False, norm_logging_components, _flag_not_superset),
     Facet("monitoring-components", ".monitoringConfig.componentConfig.enableComponents", "minor", False, False, norm_monitoring_components, _flag_not_superset),
     Facet("managed-prometheus", ".monitoringConfig.managedPrometheusConfig.enabled", "minor", False, False, norm_managed_prometheus, _flag_ne),

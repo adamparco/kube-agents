@@ -281,6 +281,28 @@ class FacetNormalizeTest(unittest.TestCase):
         c = cluster("c", masterAuthorizedNetworksConfig={"enabled": True, "cidrBlocks": []})
         self.assertEqual(fd.norm_authorized_networks(c), "OFF")
 
+    def test_authorized_networks_falls_back_to_newer_field(self):
+        """The two surfaces are mutually exclusive, so one read is not enough.
+
+        `norm_private_endpoint` above already falls back this way. Authorized
+        networks did not, so a cluster configured through
+        `ipEndpointsConfig.authorizedNetworksConfig` normalised to OFF and drifted
+        as a critical against peers holding the identical setting.
+        """
+        c = cluster(
+            "c",
+            masterAuthorizedNetworksConfig={},
+            controlPlaneEndpointsConfig={
+                "ipEndpointsConfig": {
+                    "authorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"displayName": "corp", "cidrBlock": "10.0.0.0/8"}],
+                    }
+                }
+            },
+        )
+        self.assertEqual(fd.norm_authorized_networks(c), "ON")
+
     def test_logging_components_superset_not_flagged(self):
         baseline = fd.norm_logging_components(cluster("c"))
         outlier = fd.norm_logging_components(cluster("c", loggingConfig={"componentConfig": {"enableComponents": ["SYSTEM_COMPONENTS", "WORKLOADS", "APISERVER"]}}))
