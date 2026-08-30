@@ -2725,7 +2725,9 @@ def coverage_gaps(data: dict) -> list[str]:
         roster = audit_target_checks(audit_id, name)
         applicable = [check for check in roster if check not in na]
         missing = [check for check in applicable if check not in ran]
-        if _limitation_restates_na(limitation, na, roster):
+        reasons = [str(entry.get("reason", "")) for entry in cluster.get("checks_not_applicable") or []
+                   if isinstance(entry, dict)]
+        if _limitation_restates_na(limitation, na, roster, reasons):
             limitation = ""
         if not limitation and not missing:
             continue
@@ -2755,7 +2757,7 @@ def coverage_gaps(data: dict) -> list[str]:
     return gaps
 
 
-def _limitation_restates_na(limitation: str, na: set, roster: tuple) -> bool:
+def _limitation_restates_na(limitation: str, na: set, roster: tuple, reasons: object = ()) -> bool:
     """Is this `limitations` string just the not-applicable reason said twice?
 
     A limitation normally means a check ran against less than it should have —
@@ -2772,12 +2774,24 @@ def _limitation_restates_na(limitation: str, na: set, roster: tuple) -> bool:
     because a subnet holding no allocations has no utilization to read — into
     41 gaps and a `partial: True` on a run that had refused nothing.
 
-    Conservative on both edges, because a false negative here hides an
-    uncovered check:
+    Two routes, both conservative, because a false negative here hides an
+    uncovered check.
 
-    - The limitation must name at least one check by slug. Prose naming no
-      check is the degradation case above, which no `checks_not_applicable`
-      entry can have dispositioned, so it stays a gap.
+    The first is the limitation being a `checks_not_applicable` reason from
+    this same target, word for word — the model copied the disposition into the
+    prose field, so the prose adds nothing the disposition has not already
+    said. Compared with case and whitespace flattened and trailing punctuation
+    dropped, since that is all a copy tends to change. This route exists
+    because the slug rule below misses exactly the clearest case of the
+    double-count: a reason written for a human names the surface it could not
+    read, not the slug of the check that would have read it. The same live
+    `gcp-networking-fabric-audit` fleet reported 0 gaps on one run and 41 on
+    the next with nothing changed but that wording.
+
+    The second is by slug:
+
+    - The limitation must name at least one check. Prose naming none and
+      matching no reason is the degradation case above, so it stays a gap.
     - Every slug it names must be one this target declared not-applicable. One
       slug outside `na` means the prose is also talking about a check that ran,
       and the whole string stays.
@@ -2790,6 +2804,10 @@ def _limitation_restates_na(limitation: str, na: set, roster: tuple) -> bool:
     """
     if not limitation or not na:
         return False
+    squashed = " ".join(limitation.lower().split()).strip(" .;:")
+    if any(squashed == " ".join(str(reason).lower().split()).strip(" .;:")
+           for reason in reasons or ()):
+        return True
     na = set(na)
     named = {check for check in set(roster) | na if check in limitation}
     return bool(named) and named <= na

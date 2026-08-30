@@ -9215,6 +9215,123 @@ class TestLimitationRestatingNotApplicable(unittest.TestCase):
             audit_report._limitation_restates_na(self.REASON, set(), roster)
         )
 
+    # --- the reason that names no slug ---------------------------------- #
+    #
+    # `REASON` above names `subnet-ip-exhaustion`, so every test to here is
+    # suppressed by the slug route. The reason the collector actually writes
+    # names the *surface* it could not read and no check at all -- a reason is
+    # written for a human, and the human is looking at the check's own row.
+    # Two live runs of the same fleet nine hours apart, nothing changed but
+    # this wording, reported 0 gaps and then 41.
+
+    SLUGLESS_REASON = (
+        "No IP-utilization figure for this subnet on either surface: gcloud's "
+        "UsableSubnetwork omits the field, and "
+        "google.networkanalyzer.vpcnetwork.ipAddressInsight published no stats "
+        "for it, which Network Analyzer does for subnets holding no allocations."
+    )
+
+    def test_a_reason_naming_no_slug_is_still_recognised_when_copied_verbatim(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {
+                                "check": "subnet-ip-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations=self.SLUGLESS_REASON,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_the_copy_still_matches_through_case_spacing_and_a_lost_full_stop(self):
+        """What survives a round trip through a model is not byte equality."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {
+                                "check": "subnet-ip-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations="  No IP-utilization Figure for this subnet on either surface: "
+                        "gcloud's UsableSubnetwork omits the field, and\n"
+                        "google.networkanalyzer.vpcnetwork.ipAddressInsight published no "
+                        "stats for it, which Network Analyzer does for subnets holding "
+                        "no allocations ",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_slugless_prose_that_is_not_one_of_the_reasons_stays_a_gap(self):
+        """The conservatism the slug route had, kept.
+
+        Degradation prose names no check either. Matching it against the
+        reasons is what tells the two apart -- without that, the new route
+        would swallow every unnamed limitation on any target that happened to
+        disposition something.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_run=["subnet-ip-exhaustion"],
+                        checks_not_applicable=[
+                            {
+                                "check": "cloud-nat-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations="Two of five Cloud Armor policies were unreadable this run.",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("Cloud Armor", gaps[0])
+
+    def test_a_reason_from_a_different_target_does_not_suppress(self):
+        """Reasons are matched per target, not pooled across the document."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        name="acme-prod/us-east4/one",
+                        checks_not_applicable=[
+                            {
+                                "check": "subnet-ip-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations=self.SLUGLESS_REASON,
+                    ),
+                    self._subnet(
+                        name="acme-prod/us-east4/two",
+                        checks_run=["subnet-ip-exhaustion"],
+                        checks_not_applicable=[
+                            {"check": "cloud-nat-exhaustion", "reason": "project-scoped"}
+                        ],
+                        limitations=self.SLUGLESS_REASON,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("acme-prod/us-east4/two", gaps[0])
+
 
 class TestChecksRun(unittest.TestCase):
     """The field that tells an audit that ran from one that merely finished.
