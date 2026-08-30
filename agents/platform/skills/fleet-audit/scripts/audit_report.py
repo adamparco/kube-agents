@@ -28,6 +28,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -1809,6 +1810,80 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
         if isinstance(finding, dict) and finding.get("id"):
             titles[str(finding["id"])] = str(finding.get("title") or "").strip()
     return titles
+
+
+def _remediation_is_file_backed(remediation: object) -> bool:
+    if not isinstance(remediation, dict):
+        return False
+    return remediation.get("kind") == "manifest" or bool(
+        str(remediation.get("path") or "").strip()
+    )
+
+
+def carry_unchanged_findings(
+    findings: list[dict], envelope: dict | None, *, exclude: set[str]
+) -> list[str]:
+    """Reuse the previous run's prose for a finding whose evidence did not move.
+
+    An id that survives with byte-identical `evidence` is the same finding about
+    the same object, observed in the same state. Everything the model authors
+    about it — title, impact, recommendation, remediation note — describes that
+    state, so a rewrite is the model saying the same thing differently rather
+    than the fleet having changed, and `render_findings` already means to be
+    byte-identical across an unchanged fleet.
+
+    Re-asking does not converge. Of the 92 such id-pairs in this install's
+    stored history on 2026-08-30, *all 92* had at least one authored field
+    rewritten between consecutive runs, and 83 changed the remediation. Two of
+    those rewrites were not wording. `no-notifications` on ap-ap-deploy-test
+    flipped `kind` from `gcloud` to `manual`, turning a command the reader could
+    run into a paragraph telling them to work it out — eight pairs flip that way
+    in one direction or the other. And `single-zone-nodepool` on
+    spot-capacity-test proposed `nodeLocations: [us-east4-b, us-east4-c]` one
+    morning and `[us-east4-a, us-east4-b, us-east4-c]` the next: the first drops
+    the only zone the pool has nodes in.
+
+    The remediation carries only when neither side is file-backed. A `manifest`
+    remediation names a file *this* run had to write, so the previous run's path
+    would point at nothing; and overwriting a manifest the model just wrote with
+    last run's manual note would discard a real fix. `exclude` holds the ids
+    `degrade_missing_remediations` rewrote, whose notes now disclose a promised
+    file that never arrived — carrying over that disclosure would drop it.
+
+    Nothing here freezes a finding permanently: evidence that moves, or a
+    finding that resolves and later returns, is authored fresh.
+
+    Returns the ids stabilised, for the caller to log.
+    """
+    document = (envelope or {}).get("document")
+    if not isinstance(document, dict) or not isinstance(document.get("findings"), list):
+        return []
+    previous = {
+        str(f["id"]): f
+        for f in document["findings"]
+        if isinstance(f, dict) and f.get("id")
+    }
+    carried: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        before = previous.get(fid)
+        if before is None or fid in exclude:
+            continue
+        if before.get("evidence") != finding.get("evidence"):
+            continue
+        fields = ["title", "impact", "recommendation"]
+        if not _remediation_is_file_backed(
+            before.get("remediation")
+        ) and not _remediation_is_file_backed(finding.get("remediation")):
+            fields.append("remediation")
+        stabilised = False
+        for field in fields:
+            if field in before and before[field] != finding.get(field):
+                finding[field] = copy.deepcopy(before[field])
+                stabilised = True
+        if stabilised:
+            carried.append(fid)
+    return carried
 
 
 def base_branch() -> str:
@@ -7149,7 +7224,8 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report.
-    for fid in degrade_missing_remediations(findings, root):
+    degraded = degrade_missing_remediations(findings, root)
+    for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
@@ -7188,6 +7264,11 @@ def handle_finish(args: argparse.Namespace) -> None:
     delta_known = existing_issue is None or memory is not None
     previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
     previous_titles = report_finding_titles(memory)
+    # Before anything reads a title or renders a body: a finding whose evidence
+    # is unchanged keeps the words the last run gave it, so an unchanged fleet
+    # reads as unchanged instead of being re-described every morning.
+    for fid in carry_unchanged_findings(findings, memory, exclude=set(degraded)):
+        log(f"{fid} is unchanged since the last run; its wording is carried forward.")
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis

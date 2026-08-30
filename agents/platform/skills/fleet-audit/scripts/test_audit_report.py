@@ -2733,6 +2733,129 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
 
+class TestCarryUnchangedFindings(unittest.TestCase):
+    """An unchanged finding keeps last run's words.
+
+    Every case here was drawn from this install's stored run history rather
+    than invented: 92 id-pairs with byte-identical evidence, all 92 rewritten,
+    83 of them in the remediation.
+    """
+
+    def before(self, **overrides):
+        finding = {
+            "id": "single-zone-nodepool.spot._.nodepool-spot-pool",
+            "title": "spot-pool is locked to a single zone",
+            "impact": "A zonal stockout halts autoscaling for this pool.",
+            "recommendation": {"action": "Add us-east4-b and us-east4-c."},
+            "remediation": {"kind": "manual", "note": "Add nodeLocations."},
+            "evidence": [{"command": "gcloud container node-pools list", "excerpt": "a"}],
+            "severity": "major",
+        }
+        finding.update(overrides)
+        return finding
+
+    def envelope(self, finding):
+        return {"document": {"findings": [finding]}}
+
+    def carry(self, before, now, exclude=frozenset()):
+        findings = [now]
+        ids = audit_report.carry_unchanged_findings(
+            findings, self.envelope(before), exclude=set(exclude)
+        )
+        return ids, findings[0]
+
+    def test_rewritten_prose_on_identical_evidence_is_reverted(self):
+        now = self.before(
+            title="spot-pool is a single-zone autoscaling node pool",
+            impact="This Standard cluster's Spot pool is locked to us-east4-a.",
+            recommendation={"action": "Add one or more additional zones."},
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, ["single-zone-nodepool.spot._.nodepool-spot-pool"])
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(out["impact"], "A zonal stockout halts autoscaling for this pool.")
+        self.assertEqual(out["recommendation"], {"action": "Add us-east4-b and us-east4-c."})
+
+    def test_a_remediation_that_drops_a_zone_does_not_survive(self):
+        # The live pair. One run proposed [us-east4-b, us-east4-c] for a pool
+        # whose only nodes are in us-east4-a; the next proposed all three.
+        keep = {"kind": "manual", "note": "nodeLocations: [a, b, c]"}
+        ids, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "nodeLocations: [b, c]"}),
+        )
+        self.assertEqual(out["remediation"], keep)
+        self.assertTrue(ids)
+
+    def test_a_gcloud_remediation_is_not_demoted_to_manual(self):
+        # Eight live pairs flip between an executable command and a paragraph.
+        keep = {"kind": "gcloud", "note": "gcloud container clusters update ..."}
+        _, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "Work it out."}),
+        )
+        self.assertEqual(out["remediation"], keep)
+
+    def test_evidence_that_moved_is_authored_fresh(self):
+        now = self.before(
+            title="a genuinely new title",
+            evidence=[{"command": "gcloud container node-pools list", "excerpt": "b"}],
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "a genuinely new title")
+
+    def test_a_finding_the_previous_run_never_saw_is_untouched(self):
+        now = self.before(id="single-zone-nodepool.other._.nodepool-x", title="fresh")
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "fresh")
+
+    def test_a_manifest_remediation_keeps_this_runs_path(self):
+        # Last run's path names a file *this* run never wrote, and this run's
+        # manifest is a real fix. Neither side may cross.
+        mine = {"kind": "manifest", "path": "clusters/spot/pool.yaml", "note": "n"}
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "by hand"}),
+            self.before(title="reworded", remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        # The prose still stabilises; only the remediation is held back.
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertTrue(ids)
+
+    def test_a_degraded_finding_keeps_its_disclosure(self):
+        # `degrade_missing_remediations` has just rewritten this note to say a
+        # promised file never arrived. Carrying last run's note would drop it.
+        degraded = {"kind": "manual", "path": "", "note": "n _(The audit did not write it.)_"}
+        fid = "single-zone-nodepool.spot._.nodepool-spot-pool"
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "clean"}),
+            self.before(title="reworded", remediation=degraded),
+            exclude={fid},
+        )
+        self.assertEqual(ids, [])
+        self.assertEqual(out["remediation"], degraded)
+        self.assertEqual(out["title"], "reworded")
+
+    def test_severity_is_never_carried(self):
+        # The collector computes severity. A change in it is a real change.
+        _, out = self.carry(self.before(), self.before(severity="critical"))
+        self.assertEqual(out["severity"], "critical")
+
+    def test_an_unknowable_memory_changes_nothing(self):
+        for envelope in (None, {}, {"document": None}, {"document": {"findings": "x"}}):
+            findings = [self.before(title="mine")]
+            self.assertEqual(
+                audit_report.carry_unchanged_findings(findings, envelope, exclude=set()), []
+            )
+            self.assertEqual(findings[0]["title"], "mine")
+
+    def test_an_identical_run_reports_nothing_carried(self):
+        ids, _ = self.carry(self.before(), self.before())
+        self.assertEqual(ids, [])
+
+
 class TestPublishedBodies(HarnessTestCase):
     """What reaches GitHub, read back off the `--body-file` the harness wrote.
 
