@@ -766,6 +766,29 @@ codes, a markdown heading, and every finding in the ledger restated underneath a
 The numbers were all in the JSON. Reassembling them was the step that went wrong, so the harness
 does it. Send the string; the link is the report.
 
+Do not announce the copying either. The first scheduled run under this rule replied `The audit run
+completed successfully. Per the skill's instructions, this is a scheduled run and my entire final
+response must be exactly chat_summary copied verbatim.` — and then the line, correctly. Quoting the
+rule back is not following it: the channel got two sentences ahead of the one that was wanted, and
+the second of them was about this document. Whatever reasoning got you to the string stays where the
+reasoning goes. The response is the string.
+
+**Silence is a message not sent, never a message about silence.** `[SILENT]` is a token the
+scheduler consumes to suppress the delivery; it is not text for a human and it is not an
+announcement you make. So a silent run does not explain that it is staying quiet, does not report
+`silent_ok: true`, does not summarise what it decided not to say, and does not quote the token
+inside a sentence. Any of those and the run has already spoken.
+
+That is not hypothetical. On 2026-08-30 six scheduled runs across four streams answered a
+`silent_ok: true` with two to four hundred characters of prose about the flag — `The run completed
+successfully with status: CLEAN, silent_ok: true…` — and left `[SILENT]` alone on the final line
+underneath. Every one of them reached the channel's doorstep and was suppressed only because the
+scheduler's matcher tolerates a trailing marker. Nothing about the audit made them silent. Move the
+token one line up into the prose and all six get delivered.
+
+So there is exactly one silent response, and it is the eight characters `chat_summary` already
+handed you.
+
 Two clean runs come back `silent_ok: false`, and both matter:
 
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
