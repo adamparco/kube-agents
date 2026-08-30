@@ -988,6 +988,32 @@ def target_kind(name: str) -> str:
     return "subnet" if "/" in name else "cluster"
 
 
+def scope_phrase(clusters: object) -> str:
+    """What a run read, counted by what the entries actually are.
+
+    `scope.clusters` holds all three kinds `target_kind` distinguishes, so its
+    length is not a cluster count. Networking enumerates a subnet per region and
+    reads no cluster at all, which rendered as "Audited 43 cluster(s)" against a
+    16-cluster fleet — an overstatement in the one line the report offers for
+    judging coverage, and in the direction that manufactures confidence.
+    """
+    counts: dict[str, int] = {}
+    for entry in clusters if isinstance(clusters, list) else ():
+        if isinstance(entry, dict):
+            kind = target_kind(str(entry.get("name", "")).strip())
+            counts[kind] = counts.get(kind, 0) + 1
+    parts = [
+        f"{counts[kind]} {kind}" + ("" if counts[kind] == 1 else "s")
+        for kind in ("cluster", "subnet", "project")
+        if counts.get(kind)
+    ]
+    if not parts:
+        return "0 clusters"
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
 def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
     """The roster subset `target_name` is answerable for.
 
@@ -4453,8 +4479,10 @@ def _render_scope(
     show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
     roster = audit_checks(audit_id)
 
-    out = ["", "## Scope", "", f"Audited {len(clusters)} cluster(s) on {stamp}."]
-    header = "| Cluster | Location | Project |"
+    out = ["", "## Scope", "", f"Audited {scope_phrase(clusters)} on {stamp}."]
+    kinds = {target_kind(str(c.get("name", "")).strip()) for c in clusters}
+    noun = "Cluster" if kinds <= {"cluster"} else "Target"
+    header = f"| {noun} | Location | Project |"
     rule = "| ------- | -------- | ------- |"
     if roster:
         header += " Checks |"
@@ -4939,7 +4967,7 @@ def render_clean_comment(
             f"### `{audit_id}` found nothing — but did not see the whole fleet",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(clusters)}: {names}.",
             "",
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
@@ -4955,7 +4983,7 @@ def render_clean_comment(
             f"### `{audit_id}` is now clean — closing",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(clusters)}: {names}.",
             "",
             "Every finding previously reported here is gone, so this ledger is being "
             "closed as completed. The next run that finds anything opens a fresh one.",

@@ -8856,6 +8856,111 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertNotIn("⚠", out)
 
 
+class TestScopeCountsTargetsByKind(unittest.TestCase):
+    """"Audited N cluster(s)" was `len(scope.clusters)`, which is not a count of
+    clusters.
+
+    The list holds all three kinds `target_kind` separates. The live
+    `gcp-networking-fabric-audit` run enumerated 42 subnets and the project
+    entry and read no cluster at all, and its Scope section opened "Audited 43
+    cluster(s)" against a 16-cluster fleet. Coverage is the one thing that line
+    exists to convey, and it overstated it in the direction that reads as
+    reassurance.
+    """
+
+    NET = "gcp-networking-fabric-audit"
+    STOCKOUT = "stockout-prevention"
+
+    def _subnets(self, n):
+        return [
+            {
+                "name": f"acme-prod/region-{i}/default",
+                "location": f"region-{i}",
+                "project": "acme-prod",
+                "checks_run": ["subnet-ip-exhaustion"],
+            }
+            for i in range(n)
+        ]
+
+    def _project(self):
+        return {
+            "name": "project/acme-prod",
+            "location": "-",
+            "project": "acme-prod",
+            "checks_run": ["vpc-peering-health"],
+        }
+
+    def _clusters(self, n):
+        return [
+            {
+                "name": f"prod-{i}",
+                "location": "us-east4",
+                "project": "acme-prod",
+                "checks_run": [],
+            }
+            for i in range(n)
+        ]
+
+    def test_subnets_and_the_project_are_not_counted_as_clusters(self):
+        out = "\n".join(
+            audit_report._render_scope(
+                self._subnets(42) + [self._project()], [], NOW, self.NET
+            )
+        )
+        self.assertIn("Audited 42 subnets and 1 project on", out)
+        self.assertNotIn("43 cluster", out)
+
+    def test_a_mixed_scope_names_each_kind(self):
+        out = "\n".join(
+            audit_report._render_scope(
+                self._clusters(16) + [self._project()], [], NOW, self.STOCKOUT
+            )
+        )
+        self.assertIn("Audited 16 clusters and 1 project on", out)
+        self.assertNotIn("17 cluster", out)
+
+    def test_an_all_cluster_scope_still_reads_as_clusters(self):
+        out = "\n".join(
+            audit_report._render_scope(self._clusters(16), [], NOW, AUDIT)
+        )
+        self.assertIn("Audited 16 clusters on", out)
+        self.assertIn("| Cluster | Location | Project |", out)
+
+    def test_the_table_heading_stops_calling_a_subnet_a_cluster(self):
+        out = "\n".join(
+            audit_report._render_scope(
+                self._subnets(2) + [self._project()], [], NOW, self.NET
+            )
+        )
+        self.assertIn("| Target | Location | Project |", out)
+        self.assertNotIn("| Cluster | Location | Project |", out)
+
+    def test_one_of_a_kind_is_singular(self):
+        self.assertEqual(
+            audit_report.scope_phrase([{"name": "solo"}]), "1 cluster"
+        )
+        self.assertEqual(
+            audit_report.scope_phrase([{"name": "project/acme"}]), "1 project"
+        )
+
+    def test_an_empty_scope_does_not_crash_the_heading(self):
+        # `scope.clusters` is validated non-empty, but `_render_scope` is also
+        # reached from paths that have not been through the validator.
+        self.assertEqual(audit_report.scope_phrase([]), "0 clusters")
+        self.assertEqual(audit_report.scope_phrase(None), "0 clusters")
+
+    def test_the_clean_comment_counts_by_kind_too(self):
+        """The all-clear says what it read; it was making the same claim."""
+        doc = make_doc(
+            findings=[],
+            audit=self.NET,
+            clusters=self._subnets(2) + [self._project()],
+        )
+        comment = audit_report.render_clean_comment(self.NET, doc, NOW)
+        self.assertIn("2 subnets and 1 project", comment)
+        self.assertNotIn("3 audited cluster", comment)
+
+
 class TestLimitationRestatingNotApplicable(unittest.TestCase):
     """A disposition written twice must not count as a gap twice.
 
