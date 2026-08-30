@@ -667,6 +667,26 @@ class UnattachedDiskTest(unittest.TestCase):
         hits = fw.check_unattached_disk([self.disk(size_gb=600, disk_type="pd-ssd")], set(), now=NOW)
         self.assertEqual(hits[0]["severity"], "major")
 
+    def test_a_zonal_disk_carries_its_zone_scope_flag(self):
+        """The excerpt used to print `zone=` with gcloud's raw selfLink in it.
+
+        A URL is not something you can paste after `--zone`, so the describe and
+        delete in §3.2's chain went out unscoped and resolved against gcloud's
+        configured zone.
+        """
+        url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-east4-a"
+        hits = fw.check_unattached_disk([{**self.disk(), "zone": url}], set(), now=NOW)
+        self.assertIn("--zone=us-east4-a", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_a_regional_disk_carries_a_region_flag_not_a_zone_one(self):
+        """A regional PD has `region` and no `zone`; `--zone` would not find it."""
+        disk = {k: v for k, v in self.disk().items() if k != "zone"}
+        disk["region"] = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+        self.assertNotIn("--zone", hits[0]["excerpt"])
+
 
 class IdleAddressTest(unittest.TestCase):
     def address(self, name="addr1", addr_type="EXTERNAL", status="RESERVED", purpose="", created="2026-01-01T00:00:00Z", region="us-central1"):
@@ -745,6 +765,38 @@ class OrphanLbTest(unittest.TestCase):
     def test_does_not_flag_recent_forwarding_rule(self):
         rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-07-30T00:00:00Z"}
         self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
+
+    REGION = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
+
+    def test_a_regional_forwarding_rule_carries_its_scope_flag(self):
+        """The remediation chain deletes the rule, so it needs to find it.
+
+        Every resource in §3.6's chain is regional-or-global, and an unscoped
+        `gcloud compute` verb resolves against whatever region gcloud is
+        configured for -- answering `was not found` for a rule that is really
+        there, which reads as already-remediated.
+        """
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z", "region": self.REGION}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_a_global_forwarding_rule_carries_the_global_flag(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertIn("--global", hits[0]["excerpt"])
+
+    def test_a_target_pool_carries_its_region(self):
+        hits = fw.check_orphan_lb([], [{"name": "tp1", "instances": [], "region": self.REGION}], [], set(), now=NOW)
+        self.assertIn("--region=us-east4", hits[0]["excerpt"])
+
+    def test_a_backend_service_carries_its_scope_flag(self):
+        """A backend service is regional or global, and the listing tells them
+        apart only by whether `region` is there at all."""
+        regional = fw.check_orphan_lb([], [], [{"name": "bs1", "backends": [], "region": self.REGION}], set(), now=NOW)
+        self.assertIn("--region=us-east4", regional[0]["excerpt"])
+        glob = fw.check_orphan_lb([], [], [{"name": "bs2", "backends": []}], set(), now=NOW)
+        self.assertIn("--global", glob[0]["excerpt"])
 
 
 class CollectProjectComputeTest(unittest.TestCase):

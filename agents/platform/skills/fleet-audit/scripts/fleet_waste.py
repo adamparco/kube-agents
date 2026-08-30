@@ -1132,28 +1132,43 @@ def check_unattached_disk(disks: list[dict], live_pv_handles: set[str], *, now: 
         hits.append(
             {
                 "object": f"Disk/{disk.get('name', '')}",
-                "excerpt": f"unattached since {disk.get('creationTimestamp')}, {size_gb:.0f} GB, {disk.get('type')}, zone={disk.get('zone')}",
+                "excerpt": f"unattached since {disk.get('creationTimestamp')}, {size_gb:.0f} GB, {disk.get('type')} ({_scope_flag(disk)})",
                 "severity": "major" if size_gb >= 500 or "ssd" in disk_type or "extreme" in disk_type else "minor",
             }
         )
     return hits
 
 
-def _address_location(addr: dict) -> str:
-    """`us-east4` or `global` for an address, from gcloud's two shapes for it.
+def _location_of(obj: dict) -> str:
+    """`us-east4-a`, `us-east4`, or `global` for any compute resource.
 
-    gcloud returns `region` as a full selfLink URL for a regional address and
-    omits the key entirely for a global one, so a candidate that passes the
-    field through carries a URL where a location belongs and nothing at all for
-    the global case. Both matter downstream: every remediation command for an
-    address needs a scope flag, and the wrong one fails the same way the missing
-    one does -- `was not found`, which reads as a finding somebody has already
-    remediated rather than a command written wrong, so the waste stays on the
-    bill. Handles a bare region name too, which is what the API returns for some
-    projections.
+    gcloud returns `zone` and `region` as full selfLink URLs and omits both keys
+    for a global resource, so a finding that passes either field through carries
+    a URL where a location belongs -- and nothing at all in the global case.
+    Handles a bare name too, which is what some projections return.
     """
-    region = addr.get("region") or ""
-    return region.rsplit("/", 1)[-1] if region else "global"
+    for key in ("zone", "region"):
+        value = obj.get(key) or ""
+        if value:
+            return value.rsplit("/", 1)[-1]
+    return "global"
+
+
+def _scope_flag(obj: dict) -> str:
+    """The gcloud scope flag a remediation command for `obj` must carry.
+
+    Every `gcloud compute` verb has to be told where to look, and getting it
+    wrong does not fail loudly: with no flag gcloud resolves against whatever
+    region it happens to be configured for, so a global address -- or a disk in
+    another zone -- answers `was not found`. A reader takes that for a finding
+    somebody has already remediated rather than a command written wrong, so the
+    resource stays on the bill and a true finding is discredited. Emitting the
+    flag next to the object is what keeps the agent from having to infer it.
+    """
+    location = _location_of(obj)
+    if location == "global":
+        return "--global"
+    return f"--zone={location}" if obj.get("zone") else f"--region={location}"
 
 
 def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *, now: datetime) -> list[dict]:
@@ -1171,12 +1186,10 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
             continue
         idle.append(addr)
     if len(idle) >= 10:
-        location = _address_location(idle[0])
+        location = _location_of(idle[0])
         return [{"object": f"Address/rollup-{location}", "excerpt": f"{len(idle)} external addresses RESERVED and unattached in {location}", "severity": "major"}]
     for addr in idle:
-        location = _address_location(addr)
-        scope = "--global" if location == "global" else f"--region={location}"
-        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')} ({scope})", "severity": "minor"})
+        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')} ({_scope_flag(addr)})", "severity": "minor"})
     return hits
 
 
@@ -1195,13 +1208,13 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
         age = _age_days(rule.get("creationTimestamp", ""), now=now)
         if age is None or age < 7:
             continue
-        hits.append({"object": f"ForwardingRule/{rule.get('name', '')}", "excerpt": f"targets deleted Service {m.group(1)}", "severity": "major"})
+        hits.append({"object": f"ForwardingRule/{rule.get('name', '')}", "excerpt": f"targets deleted Service {m.group(1)} ({_scope_flag(rule)})", "severity": "major"})
     for pool in target_pools:
         if not pool.get("instances"):
-            hits.append({"object": f"TargetPool/{pool.get('name', '')}", "excerpt": "zero instances", "severity": "major"})
+            hits.append({"object": f"TargetPool/{pool.get('name', '')}", "excerpt": f"zero instances ({_scope_flag(pool)})", "severity": "major"})
     for backend in backend_services:
         if not backend.get("backends"):
-            hits.append({"object": f"BackendService/{backend.get('name', '')}", "excerpt": "zero backends", "severity": "major"})
+            hits.append({"object": f"BackendService/{backend.get('name', '')}", "excerpt": f"zero backends ({_scope_flag(backend)})", "severity": "major"})
     return hits
 
 
