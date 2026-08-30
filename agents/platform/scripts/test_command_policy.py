@@ -976,6 +976,36 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_a_global_compute_resource_can_be_described(self):
+        # §3.5 and §3.6 of governance/fleet_wide_cost_analysis_sop.md both make
+        # a describe the confirm step before an irreversible release, and
+        # fleet_waste.py's _scope_flag emits --global for any object the
+        # listing gave no region. gcloud will not resolve those objects without
+        # it -- "Underspecified resource ... Specify one of the [--global,
+        # --region] flags" -- so the allowlist entries for these two describes
+        # covered regional resources and nothing else.
+        for argv, desc in (
+            (["gcloud", "compute", "addresses", "describe", "argocd-webhook-ip",
+              "--global", "--project", "p"], "SOP 3.5 confirm before release"),
+            (["gcloud", "compute", "forwarding-rules", "describe", "a1b2c3",
+              "--global", "--project", "p"], "SOP 3.6 confirm the target"),
+            (["gcloud", "compute", "addresses", "list", "--global",
+              "--project", "p"], "the listing the scope flag comes from"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_global_does_not_reach_a_verb_that_is_not_a_read(self):
+        # --global is now readable, so the command path behind it is read and
+        # judged rather than the whole command being refused as unparseable.
+        # `addresses delete` is the second half of the same SOP remediation and
+        # it must still be refused -- on gcp.read-only, the rule that means the
+        # allowlist was consulted.
+        decision = evaluate(["gcloud", "compute", "addresses", "delete", "n",
+                             "--global", "--project", "p"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+
     def test_the_daily_networking_fabric_audit_can_run_its_reads(self):
         # agents/platform/cron/jobs.json schedules `gcp-networking-fabric-audit`
         # daily, enabled, deliver: all, executing

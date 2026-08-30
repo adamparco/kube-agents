@@ -471,6 +471,18 @@ _GCLOUD_BOOLEAN_FLAGS = frozenset(
         # images describe`; without it the entry granting that read was
         # unreachable.
         "--show-package-vulnerability",
+        # The scope selector on every `gcloud compute` verb. A global address
+        # or forwarding rule cannot be named without it -- gcloud answers
+        # "Underspecified resource ... Specify one of the [--global, --region]
+        # flags" -- so `compute addresses describe` and `compute
+        # forwarding-rules describe`, both allowlisted above, were granted for
+        # regional resources only. fleet_waste.py's _scope_flag emits --global
+        # into the remediation for exactly the objects §3.5 and §3.6 of
+        # governance/fleet_wide_cost_analysis_sop.md tell the agent to confirm
+        # with a describe before releasing, and that confirm step was refused.
+        # --region and --zone are in _GCLOUD_FLAGS_WITH_VALUE; this is the
+        # third member of that trio and the only one that takes no value.
+        "--global",
     }
 )
 
