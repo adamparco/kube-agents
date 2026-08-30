@@ -2402,6 +2402,18 @@ class CommandExecutor:
         A `path1:path2` merge list is refused outright. kubectl would flatten it
         into one view, and there is no sound way to regenerate a merge of
         documents whose contents are never trusted in the first place.
+
+        The containment refusal names the path and the root, the way the `git`
+        containment refusal above already does. It used to name neither, and a
+        caller who gets "kubeconfig is outside the shared workspace" back cannot
+        tell a typo from a directory that moved from a rule that refuses the
+        whole idea -- so it retries. On 2026-08-30 a fleet-wide-cost-analysis
+        run spent 32 of its 241 proxied commands on this refusal in a
+        three-second burst, the same shape as the 37-call ENOENT loop that
+        `_unreadable_kubeconfig_message` was written for. Naming the root turns
+        it into a correction, and a caller that then picks a wrong name *inside*
+        the root gets that function's sibling listing, so the two messages chain
+        into a path that terminates.
         """
         entries = [entry.strip() for entry in kubeconfig.split(os.pathsep) if entry.strip()]
         if not entries:
@@ -2412,7 +2424,10 @@ class CommandExecutor:
             )
         candidate = Path(entries[0]).resolve()
         if not self._within_workspace(candidate):
-            raise ValueError("kubeconfig is outside the shared workspace")
+            raise ValueError(
+                f"kubeconfig {candidate} is outside the shared workspace; it "
+                f"must be under {self.workspace_dir}"
+            )
         return candidate
 
     def _resolve_kubeconfig(self, kubeconfig: str) -> Path:
@@ -2616,7 +2631,13 @@ class CommandExecutor:
         if cwd:
             requested_cwd = Path(cwd).resolve()
             if not self._within_workspace(requested_cwd):
-                raise ValueError("working directory is outside the shared workspace")
+                # Named, for the reason `_workspace_kubeconfig` gives: a
+                # containment refusal that withholds the path and the root
+                # leaves the caller nothing to correct.
+                raise ValueError(
+                    f"working directory {requested_cwd} is outside the shared "
+                    f"workspace; it must be under {self.workspace_dir}"
+                )
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":

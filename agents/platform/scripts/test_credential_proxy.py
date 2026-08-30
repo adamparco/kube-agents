@@ -2160,6 +2160,17 @@ class CommandExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
             self.executor().execute(["git", "status"], cwd="/")
 
+    def test_the_working_directory_refusal_names_the_path_and_the_root(self):
+        # Same defect as the kubeconfig containment message, same fix: a bare
+        # "working directory is outside the shared workspace" says nothing the
+        # caller can act on.
+        executor = self.executor()
+        with self.assertRaises(ValueError) as raised:
+            executor._execute(["git", "status"], cwd="/etc")
+        message = str(raised.exception)
+        self.assertIn("/etc", message)
+        self.assertIn(str(executor.workspace_dir), message)
+
     def test_kubeconfig_defaults_to_the_sidecar_context(self):
         # Omitting the field must not disturb the bootstrapped context — the
         # Platform Agent sends no KUBECONFIG and relies on this default.
@@ -2261,6 +2272,19 @@ class CommandExecutorTest(unittest.TestCase):
     def test_rejects_kubeconfig_outside_shared_workspace(self):
         with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
             self.executor()._resolve_kubeconfig("/etc/kubeconfig.yaml")
+
+    def test_the_containment_refusal_names_the_path_and_the_root(self):
+        # Withholding both leaves the caller unable to tell a typo from a moved
+        # directory from a rule that refuses the whole idea, so it retries: 32
+        # of one cost run's 241 proxied commands, in a three-second burst on
+        # 2026-08-30. The root is the correction, and a caller that then picks
+        # a wrong name inside it gets the ENOENT sibling listing instead.
+        executor = self.executor()
+        with self.assertRaises(ValueError) as raised:
+            executor._resolve_kubeconfig("/etc/kubeconfig.yaml")
+        message = str(raised.exception)
+        self.assertIn("/etc/kubeconfig.yaml", message)
+        self.assertIn(str(executor.workspace_dir), message)
 
     def test_rejects_kubeconfig_escaping_the_workspace_by_traversal(self):
         executor = self.executor()
