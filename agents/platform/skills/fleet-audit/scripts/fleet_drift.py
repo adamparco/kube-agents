@@ -382,6 +382,21 @@ def _flag_off_only(observed: str, baseline: str) -> bool:
     return observed == "OFF" and baseline != "OFF"
 
 
+def _flag_less_only(observed: str, baseline: str) -> bool:
+    """`_flag_off_only` for the three-token `_pool_fraction` facets.
+
+    Flags a cluster that covers fewer of its pools than the cohort does, and
+    stays quiet when it covers more. The facets scored this way state an impact
+    ("nodes boot unverified", "cannot absorb load the way its peers do") and
+    carry a remediation that turns the feature *on*, so in the other direction
+    the finding reads backwards and cannot be closed: enabling the feature on
+    the remaining pools moves the token to ALL, which still differs from a NONE
+    baseline, so the same finding returns on the next run.
+    """
+    rank = {"NONE": 0, "SOME": 1, "ALL": 2}
+    return rank.get(observed, 0) < rank.get(baseline, 0)
+
+
 def _flag_not_superset(observed: str, baseline: str) -> bool:
     base_set = set(baseline.split(",")) if baseline != "NONE" else set()
     obs_set = set(observed.split(",")) if observed != "NONE" else set()
@@ -405,9 +420,9 @@ class Facet(NamedTuple):
 
 FACETS: tuple[Facet, ...] = (
     Facet("release-channel", ".releaseChannel.channel", "minor", False, False, norm_release_channel, _flag_ne),
-    Facet("shielded-nodes", ".shieldedNodes.enabled", "major", False, False, norm_shielded_nodes, _flag_ne),
-    Facet("secure-boot", ".nodePools[].config.shieldedInstanceConfig.enableSecureBoot", "major", True, False, norm_secure_boot, _flag_ne),
-    Facet("integrity-monitoring", ".nodePools[].config.shieldedInstanceConfig.enableIntegrityMonitoring", "minor", True, False, norm_integrity_monitoring, _flag_ne),
+    Facet("shielded-nodes", ".shieldedNodes.enabled", "major", False, False, norm_shielded_nodes, _flag_off_only),
+    Facet("secure-boot", ".nodePools[].config.shieldedInstanceConfig.enableSecureBoot", "major", True, False, norm_secure_boot, _flag_less_only),
+    Facet("integrity-monitoring", ".nodePools[].config.shieldedInstanceConfig.enableIntegrityMonitoring", "minor", True, False, norm_integrity_monitoring, _flag_less_only),
     Facet("network-policy", ".networkConfig.datapathProvider / .networkPolicy.enabled", "major", False, False, norm_network_policy, _flag_off_only),
     Facet("private-nodes", ".privateClusterConfig.enablePrivateNodes", "critical", False, False, norm_private_nodes, _flag_ne),
     Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint / .controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint", "major", False, False, norm_private_endpoint, _flag_ne),
@@ -416,8 +431,8 @@ FACETS: tuple[Facet, ...] = (
     Facet("monitoring-components", ".monitoringConfig.componentConfig.enableComponents", "minor", False, False, norm_monitoring_components, _flag_not_superset),
     Facet("managed-prometheus", ".monitoringConfig.managedPrometheusConfig.enabled", "minor", False, False, norm_managed_prometheus, _flag_ne),
     Facet("binary-authorization", ".binaryAuthorization.evaluationMode", "major", False, False, norm_binary_authorization, _flag_off_only),
-    Facet("node-autoprovisioning", ".autoscaling.enableNodeAutoprovisioning", "minor", True, False, norm_node_autoprovisioning, _flag_ne),
-    Facet("pool-autoscaling", ".nodePools[].autoscaling.enabled", "minor", True, False, norm_pool_autoscaling, _flag_ne),
+    Facet("node-autoprovisioning", ".autoscaling.enableNodeAutoprovisioning", "minor", True, False, norm_node_autoprovisioning, _flag_off_only),
+    Facet("pool-autoscaling", ".nodePools[].autoscaling.enabled", "minor", True, False, norm_pool_autoscaling, _flag_less_only),
     Facet("intra-node-visibility", ".networkConfig.enableIntraNodeVisibility", "minor", False, False, norm_intra_node_visibility, _flag_ne),
     Facet("datapath-provider", ".networkConfig.datapathProvider", "major", False, True, norm_datapath_provider, _flag_ne),
     Facet("label-keys", ".resourceLabels", "minor", False, False, norm_label_keys, _flag_not_superset),

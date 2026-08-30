@@ -255,6 +255,73 @@ class FacetNormalizeTest(unittest.TestCase):
         base, out, flagged = self.hit("integrity-monitoring", cluster("c"), {"nodePools": [{"config": {"shieldedInstanceConfig": {"enableIntegrityMonitoring": False}}}]})
         self.assertTrue(flagged)
 
+    # SOP 4.3 and 4.8 both state a one-directional impact ("nodes boot
+    # unverified", "cannot absorb load the way its peers do") and a remediation
+    # that turns the feature on. A cluster covering *more* pools than its cohort
+    # is the reverse, so flagging it renders an inverted impact and a fix that
+    # never converges: enabling the feature everywhere lands on ALL, which still
+    # is not a NONE baseline, and the finding recurs on every subsequent run.
+
+    def test_less_only_ranks_none_below_some_below_all(self):
+        self.assertTrue(fd._flag_less_only("NONE", "SOME"))
+        self.assertTrue(fd._flag_less_only("NONE", "ALL"))
+        self.assertTrue(fd._flag_less_only("SOME", "ALL"))
+        self.assertFalse(fd._flag_less_only("ALL", "ALL"))
+        self.assertFalse(fd._flag_less_only("SOME", "SOME"))
+
+    def test_pool_autoscaling_some_against_none_baseline_is_not_flagged(self):
+        # The live case: nine peers autoscale no pool, spot-capacity-test
+        # autoscales its spot pool. It absorbs load better, not worse.
+        base, out, flagged = self.hit(
+            "pool-autoscaling",
+            cluster("c", nodePools=[{"name": "default-pool"}, {"name": "spot-pool"}]),
+            {"nodePools": [{"name": "default-pool"}, {"name": "spot-pool", "autoscaling": {"enabled": True}}]},
+        )
+        self.assertEqual(base, "NONE")
+        self.assertEqual(out, "SOME")
+        self.assertFalse(flagged)
+
+    def test_pool_autoscaling_none_against_all_baseline_is_flagged(self):
+        base, out, flagged = self.hit(
+            "pool-autoscaling",
+            cluster("c", nodePools=[{"name": "default-pool", "autoscaling": {"enabled": True}}]),
+            {"nodePools": [{"name": "default-pool"}]},
+        )
+        self.assertEqual((base, out), ("ALL", "NONE"))
+        self.assertTrue(flagged)
+
+    def test_secure_boot_all_against_none_baseline_is_not_flagged(self):
+        base, out, flagged = self.hit(
+            "secure-boot",
+            cluster("c", nodePools=[{"name": "p", "config": {"imageType": "COS_CONTAINERD"}}]),
+            {"nodePools": [{"name": "p", "config": {"imageType": "COS_CONTAINERD", "shieldedInstanceConfig": {"enableSecureBoot": True}}}]},
+        )
+        self.assertEqual((base, out), ("NONE", "ALL"))
+        self.assertFalse(flagged)
+
+    def test_node_autoprovisioning_on_against_off_baseline_is_not_flagged(self):
+        base, out, flagged = self.hit(
+            "node-autoprovisioning",
+            cluster("c", autoscaling={"enableNodeAutoprovisioning": False}),
+            {"autoscaling": {"enableNodeAutoprovisioning": True}},
+        )
+        self.assertEqual((base, out), ("OFF", "ON"))
+        self.assertFalse(flagged)
+
+    def test_node_autoprovisioning_off_against_on_baseline_is_flagged(self):
+        base, out, flagged = self.hit(
+            "node-autoprovisioning",
+            cluster("c", autoscaling={"enableNodeAutoprovisioning": True}),
+            {"autoscaling": {"enableNodeAutoprovisioning": False}},
+        )
+        self.assertEqual((base, out), ("ON", "OFF"))
+        self.assertTrue(flagged)
+
+    def test_shielded_nodes_on_against_off_baseline_is_not_flagged(self):
+        base, out, flagged = self.hit("shielded-nodes", cluster("c", shieldedNodes={"enabled": False}), {"shieldedNodes.enabled": True})
+        self.assertEqual((base, out), ("OFF", "ON"))
+        self.assertFalse(flagged)
+
     def test_network_policy_dpv2_vs_calico_is_never_flagged(self):
         base = "DPV2"
         outlier = "CALICO"
