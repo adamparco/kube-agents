@@ -580,8 +580,8 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
     The only cluster-scoped check that walks a `*_by_namespace` map with no
     workload to anchor it, so it is the only one that has to apply S1 and S2
     itself. `check_no_hpa` reads `context["hpas"]` under a workload's own
-    namespace and `check_pdb_blocks_drain` drops a PDB whose target is not in
-    the audited set, so both inherit the suppressions for free. This one did
+    namespace and `check_blocking_pdb` drops a PDB whose target is not in the
+    audited set, so both inherit the suppressions for free. This one did
     not, and GKE makes that expensive: `kube-state-metrics` lives in
     `gke-managed-cim` and `opentelemetry-collector` in `gke-managed-otel`, S1
     keeps their StatefulSet and Deployment out of `workloads`, and their HPAs
@@ -952,15 +952,27 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
 
 
 def check_netpol_missing(context: dict) -> list[dict]:
+    """§2.6's exposure test is `kubectl get pods -n <ns> | wc -l`, so it reads
+    `pod_namespaces` — every namespace holding a live Pod — and not the audited
+    workload set.
+
+    Those are different sets, and the difference swallowed the check.
+    `normalize_compliance_workloads` drops any Pod carrying `ownerReferences`,
+    because compliance audits the controller and never the pod, whose name
+    carries a random suffix. Every pod a Deployment, StatefulSet, DaemonSet or
+    Job creates carries one — so counting Pods in that set returned zero for
+    the ordinary namespace, which then read as "zero workloads, no exposure,
+    pure churn" and was skipped. The namespace the check exists to find, one
+    running a Deployment with no NetworkPolicy, was the exact case it could not
+    report: on this 16-cluster fleet `cert-manager` had three pods and no
+    policy across every run, and the stream flagged nothing.
+    """
     hits = []
     netpols_by_ns: dict[str, list[dict]] = {}
     for netpol in context.get("networkpolicies") or []:
         ns = (netpol.get("metadata") or {}).get("namespace", "")
         netpols_by_ns.setdefault(ns, []).append(netpol)
-    pod_count_by_ns: dict[str, int] = {}
-    for wl in context.get("workloads") or []:
-        if wl["kind"] == "Pod":
-            pod_count_by_ns[wl["ns"]] = pod_count_by_ns.get(wl["ns"], 0) + 1
+    pod_namespaces = context["pod_namespaces"]
     # §2.6's Do-NOT-flag case: a namespace already covered fleet-wide by a
     # Dataplane V2 ClusterNetworkPolicy is not a default-allow posture just
     # because it has no *namespaced* NetworkPolicy of its own.
@@ -972,8 +984,8 @@ def check_netpol_missing(context: dict) -> list[dict]:
             continue
         policies = netpols_by_ns.get(ns, [])
         if not policies:
-            if pod_count_by_ns.get(ns, 0) == 0:
-                continue  # no workloads, no exposure, pure churn
+            if ns not in pod_namespaces:
+                continue  # no pods, no exposure, pure churn
             if has_cluster_network_policy:
                 continue
             hits.append(
@@ -1706,6 +1718,14 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     context["workloads"] = normalize_compliance_workloads(parsed)
+    # Raw, from the same dump: `netpol-missing`'s exposure test asks whether a
+    # namespace runs pods, which is not the same question as whether it holds
+    # anything this audit is allowed to name.
+    context["pod_namespaces"] = {
+        (i.get("metadata") or {}).get("namespace", "")
+        for i in parsed.get("items", []) or []
+        if i.get("kind") == "Pod"
+    }
     workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:

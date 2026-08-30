@@ -104,6 +104,7 @@ def context_of(dump=None, **overrides):
         "services": {},
         "workloads": [],
         "workload_keys": set(),
+        "pod_namespaces": set(),
         "cluster_name": "test-cluster",
     }
     if dump is not None:
@@ -122,6 +123,13 @@ def context_of(dump=None, **overrides):
         # those tests about the check they name; the S4/S5 cases that need the
         # two sets to *differ* pass a dump, or `workload_keys` outright.
         base["workload_keys"] = {(wl["ns"], wl["kind"], wl["name"]) for wl in base["workloads"]}
+    if "pod_namespaces" not in overrides:
+        # Same rule for the raw pod set `netpol-missing` reads. A test that
+        # says the namespace holds a Pod means the cluster has one there; the
+        # cases about the gap between the two -- an owned pod the audited set
+        # drops, a namespace whose only Pod is in `pod_namespaces` and nowhere
+        # else -- pass it outright.
+        base["pod_namespaces"] = {wl["ns"] for wl in base["workloads"] if wl["kind"] == "Pod"}
     return base
 
 
@@ -1383,6 +1391,37 @@ class TestNetpolMissing(unittest.TestCase):
             cluster_network_policies=[],
         )
         self.assertEqual(len(collect.check_netpol_missing(ctx)), 1)
+
+    def test_a_namespace_whose_only_pods_are_controller_owned_is_still_flagged(self):
+        """The defect this check spent every run not finding.
+
+        `normalize_compliance_workloads` drops a Pod with `ownerReferences`, so
+        a namespace running nothing but a Deployment's pods reaches the check
+        with no Pod-kind workload at all. Reading exposure off that set made it
+        "zero workloads, pure churn" and skipped the namespace -- which is the
+        ordinary namespace, and the one §2.6 exists to report.
+        """
+        ctx = context_of(
+            namespaces=[namespace("cert-manager")],
+            networkpolicies=[],
+            workloads=[{"kind": "Deployment", "ns": "cert-manager", "name": "cert-manager"}],
+            pod_namespaces={"cert-manager"},
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_a_namespace_with_a_workload_but_no_running_pod_is_not_flagged(self):
+        """The other side of it: §2.6's test is `get pods … | wc -l`, so a
+        Deployment scaled to zero is not exposure. Counting workloads instead
+        of pods would fix the case above by flagging this one."""
+        ctx = context_of(
+            namespaces=[namespace("dormant")],
+            networkpolicies=[],
+            workloads=[{"kind": "Deployment", "ns": "dormant", "name": "batch"}],
+            pod_namespaces=set(),
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
 
 
 class TestDefaultSaAutomount(unittest.TestCase):
