@@ -287,11 +287,30 @@ def check_no_channel(cluster: dict) -> dict | None:
     return {"object": f"Cluster/{cluster['name']}", "excerpt": "releaseChannel.channel is empty"}
 
 
+def _observed(mapping: dict, key: str, path: str) -> str:
+    """`<path>=<value>` when the key is there, `<path> absent` when it is not.
+
+    A disabled setting and a missing one are different observations with
+    different fixes -- one is flipped, the other has to be created -- and an
+    excerpt reading "false or absent" commits to neither. It also hides the
+    move between them: a pool that grows an explicit `autoRepair: false`
+    publishes an excerpt byte-identical to the one it had while the field was
+    missing, so `carry_unchanged_findings` treats a real change as no change
+    and the run-over-run diff shows nothing happened. `json.dumps` rather than
+    `str` so the value reads as it does in the API response -- `false`, not
+    `False`, and `null` for a key present but unset.
+    """
+    return f"{path}={json.dumps(mapping[key])}" if key in mapping else f"{path} absent"
+
+
 def check_no_autoupgrade(cluster: dict) -> list[dict]:
     if (cluster.get("autopilot") or {}).get("enabled"):
         return []
     return [
-        {"object": f"NodePool/{p.get('name', '')}", "excerpt": "management.autoUpgrade is false or absent"}
+        {
+            "object": f"NodePool/{p.get('name', '')}",
+            "excerpt": _observed(p.get("management") or {}, "autoUpgrade", "management.autoUpgrade"),
+        }
         for p in cluster.get("nodePools") or []
         if not (p.get("management") or {}).get("autoUpgrade")
     ]
@@ -301,7 +320,10 @@ def check_no_autorepair(cluster: dict) -> list[dict]:
     if (cluster.get("autopilot") or {}).get("enabled"):
         return []
     return [
-        {"object": f"NodePool/{p.get('name', '')}", "excerpt": "management.autoRepair is false or absent"}
+        {
+            "object": f"NodePool/{p.get('name', '')}",
+            "excerpt": _observed(p.get("management") or {}, "autoRepair", "management.autoRepair"),
+        }
         for p in cluster.get("nodePools") or []
         if not (p.get("management") or {}).get("autoRepair")
     ]
@@ -360,7 +382,10 @@ def check_stale_image_type(cluster: dict, baseline: dict | None) -> list[dict]:
 def check_no_notifications(cluster: dict) -> dict | None:
     pubsub = ((cluster.get("notificationConfig") or {}).get("pubsub") or {})
     if not pubsub.get("enabled"):
-        return {"object": f"Cluster/{cluster['name']}", "excerpt": "notificationConfig.pubsub.enabled is false or absent"}
+        return {
+            "object": f"Cluster/{cluster['name']}",
+            "excerpt": _observed(pubsub, "enabled", "notificationConfig.pubsub.enabled"),
+        }
     event_types = ((pubsub.get("filter") or {}) or {}).get("eventType") or []
     if event_types and "UPGRADE_AVAILABLE_EVENT" not in event_types:
         return {"object": f"Cluster/{cluster['name']}", "excerpt": f"pubsub filter excludes UPGRADE_AVAILABLE_EVENT: {event_types}"}

@@ -203,6 +203,18 @@ class NoAutoupgradeAutorepairTest(unittest.TestCase):
         c = cluster(node_pools=[pool(auto_repair=False)])
         self.assertEqual(len(pr.check_no_autorepair(c)), 1)
 
+    def test_the_excerpt_says_which_of_disabled_or_absent_was_read(self):
+        """`management` is omitted entirely on a pool that has never had either
+        setting, and that is a different observation from an explicit `false`."""
+        explicit = cluster(node_pools=[pool(auto_repair=False)])
+        missing = cluster(node_pools=[pool(management={})])
+        self.assertEqual(
+            pr.check_no_autorepair(explicit)[0]["excerpt"], "management.autoRepair=false"
+        )
+        self.assertEqual(
+            pr.check_no_autorepair(missing)[0]["excerpt"], "management.autoRepair absent"
+        )
+
     def test_does_not_flag_enabled(self):
         c = cluster(node_pools=[pool(auto_upgrade=True, auto_repair=True)])
         self.assertEqual(pr.check_no_autoupgrade(c), [])
@@ -299,11 +311,28 @@ class StaleImageTypeTest(unittest.TestCase):
 class NoNotificationsTest(unittest.TestCase):
     def test_flags_disabled(self):
         c = cluster(**{"notificationConfig": {"pubsub": {"enabled": False}}})
-        self.assertIsNotNone(pr.check_no_notifications(c))
+        self.assertEqual(
+            pr.check_no_notifications(c)["excerpt"], "notificationConfig.pubsub.enabled=false"
+        )
 
     def test_flags_absent(self):
         c = cluster(**{"notificationConfig": {}})
-        self.assertIsNotNone(pr.check_no_notifications(c))
+        self.assertEqual(
+            pr.check_no_notifications(c)["excerpt"], "notificationConfig.pubsub.enabled absent"
+        )
+
+    def test_disabled_and_absent_do_not_read_the_same(self):
+        """The two cases above are one finding with two different fixes: an
+        absent block has to be created, a disabled one flipped. They shared an
+        excerpt reading "false or absent" until this asserted otherwise, which
+        also meant a cluster moving from absent to explicitly-false published
+        byte-identical evidence and showed up as unchanged."""
+        disabled = cluster(**{"notificationConfig": {"pubsub": {"enabled": False}}})
+        absent = cluster(**{"notificationConfig": {}})
+        self.assertNotEqual(
+            pr.check_no_notifications(disabled)["excerpt"],
+            pr.check_no_notifications(absent)["excerpt"],
+        )
 
     def test_enabled_with_no_filter_is_not_flagged(self):
         c = cluster(**{"notificationConfig": {"pubsub": {"enabled": True}}})

@@ -1167,11 +1167,26 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
             non_root = None
         run_as_user = c_sc.get("runAsUser", pod_sc.get("runAsUser"))
         seccomp_type = ((c_sc.get("seccompProfile") or {}).get("type") or (pod_sc.get("seccompProfile") or {}).get("type") or "")
-        if non_root is not True or run_as_user == 0 or seccomp_type not in ("RuntimeDefault", "Localhost"):
-            bad.append(container.get("name", ""))
+        # Which of the three fired, not just that one did. This check reads
+        # three independent settings and a bare container name throws away the
+        # only part a reader needs: the fix for `runAsUser=0` is not the fix
+        # for a missing seccomp profile. `audit_report.py`'s
+        # `adopt_collector_evidence` cites "a full securityContext breakdown
+        # [coming back] as `containers: litellm-container`" as the detail loss
+        # it exists to stop -- and then publishes this excerpt over the model's,
+        # so the collector has to be the one carrying the detail.
+        reasons = []
+        if non_root is not True:
+            reasons.append(f"runAsNonRoot={json.dumps(non_root)}")
+        if run_as_user == 0:
+            reasons.append("runAsUser=0")
+        if seccomp_type not in ("RuntimeDefault", "Localhost"):
+            reasons.append(f"seccompProfile.type={seccomp_type or 'absent'}")
+        if reasons:
+            bad.append(f"{container.get('name', '')} ({', '.join(reasons)})")
     if not bad:
         return None
-    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {'; '.join(bad)}"}
 
 
 # --------------------------------------------------------------------------- #

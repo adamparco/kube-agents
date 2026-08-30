@@ -1662,6 +1662,22 @@ class TestPodSecurityGaps(unittest.TestCase):
         sc = {"runAsNonRoot": True, "runAsUser": 0, "seccompProfile": {"type": "RuntimeDefault"}}
         self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
 
+    def test_the_excerpt_names_which_of_the_three_settings_failed(self):
+        """Three independent settings decide this check, and the excerpt is
+        published verbatim -- `adopt_collector_evidence` overwrites whatever the
+        model wrote with it. A bare container name would tell a reader a
+        workload is non-compliant without telling them what to change, and the
+        fix for `runAsUser=0` is not the fix for a missing seccomp profile."""
+        sc = {"runAsNonRoot": True, "runAsUser": 0, "seccompProfile": {"type": "RuntimeDefault"}}
+        only_uid = collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of())
+        self.assertEqual(only_uid["excerpt"], "containers: app (runAsUser=0)")
+
+        everything = collect.check_podsecurity_gaps(self.wl(), context_of())
+        self.assertEqual(
+            everything["excerpt"],
+            "containers: app (runAsNonRoot=null, seccompProfile.type=absent)",
+        )
+
     def test_missing_seccomp_profile_is_flagged(self):
         sc = {"runAsNonRoot": True, "runAsUser": 10001}
         self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
