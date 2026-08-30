@@ -2702,6 +2702,8 @@ def coverage_gaps(data: dict) -> list[str]:
     the roster for that cluster rather than counting as unread. Without that,
     "this check cannot exist here" and "nobody looked" were the same state, and
     two Autopilot clusters were enough to keep a stream partial in perpetuity.
+    A target whose whole roster leaves that way has nothing left to be uncovered,
+    so its `limitations` prose is not a gap either, whatever it says.
 
     The roster is per target, not per stream, because three SOPs enumerate
     project and subnet entries alongside clusters — see `AuditSpec.scopes`.
@@ -2727,7 +2729,23 @@ def coverage_gaps(data: dict) -> list[str]:
         missing = [check for check in applicable if check not in ran]
         reasons = [str(entry.get("reason", "")) for entry in cluster.get("checks_not_applicable") or []
                    if isinstance(entry, dict)]
-        if _limitation_restates_na(limitation, na, roster, reasons):
+        if limitation and na and not applicable and not ran:
+            # Every check this target owes was dispositioned not-applicable,
+            # each carrying its own reason, and none ran. There is no check
+            # left for prose to report as uncovered, so whatever the string
+            # says it is not naming one -- and the run is not partial on
+            # account of a target that refused nothing.
+            #
+            # This is the structural form of the test below, and it is here
+            # because the textual one cannot be made to hold. Three live
+            # `gcp-networking-fabric-audit` runs over the same 42 subnets
+            # produced three restatements of the same 41 dispositions: prose
+            # naming the check, one reason copied verbatim, and all five
+            # reasons joined under a prefix. Matching the wording caught two
+            # of the three and would go on losing, because the wording is a
+            # model's to choose and `partial` is not.
+            limitation = ""
+        elif _limitation_restates_na(limitation, na, roster, reasons):
             limitation = ""
         if not limitation and not missing:
             continue

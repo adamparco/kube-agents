@@ -9302,6 +9302,79 @@ class TestLimitationRestatingNotApplicable(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("Cloud Armor", gaps[0])
 
+    # --- the structural rule -------------------------------------------- #
+    #
+    # A third live run wrote a third restatement: all five reasons joined
+    # under "No checks ran against this target this run: ...". Neither route
+    # above matches it, and there is no reason to think a fourth wording would
+    # not find a fourth way past. What every one of them has in common is the
+    # state underneath -- a target whose whole roster is dispositioned and on
+    # which nothing ran -- and that is not the model's to phrase.
+
+    JOINED_REASONS = (
+        "No checks ran against this target this run: NAT gateways are "
+        "configured at the Cloud Router level, not per subnet.; Private "
+        "Service Connect endpoints are project-level resources, not subnet "
+        "resources."
+    )
+
+    def test_a_fully_dispositioned_target_is_not_a_gap_whatever_the_prose_says(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        # Explicit, because `make_doc` reads an absent
+                        # `checks_run` as "ran the full roster" and the live
+                        # subnets this covers ran nothing at all.
+                        checks_run=[],
+                        checks_not_applicable=[
+                            {"check": "subnet-ip-exhaustion", "reason": "no allocations"},
+                            {"check": "cloud-nat-exhaustion", "reason": "router-scoped"},
+                        ],
+                        limitations=self.JOINED_REASONS,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_a_check_that_ran_keeps_the_prose_even_when_the_rest_is_dispositioned(self):
+        """The rule turns on nothing having run, not on `na` being large.
+
+        One check ran, so the prose can be describing how far it got — the
+        thing a limitation is actually for — and no disposition covers that.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_run=["subnet-ip-exhaustion"],
+                        checks_not_applicable=[
+                            {"check": "cloud-nat-exhaustion", "reason": "router-scoped"},
+                        ],
+                        limitations="subnet-ip-exhaustion read 3 of 4 secondary ranges.",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("3 of 4 secondary ranges", gaps[0])
+
+    def test_prose_on_a_target_that_dispositioned_nothing_is_still_a_gap(self):
+        """`na` empty means nothing was accounted for, so nothing is excused."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(limitations="The whole subnet was unreachable."),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("unreachable", gaps[0])
+
     def test_a_reason_from_a_different_target_does_not_suppress(self):
         """Reasons are matched per target, not pooled across the document."""
         gaps = audit_report.coverage_gaps(
