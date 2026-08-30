@@ -1265,6 +1265,30 @@ def check_model_remote_code_trusted(workload: dict, context: dict) -> dict | Non
     return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
 
 
+def _env_paths_under(container: dict, mount_path: str) -> list[str]:
+    """Env vars on this container whose literal value is a path inside `mount_path`.
+
+    A container that keeps HOME, a cache directory, or a model directory inside the
+    weights mount writes to that mount, so adding `readOnly: true` to it stops the
+    process instead of hardening it -- ollama derives OLLAMA_MODELS=$HOME/.ollama/models
+    and prunes it at every start, vLLM writes HF_HOME, and both exit on boot. The
+    remediation for 3.3 only sees this finding's evidence, so the conflict has to be
+    named here for it to move the write path out in the same change rather than
+    flipping the flag blind.
+    """
+    if not mount_path:
+        return []
+    base = mount_path.rstrip("/")
+    hits = []
+    for e in container.get("env") or []:
+        v = e.get("value")
+        if not isinstance(v, str) or e.get("valueFrom") is not None:
+            continue
+        if v == base or v.startswith(base + "/"):
+            hits.append(f"{e.get('name')}={v}")
+    return hits
+
+
 def check_weights_mount_writable(workload: dict, context: dict) -> dict | None:
     vols_by_name = {v.get("name"): v for v in workload["spec"].get("volumes") or []}
     bad = []
@@ -1277,7 +1301,11 @@ def check_weights_mount_writable(workload: dict, context: dict) -> dict | None:
                 continue
             csi, pvc = vol.get("csi"), vol.get("persistentVolumeClaim")
             if (csi is not None and not csi.get("readOnly", False)) or (pvc is not None and not pvc.get("readOnly", False)):
-                bad.append(f"{c.get('name', '')}:{m.get('name')}:{m.get('mountPath')}")
+                entry = f"{c.get('name', '')}:{m.get('name')}:{m.get('mountPath')}"
+                writers = _env_paths_under(c, m.get("mountPath"))
+                if writers:
+                    entry += " (container writes here: " + ", ".join(writers) + ")"
+                bad.append(entry)
     if not bad:
         return None
     return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": "; ".join(bad)}

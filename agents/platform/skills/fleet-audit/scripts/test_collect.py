@@ -2037,6 +2037,42 @@ class TestWeightsMountWritable(unittest.TestCase):
         w = self.collected({"volumeMounts": [{"name": "missing", "mountPath": "/x"}]}, [])
         self.assertIsNone(collect.check_weights_mount_writable(w, {}))
 
+    def test_names_env_paths_that_the_flagged_container_writes_into(self):
+        # An auto-merged remediation added readOnly: true to a mount whose own
+        # container had HOME set inside it, and the pod went to CrashLoopBackOff
+        # with "remove /models/.ollama/models/manifests: read-only file system".
+        # The evidence has to carry the conflict or the fix cannot see it.
+        w = self.collected(
+            {
+                "volumeMounts": [{"name": "weights", "mountPath": "/models"}],
+                "env": [
+                    {"name": "HOME", "value": "/models"},
+                    {"name": "HF_HOME", "value": "/models/.cache"},
+                ],
+            },
+            [{"name": "weights", "persistentVolumeClaim": {"claimName": "w"}}],
+        )
+        hit = collect.check_weights_mount_writable(w, {})
+        self.assertIn("HOME=/models", hit["excerpt"])
+        self.assertIn("HF_HOME=/models/.cache", hit["excerpt"])
+
+    def test_env_outside_the_mount_is_not_reported_as_a_writer(self):
+        # /models-cache is a sibling of /models, not a path inside it; a prefix
+        # test without the separator would call it a conflict and push the
+        # remediation into a manual finding for no reason.
+        w = self.collected(
+            {
+                "volumeMounts": [{"name": "weights", "mountPath": "/models"}],
+                "env": [
+                    {"name": "HOME", "value": "/state"},
+                    {"name": "CACHE", "value": "/models-cache"},
+                ],
+            },
+            [{"name": "weights", "persistentVolumeClaim": {"claimName": "w"}}],
+        )
+        hit = collect.check_weights_mount_writable(w, {})
+        self.assertNotIn("container writes here", hit["excerpt"])
+
 
 class TestModelArtifactUnpinnedSource(unittest.TestCase):
     def hit(self, container):
