@@ -143,7 +143,7 @@ Every facet reads only GKE control-plane and node-pool metadata through `gcloud 
 #### 4.5 Private nodes, private endpoint, authorized networks (`private-nodes`, `private-endpoint`, `authorized-networks`)
 
 - **Read:** three facets, each `ON`/`OFF`, from `.privateClusterConfig.enablePrivateNodes`, `.privateClusterConfig.enablePrivateEndpoint`, and `.masterAuthorizedNetworksConfig.enabled` plus `.cidrBlocks` (authorized networks is `ON` only when enabled **and** `cidrBlocks` is non-empty). Recent GKE versions carry equivalents under `.networkConfig` and `.controlPlaneEndpointsConfig`: read whichever is actually present and name the path in the excerpt.
-- **Do NOT flag:** the **contents** of `cidrBlocks` — CIDRs legitimately differ per cluster and comparing them is guaranteed noise; `enablePrivateEndpoint: false` when the majority is also false (normal for admin-reachable control planes).
+- **Do NOT flag:** the **contents** of `cidrBlocks` — CIDRs legitimately differ per cluster and comparing them is guaranteed noise; `enablePrivateEndpoint: false` when the majority is also false (normal for admin-reachable control planes); a cluster that keeps **more** private than its cohort (`ON` against an `OFF` majority). Only `OFF` against a restricting majority is a finding. The impact and remediation below describe the outlier as the exposed one and only ever turn a control on, so in the other direction the finding accuses a hardened cluster of the exposure its peers actually carry — and the only recommendation that would close it is to open it up to match them.
 - **Severity:** base `critical` for private nodes and authorized networks, base `major` for private endpoint.
 - **Impact:** the outlier exposes node or control-plane surface its peers keep private.
 - **Remediation:** authorized networks are `gcloud` — `gcloud container clusters update … --enable-master-authorized-networks --master-authorized-networks=<ranges the cluster's own owner approves>`; never copy a peer's CIDRs. Private nodes usually cannot be enabled in place: prefer `manual` with the migration note unless `--enable-private-nodes` is valid for that cluster's version.
@@ -151,7 +151,7 @@ Every facet reads only GKE control-plane and node-pool metadata through `gcloud 
 #### 4.6 Logging and monitoring component sets (`logging-components`, `monitoring-components`, `managed-prometheus`)
 
 - **Read:** three facets. `.loggingConfig.componentConfig.enableComponents[]` and `.monitoringConfig.componentConfig.enableComponents[]` are list-valued: deduplicate, sort ascending lexicographically, join with `,` — that canonical ordering is what makes them comparable, and an absent config, an absent `enableComponents`, and an empty list all become `NONE`. `.monitoringConfig.managedPrometheusConfig.enabled` → `ON`/`OFF`.
-- **Do NOT flag:** a cluster whose set is a strict **superset** of the baseline — collecting more telemetry than peers is not drift. Flag subsets and disjoint sets, and name the missing components.
+- **Do NOT flag:** a cluster whose set is a strict **superset** of the baseline — collecting more telemetry than peers is not drift. Flag subsets and disjoint sets, and name the missing components. The same holds for `managed-prometheus`, which is the one facet here that is not set-valued: only `OFF` against an `ON` majority is a finding, never `ON` against an `OFF` one.
 - **Severity:** base `major` when the outlier is missing `SYSTEM_COMPONENTS`, otherwise base `minor`.
 - **Impact:** the outlier is invisible to fleet dashboards and alerts built on the peers' component set.
 - **Remediation:** `gcloud` — `gcloud container clusters update … --logging=<t* comma list> --monitoring=<t* comma list>`.
@@ -204,7 +204,7 @@ Every facet reads only GKE control-plane and node-pool metadata through `gcloud 
 #### 4.13 Database encryption, etcd CMEK (`database-encryption`)
 
 - **Read:** `.databaseEncryption.state` → `ENCRYPTED`/`DECRYPTED`, with an absent block `DECRYPTED`. Compare the state only — **never `keyName`**, which is region- and project-scoped and legitimately differs.
-- **Do NOT flag:** `ENCRYPTED` with an unreachable key — that is a health problem for a different audit, not consistency drift.
+- **Do NOT flag:** `ENCRYPTED` with an unreachable key — that is a health problem for a different audit, not consistency drift; `ENCRYPTED` against a `DECRYPTED` majority. Only the outlier whose etcd is unwrapped where its peers' is wrapped is a finding: the reverse would report the one cluster that got this right, and the only change that would close it is deleting its CMEK.
 - **Severity:** base `critical`.
 - **Impact:** application secrets in the outlier's etcd are not wrapped with the customer-managed key every peer uses.
 - **Remediation:** `gcloud` — `gcloud container clusters update … --database-encryption-key=<KEY>` (`# KEY must be created in the cluster's region and IAM-bound by a human first; do not reuse a peer's key`).

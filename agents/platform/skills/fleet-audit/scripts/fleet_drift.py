@@ -378,8 +378,12 @@ def _flag_ne(observed: str, baseline: str) -> bool:
     return observed != baseline
 
 
+# Every two-token facet spells "the control is not in force" one of two ways.
+_DEGRADED = frozenset({"OFF", "DECRYPTED"})
+
+
 def _flag_off_only(observed: str, baseline: str) -> bool:
-    return observed == "OFF" and baseline != "OFF"
+    return observed in _DEGRADED and baseline not in _DEGRADED
 
 
 def _flag_less_only(observed: str, baseline: str) -> bool:
@@ -424,12 +428,12 @@ FACETS: tuple[Facet, ...] = (
     Facet("secure-boot", ".nodePools[].config.shieldedInstanceConfig.enableSecureBoot", "major", True, False, norm_secure_boot, _flag_less_only),
     Facet("integrity-monitoring", ".nodePools[].config.shieldedInstanceConfig.enableIntegrityMonitoring", "minor", True, False, norm_integrity_monitoring, _flag_less_only),
     Facet("network-policy", ".networkConfig.datapathProvider / .networkPolicy.enabled", "major", False, False, norm_network_policy, _flag_off_only),
-    Facet("private-nodes", ".privateClusterConfig.enablePrivateNodes", "critical", False, False, norm_private_nodes, _flag_ne),
-    Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint / .controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint", "major", False, False, norm_private_endpoint, _flag_ne),
-    Facet("authorized-networks", ".masterAuthorizedNetworksConfig / .controlPlaneEndpointsConfig.ipEndpointsConfig.authorizedNetworksConfig", "critical", False, False, norm_authorized_networks, _flag_ne),
+    Facet("private-nodes", ".privateClusterConfig.enablePrivateNodes", "critical", False, False, norm_private_nodes, _flag_off_only),
+    Facet("private-endpoint", ".privateClusterConfig.enablePrivateEndpoint / .controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint", "major", False, False, norm_private_endpoint, _flag_off_only),
+    Facet("authorized-networks", ".masterAuthorizedNetworksConfig / .controlPlaneEndpointsConfig.ipEndpointsConfig.authorizedNetworksConfig", "critical", False, False, norm_authorized_networks, _flag_off_only),
     Facet("logging-components", ".loggingConfig.componentConfig.enableComponents", _logging_severity, False, False, norm_logging_components, _flag_not_superset),
     Facet("monitoring-components", ".monitoringConfig.componentConfig.enableComponents", "minor", False, False, norm_monitoring_components, _flag_not_superset),
-    Facet("managed-prometheus", ".monitoringConfig.managedPrometheusConfig.enabled", "minor", False, False, norm_managed_prometheus, _flag_ne),
+    Facet("managed-prometheus", ".monitoringConfig.managedPrometheusConfig.enabled", "minor", False, False, norm_managed_prometheus, _flag_off_only),
     Facet("binary-authorization", ".binaryAuthorization.evaluationMode", "major", False, False, norm_binary_authorization, _flag_off_only),
     Facet("node-autoprovisioning", ".autoscaling.enableNodeAutoprovisioning", "minor", True, False, norm_node_autoprovisioning, _flag_off_only),
     Facet("pool-autoscaling", ".nodePools[].autoscaling.enabled", "minor", True, False, norm_pool_autoscaling, _flag_less_only),
@@ -437,7 +441,7 @@ FACETS: tuple[Facet, ...] = (
     Facet("datapath-provider", ".networkConfig.datapathProvider", "major", False, True, norm_datapath_provider, _flag_ne),
     Facet("label-keys", ".resourceLabels", "minor", False, False, norm_label_keys, _flag_not_superset),
     Facet("image-type", ".nodePools[].config.imageType", "minor", True, False, norm_image_type, _flag_not_superset),
-    Facet("database-encryption", ".databaseEncryption.state", "critical", False, False, norm_database_encryption, _flag_ne),
+    Facet("database-encryption", ".databaseEncryption.state", "critical", False, False, norm_database_encryption, _flag_off_only),
 )
 FACETS_BY_SLUG = {f.slug: f for f in FACETS}
 

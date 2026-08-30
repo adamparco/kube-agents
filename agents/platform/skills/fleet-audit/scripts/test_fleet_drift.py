@@ -322,6 +322,41 @@ class FacetNormalizeTest(unittest.TestCase):
         self.assertEqual((base, out), ("OFF", "ON"))
         self.assertFalse(flagged)
 
+    # The same asymmetry on the facets whose SOP impact accuses the outlier of
+    # exposure (4.5), missing telemetry (4.6), or unwrapped etcd (4.13). Each
+    # offers only an enable-the-control remediation, so flagging the hardened
+    # side would report the one cluster that got it right and leave "weaken it
+    # to match your peers" as the only recommendation that closes the finding.
+
+    def test_hardened_outlier_is_never_flagged_against_a_lax_majority(self):
+        for slug, lax, hardened in (
+            ("private-nodes", "OFF", "ON"),
+            ("private-endpoint", "OFF", "ON"),
+            ("authorized-networks", "OFF", "ON"),
+            ("managed-prometheus", "OFF", "ON"),
+            ("database-encryption", "DECRYPTED", "ENCRYPTED"),
+        ):
+            with self.subTest(slug=slug):
+                should_flag = fd.FACETS_BY_SLUG[slug].should_flag
+                self.assertFalse(should_flag(hardened, lax), "%s flagged the hardened side" % slug)
+                self.assertTrue(should_flag(lax, hardened), "%s missed the degraded side" % slug)
+
+    def test_database_encryption_decrypted_against_encrypted_majority_is_flagged(self):
+        base, out, flagged = self.hit(
+            "database-encryption",
+            cluster("c", databaseEncryption={"state": "ENCRYPTED"}),
+            {"databaseEncryption": {"state": "DECRYPTED"}},
+        )
+        self.assertEqual((base, out), ("ENCRYPTED", "DECRYPTED"))
+        self.assertTrue(flagged)
+
+    def test_only_neutral_facets_still_compare_both_directions(self):
+        # release-channel, intra-node-visibility and datapath-provider describe
+        # a difference rather than a loss, so _flag_ne is right for them and
+        # wrong everywhere else. Pin the membership so a new facet has to choose.
+        bidirectional = {f.slug for f in fd.FACETS if f.should_flag is fd._flag_ne}
+        self.assertEqual(bidirectional, {"release-channel", "intra-node-visibility", "datapath-provider"})
+
     def test_network_policy_dpv2_vs_calico_is_never_flagged(self):
         base = "DPV2"
         outlier = "CALICO"
