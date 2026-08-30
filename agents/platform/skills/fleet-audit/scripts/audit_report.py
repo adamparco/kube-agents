@@ -2739,7 +2739,18 @@ def coverage_gaps(data: dict) -> list[str]:
             )
         if limitation:
             reasons.append(limitation)
-        gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
+        # "partially" is a claim about how much ran, and when nothing ran it
+        # reads as reassurance. Drift excludes a cluster under 24h old from
+        # every cohort, so all fourteen of its checks are missing and thirteen
+        # of sixteen clusters reported "partially audited — 14 of 14 applicable
+        # checks did not run": a stream that assessed nothing, described in the
+        # words of one that mostly succeeded.
+        extent = (
+            "not audited"
+            if missing and len(missing) == len(applicable)
+            else "partially audited"
+        )
+        gaps.append(f"{name}: {extent} — {'; '.join(reasons)}")
     gaps.extend(_unenumerated_kind_gaps(audit_id, scope.get("clusters") or []))
     return gaps
 

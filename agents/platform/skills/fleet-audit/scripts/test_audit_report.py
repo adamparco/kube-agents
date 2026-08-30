@@ -8580,6 +8580,50 @@ class TestCoverageGaps(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("partially audited", gaps[0])
 
+    def test_a_target_that_ran_nothing_is_not_called_partially_audited(self):
+        """"Partially" describes how much ran, and nothing ran.
+
+        `fleet-consistency-drift` excludes a cluster under 24h old from every
+        cohort, so every one of its comparative checks is missing. Thirteen of
+        sixteen clusters reported "partially audited — 14 of 14 applicable
+        checks did not run" — a stream that assessed nothing, in the words of
+        one that mostly succeeded.
+        """
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                clusters=[
+                    {
+                        "name": "drift-peer-std-1",
+                        "location": "us-east4-a",
+                        "project": "acme-prod",
+                        "checks_run": [],
+                        "limitations": "under 24h, excluded from every cohort",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("drift-peer-std-1: not audited —", gaps[0])
+        self.assertNotIn("partially audited", gaps[0])
+
+    def test_a_target_that_ran_some_checks_is_still_partially_audited(self):
+        roster = audit_report.audit_checks(AUDIT)
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                clusters=[
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": list(roster[:2]),
+                    }
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("partially audited", gaps[0])
+        self.assertNotIn("not audited", gaps[0])
+
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
 
