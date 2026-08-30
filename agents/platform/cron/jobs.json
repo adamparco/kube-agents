@@ -11,7 +11,7 @@
       "prompt": "Run the daily fleet security and RBAC posture audit. Run the collector (`skills/fleet-audit/scripts/collect.py compliance-audit`) first, redirecting its stdout to /opt/data/scratch/manifest_compliance-audit.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/compliance_audit_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "obtainability-audit",
@@ -24,7 +24,7 @@
       "prompt": "Run the daily workload reliability audit. Run the collector (`skills/fleet-audit/scripts/collect.py obtainability-audit`) first, redirecting its stdout to /opt/data/scratch/manifest_obtainability-audit.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/obtainability_audit_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "security-patch-orchestrator",
@@ -37,7 +37,7 @@
       "prompt": "Run the weekly GKE upgrade and patch readiness audit. Run the collector (`skills/fleet-audit/scripts/patch_readiness.py`) first, redirecting its stdout to /opt/data/scratch/manifest_security-patch-orchestrator.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "fleet-wide-cost-analysis",
@@ -50,7 +50,7 @@
       "prompt": "Run the weekly fleet waste audit. Run the collector (`/opt/hermes/.venv/bin/python3 skills/fleet-audit/scripts/fleet_waste.py`) first — that interpreter, not a bare `python3`, which cannot import the `google-auth` the overrequest check needs — redirecting its stdout to /opt/data/scratch/manifest_fleet-wide-cost-analysis.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "fleet-consistency-drift",
@@ -63,7 +63,7 @@
       "prompt": "Run the weekly fleet consistency drift audit. Run the collector (`skills/fleet-audit/scripts/fleet_drift.py`) first, redirecting its stdout to /opt/data/scratch/manifest_fleet-consistency-drift.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every facet in the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "ai-security-audit",
@@ -76,7 +76,7 @@
       "prompt": "Run the daily AI workload security audit. Run the collector (`skills/fleet-audit/scripts/collect.py ai-security-audit`) first, redirecting its stdout to /opt/data/scratch/manifest_ai-security-audit.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/ai_security_audit_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. The discriminator for which workloads count as AI workloads still applies; on a cluster running none, the six checks still ran and matched nothing, so record all six in checks_run with the collector's own command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "stockout-prevention",
@@ -89,7 +89,7 @@
       "prompt": "Run the daily fleet stockout prevention and capacity audit. Run the collector (`skills/fleet-audit/scripts/fleet_stockout.py`) first, redirecting its stdout to /opt/data/scratch/manifest_stockout-prevention.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/stockout_prevention_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found, for the two sub-conditions it names as yours to check by hand, and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "gcp-networking-fabric-audit",
@@ -117,7 +117,7 @@
       "no_agent": true,
       "script": "github_scan_gate.py",
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "eod-event-watcher-daily-report",
@@ -132,7 +132,7 @@
       "no_agent": true,
       "script": "eod_report_generator.py",
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     }
   ]
 }

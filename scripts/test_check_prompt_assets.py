@@ -753,6 +753,94 @@ class RepositoryTests(unittest.TestCase):
             )
 
 
+class CronDeliveryTests(unittest.TestCase):
+    """A scheduled job that reports `ok` and posts nowhere.
+
+    `deliver: "chat"` was on nine of ten platform jobs. It is a real registered
+    platform with no home channel, so the scheduler resolved it to no target and
+    delivered nothing, while the run recorded `last_status: ok` and
+    `last_delivery_error: None`. Nothing in the repository objected.
+    """
+
+    def _findings(self, *jobs):
+        roster = [(REPO / "agents/platform/cron/jobs.json", list(jobs))]
+        with mock.patch.object(cpa, "REPO", REPO), mock.patch.object(
+            cpa, "cron_rosters", return_value=roster
+        ):
+            return cpa.check_cron_delivery()
+
+    def test_a_platform_with_no_home_channel_is_caught(self):
+        findings = self._findings({"id": "compliance-audit", "deliver": "chat"})
+        self.assertEqual(len(findings), 1, findings)
+        message = str(findings[0])
+        self.assertIn("compliance-audit", message)
+        self.assertIn("'chat'", message)
+        self.assertIn("post", message.lower())
+
+    def test_the_values_that_mean_something_all_pass(self):
+        for deliver in ("all", "local", "origin", "slack", "google_chat"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
+
+    def test_an_explicit_target_names_its_own_destination(self):
+        """`platform:chat_id` carries an install-specific id. Nothing to check."""
+        self.assertEqual(
+            self._findings({"id": "j", "deliver": "slack:D0BKGRBM6RH:17"}), []
+        )
+
+    def test_every_part_of_a_comma_separated_list_is_checked(self):
+        """One good part must not vouch for a bad one.
+
+        This is the shape the bug would most plausibly come back in: someone
+        adds `all` alongside the value that was already there.
+        """
+        findings = self._findings({"id": "j", "deliver": "all,chat"})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("'chat'", str(findings[0]))
+
+    def test_a_list_is_flattened_the_way_the_scheduler_flattens_it(self):
+        """`_normalize_deliver_value` accepts a list, so reading one is not a bug.
+
+        Reporting the shape rather than the value would send someone to fix
+        something the scheduler runs happily.
+        """
+        self.assertEqual(self._findings({"id": "j", "deliver": ["all"]}), [])
+        self.assertEqual(len(self._findings({"id": "j", "deliver": ["chat"]})), 1)
+
+    def test_an_absent_deliver_is_local_and_not_a_finding(self):
+        self.assertEqual(self._findings({"id": "j"}), [])
+
+    def test_the_rosters_in_this_tree_all_deliver_somewhere(self):
+        with mock.patch.object(cpa, "REPO", REPO):
+            self.assertEqual(cpa.check_cron_delivery(), [])
+
+    def test_every_scheduled_audit_reaches_a_home_channel(self):
+        """`local` passes the rule above and would silence the fleet audits.
+
+        The rule cannot object to `local` in general -- the Chat Agent's roster
+        uses it deliberately -- so the audits state their own requirement here.
+        A scheduled audit exists to put a line in the home channel; one set to
+        `local` still runs, still writes its report, and still tells nobody.
+        """
+        with mock.patch.object(cpa, "REPO", REPO):
+            rosters = cpa.cron_rosters()
+        # By the skill it loads, not by a naming convention: three of the eight
+        # streams end in neither `-audit` nor `-analysis`, so matching on the id
+        # would have quietly graded five of them.
+        audits = {
+            job["id"]: job.get("deliver", "local")
+            for _, roster in rosters
+            for job in roster
+            if "fleet-audit" in (job.get("skills") or [])
+        }
+        self.assertGreaterEqual(len(audits), 8, f"audit discovery has narrowed: {audits}")
+        for audit, deliver in sorted(audits.items()):
+            with self.subTest(audit=audit):
+                self.assertNotIn(
+                    "local", str(deliver), f"{audit} runs and tells nobody"
+                )
+
+
 class ProfileIsolationTests(unittest.TestCase):
     """Skills belong to one profile; a merged namespace hides two failures."""
 

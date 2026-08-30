@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Four checks, all offline and standard library only:
+Five checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -29,6 +29,8 @@ Four checks, all offline and standard library only:
     the loadable name disagree.
 ``cron-asset``
     Every cron prompt sends the worker to an SOP that exists.
+``cron-deliver``
+    Every cron job's ``deliver`` names somewhere a message can actually go.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
@@ -714,6 +716,62 @@ def check_cron_assets() -> list[Finding]:
     return findings
 
 
+# Where a cron job may send its result. `deliver` is a comma-separated list of
+# these, and the scheduler resolves each part at fire time.
+#
+# `all` is a routing token: it expands to every platform that has a home channel
+# configured on *this* install, so a roster carrying it needs no edit when a
+# channel is added. A bare platform name binds to that one platform's home
+# channel and delivers nothing if it is unset. `origin` answers wherever the job
+# was created from, and `local` is the explicit "keep it, send nothing".
+CRON_DELIVER_VALUES = frozenset({"all", "origin", "local", "slack", "google_chat"})
+
+
+def check_cron_delivery() -> list[Finding]:
+    """A scheduled job that reports `ok` and posts nowhere is the failure here.
+
+    `deliver: "chat"` sat in this roster on nine of ten jobs. It reads like the
+    obvious value and it is a real registered platform, so nothing rejected it;
+    but it is not the Google Chat platform, its home channel is unset, and
+    `_resolve_single_delivery_target` returns None for a platform with no
+    chat_id. The scheduler treats that as "no target" rather than as an error,
+    so every one of those jobs ran green for weeks with `last_status: ok` and
+    `last_delivery_error: None` while the audits they published reached nobody.
+    The one job still set to `all` was the only one anyone ever saw, which read
+    as that job being special rather than as the other nine being broken.
+
+    Nothing offline can know which home channels a given install configures, so
+    this does not try. It asks the cheaper question that would have caught it:
+    is this a value we have decided means something? Adding a platform is then a
+    one-line edit to `CRON_DELIVER_VALUES` -- which is the review moment the
+    silent version never had.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            deliver = job.get("deliver", "local")
+            # The scheduler accepts a list and flattens it; so do we, rather
+            # than reporting a shape it would have run happily.
+            parts = deliver if isinstance(deliver, (list, tuple)) else str(deliver).split(",")
+            for part in (str(p).strip() for p in parts):
+                # `platform:chat_id[:thread]` names its target outright, and the
+                # id is install-specific -- there is nothing here to check.
+                if not part or ":" in part or part in CRON_DELIVER_VALUES:
+                    continue
+                findings.append(
+                    Finding(
+                        "cron-deliver",
+                        str(rel),
+                        f"job {job['id']!r} delivers to {part!r}, which is not a "
+                        f"known target ({', '.join(sorted(CRON_DELIVER_VALUES))} "
+                        "or platform:chat_id) -- the run will report ok and post "
+                        "nowhere",
+                    )
+                )
+    return findings
+
+
 def _nearest(name: str, owned: dict[str, Path]) -> str | None:
     """The closest real skill name, for the common single-character slips."""
     matches = difflib.get_close_matches(name, sorted(owned), n=1, cutoff=0.85)
@@ -768,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_skill_refs(files, skills)
         + check_skill_manifests(skills)
         + check_cron_assets()
+        + check_cron_delivery()
     )
     if findings:
         print(
