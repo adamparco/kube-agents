@@ -115,7 +115,7 @@ This is the tested, procedural implementation of every check below — see the f
 - Every entry in a `"collected"` cluster's `candidates` is a verified finding: `check`, `cluster`, `namespace`, `object`, `severity`, and `excerpt` are already computed. What is not computed — and is still yours to write — is the `recommendation` (§4) and, for a `kind: manifest` remediation, the manifest file itself (§3's declaration rule).
 - Pass `--manifest-file <path>` to `finish` (§5) so it cross-checks your `checks_run` against what the collector actually ran — a check you claim ran on a `"collected"` cluster with no matching manifest command is rejected before publication, not after.
 
-**A cluster the collector covered is not a cluster you query again.** The commands under each check below exist for the `"unreachable"`/`"gate-failed"` fallback and for confirming a candidate's evidence — never for re-deriving a verdict the manifest already gives you.
+**A cluster the collector covered is not a cluster you query again.** The commands under each check below exist for the `"unreachable"`/`"gate-failed"` fallback — never for confirming a candidate the collector already produced, whose evidence `finish` takes from the collector's manifest, and never for re-deriving a verdict the manifest already gives you.
 
 This is the fleet-wide system-namespace set, and it is canonical — the cost and reliability SOPs' own namespace exclusions are derived from this pattern, so a namespace added here has to be added there too:
 

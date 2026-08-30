@@ -88,7 +88,7 @@ This is the tested, procedural implementation of every check in Step 3 — see t
 - Every entry in a `"collected"` cluster's `candidates` is a verified finding: `check`, `cluster`, `namespace`, `object`, `severity`, and `excerpt` are already computed, including the Autopilot severity downgrade on 3.1/3.2. What is not computed — and is still yours to write — is the `recommendation` (Step 4) and, for a `kind: manifest` remediation, the manifest file itself (Step 3.5's declaration rule).
 - Pass `--manifest-file <path>` to `finish` (Step 6) so it cross-checks your `checks_run` against what the collector actually ran — a check you claim ran on a `"collected"` cluster with no matching manifest command is rejected before publication, not after.
 
-**A cluster the collector covered is not a cluster you dump or query again.** The manual dump command in Step 1 and the per-check reads below exist for the `"unreachable"`/`"gate-failed"` fallback and for confirming a candidate's evidence (Step 3's evidence discipline) — never for re-deriving a verdict the manifest already gives you.
+**A cluster the collector covered is not a cluster you dump or query again.** The manual dump command in Step 1 and the per-check reads below exist for the `"unreachable"`/`"gate-failed"` fallback — never for confirming a candidate the collector already produced, whose evidence `finish` takes from the collector's manifest, and never for re-deriving a verdict the manifest already gives you.
 
 ### 3. Checks
 
@@ -100,7 +100,7 @@ This is the tested, procedural implementation of every check in Step 3 — see t
 - **S4 — explicit opt-out:** the workload carries `kubeagents.x-k8s.io/reliability-audit: exempt` as a label or annotation.
 - **S5 — not running:** `spec.replicas == 0`, or the workload is a Job/CronJob or is owned by one.
 
-**Evidence discipline.** The dump is the _detector_; a live single-object read is the _confirmer_. For every candidate finding, run the object-scoped command below, capture a trimmed excerpt, and store that exact string in `evidence.command`. If the confirm command fails or the condition no longer holds, **drop the finding — do not soften it.**
+**Evidence discipline for the manual fallback.** The dump is the _detector_; a live single-object read is the _confirmer_. For a candidate you could not get from the collector, run the object-scoped command below, capture a trimmed excerpt, and store that exact string in `evidence.command`. If the confirm command fails or the condition no longer holds, **drop the finding — do not soften it.** A candidate the collector _did_ produce needs no confirm read: `finish` replaces both evidence fields with the collector's computed pair before publishing, so the object-scoped command you ran is not the one the ledger shows. Fill the two fields from the manifest instead — the candidate's own `excerpt`, and the `commands` entry for that check on that cluster — and the document says what the ledger will.
 
 ```bash
 KUBECONFIG=$KC kubectl get <kind> -n <ns> <name> -o yaml
