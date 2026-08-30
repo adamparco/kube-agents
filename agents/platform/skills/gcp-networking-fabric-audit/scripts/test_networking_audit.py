@@ -395,6 +395,39 @@ class CollectProjectTest(unittest.TestCase):
             {na_entry["check"] for na_entry in s1["checks_not_applicable"]},
         )
 
+    def test_an_unmeasured_subnet_carries_the_limitation_finish_will_ask_for(self):
+        # An unmeasured subnet owes one check and has it declared
+        # not-applicable, so §6 filters its `checks_run` down to []. `finish`
+        # rejects an empty `checks_run` unless that target says in
+        # `limitations` why nothing ran, and the model writing that sentence is
+        # what produced three different restatements across three live runs.
+        # Emitting it here makes the wording the collector's, not a model's.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        self.assertEqual(s2["limitations"], na.UNMEASURED_SUBNET_LIMITATION)
+        self.assertIn("subnet-ip-exhaustion", s2["limitations"])
+        # The measured subnet ran its check, so a limitation there would put a
+        # target that refused nothing into `coverage_gaps` and make the run
+        # partial.
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertNotIn("limitations", s1)
+        # Provenance is unchanged: the unmeasured subnet still records the pair
+        # of reads that established it as unmeasured. Dropping the command is
+        # the tempting way to clear the same `finish` rejection, and it would
+        # hand the reader a target with no evidence of having been looked at.
+        self.assertEqual(
+            [c["check"] for c in s2["commands"]], ["subnet-ip-exhaustion"]
+        )
+
     def test_an_insight_that_covers_nothing_is_a_gap(self):
         # Reads cleanly, publishes nothing that matches. Distinct from the
         # read failing, and the message has to say so -- Network Analyzer
@@ -726,6 +759,138 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         }
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(data, manifest)
+
+    def _fleet_with_one_unmeasured_subnet(self):
+        """One subnet Network Analyzer measured, one it did not — the auto-mode
+        shape, 1-of-2 here and 1-of-42 on the live fleet. Utilization is well
+        under the threshold so the run carries no findings and the assertions
+        below are about coverage alone."""
+        insight = (
+            '[{"content": {"ipUtilizationSummaryInfo": [{'
+            '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+            '"networkStats": [{'
+            '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+            '"subnetStats": [{'
+            '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"subnetRangeStats": [{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}]'
+            "}]}]}]}}]"
+        )
+        subnets = (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20"}, '
+            '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "subnets list-usable" in joined:
+                return run_of(0, subnets)
+            if "recommender insights list" in joined:
+                return run_of(0, insight)
+            return run_of(0, "[]")
+
+        return na.collect_fleet("proj-1", run=run)
+
+    @staticmethod
+    def _scope_entry(entry: dict) -> dict:
+        """§2's rule, applied literally: copy `commands` minus any slug this
+        same target declares not-applicable, and carry the collector's
+        `checks_not_applicable` and `limitations` through untouched."""
+        na_slugs = {d["check"] for d in entry.get("checks_not_applicable") or []}
+        out = {
+            "name": entry["name"],
+            "location": entry["location"],
+            "project": entry["project"],
+            "checks_run": [
+                {"check": c["check"], "command": c["command"]}
+                for c in entry["commands"]
+                if c["check"] not in na_slugs
+            ],
+            "checks_not_applicable": entry.get("checks_not_applicable") or [],
+        }
+        if entry.get("limitations"):
+            out["limitations"] = entry["limitations"]
+        return out
+
+    def test_the_section_two_recipe_publishes_on_the_first_attempt(self):
+        # The daily failure, end to end. Both halves of §2's rule are needed:
+        # the not-applicable filter, or `cross_check_manifest` refuses the
+        # claim; and the collector's `limitations`, or `validate_findings`
+        # refuses the empty `checks_run` the filter leaves behind.
+        import audit_report
+
+        manifest = self._fleet_with_one_unmeasured_subnet()
+        s1 = next(c for c in manifest["clusters"] if c["name"].endswith("/s1"))
+        s2 = next(c for c in manifest["clusters"] if c["name"].endswith("/s2"))
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/proj-1")
+        self.assertEqual(s2["limitations"], na.UNMEASURED_SUBNET_LIMITATION)
+
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {
+                "clusters": [self._scope_entry(e) for e in (s1, s2, project)],
+                "skipped": [],
+            },
+            "findings": [],
+        }
+        # The measured subnet still reports its check; the unmeasured one
+        # reports none, which is the shape that used to need a second attempt.
+        self.assertEqual([c["check"] for c in data["scope"]["clusters"][0]["checks_run"]],
+                         ["subnet-ip-exhaustion"])
+        self.assertEqual(data["scope"]["clusters"][1]["checks_run"], [])
+
+        audit_report.cross_check_manifest(data, manifest)
+        audit_report.validate_findings(data, "gcp-networking-fabric-audit")
+        # And the run is not partial. The unmeasured subnet refused no check
+        # its roster still owed, so it is not a coverage gap — if this starts
+        # returning the limitation, every auto-mode fleet goes permanently
+        # partial and the ledger can never close.
+        self.assertEqual(audit_report.coverage_gaps(data), [])
+
+    def test_copying_commands_verbatim_is_the_rejection_section_two_now_avoids(self):
+        # §2 used to say "copy its `commands` list verbatim". On an unmeasured
+        # subnet that claims IP-exhaustion coverage nobody has, and it is the
+        # first of the two rejections the live run paid every morning.
+        import audit_report
+
+        manifest = self._fleet_with_one_unmeasured_subnet()
+        s2 = next(c for c in manifest["clusters"] if c["name"].endswith("/s2"))
+        # Every collected target has to appear or a different rule fires
+        # first — only s2's `checks_run` is the unfiltered copy under test.
+        clusters = [self._scope_entry(e) for e in manifest["clusters"]]
+        verbatim = next(c for c in clusters if c["name"].endswith("/s2"))
+        verbatim["checks_run"] = [
+            {"check": c["check"], "command": c["command"]} for c in s2["commands"]
+        ]
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {"clusters": clusters, "skipped": []},
+            "findings": [],
+        }
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(data, manifest)
+        self.assertIn("subnet-ip-exhaustion", str(caught.exception))
+
+    def test_filtering_without_the_limitation_is_the_second_rejection(self):
+        # And the other half. Dropping the collector's `limitations` — by
+        # rewording it to nothing, or by a future collector not emitting it —
+        # leaves an empty `checks_run` that reads as "read it, checked
+        # nothing", which is the rejection the run paid on its second attempt.
+        import audit_report
+
+        manifest = self._fleet_with_one_unmeasured_subnet()
+        s2 = next(c for c in manifest["clusters"] if c["name"].endswith("/s2"))
+        stripped = self._scope_entry(s2)
+        stripped.pop("limitations")
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {"clusters": [stripped], "skipped": []},
+            "findings": [],
+        }
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.validate_findings(data, "gcp-networking-fabric-audit")
+        self.assertIn("checks_run", str(caught.exception))
 
 
 if __name__ == "__main__":

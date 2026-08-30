@@ -74,6 +74,18 @@ SUBNET_SCOPE_NOT_APPLICABLE = (
 PROJECT_SCOPE_NOT_APPLICABLE = (
     ("subnet-ip-exhaustion", "Subnet IP capacity is audited per individual subnet scope entry."),
 )
+# An unmeasured subnet owes exactly one check and could not run it, so §6's
+# `checks_run` comes out empty for it -- and `finish` rejects an empty
+# `checks_run` unless the target says in `limitations` why nothing ran. The
+# collector writes that sentence rather than leaving it to the model: three
+# live runs over the same 41 subnets produced three different restatements of
+# the same fact, which is what audit_report's `_limitation_restates_na` and the
+# structural rule above it were both written to absorb.
+UNMEASURED_SUBNET_LIMITATION = (
+    "subnet-ip-exhaustion, the only check this target owes, could not be "
+    "evaluated: neither `list-usable` nor Network Analyzer published an "
+    "IP-utilization figure for this subnet. It was enumerated, not measured."
+)
 
 SEVERITY = {
     "subnet-ip-exhaustion": "critical",
@@ -636,17 +648,24 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                 }
             )
         hit = check_subnet_ip_exhaustion(item) if measured else None
-        out.append(
-            {
-                "name": f"{project}/{region}/{name}",
-                "project": project,
-                "location": region,
-                "outcome": "collected",
-                "commands": [{"check": "subnet-ip-exhaustion", **record}],
-                "candidates": [_emit("subnet-ip-exhaustion", hit)] if hit else [],
-                "checks_not_applicable": not_applicable,
-            }
-        )
+        entry = {
+            "name": f"{project}/{region}/{name}",
+            "project": project,
+            "location": region,
+            "outcome": "collected",
+            # Recorded on every subnet, measured or not. A `commands` entry
+            # says the *command* ran, not that the check reached a verdict --
+            # and this pair of reads is exactly what established the unmeasured
+            # ones as unmeasured. §6 is where that distinction gets applied:
+            # the slug declared not-applicable above is dropped from
+            # `checks_run` there, not hidden from provenance here.
+            "commands": [{"check": "subnet-ip-exhaustion", **record}],
+            "candidates": [_emit("subnet-ip-exhaustion", hit)] if hit else [],
+            "checks_not_applicable": not_applicable,
+        }
+        if not measured:
+            entry["limitations"] = UNMEASURED_SUBNET_LIMITATION
+        out.append(entry)
     return out
 
 
