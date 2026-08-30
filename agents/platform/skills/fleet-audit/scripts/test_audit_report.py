@@ -6166,9 +6166,18 @@ class TestReportStore(HarnessTestCase):
         """
         seeded = self.seed_store(make_doc())
         self.harness.replies = {"issue list": self.issue_list()}
+        # Gapped on the seeded finding's own cluster: the run cannot vouch for
+        # its absence, so it stores no resolution against it.
         doc = make_doc(
             findings=[],
-            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+            clusters=[
+                {
+                    "name": "stage-eu",
+                    "location": "europe-west1",
+                    "project": "acme-stage",
+                }
+            ],
+            skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}],
         )
         self.assertEqual(self.run_finish(doc), 0)
 
@@ -8990,6 +8999,55 @@ class TestCoverageGaps(unittest.TestCase):
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
 
+    def test_gap_targets_name_the_cluster_each_gap_is_about(self):
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(audit_report.coverage_gap_targets(doc), {"dr-west"})
+
+    def test_a_complete_run_blocks_no_target(self):
+        self.assertEqual(audit_report.coverage_gap_targets(make_doc()), set())
+
+    def test_a_kind_nobody_enumerated_blocks_the_whole_stream(self):
+        """`None`, not a set: the stranded checks ran against no target at all.
+
+        A subnet check in a run that produced no subnet entries is owed by
+        nobody, so there is no target name to hang it on and nothing may be
+        called resolved on the strength of it.
+        """
+        doc = make_doc(
+            findings=[],
+            audit="gcp-networking-fabric-audit",
+            clusters=[
+                {"name": "project/acme-prod", "location": "-", "project": "acme-prod"}
+            ],
+        )
+        self.assertIsNone(audit_report.coverage_gap_targets(doc))
+
+    def test_only_findings_on_a_blocked_target_are_held_back(self):
+        memory = {
+            "document": {
+                "findings": [
+                    {"id": "a", "cluster": "dr-west"},
+                    {"id": "b", "cluster": "prod-us-east"},
+                ]
+            }
+        }
+        self.assertEqual(
+            audit_report.unverifiable_findings(memory, {"dr-west"}), {"a"}
+        )
+        self.assertEqual(audit_report.unverifiable_findings(memory, set()), set())
+        # `None` is the widest answer, not the absence of one.
+        self.assertEqual(
+            audit_report.unverifiable_findings(memory, None), {"a", "b"}
+        )
+
+    def test_a_finding_with_no_readable_target_is_held_whenever_anything_is(self):
+        memory = {"document": {"findings": [{"id": "a", "cluster": ""}]}}
+        self.assertEqual(audit_report.unverifiable_findings(memory, {"dr-west"}), {"a"})
+        self.assertEqual(audit_report.unverifiable_findings(memory, set()), set())
+
     def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
         """The gap prose cannot catch a run that never admits to one."""
         gaps = audit_report.coverage_gaps(
@@ -10416,9 +10474,13 @@ class TestPartialCoverageGating(HarnessTestCase):
 
     def test_a_partial_run_announces_nothing_as_resolved(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        gone = derived_id(fid="gone", obj="Namespace/gone")
+        # The vanished finding sits on the cluster the run could not read, so
+        # its absence is "not checked" rather than "fixed".
+        gone = derived_id(fid="gone", obj="Namespace/gone", cluster="dr-west")
         self.seed_store(
-            make_doc(findings=[make_finding(fid="gone"), make_finding()])
+            make_doc(
+                findings=[make_finding(fid="gone", cluster="dr-west"), make_finding()]
+            )
         )
         self.harness.replies = {"issue list": self.issue_list()}
         self.run_finish(make_doc(skipped=self.PARTIAL))
@@ -10431,6 +10493,60 @@ class TestPartialCoverageGating(HarnessTestCase):
         for comment in self.harness.bodies_for("issue", "comment"):
             self.assertNotIn(gone, comment)
             self.assertNotIn("resolved", comment.lower())
+
+    def test_a_gap_on_one_cluster_still_resolves_a_finding_on_another(self):
+        """The other half of the rule, and the reason it is scoped at all.
+
+        "The audit did not look" is true of a target, not of a stream. Read
+        stream-wide it meant one unreachable cluster stopped every *other*
+        cluster's fixes being announced — and a gap that never clears stopped
+        them permanently. `fleet-consistency-drift` sat like that for six
+        consecutive runs: gapped on `kube-agents-host` for want of an
+        `environment` label, with both of its live findings on other clusters
+        and no way to report either one fixed.
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id(fid="gone", obj="Namespace/gone")
+        self.seed_store(make_doc(findings=[make_finding(fid="gone"), make_finding()]))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(make_doc(skipped=self.PARTIAL))
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+        # Still partial: the gap is reported as loudly as ever, it just no
+        # longer speaks for clusters it is not about.
+        self.assertTrue(self.stdout_json()["partial"])
+        self.assertTrue(
+            any(gone in body for body in self.harness.bodies_for("issue", "comment"))
+        )
+
+    def test_a_gap_elsewhere_still_closes_a_stale_pull_request(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id(fid="gone", obj="Namespace/gone")
+        self.seed_store(make_doc(findings=[make_finding(fid="gone"), make_finding()]))
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr list": json.dumps(
+                [pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block([gone]))]
+            ),
+        }
+        self.run_finish(make_doc(skipped=self.PARTIAL))
+        self.assertTrue(self.harness.gh_calls("pr", "close"))
+
+    def test_a_gap_on_the_findings_own_cluster_keeps_its_pull_request_open(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id(fid="gone", obj="Namespace/gone", cluster="dr-west")
+        self.seed_store(
+            make_doc(
+                findings=[make_finding(fid="gone", cluster="dr-west"), make_finding()]
+            )
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr list": json.dumps(
+                [pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block([gone]))]
+            ),
+        }
+        self.run_finish(make_doc(skipped=self.PARTIAL))
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
 
     def test_a_truncated_body_is_not_a_coverage_gap(self):
         # `partial` used to be `bool(gaps) or rendered.partial`, which made

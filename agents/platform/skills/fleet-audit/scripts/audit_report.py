@@ -2765,8 +2765,13 @@ def manifest_paths(findings: list[dict]) -> list[str]:
     return sorted(paths)
 
 
-def coverage_gaps(data: dict) -> list[str]:
+def _coverage_gaps(data: dict) -> list[tuple[str | None, str]]:
     """Why this run cannot speak for the whole fleet, if it cannot.
+
+    Each gap is paired with the target it is about, or `None` when it is about
+    the stream — `coverage_gaps` drops the pairing and `coverage_gap_targets`
+    keeps it. The pairing is what stops one target's gap silencing resolution
+    accounting for every other target; see `unverifiable_findings`.
 
     Three different gaps, one consequence. A cluster in `scope.skipped` was
     never read; a cluster carrying `limitations` was read but not fully checked;
@@ -2794,7 +2799,7 @@ def coverage_gaps(data: dict) -> list[str]:
     """
     scope = data.get("scope") or {}
     audit_id = str(data.get("audit") or "")
-    gaps: list[str] = []
+    gaps: list[tuple[str | None, str]] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
         # Redacted here rather than at render time, unlike every other piece of
@@ -2802,7 +2807,7 @@ def coverage_gaps(data: dict) -> list[str]:
         # which redacts, and the run-summary JSON on stdout — which the agent
         # reads back and relays into chat, and which never sees a cell.
         reason = redact_secrets(entry.get("reason", "no reason given"))
-        gaps.append(f"{cluster}: not audited — {reason}")
+        gaps.append((cluster, f"{cluster}: not audited — {reason}"))
     for cluster in scope.get("clusters") or []:
         limitation = redact_secrets(cluster.get("limitations", "")).strip()
         name = str(cluster.get("name", "")).strip() or "(unnamed)"
@@ -2854,9 +2859,78 @@ def coverage_gaps(data: dict) -> list[str]:
             if missing and len(missing) == len(applicable)
             else "partially audited"
         )
-        gaps.append(f"{name}: {extent} — {'; '.join(reasons)}")
-    gaps.extend(_unenumerated_kind_gaps(audit_id, scope.get("clusters") or []))
+        gaps.append((name, f"{name}: {extent} — {'; '.join(reasons)}"))
+    # A kind nobody enumerated is nobody's gap in particular: the checks it
+    # stranded ran against no target at all, so there is no target to scope it
+    # to and it covers the stream.
+    gaps.extend(
+        (None, text)
+        for text in _unenumerated_kind_gaps(audit_id, scope.get("clusters") or [])
+    )
     return gaps
+
+
+def coverage_gaps(data: dict) -> list[str]:
+    """`_coverage_gaps` as the caller-facing list of reasons."""
+    return [text for _, text in _coverage_gaps(data)]
+
+
+def coverage_gap_targets(data: dict) -> set[str] | None:
+    """Which targets this run's gaps cover; `None` when one covers the stream.
+
+    `None` is not "no gaps" — it is the widest possible answer, and callers
+    read it as "every finding is unverifiable". An empty set is the narrow one:
+    the run has gaps against nothing, so nothing is held back.
+    """
+    targets: set[str] = set()
+    for name, _ in _coverage_gaps(data):
+        if name is None:
+            return None
+        targets.add(name)
+    return targets
+
+
+def unverifiable_findings(memory: dict | None, blocked: set[str] | None) -> set[str]:
+    """Findings the previous run published that this one could not re-check.
+
+    Absence is evidence of a fix only where the audit looked, and where it
+    looked is a *target*. Reading that stream-wide is what this replaces: one
+    subnet whose IP utilization Network Analyzer had not published yet, or one
+    cluster held out of every drift cohort for want of an `environment` label,
+    made the whole stream unable to announce any finding resolved or retire any
+    remediation pull request — permanently, because neither gap is the kind
+    that clears on its own. `fleet-consistency-drift` carried exactly that gap
+    on `kube-agents-host` for six consecutive runs while both of its live
+    findings sat on other clusters, so a fix to either could never have been
+    reported.
+
+    Scoped to the target rather than to the (target, check) pair, which would
+    be narrower still. A gap naming three unrun checks says nothing about the
+    other eight on that cluster — but a target is the unit a collector fails at
+    and the unit a gap is written about, and over-holding a finding is the
+    error that costs a reader nothing except silence.
+
+    Returned as ids so the caller can treat them the way the rest of the
+    harness already treats a finding that is still there: not resolved, not
+    announced, and not a reason to close a pull request.
+    """
+    if blocked is not None and not blocked:
+        return set()
+    document = (memory or {}).get("document")
+    findings = document.get("findings") if isinstance(document, dict) else None
+    if not isinstance(findings, list):
+        return set()
+    held: set[str] = set()
+    for finding in findings:
+        if not isinstance(finding, dict) or not finding.get("id"):
+            continue
+        # A finding whose target cannot be read is held whenever anything is:
+        # it cannot be shown to sit outside the gap, and claiming it fixed is
+        # the failure this whole function exists to prevent.
+        target = str(finding.get("cluster") or "").strip()
+        if blocked is None or not target or target in blocked:
+            held.add(str(finding["id"]))
+    return held
 
 
 def _limitation_restates_na(limitation: str, na: set, roster: tuple, reasons: object = ()) -> bool:
@@ -7373,6 +7447,24 @@ def handle_finish(args: argparse.Namespace) -> None:
     delta_known = existing_issue is None or memory is not None
     previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
     previous_titles = report_finding_titles(memory)
+    # Which of the previous run's findings this run is not entitled to call
+    # fixed. A waiver is stream-wide by definition — nothing was collected, so
+    # no target can be vouched for — and reaches `unverifiable_findings` as the
+    # `None` that holds everything back.
+    unverifiable = unverifiable_findings(
+        memory, None if waiver else coverage_gap_targets(data)
+    )
+    # A gap with no stored memory to scope it against. The run knows it missed
+    # something and has no way to say which findings sat there, so pull-request
+    # retirement falls back to the blanket rule it had before the scoping
+    # existed. Resolution needs no fallback: an unreadable memory is an empty
+    # `previous_ids`, and a run that remembers no findings announces none fixed.
+    coverage_unscopable = bool(gaps) and memory is None
+    if unverifiable:
+        log(
+            f"{len(unverifiable)} finding(s) sit on a target this run could not "
+            "cover; they are carried as still-present rather than resolved."
+        )
     # Before anything reads a title or renders a body: a finding whose evidence
     # is unchanged keeps the words the last run gave it, so an unchanged fleet
     # reads as unchanged instead of being re-described every morning.
@@ -7388,11 +7480,14 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
+        # `unverifiable` stands in for the current ids this branch does not
+        # have: a pull request whose finding this run could not re-check is not
+        # stale, and one whose target the run covered cleanly is.
         prs_closed = (
             []
-            if gaps
+            if coverage_unscopable
             else close_stale_remediation_prs(
-                repo, audit_id, remediation_prs, set(), previous_titles, {}, now
+                repo, audit_id, remediation_prs, unverifiable, previous_titles, {}, now
             )
         )
         if existing_issue:
@@ -7498,7 +7593,8 @@ def handle_finish(args: argparse.Namespace) -> None:
         # branch reaches by way of `delta_known`. The coverage guard still
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
-        clean_resolved = 0 if gaps else len(previous_ids)
+        clean_resolved_ids = [fid for fid in previous_ids if fid not in unverifiable]
+        clean_resolved = len(clean_resolved_ids)
         payload = {
             "status": "CLEAN",
             "issue_url": existing_url,
@@ -7552,7 +7648,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                     None if body_untouched and not delta_known else existing_issue
                 ),
                 new_ids=[],
-                resolved_ids=[] if gaps else previous_ids,
+                resolved_ids=clean_resolved_ids,
                 rendered_ids=previous_ids if body_untouched else [],
             ),
             now,
@@ -7620,6 +7716,12 @@ def handle_finish(args: argparse.Namespace) -> None:
         current_ids,
         all_previous_ids=sorted(previous_titles),
     )
+    # Filtered here, once, so everything downstream can read `resolved_ids` as
+    # "resolved" without re-deriving the coverage rule. A finding held back
+    # this way is not new either — it was in `previous_ids`, so `compute_delta`
+    # never offered it as new — and it reappears in the delta the moment its
+    # target is covered again and it is still gone.
+    resolved_ids = [fid for fid in resolved_ids if fid not in unverifiable]
     # What the published body's hidden block ends up carrying, and so what the
     # store records as this run's memory. The relink edit below can change it.
     published_ids = rendered.rendered_ids
@@ -7675,20 +7777,29 @@ def handle_finish(args: argparse.Namespace) -> None:
     comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now)
 
     # Retiring a pull request means asserting its finding no longer reproduces.
-    # Over incomplete coverage that assertion is unfounded, so nothing is
-    # closed and every open fix survives to the next complete run.
-    if gaps:
+    # Over a target this run could not cover that assertion is unfounded, so
+    # the finding is passed in as though it were still current and its pull
+    # request survives to the next run that does cover it.
+    if coverage_unscopable:
         prs_closed = []
         log(
-            "Coverage is partial, so no remediation pull request was closed as "
-            "stale; a fix cannot be retired on evidence the audit never gathered."
+            "Coverage is partial and there is no stored memory to say which "
+            "findings the gap covers, so no remediation pull request was closed "
+            "as stale; a fix cannot be retired on evidence the audit never "
+            "gathered."
         )
     else:
+        if unverifiable:
+            log(
+                f"{len(unverifiable)} finding(s) are on uncovered targets, so "
+                "their remediation pull requests stay open; a fix cannot be "
+                "retired on evidence the audit never gathered."
+            )
         prs_closed = close_stale_remediation_prs(
             repo,
             audit_id,
             remediation_prs,
-            set(current_ids),
+            set(current_ids) | unverifiable,
             previous_titles,
             {},
             now,
@@ -7776,10 +7887,10 @@ def handle_finish(args: argparse.Namespace) -> None:
             comment = render_delta_comment(
                 audit_id,
                 new_ids,
-                # Absence is only evidence of a fix when the audit looked. Over
-                # a coverage gap absence means "not checked", which is not a
-                # fix.
-                [] if gaps else resolved_ids,
+                # Absence is only evidence of a fix when the audit looked, and
+                # `resolved_ids` has already had the findings it did not look at
+                # taken out of it.
+                resolved_ids,
                 findings,
                 previous_titles,
                 now,
@@ -7791,7 +7902,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 log("No new or resolved findings; body refreshed without a comment.")
 
     reported_new = len(new_ids) if delta_known else 0
-    reported_resolved = 0 if (gaps or not delta_known) else len(resolved_ids)
+    reported_resolved = 0 if not delta_known else len(resolved_ids)
     payload = {
                 "status": status,
                 "issue_url": issue_url,
@@ -7834,9 +7945,10 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # explain it with.
                 #
                 # The two are not the same kind of incomplete. A coverage gap
-                # means the audit did not *look*, which is why it suppresses
-                # the resolved count and the stale-closes above: absence of a
-                # finding is not evidence of a fix. Truncation means it looked,
+                # means the audit did not *look*, which is why the findings on
+                # the target it names are held out of the resolved count and
+                # the stale-closes above: absence of a finding is not evidence
+                # of a fix. Truncation means it looked,
                 # found everything, and could not *print* it all — the counts
                 # in the title are still true, the delta block still lists
                 # exactly what the body rendered, and resolution accounting is
@@ -7861,7 +7973,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             now,
             issue_number=number,
             new_ids=new_ids if delta_known else [],
-            resolved_ids=[] if (gaps or not delta_known) else resolved_ids,
+            resolved_ids=[] if not delta_known else resolved_ids,
             rendered_ids=published_ids,
         ),
         now,

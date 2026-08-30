@@ -235,21 +235,28 @@ if and only if `coverage_gaps` is non-empty, and you can report from either.
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
 that _can_ apply to it is a fully covered cluster. Without that, a fleet of Autopilot clusters is
-permanently partial: the ledger never closes, `resolved` is pinned at `0`, and no stale remediation
-pull request is ever cleaned up.
+permanently partial: the ledger never closes, no finding on any of those clusters can ever be
+announced as resolved, and their remediation pull requests are never cleaned up.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
 about what the run may conclude changes. Coverage is the only thing `partial` tracks.
 
 A gap changes what the run is _allowed to conclude_, because a finding's absence from an unread
-cluster is not evidence that it was fixed. Over a partial run the harness:
+cluster is not evidence that it was fixed. It changes that **for the cluster the gap names**, not
+for the stream: one unreadable cluster does not stop the audit reporting a fix on the fifteen it
+did read. Over a partial run the harness:
 
-- reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
-- closes **no** remediation pull request as stale, so a fix survives to the next complete run;
+- holds back only the findings that sat on a gapped cluster — they stay in the ledger and out of
+  `resolved`, while a finding elsewhere that has genuinely gone away is still announced as fixed;
+- keeps **their** remediation pull requests open, so a fix survives to the next run that covers
+  that cluster, and closes the stale ones whose clusters this run did read;
 - does **not** close the ledger, even with zero findings — `status` is still `CLEAN`, but the issue
   stays open and gains a comment naming the gaps. The stream self-heals the day the fleet is fully
   readable again.
+
+Two gaps are wider than one cluster and hold everything back: a waived collector manifest, and a
+gap that belongs to no target at all — a whole kind of object nobody enumerated.
 
 A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
 and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
@@ -346,6 +353,7 @@ field, and publishes nothing:
 - `checks_run` is **required on every cluster** (the example above shows three entries per cluster
   for brevity; a real run carries one per check it ran). Each entry is an object with two required
   fields:
+
   - **`check`** — the backticked slug from the SOP heading that defines it (`netpol-missing`, not
     "2.6" and not prose). An unknown slug or a duplicate is rejected.
   - **`command`** — the literal invocation you issued on that cluster for that check, with its
@@ -361,6 +369,7 @@ field, and publishes nothing:
 
 - `checks_not_applicable` is **optional**, and says which checks the cluster's shape rules out.
   Each entry is an object with two required fields:
+
   - **`check`** — the same slugs `checks_run` uses. An unknown slug, a duplicate, or a slug that
     also appears in this cluster's `checks_run` is rejected: a check either ran or could not.
   - **`reason`** — why the check _cannot_ apply here, naming the property of the cluster that rules
