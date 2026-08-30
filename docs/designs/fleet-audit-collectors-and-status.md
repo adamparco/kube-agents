@@ -367,6 +367,21 @@ real pod reaches, and each makes a claim _more_ stealable, never less:
    holder it actually observed — but it means a returned nonce is not by itself proof of
    ownership when two operators fire at once. One at a time, or read the claim back.
 
+**A run that re-enters is resumed, not refused.** Every cover above asks whether a claim is dead.
+None asks whether it is the caller's _own_, and that is the case that reached production: a long
+audit's context is compacted, the agent re-reads the skill from the top, and calls `start` a second
+time inside the same run. The claim is alive — correctly — so `start` refused, and the refusal
+named `--steal-lock`, which the agent then used on itself. It happened twice, both about twenty
+minutes into a run, each leaving a steal token whose nonce names a claim the same container had
+written. So the claim now records the cron session that wrote it (`HERMES_SESSION_ID`), and
+`handle_start` looks for its own before taking the lock: on a match the run keeps its lock, its
+workspace, its findings, and the `t0` that `inspect_s` measures from, and skips the scrub and the
+findings unlink that would otherwise destroy its own work. A different session is refused exactly
+as before, so this makes no claim more stealable and is not a seventh cover. The refusal no longer
+mentions the override at all — covers 1 through 4 retire every dead claim automatically, so the
+only refusal an agent can ever read is a live one, and that advice was wrong every time it was
+shown. Off cluster there is no session id and every caller reads an empty one as "cannot tell".
+
 One more direction of failure is worth naming because it is the opposite mistake: **an
 unwritable store must not stop an audit.** Taking the lock is best-effort in exactly the sense
 §4.5's writer discipline means — an `OSError` from the store directory logs a warning naming the
