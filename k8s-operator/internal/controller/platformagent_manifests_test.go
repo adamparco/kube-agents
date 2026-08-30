@@ -1235,6 +1235,58 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	}
 }
 
+// TestCredentialProxyOutputCapClearsTheLargestFleetDump pins the output cap the
+// sidecar runs with. Every command an agent issues arrives through this proxy,
+// so the cap bounds a cluster dump; at the proxy's own 4 MiB default the
+// fleet-audit workload dump for kube-agents-host measured 3,866,719 bytes, 92%
+// of the way there, and crossing it truncates the JSON mid-string and drops
+// that cluster out of compliance-audit and ai-security-audit.
+//
+// The name is on mergeCredentialProxyEnv's reserved list, so the second half
+// matters as much as the first: setting it here is the only way it gets set at
+// all, and a value in spec.deployment.env cannot raise or lower it.
+func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{
+						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
+					},
+				},
+			},
+		},
+	}
+
+	env := make(map[string]string)
+	for _, item := range buildCredentialProxySidecar(agent, "/opt/hermes").Env {
+		env[item.Name] = item.Value
+	}
+
+	// Without this the override half of the test is vacuous: a spec env list
+	// that never reaches the merge would also produce the operator's value.
+	if env["UNRESERVED_PASSENGER"] != "arrived" {
+		t.Fatalf("spec.deployment.env never reached the sidecar, so the override below proves nothing")
+	}
+
+	const want = "33554432" // 32 MiB
+	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
+		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
+	}
+	// The measured worst case, so a future reduction of the cap has to argue
+	// with the number rather than pass silently.
+	const largestObservedDump = 3866719
+	capBytes, err := strconv.Atoi(env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"])
+	if err != nil {
+		t.Fatalf("proxy output cap is not an integer: %v", err)
+	}
+	if capBytes <= largestObservedDump {
+		t.Errorf("proxy output cap %d does not clear the largest observed dump %d", capBytes, largestObservedDump)
+	}
+}
+
 // TestBuildPodTemplateSpecIsolatesTheSidecarUser covers the two Pod-level halves
 // of the credential boundary: the sandbox must not be able to read the sidecar's
 // process state, and the two must not run as one user.
