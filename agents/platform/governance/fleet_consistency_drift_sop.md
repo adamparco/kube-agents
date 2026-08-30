@@ -170,7 +170,7 @@ Every facet reads only GKE control-plane and node-pool metadata through `gcloud 
 - **Do NOT flag:** single-pool clusters against multi-pool peers on the `ALL`/`SOME`/`NONE` facet; pools carrying `.config.taints` that mark them dedicated or pinned capacity — exclude those from the fraction, they are deliberately fixed-size.
 - **Severity:** base `minor`.
 - **Impact:** the outlier cannot absorb load the way its peers do and needs manual capacity intervention.
-- **Remediation:** `gcloud` — `gcloud container node-pools update <pool> --enable-autoscaling --min-nodes=<N> --max-nodes=<N>` or `clusters update … --enable-autoprovisioning …`; the limits are a human judgement, so leave them as named placeholders in a `#` comment rather than inventing numbers.
+- **Remediation:** `gcloud` — `gcloud container node-pools update <pool> --cluster <name> --location <loc> --project <proj> --enable-autoscaling --min-nodes=<N> --max-nodes=<N>` or `clusters update … --enable-autoprovisioning …`; the limits are a human judgement, so leave them as named placeholders in a `#` comment rather than inventing numbers. The pool commands name the cluster and location in full rather than eliding them as the `clusters update` lines above do: `node-pools update` falls back to the `container/cluster` and `compute/zone` properties when those flags are absent, so a command that looks complete can reconfigure a pool on whatever cluster the operator's gcloud happens to point at.
 
 #### 4.9 Intra-node visibility and dataplane provider (`intra-node-visibility`, `datapath-provider`)
 
