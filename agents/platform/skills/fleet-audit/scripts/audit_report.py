@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -5206,7 +5207,11 @@ def run_cmd(
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
-    log("$ " + " ".join(cmd) + where)
+    # `shlex.join`, not `" ".join`: this line is prefixed `$ ` and read as
+    # something to paste. A `--title` with spaces or a `--format json(...)`
+    # space-joined is not the command that just ran, it is one the shell
+    # refuses.
+    log("$ " + shlex.join(cmd) + where)
     try:
         result = subprocess.run(
             cmd,
@@ -5216,7 +5221,7 @@ def run_cmd(
             cwd=str(target) if target is not None else None,
         )
     except subprocess.CalledProcessError as exc:
-        log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
+        log(f"FAILED ({exc.returncode}): {shlex.join(cmd)}")
         if exc.stderr:
             log(exc.stderr.strip())
         raise
@@ -5224,7 +5229,7 @@ def run_cmd(
     # except arm, which a non-raising call never reaches, so a `gh` outage on
     # the comment path left no trace anywhere in the run's output.
     if result.returncode != 0:
-        log(f"FAILED ({result.returncode}): {' '.join(cmd)}")
+        log(f"FAILED ({result.returncode}): {shlex.join(cmd)}")
         if capture and result.stderr:
             log(result.stderr.strip())
     return result
@@ -5506,29 +5511,63 @@ def fetch_issue_title(repo: str, number: int) -> str | None:
         return None
 
 
-def retitle_coverage_ledger(repo: str, number: int, audit_id: str, gaps: list[str]) -> None:
-    """Keep an open coverage ledger's gap count honest across runs.
+def refresh_coverage_ledger(
+    repo: str,
+    number: int,
+    audit_id: str,
+    gaps: list[str],
+    data: dict,
+    now: datetime,
+) -> None:
+    """Keep an open coverage ledger's title and body honest across runs.
 
-    The findings path retitles on every update. This one never did, so a
-    ledger opened the morning one target was unreadable still read `1 gap`
-    after a later run could not read forty-one — and the title is the
-    daily-visible artifact, the thing someone scanning the issue list decides
-    on before opening anything. A frozen count there is the same lie the body
-    is careful never to tell.
+    The findings path rewrites both on every update. This one rewrote the title
+    only, and only when the gap count moved, so a ledger opened the morning one
+    target was unreadable still read `1 gap` after a later run could not read
+    forty-one — and its Scope table still described the fleet as it stood the
+    day the ledger opened. On 2026-08-29 `fleet-consistency-drift`'s #58 showed
+    both halves of that: a title correctly reporting five gaps over a body
+    dated 2026-08-10 listing four clusters, one of them `platform-agent-host`,
+    deleted since. The body is what someone reads once the title gets them to
+    open the issue, and it opens by promising it "is rewritten in full on every
+    run".
 
-    Only a title this code minted is rewritten. A findings ledger that has
-    since gone clean-with-gaps keeps its own: this branch deliberately leaves
-    the body alone, so a title claiming `0 findings` over a body still listing
-    seven would trade a stale number for a contradictory one.
+    Only a ledger this code minted is touched. A findings ledger that has since
+    gone clean-with-gaps keeps both of its own: rewriting there would replace a
+    body still listing seven findings with one claiming none. The title guard
+    below is what rules that out, which is why it runs before anything else and
+    not at the call site.
     """
     current = fetch_issue_title(repo, number)
     if current is None or not COVERAGE_TITLE_RE.search(current):
         return
+
+    # No `current == wanted` early exit. The gap *count* holding steady across
+    # runs says nothing about which clusters went unread or when — the two runs
+    # that froze #58's body were both "4 gaps", unchanged, and returned here
+    # before touching anything. The body carries a scope table and a generated
+    # timestamp, so a run that changed neither number still has something newer
+    # to say than what is published.
     wanted = coverage_issue_title(audit_id, gaps)
-    if current == wanted:
-        return
-    gh(["issue", "edit", str(number), "-R", repo, "--title", wanted], check=False)
-    log(f"Retitled coverage ledger #{number} to: {wanted}")
+    body_file = _write_temp(render_issue_body(data, generated_at=now, audit_id=audit_id).body)
+    try:
+        gh(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                repo,
+                "--title",
+                wanted,
+                "--body-file",
+                body_file,
+            ],
+            check=False,
+        )
+    finally:
+        _unlink(body_file)
+    log(f"Refreshed coverage ledger #{number}: {wanted}")
 
 
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
@@ -7017,7 +7056,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 render_clean_comment(audit_id, data, now),
                 what="partial all-clear comment",
             )
-            retitle_coverage_ledger(repo, existing_issue, audit_id, gaps)
+            refresh_coverage_ledger(repo, existing_issue, audit_id, gaps, data, now)
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "

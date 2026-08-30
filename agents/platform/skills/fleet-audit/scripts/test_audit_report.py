@@ -9441,18 +9441,42 @@ class TestPartialCoverageGating(HarnessTestCase):
             [audit_report.coverage_issue_title(AUDIT, ["a", "b"])],
         )
 
-    def test_an_unchanged_gap_count_is_not_rewritten(self):
-        """One `gh` call per run that changes nothing is one too many."""
+    def test_an_unchanged_gap_count_still_refreshes_the_ledger(self):
+        """A steady gap count is not a steady ledger.
+
+        This used to return early on `current == wanted`, on the reasoning that
+        one `gh` call per run that changes nothing is one too many. The premise
+        was wrong: the count holding at four says nothing about *which* four
+        clusters went unread, and the body carries a scope table and a
+        generated timestamp that move regardless. Live #58 froze on exactly
+        this path — two consecutive `4 gaps` runs returned here without
+        publishing, and its body still described the fleet of 2026-08-10.
+        """
         self.harness.replies = self._coverage_ledger(
             audit_report.coverage_issue_title(AUDIT, ["only"])
         )
         self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
-        self.assertEqual(self._retitles(), [])
+        self.assertEqual(
+            self._retitles(), [audit_report.coverage_issue_title(AUDIT, ["only"])]
+        )
 
-    def test_a_findings_ledger_gone_gapped_keeps_its_own_title(self):
-        """This branch leaves the body alone, so retitling it to `0 findings`
-        over a body still listing seven trades a stale number for a
-        contradictory one."""
+    def test_the_refreshed_ledger_body_describes_this_run(self):
+        """The title getting the count right is worth little if the body a
+        reader lands on describes a fleet from three weeks ago."""
+        self.harness.replies = self._coverage_ledger(
+            audit_report.coverage_issue_title(AUDIT, ["only"])
+        )
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        bodies = self.harness.bodies_for("issue", "edit")
+        self.assertEqual(len(bodies), 1)
+        # The cluster this run could not read, named in the body it published —
+        # not merely counted in the title.
+        self.assertIn("dr-west", bodies[0])
+
+    def test_a_findings_ledger_gone_gapped_keeps_its_own_title_and_body(self):
+        """The guard rules out both. Retitling to `0 findings` over a body
+        still listing seven trades a stale number for a contradictory one, and
+        rewriting that body would discard the seven outright."""
         self.harness.replies = self._coverage_ledger(
             "[audit] Security & RBAC Posture Audit — 7 findings (6 critical)"
         )

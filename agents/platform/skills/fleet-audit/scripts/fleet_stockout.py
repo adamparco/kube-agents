@@ -68,6 +68,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -307,6 +308,25 @@ def check_ccc_missing_fallbacks(cc: dict) -> dict | None:
 def check_ccc_no_ondemand_floor(cc: dict, referenced_by_inference: bool) -> dict | None:
     priorities = (cc.get("spec") or {}).get("priorities") or []
     if not priorities or not all(_priority_is_spot(p) for p in priorities):
+        return None
+    # The guard `check_ccc_missing_fallbacks` carries, for the reason §3.1
+    # already gives and §3.2 omits: `autopilot-spot` is one of the three classes
+    # GKE pre-installs and reconciles on every Autopilot cluster, its whole
+    # chain is the single priority `{podFamily: general-purpose, spot: true}`,
+    # and it is GKE-managed, so there is no manifest in the GitOps clone to
+    # append an On-Demand rule to. §3.2's remediation is `kind: manifest`; on
+    # this object it cannot be written, which is precisely why §3.1 excludes the
+    # same three. Being all-Spot is what that class *is*, not a way someone
+    # misconfigured it, and the finding's own recommendation conceded as much by
+    # telling the reader to go and declare a different class instead. It fired
+    # once per Autopilot cluster on every run -- 17 of one run's 18 findings.
+    #
+    # Not suppressed when an inference workload actually selects it. There the
+    # risk is real and immediate in a way the §3.2 escalation already grades
+    # `critical`, and a manual finding beats silence even though the object
+    # still has no manifest. Nothing on this fleet selects any ComputeClass at
+    # all, so today this branch costs the ledger nothing and saves it 17.
+    if all(_priority_is_pod_family(p) for p in priorities) and not referenced_by_inference:
         return None
     hit = {"object": f"ComputeClass/{cc['metadata']['name']}", "excerpt": f"{len(priorities)} priorities, all Spot, no On-Demand floor"}
     if referenced_by_inference:
@@ -747,7 +767,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
         return {"name": name, "project": project, "location": location, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}
-    dump_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(dump_argv)}", result)
+    dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
 
     items = parsed.get("items", [])
     compute_classes = [i for i in items if i.get("kind") == "ComputeClass"]
@@ -790,7 +810,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         pools_result = run(node_pools_argv)
         pools_readable = pools_result.rc == 0
         node_pools = json.loads(pools_result.stdout) if pools_readable and pools_result.stdout.strip() else []
-        pools_record = _record(" ".join(node_pools_argv), pools_result)
+        pools_record = _record(shlex.join(node_pools_argv), pools_result)
     has_nap = bool(cluster.get("has_nap"))
     # ComputeClass-managed pools carry the class name as this label, not as
     # their own pool name -- matching against pool names would test the
@@ -930,7 +950,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     ]
     entries, logging_result = run_and_gate(logging_argv, run=run)
     if logging_result.rc == 0:
-        commands["autoscaler-out-of-resources"] = _record(" ".join(logging_argv), logging_result)
+        commands["autoscaler-out-of-resources"] = _record(shlex.join(logging_argv), logging_result)
         # `entries` is None for an empty result set as well as for unparseable
         # output, because gcloud prints nothing at all when nothing matched.
         # rc == 0 already told us the read succeeded, so an empty window is a
@@ -965,7 +985,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 f"(rc={advice_result.rc}) — {advice_result.stderr.strip()[:200] or 'no stderr'}"
             )
             continue
-        commands["spot-scarcity-risk"] = _record(" ".join(advice_argv), advice_result)
+        commands["spot-scarcity-risk"] = _record(shlex.join(advice_argv), advice_result)
         # A list of one, on every response seen so far. Unwrapped here rather
         # than in the helpers so they take the shape the API documents.
         first = advice[0] if isinstance(advice, list) and advice else advice
@@ -1031,7 +1051,7 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
         parsed, result = run_and_gate(q_argv, run=run)
         if parsed is None:
             continue
-        quota_records[region] = _record(" ".join(q_argv), result)
+        quota_records[region] = _record(shlex.join(q_argv), result)
         for quota in parsed.get("quotas") or []:
             for hit in [check_quota(quota)]:
                 if hit:
@@ -1044,7 +1064,7 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
     commands = []
     candidates = []
     if reservations is not None:
-        commands.append({"check": "reservation-mismatch-risk", **_record(" ".join(res_argv), res_result)})
+        commands.append({"check": "reservation-mismatch-risk", **_record(shlex.join(res_argv), res_result)})
         for reservation in reservations:
             for hit in [check_reservation(reservation)]:
                 if hit:

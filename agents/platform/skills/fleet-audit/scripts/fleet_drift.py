@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -153,7 +154,7 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
         return [], None, f"clusters list rc={result.rc}: {result.stderr.strip()[:300] or 'no stderr'}"
     for c in parsed:
         c["_project"] = project
-    return parsed, _record(" ".join(argv), result), None
+    return parsed, _record(shlex.join(argv), result), None
 
 
 def cluster_eligibility(c: dict, *, now: datetime) -> str | None:

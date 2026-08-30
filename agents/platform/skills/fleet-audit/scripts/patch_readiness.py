@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -529,7 +530,7 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
                 "error": f"clusters list rc={result.rc}: {result.stderr.strip()[:300] or 'no stderr'}",
             }
         ]
-    clusters_record = _record(" ".join(argv), result)
+    clusters_record = _record(shlex.join(argv), result)
 
     by_location: dict[str, list[dict]] = {}
     for c in parsed:
@@ -543,7 +544,7 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             log(f"{project}/{location}: get-server-config gate failed (rc={sc_result.rc}); master-behind/stale-image-type unavailable there")
             baselines[location] = None
         else:
-            baselines[location] = (normalize_server_config(sc_parsed), _record(" ".join(sc_argv), sc_result))
+            baselines[location] = (normalize_server_config(sc_parsed), _record(shlex.join(sc_argv), sc_result))
 
     fleet_spread_hits = {hit["object"].split("/", 1)[1]: hit for hit in check_fleet_spread(parsed)}
 

@@ -9,6 +9,8 @@ parallelism, and both never reading as a shorter candidate list.
 
 import inspect
 import json
+import re
+import shlex
 import sys
 import unittest
 from pathlib import Path
@@ -2056,6 +2058,69 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         for slug in commands_by_slug:
             if slug != "inference-endpoint-public":
                 self.assertIn(collect.COMPLIANCE_DUMP_KINDS, commands_by_slug[slug])
+
+
+class TestEvidenceCommandsArePasteable(unittest.TestCase):
+    """Every published command is an offer: run this and see what we saw.
+
+    The ledger says so in as many words — "these are re-runnable so that it
+    does not have to be taken on trust". A command that a shell refuses is
+    worse than no command at all, because the reader concludes the finding is
+    junk rather than the rendering. `compliance-audit` shipped seventeen
+    criticals on 2026-08-29 citing
+
+        gcloud ... --format json(workloadIdentityConfig,privateClusterConfig,...)
+
+    which answers `Syntax error: "(" unexpected`, rc=2 — the argv was correct
+    and only the space-join that rendered it was not.
+    """
+
+    MODULES = ("collect", "fleet_drift", "fleet_stockout", "fleet_waste", "patch_readiness")
+
+    def test_no_collector_renders_an_argv_by_space_joining_it(self):
+        # A behavioural test can only reach the argvs some fixture happens to
+        # provoke. This reaches all of them, including the ones no test builds
+        # yet, and it is the check that fails when the next site is added.
+        pattern = re.compile(r"""["'] ["']\.join\((\w*argv|cmd)\)""")
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                source = (Path(__file__).resolve().parent / f"{name}.py").read_text()
+                self.assertEqual(
+                    pattern.findall(source),
+                    [],
+                    f"{name}.py renders an argv with a space-join; use shlex.join",
+                )
+
+    def test_the_compliance_describe_command_survives_a_shell(self):
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                result = collect.collect_cluster(
+                    {"name": "kube-agents-host", "location": "us-east4", "project": "adamparco-kage"},
+                    "compliance-audit",
+                    collect.COMPLIANCE_CHECKS,
+                    run=self._run,
+                )
+        commands = {c["check"]: c["command"] for c in result["commands"]}
+        rendered = commands["public-control-plane"]
+        self.assertIn("--format", rendered)
+        # The whole `json(...)` selector arrives as one word, parentheses and
+        # all, rather than as a subshell the shell then tries to open.
+        selector = shlex.split(rendered)[shlex.split(rendered).index("--format") + 1]
+        self.assertTrue(selector.startswith("json(") and selector.endswith(")"), selector)
+        self.assertEqual(shlex.split(rendered), self.describe_argv)
+
+    def setUp(self):
+        self.describe_argv = None
+
+    def _run(self, argv, **kwargs):
+        if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+            self.describe_argv = list(argv)
+            return Run(argv, 0, json.dumps({"privateClusterConfig": {}}), "", 0.1)
+        if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+            return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+        if argv[:2] == ["gcloud", "container"] and argv[2] == "node-pools":
+            return Run(argv, 0, "[]", "", 0.1)
+        return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1664,7 +1665,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     context["workloads"] = normalize_compliance_workloads(parsed)
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(workload_argv)}", result)
+    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
             commands[spec.slug] = workload_record
@@ -1677,7 +1678,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     context["roles"] = [i for i in items if i.get("kind") in ("ClusterRole", "Role")]
     context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
     context["rolebindings"] = [i for i in items if i.get("kind") == "RoleBinding"]
-    record = _record(f"KUBECONFIG={kubeconfig} {' '.join(rbac_argv)}", result)
+    record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(rbac_argv)}", result)
     for slug in ("cluster-admin-binding", "wildcard-rbac"):
         commands[slug] = record
 
@@ -1688,7 +1689,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     items = parsed.get("items", [])
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
-    commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {' '.join(netpol_argv)}", result)
+    commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(netpol_argv)}", result)
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
@@ -1707,7 +1708,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     if parsed is None:
         raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    commands["default-sa-automount"] = _record(f"KUBECONFIG={kubeconfig} {' '.join(sa_argv)}", result)
+    commands["default-sa-automount"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
 
     describe_argv = [
         "gcloud", "container", "clusters", "describe", name, "--location", location, "--project", project,
@@ -1718,7 +1719,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     if parsed is None:
         raise GateFailure(f"cluster describe gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     context["cluster_describe"] = parsed
-    describe_command = " ".join(describe_argv)
+    describe_command = shlex.join(describe_argv)
     for slug in ("workload-identity-off", "public-control-plane"):
         commands[slug] = _record(describe_command, result)
 
@@ -1747,7 +1748,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         if parsed is None:
             raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
         context["node_pools"] = parsed if isinstance(parsed, list) else []
-        commands["legacy-metadata"] = _record(" ".join(node_pools_argv), result)
+        commands["legacy-metadata"] = _record(shlex.join(node_pools_argv), result)
 
     return CollectedContext(context, context["workloads"], commands)
 
@@ -1763,13 +1764,13 @@ def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpe
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     ai_workloads = normalize_ai_workloads(parsed)
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(workload_argv)}", result)
+    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
 
     svc_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
     svc_parsed, svc_result = run_and_gate(svc_argv, kubeconfig, run=run)
     if svc_parsed is None:
         raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:300]}")
-    svc_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(svc_argv)}", svc_result)
+    svc_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(svc_argv)}", svc_result)
 
     context = {"ai_workloads": ai_workloads, "services": svc_parsed.get("items", [])}
     commands = {

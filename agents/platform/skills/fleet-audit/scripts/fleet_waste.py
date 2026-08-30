@@ -47,6 +47,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -981,7 +982,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     parsed, result = run_and_gate(dump_argv, run=run, env=env)
     if parsed is None:
         return {"name": name, "project": project, "location": location, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}"}, empty_facts
-    dump_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(dump_argv)}", result)
+    dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
 
@@ -995,7 +996,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     node_pools, pools_result = run_and_gate(node_pools_argv, run=run)
     pools_readable = node_pools is not None
     node_pools = node_pools or []
-    pools_record = _record(" ".join(node_pools_argv), pools_result)
+    pools_record = _record(shlex.join(node_pools_argv), pools_result)
     limitations: list[str] = []
     not_applicable: list[dict] = []
 
@@ -1211,7 +1212,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     # message fingers none of them, and the only way to learn which had been
     # failing all along was to run all five by hand against a live project.
     failed = [
-        f"{' '.join(argv)} rc={result.rc}: {result.stderr.strip()[:200] or 'no stderr'}"
+        f"{shlex.join(argv)} rc={result.rc}: {result.stderr.strip()[:200] or 'no stderr'}"
         for argv, parsed, result in (
             (disks_argv, disks_parsed, disks_result),
             (addr_argv, addr_parsed, addr_result),
@@ -1241,10 +1242,10 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         "location": "global",
         "outcome": "collected",
         "commands": [
-            {"check": "unattached-disk", **_record(" ".join(disks_argv), disks_result)},
-            {"check": "idle-address", **_record(" ".join(addr_argv), addr_result)},
+            {"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)},
+            {"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)},
         ]
-        + ([{"check": "orphan-lb", **_record(" ".join(fwd_argv), fwd_result)}] if all_reachable else []),
+        + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else []),
         "candidates": candidates,
     }
 

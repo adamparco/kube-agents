@@ -223,7 +223,12 @@ class CccMissingFallbacksTest(unittest.TestCase):
         self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
 
     def test_does_not_flag_a_spot_pod_family_chain(self):
-        """`autopilot-spot`. §3.2 is what has something to say about the Spot-ness."""
+        """`autopilot-spot`, which pins no machine family here either.
+
+        §3.2 has something to say about the Spot-ness, but only when an
+        inference workload selects the class — see
+        `CccNoOndemandFloorTest`. Unreferenced, neither section flags it.
+        """
         cc = compute_class("cc1", [{"podFamily": "general-purpose", "spot": True}])
         self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
 
@@ -261,6 +266,33 @@ class CccNoOndemandFloorTest(unittest.TestCase):
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
         hit = fs.check_ccc_no_ondemand_floor(cc, True)
         self.assertEqual(hit["severity"], "critical")
+
+    def test_does_not_flag_the_built_in_autopilot_spot(self):
+        """GKE's own class, verbatim: `{podFamily, spot}` and nothing else.
+
+        Spot-only is the definition of `autopilot-spot`, not a mistake in it,
+        and §3.2's `kind: manifest` remediation has nothing to append to on an
+        object GKE reconciles — §3.1 excludes the same three classes for that
+        exact reason. Unguarded it fired once per Autopilot cluster on every
+        run: 17 of the 2026-08-30 run's 18 findings, against a class no
+        workload on the fleet even selects.
+        """
+        cc = compute_class("autopilot-spot", [{"podFamily": "general-purpose", "spot": True}])
+        self.assertIsNone(fs.check_ccc_no_ondemand_floor(cc, False))
+
+    def test_still_flags_the_built_in_when_an_inference_workload_selects_it(self):
+        """The escalation is worth a finding whose remediation must be manual."""
+        cc = compute_class("autopilot-spot", [{"podFamily": "general-purpose", "spot": True}])
+        hit = fs.check_ccc_no_ondemand_floor(cc, True)
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_a_hand_authored_spot_chain_that_also_names_a_pod_family_is_still_flagged(self):
+        """`all()`, not `any()` — same reasoning as §3.1's guard. A chain mixing
+        the two was written by a person, and its machine-typed entry is a real
+        Spot pin with a real manifest to fix."""
+        cc = compute_class("cc1", [{"podFamily": "general-purpose", "spot": True},
+                                   {"machineFamily": "c3", "spot": True}])
+        self.assertIsNotNone(fs.check_ccc_no_ondemand_floor(cc, False))
 
 
 class CccLargeVmScarcityTest(unittest.TestCase):
