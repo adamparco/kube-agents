@@ -103,6 +103,7 @@ def context_of(dump=None, **overrides):
         "hpas": {},
         "services": {},
         "workloads": [],
+        "workload_keys": set(),
         "cluster_name": "test-cluster",
     }
     if dump is not None:
@@ -112,8 +113,15 @@ def context_of(dump=None, **overrides):
             hpas=collect.hpas_by_namespace(dump),
             services=collect.services_by_namespace(dump),
             workloads=collect.normalize_workloads(dump),
+            workload_keys=collect.workload_keys(dump),
         )
     base.update(overrides)
+    if "workload_keys" not in overrides and dump is None:
+        # A test that hands over `workloads` and no dump is saying "this is
+        # what the cluster holds", so the two have to agree. Deriving keeps
+        # those tests about the check they name; the S4/S5 cases that need the
+        # two sets to *differ* pass a dump, or `workload_keys` outright.
+        base["workload_keys"] = {(wl["ns"], wl["kind"], wl["name"]) for wl in base["workloads"]}
     return base
 
 
@@ -419,6 +427,56 @@ class TestHpaCannotScale(unittest.TestCase):
         # limitations prose, never in this finding.
         ctx = context_of(hpas={"default": [hpa("h", target={"apiVersion": "apps/v1", "kind": "CustomThing", "name": "x"})]})
         self.assertEqual(collect.check_hpa_cannot_scale(ctx), [])
+
+    def test_a_gke_managed_namespace_hpa_is_not_flagged(self):
+        # GKE puts kube-state-metrics in `gke-managed-cim`. S1 keeps its
+        # StatefulSet out of `workloads`, so before the HPA carried the same
+        # suppression this read as a dangling target on every cluster in the
+        # fleet -- 17 minor findings about objects Google owns.
+        dump = dump_of(
+            deployment("kube-state-metrics", ns="gke-managed-cim"),
+            hpa("kube-state-metrics", ns="gke-managed-cim",
+                target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "kube-state-metrics"}),
+        )
+        self.assertEqual(collect.check_hpa_cannot_scale(context_of(dump)), [])
+
+    def test_a_gke_managed_namespace_pinned_hpa_is_not_flagged_either(self):
+        # The pinned branch needs the suppression as much as the dangling one:
+        # an addon HPA Google pinned is not the operator's to widen.
+        dump = dump_of(hpa("otel", ns="gke-managed-otel", min_replicas=2, max_replicas=2))
+        self.assertEqual(collect.check_hpa_cannot_scale(context_of(dump)), [])
+
+    def test_an_addonmanager_labelled_hpa_is_not_flagged(self):
+        # S2, for the addon that sits in a namespace S1 does not cover.
+        h = hpa("addon", min_replicas=2, max_replicas=2)
+        h["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        self.assertEqual(collect.check_hpa_cannot_scale(context_of(dump_of(h))), [])
+
+    def test_an_exempted_target_still_exists_so_the_hpa_is_not_dangling(self):
+        # S4 takes the Deployment out of the audited set. "scaleTargetRef
+        # Deployment/api not found" would be a false statement about the
+        # cluster, and opting a workload out of the audit would create a
+        # finding rather than remove one.
+        dep = deployment("api")
+        dep["metadata"]["labels"] = {collect.OPT_OUT_KEY: "exempt"}
+        ctx = context_of(dump_of(dep, hpa("h")))
+        self.assertEqual(ctx["workloads"], [])
+        self.assertEqual(collect.check_hpa_cannot_scale(ctx), [])
+
+    def test_a_scaled_to_zero_target_still_exists(self):
+        # S5, the same mistake from the other side.
+        ctx = context_of(dump_of(deployment("api", **{"spec.replicas": 0}), hpa("h")))
+        self.assertEqual(ctx["workloads"], [])
+        self.assertEqual(collect.check_hpa_cannot_scale(ctx), [])
+
+    def test_a_genuinely_absent_target_is_still_dangling(self):
+        # The whole point of the check survives the two fixes above.
+        ctx = context_of(dump_of(deployment("other"),
+                                 hpa("h", target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "gone"})))
+        hits = collect.check_hpa_cannot_scale(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+        self.assertIn("Deployment/gone not found", hits[0]["excerpt"])
 
 
 class TestRigidScheduling(unittest.TestCase):

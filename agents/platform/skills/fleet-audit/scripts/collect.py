@@ -400,6 +400,22 @@ def hpas_by_namespace(dump: dict) -> dict[str, list[dict]]:
     }
 
 
+def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
+    """Every workload in the dump as `(ns, kind, name)`, suppressed or not.
+
+    "Is this object this audit's business" and "does this object exist" are
+    different questions, and `workloads` only answers the first. A check that
+    reports a reference as broken is answering the second, so it has to read
+    the dump rather than the audited set — otherwise opting a Deployment out of
+    the audit is enough to make something else report it as missing.
+    """
+    return {
+        ((item.get("metadata") or {}).get("namespace", ""), item["kind"], (item.get("metadata") or {}).get("name", ""))
+        for item in dump.get("items", []) or []
+        if item.get("kind") in WORKLOAD_KINDS
+    }
+
+
 def build_context(dump: dict, workloads: list[dict]) -> dict:
     return {
         "limitranges": limitranges_by_namespace(dump),
@@ -407,6 +423,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "hpas": hpas_by_namespace(dump),
         "services": services_by_namespace(dump),
         "workloads": workloads,
+        "workload_keys": workload_keys(dump),
     }
 
 
@@ -558,12 +575,36 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
     """Cluster-scoped: two independent flag conditions on the HPA itself,
     (a) `major` — pinned (`minReplicas == maxReplicas`) and (b) `minor` —
     dangling (target absent from the dump). Severity rides on the hit, not
-    the check table default, because the two sub-cases disagree."""
-    known = {(wl["ns"], wl["kind"], wl["name"]) for wl in context["workloads"]}
+    the check table default, because the two sub-cases disagree.
+
+    The only cluster-scoped check that walks a `*_by_namespace` map with no
+    workload to anchor it, so it is the only one that has to apply S1 and S2
+    itself. `check_no_hpa` reads `context["hpas"]` under a workload's own
+    namespace and `check_pdb_blocks_drain` drops a PDB whose target is not in
+    the audited set, so both inherit the suppressions for free. This one did
+    not, and GKE makes that expensive: `kube-state-metrics` lives in
+    `gke-managed-cim` and `opentelemetry-collector` in `gke-managed-otel`, S1
+    keeps their StatefulSet and Deployment out of `workloads`, and their HPAs
+    then read as pointing at objects that do not exist. That was 17 `minor`
+    findings across a 16-cluster fleet — one per cluster — about resources
+    Google owns and the operator cannot edit.
+
+    Dangling resolves against `workload_keys` rather than `workloads` for the
+    other half of the same mistake: the target of a *user* HPA can leave the
+    audited set by being exempted (S4) or scaled to zero (S5) while plainly
+    still existing, and "scaleTargetRef … not found" is a claim about the
+    cluster, not about this audit's roster.
+    """
+    known = context["workload_keys"]
     hits = []
     for ns, hpas in context["hpas"].items():
+        if _is_system_namespace(ns):  # S1
+            continue
         for hpa in hpas:
-            name = (hpa.get("metadata") or {}).get("name", "")
+            meta = hpa.get("metadata") or {}
+            if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):  # S2
+                continue
+            name = meta.get("name", "")
             spec = hpa.get("spec") or {}
             min_r, max_r = spec.get("minReplicas"), spec.get("maxReplicas")
             target = spec.get("scaleTargetRef") or {}
