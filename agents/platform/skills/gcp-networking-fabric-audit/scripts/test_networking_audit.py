@@ -428,6 +428,113 @@ class CollectProjectTest(unittest.TestCase):
             [c["check"] for c in s2["commands"]], ["subnet-ip-exhaustion"]
         )
 
+    # A subnet whose primary and one secondary are published, and whose other
+    # secondary is not. This is `us-east4/default` on the live fleet: Network
+    # Analyzer published 14 of its 16 pod ranges, omitting the two belonging to
+    # Autopilot clusters parked at zero nodes.
+    PARTIAL_INSIGHT = (
+        '[{"content": {"ipUtilizationSummaryInfo": [{'
+        '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+        '"networkStats": [{'
+        '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+        '"subnetStats": [{'
+        '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/s1", '
+        '"subnetRangeStats": ['
+        '{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}, '
+        '{"allocationRatio": 0.2, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}'
+        ']}]}]}]}}]'
+    )
+
+    def _subnet_with_two_secondaries(self) -> str:
+        return (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": ['
+            '{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}, '
+            '{"rangeName": "ap-pods", "ipCidrRange": "10.8.0.0/14"}]}]'
+        )
+
+    def _partial_responses(self) -> dict:
+        return {
+            "subnets list-usable": run_of(0, self._subnet_with_two_secondaries()),
+            "recommender insights list": run_of(0, self.PARTIAL_INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+
+    def test_a_range_the_insight_omits_is_named_rather_than_silently_cleared(self):
+        # The subnet-level gate asks `any`, so two measured ranges mark this
+        # subnet measured and `check_subnet_ip_exhaustion` returns nothing for
+        # the third -- indistinguishable from clearing it. The subnet keeps its
+        # verdict for what was measured; the limitation says what it does not
+        # cover, which is what §6 turns into a coverage gap.
+        entries = na.collect_project("proj-1", run=self.fake_run(self._partial_responses()))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertEqual(s1["outcome"], "collected")
+        self.assertIn("ap-pods", s1["limitations"])
+        self.assertIn("2 of 3 ranges", s1["limitations"])
+        # Named by the check that could not reach it, so `coverage_gaps` sees a
+        # slug outside `checks_not_applicable` and keeps the string.
+        self.assertIn("subnet-ip-exhaustion", s1["limitations"])
+        # It stays measured: declaring the check inapplicable here would take a
+        # check that ran on two thirds of the subnet out of the denominator,
+        # and `cross_check_manifest` rejects exactly that.
+        self.assertNotIn(
+            "subnet-ip-exhaustion",
+            {entry["check"] for entry in s1["checks_not_applicable"]},
+        )
+        self.assertEqual([c["check"] for c in s1["commands"]], ["subnet-ip-exhaustion"])
+
+    def test_the_measured_ranges_still_reach_a_verdict(self):
+        # The limitation must not cost the subnet the finding it did earn. Same
+        # fixture, with the one published secondary over the threshold.
+        responses = self._partial_responses()
+        responses["recommender insights list"] = run_of(
+            0, self.PARTIAL_INSIGHT.replace('"allocationRatio": 0.2', '"allocationRatio": 0.95')
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertIn("secondary range pods", s1["candidates"][0]["excerpt"])
+        self.assertIn("ap-pods", s1["limitations"])
+
+    def test_a_fully_covered_subnet_carries_no_limitation(self):
+        # The other half: the limitation appears because a range was missed,
+        # not because the code now writes one on every subnet. A subnet whose
+        # every range was published must stay clean, or the stream is partial
+        # in perpetuity for no reason.
+        responses = self._partial_responses()
+        responses["subnets list-usable"] = run_of(
+            0,
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}]',
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertNotIn("limitations", s1)
+
+    def test_unmeasured_ranges_names_the_primary_and_reads_presence(self):
+        self.assertEqual(na._unmeasured_ranges({"ipUtilization": 0.0}), [])
+        self.assertEqual(
+            na._unmeasured_ranges({"ipCidrRange": "10.0.0.0/20"}), ["the primary range"]
+        )
+        # 0.0 is measured-and-empty on a secondary too.
+        self.assertEqual(
+            na._unmeasured_ranges(
+                {"ipUtilization": 0.1, "secondaryIpRanges": [{"rangeName": "a", "ipUtilization": 0.0}]}
+            ),
+            [],
+        )
+        self.assertEqual(
+            na._unmeasured_ranges(
+                {"ipUtilization": 0.1, "secondaryIpRanges": [{"rangeName": "a"}, {"ipUtilization": 0.3}]}
+            ),
+            ["a"],
+        )
+
     def test_an_insight_that_covers_nothing_is_a_gap(self):
         # Reads cleanly, publishes nothing that matches. Distinct from the
         # read failing, and the message has to say so -- Network Analyzer

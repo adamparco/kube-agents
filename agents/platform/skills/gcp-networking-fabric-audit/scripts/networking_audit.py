@@ -87,6 +87,31 @@ UNMEASURED_SUBNET_LIMITATION = (
     "evaluated: neither `list-usable` nor Network Analyzer published an "
     "IP-utilization figure for this subnet. It was enumerated, not measured."
 )
+# `_carries_utilization` asks `any`, so one range with a figure marks the whole
+# subnet measured -- and `check_subnet_ip_exhaustion` then passes over every
+# sibling that has none, returning nothing for it, which is indistinguishable
+# from clearing it. That is the same silent-clean failure the gate in
+# `_collect_subnet_targets` refuses one layer up, surviving inside a subnet
+# because the gate is satisfied by a single reading.
+#
+# Network Analyzer produces the shape routinely. On this fleet it published 14
+# of `us-east4/default`'s 16 pod ranges, omitting the two belonging to Autopilot
+# clusters parked at zero nodes; those two are genuinely empty, so the silence
+# happened to be correct. The same omission covers a range Network Analyzer has
+# not got to yet, which for a freshly created cluster runs about a day -- and
+# that is exactly the window in which an undersized Pod CIDR fills up. Being
+# right by luck on the empty case is not a reason to stay silent on the other.
+#
+# `cross_check_manifest` states where this belongs: a check that applies but
+# could not be evaluated is the target's `limitations`, which §6 turns into a
+# coverage gap. The subnet stays measured and keeps its verdict for the ranges
+# that had figures; the gap says which ranges the verdict does not cover.
+PARTIAL_SUBNET_LIMITATION = (
+    "subnet-ip-exhaustion reached {measured} of {total} ranges on this subnet. "
+    "Neither `list-usable` nor Network Analyzer published an IP-utilization "
+    "figure for the rest, which the check passed over rather than cleared: "
+    "{names}."
+)
 
 SEVERITY = {
     "subnet-ip-exhaustion": "critical",
@@ -396,6 +421,23 @@ def _carries_utilization(subnet: dict) -> bool:
     )
 
 
+def _unmeasured_ranges(subnet: dict) -> list[str]:
+    """The ranges on this subnet that `_carries_utilization` did not account
+    for, named the way a reader can go and look them up.
+
+    Presence again, not truthiness, for the same reason: a range at 0.0 was
+    measured. The primary is described rather than named because it has no
+    `rangeName` to give.
+    """
+    missing = []
+    if not isinstance(subnet.get("ipUtilization"), (int, float)):
+        missing.append("the primary range")
+    for sec in subnet.get("secondaryIpRanges") or []:
+        if not isinstance(sec.get("ipUtilization"), (int, float)):
+            missing.append(str(sec.get("rangeName") or "(unnamed secondary range)"))
+    return missing
+
+
 # Network Analyzer's IP-utilization insight, which is where the measurement
 # `check_subnet_ip_exhaustion` needs actually lives. Not
 # `google.compute.subnetwork.IpUtilizationInsight` -- that name appears in
@@ -666,6 +708,15 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
         }
         if not measured:
             entry["limitations"] = UNMEASURED_SUBNET_LIMITATION
+        else:
+            unmeasured = _unmeasured_ranges(item)
+            if unmeasured:
+                total = 1 + len(item.get("secondaryIpRanges") or [])
+                entry["limitations"] = PARTIAL_SUBNET_LIMITATION.format(
+                    measured=total - len(unmeasured),
+                    total=total,
+                    names=", ".join(unmeasured),
+                )
         out.append(entry)
     return out
 
