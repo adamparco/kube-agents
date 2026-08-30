@@ -906,10 +906,12 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
     `kubectl logs` and `kubectl exec`. The subject test reads that user as
     non-system because the name carries no `system:` prefix, so the role
     counted as bound, and every cluster in the fleet reported one `critical`.
-    Sixteen of the eighteen findings in the last compliance run were this one
-    object. It is also unfixable: the label is `Reconcile`, so the add-on
-    manager reverts an edit, and a server-side dry-run patch is refused
-    outright.
+    Four of the eight stored compliance runs rendered it and four dropped it,
+    which is worse than either -- the ledger is keyed on (check, cluster,
+    namespace, object), so the same object churned as new and resolved run to
+    run. The run that rendered it per cluster made it 16 of 34 findings. It is
+    also unfixable: the label is `Reconcile`, so the add-on manager reverts an
+    edit, and a server-side dry-run patch is refused outright.
 
     The label test is the same S2 rung the workload checks use, and the SOP
     names this exact failure -- "flagging these is the fastest way to get this
