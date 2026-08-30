@@ -3186,6 +3186,106 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
                 )
 
 
+def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Replace each finding's `evidence` with what the collector recorded for
+    the same identity. Returns the ids changed.
+
+    `evidence` is the one part of the document that claims to be *observed* —
+    a command, and the output it produced — and the model wrote both. It is
+    not usually wrong: spot-checked against the live API, the excerpts it
+    types are faithful projections of data the collector really did fetch.
+    What it does is retype them differently every run, and lose detail while
+    it does. Between the two most recent runs of every stream on this install,
+    not one finding survived with byte-identical evidence — 37 of 37 excerpts
+    rewritten on `obtainability-audit` alone, `argocd-applicationset-controller:
+    missing cpu,memory` coming back as `argocd-applicationset-controller:
+    requests=`, and a full securityContext breakdown as `containers:
+    litellm-container`. Nothing downstream can tell that from a fleet that
+    moved, so `carry_unchanged_findings` never fires and the ledger re-derives
+    prose it already had.
+
+    The collector computed the same excerpt deterministically, so take it from
+    there and treat the model's as a draft. Commit 69b612e5 settled the same
+    question for finding titles the same way: the collector writes the
+    sentence rather than the model.
+
+    The command has to come with it, and that is the part worth being careful
+    about, because in isolation the model's is often the *better* string — a
+    narrow `gcloud container clusters describe … --format="json(maintenancePolicy)"`
+    against the collector's one broad `clusters list --format json`. But the
+    two fields are one claim. Once the excerpt is the collector's computed
+    line, a narrow command beside it no longer produces what it sits above:
+    `describe --format="json(maintenancePolicy)"` prints a JSON object, not
+    `no maintenancePolicy.window configured`. Keeping the model's command
+    would manufacture exactly the mismatch this exists to remove, so both
+    fields move together or neither does.
+
+    Nothing is invented. A finding with no matching candidate keeps what it
+    arrived with, which is what keeps the manual fallback working: a target
+    the collector could not read yields no candidates, and the agent's
+    hand-run command is then the only evidence there is.
+    """
+    if not manifest:
+        return []
+    by_id: dict[str, tuple[dict, str]] = {}
+    for entry in manifest.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        # A candidate's cluster comes from the entry containing it. Only
+        # collect.py's check-table path writes `cluster` into the candidate
+        # itself; fleet_drift, patch_readiness, fleet_stockout and fleet_waste
+        # build the name into `object` and omit the field, so an id derived
+        # from such a candidate alone reads `check._._.object` and matches
+        # nothing — which is exactly what those four streams did, 35 candidates
+        # joining zero findings. Reading the name from the enclosing entry is
+        # true of both shapes and needs no change in any collector.
+        cluster_name = str(entry.get("name") or "")
+        commands = {
+            str(command.get("check")): str(command.get("command") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict)
+            and command.get("rc") == 0
+            and str(command.get("command") or "").strip()
+        }
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            by_id[derive_finding_id(keyed)] = (
+                candidate,
+                commands.get(str(candidate.get("check")), ""),
+            )
+
+    adopted = []
+    for finding in findings:
+        match = by_id.get(derive_finding_id(finding))
+        evidence = finding.get("evidence")
+        if match is None or not isinstance(evidence, dict):
+            continue
+        candidate, command = match
+        excerpt = str(candidate.get("excerpt") or "").strip()
+        # All of it or none of it, for the reason in the docstring: a
+        # collector-computed excerpt under a model-written command is the
+        # mismatch this function exists to remove, so a candidate missing
+        # either half is left alone entirely. Nothing on this install is —
+        # every one of the 91 live candidates has a successful recorded
+        # command behind it — so the branch costs no coverage; it is here so
+        # that a collector which someday emits a candidate it cannot back
+        # degrades to the model's pair rather than to a spliced one.
+        if not excerpt or not command:
+            continue
+        changed = False
+        if evidence.get("excerpt") != excerpt:
+            evidence["excerpt"] = excerpt
+            changed = True
+        if evidence.get("command") != command:
+            evidence["command"] = command
+            changed = True
+        if changed:
+            adopted.append(str(finding.get("id") or ""))
+    return adopted
+
+
 class ContainmentError(ValidationError):
     """A remediation path that passed the string check still escapes the repo."""
 
@@ -7185,6 +7285,15 @@ def handle_finish(args: argparse.Namespace) -> None:
                 f"--manifest-file: {args.manifest_file} is not valid JSON: {exc}"
             ) from exc
         cross_check_manifest(data, manifest)
+        # Before anything reads `evidence` — the dry-run preview, the ledger
+        # body, and the carry-forward's before/after comparison all do.
+        adopted = adopt_collector_evidence(data["findings"], manifest)
+        if adopted:
+            shown = ", ".join(adopted[:5]) + (", …" if len(adopted) > 5 else "")
+            log(
+                f"evidence: adopted the collector's command and excerpt for "
+                f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
+            )
     # Every cross-check above is reachable only through --manifest-file, and
     # until now omitting it was silent. The security-patch run on 2026-08-29
     # is what that costs: four dry-runs carrying the flag, then a fifth,

@@ -6884,6 +6884,146 @@ class TestCrossCheckManifest(unittest.TestCase):
         # which runs against this exact manifest shape.
 
 
+class TestAdoptCollectorEvidence(unittest.TestCase):
+    """`evidence` is observed, so the collector authors it — see
+    `audit_report.adopt_collector_evidence`.
+    """
+
+    COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+
+    def candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies",
+            "impact": "collector-authored impact",
+            "needs_triage": None,
+        }
+        cand.update(overrides)
+        return cand
+
+    def manifest(self, candidates, rc=0, name="prod-us-east", check="netpol-missing"):
+        return {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [{"check": check, "command": self.COMMAND, "rc": rc}],
+                    "candidates": candidates,
+                }
+            ]
+        }
+
+    def test_the_collectors_excerpt_and_command_replace_the_models(self):
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate()])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["excerpt"], "zero NetworkPolicies")
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
+    def test_a_candidate_without_a_cluster_field_still_joins(self):
+        """The shape the four procedural collectors emit.
+
+        `fleet_drift`, `patch_readiness`, `fleet_stockout` and `fleet_waste`
+        build the cluster name into `object` and never write a `cluster` key,
+        so an id derived from the candidate alone reads `check._._.object`.
+        Live, that was 35 candidates across four streams joining nothing at
+        all. The enclosing manifest entry names the cluster in both shapes,
+        which is why this is fixed here and not in four collectors.
+        """
+        cand = {
+            "check": "logging-components",
+            "namespace": "",
+            "object": "Cluster/drift-peer-std-4",
+            "severity": "minor",
+            "excerpt": "loggingConfig.componentConfig.enableComponents=[SYSTEM_COMPONENTS]",
+            "impact": "x",
+            "needs_triage": None,
+        }
+        self.assertNotIn("cluster", cand)
+        finding = make_finding(
+            check="logging-components",
+            cluster="drift-peer-std-4",
+            namespace="",
+            obj="Cluster/drift-peer-std-4",
+            excerpt="logging is partly off",
+        )
+        adopted = audit_report.adopt_collector_evidence(
+            [finding],
+            self.manifest([cand], name="drift-peer-std-4", check="logging-components"),
+        )
+        self.assertEqual(len(adopted), 1)
+        self.assertEqual(finding["evidence"]["excerpt"], cand["excerpt"])
+
+    def test_a_finding_the_collector_did_not_propose_is_left_alone(self):
+        """The manual fallback. A target the collector could not read yields no
+        candidates, and the agent's hand-run command is the only evidence there
+        is — overwriting or blanking it would delete the finding's only proof.
+        """
+        finding = make_finding(cluster="stage-eu")
+        before = json.loads(json.dumps(finding["evidence"]))
+        self.assertEqual(
+            audit_report.adopt_collector_evidence([finding], self.manifest([self.candidate()])),
+            [],
+        )
+        self.assertEqual(finding["evidence"], before)
+
+    def test_a_candidate_the_collector_cannot_back_is_left_whole(self):
+        """Half a swap is worse than none.
+
+        `rc != 0` produced no output, so it is not what the excerpt came from,
+        and an empty candidate excerpt has nothing to offer. Either way the
+        finding keeps *both* of the model's fields: a collector-computed
+        excerpt under a model-written command is the mismatch this function
+        exists to remove, not a partial fix.
+        """
+        for manifest in (
+            self.manifest([self.candidate()], rc=1),
+            self.manifest([self.candidate(excerpt="   ")]),
+        ):
+            finding = make_finding()
+            self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+            self.assertEqual(
+                finding["evidence"],
+                {
+                    "command": "kubectl get networkpolicy -n payments",
+                    "excerpt": "No resources found in payments namespace.",
+                },
+            )
+
+    def test_adoption_is_idempotent(self):
+        """The whole point: two runs over one unchanged fleet agree byte for
+        byte, which is the precondition `carry_unchanged_findings` compares on.
+        """
+        manifest = self.manifest([self.candidate()])
+        finding = make_finding()
+        self.assertEqual(len(audit_report.adopt_collector_evidence([finding], manifest)), 1)
+        self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+
+    def test_nothing_but_evidence_is_taken_from_the_candidate(self):
+        """The candidate also carries `severity` and `impact`, and neither may
+        cross. Severity is re-judged against the fleet's context (Autopilot,
+        blast radius) and impact is prose about consequence; only the command
+        and the output it produced are observations.
+        """
+        finding = make_finding(severity="critical", impact="model-authored impact")
+        audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate()])
+        )
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["impact"], "model-authored impact")
+
+    def test_no_manifest_changes_nothing(self):
+        finding = make_finding()
+        for manifest in (None, {}, {"clusters": []}):
+            self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The --manifest-file CLI wiring in handle_finish."""
 
@@ -6904,6 +7044,62 @@ class TestFinishManifestFlag(HarnessTestCase):
         }
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0)
+
+    def test_the_collectors_evidence_is_what_reaches_the_ledger(self):
+        """The wiring, asserted on the wire rather than on the return value.
+
+        `adopt_collector_evidence` is unit-tested above; this is the only thing
+        that fails if the call is dropped from `handle_finish` or moved after
+        the body is rendered.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        checks = list(audit_report.audit_checks(AUDIT))
+        command = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+        manifest = {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [
+                        {
+                            "check": c,
+                            "command": command if c == "netpol-missing" else f"ran {c}",
+                            "rc": 0,
+                        }
+                        for c in checks
+                    ],
+                    "candidates": (
+                        [
+                            {
+                                "check": "netpol-missing",
+                                "cluster": "prod-us-east",
+                                "namespace": "payments",
+                                "object": "Namespace/no-network-policy",
+                                "severity": "major",
+                                "excerpt": "zero NetworkPolicies in payments",
+                                "impact": "x",
+                                "needs_triage": None,
+                            }
+                        ]
+                        if name == "prod-us-east"
+                        else []
+                    ),
+                }
+                for name in ("prod-us-east", "stage-eu")
+            ]
+        }
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("zero NetworkPolicies in payments", body)
+        self.assertIn(command, body)
+        # The model's two strings are gone, not merely joined by the truth.
+        self.assertNotIn("No resources found in payments namespace.", body)
+        self.assertNotIn("kubectl get networkpolicy -n payments\n", body)
 
     def test_a_failing_manifest_rejects_before_any_publish(self):
         manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "commands": []}]}
