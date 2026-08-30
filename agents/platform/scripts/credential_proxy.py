@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import hashlib
 import hmac
 import http.client
@@ -2466,7 +2467,7 @@ class CommandExecutor:
                 raise ValueError(f"kubeconfig is implausibly large: {requested}")
             text = requested.read_text(encoding="utf-8", errors="replace")
         except OSError as error:
-            raise ValueError(f"kubeconfig is unreadable: {requested}") from error
+            raise ValueError(_unreadable_kubeconfig_message(requested, error)) from error
         context = read_current_context(text)
         if not context:
             raise ValueError(f"kubeconfig names no current-context: {requested}")
@@ -2724,6 +2725,37 @@ def read_only_enforced() -> bool:
     person running the process.
     """
     return os.getenv("CREDENTIAL_PROXY_ENFORCE_READ_ONLY", "true").strip().lower() != "false"
+
+
+def _unreadable_kubeconfig_message(requested: Path, error: OSError) -> str:
+    """Say which way the read failed, and for a missing file, what is there.
+
+    "kubeconfig is unreadable" reads as a permissions problem, so an agent that
+    has mistyped the filename has nothing to correct and retries the same wrong
+    path. On 2026-08-30 one did: 37 rejections in 7.1 seconds inside a
+    compliance-audit run, 36 of them naming
+    `.kubeconfigs/adamparco-kage_kube-agents-host_us-east4.yaml` -- the
+    documented name minus its `kubeconfig_` prefix. Naming the neighbours turns
+    that into a correction the caller can make on the next call, because these
+    files are per-cluster and their names are the answer.
+
+    Listing the directory discloses nothing the caller could not already get:
+    the entries are cluster coordinates, and `container clusters list` is on the
+    read allowlist. The cap keeps a large fleet from crowding out the error.
+    """
+    if error.errno != errno.ENOENT:
+        return f"kubeconfig is unreadable: {requested} ({error.strerror})"
+    try:
+        siblings = sorted(entry.name for entry in requested.parent.iterdir())
+    except OSError:
+        return f"kubeconfig does not exist: {requested}"
+    shown = ", ".join(siblings[:12]) or "(none)"
+    if len(siblings) > 12:
+        shown += f", and {len(siblings) - 12} more"
+    return (
+        f"kubeconfig does not exist: {requested};"
+        f" {requested.parent} holds: {shown}"
+    )
 
 
 def _sanitize_for_logging(s: str, max_length: int = 64) -> str:

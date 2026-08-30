@@ -2282,6 +2282,37 @@ class CommandExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "implausibly large"):
             executor._resolve_kubeconfig(str(pinned))
 
+    def test_a_missing_kubeconfig_names_the_ones_that_exist(self):
+        # "unreadable" reads as a permissions problem and gives a caller that
+        # mistyped the filename nothing to correct, so it retries the same wrong
+        # path -- 37 times in 7.1 seconds during a compliance-audit run on
+        # 2026-08-30, all of them the documented name minus its `kubeconfig_`
+        # prefix. The neighbours are the correction.
+        executor = self.executor()
+        present = self.caller_kubeconfig(
+            executor, name=".kubeconfigs/kubeconfig_p_c_l.yaml")
+        typo = present.parent / "p_c_l.yaml"
+        with self.assertRaises(ValueError) as raised:
+            executor._resolve_kubeconfig(str(typo))
+        message = str(raised.exception)
+        self.assertIn("does not exist", message)
+        self.assertIn("kubeconfig_p_c_l.yaml", message)
+
+    def test_a_kubeconfig_that_exists_but_cannot_be_read_says_so(self):
+        # The other half: a real permissions failure must not be reported as a
+        # missing file, or the caller goes looking for a name that is right
+        # there. errno is what separates them.
+        executor = self.executor()
+        pinned = self.caller_kubeconfig(executor)
+        pinned.chmod(0o000)
+        try:
+            if os.access(pinned, os.R_OK):  # root ignores the mode
+                self.skipTest("running as a user that can read a 0000 file")
+            with self.assertRaisesRegex(ValueError, "is unreadable"):
+                executor._resolve_kubeconfig(str(pinned))
+        finally:
+            pinned.chmod(0o600)
+
     # ---- Fetching, and the visible pin --------------------------------------
 
     def test_cache_miss_refetches_credentials_from_gcloud(self):
