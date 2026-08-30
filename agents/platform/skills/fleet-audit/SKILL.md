@@ -140,12 +140,18 @@ stream's open ledger issue, and clears any findings document a crashed run left 
 Write your findings to the `findings_path` it gives you. Do not pick your own path.
 
 **Exit code 3 is not a crash — it is another run of this stream already holding it.** `start` prints
-`RUN IN PROGRESS` with the holding pid and start time and writes no JSON. Stop; do not retry, do not
-route around it, and do not start inspecting without a workspace. Say the stream is busy and give
-the pid and start time from the message. A holder is released when its run finishes and is judged
-dead automatically if the pod restarted under it, its clock is nonsense, or two hours pass — so
-this clears itself. `--steal-lock` overrides a holder you have confirmed is gone; it is an operator
-command, not a retry, so do not reach for it on your own.
+`RUN IN PROGRESS` with the holding pid, session, and start time and writes no JSON. Stop; do not
+retry, do not route around it, and do not start inspecting without a workspace. Say the stream is
+busy and give the pid and start time from the message. A holder is released when its run finishes
+and is judged dead automatically if the pod restarted under it, its clock is nonsense, or two hours
+pass — so this clears itself.
+
+**If you have lost track of your workspace, re-run `start` — that is the whole recovery.** A stream
+held by your own session is resumed, not refused: you get the same workspace, the same
+`findings_path`, and whatever you had already written to it, with the run's original start time
+intact. So exit code 3 always means a _different_ run, and it is never yours to clear. `--steal-lock`
+is an operator command for a holder a human has confirmed is dead; taking it from a run that is
+still going leaves both writing this one stream. Do not reach for it on your own.
 
 `checks` is your stream's full roster, handed over so coverage never depends on how far into the SOP
 you read. **It is the work list, not a substitute for the SOP** — the slug says which check, the SOP

@@ -1214,11 +1214,23 @@ class RunInProgress(Exception):
     def __init__(self, audit_id: str, holder: dict) -> None:
         self.audit_id = audit_id
         self.holder = holder
+        # This deliberately does not name `--steal-lock`. It used to, and that
+        # was the whole of two incidents: a claim from a dead container or one
+        # past the ceiling is retired automatically, so the only refusal anyone
+        # can ever read is a live claim — exactly the one case where stealing is
+        # wrong. Two runs then write one stream, and the stolen t0 is the one
+        # `inspect_s` measures from, so the run also mis-reports its own
+        # duration. The override still exists for an operator; it is documented
+        # in `start --help`, where a human looking for it will find it and an
+        # agent reading an error will not.
         super().__init__(
             f"{audit_id}: a run started {holder.get('t0') or 'at an unknown time'} "
-            f"(pid {holder.get('pid')}) still holds this stream. It expires on its "
-            f"own {RUN_LOCK_CEILING_S // 3600}h after it started. To override now, "
-            f"re-run `start --steal-lock`; the file itself is "
+            f"(pid {holder.get('pid')}, session {holder.get('session') or 'unknown'}) "
+            f"still holds this stream. Wait: a holder is released when its run "
+            f"finishes, is retired the moment the pod restarts under it, and "
+            f"expires on its own {RUN_LOCK_CEILING_S // 3600}h after it started. "
+            f"Do not take it from a run that is still going — both runs then write "
+            f"this one stream and corrupt each other. The file itself is "
             f"{started_path_for(audit_id)}."
         )
 
@@ -1257,6 +1269,20 @@ def pod_instance() -> str | None:
     except OSError:
         pass
     return f"{boot}:{starttime}"
+
+
+def run_session() -> str:
+    """The hermes session this process belongs to, or "" when there is none.
+
+    One cron dispatch is one session, held across every tool call the run makes,
+    so this is what tells "another run holds this stream" apart from "my own run
+    is asking again". The second is what happens when a long audit's context is
+    compacted: the agent re-reads the skill from the top and calls `start` a
+    second time. Empty off-cluster and under the test suite, and every caller
+    reads empty as "cannot tell", so the behaviour there is the one from before
+    this existed.
+    """
+    return (os.environ.get("HERMES_SESSION_ID") or "").strip()
 
 
 def _corrupt_claim_nonce(path: str) -> str:
@@ -1309,6 +1335,24 @@ def read_run_claim(audit_id: str) -> dict | None:
         # file, so that two such claims on one stream do not share a token.
         return dict(claim, nonce=_corrupt_claim_nonce(path))
     return claim
+
+
+def own_run_claim(audit_id: str) -> dict | None:
+    """The claim on this stream if *this same run* wrote it, else None.
+
+    Rules 2 and 3 of `_claim_is_dead` already retire a claim from a container
+    that is gone and one past the ceiling, so the only refusal a caller can
+    actually meet is a claim from this container, inside the ceiling — and the
+    most likely author of that claim is the caller itself. Recognising it
+    matters because `start` is destructive: it scrubs the stream's GitOps tree
+    and deletes the findings file, so a re-entering run has to be spotted before
+    any of that runs and handed back what it already has.
+    """
+    session = run_session()
+    if not session:
+        return None
+    holder = read_run_claim(audit_id) or {}
+    return holder if holder.get("session") == session else None
 
 
 def _claim_is_dead(
@@ -1381,6 +1425,7 @@ def acquire_run_lock(
                 "pid": os.getpid(),
                 "nonce": nonce,
                 "instance": pod_instance(),
+                "session": run_session(),
             },
             handle,
         )
@@ -6440,16 +6485,29 @@ def handle_start(args: argparse.Namespace) -> None:
     # that reached it would delete a live run's working files — the refusal has
     # to come first, not after the damage.
     t0 = datetime.now(timezone.utc)
-    take_run_lock(audit_id, t0, steal=bool(getattr(args, "steal_lock", False)))
-    prune_steal_tokens(audit_id, now=t0.timestamp())
+    # `start` twice in one run is not a double dispatch — it is an audit whose
+    # context was compacted mid-flight, re-reading the skill and asking again.
+    # Resume it: keep the lock it already holds, keep the t0 `inspect_s`
+    # measures from, and skip the scrub and the unlink below, because the run
+    # this would be destroying is the caller's own.
+    resumed = own_run_claim(audit_id)
+    if resumed is None:
+        take_run_lock(audit_id, t0, steal=bool(getattr(args, "steal_lock", False)))
+        prune_steal_tokens(audit_id, now=t0.timestamp())
+    else:
+        log(
+            f"RESUMING {audit_id}: this run already holds the stream "
+            f"(started {resumed.get('t0')}). Keeping its workspace and findings."
+        )
 
     # Resolve first, then mint: the token is repo-scoped, and the repository
     # cannot be read off a clone that does not exist yet.
     repo = resolve_repo()
     refresh_credentials(repo)
     # The one place a scrub is correct: the audit has not written anything yet,
-    # so whatever is in the tree is debris from a run that did not finish.
-    root = ensure_workspace(repo, audit_id, reset=True)
+    # so whatever is in the tree is debris from a run that did not finish. On a
+    # resume that reasoning inverts — the tree holds this run's own work.
+    root = ensure_workspace(repo, audit_id, reset=resumed is None)
     ensure_labels(repo, audit_id)
 
     # No branch is created or reset here. The report branch is gone: the ledger
@@ -6466,9 +6524,12 @@ def handle_start(args: argparse.Namespace) -> None:
         pass
 
     # A crashed run must not leave a document behind for the next one to
-    # publish as if it were fresh.
+    # publish as if it were fresh. A resume is not the next run, though: the
+    # findings there are the ones this run has already written, and deleting
+    # them would throw away the inspection the compaction interrupted.
     findings_path = findings_path_for(audit_id)
-    Path(findings_path).unlink(missing_ok=True)
+    if resumed is None:
+        Path(findings_path).unlink(missing_ok=True)
 
     print(
         json.dumps(
@@ -7526,10 +7587,13 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--steal-lock",
         action="store_true",
-        help="Take this stream's run lock even though another run holds it. For "
-        "a run you know is dead but that has not yet reached its "
-        f"{RUN_LOCK_CEILING_S // 3600}h expiry; the running audit, if there is "
-        "one, will overwrite this one's state or be overwritten by it.",
+        help="Operator override: take this stream's run lock even though another "
+        "run holds it. For a run a human has confirmed is dead but that has not "
+        f"reached its {RUN_LOCK_CEILING_S // 3600}h expiry. Not a retry, and not "
+        "the answer to a RUN IN PROGRESS message — if the holder is still going, "
+        "the two runs overwrite each other's state. A run that lost its context "
+        "and needs its workspace back should just re-run `start`, which resumes "
+        "a stream its own session already holds.",
     )
 
     finish_parser = subparsers.add_parser(

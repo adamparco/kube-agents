@@ -2978,6 +2978,67 @@ class TestStart(HarnessTestCase):
                     f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
                 )
 
+    def start_as(self, session, audit_id=AUDIT):
+        """Run `start` as a named hermes session, the way a cron dispatch does.
+
+        `_HELD_LOCK` is cleared first because every real `start` is its own
+        process and begins holding nothing. Left set, the second call in a test
+        looks like one process that took the lock and then met a refusal, and
+        the failure path hands back a claim this run never wrote.
+        """
+        self.out = ""
+        self.harness.replies = {"issue list": "[]"}
+        audit_report._HELD_LOCK = None
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": session}):
+            return self.run_main(["start", "--audit", audit_id])
+
+    def test_a_run_that_lost_its_context_resumes_rather_than_being_refused(self):
+        """The recovery that two runs reached for `--steal-lock` to get.
+
+        A long audit's context is compacted mid-flight; the agent re-reads the
+        skill from the top and calls `start` again. Refusing that used to be the
+        end of the road — and the refusal recommended `--steal-lock`, so twice a
+        run took the stream from itself ~21 minutes in, resetting the `t0` that
+        `inspect_s` is measured from. The stream is already this run's, so hand
+        it back: same workspace, same findings, same start time.
+        """
+        self.assertEqual(self.start_as("cron_compliance_1"), 0)
+        first = json.loads(self.out)
+        held = json.loads(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        )
+        # Work the compacted run had already done, which a scrub would destroy.
+        Path(first["findings_path"]).write_text('{"findings": []}', encoding="utf-8")
+
+        self.assertEqual(self.start_as("cron_compliance_1"), 0)
+        self.assertEqual(json.loads(self.out), first)
+        self.assertEqual(
+            Path(first["findings_path"]).read_text(encoding="utf-8"),
+            '{"findings": []}',
+        )
+        # Same claim, so `inspect_s` still measures from when the run really
+        # began rather than from the moment it re-entered.
+        self.assertEqual(
+            json.loads(audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")),
+            held,
+        )
+
+    def test_a_genuinely_different_run_is_still_refused(self):
+        # The resume must not become a way for a second dispatch to join the
+        # first: two runs writing one stream is what the lock exists to stop.
+        self.assertEqual(self.start_as("cron_compliance_1"), 0)
+        held = audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        self.assertEqual(self.start_as("cron_compliance_2"), 3)
+        self.assertEqual(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8"), held
+        )
+
+    def test_without_a_session_id_the_old_refusal_stands(self):
+        # Off-cluster there is no run identity to key on, so nothing is
+        # recognised as ours and the behaviour is the one from before resume.
+        self.assertEqual(self.start_as(""), 0)
+        self.assertEqual(self.start_as(""), 3)
+
     def test_the_workspace_is_named_so_manifests_can_be_written_into_it(self):
         # The agent does not start in a working tree, so a `remediation.path`
         # is meaningless unless `start` says what it is relative to.
@@ -5194,6 +5255,35 @@ class TestRunLock(BaseTestCase):
         winners = self.winners(self.race(_race_for_the_lock, True))
         self.assertEqual(len(winners), 1)
         self.assertEqual(self.held_nonce(), winners[0])
+
+    def test_the_refusal_never_advertises_the_override(self):
+        """The regression guard for two runs that stole their own lock.
+
+        A claim from a departed container, and one past the ceiling, are both
+        retired without anyone reading prose — so the only refusal that ever
+        reaches a reader is a *live* holder, and the message used to close with
+        "To override now, re-run `start --steal-lock`". That advice was wrong
+        every time it was shown. Twice an audit took it and stole the stream
+        from itself ~21 minutes into its own run.
+        """
+        message = str(
+            audit_report.RunInProgress(
+                AUDIT, {"t0": "2026-01-01T00:00:00+00:00", "pid": 7, "session": "cron_x"}
+            )
+        )
+        self.assertNotIn("steal", message.lower())
+        # Still says who holds it, so a report can name the run it lost to.
+        self.assertIn("cron_x", message)
+        self.assertIn("7", message)
+
+    def test_a_claim_records_the_run_that_wrote_it(self):
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "cron_x"}):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+            self.assertEqual(audit_report.own_run_claim(AUDIT), audit_report.read_run_claim(AUDIT))
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "cron_y"}):
+            self.assertIsNone(audit_report.own_run_claim(AUDIT))
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": ""}):
+            self.assertIsNone(audit_report.own_run_claim(AUDIT))
 
     def test_acquire_release_churn_never_double_admits(self):
         outcomes = self.race(_churn_the_lock, LOCK_ROUNDS)
