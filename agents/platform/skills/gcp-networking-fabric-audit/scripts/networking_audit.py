@@ -77,10 +77,11 @@ PROJECT_SCOPE_NOT_APPLICABLE = (
 # An unmeasured subnet owes exactly one check and could not run it, so §6's
 # `checks_run` comes out empty for it -- and `finish` rejects an empty
 # `checks_run` unless the target says in `limitations` why nothing ran. The
-# collector writes that sentence rather than leaving it to the model: three
-# live runs over the same 41 subnets produced three different restatements of
-# the same fact, which is what audit_report's `_limitation_restates_na` and the
-# structural rule above it were both written to absorb.
+# collector writes that sentence rather than leaving it to the model, because
+# the model does not converge on one: every stored run of this stream over the
+# same 41 subnets wrote a different sentence -- 11 runs, 11 wordings, measured
+# on 2026-08-30. Two of them are the shapes that defeated audit_report's
+# `_limitation_restates_na` and forced the structural rule above it.
 UNMEASURED_SUBNET_LIMITATION = (
     "subnet-ip-exhaustion, the only check this target owes, could not be "
     "evaluated: neither `list-usable` nor Network Analyzer published an "
