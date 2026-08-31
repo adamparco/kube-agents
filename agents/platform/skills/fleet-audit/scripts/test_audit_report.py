@@ -6002,6 +6002,9 @@ class TestReportStore(HarnessTestCase):
             sorted(self.stored_envelope()),
             [
                 "audit_id",
+                # The line the run posted, kept beside what it found — the only
+                # part of a scheduled run an operator ever sees.
+                "chat_summary",
                 "collect_s",
                 "coverage_gaps",
                 "current_ids",
@@ -6241,6 +6244,37 @@ class TestReportStore(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         self.assertTrue(self.stdout_json()["silent_ok"])
+
+    def test_the_stored_summary_is_the_line_the_run_printed(self):
+        """The envelope's `chat_summary` and the payload's are one string.
+
+        `finish` prints the payload for the model to copy and stores the
+        envelope for everyone afterwards. If those two disagree about what was
+        said, the store is a record of a message nobody received — so pin them
+        to each other rather than to a literal, which would only re-assert what
+        `chat_summary` renders.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        printed = self.stdout_json()["chat_summary"]
+        self.assertTrue(printed, "finish printed no summary to copy")
+        self.assertEqual(self.stored_envelope()["chat_summary"], printed)
+
+    def test_a_silent_run_stores_the_marker_it_did_not_send(self):
+        """Silence is a decision, and the store is where it is recorded.
+
+        Nothing reaches the home channel on a silent run, so the envelope is
+        the only place that can distinguish "this run chose to say nothing"
+        from "this run's delivery failed" — two states an operator reading a
+        quiet morning has no other way to tell apart.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertTrue(self.stdout_json()["silent_ok"])
+        self.assertEqual(
+            self.stored_envelope()["chat_summary"], audit_report.SILENT_MARKER
+        )
 
     def test_a_dry_run_stores_nothing(self):
         """`--dry-run` publishes nothing, so it must remember nothing: a store

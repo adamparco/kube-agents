@@ -1655,6 +1655,18 @@ def report_envelope(
         "prs_opened": list(payload.get("prs_opened") or []),
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
+        # What the run actually said, kept beside what it found. Every other
+        # key here describes the audit; this one describes the message, and it
+        # is the only part of a scheduled run an operator ever sees. It is
+        # derivable — `chat_summary` reads `status`, the two id lists and
+        # `issue_url`, all of which are in this envelope — but deriving it
+        # means re-running the renderer against a payload reassembled from an
+        # envelope, and the answer to "what did last night's run post?" should
+        # not depend on reproducing a computation. Storing it also makes the
+        # silent case legible: `[SILENT]` here says the run deliberately sent
+        # nothing, which is otherwise indistinguishable from a run whose
+        # delivery failed.
+        "chat_summary": payload.get("chat_summary"),
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
