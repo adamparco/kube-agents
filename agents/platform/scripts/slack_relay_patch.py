@@ -101,6 +101,13 @@ def is_silent_text(message: Any) -> bool:
     comes out of the wrapper this message still carries; a formatted leg that
     has lost the wrapper yields no id, and the text test carries that leg alone
     exactly as before.
+
+    Both tests read the *unwrapped* message, which is the form the sibling
+    tests. ``is_silent_report`` undresses by stripping markdown off the two
+    ends of what it is given, so handed the whole delivery it strips the ends
+    of the wrapper — and ``**[SILENT]**`` under a ``Cronjob Response:`` header
+    came back False, which is every cron delivery there is. The undressing was
+    only ever reachable here on a message that had lost its wrapper.
     """
     text = "" if message is None else str(message)
     try:
@@ -111,7 +118,8 @@ def is_silent_text(message: Any) -> bool:
         )
     except Exception:
         return not text.strip()
-    return bool(is_silent_report(text) or declared_silent(parse_cron_wrapper(text)[0]))
+    job_id, _title, report = parse_cron_wrapper(text)
+    return bool(is_silent_report(report) or declared_silent(job_id))
 
 
 def read_upload(path: Path, max_file_bytes: int) -> bytes:

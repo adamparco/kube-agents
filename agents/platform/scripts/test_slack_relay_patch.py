@@ -882,18 +882,34 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
         Loaded under the name the patch imports rather than stubbed, so the
         assertion is that the two ends share one predicate rather than that
         they share an idea of one.
+
+        Wrapped as well as bare, because wrapped is the only form a scheduled
+        run produces and the bare cases alone passed against a predicate that
+        dropped every one of them. ``is_silent_report`` undresses by stripping
+        markdown off the two ends of what it is handed, so handed the whole
+        delivery it strips the ends of the ``Cronjob Response:`` header instead
+        of the marker.
         """
         entry = self._register_slack()
         captured, patched = self._relay([])
+        wrap = "Cronjob Response: Compliance Audit\n(job_id: compliance-audit)\n-----\n\n{}"
         with mock.patch.dict(sys.modules, _chat_adapter_modules()):
             for dressed in ("`[SILENT]`", "**[SILENT]**", "  **`[silent]`**  "):
-                with self.subTest(dressed):
-                    with patched:
-                        result = self._send(entry, message=dressed)
-                    self.assertEqual(
-                        {"success": True, "platform": "slack", "skipped": "empty_text"},
-                        result,
-                    )
+                for label, message in (
+                    ("bare", dressed),
+                    ("wrapped", wrap.format(dressed)),
+                ):
+                    with self.subTest(dressed=dressed, form=label):
+                        with patched:
+                            result = self._send(entry, message=message)
+                        self.assertEqual(
+                            {
+                                "success": True,
+                                "platform": "slack",
+                                "skipped": "empty_text",
+                            },
+                            result,
+                        )
         self.assertEqual([], captured)
 
     def test_a_real_brief_still_goes_out_when_the_sibling_predicate_is_loaded(self):
