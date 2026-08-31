@@ -96,6 +96,11 @@ API_KEY_ENV = "SESSION_KV_API_KEY"
 #: written down as a failure.
 RELAY_TIMEOUT_SECONDS = 360.0
 
+#: Markdown a model wraps around a bare token: emphasis, code spans, and the
+#: whitespace either side. Stripped from both ends of a report before it is
+#: tested for silence — see :func:`is_silent_report`.
+_MARKDOWN_DRESS = "`*_~ \t\r\n"
+
 #: ``_deliver_result``'s wrapper. Matched, not assumed — see
 #: :func:`parse_cron_wrapper`.
 _WRAPPER_RE = re.compile(
@@ -212,6 +217,40 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
     )
 
 
+def is_silent_report(report: str) -> bool:
+    """Should this report be swallowed rather than relayed?
+
+    True for an empty report, and for one whose entire content is the silence
+    marker however the model dressed it. The scheduler's own matcher is already
+    generous — ``[SILENT]`` bare, lowercased, or on its own line among prose all
+    suppress delivery — and where it applies, ``standalone_send`` is never
+    reached at all. What it does not accept is the marker wearing markdown:
+    ``` `[SILENT]` ``` and ``**[SILENT]**`` both test False and are delivered.
+
+    Which is the form to expect. These reports are written by agents that write
+    markdown by default, and every audit SOP now tells the run to copy
+    ``chat_summary`` — a field whose value *is* ``[SILENT]`` on a quiet run —
+    verbatim into its final response. Emphasise it once and the run that meant
+    to say nothing posts the word "[SILENT]" to the home channel instead, which
+    is the one outcome the silent path exists to prevent.
+
+    So undress the report before testing it. On a real report this changes
+    nothing: stripping punctuation off the two ends of a multi-line audit
+    summary cannot turn it into the marker.
+    """
+    bare = report.strip(_MARKDOWN_DRESS)
+    if not bare:
+        return True
+    try:
+        from cron.scheduler import _is_cron_silence_response
+    except Exception:
+        # Outside the Hermes tree — the unit tests, and any caller that imports
+        # this module on its own. Fall back to the marker itself rather than
+        # failing open, because failing open here means posting the marker.
+        return bare.strip().upper() == "[SILENT]"
+    return bool(_is_cron_silence_response(bare))
+
+
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     """FastAPI's ``detail`` off an error response, as ``": <detail>"`` or ``""``.
 
@@ -319,7 +358,12 @@ async def standalone_send(
     # Ahead of the credential check on purpose. There is nothing to send, so a
     # missing key is not this tick's problem, and reporting one would be the
     # same error-every-ten-minutes by another name.
-    if not report.strip():
+    #
+    # :func:`is_silent_report` also covers the marker upstream lets through
+    # because a model emphasised it. Relaying that would be worse than posting
+    # it raw: the route runs a Chat Agent turn over the text, and the Chat Agent
+    # asked to relay "[SILENT]" writes a sentence about it.
+    if is_silent_report(report):
         logger.info(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
         )

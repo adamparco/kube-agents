@@ -234,6 +234,61 @@ class TestStandaloneSend(unittest.TestCase):
             self.assertEqual(result.get("skipped"), "empty_report")
             self.assertEqual(relay.requests, [])
 
+    def test_an_emphasised_silence_marker_is_still_silence(self):
+        """The leak this guard exists for.
+
+        Upstream's matcher takes `[SILENT]` bare, lowercased, or among prose,
+        and where it applies `standalone_send` is never called. It does not
+        take the marker in a code span or in bold -- and the audit SOPs tell
+        every run to copy `chat_summary` verbatim, on a quiet run that field is
+        exactly `[SILENT]`, and these agents write markdown. Emphasise it once
+        and the operator gets a message reading "[SILENT]" from a run whose
+        whole point was to stay quiet.
+        """
+        for dressed in ("`[SILENT]`", "**[SILENT]**", "_[SILENT]_", "  **`[silent]`**  "):
+            with self.subTest(report=dressed):
+                with RecordingRelay() as relay:
+                    with patch.dict(
+                        os.environ,
+                        {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+                    ):
+                        result = asyncio.run(
+                            mod.standalone_send(
+                                None, "c", wrapped("Compliance Audit", "ca", dressed)
+                            )
+                        )
+                self.assertTrue(result.get("success"), result)
+                self.assertEqual(result.get("skipped"), "empty_report")
+                self.assertEqual(relay.requests, [], f"{dressed!r} was relayed")
+
+    def test_a_real_report_is_never_mistaken_for_silence(self):
+        """Undressing strips punctuation off both ends; it must not eat a report.
+
+        The summary line the harness renders is the exact shape at risk -- it
+        ends in a URL and can begin with an emphasised count -- so it is the
+        one checked, alongside a report that merely mentions the marker.
+        """
+        real = [
+            "2 critical, 5 medium (3 new, 1 resolved) — https://github.com/x/y/issues/41",
+            "**3 high** (no change) — https://github.com/x/y/issues/12",
+            "The run emitted [SILENT] on its first attempt, then found 4 criticals.",
+            "---",  # a horizontal rule: punctuation, but not the dress this strips
+        ]
+        for report in real:
+            with self.subTest(report=report[:40]):
+                self.assertFalse(mod.is_silent_report(report))
+
+    def test_a_report_of_nothing_but_emphasis_is_silence(self):
+        """`***` undresses to empty, and that is the wanted answer.
+
+        It carries no content, so the alternative is posting three asterisks to
+        the operator's home channel -- which is what the previous
+        `report.strip()` guard did.
+        """
+        for report in ("***", "_", "~~~", "  **  ", "`"):
+            with self.subTest(report=report):
+                self.assertTrue(mod.is_silent_report(report))
+
     def test_silence_is_not_a_missing_key(self):
         """A quiet tick has nothing to authenticate, so an unset key is not its problem.
 
