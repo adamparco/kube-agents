@@ -1185,12 +1185,29 @@ def _has_restrictive_authorized_networks(describe: dict) -> bool:
 
 
 def check_public_control_plane(context: dict) -> list[dict]:
+    """Whether the API server answers from the internet.
+
+    Two generations of the same setting, and only one of them is authoritative
+    on any given cluster. `controlPlaneEndpointsConfig.ipEndpointsConfig.
+    enablePublicEndpoint` is the current field and says outright whether the
+    public endpoint is served; `privateClusterConfig.enablePrivateEndpoint` is
+    the legacy inversion of it, and GKE keeps returning that block for
+    compatibility with only the addresses filled in. Reading them as an `or`
+    took the union of two readings of the same fact: a cluster that turned the
+    public endpoint off the current way, and so carries no legacy
+    `enablePrivateEndpoint: true`, was reported as reachable from the internet
+    at `critical`. Prefer the current field wherever GKE returns it and fall
+    back to the legacy one only when it does not.
+    """
     describe = context.get("cluster_describe") or {}
     private_cfg = describe.get("privateClusterConfig") or {}
     public_endpoint_enabled = (
         (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
     ).get("enablePublicEndpoint")
-    reachable = private_cfg.get("enablePrivateEndpoint") is not True or public_endpoint_enabled is True
+    if public_endpoint_enabled is None:
+        reachable = private_cfg.get("enablePrivateEndpoint") is not True
+    else:
+        reachable = public_endpoint_enabled is True
     if not reachable:
         return []
     if _has_restrictive_authorized_networks(describe):

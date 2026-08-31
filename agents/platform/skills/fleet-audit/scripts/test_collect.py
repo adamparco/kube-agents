@@ -1708,6 +1708,41 @@ class TestPublicControlPlane(unittest.TestCase):
         ctx = context_of(cluster_describe={"privateClusterConfig": {"enablePrivateEndpoint": True}})
         self.assertEqual(collect.check_public_control_plane(ctx), [])
 
+    def test_the_public_endpoint_turned_off_the_current_way_is_never_flagged(self):
+        """`enablePublicEndpoint: false` is the whole answer where GKE returns it.
+
+        The legacy `privateClusterConfig` block keeps coming back on a cluster
+        that has none of it set -- GKE fills in the addresses and nothing else
+        -- so a cluster that closed its public endpoint on the current surface
+        carries no `enablePrivateEndpoint: true` to find. Reading the two as an
+        `or` therefore reported it reachable from the internet at `critical`,
+        which is the reverse of what it had configured.
+        """
+        for label, private_cfg in (
+            ("legacy block absent", {}),
+            ("legacy block present but only addressed", {"privateEndpoint": "10.0.0.2", "publicEndpoint": ""}),
+        ):
+            with self.subTest(legacy=label):
+                ctx = context_of(
+                    cluster_describe={
+                        "privateClusterConfig": private_cfg,
+                        "controlPlaneEndpointsConfig": {"ipEndpointsConfig": {"enablePublicEndpoint": False}},
+                    }
+                )
+                self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+    def test_the_current_field_outranks_a_stale_legacy_one(self):
+        # The other direction, so the fix is a precedence rule rather than a
+        # second way to reach "not flagged": a cluster still serving the public
+        # endpoint is flagged whatever the legacy block claims.
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+                "controlPlaneEndpointsConfig": {"ipEndpointsConfig": {"enablePublicEndpoint": True}},
+            }
+        )
+        self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
+
     def test_a_narrow_authorized_cidr_is_never_flagged(self):
         ctx = context_of(
             cluster_describe={
