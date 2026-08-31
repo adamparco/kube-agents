@@ -15,6 +15,15 @@ By default the module grants the read-only role set (the composition's
 nothing and manage roles yourself — but note the agent fails every GCP call until an
 equivalent role set exists.
 
+Whenever `project_roles` is non-empty the module also defines a project-level custom role,
+`kubeagentsSubnetUtilizationReader`, and binds it to the same GSA. Two things follow that the
+role list alone does not tell you. Its `compute.subnetworks.use` is a consumption permission
+rather than a read, so the grant is not read-only in substance — see
+[Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md) for why the
+narrower custom role is still the better of the two options. And `role_id` is a constant, not
+derived from `service_account_id`, so two instantiations of this module in one project collide on
+it; that is the same constraint the GSA's own default name already imposes.
+
 There is no admin preset to mirror: the `gke-admin` bundle was removed (see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),
 and this module has never had one. Passing admin roles through `project_roles` is

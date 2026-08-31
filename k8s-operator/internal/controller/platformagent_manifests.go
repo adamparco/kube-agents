@@ -2553,10 +2553,12 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// collectors' parse gate and drops that whole cluster out of
 		// compliance-audit and ai-security-audit as a coverage gap.
 		//
-		// Raising it costs no memory. `_execute` reads the subprocess to
-		// completion with `communicate()` and only then slices to the cap, so
-		// the full output is resident whatever this says; the value decides
-		// how much of it travels back, not the peak.
+		// The cap does not bound the read: `_execute` takes the subprocess to
+		// completion with `communicate()` before it slices, so the full output
+		// is resident whatever this says. What it does bound is the slice that
+		// survives, and that copy is then JSON-escaped and encoded for the
+		// response -- so raising it costs on the order of three times the
+		// increase per in-flight request rather than nothing.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "33554432"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},

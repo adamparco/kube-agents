@@ -19,10 +19,17 @@ resource "google_service_account_iam_member" "workload_identity" {
 # corroborate against `subnets list`. On the deployed install that was 42
 # subnets reported as zero, every run.
 #
-# No predefined role carries this permission without also carrying write-side
-# ones: roles/compute.networkUser is the usual home and brings addresses.use
-# and forwardingRules.use with it. A custom role with the single permission
-# keeps the agent's project bindings read-only in substance as well as name.
+# compute.subnetworks.use is a consumption permission, not a read: it is what
+# authorizes attaching a NIC, a node pool or a load balancer to a subnet, and
+# roles/compute.viewer does not carry it. So this is a deliberate exception to
+# the read-only project grant rather than an instance of it, taken because the
+# API offers no read-only route to the field.
+#
+# The predefined home for it is roles/compute.networkUser, which carries some
+# two hundred permissions including networksecurity.sacAttachments.create and
+# .delete -- writes. A custom role with three permissions is the narrower of
+# the two, which is the whole argument for it; it is not a way of keeping the
+# grant read-only, and the docs should not say it is.
 #
 # Gated on project_roles being non-empty so that `project_roles = []` still
 # means "grant nothing and manage roles outside the module", as its

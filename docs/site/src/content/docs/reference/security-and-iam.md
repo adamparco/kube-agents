@@ -77,6 +77,14 @@ permissions and exists because no predefined role carries them without carrying 
 `recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the Network Analyzer insight that
 reports their IP utilization — the only place that measurement is published, and otherwise reachable
 only through `roles/recommender.viewer`, which grants viewer on every recommender in the project.
+
+`compute.subnetworks.use` is the one permission in the default set that is not a read.
+`roles/compute.viewer` does not carry it: it is the permission that authorizes attaching a NIC, a
+node pool or a load balancer to a subnet, and the API offers no read-only route to the utilization
+field. The custom role is narrower than the predefined alternative — `roles/compute.networkUser`
+runs to some two hundred permissions and includes real writes — but it is an exception to the
+read-only posture rather than an instance of it, and an install that needs "no cloud-side
+capability" as an enforced property should read it as such.
 The fleet audit's subnet-ip-exhaustion check is its sole consumer. It is defined in
 [`terraform/modules/kube-agents-iam`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam)
 and, like the bundle above, is skipped entirely when `project_roles` is empty.
