@@ -1556,7 +1556,7 @@ def relay_cron_report(
     title: str,
     report: str,
     also_delivered_to: Sequence[str] = (),
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, str]:
     """Hand a specialist's finished report to the Chat Agent, then post its reply.
 
     The report goes to every platform :func:`enabled_platforms` names, each into
