@@ -5,8 +5,9 @@
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §10 phase 4, and
 governance/fleet_wide_cost_analysis_sop.md.
 
-This stream's own collector: its targets are both GKE clusters (ten
-`kubectl` object kinds plus a Cloud Monitoring usage read) and GCP projects
+This stream's own collector: its targets are both GKE clusters (the eleven
+`kubectl` object kinds in `collect_cluster`'s `dump_kinds`, plus a Cloud
+Monitoring usage read) and GCP projects
 (`gcloud compute disks/addresses/forwarding-rules/target-pools/backend-services`),
 so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
@@ -591,8 +592,20 @@ def _allocatable(node: dict) -> tuple[float, float]:
     return parse_cpu_cores(str(alloc.get("cpu", "0"))) or 0, parse_mem_mib(str(alloc.get("memory", "0"))) or 0
 
 
-MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|highgpu|megamem|ultramem)-(\d+)$")
+MACHINE_TYPE_VCPU_RE = re.compile(r"^[a-z0-9]+-(?:standard|highmem|highcpu|megamem|ultramem)-(\d+)(?:-\w+)?$")
 CUSTOM_MACHINE_TYPE_VCPU_RE = re.compile(r"^(?:[a-z0-9]+-)?custom-(\d+)-\d+$")
+# `a2-highgpu-1g`, `a2-ultragpu-8g`, `a3-megagpu-8g`, `ct5lp-hightpu-4t`. The
+# trailing number on an accelerator machine type counts GPUs or TPU chips, not
+# vCPUs, so the family cannot go in the pattern above: `highgpu` sat in it and
+# never matched anything, because the suffix is `8g` rather than `8`. Reading
+# the digit as a vCPU count would be worse than not matching -- `a3-highgpu-8g`
+# is a 208-vCPU machine and would have scored 8. Every member of these families
+# is far past the 8-vCPU line §3.7's severity rule draws, so they are answered
+# directly. `config.accelerators` covers most of them anyway, but not TPU pools:
+# a TPU node pool carries its topology, not an `accelerators` list, and §3.7 is
+# explicit that "an idle accelerator pool with a non-zero floor is the single
+# largest reclaimable item this audit can find".
+ACCELERATOR_MACHINE_RE = re.compile(r"^[a-z0-9]+-(?:high|ultra|mega)(?:gpu|tpu)-\d+[a-z]?$")
 
 
 def _machine_type_vcpus(machine_type: str) -> int | None:
@@ -601,6 +614,13 @@ def _machine_type_vcpus(machine_type: str) -> int | None:
         if m:
             return int(m.group(1))
     return None
+
+
+def _is_big_machine(machine_type: str) -> bool:
+    """§3.7's "machine type of >= 8 vCPU, or attached accelerators" severity leg."""
+    if ACCELERATOR_MACHINE_RE.match(machine_type or ""):
+        return True
+    return (_machine_type_vcpus(machine_type) or 0) >= 8
 
 
 def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime) -> list[dict]:
@@ -624,13 +644,33 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
         nodes = nodes_by_pool.get(pool_name, [])
         if not nodes or len(node_pools) <= 1:
             continue
-        age_days = _age_days((nodes[0].get("metadata", {}) or {}).get("creationTimestamp", ""), now=now)
-        if age_days is not None and age_days < 7:
+        # §3.7's "pools created < 7 days ago" exclusion, measured off the
+        # *oldest* node rather than whichever one the dump listed first. The
+        # dump comes back name-sorted, so `nodes[0]` is the alphabetically
+        # first node, and a pool that has run for months exempts itself the
+        # moment an autoscaler adds a node whose name happens to sort early.
+        # The oldest node is the closest lower bound on the pool's own age that
+        # the object dump carries.
+        ages = [
+            age
+            for node in nodes
+            if (age := _age_days((node.get("metadata", {}) or {}).get("creationTimestamp", ""), now=now))
+            is not None
+        ]
+        if ages and max(ages) < 7:
             continue
         if any(node.get("spec", {}).get("unschedulable") for node in nodes):
             continue
 
+        # §3.7 flags when *every node in the pool* is under 15%, not when the
+        # pool averages under 15%. The two disagree exactly where it matters:
+        # a ten-node pool with one node full and nine empty averages 10% and
+        # was reported as an idle pool whose floor should drop to zero, when
+        # the node holding the workload is precisely what stops it shrinking.
+        # The aggregate figures are still computed, because the excerpt quotes
+        # them and a reader wants the pool-level number.
         cpu_alloc_total = mem_alloc_total = cpu_req_total = mem_req_total = 0.0
+        every_node_idle = True
         for node in nodes:
             node_name = node.get("metadata", {}).get("name", "")
             cpu_alloc, mem_alloc = _allocatable(node)
@@ -639,11 +679,19 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
             mem_alloc_total += mem_alloc
             cpu_req_total += cpu_req
             mem_req_total += mem_req
+            if cpu_alloc <= 0 or mem_alloc <= 0:
+                # A node reporting no allocatable capacity is one this check
+                # cannot judge -- NotReady, or mid-registration. Treat it as
+                # not-idle rather than divide by zero: an unreadable node is
+                # not evidence the pool is reclaimable.
+                every_node_idle = False
+            elif cpu_req / cpu_alloc > 0.15 or mem_req / mem_alloc > 0.15:
+                every_node_idle = False
+        if not every_node_idle:
+            continue
         if cpu_alloc_total == 0 or mem_alloc_total == 0:
             continue
         cpu_pct, mem_pct = cpu_req_total / cpu_alloc_total, mem_req_total / mem_alloc_total
-        if cpu_pct > 0.15 or mem_pct > 0.15:
-            continue
 
         autoscaling = pool.get("autoscaling") or {}
         floor_nonzero = not autoscaling.get("enabled") or (autoscaling.get("minNodeCount") or 0) >= 1
@@ -652,8 +700,7 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
 
         machine_type = ((pool.get("config") or {}).get("machineType") or "")
         has_accelerator = bool((pool.get("config") or {}).get("accelerators"))
-        big_machine = (_machine_type_vcpus(machine_type) or 0) >= 8
-        severity = "major" if len(nodes) >= 3 or big_machine or has_accelerator else "minor"
+        severity = "major" if len(nodes) >= 3 or _is_big_machine(machine_type) or has_accelerator else "minor"
         hits.append(
             {
                 "object": f"NodePool/{pool_name}",
@@ -663,6 +710,31 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
             }
         )
     return hits
+
+
+SAFE_TO_EVICT_ANNOTATION = "cluster-autoscaler.kubernetes.io/safe-to-evict"
+# What the cluster autoscaler itself accepts. It reads the annotation with Go's
+# `strconv.ParseBool`, so `"False"`, `"FALSE"` and `"0"` pin a pod exactly as
+# `"false"` does. An exact-string comparison against `"false"` reads all three
+# as "annotation absent" and takes the permissive branch, so a node the
+# autoscaler will never drain went unreported -- and on the other side,
+# `!= "true"` read `"True"` as unset and reported a node whose owner had
+# explicitly cleared it. Both directions are wrong against the same parse.
+_EVICT_TRUE = frozenset({"1", "t", "true"})
+_EVICT_FALSE = frozenset({"0", "f", "false"})
+
+
+def _safe_to_evict(annotations: dict) -> bool | None:
+    """The `safe-to-evict` annotation as set-true, set-false, or unset.
+
+    Unset covers a value the autoscaler cannot parse either, which it ignores.
+    """
+    raw = (annotations.get(SAFE_TO_EVICT_ANNOTATION) or "").strip().lower()
+    if raw in _EVICT_TRUE:
+        return True
+    if raw in _EVICT_FALSE:
+        return False
+    return None
 
 
 def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[dict]:
@@ -688,7 +760,7 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
             continue
         owners = pod.get("metadata", {}).get("ownerReferences") or []
         annotations = pod.get("metadata", {}).get("annotations") or {}
-        safe_to_evict = annotations.get("cluster-autoscaler.kubernetes.io/safe-to-evict")
+        evictable = _safe_to_evict(annotations)
         has_local_storage = any(("emptyDir" in v or "hostPath" in v) for v in (pod.get("spec") or {}).get("volumes") or [])
 
         blocked_by_pdb = any(_selector_matches(sel, (pod.get("metadata", {}).get("labels") or {})) for sel in pdb_selectors)
@@ -696,16 +768,19 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
             continue  # already reported by obtainability-audit's 3.3/3.4
 
         bare_pod = not owners
-        unevictable = safe_to_evict == "false" or (bare_pod and has_local_storage) or (has_local_storage and safe_to_evict != "true")
+        unevictable = evictable is False or (bare_pod and has_local_storage) or (has_local_storage and evictable is not True)
         if not unevictable:
             continue
 
-        permanent = (bare_pod and has_local_storage) or safe_to_evict == "false"
+        permanent = (bare_pod and has_local_storage) or evictable is False
         pod_name = pod.get("metadata", {}).get("name", "")
+        # The raw annotation, not the parse: the excerpt is evidence, and a
+        # reader checking it against `kubectl get pod -o yaml` needs to see what
+        # is really on the object.
         hits.append(
             {
                 "object": f"Node/{node_name}",
-                "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={safe_to_evict}, local-storage={has_local_storage})",
+                "excerpt": f"pod {ns}/{pod_name} blocks drain (ownerReferences={'none' if bare_pod else 'set'}, safe-to-evict={annotations.get(SAFE_TO_EVICT_ANNOTATION)}, local-storage={has_local_storage})",
                 "severity": "critical" if permanent else "major",
             }
         )
@@ -718,6 +793,29 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
 # --------------------------------------------------------------------------- #
 
 GC_OWNED_LABEL_PREFIXES = ("workflows.argoproj.io/", "tekton.dev/", "fluxcd.io/")
+#: The Job conditions that mean "this Job is over". `SuccessCriteriaMet` is
+#: what a Job with a `successPolicy` gets instead of `Complete`.
+JOB_TERMINAL_CONDITIONS = ("Complete", "Failed", "SuccessCriteriaMet")
+
+
+def _job_finished_at(status: dict) -> str:
+    """When a Job without a `completionTime` last transitioned to a terminal
+    condition.
+
+    A failed Job never gets a `completionTime`, so the condition list is the
+    only timestamp there -- and it is a *list*, appended to in the order the
+    controller set each condition. `conditions[0]` is therefore whichever one
+    was set first, which on a suspended-then-failed Job is `Suspended` and on a
+    Job the controller has since un-suspended is a condition whose
+    `lastTransitionTime` is when it stopped applying. Both dated the Job's
+    death to the wrong moment, and 3.9's whole gate is "terminal for >= 7 days".
+    """
+    candidates = [
+        c.get("lastTransitionTime", "")
+        for c in status.get("conditions") or []
+        if c.get("type") in JOB_TERMINAL_CONDITIONS and c.get("status") == "True"
+    ]
+    return max((c for c in candidates if c), default="")
 
 
 def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
@@ -753,7 +851,7 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
             continue
         if spec.get("ttlSecondsAfterFinished") is not None:
             continue
-        done = status.get("completionTime") or (status.get("conditions") or [{}])[0].get("lastTransitionTime", "")
+        done = status.get("completionTime") or _job_finished_at(status)
         if not (status.get("succeeded") or status.get("failed")):
             continue
         age = _age_days(done, now=now)
@@ -822,6 +920,26 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
+def _owner_key(owners: list[dict]) -> tuple[str, str] | None:
+    """The controller that owns a pod, as `(kind, name)`.
+
+    `ownerReferences[0]` is not it. The API guarantees at most one entry with
+    `controller: true` and says nothing about the order of the rest, so a pod
+    carrying a second, non-controlling reference -- which is how several
+    operators mark ownership alongside the ReplicaSet -- could aggregate under
+    either one, and under a different one next week. That moves the finding's
+    `object`, and §5 is explicit that a `check`/`cluster`/`namespace`/`object`
+    that moves is announced as fixed one week and re-announced as new the next.
+    Sorting the non-controller fallback keeps the answer stable even where no
+    reference claims to be the controller.
+    """
+    controllers = [o for o in owners if o.get("controller")]
+    pick = controllers[0] if controllers else min(owners, key=lambda o: (o.get("kind", ""), o.get("name", "")), default=None)
+    if not pick:
+        return None
+    return (pick.get("kind", ""), pick.get("name", ""))
+
+
 def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
     """`usage_peaks` is `fetch_usage_peaks`'s `(ns, pod) -> (cores, MiB)`.
 
@@ -855,7 +973,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         limits = [(c.get("resources") or {}).get("limits") or {} for c in containers]
         if not any(requests):
             continue  # obtainability-audit's `no-requests` owns this
-        owner_key = (owners[0]["kind"], owners[0]["name"]) if owners else ("Pod", name)
+        owner_key = _owner_key(owners) or ("Pod", name)
         entry = by_owner.setdefault(owner_key, {"ns": ns, "pods": [], "oldest_h": None})
         entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits})
         # A peak is only as long as the pod that reported it. Monitoring keeps a
@@ -1209,7 +1327,14 @@ def _scope_flag(obj: dict) -> str:
     return f"--zone={location}" if obj.get("zone") else f"--region={location}"
 
 
-def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *, now: datetime) -> list[dict]:
+#: How many of a roll-up's members the excerpt names before it stops. Enough to
+#: start on without opening the console; short of the point where one finding's
+#: evidence crowds the rest of the ledger out of the 60,000-character body §5
+#: warns about.
+ROLLUP_EXCERPT_MEMBERS = 12
+
+
+def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *, project: str, now: datetime) -> list[dict]:
     hits = []
     idle = []
     for addr in addresses:
@@ -1224,8 +1349,28 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
             continue
         idle.append(addr)
     if len(idle) >= 10:
-        location = _location_of(idle[0])
-        return [{"object": f"Address/rollup-{location}", "excerpt": f"{len(idle)} external addresses RESERVED and unattached in {location}", "severity": "major"}]
+        # §3.5's roll-up is per *project*, and §5 requires a roll-up to be named
+        # after the scope it covers rather than after one of its members. It was
+        # named `Address/rollup-<region of idle[0]>`: a region only the first
+        # address is necessarily in -- so a project leaking addresses across
+        # three regions published one finding claiming all of them were in one --
+        # and an identity that moves the moment that address is released, which
+        # re-announces the same leak as a new finding. The scope is the project.
+        by_location: dict[str, list[str]] = {}
+        for addr in idle:
+            by_location.setdefault(_location_of(addr), []).append(addr.get("name", ""))
+        breakdown = ", ".join(f"{loc} ({len(names)})" for loc, names in sorted(by_location.items()))
+        names = sorted(n for n in (a.get("name", "") for a in idle) if n)
+        shown = ", ".join(names[:ROLLUP_EXCERPT_MEMBERS])
+        if len(names) > ROLLUP_EXCERPT_MEMBERS:
+            shown += f", and {len(names) - ROLLUP_EXCERPT_MEMBERS} more"
+        return [
+            {
+                "object": f"Project/{project}",
+                "excerpt": f"{len(idle)} external addresses RESERVED and unattached across {breakdown}: {shown}",
+                "severity": "major",
+            }
+        ]
     for addr in idle:
         hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')} ({_scope_flag(addr)})", "severity": "minor"})
     return hits
@@ -1233,7 +1378,15 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
 
 def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], backend_services: list[dict], known_services: set[str], *, now: datetime) -> list[dict]:
     hits = []
-    svc_name_re = re.compile(r"kubernetes\.io/service-name:\s*([\w.-]+/[\w.-]+)")
+    # The GKE service controller writes this description as a JSON object --
+    # `{"kubernetes.io/service-name":"ns/name","kubernetes.io/api-version":"v1"}`
+    # -- so the key is followed by a closing quote before the colon. A pattern
+    # requiring `service-name:` therefore matched no real forwarding rule at
+    # all: every one of them fell through the `if not m: continue` and 3.6's
+    # orphaned-rule leg has never emitted a finding against a live fleet. The
+    # optional quotes accept both that shape and the bare `key: value` form the
+    # SOP's own example uses.
+    svc_name_re = re.compile(r"""kubernetes\.io/service-name["']?\s*:\s*["']?([\w.-]+/[\w.-]+)""")
     for rule in forwarding_rules:
         desc = rule.get("description", "") or ""
         m = svc_name_re.search(desc)
@@ -1302,7 +1455,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         }
 
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now)]
-    candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], now=now)]
+    candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
 
@@ -1333,10 +1486,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         entry["limitations"] = (
             "orphan-lb was not evaluated for this project: §3.6 compares "
             "forwarding rules against the Service names of every cluster in "
-            "the project, and at least one of them could not be read, so a "
-            "rule its Services reference would read as orphaned. See the "
-            "unreachable cluster entries in this manifest for the reason each "
-            "one failed."
+            "the project, and this run holds a complete Service list for none "
+            "of them -- either a cluster could not be read or the project "
+            "contributed no readable cluster at all -- so a rule its Services "
+            "reference would read as orphaned. See this project's cluster "
+            "entries in this manifest for the reason each one failed."
         )
     return entry
 
@@ -1405,6 +1559,18 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     by_project: dict[str, list[tuple[dict, dict]]] = {}
     for cluster, result in zip(clusters, results):
         by_project.setdefault(cluster["project"], []).append(result)
+    # The clusters that never reached a worker belong to the gate too. §3.6
+    # withholds `orphan-lb` unless *every* cluster in the project was read, and
+    # a DEGRADED or PROVISIONING cluster is one that was not: it goes straight
+    # into `scope.skipped` per §2, and its Services are exactly the ones a
+    # forwarding rule might still reference. Reading the gate off `by_project`
+    # alone -- which only ever holds RUNNING clusters -- meant a project could
+    # have a cluster in `scope.skipped` and still publish `orphan-lb` findings
+    # against Service names it had not finished collecting, which is the false
+    # positive §3.6 calls the highest-risk cross-check in the audit.
+    skipped_by_project: dict[str, list[dict]] = {}
+    for entry in unaudited:
+        skipped_by_project.setdefault(entry.get("project", ""), []).append(entry)
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []
@@ -1412,7 +1578,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         group = by_project.get(p, [])
         group_entries = [entry for entry, _ in group]
         cluster_entries.extend(group_entries)
-        all_reachable = bool(group_entries) and all(e["outcome"] == "collected" for e in group_entries)
+        all_reachable = (
+            bool(group_entries)
+            and not skipped_by_project.get(p)
+            and all(e["outcome"] == "collected" for e in group_entries)
+        )
         fleet_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
         for _, facts in group:
             for key in fleet_facts:

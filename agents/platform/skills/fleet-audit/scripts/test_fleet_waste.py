@@ -6,7 +6,7 @@ import os
 import sys
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -416,6 +416,58 @@ class IdleNodepoolTest(unittest.TestCase):
         hits = fw.check_idle_nodepool(context, pools, now=NOW)
         self.assertEqual(hits[0]["severity"], "minor")
 
+    def test_a_tpu_pool_is_major_without_an_accelerators_list(self):
+        """A TPU node pool carries its topology, not `config.accelerators`, so
+        `has_accelerator` is False there and the machine type is the only
+        signal. §3.7: an idle accelerator pool with a non-zero floor is the
+        largest reclaimable item this audit can find."""
+        nodes = [self.node("n1", "tpu-pool")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("tpu-pool", machine_type="ct5lp-hightpu-4t"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_one_busy_node_stops_the_pool_being_called_idle(self):
+        """§3.7 flags when *every* node in the pool is under 15%, not when the
+        pool averages under 15%. Nine empty nodes and one full one average 10%,
+        and the full one is exactly what stops the pool shrinking."""
+        nodes = [self.node(f"n{i}", "pool") for i in range(10)]
+        pods = [self.pod_on("n0", cpu_req="3800m", mem_req="7Gi")]
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_a_pool_where_every_node_is_idle_is_still_flagged(self):
+        nodes = [self.node(f"n{i}", "pool") for i in range(10)]
+        pods = [self.pod_on(f"n{i}", cpu_req="100m", mem_req="100Mi") for i in range(10)]
+        context = {"nodes": nodes, "pods": pods}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_a_node_reporting_no_allocatable_is_not_evidence_of_idleness(self):
+        nodes = [self.node("n1", "pool"), self.node("n2", "pool", cpu_alloc="0", mem_alloc="0")]
+        context = {"nodes": nodes, "pods": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_pool_age_comes_from_the_oldest_node_not_the_first_listed(self):
+        """`kubectl get nodes` comes back name-sorted, so `nodes[0]` was the
+        alphabetically first node. A months-old pool that autoscaled up a node
+        named `a-...` yesterday exempted itself from the whole check."""
+        old = self.node("z-old", "pool")  # creationTimestamp 2026-01-01
+        new = self.node("a-new", "pool")
+        new["metadata"]["creationTimestamp"] = (NOW - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        context = {"nodes": [new, old], "pods": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_a_genuinely_new_pool_is_still_skipped(self):
+        new = self.node("n1", "pool")
+        new["metadata"]["creationTimestamp"] = (NOW - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        context = {"nodes": [new], "pods": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
 
 class MachineTypeVcpusTest(unittest.TestCase):
     def test_standard(self):
@@ -429,6 +481,32 @@ class MachineTypeVcpusTest(unittest.TestCase):
 
     def test_small_is_unmatched(self):
         self.assertIsNone(fw._machine_type_vcpus("e2-small"))
+
+    def test_a_local_ssd_variant_still_parses(self):
+        self.assertEqual(fw._machine_type_vcpus("c3-standard-8-lssd"), 8)
+
+    def test_an_accelerator_type_is_not_read_as_a_vcpu_count(self):
+        """`a3-highgpu-8g`'s `8` counts GPUs, not vCPUs -- it is a 208-vCPU
+        machine. Answering 8 would be luck; answering None and letting
+        `_is_big_machine` decide is the honest split."""
+        for machine_type in ("a2-highgpu-1g", "a2-ultragpu-8g", "a3-megagpu-8g", "ct5lp-hightpu-4t"):
+            with self.subTest(machine_type=machine_type):
+                self.assertIsNone(fw._machine_type_vcpus(machine_type))
+
+
+class IsBigMachineTest(unittest.TestCase):
+    def test_eight_vcpus_is_the_line(self):
+        self.assertTrue(fw._is_big_machine("e2-standard-8"))
+        self.assertFalse(fw._is_big_machine("e2-standard-4"))
+
+    def test_every_accelerator_family_is_big(self):
+        for machine_type in ("a2-highgpu-1g", "a2-ultragpu-8g", "a3-megagpu-8g", "a3-highgpu-8g", "ct5lp-hightpu-4t"):
+            with self.subTest(machine_type=machine_type):
+                self.assertTrue(fw._is_big_machine(machine_type))
+
+    def test_an_unparseable_type_is_not_assumed_big(self):
+        self.assertFalse(fw._is_big_machine("e2-micro"))
+        self.assertFalse(fw._is_big_machine(""))
 
 
 class ScaledownBlockedTest(unittest.TestCase):
@@ -460,6 +538,87 @@ class ScaledownBlockedTest(unittest.TestCase):
         pod = obj("Pod", "app", ns="default", **{"spec.nodeName": "n1", "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}]})
         context = {"pods": [pod], "pdbs": []}
         self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def evict_pod(self, value, node="n1"):
+        return obj(
+            "Pod", "app", ns="default",
+            **{
+                "spec.nodeName": node,
+                "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": "x"}],
+                "metadata.annotations": {fw.SAFE_TO_EVICT_ANNOTATION: value},
+            },
+        )
+
+    def test_every_spelling_the_autoscaler_accepts_pins_the_node(self):
+        """The autoscaler parses this annotation with `strconv.ParseBool`, so
+        `"False"`, `"FALSE"` and `"0"` pin a pod exactly as `"false"` does. An
+        exact match against `"false"` read all three as the annotation being
+        absent and let the node through unreported."""
+        for value in ("false", "False", "FALSE", "0", "f", " false "):
+            with self.subTest(value=value):
+                context = {"pods": [self.evict_pod(value)], "pdbs": []}
+                hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+                self.assertEqual(len(hits), 1, value)
+                self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_a_capitalised_true_clears_the_local_storage_pin(self):
+        """The mirror-image error: `!= "true"` read `"True"` as unset, so a pod
+        whose owner had explicitly cleared the annotation was still reported."""
+        for value in ("true", "True", "TRUE", "1"):
+            with self.subTest(value=value):
+                pod = self.evict_pod(value)
+                pod["spec"]["volumes"] = [{"emptyDir": {}}]
+                context = {"pods": [pod], "pdbs": []}
+                self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def test_an_unparseable_value_is_treated_as_unset(self):
+        pod = self.evict_pod("maybe")
+        context = {"pods": [pod], "pdbs": []}
+        self.assertEqual(fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}]), [])
+
+    def test_the_excerpt_quotes_the_raw_annotation(self):
+        context = {"pods": [self.evict_pod("False")], "pdbs": []}
+        hits = fw.check_scaledown_blocked(context, [{"_node_names": {"n1"}}])
+        self.assertIn("safe-to-evict=False", hits[0]["excerpt"])
+
+
+class OwnerKeyTest(unittest.TestCase):
+    def test_no_owners_is_none(self):
+        self.assertIsNone(fw._owner_key([]))
+
+    def test_the_controller_wins_wherever_it_sits_in_the_list(self):
+        owners = [
+            {"kind": "ThingBinding", "name": "zzz"},
+            {"kind": "ReplicaSet", "name": "web-abc", "controller": True},
+        ]
+        self.assertEqual(fw._owner_key(owners), ("ReplicaSet", "web-abc"))
+        self.assertEqual(fw._owner_key(list(reversed(owners))), ("ReplicaSet", "web-abc"))
+
+    def test_with_no_controller_the_answer_is_still_order_independent(self):
+        owners = [{"kind": "B", "name": "b"}, {"kind": "A", "name": "a"}]
+        self.assertEqual(fw._owner_key(owners), fw._owner_key(list(reversed(owners))))
+
+
+class JobFinishedAtTest(unittest.TestCase):
+    def test_picks_the_terminal_condition_not_the_first_one(self):
+        status = {
+            "conditions": [
+                {"type": "Suspended", "status": "False", "lastTransitionTime": "2026-01-01T00:00:00Z"},
+                {"type": "Failed", "status": "True", "lastTransitionTime": "2026-07-01T00:00:00Z"},
+            ]
+        }
+        self.assertEqual(fw._job_finished_at(status), "2026-07-01T00:00:00Z")
+
+    def test_a_condition_that_is_not_true_does_not_count(self):
+        status = {"conditions": [{"type": "Failed", "status": "False", "lastTransitionTime": "2026-01-01T00:00:00Z"}]}
+        self.assertEqual(fw._job_finished_at(status), "")
+
+    def test_success_criteria_met_counts(self):
+        status = {"conditions": [{"type": "SuccessCriteriaMet", "status": "True", "lastTransitionTime": "2026-02-02T00:00:00Z"}]}
+        self.assertEqual(fw._job_finished_at(status), "2026-02-02T00:00:00Z")
+
+    def test_no_conditions_is_empty(self):
+        self.assertEqual(fw._job_finished_at({}), "")
 
 
 class TerminalPodsTest(unittest.TestCase):
@@ -693,25 +852,25 @@ class IdleAddressTest(unittest.TestCase):
         return {"name": name, "address": "1.2.3.4", "addressType": addr_type, "status": status, "purpose": purpose, "creationTimestamp": created, "region": region}
 
     def test_flags_reserved_external_over_14_days(self):
-        self.assertEqual(len(fw.check_idle_address([self.address()], set(), now=NOW)), 1)
+        self.assertEqual(len(fw.check_idle_address([self.address()], set(), project="p", now=NOW)), 1)
 
     def test_does_not_flag_internal(self):
-        self.assertEqual(fw.check_idle_address([self.address(addr_type="INTERNAL")], set(), now=NOW), [])
+        self.assertEqual(fw.check_idle_address([self.address(addr_type="INTERNAL")], set(), project="p", now=NOW), [])
 
     def test_does_not_flag_gce_endpoint_purpose(self):
-        self.assertEqual(fw.check_idle_address([self.address(purpose="GCE_ENDPOINT")], set(), now=NOW), [])
+        self.assertEqual(fw.check_idle_address([self.address(purpose="GCE_ENDPOINT")], set(), project="p", now=NOW), [])
 
     def test_does_not_flag_referenced_by_annotation(self):
-        self.assertEqual(fw.check_idle_address([self.address(name="my-ip")], {"my-ip"}, now=NOW), [])
+        self.assertEqual(fw.check_idle_address([self.address(name="my-ip")], {"my-ip"}, project="p", now=NOW), [])
 
     def test_rolls_up_ten_or_more_into_one_major_finding(self):
         addrs = [self.address(name=f"a{i}") for i in range(10)]
-        hits = fw.check_idle_address(addrs, set(), now=NOW)
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
 
     def test_a_regional_address_carries_the_region_scope_flag(self):
-        hits = fw.check_idle_address([self.address()], set(), now=NOW)
+        hits = fw.check_idle_address([self.address()], set(), project="p", now=NOW)
         self.assertIn("--region=us-central1", hits[0]["excerpt"])
 
     def test_a_global_address_carries_the_global_scope_flag(self):
@@ -721,23 +880,63 @@ class IdleAddressTest(unittest.TestCase):
         all, gcloud resolves it against its configured default region, and the
         command answers `was not found` on an address that is really there.
         """
-        hits = fw.check_idle_address([self.address(region=None)], set(), now=NOW)
+        hits = fw.check_idle_address([self.address(region=None)], set(), project="p", now=NOW)
         self.assertIn("--global", hits[0]["excerpt"])
         self.assertNotIn("--region", hits[0]["excerpt"])
 
     def test_a_region_selflink_is_reduced_to_its_name(self):
         """The list API returns `region` as a full URL, not `us-central1`."""
         url = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
-        hits = fw.check_idle_address([self.address(region=url)], set(), now=NOW)
+        hits = fw.check_idle_address([self.address(region=url)], set(), project="p", now=NOW)
         self.assertIn("--region=us-east4", hits[0]["excerpt"])
         self.assertNotIn("googleapis", hits[0]["excerpt"])
 
     def test_the_rollup_names_a_location_not_a_url(self):
         url = "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4"
         addrs = [self.address(name=f"a{i}", region=url) for i in range(10)]
-        hits = fw.check_idle_address(addrs, set(), now=NOW)
-        self.assertEqual(hits[0]["object"], "Address/rollup-us-east4")
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertIn("us-east4", hits[0]["excerpt"])
         self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_the_rollup_is_named_after_the_project_not_one_members_region(self):
+        """§3.5's roll-up is per project and §5 forbids naming it after a member.
+
+        The old `Address/rollup-<region of the first address>` was both: it
+        claimed a region for addresses that were not in it, and it moved --
+        releasing that one address renamed the finding, so the ledger announced
+        the same leak as resolved and then as new.
+        """
+        addrs = [self.address(name=f"a{i}", region="us-east4") for i in range(6)]
+        addrs += [self.address(name=f"b{i}", region="europe-west1") for i in range(6)]
+        hits = fw.check_idle_address(addrs, set(), project="adamparco-kage", now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Project/adamparco-kage")
+        # Both regions named, with their own counts -- not one region's name
+        # over a total that spans two.
+        self.assertIn("us-east4 (6)", hits[0]["excerpt"])
+        self.assertIn("europe-west1 (6)", hits[0]["excerpt"])
+        self.assertTrue(hits[0]["excerpt"].startswith("12 external addresses"))
+
+    def test_the_rollup_identity_survives_releasing_one_member(self):
+        many = [self.address(name=f"a{i}", region="us-east4") for i in range(11)]
+        first = fw.check_idle_address(many, set(), project="p", now=NOW)
+        # Release the one that used to decide the name, in the region that used
+        # to decide the name.
+        rest = [a for a in many if a["name"] != "a0"]
+        rest[0]["region"] = "europe-west1"
+        second = fw.check_idle_address(rest, set(), project="p", now=NOW)
+        self.assertEqual(first[0]["object"], second[0]["object"])
+
+    def test_the_rollup_excerpt_names_its_members(self):
+        addrs = [self.address(name=f"a{i:02d}") for i in range(10)]
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertIn("a00", hits[0]["excerpt"])
+        self.assertIn("a09", hits[0]["excerpt"])
+
+    def test_a_long_rollup_says_how_many_it_did_not_name(self):
+        addrs = [self.address(name=f"a{i:03d}") for i in range(40)]
+        hits = fw.check_idle_address(addrs, set(), project="p", now=NOW)
+        self.assertIn(f"and {40 - fw.ROLLUP_EXCERPT_MEMBERS} more", hits[0]["excerpt"])
 
 
 class OrphanLbTest(unittest.TestCase):
@@ -761,6 +960,26 @@ class OrphanLbTest(unittest.TestCase):
     def test_flags_empty_backend_service(self):
         hits = fw.check_orphan_lb([], [], [{"name": "bs1", "backends": []}], set(), now=NOW)
         self.assertEqual(hits[0]["object"], "BackendService/bs1")
+
+    #: What the GKE service controller actually writes into a forwarding rule's
+    #: description. Every test above uses the bare `key: value` form, which is
+    #: what the SOP's prose example shows and what no live rule carries -- so
+    #: the whole leg passed its tests while matching nothing in the fleet.
+    GKE_DESC = '{"kubernetes.io/service-name":"staging/checkout","kubernetes.io/api-version":"v1"}'
+
+    def test_the_json_description_gke_really_writes_is_matched(self):
+        rule = {"name": "fr1", "description": self.GKE_DESC, "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("staging/checkout", hits[0]["excerpt"])
+
+    def test_a_live_service_still_suppresses_the_json_form(self):
+        rule = {"name": "fr1", "description": self.GKE_DESC, "creationTimestamp": "2026-01-01T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], {"staging/checkout"}, now=NOW), [])
+
+    def test_a_rule_with_no_kubernetes_description_is_still_skipped(self):
+        rule = {"name": "tf-managed", "description": "managed by terraform", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        self.assertEqual(fw.check_orphan_lb([rule], [], [], set(), now=NOW), [])
 
     def test_does_not_flag_recent_forwarding_rule(self):
         rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-07-30T00:00:00Z"}
@@ -1424,6 +1643,70 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertEqual(by_name["sick"]["outcome"], "unreachable")
         self.assertIn("DEGRADED", by_name["sick"]["error"])
         self.assertEqual(by_name["c1"]["outcome"], "collected")
+
+    def fleet_with(self, clusters, orphan_rule=True):
+        rule = {
+            "name": "fr1",
+            "description": '{"kubernetes.io/service-name":"gone/svc"}',
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+        }
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, json.dumps(clusters))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:4] == ["gcloud", "compute", "forwarding-rules", "list"]:
+                return run_of(0, json.dumps([rule] if orphan_rule else []))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        return {c["name"]: c for c in manifest["clusters"]}
+
+    RUNNING = {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+    DEGRADED = {"name": "sick", "location": "us-east4", "status": "DEGRADED"}
+
+    def test_a_readable_fleet_evaluates_orphan_lb(self):
+        by_name = self.fleet_with([self.RUNNING])
+        project = by_name["project/acme"]
+        self.assertIn("orphan-lb", {c["check"] for c in project["commands"]})
+        self.assertIn("orphan-lb", {c["check"] for c in project["candidates"]})
+        self.assertNotIn("limitations", project)
+
+    def test_a_degraded_cluster_closes_the_orphan_lb_gate_for_its_project(self):
+        """§3.6 runs only if *every* cluster in the project was enumerated, and
+        a DEGRADED cluster goes straight into `scope.skipped` per §2. The gate
+        was read off the RUNNING clusters alone, so a project with a cluster in
+        `scope.skipped` still published `orphan-lb` findings against a Service
+        list it had not finished collecting -- the false positive §3.6 calls the
+        highest-risk cross-check in the audit."""
+        by_name = self.fleet_with([self.RUNNING, self.DEGRADED])
+        project = by_name["project/acme"]
+        self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
+        self.assertNotIn("orphan-lb", {c["check"] for c in project["candidates"]})
+        self.assertIn("orphan-lb was not evaluated", project["limitations"])
+        # The other two project checks still run: only 3.6 needs the union.
+        self.assertEqual({c["check"] for c in project["commands"]}, {"unattached-disk", "idle-address"})
+
+    def test_an_unlistable_project_also_closes_the_gate(self):
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(1, "", "PERMISSION_DENIED")
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
+        self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):
