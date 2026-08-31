@@ -657,10 +657,19 @@ def install() -> None:
             # sender's predicate, so a dressed ``[SILENT]`` is dropped on both
             # legs rather than on one.
             blank = {"success": True, "platform": "slack", "skipped": "empty_text"}
-            if is_silent_text(message):
-                return blank
-            formatted = format_mrkdwn(module, message)
+            formatted = message if is_silent_text(message) else format_mrkdwn(module, message)
             if is_silent_text(formatted):
+                # A drop that leaves no trace is the failure nobody can find
+                # afterwards: `skipped` reports success and the scheduler
+                # records no `last_delivery_error`, so a suppressed report
+                # reads exactly like one that was never scheduled. The sibling
+                # chat sender logs its own suppression; this leg logged none,
+                # which was defensible only while the branch required literally
+                # blank text.
+                LOGGER.info(
+                    "slack relay: dropped a %d-byte message as a silent tick",
+                    len(str(message or "")),
+                )
                 return blank
 
             target = str(chat_id or "")
