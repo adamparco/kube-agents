@@ -492,8 +492,9 @@ def _emit(slug: str, hit: dict) -> dict:
 # hits there.
 #
 # Returning no hits was the whole of it, and that is the bug. This collector
-# issues one `clusters describe` and records it against every slug, so an
-# Autopilot cluster's manifest said `pool-skew` ran at rc=0 and found nothing
+# issues one `clusters list` per project -- never a `describe`, per the module
+# docstring -- and records it against every slug, so an Autopilot cluster's
+# manifest said `pool-skew` ran at rc=0 and found nothing
 # -- indistinguishable from a Standard cluster whose pools are all in step.
 # Whether the run then told the truth came down to whether the model happened
 # to know GKE well enough to overrule its own manifest. On 2026-08-29 it did,

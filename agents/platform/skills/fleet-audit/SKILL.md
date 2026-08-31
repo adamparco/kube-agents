@@ -431,6 +431,10 @@ field, and publishes nothing:
   it is the same next week.
 
 - `severity` is one of `critical`, `major`, `minor`.
+- `title` **says what is wrong, not which check found it.** "payments namespace has no
+  NetworkPolicy", never "netpol-missing on Namespace/payments (prod-us-east)". The rendered heading
+  is followed immediately by a `**Where:**` line carrying the cluster, the namespace and the object,
+  so a title built out of those three restates them and leaves no field saying what happened.
 - `namespace` may be empty for cluster-scoped objects.
 - `evidence.command` is **required and non-empty**.
 - `recommendation` is **required on every finding**, with all three of `action`, `rationale`, and
