@@ -460,6 +460,11 @@ every one of them is visible to a job author:
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
   `"relay": "degraded"` next to `"status": "delivered"`.
+  A send that lands on one platform and not another is degraded too — the report
+  is in a channel, so it is not the error above, but one channel has nothing.
+  `relay` cannot tell the two apart and both callers phrased it as the failed
+  turn, so the body also carries `relay_detail`: the reason in words, naming the
+  platform that missed the report and the ones that got it.
   That is the whole reason the route blocks rather than accepting into a
   background task: answering `accepted` first would make each of those failures
   invisible, leaving the run written down as delivered with nothing in the

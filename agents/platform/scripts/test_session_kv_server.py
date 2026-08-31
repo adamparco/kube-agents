@@ -871,9 +871,10 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # happens after.
         self._trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self._trigger.start()
-        # (error, degraded) — an unconfigured MagicMock would not unpack.
+        # (error, degraded) — an unconfigured MagicMock would not unpack, and
+        # `degraded` is the reason string, so the healthy value is empty.
         self._relay = patch.object(
-            session_kv_server, "relay_cron_report", return_value=(None, False)
+            session_kv_server, "relay_cron_report", return_value=(None, "")
         )
         self._relay.start()
 
@@ -2012,6 +2013,11 @@ class TestCronReportRelay(unittest.TestCase):
             ok = self.client.post("/v1/cron-reports", json={"job_id": "j9", "report": "x"})
 
         self.assertEqual(ok.json()["relay"], "ok")
+        # The healthy answer carries an empty detail rather than omitting it, so
+        # a caller can read the field unconditionally.
+        self.assertEqual(ok.json()["relay_detail"], "")
+        self.assertIn("Chat Agent turn", degraded.json()["relay_detail"])
+        self.assertIn("[unrelayed]", degraded.json()["relay_detail"])
 
     def test_a_send_failure_is_answered_as_a_failure(self):
         """The invariant `deliver` exists to protect: a broken watchdog is audible.
@@ -2342,6 +2348,24 @@ class TestRelayReachesEveryEnabledPlatform(unittest.TestCase):
         with sqlite3.connect(temp_db_path) as conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0], 1)
+
+    def test_a_failed_leg_says_which_leg_and_does_not_claim_a_failed_turn(self):
+        """`degraded` alone sent the reader looking for the wrong thing.
+
+        Both consumers of the verdict printed one hardcoded sentence — "the Chat
+        Agent turn failed, so the channel has the raw text marked [unrelayed]".
+        Here the turn succeeded and Slack has a properly composed report; what is
+        wrong is that Google Chat has nothing. An operator handed that sentence
+        greps two channels for a marker neither of them contains and never learns
+        which one is missing the report.
+        """
+        detail = self._post(self._threads('google_chat'))[0].json()["relay_detail"]
+        self.assertIn("google_chat", detail)
+        self.assertNotIn("unrelayed", detail)
+        # Naming what did land is the other half: "never reached google_chat" on
+        # a single-platform install would be the whole delivery failing, which is
+        # a 502, not this.
+        self.assertIn("slack", detail)
 
     def test_the_surviving_leg_becomes_the_primary(self):
         """Slack is first in precedence, but a card cannot be addressed to a

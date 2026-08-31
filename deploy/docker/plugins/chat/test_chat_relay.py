@@ -432,6 +432,62 @@ class TestStandaloneSend(unittest.TestCase):
         self.assertIn("was posted", error)
         self.assertIn("do not re-run", error.lower())
 
+    def test_the_degraded_string_says_which_degradation_it_was(self):
+        """`degraded` covers two outcomes and they want opposite responses.
+
+        A failed Chat Agent turn leaves raw text in every channel; a send that
+        never landed leaves one channel with nothing. Both used to print the
+        first one's sentence, so an operator whose Google Chat leg had been
+        failing was told to go and find `[unrelayed]` text — which was not
+        there, in a channel that was not the one missing the report.
+        """
+        detail = "the composed report never reached google_chat (it reached slack)"
+        body = json.dumps(
+            {"status": "delivered", "relay": "degraded", "relay_detail": detail}
+        ).encode()
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        error = result["error"]
+        self.assertIn(detail, error)
+        self.assertNotIn("unrelayed", error)
+        # Still the two things the string has always had to say.
+        self.assertIn("was posted", error)
+        self.assertIn("do not re-run", error.lower())
+
+    def test_a_degraded_relay_with_no_detail_keeps_the_sentence_it_had(self):
+        """A route too old to send `relay_detail` had only the one cause.
+
+        So the fallback is not a guess about what happened — before the second
+        cause was reported separately, `degraded` from such a route did mean the
+        turn failed. Keeping the old wording for exactly that case is what makes
+        the change safe to deploy against a gateway that has not restarted yet.
+        """
+        body = b'{"status":"delivered","relay":"degraded","session_id":"s1"}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertIn("[unrelayed]", result["error"])
+        self.assertIn("Chat Agent turn", result["error"])
+
+    def test_a_detail_on_a_healthy_relay_changes_nothing(self):
+        # The field is only ever read under a `degraded` verdict, so a route
+        # that sends an empty one alongside `ok` is still a plain success.
+        body = b'{"status":"delivered","relay":"ok","relay_detail":""}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", self.MESSAGE))
+        self.assertTrue(result.get("success"), result)
+
     def test_a_2xx_that_says_nothing_about_the_relay_is_a_success(self):
         """An older route, or one that answered before the field existed."""
         for body in (b"{}", b"", b"<html>ok</html>", b'{"relay":null}', b"[]"):
@@ -455,15 +511,19 @@ class TestStandaloneSend(unittest.TestCase):
                 result = asyncio.run(mod.standalone_send(None, "c", "r"))
         self.assertIn("502", result["error"])
 
-    def test_post_returns_an_error_and_a_verdict(self):
-        """Every path out of `_post` is a 2-tuple; the callers unpack it."""
-        with RecordingRelay(body=b'{"relay":"degraded"}') as relay:
+    def test_post_returns_an_error_a_verdict_and_a_detail(self):
+        """Every path out of `_post` is a 3-tuple; the callers unpack it."""
+        body = b'{"relay":"degraded","relay_detail":"the send never reached slack"}'
+        with RecordingRelay(body=body) as relay:
             with patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(mod._post(relay.url, {}, "k"), (None, "degraded"))
+                self.assertEqual(
+                    mod._post(relay.url, {}, "k"),
+                    (None, "degraded", "the send never reached slack"),
+                )
         with patch.dict(os.environ, {}, clear=True):
-            error, verdict = mod._post("not-a-url", {}, "k")
+            error, verdict, detail = mod._post("not-a-url", {}, "k")
         self.assertIsNotNone(error)
-        self.assertEqual(verdict, "")
+        self.assertEqual((verdict, detail), ("", ""))
 
     def test_the_timeout_outlasts_a_chat_agent_turn(self):
         """Time out before the route answers and a delivered report is recorded

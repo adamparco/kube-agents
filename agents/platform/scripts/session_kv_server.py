@@ -1608,6 +1608,16 @@ def relay_cron_report(
     :func:`_unrelayed_notice`, and once in this return value, which the caller
     puts in the response body.
 
+    It is the reason, not a bool: a clause saying what actually degraded, empty
+    when nothing did, so a caller testing it for truth reads exactly as it did
+    when it was a bool. Two unrelated things set it and they leave opposite
+    problems behind — an unrelayed report sits in every channel as raw text, an
+    undelivered leg sits in one channel not at all — and both callers had one
+    hardcoded sentence for the pair, which described the first. Composing the
+    clause here rather than at each caller is also the only place it can be
+    composed: which platforms took the report is known in this function and
+    nowhere above it.
+
     Ordering is deliberate. The turn runs before the send so that what reaches
     chat is the Chat Agent's message rather than a placeholder it later talks
     around; the routing registration and the incident store happen after the
@@ -1649,14 +1659,15 @@ def relay_cron_report(
     message = _run_relay_turn(
         api_url, session_id, report, _build_relay_instructions(profile, job_id, title), headers
     )
-    degraded = message is None
-    if degraded:
+    unrelayed = message is None
+    if unrelayed:
         # Degraded, and say so in the channel rather than in a log nobody reads:
         # the report is the point, the Chat Agent's framing is the polish.
         logger.warning(f"Relay for {profile}/{job_id}: posting the raw report, unrelayed")
         message = _unrelayed_notice(profile, job_id) + report
 
     delivered: list[str] = []
+    undelivered: list[str] = []
     for platform in targets:
         chat_id, thread_id = _lookup_session_routing(session_id, platform)
         new_thread_id = _send_to_chat(platform, message, chat_id, thread_id)
@@ -1664,7 +1675,7 @@ def relay_cron_report(
             logger.error(
                 f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"
             )
-            degraded = True
+            undelivered.append(platform)
             continue
 
         if new_thread_id != thread_id:
@@ -1685,6 +1696,23 @@ def relay_cron_report(
         delivered.append(platform)
         logger.info(f"Relayed {profile}/{job_id} report to {platform} thread {thread_id}")
 
+    # Which degradation, said here because this is the only place that knows.
+    # Two unrelated things degrade a relay and they leave the operator opposite
+    # problems: an unrelayed report is in every channel as raw text, and an
+    # undelivered leg is in one channel not at all. Both used to arrive at the
+    # caller as a bare `True`, so both got the caller's one sentence -- which
+    # described the first, and told an operator whose Google Chat leg had died
+    # to go and look for `[unrelayed]` text that was not there.
+    notes: list[str] = []
+    if unrelayed:
+        notes.append(
+            "the Chat Agent turn failed, so the channel has the raw report marked "
+            "[unrelayed] rather than a composed message"
+        )
+    if undelivered:
+        reached = f" (it reached {', '.join(delivered)})" if delivered else ""
+        notes.append(f"the composed report never reached {', '.join(undelivered)}{reached}")
+    degraded = "; ".join(notes)
     if not delivered:
         return f"composed but not delivered to {', '.join(targets)}", degraded
     return None, degraded
@@ -1762,10 +1790,13 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     # 200, because the report is in the channel and the run did its job. `relay`
     # is what tells the scheduler which of the two deliveries it got, so a job
     # whose front door has been down all week is visible without reading logs.
+    # `relay_detail` says *which* degradation; `relay` stays a two-value verdict
+    # so the callers that only branch on it need no change at all.
     return {
         "status": "delivered",
         "session_id": session_id,
         "relay": "degraded" if degraded else "ok",
+        "relay_detail": degraded,
     }
 def _watcher_features(header_value: str) -> set:
     """The response behaviours the calling watcher said it understands.

@@ -825,11 +825,18 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # The route answers 200 for both a composed delivery and a degraded one, and
     # says which in `relay`. Reading it here is the difference between the agent
     # knowing its report went out raw and it believing the Chat Agent framed it.
+    # `relay_detail` says which degradation — a failed Chat Agent turn and a
+    # channel the send never reached are both `degraded` and want opposite
+    # descriptions. Older routes do not send it; the sentence they used to get is
+    # the fallback, which is right for them because they only had the one cause.
     if payload.get("relay") == "degraded":
+        detail = str(payload.get("relay_detail") or "").strip() or (
+            "the Chat Agent turn failed, so the user sees your raw text marked "
+            "[unrelayed] rather than a composed message"
+        )
         return (
             f"SUCCESS (degraded): the report was posted to chat (session "
-            f"{payload.get('session_id', '?')}) but the Chat Agent turn failed, so the user "
-            "sees your raw text marked [unrelayed] rather than a composed message. It is "
+            f"{payload.get('session_id', '?')}) but {detail}. It is "
             "delivered — do not send it again — and there is nothing for you to retry."
         )
     return (
