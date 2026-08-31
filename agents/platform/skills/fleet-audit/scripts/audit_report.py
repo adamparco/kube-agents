@@ -5018,7 +5018,9 @@ def _render_findings(
             "title and in the summary above are the true totals. Findings are cut "
             "from the least-severe end of the list, which is not the same as the "
             "omitted ones being less severe than those shown — the per-severity "
-            "headings above give how many of each made it._",
+            "headings above give how many of each made it. They are kept in full "
+            "in this run's stored report; ask the agent for that report to read "
+            "them._",
         ]
     return out, omitted
 
@@ -5334,8 +5336,9 @@ def render_delta_comment(
             "",
             f"**Coverage of this description is partial:** {omitted} further "
             "finding(s) did not fit GitHub's body limit and are not listed above "
-            "or below. They are still counted in the title. Resolve some findings, "
-            "or narrow the audit's scope, to see them.",
+            "or below. They are still counted in the title. They are kept in full "
+            "in this run's stored report; ask the agent for that report to read "
+            "them.",
         ]
     # Capping the body made this path reachable: previously the body failed
     # first at ~67 findings, so a delta this large could never be produced.

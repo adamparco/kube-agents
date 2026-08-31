@@ -3878,6 +3878,19 @@ class TestRenderBudget(BaseTestCase):
         self.assertRegex(body, r"are omitted from this description[^_]*\d+ major")
         self.assertNotIn("the omitted findings are the least severe", body)
 
+    def test_truncation_notice_says_where_the_omitted_findings_survive(self):
+        """The reader's next question, which the notice used not to answer.
+
+        The checks table's own truncation notice has always pointed at the
+        stored report; this one did not, and `obtainability-audit` runs with a
+        dozen findings nobody can reach from the ledger. The store is written on
+        every run, so the pointer is true whenever the notice can appear.
+        """
+        body = self.render(make_doc(findings=bulk_findings(250)))
+        notice = re.search(r"_\d+ further finding\(s\) are omitted.*?_", body, re.S)
+        self.assertIsNotNone(notice)
+        self.assertIn("stored report", notice.group(0))
+
     def test_truncation_notice_omits_severities_that_all_rendered(self):
         # The breakdown lists only what was actually dropped: a "0 major" in a
         # notice about omissions reads as a fourth thing to go and check.
@@ -3968,6 +3981,21 @@ class TestRenderBudget(BaseTestCase):
             NOW,
         )
         self.assertLess(len(comment), GITHUB_BODY_LIMIT)
+
+    def test_the_delta_comments_partial_notice_points_at_the_stored_report(self):
+        """It used to tell the reader to change the fleet in order to read it.
+
+        "Resolve some findings, or narrow the audit's scope, to see them" was
+        the only route the notice offered, and it predates the store: every
+        finding is on the volume, so the answer to "where are the other twelve"
+        is a query, not a remediation campaign.
+        """
+        comment = audit_report.render_delta_comment(
+            AUDIT, ["new-1"], [], bulk_findings(3), {}, NOW, omitted=12
+        )
+        self.assertIn("Coverage of this description is partial", comment)
+        self.assertIn("stored report", comment)
+        self.assertNotIn("narrow the audit's scope", comment)
 
     def test_long_command_is_trimmed(self):
         finding = make_finding(command="kubectl get pods " + "x" * 5000)
