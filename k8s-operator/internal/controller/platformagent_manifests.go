@@ -1643,6 +1643,23 @@ type renderOptions struct {
 	otlpDisabled bool
 }
 
+// lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
+// surviving one where it already sits. Order is otherwise untouched, so on the ordinary
+// render -- no plugin naming an operator-owned variable -- the result is the input.
+func lastWinsEnv(env []corev1.EnvVar) []corev1.EnvVar {
+	lastIndex := make(map[string]int, len(env))
+	for i, e := range env {
+		lastIndex[e.Name] = i
+	}
+	out := make([]corev1.EnvVar, 0, len(lastIndex))
+	for i, e := range env {
+		if lastIndex[e.Name] == i {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -3047,6 +3064,21 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
 	})
+
+	// Every "appended after the merge" comment above rests on the kubelet collapsing a
+	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`
+	// carries `patchMergeKey=name` and the controller applies server-side, so the API
+	// server refuses the object before it exists:
+	//
+	//   .spec.template.spec.containers[name="platform-agent"].env:
+	//   duplicate entries for key [name="HERMES_HOME_MODE"]
+	//
+	// So a plugin naming one of those variables did not lose the argument -- it stalled
+	// the gateway's reconciliation outright, leaving the running pod on whatever it last
+	// had and nothing in the Deployment to show why. Collapse here, once, at the only
+	// point every append has already run, rather than at each of them; last-wins is the
+	// semantics they were all written for, so this changes no rendered value.
+	gatewayEnvVars = lastWinsEnv(gatewayEnvVars)
 
 	containers := []corev1.Container{
 		{

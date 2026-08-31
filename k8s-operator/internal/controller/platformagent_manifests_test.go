@@ -3584,6 +3584,25 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])
 	}
+	// The four assertions above read the env as a map, so they pass whether the operator
+	// won by replacing the plugin's entry or by appending a second one the kubelet would
+	// collapse. Those are not the same outcome. `Container.Env` carries
+	// `patchMergeKey=name` and the controller applies server-side, so a second entry is
+	// refused by the API server -- ".spec.template.spec.containers[name=\"platform-agent\"]
+	// .env: duplicate entries for key" -- and the Deployment never reconciles at all.
+	// Count each one; the map read cannot see the failure it is asserting against.
+	for _, name := range []string{
+		"CREDENTIAL_PROXY_URL",
+		"AGENT_SHARED_STATE_SETUP",
+		"HERMES_MANAGED_DIR",
+		"HERMES_HOME_MODE",
+	} {
+		if counts[name] != 1 {
+			t.Errorf("expected %s exactly once, got %d occurrences; a repeated env name is "+
+				"rejected by server-side apply, so this stalls the gateway rather than "+
+				"letting the operator's value win", name, counts[name])
+		}
+	}
 }
 
 // TestRenderConfigYAML_AllowlistedSubtreeMergeIsAdditive documents that list merges under
