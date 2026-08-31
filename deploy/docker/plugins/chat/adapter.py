@@ -273,6 +273,53 @@ _REPORTS_DIR = os.getenv("FLEET_AUDIT_REPORTS_DIR", "") or "/opt/data/fleet-audi
 _SILENCE_WINDOW_SECONDS = 900
 
 
+def _fresh_report(job_id: str) -> dict:
+    """This audit stream's last run, if it is recent enough to be this delivery's.
+
+    ``{}`` for everything else: a job that is not an audit stream, a store that
+    is not there, an unreadable or timestampless report, and one left by an
+    earlier run. Both callers treat ``{}`` as "no opinion" and fall back to the
+    behaviour that shipped before them, so a bad read never costs a delivery.
+    """
+    if not job_id:
+        return {}
+    try:
+        report = json.loads((Path(_REPORTS_DIR) / job_id / "latest.json").read_text("utf-8"))
+        age = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.datetime.fromisoformat(report["finished_at"])
+        ).total_seconds()
+    except Exception:
+        return {}
+    return report if 0 <= age <= _SILENCE_WINDOW_SECONDS else {}
+
+
+def recorded_summary(job_id: str) -> str:
+    """The one line ``finish`` composed for the channel, or ``""`` to keep what came.
+
+    ``chat_summary`` is built by the harness from the counts, the delta and the
+    ledger URL, and every audit SOP ends by telling the run to make that string
+    its entire final response. Measured against what the reference install
+    actually posted, 36 of 38 non-silent runs wrote their own report instead —
+    a median of 1.6kB of headed markdown per delivery, eight streams a day, in
+    place of the line the harness had already composed.
+
+    Nothing is lost by preferring the recorded line: all 38 of those responses
+    carried the ledger URL, so the detail they added over it is detail the
+    ledger holds, one click away, in the form the operator is meant to read it.
+
+    ``""`` leaves the model's text alone, and that is the answer whenever there
+    is no fresh report, whenever the harness recorded no summary — every report
+    written before the field existed — and on a silent run, which
+    :func:`declared_silent` has already stopped.
+    """
+    report = _fresh_report(job_id)
+    if report.get("silent_ok"):
+        return ""
+    summary = str(report.get("chat_summary") or "").strip()
+    return "" if not summary or is_silent_report(summary) else summary
+
+
 def declared_silent(job_id: str) -> bool:
     """Did this audit stream's own run just decide it had nothing to say?
 
@@ -289,30 +336,10 @@ def declared_silent(job_id: str) -> bool:
     than a decision already taken. Read the decision from where ``finish``
     wrote it down instead. ``job_id`` is the audit stream, which is also the
     report store's directory name, so a cron job that is not an audit stream
-    finds nothing here and is unaffected.
-
-    Freshness is what stops an old report from silencing a later delivery: the
-    report is written seconds before the response it belongs to, so one older
-    than :data:`_SILENCE_WINDOW_SECONDS` was decided by some earlier run and
-    says nothing about this message.
+    finds nothing here and is unaffected. :func:`_fresh_report` is what keeps
+    an earlier run's decision from silencing this one.
     """
-    if not job_id:
-        return False
-    try:
-        report = json.loads((Path(_REPORTS_DIR) / job_id / "latest.json").read_text("utf-8"))
-        if not report.get("silent_ok"):
-            return False
-        age = (
-            datetime.datetime.now(datetime.timezone.utc)
-            - datetime.datetime.fromisoformat(report["finished_at"])
-        ).total_seconds()
-    except Exception:
-        # No store, no report for this job, unreadable JSON, missing or
-        # unparseable timestamp. This is a second opinion on top of the text
-        # test, so failing open leaves exactly the behaviour that shipped
-        # before it rather than dropping a message on a bad read.
-        return False
-    return 0 <= age <= _SILENCE_WINDOW_SECONDS
+    return bool(_fresh_report(job_id).get("silent_ok"))
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -439,6 +466,22 @@ async def standalone_send(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
         )
         return {"success": True, "platform": PLATFORM_NAME, "skipped": "empty_report"}
+
+    # The other half of the same disagreement. Having decided it does have
+    # something to say, an audit run is supposed to say it in the one line
+    # `finish` composed — counts, delta, ledger URL — and usually writes its own
+    # multi-section report instead. Prefer the recorded line where there is one,
+    # so what reaches the channel is the same shape from every stream on every
+    # run rather than whatever the turn felt like writing.
+    summary = recorded_summary(job_id)
+    if summary and summary != report:
+        logger.info(
+            "chat relay: job_id=%s — relaying the recorded summary in place of "
+            "a %d-byte composed report",
+            job_id,
+            len(report),
+        )
+        report = summary
 
     api_key = (os.getenv(API_KEY_ENV, "") or "").strip()
     if not api_key:

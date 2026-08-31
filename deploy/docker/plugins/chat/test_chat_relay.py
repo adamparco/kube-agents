@@ -657,6 +657,106 @@ class TestDeclaredSilent(unittest.TestCase):
         self.assertEqual(len(relay.requests), 1, "the loud run's report was dropped")
 
 
+class TestRecordedSummary(unittest.TestCase):
+    """A loud run relays the line `finish` composed, not the one the model wrote.
+
+    Same disagreement as ``TestDeclaredSilent``, opposite direction. The run
+    has something to report and the SOP tells it to report the recorded
+    ``chat_summary`` verbatim; 36 of the reference install's 38 non-silent runs
+    posted a headed multi-section report instead, median 1.6kB.
+    """
+
+    SUMMARY = (
+        "Security & RBAC Posture Audit: 16 critical, 2 major, 1 minor "
+        "(3 new, 1 resolved) — https://github.com/gke-agentic/adamparco-infra/issues/57"
+    )
+    COMPOSED = (
+        "## Security & RBAC Posture Audit — complete\n\n"
+        "The run finished and published to the ledger. Here is the breakdown by\n"
+        "cluster, with the three new findings called out first.\n\n"
+        "- 16 clusters expose a public control plane\n"
+        "- `argocd` grants a wildcard ClusterRole\n\n"
+        "Ledger: https://github.com/gke-agentic/adamparco-infra/issues/57"
+    )
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def write(self, stream: str, payload: dict, *, age_s: float = 20.0) -> None:
+        import datetime
+
+        finished = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=age_s
+        )
+        os.makedirs(os.path.join(self.root, stream), exist_ok=True)
+        body = dict(payload)
+        body.setdefault("finished_at", finished.isoformat())
+        with open(os.path.join(self.root, stream, "latest.json"), "w") as handle:
+            json.dump(body, handle)
+
+    def relayed(self, body: str, job_id: str = "compliance-audit"):
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {
+                    "SESSION_KV_API_KEY": "k",
+                    "CRON_REPORT_RELAY_URL": relay.url,
+                    "FLEET_AUDIT_REPORTS_DIR": self.root,
+                },
+            ):
+                with patch.object(mod, "_REPORTS_DIR", self.root):
+                    result = asyncio.run(
+                        mod.standalone_send(
+                            None, "c", wrapped("Compliance Audit", job_id, body)
+                        )
+                    )
+        self.assertTrue(result.get("success", True), result)
+        return [r["body"]["report"] for r in relay.requests]
+
+    def test_the_recorded_summary_replaces_a_composed_report(self):
+        self.write("compliance-audit", {"silent_ok": False, "chat_summary": self.SUMMARY})
+        self.assertEqual(self.relayed(self.COMPOSED), [self.SUMMARY])
+
+    def test_a_run_that_obeyed_is_relayed_unchanged(self):
+        self.write("compliance-audit", {"silent_ok": False, "chat_summary": self.SUMMARY})
+        self.assertEqual(self.relayed(self.SUMMARY), [self.SUMMARY])
+
+    def test_a_report_with_no_recorded_summary_is_left_alone(self):
+        """Every report written before the field existed, and every non-audit job."""
+        self.write("compliance-audit", {"silent_ok": False})
+        self.assertEqual(self.relayed(self.COMPOSED), [self.COMPOSED])
+
+    def test_a_stale_summary_does_not_replace_a_later_report(self):
+        self.write(
+            "compliance-audit",
+            {"silent_ok": False, "chat_summary": self.SUMMARY},
+            age_s=mod._SILENCE_WINDOW_SECONDS + 60,
+        )
+        self.assertEqual(self.relayed(self.COMPOSED), [self.COMPOSED])
+
+    def test_a_non_audit_job_is_untouched(self):
+        self.write("compliance-audit", {"silent_ok": False, "chat_summary": self.SUMMARY})
+        self.assertEqual(
+            self.relayed(self.COMPOSED, job_id="github-repo-watcher"), [self.COMPOSED]
+        )
+
+    def test_a_recorded_marker_never_becomes_the_message(self):
+        """`silent_ok` and `chat_summary` disagreeing must not post "[SILENT]".
+
+        Belt and braces: `declared_silent` already stops the silent case, so
+        reaching here means the report claims to be loud while carrying the
+        marker. Substituting it would put the word in the channel, which is the
+        one outcome both halves of this guard exist to prevent.
+        """
+        for marker in ("[SILENT]", "**[SILENT]**", "  [silent]  "):
+            with self.subTest(chat_summary=marker):
+                self.write(
+                    "compliance-audit", {"silent_ok": False, "chat_summary": marker}
+                )
+                self.assertEqual(self.relayed(self.COMPOSED), [self.COMPOSED])
+
+
 class TestSiblingDeliveryTargets(unittest.TestCase):
     """Which platforms the scheduler is posting this same report to itself.
 
