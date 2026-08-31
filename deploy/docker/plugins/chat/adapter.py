@@ -189,13 +189,22 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
         return []
 
     jobs = store.get("jobs") if isinstance(store, dict) else store
-    deliver = ""
+    raw: object = ""
     for job in jobs if isinstance(jobs, list) else []:
         if isinstance(job, dict) and str(job.get("id") or "") == job_id:
-            deliver = str(job.get("deliver") or "")
+            raw = job.get("deliver") or ""
             break
 
-    tokens = {t.strip().lower() for t in deliver.replace(";", ",").split(",") if t.strip()}
+    # A list is the shape the paragraph above describes and the one hermes
+    # treats as native -- `hermes_cli/cron.py` coerces a string *into* a list,
+    # never the reverse -- so it is the string form here that is the shorthand.
+    # `str()` over the list gave `"['slack', 'gchat']"`, whose comma split
+    # yields two tokens matching no platform and no `<NAME>_HOME_CHANNEL`. The
+    # fan-out then came back empty, which is indistinguishable from the honest
+    # empty answer for `deliver: "chat"` -- so every sibling channel quietly got
+    # the duplicate copy this function exists to subtract.
+    text = ",".join(str(entry) for entry in raw) if isinstance(raw, (list, tuple)) else str(raw)
+    tokens = {t.strip().lower() for t in text.replace(";", ",").split(",") if t.strip()}
     if not tokens or tokens <= {PLATFORM_NAME}:
         return []
 

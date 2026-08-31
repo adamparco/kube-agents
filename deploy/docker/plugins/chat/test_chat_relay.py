@@ -537,6 +537,41 @@ class TestSiblingDeliveryTargets(unittest.TestCase):
         os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
         self.assertEqual(mod.sibling_delivery_targets("audit"), ["slack"])
 
+    def test_a_json_list_is_read_the_same_as_the_comma_form(self):
+        """The test above calls a comma string "an explicit list"; this is one.
+
+        A JSON list is the shape hermes treats as native — `hermes_cli/cron.py`
+        coerces a string *into* a list and never the reverse — so it is the one
+        an operator writing the roster by hand is most likely to produce. It
+        used to reach `str()`, come back as `"['chat', 'slack']"`, and split
+        into two tokens matching no platform at all. The empty result that
+        produced is the same empty result `deliver: "chat"` legitimately
+        returns, so nothing anywhere reported a problem: Slack simply received
+        the scheduler's copy and the relay's composed copy both.
+        """
+        for shape in (["chat", "slack"], ("chat", "slack")):
+            with self.subTest(deliver=type(shape).__name__):
+                self._roster(list(shape))
+                os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+                os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+                self.assertEqual(mod.sibling_delivery_targets("audit"), ["slack"])
+
+    def test_a_single_entry_json_list_of_the_relay_is_still_relay_only(self):
+        # The `deliver: ["chat"]` spelling of the roster's own default. It must
+        # reach the same "no siblings" answer as the bare string, not a token
+        # set that happens to resolve to nothing for the wrong reason.
+        self._roster(["chat"])
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_a_json_list_saying_all_expands_the_same_way(self):
+        self._roster(["all"])
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["google_chat", "slack"])
+
     def test_a_platform_named_without_a_home_channel_is_not_a_sibling(self):
         """It resolves to nothing, so the scheduler sends it nowhere."""
         self._roster("chat,slack")
