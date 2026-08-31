@@ -281,14 +281,25 @@ def _fresh_report(job_id: str) -> dict:
     earlier run. Both callers treat ``{}`` as "no opinion" and fall back to the
     behaviour that shipped before them, so a bad read never costs a delivery.
     """
-    if not job_id:
+    # A job id is one path segment. It is parsed out of message text, so
+    # anything else -- `../scratch/x` from a runtime job, an absolute path,
+    # `.` -- is steering this read rather than naming a stream, and the join
+    # would follow it off the store.
+    if not job_id or job_id != Path(job_id).name:
         return {}
+    # Re-read rather than trust the import-time constant: a cron child that
+    # sets the variable after this module loads writes to one store and would
+    # otherwise be read from another, with no error either side.
+    root = os.getenv("FLEET_AUDIT_REPORTS_DIR", "") or _REPORTS_DIR
     try:
-        report = json.loads((Path(_REPORTS_DIR) / job_id / "latest.json").read_text("utf-8"))
-        age = (
-            datetime.datetime.now(datetime.timezone.utc)
-            - datetime.datetime.fromisoformat(report["finished_at"])
-        ).total_seconds()
+        report = json.loads((Path(root) / job_id / "latest.json").read_text("utf-8"))
+        finished = datetime.datetime.fromisoformat(report["finished_at"])
+        # `finish` writes an aware stamp today. A naive one would otherwise
+        # raise inside the blanket handler below and take the whole feature
+        # inert fleet-wide, indistinguishable from having no store at all.
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc) - finished).total_seconds()
     except Exception:
         return {}
     return report if 0 <= age <= _SILENCE_WINDOW_SECONDS else {}
