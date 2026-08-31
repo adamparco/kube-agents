@@ -70,6 +70,17 @@ The default **read-only** set binds viewer roles only:
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
+Alongside them the composition defines one project-level custom role,
+`kubeagentsSubnetUtilizationReader`, and binds it to the same service account. It carries three
+permissions and exists because no predefined role carries them without carrying much more:
+`compute.subnetworks.use` to see subnets at all, and
+`recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the Network Analyzer insight that
+reports their IP utilization — the only place that measurement is published, and otherwise reachable
+only through `roles/recommender.viewer`, which grants viewer on every recommender in the project.
+The fleet audit's subnet-ip-exhaustion check is its sole consumer. It is defined in
+[`terraform/modules/kube-agents-iam`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam)
+and, like the bundle above, is skipped entirely when `project_roles` is empty.
+
 The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
 
 If that list names a role like `roles/container.admin`, the installer says so at the point of choice — it is the authority the removed bundle granted, reached the long way round — and continues. It is your call to make, not the installer's.
@@ -176,7 +187,7 @@ With `MODEL_PROVIDER=vertex_ai` the LiteLLM gateway gets its own KSA (`kubeagent
   done
   ```
 
-  The nine are `local.read_only_roles` in `terraform/examples/full-install/main.tf`, and a unit test pins the verifier's copy to them.
+  The nine are `local.read_only_roles` in `terraform/examples/full-install/main.tf`, and a unit test pins the verifier's copy to them. What this recipe does not create is the `kubeagentsSubnetUtilizationReader` custom role described above — `gcloud` has no idempotent one-liner for a custom role, and the fleet audit's subnet-ip-exhaustion check is the only thing that misses it. Re-running the composition adds it; until then that one check reports as a coverage gap rather than as clean.
 
 The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 

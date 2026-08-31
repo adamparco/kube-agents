@@ -428,6 +428,50 @@ class DanglingComputeClassTest(unittest.TestCase):
         d = deployment("api", node_selector={"cloud.google.com/compute-class": "missing"})
         self.assertIsNotNone(fs.check_dangling_compute_class(d, {}, None))
 
+    def test_an_absent_auto_creation_block_is_disabled_not_enabled(self):
+        """`compute_class()` above always writes the field; the CRD does not
+        require it, it defaults to off, and omitting it is the ordinary way to
+        leave auto-creation disabled. Reading absence as "enabled" exempted the
+        common case from arm two entirely."""
+        cc = {"kind": "ComputeClass", "metadata": {"name": "cc1"}, "spec": {"priorities": []}}
+        d = deployment("api", node_selector={"cloud.google.com/compute-class": "cc1"})
+        hit = fs.check_dangling_compute_class(d, {"cc1": cc}, {"other-class"})
+        self.assertIsNotNone(hit)
+        self.assertIn("no matching node pool", hit["excerpt"])
+
+    def test_gpu_declared_only_under_limits_still_counts(self):
+        """The canonical GPU manifest sets `nvidia.com/gpu` under `limits`
+        alone. Kubernetes defaults `requests` from `limits` on a Pod, but these
+        are Deployment pod *templates*, which are not defaulted -- so reading
+        `requests` alone made arm three inert rather than failing."""
+        cc = compute_class("cc1", [])
+        d = deployment(
+            "api",
+            node_selector={"cloud.google.com/compute-class": "cc1"},
+            containers=[{"name": "app", "resources": {"limits": {"nvidia.com/gpu": "1"}}}],
+        )
+        hit = fs.check_dangling_compute_class(d, {"cc1": cc}, set())
+        self.assertIsNotNone(hit)
+        self.assertIn("toleration", hit["excerpt"])
+
+    def test_every_arm_carries_the_workload_namespace(self):
+        """`derive_finding_id` keys on (check, cluster, namespace, object), so
+        without this `Deployment/api` in two namespaces is one identity: one is
+        dropped, and the delta alternates between them run to run."""
+        cc_disabled = compute_class("cc1", [], node_pool_auto_creation=False)
+        cc = compute_class("cc1", [])
+        gpu = [{"name": "app", "resources": {"limits": {"nvidia.com/gpu": "1"}}}]
+        arms = [
+            ("missing class", {}, deployment("api", ns="team-a", node_selector={"cloud.google.com/compute-class": "missing"}), set()),
+            ("no pool label", {"cc1": cc_disabled}, deployment("api", ns="team-a", node_selector={"cloud.google.com/compute-class": "cc1"}), set()),
+            ("gpu no toleration", {"cc1": cc}, deployment("api", ns="team-a", node_selector={"cloud.google.com/compute-class": "cc1"}, containers=gpu), set()),
+        ]
+        for label, classes, workload, labels in arms:
+            with self.subTest(arm=label):
+                hit = fs.check_dangling_compute_class(workload, classes, labels)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["namespace"], "team-a")
+
 
 class SingleZoneNodepoolTest(unittest.TestCase):
     def test_flags_single_zone_autoscaling_no_nap(self):
@@ -480,6 +524,29 @@ class ReservationTest(unittest.TestCase):
         r = {"name": "r1", "specificReservation": {"count": 0, "inUseCount": 0}}
         self.assertIsNone(fs.check_reservation(r))
 
+    def test_int64_strings_are_what_the_api_actually_sends(self):
+        """Every fixture above uses Python ints; the GCE API does not.
+
+        `gcloud compute reservations list --format json` serialises int64 as a
+        JSON string, so the live shape is `{"count": "10", "inUseCount": "2"}`.
+        Dividing those raises `TypeError`, which nothing in this module catches
+        -- and the SOP invokes the collector as `... > manifest_<audit>.json`,
+        so the shell has already truncated the file. One reservation would cost
+        the whole stream its manifest.
+        """
+        r = {"name": "r1", "specificReservation": {"count": "10", "inUseCount": "2"}}
+        hit = fs.check_reservation(r)
+        self.assertIsNotNone(hit)
+        self.assertIn("2/10", hit["excerpt"])
+
+    def test_absent_in_use_count_is_zero_not_unknown(self):
+        """proto3 JSON omits a zero int64, so the reservation nothing is using
+        -- §3.10(c)'s maximum-waste case -- arrives with no `inUseCount`."""
+        r = {"name": "r1", "specificReservation": {"count": "10"}}
+        hit = fs.check_reservation(r)
+        self.assertIsNotNone(hit)
+        self.assertIn("0/10", hit["excerpt"])
+
 
 class ReservationAffinityTest(unittest.TestCase):
     def test_flags_automatic_affinity(self):
@@ -511,6 +578,22 @@ class QuotaTest(unittest.TestCase):
 
     def test_zero_limit_is_not_a_crash(self):
         self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 0, "usage": 0}))
+
+    def test_only_node_capacity_metrics_count(self):
+        """§3.7 is "GPU/TPU/CPU limits". A region describe returns every
+        Compute quota there is -- 164 on `us-east4` -- and without a filter a
+        project at 92% of `BACKEND_BUCKETS` publishes a `critical` stockout."""
+        for metric in ("CPUS", "CPUS_ALL_REGIONS", "N4_CPUS", "PREEMPTIBLE_CPUS",
+                       "NVIDIA_L4_GPUS", "COMMITTED_NVIDIA_A100_GPUS", "TPU_V5_LITEPOD_SLICES"):
+            with self.subTest(metric=metric, capacity=True):
+                self.assertIsNotNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}))
+        for metric in ("BACKEND_BUCKETS", "AFFINITY_GROUPS", "IN_USE_ADDRESSES",
+                       "DISKS_TOTAL_GB", "LOCAL_SSD_TOTAL_GB", "FIREWALLS"):
+            with self.subTest(metric=metric, capacity=False):
+                self.assertIsNone(fs.check_quota({"metric": metric, "limit": 100, "usage": 95}))
+
+    def test_absent_usage_is_not_a_crash(self):
+        self.assertIsNone(fs.check_quota({"metric": "N4_CPUS", "limit": 100}))
 
 
 class AutoscalerVisibilityTest(unittest.TestCase):
@@ -1082,6 +1165,45 @@ class CollectProjectTest(unittest.TestCase):
             return run_of(1, "", "denied")
 
         self.assertIsNone(fs.collect_project("acme", {"us-central1"}, run=run))
+
+
+class CrashIsolationTest(unittest.TestCase):
+    def test_one_cluster_crashing_costs_that_cluster_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects this collector's
+        stdout into the manifest — so an unmodelled exception on one cluster
+        used to leave a zero-byte file and lose the whole fleet."""
+        clusters_json = json.dumps(
+            [
+                {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+                {"name": "boom", "location": "us-central1", "status": "RUNNING"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
+                    raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "regions"]:
+                return run_of(0, json.dumps({"quotas": []}))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet("acme", run=run)
+
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if c["name"] in ("c1", "boom")}
+        self.assertEqual(outcomes, {"c1": "collected", "boom": "gate-failed"})
+        boom = next(c for c in manifest["clusters"] if c["name"] == "boom")
+        self.assertIn("TypeError", boom["error"])
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

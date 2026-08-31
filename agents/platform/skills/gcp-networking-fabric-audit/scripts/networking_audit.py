@@ -22,9 +22,18 @@ Field contracts assumed of `gcloud ... --format=json` output, spelled out
 because none of these five checks has one authoritative field name for "how
 exhausted is this":
 
-- `subnet-ip-exhaustion` reads `networks subnets list-usable`. Each item's
-  primary range and each entry in `secondaryIpRanges` carries `ipUtilization`
-  as a fraction (0-1) of that range's addresses currently allocated.
+- `subnet-ip-exhaustion` enumerates with `networks subnets list-usable` and
+  measures with Network Analyzer. `list-usable` does **not** carry
+  `ipUtilization` — the field is absent from gcloud's `UsableSubnetwork` in
+  v1, beta and alpha alike, so the enumeration alone reaches no verdict. The
+  ratio comes from the `google.networkanalyzer.vpcnetwork.ipAddressInsight`
+  insight, whose `subnetRangeStats[].allocationRatio` `_backfill_utilization`
+  writes onto each range's `ipUtilization` so the threshold in
+  `check_subnet_ip_exhaustion` reads one field whatever supplied it. A range
+  neither surface measures is unmeasured, never healthy: Network Analyzer
+  omits subnets holding no allocations, and `_collect_subnet_targets` turns
+  that silence into a not-applicable declaration plus a `limitations` string
+  rather than a pass.
 - `cloud-nat-exhaustion` combines three real GCP surfaces: `routers list` for
   each NAT gateway's `natIpAllocateOption` and (when dynamic port allocation
   is on) `maxPortsPerVm`; `routers get-status` for
@@ -64,6 +73,12 @@ from typing import Callable, NamedTuple
 MANIFEST_VERSION = 1
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
+# `audit_report.validate_check_command`'s ceiling, restated rather than
+# imported because this script ships standalone (see the module docstring).
+# An over-length `command` is not a clipped field: `finish` refuses the whole
+# document, so a project with enough Cloud Routers to overflow the joined NAT
+# provenance below would publish nothing at all.
+MAX_COMMAND_CHARS = 2000
 
 SUBNET_SCOPE_NOT_APPLICABLE = (
     ("cloud-nat-exhaustion", "NAT gateways are configured at the Cloud Router level, not per subnet."),
@@ -112,6 +127,11 @@ PARTIAL_SUBNET_LIMITATION = (
     "figure for the rest, which the check passed over rather than cleared: "
     "{names}."
 )
+
+# Cloud NAT's documented per-VM port defaults, applied when `routers list`
+# omits the field — which it does for any NAT that never overrode it.
+DEFAULT_MIN_PORTS_PER_VM = 64
+DEFAULT_MAX_PORTS_PER_VM = 65536
 
 SEVERITY = {
     "subnet-ip-exhaustion": "critical",
@@ -210,6 +230,43 @@ def _record(argv_str: str, result: Run) -> dict:
     }
 
 
+def _joined_record(reads: list[tuple[str, Run]]) -> dict:
+    """One `commands` entry covering every read that backed one check.
+
+    Three of the five checks take more than one read — `cloud-nat-exhaustion`
+    a `routers list` plus a `get-status` and a `get-nat-mapping-info` per
+    router, `cloud-armor-false-positive` a `security-policies list` plus a
+    `backend-services list` — and a `dict[slug] = record` assignment per read
+    published only the last. Cloud Armor's entry therefore named
+    `backend-services list`, which carries no rule and so reproduces no
+    verdict, and the NAT entry named whichever router happened to be read
+    last, which reads as one router inspected on a target where every router
+    was.
+
+    Joined with ` && ` so the field stays a line a reader can paste, the same
+    form the subnet path already publishes. `rc` is 0 because every read here
+    passed its gate — a failure raises `GateFailure` before reaching this.
+    """
+    parts = [command for command, _ in reads]
+    joined = " && ".join(parts)
+    if len(joined) > MAX_COMMAND_CHARS:
+        # Clipped at a join boundary, and the tail is counted rather than
+        # dropped: a `commands` entry silently listing three of a project's
+        # seventeen NAT reads claims narrower coverage than the run had.
+        kept = [parts[0]]
+        for part in parts[1:]:
+            if len(" && ".join(kept + [part])) > MAX_COMMAND_CHARS - 64:
+                break
+            kept.append(part)
+        joined = " && ".join(kept) + f"  # and {len(parts) - len(kept)} more read(s) of the same shape"
+    return {
+        "command": joined[:MAX_COMMAND_CHARS],
+        "rc": 0,
+        "duration_s": round(sum(result.duration_s for _, result in reads), 2),
+        "output_sha256": output_digest("".join(result.stdout for _, result in reads)),
+    }
+
+
 def _last_segment(url: str) -> str:
     return (url or "").rstrip("/").split("/")[-1]
 
@@ -285,8 +342,18 @@ def check_router_nat(router: dict, status: dict | None, mapping: list | None) ->
     `get-status`'s response for it; `mapping` is
     `get-nat-mapping-info`'s response for it. One finding per router,
     aggregating every NAT gateway on it that is either lacking an
-    auto-allocated external IP or has a VM near its port ceiling."""
+    auto-allocated external IP or has a VM near its port ceiling.
+
+    The object names the region as well as the router: a router name is
+    unique inside a region, not inside a project, so `Router/<name>` collides
+    for two NAT routers of the same name in two regions of one project. Both
+    would land in the project-scoped target under the same
+    `(check, cluster, namespace, object)` identity, and `finish` refuses a
+    document holding two findings that agree on all four rather than
+    collapsing them.
+    """
     router_name = router.get("name", "")
+    region = _last_segment(router.get("region", ""))
     problems = []
     for nat in router.get("nats") or []:
         nat_name = nat.get("name", "")
@@ -295,8 +362,17 @@ def check_router_nat(router: dict, status: dict | None, mapping: list | None) ->
             if entry is not None and not entry.get("autoAllocatedNatIps"):
                 problems.append(f"{nat_name}: AUTO_ONLY with no auto-allocated external IP")
                 continue
-        ceiling = nat.get("maxPortsPerVm") if nat.get("enableDynamicPortAllocation") else nat.get("minPortsPerVm")
-        if not ceiling or mapping is None:
+        # Fall back to GCP's documented defaults rather than skipping. `routers
+        # list` omits `minPortsPerVm`/`maxPortsPerVm` whenever the NAT was left
+        # on them, so `ceiling = None` silently dropped §2.2's port half for
+        # exactly the gateways running the stock 64 ports per VM -- the
+        # configuration most likely to exhaust, and the one this check never
+        # once evaluated.
+        if nat.get("enableDynamicPortAllocation"):
+            ceiling = nat.get("maxPortsPerVm") or DEFAULT_MAX_PORTS_PER_VM
+        else:
+            ceiling = nat.get("minPortsPerVm") or DEFAULT_MIN_PORTS_PER_VM
+        if mapping is None:
             continue
         for vm in mapping:
             for iface in vm.get("interfaceNatMappings") or []:
@@ -308,20 +384,27 @@ def check_router_nat(router: dict, status: dict | None, mapping: list | None) ->
                     )
     if not problems:
         return None
-    return {"object": f"Router/{router_name}", "excerpt": "; ".join(problems)}
+    return {"object": f"Router/{region or 'global'}/{router_name}", "excerpt": "; ".join(problems)}
 
 
 def check_psc_routing(forwarding_rules: list[dict]) -> list[dict]:
     """`forwarding_rules` is `forwarding-rules list --filter
     target:ServiceAttachment`'s response. One finding per rule whose PSC
-    connection has been rejected or closed at the target's end."""
+    connection has been rejected or closed at the target's end.
+
+    Scoped by region for the same reason `check_router_nat` is: a forwarding
+    rule's name is unique per region (or once globally), so the bare name
+    collides across regions inside one project and `finish` refuses the whole
+    document rather than merging the two findings.
+    """
     hits = []
     for fr in forwarding_rules or []:
         name = fr.get("name", "")
+        scope = _last_segment(fr.get("region", "")) or "global"
         target = fr.get("target", "")
         status = fr.get("pscConnectionStatus", "")
         if target and "serviceAttachments" in target and status in ("REJECTED", "CLOSED"):
-            hits.append({"object": f"ForwardingRule/{name}", "excerpt": f"pscConnectionStatus: {status}"})
+            hits.append({"object": f"ForwardingRule/{scope}/{name}", "excerpt": f"pscConnectionStatus: {status}"})
     return hits
 
 
@@ -363,7 +446,15 @@ def _looks_non_production(name: str) -> bool:
 def check_cloud_armor(policies: list[dict], backend_services: list[dict]) -> list[dict]:
     """Flags a policy attached to a production-looking backend that still
     carries a `preview` rule (excluding GCP's implicit default rule at
-    priority 2147483647), or that has two rules sharing one `priority`."""
+    priority 2147483647), or that has two rules sharing one `priority`.
+
+    The production gate governs both limbs. §2.5's Do-NOT-flag rule is written
+    about the check, not about its first condition, and the impact this stream
+    publishes is about production traffic — but the gate sat on the preview
+    branch alone, so a duplicate priority was reported on every policy in the
+    project, including ones attached to a `dev` backend and ones attached to
+    no backend at all, where the effective policy governs nothing.
+    """
     attached_by_policy: dict[str, list[str]] = {}
     for svc in backend_services or []:
         policy_ref = svc.get("securityPolicy") or ""
@@ -376,14 +467,15 @@ def check_cloud_armor(policies: list[dict], backend_services: list[dict]) -> lis
         name = policy.get("name", "")
         rules = policy.get("rules") or []
         production = [svc for svc in attached_by_policy.get(name, []) if not _looks_non_production(svc)]
+        if not production:
+            continue
         problems = []
-        if production:
-            preview_priorities = [r.get("priority") for r in rules if r.get("preview") and r.get("priority") != 2147483647]
-            if preview_priorities:
-                problems.append(
-                    f"attached to production backend(s) {', '.join(production)} with rule(s) in "
-                    f"preview: {', '.join(str(p) for p in preview_priorities)}"
-                )
+        preview_priorities = [r.get("priority") for r in rules if r.get("preview") and r.get("priority") != 2147483647]
+        if preview_priorities:
+            problems.append(
+                f"attached to production backend(s) {', '.join(production)} with rule(s) in "
+                f"preview: {', '.join(str(p) for p in preview_priorities)}"
+            )
         priorities = [r.get("priority") for r in rules if r.get("priority") is not None]
         dupes = sorted({p for p in priorities if priorities.count(p) > 1})
         if dupes:
@@ -723,14 +815,16 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
 
 def _collect_project_target(project: str, *, run: RunFn) -> dict:
     name = f"project/{project}"
-    commands: dict[str, dict] = {}
+    # Every read that backed each slug, in the order it ran — see
+    # `_joined_record` for why this accumulates rather than assigns.
+    reads: dict[str, list[tuple[str, Run]]] = {}
     candidates: list[dict] = []
 
     def gated(argv: list[str], slug: str):
         parsed, result = run_and_gate(argv, run=run)
         if parsed is None:
             raise GateFailure(f"{slug}: {' '.join(argv)} failed (rc={result.rc}): {result.stderr.strip()[:300]}")
-        commands[slug] = _record(" ".join(argv), result)
+        reads.setdefault(slug, []).append((" ".join(argv), result))
         return parsed
 
     try:
@@ -790,10 +884,34 @@ def _collect_project_target(project: str, *, run: RunFn) -> dict:
         "project": project,
         "location": "global",
         "outcome": "collected",
-        "commands": [{"check": slug, **record} for slug, record in commands.items()],
+        "commands": [{"check": slug, **_joined_record(slug_reads)} for slug, slug_reads in reads.items()],
         "candidates": candidates,
         "checks_not_applicable": [{"check": slug, "reason": reason} for slug, reason in PROJECT_SCOPE_NOT_APPLICABLE],
     }
+
+
+def crashed_entries(project: str, exc: BaseException) -> list[dict]:
+    """The `clusters[]` entries for a worker that raised something unmodelled.
+
+    `future.result()` re-raises, so one unhandled exception on one project
+    aborts `collect_fleet` — and the SOP invokes this collector as
+    `networking_audit.py … > manifest_gcp-networking-fabric-audit.json`, so by
+    then the shell has already truncated the file. The run loses every project
+    to one bad object instead of one. The shape is the `gate-failed`
+    project-scoped entry `_collect_project_target` already returns, for the
+    same reason: a project missing from the manifest reads as a project with
+    nothing to report.
+    """
+    print(f"[networking_audit] {project}: collector raised {type(exc).__name__}: {exc}", file=sys.stderr)
+    return [
+        {
+            "name": f"project/{project}",
+            "project": project,
+            "location": "global",
+            "outcome": "gate-failed",
+            "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
+        }
+    ]
 
 
 def collect_project(project: str, *, run: RunFn = default_run) -> list[dict]:
@@ -812,7 +930,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_project, p, run=run): i for i, p in enumerate(projects)}
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 — see crashed_entries
+                results[index] = crashed_entries(projects[index], exc)
 
     return {
         "version": MANIFEST_VERSION,

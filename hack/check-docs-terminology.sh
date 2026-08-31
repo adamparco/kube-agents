@@ -335,11 +335,19 @@ cap_guard \
 # at 102-314. A quotation that has drifted from the thing it quotes is worse
 # than no quotation, so require it to be a literal substring of the manifest.
 #
-# The consequence to know before you write: `all N lines of it` is treated as a
-# claim to be quoting a prompt, not as a phrase. Prose that paraphrases a
-# watchdog rather than quoting it will fail this check even though nothing has
-# drifted. Quote the prompt verbatim from the manifest, or describe it in words
-# that avoid the idiom.
+# The anchor is the JSON key, not anything the prompt says. It used to be the
+# phrase `all N lines of it`, and that is precisely how this guard stopped
+# working: the prompts dropped their line-count geography to name a collector
+# instead, no document matched the phrase any more, the loop below ran zero
+# times, and the check went green while both pages still carried the superseded
+# quotation it exists to catch. An anchor drawn from the text being checked
+# fails silent the one time it matters — when that text changes. `"prompt": "`
+# is structural, so a rewording cannot make the guard stop looking.
+#
+# The consequence to know before you write: a fenced `"prompt": "…"` line is
+# treated as a claim to be quoting a roster entry. Paraphrase a watchdog in
+# prose and nothing here objects; render it as manifest JSON and the value has
+# to be the manifest's.
 #
 # Both rosters are ground truth. The governance prompts live on the Platform
 # Agent's; the Chat Agent's is checked too so a job that moves between them
@@ -354,16 +362,23 @@ done
 
 PROMPT_HITS=$(mktemp)
 trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
-search 'all [0-9]+ lines of it' > "$PROMPT_HITS"
+search '^[[:space:]]*"prompt": "' > "$PROMPT_HITS"
 
 # No floor here, unlike the caps above: the site owes nobody a quotation of a
-# cron prompt, and zero copies is zero stale copies.
+# cron prompt, and zero copies is zero stale copies. That is safe only because
+# the anchor above is structural — see the note on why it used to not be.
 STALE_PROMPTS=""
 while IFS= read -r HIT; do
   [ -n "$HIT" ] || continue
-  QUOTED=$(printf '%s\n' "$HIT" | grep -oE 'Read the SOP at .*so a read that stops early' || true)
+  # Strip the grep `path:line:` prefix, the JSON key, and the trailing `",`.
+  # A trailing `...` is an explicit elision — `concepts/skills.md` quotes the
+  # first sentence to show the shape of an entry, not the prompt — so check as
+  # far as the ellipsis and no further. Abbreviating is allowed; misquoting the
+  # part you did show is not.
+  QUOTED=$(printf '%s\n' "$HIT" \
+    | sed -E 's/^.*"prompt": "//; s/",?[[:space:]]*$//; s/[[:space:]]*\.\.\.$//')
   # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
-  if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" $CRON_JOBS; then
+  if [ -z "$QUOTED" ] || ! grep -qF -- "$QUOTED" $CRON_JOBS; then
     STALE_PROMPTS="${STALE_PROMPTS}${HIT}
 "
   fi

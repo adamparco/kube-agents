@@ -288,7 +288,7 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
 | `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
 | `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
-| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
+| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`     | comment once on the merged PR; never reopen it          |
 | `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
 | `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
 | `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
@@ -447,10 +447,12 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — eleven keys, always all eleven. The nine semantic keys below decide behaviour;
-the two timing keys (`inspect_s`, `publish_s`) are telemetry added by
-[`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.4, elided from
-the examples for width, and `inspect_s` is `null` when `start`'s timestamp file is missing:
+Exit contract — thirteen keys, always all thirteen. The nine semantic keys below decide
+behaviour. `chat_summary` carries the whole of what a scheduled run replies, and the three timing
+keys (`inspect_s`, `publish_s`, `collect_s`) are telemetry added by
+[`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.4; all four are
+elided from the examples for width. `inspect_s` is `null` when `start`'s timestamp file is missing
+and `collect_s` is `null` on a run that passed no collector manifest:
 
 - `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
 - `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
@@ -754,9 +756,9 @@ than as two separate gaps. The denominator is the stream's roster minus that clu
 check nobody ran.
 
 Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
-economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
-the full set of withheld conclusions — no resolved claims, no stale-closes, no ledger closure, not
-`[SILENT]` — without a second mechanism to keep in step with the first.
+economy of the change. Everything below already keys off the gaps, so an incomplete run inherits
+the withheld conclusions — resolved claims and stale-closes for the affected targets, and ledger
+closure and `[SILENT]` for the stream — without a second mechanism to keep in step with the first.
 
 The reason this needs a name is that the whole ledger rests on one inference: _a finding that was in
 yesterday's document and is not in today's has been fixed._ That inference is sound only over a
@@ -765,16 +767,26 @@ of absence, and acting on it does real damage — it announces fixes that did no
 closes the pull request that was going to make them happen.
 
 So over a partial run the harness withholds exactly the conclusions that depend on complete
-coverage, and nothing else:
+coverage, and nothing else. Two of the four are withheld **per target** rather than stream-wide:
+`coverage_gap_targets` names the targets this run's gaps cover, and
+`unverifiable_findings` turns that into the ids sitting on them. A gap that names no target at all
+still reads as the whole stream, which is the widest answer and the safe one.
 
-- `resolved` is reported as `0` and no resolved-delta is posted. Findings that genuinely were fixed
-  are simply reported the next time the fleet is fully readable.
-- No remediation PR is stale-closed. Every open fix survives to the next complete run.
-- Zero findings does not close the ledger. `status` is still `CLEAN` — the audit found nothing, and
+- `resolved` counts only findings on targets this run **did** read; one on an unreadable target is
+  reported as still open, and is announced fixed the next time that target is readable. Reading
+  this stream-wide was the earlier rule, and it cost more than it protected:
+  `fleet-consistency-drift` carried one gap on `kube-agents-host` for six consecutive runs — a
+  cluster held out of every cohort for want of an `environment` label, a gap that never clears on
+  its own — while both of its live findings sat elsewhere, so a fix to either could never have
+  been reported.
+- No remediation PR is stale-closed **for a finding on an unreadable target**. Its fix survives to
+  the next run that can reach it.
+- Zero findings does not close the ledger — this one stays stream-wide, on any gap at all. `status` is still `CLEAN` — the audit found nothing, and
   saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
   gaps, so the stream self-heals the day the unreadable clusters come back.
-- The run is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5). "I found nothing" and "I
-  could not look" must not arrive in chat as the same silence.
+- The run is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5) on any gap, also
+  stream-wide. "I found nothing" and "I could not look" must not arrive in chat as the same
+  silence.
 
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
 published normally, and new fixes are still proposed for them. A partial audit is a partial audit,

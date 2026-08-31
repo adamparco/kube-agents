@@ -83,7 +83,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 **Run the collector before evaluating a covered check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/fleet_stockout.py --project "$PROJECT" > /opt/data/scratch/manifest_stockout-prevention.json
+python3 ./skills/fleet-audit/scripts/fleet_stockout.py > /opt/data/scratch/manifest_stockout-prevention.json
 ```
 
 This covers all twelve checks below — the ten built on a `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute reservations list`, or `gcloud compute regions describe --format=json(quotas)`, plus `spot-scarcity-risk` (3.8) off `gcloud beta compute advice capacity-history` and `autoscaler-out-of-resources` (3.11) off `gcloud logging read`. The `Node` dump exists only so 3.9's "`>= 90%` of `maxNodeCount`" test can count each pool's _live_ nodes — `initialNodeCount` is creation-time and the autoscaler never updates it. Two sub-conditions it does not reach — 3.10(b) and 3.12(b), both listed below — stay yours to check by hand. Read the manifest before doing anything else:

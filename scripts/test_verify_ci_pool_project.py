@@ -1621,7 +1621,7 @@ class IamGrantsTest(unittest.TestCase):
     ):
         """The project's own policy: both identities holding exactly what they should."""
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
-        platform = checker.PLATFORM_GSA_ROLES if platform_roles is None else platform_roles
+        platform = checker.platform_gsa_roles(project_id) if platform_roles is None else platform_roles
         platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
         bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(prow)]
         bindings += [{"role": r, "members": [platform_member]} for r in sorted(platform)]
@@ -1807,7 +1807,7 @@ class IamGrantsTest(unittest.TestCase):
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
-                    platform_roles=checker.PLATFORM_GSA_ROLES - {"roles/container.viewer"})),
+                    platform_roles=checker.platform_gsa_roles("kube-agents-evals-3") - {"roles/container.viewer"})),
                 _ok(self._both_build_identities()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -1822,7 +1822,7 @@ class IamGrantsTest(unittest.TestCase):
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
-                    platform_roles=checker.PLATFORM_GSA_ROLES | {"roles/container.admin"})),
+                    platform_roles=checker.platform_gsa_roles("kube-agents-evals-3") | {"roles/container.admin"})),
                 _ok(self._both_build_identities()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
@@ -1900,6 +1900,22 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
             "the project_roles default in variables.tf",
         )
         self.assertEqual(declared, checker.PLATFORM_GSA_ROLES)
+
+    def test_the_custom_role_the_module_also_binds_is_expected(self):
+        """The two assertions above scan for `"roles/..."` literals, so a grant
+        the module makes as a `google_project_iam_custom_role` resource is
+        invisible to them — which is how it came to be missing from the
+        expected set while every provisioned project held it, and every
+        verification reported "holds 1 role(s) beyond the read-only set"."""
+        tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf").read_text()
+        role_ids = set(re.findall(r'^\s*role_id\s*=\s*"([^"]+)"', tf, re.M))
+        self.assertEqual(role_ids, {checker.PLATFORM_GSA_CUSTOM_ROLE_ID})
+        self.assertIn("google_project_iam_member", tf)
+        expected = checker.platform_gsa_roles("kube-agents-evals-3")
+        self.assertEqual(
+            expected - checker.PLATFORM_GSA_ROLES,
+            {f"projects/kube-agents-evals-3/roles/{checker.PLATFORM_GSA_CUSTOM_ROLE_ID}"},
+        )
 
 
 class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):

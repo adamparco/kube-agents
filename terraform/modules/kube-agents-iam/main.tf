@@ -33,7 +33,7 @@ resource "google_project_iam_custom_role" "subnet_utilization_reader" {
   project     = var.project_id
   role_id     = "kubeagentsSubnetUtilizationReader"
   title       = "Kube-Agents Subnet Utilization Reader"
-  description = "Grants only the two permissions the fleet audit's subnet-ip-exhaustion check needs: compute.subnetworks.use to see subnets at all, and the Network Analyzer insight read that carries their utilization."
+  description = "Grants only the three permissions the fleet audit's subnet-ip-exhaustion check needs: compute.subnetworks.use to see subnets at all, plus the list and get on the Network Analyzer insight that carries their utilization."
   permissions = [
     "compute.subnetworks.use",
     # `list-usable` turned out to answer only half the question: it reports

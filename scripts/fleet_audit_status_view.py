@@ -15,7 +15,9 @@ consumes, so the view is reproducible without a cluster.
 The ENABLED and SCHEDULE columns come from the checked-in cron roster
 (`agents/platform/cron/jobs.json`), not the runtime copy on the pod, and the
 header says which file it read; a stream disabled at runtime therefore shows
-its seed state.
+its seed state. A roster that cannot be read is named in that field and in the
+lead rather than swallowed: it disarms NEVER and STALE, so the empty flag list
+it produces is "not checked", not "clean", and the exit code is 1.
 
 Four flags the raw rows cannot be trusted without:
   - NO STORE: the store directory is absent, or this stream's files could not
@@ -101,6 +103,15 @@ STALE_SLACK = timedelta(hours=1)
 CONTEXT_PROBE_LIMIT = 12
 CONTEXT_PROBE_TIMEOUT = 6
 
+#: The two reads that are not probes: finding the pod, and running the
+#: projection inside it. Untimed, an API server that accepts the connection and
+#: then says nothing hangs the view indefinitely -- and under `--watch` it hangs
+#: with the last frame still on screen, which reads as a fleet that has stopped
+#: changing rather than as a tool that is stuck. The exec gets the longer budget
+#: because it walks the whole store on the far side.
+DISCOVER_TIMEOUT = 20
+EXEC_TIMEOUT = 120
+
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x9b\x90\x9d]")
 
 #: Every outcome the audit skill writes. Anything else is styled as a warning
@@ -162,14 +173,46 @@ def _pods_query(namespace: str) -> list[str]:
     ]
 
 
+def run_kubectl(
+    args: list[str],
+    context: str | None,
+    timeout: int,
+    what: str,
+    stdin: str | None = None,
+) -> subprocess.CompletedProcess:
+    """kubectl, with the two process-level failures turned into ProjectionError.
+
+    A kubectl that is not installed and an API server that never answers both
+    reach the operator as a sentence saying which read was being attempted,
+    rather than as a traceback or as an indefinite wait. Neither sets
+    `search_namespace`: "I could not ask" is not "nothing is here", so the
+    fallback that probes a dozen other contexts stays out of it.
+    """
+    try:
+        return subprocess.run(
+            _kubectl(args, context),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=stdin,
+        )
+    except subprocess.TimeoutExpired:
+        raise ProjectionError(f"{what} timed out after {timeout}s") from None
+    except OSError as exc:
+        raise ProjectionError(f"{what} could not run kubectl: {_oneline(exc)}") from exc
+
+
 def discover_pod(namespace: str, context: str | None = None) -> list[str]:
     """Running agent pods in the namespace, sorted. Never empty — an empty
     result is the "no agent pod" failure, which the caller must not render as
     an empty fleet."""
-    res = subprocess.run(
-        _kubectl(_pods_query(namespace), context), capture_output=True, text=True
-    )
     where = context or "the current context"
+    res = run_kubectl(
+        _pods_query(namespace),
+        context,
+        DISCOVER_TIMEOUT,
+        f"the agent pod lookup in {namespace} on {where}",
+    )
     if res.returncode != 0:
         raise ProjectionError(
             f"no agent pod found in namespace {namespace} on {where}: "
@@ -281,7 +324,13 @@ def context_hint(exc: ProjectionError, context: str | None) -> list[str]:
     if found is None:
         found = contexts_with_agent(namespace, here)
     if found:
-        lines.append("  an agent pod is running on more than one context:")
+        # One is reachable here even though `resolve_target` only re-raises on
+        # zero or two-plus: an explicit `--context` is never overridden, so that
+        # path raises before probing and this function does the probe itself.
+        lines.append(
+            "  an agent pod is running on %s:"
+            % ("another context" if len(found) == 1 else "%d other contexts" % len(found))
+        )
         lines += [f"    --context {name}" for name in found]
     elif kubeconfig_contexts():
         lines.append(
@@ -305,14 +354,12 @@ def fetch_projection(
         raise ProjectionError(
             f"projection script unreadable at {PROJECTION_SCRIPT}: {_oneline(exc)}"
         ) from exc
-    res = subprocess.run(
-        _kubectl(
-            ["exec", "-i", pod, "-c", container, "-n", namespace, "--", "python3", "-"],
-            context,
-        ),
-        input=script,
-        capture_output=True,
-        text=True,
+    res = run_kubectl(
+        ["exec", "-i", pod, "-c", container, "-n", namespace, "--", "python3", "-"],
+        context,
+        EXEC_TIMEOUT,
+        f"the projection in {namespace}/{pod} [{container}]",
+        stdin=script,
     )
     if res.returncode != 0:
         raise ProjectionError(
@@ -343,11 +390,22 @@ def as_projection(text: str, origin: str) -> dict:
     return doc
 
 
-def load_roster(path: Path) -> dict[str, dict]:
+def load_roster(path: Path) -> tuple[dict[str, dict], str]:
+    """The roster's fleet-audit jobs, and why the file could not be read.
+
+    The reason is returned rather than swallowed because an unreadable roster
+    silently disarms two of the four flags: NEVER and STALE both gate on
+    `job.get("enabled")`, which is False for every stream when the roster came
+    back empty, so a fleet that has been silent for a week renders as a table of
+    calm blank rows under the word "all clear". Same principle the NO STORE flag
+    exists for -- "I could not look" is not "nothing is wrong" -- applied to the
+    other half of the inputs. An empty roster is not this case: a file that
+    parses and holds no fleet-audit job returns no reason.
+    """
     try:
         jobs = json.loads(path.read_text(encoding="utf-8")).get("jobs") or []
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as exc:
+        return {}, _oneline(exc)
     out = {}
     for job in jobs:
         if "fleet-audit" in (job.get("skills") or []):
@@ -355,7 +413,7 @@ def load_roster(path: Path) -> dict[str, dict]:
                 "enabled": bool(job.get("enabled")),
                 "expr": str(((job.get("schedule") or {}).get("expr")) or ""),
             }
-    return out
+    return out, ""
 
 
 def next_fire(expr: str, after: datetime) -> datetime | None:
@@ -363,6 +421,11 @@ def next_fire(expr: str, after: datetime) -> datetime | None:
 
     The governance roster only uses these two forms. Anything fancier returns
     None and the STALE flag abstains for that stream rather than guessing.
+
+    Out-of-range fields (`99 3 * * *`) abstain the same way. They reach here
+    through the same door a typo in the roster does, and `.replace()` raises on
+    them, so the check has to be inside the `try` -- a single bad entry would
+    otherwise take down all eight rows on its way past `render`.
     """
     parts = expr.split()
     if len(parts) != 5 or parts[2] != "*" or parts[3] != "*":
@@ -370,10 +433,9 @@ def next_fire(expr: str, after: datetime) -> datetime | None:
     try:
         minute, hour = int(parts[0]), int(parts[1])
         dows = None if parts[4] == "*" else {int(d) % 7 for d in parts[4].split(",")}
+        candidate = after.replace(minute=minute, hour=hour, second=0, microsecond=0)
     except ValueError:
         return None
-    candidate = after.replace(minute=minute, second=0, microsecond=0)
-    candidate = candidate.replace(hour=hour)
     if candidate <= after:
         candidate += timedelta(days=1)
     for _ in range(8):
@@ -647,6 +709,7 @@ def render(
     patterns: tuple[str, ...] = (),
     flagged_only: bool = False,
     show_gaps: bool = False,
+    roster_error: str = "",
 ) -> str:
     palette = palette or Palette(False)
     box = box or BOX_UNICODE
@@ -683,7 +746,9 @@ def render(
 
     shown.sort(key=key)
 
-    out = header_lines(projection, built, source, roster_path, context, palette, now, utc)
+    out = header_lines(
+        projection, built, source, roster_path, context, palette, now, utc, roster_error
+    )
     out += ["", palette("STREAMS", "head")]
     out += render_table(
         COLUMNS, [entry["row"] for entry in shown], palette,
@@ -758,6 +823,7 @@ def header_lines(
     palette: Palette,
     now: datetime,
     utc: bool,
+    roster_error: str = "",
 ) -> list[str]:
     total = len(built)
     attention = [e for e in built if e["flags"] or e["latest"].get("partial")]
@@ -785,12 +851,22 @@ def header_lines(
             "%d stream%s" % (total, "" if total == 1 else "s"), "bold"
         ),
     )
-    lead += "  %s  %s" % (
-        palette("·", "dim"),
-        palette("%d need attention" % len(attention), "yellow")
-        if attention
-        else palette("all clear", "green"),
-    )
+    # With no roster, NEVER and STALE cannot fire. That makes both halves of
+    # the usual verdict untrustworthy rather than just one: "all clear" is the
+    # outright lie, but a count is one too -- it is a count of what was looked
+    # for, and the two flags that catch a silent stream were not among them. So
+    # the caveat is appended in either case, and only "all clear" is withheld.
+    verdicts = []
+    if attention:
+        verdicts.append(palette("%d need attention" % len(attention), "yellow"))
+    elif not roster_error:
+        verdicts.append(palette("all clear", "green"))
+    if roster_error:
+        verdicts.append(
+            palette("roster unreadable — NEVER and STALE not checked", "crit")
+        )
+    for verdict in verdicts:
+        lead += "  %s  %s" % (palette("·", "dim"), verdict)
     if newest:
         lead += "  %s  %s" % (
             palette("·", "dim"),
@@ -805,7 +881,17 @@ def header_lines(
     lines.append(field("source", scrub(source)))
     if context:
         lines.append(field("context", scrub(context)))
-    lines.append(field("roster", short_path(roster_path)))
+    lines.append(
+        field(
+            "roster",
+            short_path(roster_path)
+            + (
+                palette(" — unreadable: " + scrub(roster_error), "crit")
+                if roster_error
+                else ""
+            ),
+        )
+    )
     lines.append(
         field(
             "findings",
@@ -974,9 +1060,10 @@ def draw(args: argparse.Namespace, palette: Palette, box: dict, width: int) -> t
     projection, source, context = load_projection(args)
     if args.json:
         return json.dumps(projection, indent=2, sort_keys=True), exit_code(projection)
+    roster, roster_error = load_roster(Path(args.roster))
     text = render(
         projection,
-        load_roster(Path(args.roster)),
+        roster,
         datetime.now(timezone.utc),
         args.roster,
         source,
@@ -989,8 +1076,9 @@ def draw(args: argparse.Namespace, palette: Palette, box: dict, width: int) -> t
         patterns=tuple(args.stream),
         flagged_only=args.flagged,
         show_gaps=args.gaps,
+        roster_error=roster_error,
     )
-    return text, exit_code(projection)
+    return text, max(exit_code(projection), 1 if roster_error else 0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1005,11 +1093,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             text, code = draw(args, palette, box, width)
         except ProjectionError as exc:
-            print(f"fleet-audit view: {exc}", file=sys.stderr)
+            lines = [f"fleet-audit view: {exc}"]
             if exc.search_namespace:
-                for line in context_hint(exc, args.context):
+                lines += context_hint(exc, args.context)
+            if not args.watch:
+                for line in lines:
                     print(line, file=sys.stderr)
-            return 2
+                return 2
+            # A watch that exits on the first failure is a dashboard nobody
+            # leaves open: a rolled agent pod, an API server restart, or a
+            # laptop that slept all end it, and the operator comes back to a
+            # dead terminal rather than to the fleet. Draw the failure into the
+            # frame and try again on the next tick.
+            text, code = "\n".join(palette(scrub(line), "crit") for line in lines), 2
         if not args.watch:
             print(text)
             return code

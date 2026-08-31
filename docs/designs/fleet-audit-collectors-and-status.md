@@ -1,14 +1,15 @@
 # Fleet Audit — Procedural Collection, Native Timing, and the Status Surface
 
-> **STATUS — implemented, with §4.5 being replaced.** Every stream now runs through a
+> **STATUS — implemented.** Every stream now runs through a
 > procedural collector (or names, in its own module docstring, exactly which of its checks it
 > does not cover and why), native timing rides `finish`'s exit JSON, `make fleet-audit-view`
 > renders the fleet, and §4.8's local report store is `finish`'s delta memory in place of the
-> retired ledger-body read-back. **§4.5's status ConfigMap shipped but never worked on a real
-> install and is being deleted** — the status surface moves into the report store, which §4.5
-> now specifies and §10 phase 7 tracks. One further piece is deliberately not done, with its
-> reasoning recorded where it applies rather than here: §4.7's `AuditSpec` consolidation is
-> deferred (§10 phase 5).
+> retired ledger-body read-back. §4.5's status ConfigMap shipped, never worked on a real
+> install, and **has been deleted** — chart template and proxy route both gone; the status
+> surface lives in the report store, which §4.5 specifies and §10 phase 7 records. The §4.3 run
+> lock (phase 8) and the `fleet-audit-reports` reader skill (phase 9) are in as well. One piece
+> is deliberately not done, with its reasoning recorded where it applies rather than here:
+> §4.7's `AuditSpec` consolidation is deferred (§10 phase 5).
 > [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) remains the design of record for
 > the reporting half — the ledger, delta, and promotion contracts — which this document amends
 > in exactly two places, named in **Builds on** below.
@@ -258,21 +259,25 @@ eight idle ones, and a fifty-cluster fleet runs eight at a time until it is done
 frees, which beats fixed batches, where the whole bucket waits on its slowest member. Nothing
 hand-rolls batches.
 
-`MAX_WORKERS` is 8 on five of the six streams. The cost stream sets 64, and the asymmetry is
-deliberate: its threads spend nearly all their wall-clock asleep between the three ≥5-minute
-`kubectl top` rounds, so width there costs almost no concurrent load, while a cap of 8 would
-serialise a large fleet across sampling windows and stretch the run by hours. The binding
-constraint on the other five is the credential proxy — one sidecar process serialising nothing
-but able to be swamped — and the apiserver of each cluster being dumped, not the harness's own
-CPU.
+`MAX_WORKERS` is 8 on all six streams. The cost stream was to have been the exception at 64,
+on the reasoning that its threads spent nearly all their wall-clock asleep between the three
+≥5-minute `kubectl top` rounds, so width there bought throughput at almost no concurrent load.
+Retiring the sampling for a Cloud Monitoring read (see phase 4 in §10) removed the sleep and
+with it the argument: `fleet_waste.py` now issues two HTTP reads per cluster and belongs under
+the same cap as everything else. The binding constraint on all six is the credential proxy —
+one sidecar process serialising nothing but able to be swamped — and the apiserver of each
+cluster being dumped, not the harness's own CPU.
 
 **Thread safety is a path-keying discipline, not a lock.** Two rules, and they are exhaustive
 because there is no shared mutable state in the collectors beyond the filesystem:
 
-- **A worker thread writes only to paths keyed by its own cluster.** The per-cluster state dump
-  is `wra_state_{cluster}.json`; no two threads in a run can name the same file, so the
-  concurrent case is not a race at all. New per-cluster artefacts follow the same naming or they
-  are a bug.
+- **A worker thread writes only to paths keyed by its own cluster** — by the whole
+  `(project, cluster, location)` triple, as `kubeconfig_path` and the per-cluster state dump
+  `wra_state_{project}_{cluster}_{location}.json` both are. The triple, not the name: a cluster
+  name is unique inside a project and the collector runs eight projects at once, so keying on
+  the name alone let two clusters called `prod` write one path and the loser re-read the
+  winner's dump — one cluster's workloads published under the other's name, over a manifest
+  recording a clean read. New per-cluster artefacts follow the same naming or they are a bug.
 - **Anything written to a shared path goes through `_atomic_write`** — a unique
   `NamedTemporaryFile` in the target's own directory, then `os.replace`. That buys two distinct
   properties: a reader never sees a torn file (the chat path reads `latest.json` at arbitrary
@@ -416,13 +421,14 @@ not yet reaped it, and it carries no record of _who_ holds it or _since when_ �
 surface would need a second file anyway. A self-expiring claim file gives liveness and mutual
 exclusion from one artifact, and its recovery rule is a wall-clock ceiling any reader can evaluate.
 
-The cost stream's sampling changes sequence, not shape: today three `kubectl top` rounds with
-`sleep 300` between are written inside the per-cluster block — a literal reading sleeps 600 s
-_per cluster_. The collector samples all clusters back-to-back, timestamps the round, does the
-non-sample collection inside the window, and sleeps only the remainder before the next round:
-600 s per _fleet_, same three samples, same ≥5-minute spacing the impact lines must name, with
-the four sample-dependent checks (`overrequest`, `unconsumed-pvc`, `idle-nodepool`,
-`idle-namespace`) reading identical data.
+The cost stream's sampling was to have changed sequence, not shape: §2 wrote three
+`kubectl top` rounds with `sleep 300` between them inside the per-cluster block — a literal
+reading sleeps 600 s _per cluster_ — and the plan here was to sample all clusters
+back-to-back, do the non-sample collection inside the window, and sleep only the remainder, for
+600 s per _fleet_. What shipped removes the sampling instead: `fetch_usage_peaks` reads the peak
+from Cloud Monitoring over a trailing week, so the four sample-dependent checks
+(`overrequest`, `unconsumed-pvc`, `idle-nodepool`, `idle-namespace`) read a longer window with
+no sleep at all. Phase 4 in §10 records why.
 
 _Rejected alternative:_ overlapping cluster-A triage with cluster-B collection across shell
 calls (backgrounding with sentinel files). Whether the harness shell reaps background children
@@ -464,7 +470,7 @@ numbers in an exit payload add no collector daemon and no scrape target. The one
 exception in this design is §4.8's report store, which does carry the delta's memory on the
 PVC — Q5 prices that openly rather than folding it in here. Operators who want dashboards can
 build them on the store's JSON, which is stable enough to parse and versioned by
-`schema_version`.
+`id_scheme` (`ID_SCHEME = 2`).
 
 ### 4.5 The status surface: two files in the report store, and no ConfigMap
 
@@ -499,9 +505,10 @@ same volume the report already lands on.
 **Two files per stream, both in `reports/<audit-id>/`** (§4.8 owns the directory):
 
 - **`started.json`** — written by `start`, removed by `finish`. Its presence means "a run holds
-  this stream". The file mostly exists already: `write_phase_start` writes `{audit, t0, pid}` on
+  this stream". The file mostly exists already: `start` writes `{audit, t0, pid}` on
   every start so `finish` can compute `inspect_s`. What changes is where it lives
-  (`SCRATCH_DIR/phase_<audit>.json` → `reports_dir_for(audit_id)/started.json`), that it gains a
+  (`SCRATCH_DIR/phase_<audit>.json` → `started_path_for(audit_id)`, under
+  `reports_dir_for(audit_id)`), that it gains a
   `nonce`, that it is created through the atomic acquire of §4.3 rather than an unconditional
   overwrite, and that `finish` releases it.
 - **`latest.json`** — written by `finish`, and already the store's envelope. It gains the three
@@ -617,7 +624,11 @@ never-scheduled stream were indistinguishable. Under the file model the view dis
 **never ran** (roster-enabled, neither file present, and the store readable — flag `NEVER`, not
 blank), **unreadable** (`root_exists` false or a per-stream `error` — flag `NO STORE`), and
 **stale/died** (the §4.5 rule). Exit is non-zero when the store cannot be read, because "I could
-not look" must not render as "nothing is wrong".
+not look" must not render as "nothing is wrong" — and equally when the roster cannot be read,
+which is the same failure on the other half of the inputs: `NEVER` and `STALE` both gate on a
+stream being roster-enabled, so an unreadable roster disarms them both and a fleet silent for a
+week renders as an empty FLAGS column. The header names the file and the reason, and says which
+two flags went unchecked, rather than printing "all clear" over them.
 
 **What changes at the command surface**, since the view no longer reads a namespaced object:
 
@@ -935,8 +946,9 @@ the cheap validator round) + `finish` (1) + report (1): **9–13 iterations**. T
 projection splits by stream shape: a low-finding stream lands around 2–4.5 minutes (the
 collector iteration is collection-bound, 30–90 s of parallel dumps, not the 12–20 s of a chat
 round trip); a finding-heavy stream adds authoring and confirm iterations that scale with
-findings (compliance's 57 findings keep it well above the floor); and the cost stream keeps
-its hard 600 s sampling floor whatever else improves. Against 902 s measured for
+findings (compliance's 57 findings keep it well above the floor); and the cost stream was projected to keep a hard 600 s
+sampling floor whatever else improved — a floor its collector then removed outright by reading
+Cloud Monitoring rather than sampling. Against 902 s measured for
 obtainability, that is still most of the time back — before counting compliance's five-fold
 re-dumping or the drift stream's nineteen facets of LLM arithmetic becoming exact code. These
 are projections from the measured per-iteration cost, not measurements; the instrumentation in
@@ -997,7 +1009,11 @@ The manifest is the new machine boundary between collector and harness, so it ge
 ```
 
 Rules: every enumerated cluster appears with an `outcome` and an `autopilot` flag; a gate failure (zero-byte or
-truncated dump) is `outcome: "gate-failed"`, never a shorter candidate list; `excerpt` is cut
+truncated dump) is `outcome: "gate-failed"`, never a shorter candidate list; a cluster the
+collector reached but its SOP's §1 rules out of scope — a GKE cluster mid-provision, or an
+alpha cluster that cannot be upgraded — is `outcome: "out-of-scope"` with the reason in
+`error`, so that the document puts it in `scope.skipped` as the SOP asks rather than being
+forced into `scope.clusters` by a `collected` it did not earn; `excerpt` is cut
 from the dump under the same credential-projection rules the SOPs mandate, and the harness
 redactor remains the backstop. `finish` ingests the manifest when present: it cross-checks
 `scope` against manifest clusters (§4.3), copies durations into the status row, and applies
@@ -1204,7 +1220,9 @@ Each phase is one PR, independently valuable, in this order:
    emphatic a jq filter must get right). Generalized `collect_cluster` into a dispatcher over
    per-stream context builders so the second stream's genuinely different collection shape
    proved the seam rather than being forced into the first stream's, and the manifest
-   cross-check wired into `finish` behind `--manifest-file`, opt-in per run. Both streams:
+   cross-check wired into `finish` behind `--manifest-file`, opt-in per run at this point —
+   phase 4 made it mandatory once every stream had a collector to produce one, with
+   `--no-collector-manifest '<why>'` as the documented waiver. Both streams:
    golden dumps, fault injection (zero-byte dump, truncated dump, a `get-credentials` failure
    under parallelism, a gate failure on one of several collections failing the whole cluster
    closed), and an integration test running `collect_fleet`'s real output through `finish`'s
@@ -1212,7 +1230,7 @@ Each phase is one PR, independently valuable, in this order:
    does not yet touch either stream's SOP prose or cron prompt — SOP shrink is deliberately
    its own slice, reviewable without also reviewing twenty-two checks' worth of logic in the
    same diff.
-4. **SOP shrink for both pilot streams, then the remaining streams** — retire each SOP's
+4. **Done. SOP shrink for both pilot streams, then the remaining streams** — retire each SOP's
    command/filter prose now that a collector carries it, update the cron prompts, then the
    other six streams in turn, including the cost stream's hoisted sampling and the drift
    stream's arithmetic; stockout last, after its qualitative thresholds ("latency-sensitive",
@@ -1224,7 +1242,7 @@ Each phase is one PR, independently valuable, in this order:
    model is the same — GKE clusters reached through a kubeconfig — even though its concrete
    collection shape is its own: a workload dump plus a Service dump, the second backing exactly
    one check (`inference-endpoint-public`) that joins it against the first, genuinely different
-   from both obtainability's single dump and compliance's five distinct reads. The dispatcher
+   from both obtainability's single dump and compliance's half-dozen distinct reads. The dispatcher
    phase 3 built already generalizes over a per-stream context builder for exactly this reason,
    so a third distinct shape needed no new script, only a new context builder;
    `security-patch-orchestrator`, its own script (`patch_readiness.py`) since
@@ -1233,10 +1251,15 @@ Each phase is one PR, independently valuable, in this order:
    per distinct location backs every one of its ten checks, where the SOP's own per-check
    command lines implied a `node-pools describe` per pool per check; and
    `fleet-wide-cost-analysis`, its own script (`fleet_waste.py`) mixing cluster-named and
-   `project/<id>` manifest entries the way `networking_audit.py` does, whose collector is this
-   phase's "hoisted sampling": §2's three `kubectl top` samples five minutes apart are still a
-   real ten-minute wall-clock cost, but the thread pool now pays it once per cluster,
-   concurrently across the whole fleet, instead of serially inside one SOP-executed shell; and
+   `project/<id>` manifest entries the way `networking_audit.py` does, and which went further
+   than this phase's planned "hoisted sampling": rather than pay §2's three `kubectl top`
+   samples five minutes apart concurrently instead of serially, `fetch_usage_peaks` retires the
+   sampling altogether and reads the peak from Cloud Monitoring over a trailing
+   `USAGE_WINDOW_HOURS = 168`. Two HTTP reads per cluster and no sleeping at all, so the ten
+   minutes of wall clock go to zero — but the wall clock was the smaller gain. A ten-minute
+   Monday-morning window cannot see a nightly batch peak, and every caveat §2 wrapped around
+   that blind spot (all three samples must agree, peak never mean, an absolute floor) was
+   scaffolding the week-long window does not need. The module docstring carries the argument; and
    `fleet-consistency-drift`, its own script (`fleet_drift.py`) since — like
    `security-patch-orchestrator` — every facet reads only `gcloud container` metadata and needs
    no kubeconfig, and because this stream's "check" is not a per-cluster verdict at all but a
@@ -1295,8 +1318,9 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
    skipped, logged — and that same run's store write restores the delta from the next run on;
    keeping the old parse as a one-release migration seed was rejected as dead code in waiting
    for a transition this mild.
-7. **Status moves into the store; the ConfigMap is deleted** (§4.5, §4.6) — one PR, and mostly
-   deletion. Harness: `phase_path_for` re-pointed at `reports_dir_for(audit_id)/started.json`,
+7. **Done. Status moved into the store; the ConfigMap is deleted** (§4.5, §4.6) — one PR, and mostly
+   deletion. Harness: the phase file re-pointed at `started_path_for(audit_id)`, i.e.
+   `reports_dir_for(audit_id)/started.json`,
    the three status keys added to the envelope, `_status_post` and its callers removed. Proxy:
    `_handle_fleet_audit_status` and its `do_POST` wiring removed. Chart:
    `templates/fleet-audit-status.yaml` deleted whole — ConfigMap and RBAC together. View:
@@ -1305,7 +1329,8 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
    store legible. Adds the new `report_status.py` projection. Net negative outside fleet-audit's
    own directory, and it needs no `helm upgrade` to take effect — which is the property whose
    absence caused the failure it fixes.
-8. **The run lock** (§4.3) — `acquire`/`release`/`prune_tokens` on `started.json`, `start`
+8. **Done. The run lock** (§4.3) — `acquire_run_lock`/`release_run_lock` (plus
+   `release_own_lock` on abnormal exit) and `prune_steal_tokens` on `started.json`, `start`
    wired to acquire and exit non-zero on a live holder, `finish` wired to release, the
    sub-second ring stamp, §4.3's six anti-wedge covers with `start --steal-lock` as the
    operator override and a nonce-checked release on every abnormal exit from `main`,
@@ -1313,7 +1338,7 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
    the multi-process lock tests. Separable from 7 and shipped after it, because it changes when
    a run _refuses to start_ and deserves its own review and its own live validation rather than
    riding along with a deletion PR.
-9. **The reader skill** (§4.9) — `agents/platform/skills/fleet-audit-reports/` with its
+9. **Done. The reader skill** (§4.9) — `agents/platform/skills/fleet-audit-reports/` with its
    `SKILL.md` and `report_query.py`, the reading section moved out of `fleet-audit`'s SKILL.md
    and replaced by a pointer, one line in `generate_docs.py`'s `SKILL_GROUPS`, and
    `make docs-generate` for the skill catalogue. No harness change at all — it reads files
@@ -1329,7 +1354,7 @@ count` pinned to a ratio-plus-floor; "near `maxNodeCount`" pinned to `>= 90%`; a
 | Proxy     | `agents/platform/scripts/credential_proxy.py` — the `_handle_fleet_audit_status` route added in phase 2 and **removed again in phase 7**, with its tests; `command_policy.py` untouched throughout                                                                                                                                                                                       |
 | Chart     | `charts/kube-agents/templates/fleet-audit-status.yaml` — added in phase 2, **deleted in phase 7**. No chart object, no RBAC, and no operator change survives this design                                                                                                                                                                                                                 |
 | Status    | (§4.5, phase 7) `audit_report.py` — `started.json` relocation, three envelope keys, `_status_post` deleted; `agents/platform/skills/fleet-audit/scripts/report_status.py` (new projection); `test_audit_report.py`                                                                                                                                                                       |
-| Lock      | (§4.3, phase 8) `audit_report.py` — `acquire`/`release`/`prune_tokens` over `started.json`, `start` wired to acquire and `finish` to release, the six anti-wedge covers and the `--steal-lock` override, sub-second ring stamp; the multi-process lock tests in `test_audit_report.py`                                                                                                   |
+| Lock      | (§4.3, phase 8) `audit_report.py` — `acquire_run_lock`/`release_run_lock`/`release_own_lock`/`prune_steal_tokens` over `started.json`, `start` wired to acquire and `finish` to release, the six anti-wedge covers and the `--steal-lock` override, sub-second ring stamp; the multi-process lock tests in `test_audit_report.py`                                                        |
 | Store     | (§4.8, phase 6) `audit_report.py` — store writer, delta re-pointed at the store, ledger-body read-back deleted; `test_audit_report.py`; the fleet-audit `SKILL.md` reading section; `fleet-audit-issue-ledger.md`'s delta-memory amendment; `concepts/declarative-workflow.md`'s computable-delta bullet                                                                                 |
 | View      | `scripts/fleet_audit_status_view.py` (new), `Makefile`, tests (new)                                                                                                                                                                                                                                                                                                                      |
 | Skills    | (§4.9, phase 9) `agents/platform/skills/fleet-audit-reports/SKILL.md` and its `scripts/report_query.py` (both new); the reading section cut from `fleet-audit`'s `SKILL.md` and replaced by a pointer; one line in `scripts/generate_docs.py`'s `SKILL_GROUPS`; `tests/` coverage for the query script                                                                                   |
@@ -1439,7 +1464,7 @@ recoverable from GitHub by a human, because the ledger body keeps publishing the
   permanently, because deleting it on success is exactly the bug the torture test caught: a
   racer holding the same dead claim would find the token free and replace the new owner (§4.3).
   _Why accepted:_ correctness beats tidiness, and the file is empty-ish and one per steal.
-  _What it costs:_ a few dozen bytes per crashed run, pruned by `prune_tokens` once older than
+  _What it costs:_ a few dozen bytes per crashed run, pruned by `prune_steal_tokens` once older than
   the ceiling. _What would change it:_ nothing — the prune is the answer, and it is in phase 8.
 - **The report store dies with its PVC, and the delta forgets with it (§4.8, phase 6).** A
   wiped or recreated PVC empties the store; each stream's next run publishes once with no

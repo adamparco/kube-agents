@@ -966,6 +966,39 @@ def _fleet_facts(context: dict) -> dict:
     return {"pv_handles": pv_handles, "service_names": service_names, "referenced_addresses": referenced_addresses}
 
 
+def empty_fleet_facts() -> dict:
+    """The `fleet_facts` half of a `collect_cluster` return for a cluster
+    nothing could be read from."""
+    return {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
+
+
+def crashed_entry(cluster: dict, exc: BaseException) -> dict:
+    """A `clusters[]` entry for a worker that raised something unmodelled.
+
+    `future.result()` re-raises, so one unhandled exception on one cluster
+    aborts `collect_fleet` — and the SOP invokes this collector as
+    `fleet_waste.py … > manifest_fleet-wide-cost-analysis.json`, so by then
+    the shell has already truncated the file. The run loses the whole fleet to
+    one bad object instead of one cluster. `gate-failed` is the shape the
+    document already carries for "enumerated, could not be read", and it also
+    closes §3.6's `all_reachable` gate for that project, which is the
+    conservative answer when a cluster's objects went unseen.
+    """
+    print(
+        f"[fleet_waste] {cluster.get('project', '?')}/{cluster.get('name', '?')}: "
+        f"collector raised {type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )
+    return {
+        "name": cluster.get("name", "?"),
+        "project": cluster.get("project", "?"),
+        "location": cluster.get("location", "?"),
+        "autopilot": bool(cluster.get("autopilot")),
+        "outcome": "gate-failed",
+        "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
+    }
+
+
 def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime) -> tuple[dict, dict]:
     """Returns `(manifest_entry, fleet_facts)` — the second only populated
     when the object dump succeeded; `collect_fleet` unions it across every
@@ -975,7 +1008,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # every shape below: the mode does not stop being true because this run
     # failed to read inside the cluster.
     mode = {"autopilot": bool(cluster.get("autopilot"))}
-    empty_facts = {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()}
+    empty_facts = empty_fleet_facts()
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
         return {"name": name, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
@@ -1357,7 +1390,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
         futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 — see crashed_entry
+                results[index] = (crashed_entry(clusters[index], exc), empty_fleet_facts())
 
     # Group per project: the "all reachable" gate for orphan-lb (§3.6) and
     # the cross-cluster fact union it and the disk/address checks read are

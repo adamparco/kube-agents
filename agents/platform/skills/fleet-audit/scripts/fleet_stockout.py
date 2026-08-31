@@ -240,6 +240,30 @@ def region_of(location: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _gce_int(value: object, default: int | None = None) -> int | None:
+    """An int64 out of a GCE JSON response, which serialises them as strings.
+
+    `{"count": "100", "inUseCount": "3"}` is what `gcloud compute reservations
+    list --format json` returns -- the Google API int64-to-string convention,
+    reproduced verbatim by gcloud's `resource_projector`. Dividing two of them
+    raises `TypeError`, and nothing in this module catches one, so the
+    traceback escapes `collect_fleet`; every SOP invokes this collector as
+    `... > manifest_<audit>.json`, so the shell has already truncated the file
+    and the whole stream loses its manifest rather than one finding.
+
+    `default` is for a field the API omits when it is zero -- proto3 JSON drops
+    default values, so an unused reservation carries no `inUseCount` at all,
+    and reading that absence as "unknown, skip" hides the maximum-waste case
+    the check exists to find.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _priority_is_spot(p: dict) -> bool:
     return bool(p.get("spot")) or p.get("provisioningModel") == "SPOT"
 
@@ -398,19 +422,42 @@ def check_dangling_compute_class(workload: dict, compute_classes_by_name: dict[s
     """
     spec = workload.get("spec") or {}
     template_spec = ((spec.get("template") or {}).get("spec")) or spec
+    # Deployments and StatefulSets are namespaced, and `derive_finding_id` keys
+    # on (check, cluster, namespace, object): without this, `Deployment/api` in
+    # `team-a` and in `team-b` share one identity, so one is dropped and the
+    # delta alternates between them run to run.
+    namespace = (workload.get("metadata") or {}).get("namespace", "")
+    obj = f"{workload['kind']}/{workload['metadata']['name']}"
     selector = (template_spec.get("nodeSelector") or {}).get("cloud.google.com/compute-class")
     if selector and selector not in compute_classes_by_name:
-        return {"object": f"{workload['kind']}/{workload['metadata']['name']}", "excerpt": f"nodeSelector references ComputeClass {selector!r}, which does not exist"}
+        return {"namespace": namespace, "object": obj, "excerpt": f"nodeSelector references ComputeClass {selector!r}, which does not exist"}
     if selector:
         cc = compute_classes_by_name[selector]
+        # `is not True`, not `is False`: the CRD's field defaults to off, so the
+        # ordinary way to leave auto-creation disabled is to omit
+        # `nodePoolAutoCreation` altogether, and reading that absence as
+        # "enabled" exempts the common case from the check.
         auto_create = ((cc.get("spec") or {}).get("nodePoolAutoCreation") or {}).get("enabled")
-        if auto_create is False and node_pool_labels is not None and selector not in node_pool_labels:
-            return {"object": f"{workload['kind']}/{workload['metadata']['name']}", "excerpt": f"references ComputeClass {selector!r} with nodePoolAutoCreation disabled and no matching node pool label/taint"}
+        if auto_create is not True and node_pool_labels is not None and selector not in node_pool_labels:
+            return {"namespace": namespace, "object": obj, "excerpt": f"references ComputeClass {selector!r} with nodePoolAutoCreation disabled and no matching node pool label/taint"}
     if selector:
-        requests_gpu = any("nvidia.com/gpu" in ((c.get("resources") or {}).get("requests") or {}) for c in template_spec.get("containers") or [])
+        # `limits` as well as `requests`. The canonical GPU manifest -- Google's
+        # own documentation, and effectively every real workload -- sets
+        # `nvidia.com/gpu` under `limits` alone. Kubernetes defaults `requests`
+        # from `limits` on a Pod, but these are Deployment and StatefulSet pod
+        # *templates*, which are not defaulted, so a requests-only read makes
+        # this check inert rather than failing.
+        def _wants_gpu(container: dict) -> bool:
+            resources = container.get("resources") or {}
+            return any(
+                "nvidia.com/gpu" in (resources.get(field) or {})
+                for field in ("requests", "limits")
+            )
+
+        requests_gpu = any(_wants_gpu(c) for c in template_spec.get("containers") or [])
         tolerates_gpu = any(t.get("key") == "nvidia.com/gpu" for t in template_spec.get("tolerations") or [])
         if requests_gpu and not tolerates_gpu:
-            return {"object": f"{workload['kind']}/{workload['metadata']['name']}", "excerpt": f"GPU workload references ComputeClass {selector!r} without an nvidia.com/gpu toleration"}
+            return {"namespace": namespace, "object": obj, "excerpt": f"GPU workload references ComputeClass {selector!r} without an nvidia.com/gpu toleration"}
     return None
 
 
@@ -443,7 +490,11 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
 
 def check_reservation(reservation: dict) -> dict | None:
     specific = reservation.get("specificReservation") or {}
-    count, in_use = specific.get("count"), specific.get("inUseCount")
+    # `inUseCount` defaults to 0 rather than to "unknown": proto3 JSON omits a
+    # zero int64, so the reservation nothing is consuming -- the one §3.10(c)
+    # most wants -- is exactly the one that arrives without the field.
+    count = _gce_int(specific.get("count"))
+    in_use = _gce_int(specific.get("inUseCount"), 0)
     if count is None or in_use is None or count == 0:
         return None
     ratio = in_use / count
@@ -474,8 +525,21 @@ def check_reservation_affinity(cc: dict) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 
+# §3.7 is about node capacity -- "GPU/TPU/CPU limits" in its own words -- and a
+# region describe returns every Compute quota there is, 164 of them on
+# `us-east4`. Without this filter a project at 92% of `BACKEND_BUCKETS` or
+# `AFFINITY_GROUPS` publishes a `critical` stockout finding, and 95 of the 164
+# metrics have nothing to do with whether the autoscaler can get a node.
+_CAPACITY_QUOTA_RE = re.compile(r"(?:^|_)(?:CPUS|GPUS)(?:_ALL_REGIONS)?$|TPU")
+
+
 def check_quota(quota: dict) -> dict | None:
-    limit, usage = quota.get("limit"), quota.get("usage")
+    metric = str(quota.get("metric") or "")
+    if not _CAPACITY_QUOTA_RE.search(metric):
+        return None
+    limit, usage = quota.get("limit"), quota.get("usage", 0)
+    if not isinstance(limit, (int, float)) or not isinstance(usage, (int, float)):
+        return None
     if not limit:
         return None
     ratio = usage / limit
@@ -755,6 +819,32 @@ def _emit(slug: str, hit: dict) -> dict:
         "excerpt": hit["excerpt"],
         "impact": IMPACT[slug],
         "needs_triage": None,
+    }
+
+
+def crashed_entry(cluster: dict, exc: BaseException) -> dict:
+    """A `clusters[]` entry for a worker that raised something unmodelled.
+
+    `future.result()` re-raises, so one unhandled exception on one cluster
+    aborts `collect_fleet` — and the SOP invokes this collector as
+    `fleet_stockout.py … > manifest_stockout-prevention.json`, so by then the
+    shell has already truncated the file. The run loses the whole fleet to one
+    bad object instead of one cluster. `gate-failed` is the shape the document
+    already carries for "enumerated, could not be read".
+    """
+    print(
+        f"[fleet_stockout] {cluster.get('project', '?')}/{cluster.get('name', '?')}: "
+        f"collector raised {type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )
+    return {
+        "name": cluster.get("name", "?"),
+        "project": cluster.get("project", "?"),
+        "location": cluster.get("location", "?"),
+        "autopilot": bool(cluster.get("autopilot")),
+        "has_nap": bool(cluster.get("has_nap")),
+        "outcome": "gate-failed",
+        "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
     }
 
 
@@ -1101,7 +1191,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_cluster, c, run=run): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
-            cluster_entries[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                cluster_entries[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 — see crashed_entry
+                cluster_entries[index] = crashed_entry(clusters[index], exc)
 
     regions = {region_of(c["location"]) for c in clusters if c.get("location")}
     project_entry = collect_project(resolved_project, regions, run=run)

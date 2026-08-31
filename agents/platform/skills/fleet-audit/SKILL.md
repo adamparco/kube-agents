@@ -192,8 +192,16 @@ about is not covered by that guarantee.
 ### Step 3 — `finish`
 
 ```bash
-python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <findings_path>
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> \
+  --findings-file <findings_path> --manifest-file <manifest_path>
 ```
+
+**`--manifest-file` is not optional.** Without it nothing checks the document against what the
+collector actually ran, so a fabricated or truncated scope publishes unchallenged — and until it
+was refused, omitting it was silent. On a run where the collector produced no manifest at all,
+pass `--no-collector-manifest '<why>'` in its place: that publishes, but records the reason as a
+coverage gap and reports the run as partial. Your stream's SOP names the manifest path its
+collector writes.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
@@ -221,10 +229,10 @@ the directory you happen to be standing in, so "the manifest is missing" is a fi
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
-the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
+the message names and re-run; never delete the finding that tripped it. Four things reach exit 2:
 the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else
-broke.
+JSON, `--audit` is not one of the registered ids above, or neither `--manifest-file` nor
+`--no-collector-manifest` was given. Exit 1 is fatal and means something else broke.
 
 ### Partial coverage
 
@@ -545,14 +553,16 @@ run's ids, not this run's states.
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
 | `open`               | `open`                                | Reproduces; no pull request                | Nothing, unless it qualifies for auto-promotion              |
 | `pr-open`            | `fix proposed`                        | Reproduces; a fix is open on its branch    | **Labels re-asserted.** The pull request itself is untouched |
-| `pr-merged-persists` | `⚠ fix merged, still reproduces`      | Reproduces; the fix **merged anyway**      | Comments once on the merged PR; never reopens it             |
+| `pr-merged-persists` | `⚠ fix merged, still reproduces`     | Reproduces; the fix **merged anyway**      | Comments once on the merged PR; never reopens it             |
 | `refused`            | `fix refused`                         | Reproduces; a **human closed** the fix     | Nothing. The close stands until someone says `/remediate`    |
 | `withdrawn`          | `fix withdrawn, awaiting re-proposal` | Reproduces; the **harness closed** the fix | Treats it as having no pull request — it is promotable again |
 
 Every row above says "reproduces", and that is not an accident: **a finding that stopped reproducing
 is not in the document at all**, so it has no row in the ledger to carry a state. Two further states
 exist in the code — `resolved` and `resolved-merged` — but neither is ever rendered here. A
-resolution is announced in the delta comment, by id and title recovered from the previous body, and
+resolution is announced in the delta comment, by id and title recovered from the previous run's
+envelope in the on-pod report store — not from the ledger body, which a GitHub truncation can make
+unreadable — and
 the finding's open pull request is closed as stale. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 

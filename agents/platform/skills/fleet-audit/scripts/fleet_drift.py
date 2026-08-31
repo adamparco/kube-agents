@@ -39,13 +39,11 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable, NamedTuple
 
 MANIFEST_VERSION = 1
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
-INVENTORY_PATH = "/opt/data/INVENTORY.raw.md"
 COHORT_FLOOR = 3
 SEVERITY_LEVELS = ("critical", "major", "minor")
 ENV_SYNONYMS = {
@@ -82,13 +80,6 @@ def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
 
-def default_read_text(path: str) -> str | None:
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
 def run_and_gate(argv: list[str], *, run: RunFn) -> tuple[object | None, Run]:
     result = run(argv)
     if result.rc != 0 or not result.stdout.strip():
@@ -116,27 +107,47 @@ def _record(argv_str: str, result: Run) -> dict:
 # §1: fleet enumeration
 # --------------------------------------------------------------------------- #
 
-PROJECT_ID_RE = re.compile(r"\b([a-z][a-z0-9-]{4,28}[a-z0-9])\b")
+def discover_projects(base_project: str | None, *, run: RunFn) -> list[str]:
+    """§1.1's project scope, on the same terms as every sibling collector:
+    `--project` scopes the run, and without one this is the active project plus
+    every other project that answers `clusters list` with at least one cluster.
 
-
-def discover_projects(base_project: str | None, *, run: RunFn, read_text: Callable[[str], str | None] = default_read_text) -> list[str]:
-    """§1.1: the active project plus any project IDs already recorded in the
-    onboarding inventory file. That file supplies project IDs only, never
-    expected values -- parsed defensively since its format is prose, not a
-    contract this collector owns."""
-    projects: list[str] = []
+    This used to add project IDs scraped out of `/opt/data/INVENTORY.raw.md`
+    with `re.compile(r"\\b([a-z][a-z0-9-]{4,28}[a-z0-9])\\b")`, which matches
+    any lowercase English word of six to thirty characters. That file is
+    model-written prose with no project-ID marker in its contract, so
+    `cluster`, `namespace`, `production` and `monitoring` all became targets
+    and the run fanned out one `gcloud container clusters list
+    --project=namespace` per token. The scrape also ran unconditionally, after
+    the `--project` branch, so `--project` never actually scoped anything --
+    contradicting both this module's `--help` and
+    `fleet_consistency_drift_sop.md` §1.1. `patch_readiness.py` and
+    `fleet_waste.py` both discover against `gcloud projects list`, which
+    answers with project IDs rather than with English.
+    """
     if base_project:
-        projects.append(base_project)
-    else:
-        result = run(["gcloud", "config", "get-value", "project"])
-        if result.rc == 0 and result.stdout.strip():
-            projects.append(result.stdout.strip())
+        return [base_project]
 
-    text = read_text(INVENTORY_PATH)
-    if text:
-        for match in PROJECT_ID_RE.findall(text):
-            if match not in projects:
-                projects.append(match)
+    result = run(["gcloud", "config", "get-value", "project"])
+    base = result.stdout.strip() if result.rc == 0 else ""
+    projects = [base] if base else []
+
+    _, list_result = run_and_gate(["gcloud", "projects", "list", "--format", "value(projectId)"], run=run)
+    if list_result.rc != 0:
+        return projects  # discovery unavailable; the base project is the whole scope
+
+    for candidate in (p.strip() for p in (list_result.stdout or "").splitlines()):
+        if not candidate or candidate in projects:
+            continue
+        parsed, _ = run_and_gate(
+            ["gcloud", "container", "clusters", "list", "--project", candidate, "--format", "json"], run=run
+        )
+        # `[]` and `None` are different answers, and only the first means the
+        # project owes this audit nothing. A project this probe could not read
+        # stays in scope so the manifest records the loss, exactly as the two
+        # sibling collectors' copies of this guard explain.
+        if parsed is None or parsed:
+            projects.append(candidate)
     return projects
 
 
@@ -740,10 +751,10 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[di
     return enumerate_project_clusters(project, run=run)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_text: Callable[[str], str | None] = default_read_text, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    projects = discover_projects(project, run=run, read_text=read_text)
+    projects = discover_projects(project, run=run)
 
     all_clusters: list[dict] = []
     command_by_project: dict[str, dict] = {}
@@ -751,7 +762,18 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, read_
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_project, p, run=run, now=now): p for p in projects}
         for future in as_completed(futures):
-            clusters, record, error = future.result()
+            try:
+                clusters, record, error = future.result()
+            except Exception as exc:  # noqa: BLE001
+                # `future.result()` re-raises, so one unhandled exception on
+                # one project used to abort the whole run — and the SOP
+                # invokes this as `fleet_drift.py … > manifest_….json`, so by
+                # then the shell had truncated the file and the fleet was lost
+                # to one bad object. A failed project is a shape this loop
+                # already has: it lands in `failed_projects`, which §6 turns
+                # into a coverage gap the document must account for.
+                log(f"{futures[future]}: collector raised {type(exc).__name__}: {exc}")
+                clusters, record, error = [], None, f"collector raised {type(exc).__name__}: {exc}"[:300]
             all_clusters.extend(clusters)
             if record is not None:
                 command_by_project[futures[future]] = record

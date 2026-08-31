@@ -2,6 +2,7 @@
 """Tests for fleet_drift.py, the fleet-consistency-drift collector."""
 
 import copy
+import inspect
 import json
 import os
 import sys
@@ -52,22 +53,77 @@ def cluster(name, project="acme", location="us-central1", autopilot=False, statu
 
 
 class DiscoverProjectsTest(unittest.TestCase):
-    def test_uses_the_given_project(self):
-        self.assertEqual(fd.discover_projects("acme", run=lambda a: run_of(0), read_text=lambda p: None), ["acme"])
+    @staticmethod
+    def _discovery_run(projects_stdout, clusters_by_project=None):
+        """A `run` that answers the three argv shapes discovery issues."""
+        clusters_by_project = clusters_by_project or {}
+
+        def run(argv, **_):
+            if argv[:4] == ["gcloud", "config", "get-value", "project"]:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, projects_stdout)
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                project = argv[argv.index("--project") + 1]
+                return run_of(0, json.dumps(clusters_by_project.get(project, [])))
+            raise AssertionError(f"unexpected argv {argv}")
+
+        return run
+
+    def test_the_given_project_is_the_whole_scope(self):
+        """`--project` scopes the run. It used to be a *seed*: the inventory
+        scrape ran unconditionally after it, so a scoped run still fanned out
+        across everything the scrape produced."""
+        calls = []
+
+        def run(argv, **_):
+            calls.append(argv)
+            return run_of(0)
+
+        self.assertEqual(fd.discover_projects("acme", run=run), ["acme"])
+        self.assertEqual(calls, [])
 
     def test_falls_back_to_active_gcloud_project(self):
-        result = fd.discover_projects(None, run=lambda a: run_of(0, "acme\n"), read_text=lambda p: None)
+        result = fd.discover_projects(None, run=self._discovery_run(""))
         self.assertEqual(result, ["acme"])
 
-    def test_adds_inventory_project_ids(self):
-        text = "Discovered projects: acme-prod, acme-staging during onboarding."
-        result = fd.discover_projects("acme-prod", run=lambda a: run_of(0), read_text=lambda p: text)
-        self.assertIn("acme-staging", result)
-        self.assertEqual(result[0], "acme-prod")
+    def test_adds_other_projects_that_hold_clusters(self):
+        result = fd.discover_projects(
+            None,
+            run=self._discovery_run("acme\nacme-staging\nempty-proj\n", {"acme-staging": [{"name": "c1"}]}),
+        )
+        self.assertEqual(result, ["acme", "acme-staging"])
 
-    def test_missing_inventory_file_is_not_a_crash(self):
-        result = fd.discover_projects("acme", run=lambda a: run_of(0), read_text=lambda p: None)
-        self.assertEqual(result, ["acme"])
+    def test_keeps_a_project_whose_clusters_list_could_not_be_read(self):
+        """`[]` and `None` are different answers: an unreadable project stays
+        in scope so the manifest records the loss."""
+
+        def run(argv, **_):
+            if argv[:4] == ["gcloud", "config", "get-value", "project"]:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "acme\ndenied-proj\n")
+            return run_of(1, "", "PERMISSION_DENIED")
+
+        self.assertEqual(fd.discover_projects(None, run=run), ["acme", "denied-proj"])
+
+    def test_an_unlistable_fleet_falls_back_to_the_base_project(self):
+        def run(argv, **_):
+            if argv[:4] == ["gcloud", "config", "get-value", "project"]:
+                return run_of(0, "acme\n")
+            return run_of(1, "", "PERMISSION_DENIED")
+
+        self.assertEqual(fd.discover_projects(None, run=run), ["acme"])
+
+    def test_english_prose_is_no_longer_a_source_of_project_ids(self):
+        """The scrape read `/opt/data/INVENTORY.raw.md` -- model-written prose
+        with no project-ID marker in its contract -- with a regex matching any
+        lowercase word of six to thirty characters, so `cluster`, `namespace`,
+        `production` and `monitoring` each became a target the run issued a
+        `clusters list` against."""
+        self.assertFalse(hasattr(fd, "PROJECT_ID_RE"))
+        self.assertFalse(hasattr(fd, "INVENTORY_PATH"))
+        self.assertNotIn("read_text", inspect.signature(fd.discover_projects).parameters)
 
 
 class EnumerateProjectClustersTest(unittest.TestCase):
@@ -625,7 +681,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual(manifest["audit"], "fleet-consistency-drift")
         self.assertEqual(len(manifest["clusters"]), 4)
         self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
@@ -641,11 +697,42 @@ class CollectFleetTest(unittest.TestCase):
         def run(argv, **kwargs):
             return run_of(1, "", "denied")
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual([c["name"] for c in manifest["clusters"]], ["project/acme"])
         entry = manifest["clusters"][0]
         self.assertEqual(entry["outcome"], "gate-failed")
         self.assertIn("denied", entry["error"])
+
+    def test_one_project_crashing_costs_that_project_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects this collector's
+        stdout into the manifest — so an unmodelled exception on one project
+        used to leave a zero-byte file and lose the whole fleet. Only a failed
+        `clusters list` was modelled; a `TypeError` off an unexpected API shape
+        was not."""
+        clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)])
+        # Discovery probes each candidate with the same `clusters list` the
+        # worker later issues, so the crash has to be the second call rather
+        # than the first — otherwise the test never reaches the pool.
+        boom_calls = []
+
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
+                return run_of(0, "acme\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "acme\nboom\n")
+            if "list" in argv and "clusters" in argv:
+                if "boom" in argv:
+                    boom_calls.append(argv)
+                    if len(boom_calls) > 1:
+                        raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet(run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual({f"c{i}" for i in range(4)} - set(by_name), set())
+        self.assertEqual(by_name["project/boom"]["outcome"], "gate-failed")
+        self.assertIn("TypeError", by_name["project/boom"]["error"])
 
     def test_a_project_that_lists_cleanly_adds_no_project_entry(self):
         clusters_json = json.dumps([cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)])
@@ -655,7 +742,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual([c for c in manifest["clusters"] if c["name"].startswith("project/")], [])
 
     def test_every_cluster_publishes_the_mode(self):
@@ -670,7 +757,7 @@ class CollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps(clusters))
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual(
             {c["name"]: c["autopilot"] for c in manifest["clusters"]},
             {"a0": True, "a1": True, "s0": False, "s1": False},
@@ -684,7 +771,7 @@ class CollectFleetTest(unittest.TestCase):
         def run(argv, **kwargs):
             return run_of(1, "", "denied")
 
-        entry = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)["clusters"][0]
+        entry = fd.collect_fleet("acme", run=run, now=NOW)["clusters"][0]
         self.assertEqual(entry["name"], "project/acme")
         self.assertNotIn("autopilot", entry)
 
@@ -709,7 +796,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        return fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        return fd.collect_fleet("acme", run=run, now=NOW)
 
     def autopilot_cohort(self, n=4):
         return [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(n)]
@@ -846,7 +933,7 @@ class CohortLimitationsTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual(len(manifest["clusters"]), 4)
         for entry in manifest["clusters"]:
             self.assertEqual(entry["commands"], [])
@@ -862,7 +949,7 @@ class CohortLimitationsTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         for entry in manifest["clusters"]:
             self.assertNotIn("limitations", entry)
             self.assertTrue(entry["commands"])
@@ -907,7 +994,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         data = {
             "audit": "fleet-consistency-drift",
             "scope": {
@@ -931,7 +1018,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0, clusters_json)
             return run_of(0)
 
-        manifest = fd.collect_fleet("acme", run=run, read_text=lambda p: None, now=NOW)
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
         data = {
             "audit": "fleet-consistency-drift",
             "scope": {"clusters": [{"name": "c0", "checks_run": [{"check": "shielded-nodes", "command": "x"}]}]},

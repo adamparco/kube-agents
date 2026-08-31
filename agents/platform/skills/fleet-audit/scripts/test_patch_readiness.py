@@ -111,6 +111,40 @@ class MasterBehindTest(unittest.TestCase):
         c = cluster(channel="MYSTERY")
         self.assertIsNone(pr.check_master_behind(c, BASELINE))
 
+    def test_an_empty_valid_roster_flags_nobody_rather_than_everybody(self):
+        """`current not in valid` is true of every version against `[]`, so a
+        baseline that carried no `validVersions` used to report the entire
+        fleet `critical` — "absent from validVersions" on clusters running the
+        version the channel had just promoted. An empty roster is a field the
+        server config did not return, not a fleet where nothing is offered."""
+        for label, raw in (
+            ("channel", {"channels": [{"channel": "REGULAR", "defaultVersion": "1.30.5-gke.100", "validVersions": []}], "validMasterVersions": []}),
+            ("static", {"channels": [], "validMasterVersions": []}),
+        ):
+            with self.subTest(baseline=label):
+                baseline = pr.normalize_server_config(raw)
+                channel = "REGULAR" if label == "channel" else ""
+                self.assertIsNone(pr.check_master_behind(cluster(channel=channel), baseline))
+
+    def test_an_unspecified_channel_is_read_as_no_channel(self):
+        """GKE spells a static-version cluster two ways, and `UNSPECIFIED` is
+        truthy: it took the channel branch, missed in `channels`, and returned
+        `None`. That exempted the clusters that take no automatic patches at
+        all, while the manifest still recorded `master-behind` as run and
+        clean. `check_no_channel` already normalised it; this did not."""
+        baseline = pr.normalize_server_config(server_config(valid_versions=["1.30.5-gke.100"]))
+        c = cluster(channel="UNSPECIFIED", master="9.9.9-gke.1")
+        self.assertEqual(pr.check_master_behind(c, baseline)["severity"], "critical")
+        self.assertIsNotNone(pr.check_no_channel(c))
+
+    def test_a_reconciling_cluster_is_suppressed(self):
+        """§3's universal gate covers 3.1, 3.2 and 3.3; only 3.2 implemented
+        it, so a cluster halfway through the upgrade that fixes the drift was
+        reported as drifted."""
+        c = cluster(master="1.28.0-gke.1", status="RECONCILING")
+        self.assertIsNone(pr.check_master_behind(c, BASELINE))
+        self.assertEqual(pr.check_master_behind(cluster(master="1.28.0-gke.1"), BASELINE)["severity"], "critical")
+
 
 class PoolSkewTest(unittest.TestCase):
     def test_autopilot_is_never_flagged(self):
@@ -176,6 +210,15 @@ class FleetSpreadTest(unittest.TestCase):
 
     def test_a_single_cluster_is_never_a_spread(self):
         self.assertEqual(pr.check_fleet_spread([cluster()]), [])
+
+    def test_a_reconciling_cluster_does_not_widen_the_spread(self):
+        """§3's gate has to drop the cluster from the computation, not just
+        from the finding: a cluster mid-upgrade is the likeliest outlier, so
+        leaving it in reports a two-minor fleet that is one minor wide the
+        moment its upgrade lands, and attaches the finding to the cluster
+        already being fixed."""
+        clusters = [cluster(name="old", master="1.28.0-gke.1", status="RECONCILING"), cluster(name="new", master="1.30.0-gke.1")]
+        self.assertEqual(pr.check_fleet_spread(clusters), [])
 
 
 class NoChannelTest(unittest.TestCase):
@@ -260,6 +303,20 @@ class BlockingExclusionTest(unittest.TestCase):
         c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-01-20T00:00:00Z")
         hit = pr.check_blocking_exclusion(c, now=NOW, has_version_finding=True)
         self.assertEqual(hit["severity"], "major")
+
+    def test_a_freeze_thirty_days_and_change_long_counts_as_long(self):
+        """`(end - now).days` truncates, so 30 days 23 hours read as 30 and
+        fell under a `> 30` threshold. The SOP's rule is on the duration, not
+        on its whole-day floor."""
+        # NOW is 2026-01-15, so this ends 30 days and 23 hours out.
+        c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-02-14T23:00:00Z")
+        hit = pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["severity"], "minor")
+
+    def test_a_freeze_exactly_thirty_days_long_is_not_long(self):
+        c = self.exclusion_cluster("2026-01-01T00:00:00Z", "2026-02-14T00:00:00Z")
+        self.assertIsNone(pr.check_blocking_exclusion(c, now=NOW, has_version_finding=False))
 
     def test_an_expired_exclusion_is_not_flagged(self):
         c = self.exclusion_cluster("2025-01-01T00:00:00Z", "2025-06-01T00:00:00Z")
@@ -438,6 +495,7 @@ class CollectProjectTest(unittest.TestCase):
             "get-server-config": run_of(0, json.dumps(server_config())),
         }
         entries = pr.collect_project("acme", run=self.fake_run(responses), now=NOW)
+        pr.attach_fleet_spread(entries)
         old_entry = next(e for e in entries if e["name"] == "old")
         new_entry = next(e for e in entries if e["name"] == "new")
         self.assertIn("fleet-spread", {c["check"] for c in old_entry["candidates"]})
@@ -473,6 +531,22 @@ class CollectProjectTest(unittest.TestCase):
         roster = set(audit_report.audit_target_checks("security-patch-orchestrator", "a"))
         for entry in entries:
             self.assertEqual(roster - {c["check"] for c in entry["commands"]}, set())
+
+    def test_the_sop_spells_an_unreadable_project_the_way_the_manifest_does(self):
+        """The SOP told the worker to write `<project>/*` and the collector
+        writes `project/<project>`, so the cross-check refused every document
+        that followed the instruction: a run that hit one unreadable project
+        could not publish at all. Derive the spelling from the collector rather
+        than restating it, so moving the f-string moves this assertion too."""
+        sop = os.path.join(os.path.dirname(__file__), "..", "..", "..", "governance", "security_patch_orchestrator_sop.md")
+        if not os.path.exists(sop):  # not shipped alongside the skill at runtime
+            self.skipTest(f"{sop} not present")
+        with open(sop, encoding="utf-8") as handle:
+            body = handle.read()
+        entries = pr.collect_project("acme", run=self.fake_run({"clusters list": run_of(1, "", "denied")}), now=NOW)
+        template = entries[0]["name"].replace("acme", "<project>")
+        self.assertIn(f'"cluster": "{template}"', body)
+        self.assertNotIn("<project>/*", body)
 
 
 class CollectFleetTest(unittest.TestCase):
@@ -511,6 +585,96 @@ class CollectFleetTest(unittest.TestCase):
         self.assertIn("project/forbidden", by_name)
         self.assertEqual(by_name["project/forbidden"]["outcome"], "gate-failed")
         self.assertIn("PERMISSION_DENIED", by_name["project/forbidden"]["error"])
+
+    def test_one_project_crashing_costs_that_project_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects this collector's
+        stdout into the manifest — so an unmodelled exception on one project
+        used to leave a zero-byte file and lose the whole fleet. Only a failed
+        `clusters list` was modelled; a `TypeError` off an unexpected API shape
+        was not. Discovery probes each candidate with the same call the worker
+        later issues, so the crash has to be the second one."""
+        boom_calls = []
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return run_of(0, "base\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "base\nboom\n")
+            if "clusters" in argv and "list" in argv:
+                if "boom" in argv:
+                    boom_calls.append(argv)
+                    if len(boom_calls) > 1:
+                        raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, json.dumps([cluster()]))
+            if "get-server-config" in argv:
+                return run_of(0, json.dumps(server_config()))
+            raise AssertionError(f"unexpected call: {argv}")
+
+        manifest = pr.collect_fleet(run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["project/boom"]["outcome"], "gate-failed")
+        self.assertIn("TypeError", by_name["project/boom"]["error"])
+        self.assertIn("base", {c["project"] for c in manifest["clusters"]})
+
+    def test_the_spread_is_measured_across_projects_not_within_one(self):
+        """§3.3 is "across all audited clusters", and computing it inside the
+        per-project worker made it neither: a fleet whose two minors live in
+        two projects reported nothing, and a fleet spread across three
+        reported it three times with three different laggards."""
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "config", "get-value"]:
+                return run_of(0, "old-proj\n")
+            if argv[:3] == ["gcloud", "projects", "list"]:
+                return run_of(0, "old-proj\nnew-proj\n")
+            if "clusters" in argv and "list" in argv:
+                master = "1.28.0-gke.1" if "old-proj" in argv else "1.30.0-gke.1"
+                name = "old" if "old-proj" in argv else "new"
+                return run_of(0, json.dumps([cluster(name=name, master=master)]))
+            if "get-server-config" in argv:
+                return run_of(0, json.dumps(server_config(valid_versions=["1.28.0-gke.1", "1.30.0-gke.1"])))
+            raise AssertionError(f"unexpected call: {argv}")
+
+        manifest = pr.collect_fleet(run=run, now=NOW)
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertIn("fleet-spread", {c["check"] for c in by_name["old"]["candidates"]})
+        self.assertNotIn("fleet-spread", {c["check"] for c in by_name["new"]["candidates"]})
+        self.assertNotIn("_master_version", by_name["old"])
+        self.assertNotIn("_status", by_name["old"])
+
+    def test_a_cluster_section_one_skips_is_not_marked_collected(self):
+        """§1.5 orders a PROVISIONING/STOPPING/ERROR or alpha cluster into
+        `scope.skipped`, and the two scope lists may not overlap — but the
+        collector marked it `collected`, and `cross_check_manifest` rejects a
+        document that omits a `collected` cluster from `scope.clusters`. On a
+        fleet holding one such cluster the run could not publish whichever list
+        the model chose."""
+        clusters = [
+            cluster(name="fine"),
+            cluster(name="mid-flight", status="PROVISIONING"),
+            cluster(name="going", status="STOPPING"),
+            cluster(name="broken", status="ERROR"),
+            cluster(name="alpha", enableKubernetesAlpha=True),
+        ]
+        responses = {
+            "clusters list": run_of(0, json.dumps(clusters)),
+            "get-server-config": run_of(0, json.dumps(server_config())),
+        }
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            for needle, result in responses.items():
+                if needle in joined:
+                    return result
+            raise AssertionError(f"unstubbed command: {joined}")
+
+        by_name = {e["name"]: e for e in pr.collect_project("acme", run=run, now=NOW)}
+        self.assertEqual(by_name["fine"]["outcome"], "collected")
+        for name in ("mid-flight", "going", "broken", "alpha"):
+            with self.subTest(cluster=name):
+                self.assertEqual(by_name[name]["outcome"], "out-of-scope")
+                self.assertNotIn("candidates", by_name[name])
+                self.assertGreater(len(by_name[name]["error"]), 16)
 
     def test_a_project_with_no_clusters_is_left_out_rather_than_gate_failed(self):
         # The other half of the same distinction: an empty list is an answer,

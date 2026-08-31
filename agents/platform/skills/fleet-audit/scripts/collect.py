@@ -269,15 +269,25 @@ class GateFailure(Exception):
 
 
 def dump_state(
-    kubeconfig: Path, cluster: str, *, run: RunFn = default_run
+    kubeconfig: Path, cluster: str, *, project: str = "", location: str = "", run: RunFn = default_run
 ) -> tuple[Path, Run, bool]:
     """`obtainability-audit`'s one dump, behind `run_and_gate`. Kept as its
     own function (rather than inlined into its context builder) because its
     fixed dump-to-a-named-file shape predates the multi-collection builder
     contract and nothing else needs a file on disk — every check reads the
     parsed dict `run_and_gate` already returns.
+
+    Keyed the way `kubeconfig_path` is, on the whole `(project, cluster,
+    location)` triple. The design's thread-safety rule is that a worker writes
+    only to paths keyed by its own cluster, and it named this file as the
+    example of a name no two threads can collide on — but a cluster name is
+    unique within a project, not across the fleet, and this collector runs
+    eight projects at once. Two clusters called `prod` in two projects wrote
+    the same path, and the loser re-read the winner's dump: not a truncated
+    file or a crash, but one cluster's workloads published under the other's
+    name, with a manifest recording a clean rc=0 read.
     """
-    dump_path = Path(SCRATCH_DIR) / f"wra_state_{cluster}.json"
+    dump_path = Path(SCRATCH_DIR) / f"wra_state_{project}_{cluster}_{location}.json"
     parsed, result = run_and_gate(["kubectl", "get", DUMP_COMMAND_KINDS, "-A", "-o", "json"], kubeconfig, run=run)
     if parsed is not None:
         dump_path.parent.mkdir(parents=True, exist_ok=True)
@@ -976,6 +986,51 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
     return hits
 
 
+# Cilium writes the pod's namespace into the endpoint's label set under this
+# key, and Dataplane V2's ClusterNetworkPolicy selects on it. `k8s:` is the
+# source prefix Cilium adds to labels it learned from Kubernetes; a policy may
+# be written with or without it.
+_CILIUM_NAMESPACE_LABELS = ("k8s:io.kubernetes.pod.namespace", "io.kubernetes.pod.namespace")
+
+
+def _ccnp_coverage(policies: list[dict]) -> tuple[bool, set[str]]:
+    """Which namespaces the cluster-wide policies actually put behind ingress
+    enforcement: `(covers_every_namespace, the_named_ones)`.
+
+    This used to be `bool(policies)` — one ClusterNetworkPolicy anywhere in the
+    cluster suppressed §2.6 in every namespace. GKE installs Dataplane V2
+    policies of its own, and a single one selecting one workload's labels was
+    enough to make the whole cluster report no default-allow namespaces, which
+    is the same silence a cluster with real coverage produces.
+
+    Two independent questions, and a policy has to answer both to suppress a
+    namespace. *Which endpoints* — an empty `endpointSelector` matches every
+    endpoint in the cluster, and a selector naming the namespace label covers
+    that namespace; any other selector picks out particular pods and leaves the
+    namespace's posture unchanged. *Enforcing what* — Cilium isolates ingress
+    only for a policy that carries an `ingress` section, so an egress-only
+    cluster policy suppresses nothing here: §2.6 is about who can reach these
+    pods.
+    """
+    covers_all = False
+    covered: set[str] = set()
+    for policy in policies:
+        spec = policy.get("spec") or {}
+        specs = [spec] + [s for s in (policy.get("specs") or []) if isinstance(s, dict)]
+        for one in specs:
+            if not one.get("ingress") and not one.get("ingressDeny"):
+                continue
+            selector = one.get("endpointSelector")
+            if not selector:
+                covers_all = True
+                continue
+            labels = (selector.get("matchLabels") or {}) if isinstance(selector, dict) else {}
+            for key in _CILIUM_NAMESPACE_LABELS:
+                if labels.get(key):
+                    covered.add(labels[key])
+    return covers_all, covered
+
+
 def check_netpol_missing(context: dict) -> list[dict]:
     """§2.6's exposure test is `kubectl get pods -n <ns> | wc -l`, so it reads
     `pod_namespaces` — every namespace holding a live Pod — and not the audited
@@ -998,10 +1053,10 @@ def check_netpol_missing(context: dict) -> list[dict]:
         ns = (netpol.get("metadata") or {}).get("namespace", "")
         netpols_by_ns.setdefault(ns, []).append(netpol)
     pod_namespaces = context["pod_namespaces"]
-    # §2.6's Do-NOT-flag case: a namespace already covered fleet-wide by a
-    # Dataplane V2 ClusterNetworkPolicy is not a default-allow posture just
-    # because it has no *namespaced* NetworkPolicy of its own.
-    has_cluster_network_policy = bool(context.get("cluster_network_policies"))
+    # §2.6's Do-NOT-flag case: a namespace already covered by a Dataplane V2
+    # ClusterNetworkPolicy is not a default-allow posture just because it has
+    # no *namespaced* NetworkPolicy of its own.
+    ccnp_all, ccnp_covered = _ccnp_coverage(context.get("cluster_network_policies") or [])
 
     for ns_item in context.get("namespaces") or []:
         ns = (ns_item.get("metadata") or {}).get("name", "")
@@ -1011,7 +1066,7 @@ def check_netpol_missing(context: dict) -> list[dict]:
         if not policies:
             if ns not in pod_namespaces:
                 continue  # no pods, no exposure, pure churn
-            if has_cluster_network_policy:
+            if ccnp_all or ns in ccnp_covered:
                 continue
             hits.append(
                 {"namespace": ns, "object": f"Namespace/{ns}", "excerpt": "zero NetworkPolicies", "severity": "major"}
@@ -1748,7 +1803,9 @@ def _record(argv_str: str, result: Run) -> dict:
 
 
 def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
-    dump_path, dump_run, gate_ok = dump_state(kubeconfig, cluster["name"], run=run)
+    dump_path, dump_run, gate_ok = dump_state(
+        kubeconfig, cluster["name"], project=cluster["project"], location=cluster["location"], run=run
+    )
     if not gate_ok:
         raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:300]}")
     dump = json.loads(dump_path.read_text(encoding="utf-8"))
@@ -1993,10 +2050,28 @@ def collect_cluster(
     checks_not_applicable: list[dict] = []
     if audit_id == "compliance-audit" and cluster.get("autopilot"):
         applicable = {spec.slug for spec in checks}
+        # A check that found something plainly applied. Each reason below
+        # asserts the object cannot exist on Autopilot, so a candidate is that
+        # premise being wrong on this cluster -- a preview channel, a
+        # workload predating the conversion, an exemption Google granted --
+        # and the manifest must not say both. Declaring it inapplicable while
+        # carrying its candidate is the incoherence the `commands` filter
+        # already avoids, and it resolves the wrong way: the finding is real
+        # and the claim about the cluster's shape is not.
+        found = {c["check"] for c in candidates}
         for slug, reason in _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE:
-            if slug in applicable:
-                not_applicable_slugs.add(slug)
-                checks_not_applicable.append({"check": slug, "reason": reason})
+            if slug not in applicable:
+                continue
+            if slug in found:
+                print(
+                    f"[collect] {project}/{name}: {slug} is declared inapplicable on "
+                    f"Autopilot but produced candidates here; reporting it as a check "
+                    f"that ran",
+                    file=sys.stderr,
+                )
+                continue
+            not_applicable_slugs.add(slug)
+            checks_not_applicable.append({"check": slug, "reason": reason})
 
     result = {
         "name": name, "project": project, "location": location,
@@ -2008,6 +2083,33 @@ def collect_cluster(
     if checks_not_applicable:
         result["checks_not_applicable"] = checks_not_applicable
     return result
+
+
+def crashed_entry(cluster: dict, exc: BaseException) -> dict:
+    """A `clusters[]` entry for a worker that raised something unmodelled.
+
+    `future.result()` re-raises, so one unhandled exception on one cluster
+    aborts `collect_fleet` — and every SOP invokes this collector as
+    `collect.py … > manifest_<audit>.json`, so by then the shell has already
+    truncated the file. The run loses the whole fleet to one bad object
+    instead of one cluster, and the operator sees an empty manifest rather
+    than a reason. `gate-failed` is the shape the document already carries for
+    "enumerated, could not be read": the validator counts it as a scope loss
+    and the remaining clusters still publish.
+    """
+    print(
+        f"[collect] {cluster.get('project', '?')}/{cluster.get('name', '?')}: "
+        f"collector raised {type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )
+    return {
+        "name": cluster.get("name", "?"),
+        "project": cluster.get("project", "?"),
+        "location": cluster.get("location", "?"),
+        "autopilot": bool(cluster.get("autopilot")),
+        "outcome": "gate-failed",
+        "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
+    }
 
 
 def collect_fleet(
@@ -2031,7 +2133,11 @@ def collect_fleet(
             for index, cluster in enumerate(clusters)
         }
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 — see crashed_entry
+                results[index] = crashed_entry(clusters[index], exc)
 
     return {
         "version": MANIFEST_VERSION,
@@ -2042,12 +2148,51 @@ def collect_fleet(
     }
 
 
+def resolve_project(cli_project: str | None, *, run: RunFn = default_run) -> str:
+    """The project to enumerate, from the flag or from the pod's environment.
+
+    `--project` was `required=True`, and the three cron prompts that name this
+    script name it without one, so the literal command each prompt hands the
+    agent exited 2 on argparse before reaching a single check. Every sibling
+    collector -- `fleet_drift.py`, `fleet_stockout.py`, `fleet_waste.py`,
+    `patch_readiness.py`, `networking_audit.py` -- already treats the flag as
+    an override over a discovered default; this one was the outlier, and the
+    outlier is what the prompts were written against.
+
+    Same env chain `networking_audit.get_target_projects` uses, minus
+    `MONITORED_PROJECT_IDS`: `enumerate_clusters` takes one project, so a
+    multi-project variable has no single right answer here and is left to the
+    fleet-wide collectors that can sweep it.
+    """
+    if cli_project:
+        return cli_project
+    for env_var in ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID"):
+        value = os.environ.get(env_var, "").strip()
+        if value:
+            return value
+    result = run(["gcloud", "config", "get-value", "project"])
+    if result.rc == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    raise RuntimeError(
+        "no project to audit: pass --project, or set GCP_PROJECT_ID, "
+        "GKE_PROJECT_ID or PROJECT_ID, or configure a gcloud default project"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("audit", choices=sorted(CHECK_TABLES))
-    parser.add_argument("--project", required=True)
+    parser.add_argument(
+        "--project",
+        help="single project to audit; omit to use GCP_PROJECT_ID/GKE_PROJECT_ID/PROJECT_ID",
+    )
     args = parser.parse_args(argv)
-    manifest = collect_fleet(args.audit, args.project)
+    try:
+        project = resolve_project(args.project)
+    except RuntimeError as exc:
+        print(f"collect.py: {exc}", file=sys.stderr)
+        return 2
+    manifest = collect_fleet(args.audit, project)
     print(json.dumps(manifest, indent=2))
     return 0
 

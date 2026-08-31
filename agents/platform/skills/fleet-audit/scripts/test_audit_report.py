@@ -2322,6 +2322,72 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"collector {name} actually documents",
                 )
 
+    def test_every_cron_prompt_names_a_command_argparse_accepts(self):
+        """Naming the right script is not the same as naming a runnable command.
+
+        `test_cron_prompts_name_the_real_collector_invocation` above checks the
+        script token and stops there, so it passed the whole time
+        `collect.py`'s `--project` was `required=True` and all three prompts
+        that name that script named it bare: the literal command each prompt
+        hands the agent exited 2 on argparse, before a single check ran, on the
+        daily production path for three of eight streams. A test that reads the
+        prompt cannot see a missing flag; only the real parser can.
+
+        So run each prompt's own argv through the real script. `gcloud` is
+        stubbed to a failing no-op, so nothing reaches the network and no
+        collector gets past enumeration -- which is the point, because argparse
+        rejects before that and everything else fails after it. Exit 2 with
+        `usage:` on stderr is argparse and nothing else; the messy non-zero
+        exit that follows a stubbed `gcloud` is a pass.
+        """
+        jobs = self.cron_jobs()
+        profile = Path(__file__).resolve().parents[4] / "platform"
+        pattern = re.compile(r"`([^`]*scripts/[a-z_]+\.py[^`]*)`")
+
+        stub = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, stub, True)
+        gcloud = stub / "gcloud"
+        gcloud.write_text("#!/bin/sh\nexit 1\n")
+        gcloud.chmod(0o755)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{stub}{os.pathsep}{env.get('PATH', '')}"
+        # What the agent pod sets, and what the collectors resolve a project
+        # from when the prompt passes no `--project`. Without it the fallback
+        # itself would be what fails, and the test would prove nothing.
+        env["GCP_PROJECT_ID"] = "argparse-probe"
+
+        checked = 0
+        for audit_id in sorted(audit_report.AUDITS):
+            invocations = pattern.findall(jobs[audit_id]["prompt"])
+            self.assertTrue(
+                invocations,
+                f"the {audit_id} prompt names no collector command",
+            )
+            for invocation in invocations:
+                argv = invocation.split()
+                # The prompt may name an interpreter first; drop it and run the
+                # script under this suite's own Python. The shebang points at
+                # the image's venv, which does not exist here.
+                argv = argv[1:] if argv[0].endswith("python3") else argv
+                script = profile / argv[0]
+                with self.subTest(audit=audit_id, command=invocation):
+                    self.assertTrue(script.is_file(), f"{script} does not exist")
+                    done = subprocess.run(
+                        [sys.executable, str(script), *argv[1:]],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=120,
+                    )
+                    self.assertFalse(
+                        done.returncode == 2 and "usage:" in done.stderr,
+                        f"the {audit_id} prompt's command is rejected by its own "
+                        f"parser:\n  {invocation}\n{done.stderr.strip()[:400]}",
+                    )
+                    checked += 1
+        self.assertEqual(checked, len(audit_report.AUDITS))
+
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.
 
@@ -6257,6 +6323,38 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["issue_number"], 42)
         self.assertEqual(stored["current_ids"], seeded["current_ids"])
         self.assertEqual(stored["resolved_ids"], [])
+
+    def test_two_clean_runs_over_the_same_gap_still_hold_the_finding_back(self):
+        """The carry-forward above covered `current_ids` and not `document`.
+
+        `unverifiable_findings` reads the stored `document`, and it has no
+        `current_ids` fallback — so the first clean-over-gaps run, storing its
+        own empty document beside the carried-forward ids, left the second one
+        with nothing to hold back. It called every carried id resolved on a
+        cluster it had not read for two runs running, and the same list retires
+        their remediation pull requests.
+        """
+        seeded = self.seed_store(make_doc())
+        gapped = dict(
+            findings=[],
+            clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}],
+            skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}],
+        )
+
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(**gapped)), 0)
+        first = self.stored_envelope()
+        self.assertEqual(first["resolved_ids"], [])
+        self.assertEqual(
+            [f["id"] for f in first["document"]["findings"]], seeded["current_ids"]
+        )
+
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(**gapped)), 0)
+        second = self.stored_envelope()
+        self.assertEqual(second["resolved_ids"], [])
+        self.assertEqual(second["current_ids"], seeded["current_ids"])
+        self.assertFalse(self.harness.gh_calls("issue", "close"))
 
     def test_a_clean_run_over_gaps_with_no_memory_claims_no_ledger(self):
         """And when the previous set is itself unknowable there is nothing to
@@ -11834,10 +11932,23 @@ class TestDispatchAndHandover(unittest.TestCase):
         command comes back "cannot restart or stop the gateway". Every stream
         burnt its first turn on that message before recovering with `python3`.
         Naming an interpreter makes the file an argument, so nothing reads it.
+
+        `fleet-audit-reports/SKILL.md` is held to the same spelling even though
+        its own script is not blocked today: running the real guard in the pod
+        against `report_query.py` returns allowed, because its eleven
+        command-position path tokens all resolve to nothing and the guard only
+        fails closed on one that resolves to a real directory. That is a
+        property of the source, not of the skill -- a single
+        `sys.path.append("/opt/defaults/scripts")`, which is exactly how
+        `audit_report.py` acquired its two, would refuse every command the
+        skill teaches. The escape is not worth depending on.
         """
-        pattern = re.compile(r"(?m)^\s*\./skills/fleet-audit/scripts/\w+\.py |Run `\./skills/")
+        pattern = re.compile(
+            r"(?m)^\s*\./skills/fleet-audit(-reports)?/scripts/\w+\.py |Run `\./skills/"
+        )
         docs = [f"governance/{audit_report.audit_sop(a)}" for a in audit_report.AUDITS]
         docs.append("skills/fleet-audit/SKILL.md")
+        docs.append("skills/fleet-audit-reports/SKILL.md")
         for doc in docs:
             with self.subTest(doc=doc):
                 self.assertEqual([], pattern.findall(self.read(doc)))

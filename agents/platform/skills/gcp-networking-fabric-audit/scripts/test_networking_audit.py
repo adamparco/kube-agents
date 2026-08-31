@@ -91,8 +91,19 @@ class RouterNatTest(unittest.TestCase):
     def test_flags_missing_auto_allocated_ip(self):
         status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": []}]}}
         hit = na.check_router_nat(self.router(), status, [])
-        self.assertEqual(hit["object"], "Router/nat-router")
+        self.assertEqual(hit["object"], "Router/us-central1/nat-router")
         self.assertIn("no auto-allocated external IP", hit["excerpt"])
+
+    def test_two_same_named_routers_in_two_regions_are_two_objects(self):
+        """Both land in the one `project/<p>` target, so a bare name would give
+        them one finding identity and `finish` would refuse the document."""
+        status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": []}]}}
+        east = self.router(region="https://www.googleapis.com/compute/v1/projects/p/regions/us-east4")
+        objects = {
+            na.check_router_nat(self.router(), status, [])["object"],
+            na.check_router_nat(east, status, [])["object"],
+        }
+        self.assertEqual(objects, {"Router/us-central1/nat-router", "Router/us-east4/nat-router"})
 
     def test_does_not_flag_healthy_auto_allocation(self):
         status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["34.1.2.3"]}]}}
@@ -113,6 +124,23 @@ class RouterNatTest(unittest.TestCase):
         hit = na.check_router_nat(router, None, mapping)
         self.assertIn("64/64", hit["excerpt"])
 
+    def test_a_nat_on_the_default_port_ceiling_is_still_measured(self):
+        """`routers list` omits `minPortsPerVm` for a NAT that never overrode
+        it, and the old `if not ceiling: continue` then passed over exactly the
+        gateways running GCP's stock 64 ports per VM."""
+        router = self.router(nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "natIps": ["34.1.2.3"]}])
+        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 56}]}]  # 87.5% of 64
+        hit = na.check_router_nat(router, None, mapping)
+        self.assertIn("56/64", hit["excerpt"])
+
+    def test_a_dynamic_nat_on_the_default_ceiling_uses_the_dynamic_default(self):
+        router = self.router(
+            nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "natIps": ["34.1.2.3"]}]
+        )
+        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 60000}]}]  # 91.6% of 65536
+        hit = na.check_router_nat(router, None, mapping)
+        self.assertIn("60000/65536", hit["excerpt"])
+
     def test_no_mapping_data_is_not_a_crash(self):
         hit = na.check_router_nat(self.router(), {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["1.2.3.4"]}]}}, None)
         self.assertIsNone(hit)
@@ -123,7 +151,20 @@ class PscRoutingTest(unittest.TestCase):
         hits = na.check_psc_routing(
             [{"name": "psc-ep-1", "target": "projects/p/regions/us-central1/serviceAttachments/sa-1", "pscConnectionStatus": "REJECTED"}]
         )
-        self.assertEqual(hits, [{"object": "ForwardingRule/psc-ep-1", "excerpt": "pscConnectionStatus: REJECTED"}])
+        self.assertEqual(hits, [{"object": "ForwardingRule/global/psc-ep-1", "excerpt": "pscConnectionStatus: REJECTED"}])
+
+    def test_a_regional_rule_carries_its_region_in_the_object(self):
+        hits = na.check_psc_routing(
+            [
+                {
+                    "name": "psc-ep-1",
+                    "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4",
+                    "target": "projects/p/regions/us-east4/serviceAttachments/sa-1",
+                    "pscConnectionStatus": "CLOSED",
+                }
+            ]
+        )
+        self.assertEqual(hits[0]["object"], "ForwardingRule/us-east4/psc-ep-1")
 
     def test_does_not_flag_accepted(self):
         hits = na.check_psc_routing(
@@ -195,10 +236,25 @@ class CloudArmorTest(unittest.TestCase):
         backends = [{"name": "checkout-api", "securityPolicy": ".../securityPolicies/waf-1"}]
         self.assertEqual(na.check_cloud_armor(policies, backends), [])
 
-    def test_flags_conflicting_priorities_regardless_of_attachment(self):
+    def test_flags_conflicting_priorities_on_a_production_backend(self):
         policies = [{"name": "waf-2", "rules": [{"priority": 1000}, {"priority": 1000}]}]
-        hits = na.check_cloud_armor(policies, [])
+        backends = [{"name": "checkout-api", "securityPolicy": ".../securityPolicies/waf-2"}]
+        hits = na.check_cloud_armor(policies, backends)
         self.assertIn("conflicting rule priorities: [1000]", hits[0]["excerpt"])
+
+    def test_the_production_gate_governs_the_priority_limb_too(self):
+        """§2.5's Do-NOT-flag rule is written about the check, not about its
+        first condition. Gating only the preview branch reported a priority
+        collision on every policy in the project — including ones protecting a
+        `dev` backend and ones protecting nothing at all, where the effective
+        policy governs no traffic to be unpredictable about."""
+        policies = [{"name": "waf-2", "rules": [{"priority": 1000}, {"priority": 1000}]}]
+        for label, backends in (
+            ("unattached", []),
+            ("staging only", [{"name": "checkout-staging", "securityPolicy": ".../securityPolicies/waf-2"}]),
+        ):
+            with self.subTest(label):
+                self.assertEqual(na.check_cloud_armor(policies, backends), [])
 
     def test_unattached_policy_is_never_flagged_for_preview(self):
         policies = [{"name": "waf-3", "rules": [{"priority": 1000, "preview": True}]}]
@@ -243,6 +299,46 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual({c["check"] for c in project_entry["commands"]}, {
             "cloud-nat-exhaustion", "psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
         })
+
+    def test_every_read_behind_a_check_reaches_that_checks_command(self):
+        """Three checks take more than one read, and `commands[slug] = record`
+        published only the last: Cloud Armor's entry named `backend-services
+        list`, which carries no rule and reproduces no verdict, and the NAT
+        entry named whichever router was read last."""
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(0, "[]"),
+            "routers list": run_of(
+                0,
+                '[{"name": "r-east", "region": "https://x/projects/proj-1/regions/us-east4", '
+                '"nats": [{"name": "nat-gw", "minPortsPerVm": 64}]}]',
+            ),
+            "routers get-status": run_of(0, '{"result": {"natStatus": []}}'),
+            "routers get-nat-mapping-info": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        commands = {c["check"]: c["command"] for c in entries[-1]["commands"]}
+
+        nat = commands["cloud-nat-exhaustion"]
+        for fragment in ("routers list", "routers get-status r-east", "routers get-nat-mapping-info r-east"):
+            self.assertIn(fragment, nat)
+
+        armor = commands["cloud-armor-false-positive"]
+        self.assertIn("security-policies list", armor)
+        self.assertIn("backend-services list", armor)
+
+    def test_a_joined_command_stays_under_the_harness_ceiling(self):
+        """`finish` refuses the whole document over an oversized `command`, so
+        an unbounded join would trade a misleading field for no report at all."""
+        reads = [(f"gcloud compute routers get-nat-mapping-info router-{i} --region us-east4 --project proj-1 --format json", run_of(0, "[]")) for i in range(200)]
+        record = na._joined_record(reads)
+        self.assertLessEqual(len(record["command"]), na.MAX_COMMAND_CHARS)
+        self.assertTrue(record["command"].startswith("gcloud "))
+        self.assertIn("more read(s) of the same shape", record["command"])
 
     def test_subnets_list_usable_failure_surfaces_a_gate_failed_entry_and_the_project_target_survives(self):
         responses = {
@@ -807,6 +903,28 @@ class CollectFleetTest(unittest.TestCase):
 
         manifest = na.collect_fleet("proj-only", run=run)
         self.assertEqual({c["project"] for c in manifest["clusters"]}, {"proj-only"})
+
+    def test_one_project_crashing_costs_that_project_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects stdout into the
+        manifest — so an unmodelled exception on one project used to leave a
+        zero-byte file and lose the whole fleet. Only `GateFailure` was
+        modelled; a `TypeError` off an unexpected API shape was not."""
+        os.environ["MONITORED_PROJECT_IDS"] = "proj-good,proj-bad"
+        os.environ.pop("GCP_PROJECT_ID", None)
+        try:
+            def run(argv, **kwargs):
+                if "proj-bad" in argv:
+                    raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, "[]")
+
+            manifest = na.collect_fleet(run=run)
+            by_project = {c["project"]: c for c in manifest["clusters"]}
+            self.assertEqual(set(by_project), {"proj-good", "proj-bad"})
+            self.assertEqual(by_project["proj-good"]["outcome"], "collected")
+            self.assertEqual(by_project["proj-bad"]["outcome"], "gate-failed")
+            self.assertIn("TypeError", by_project["proj-bad"]["error"])
+        finally:
+            os.environ.pop("MONITORED_PROJECT_IDS", None)
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

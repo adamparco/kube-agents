@@ -34,8 +34,12 @@ An envelope carries `audit_id`, `finished_at`, `status`, `issue_number`, `issue_
 on a finding-heavy stream — times eight streams, times fourteen runs. Answering "how many criticals
 are open?" that way spends tens of thousands of tokens on an integer.
 
-`./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON object
-per call:
+`python3 ./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
+object per call. Naming the interpreter is load-bearing here for the reason
+[`fleet-audit/SKILL.md`](../fleet-audit/SKILL.md#step-1--start) gives: run by path, the gateway's
+lifecycle guard reads the script's own text and fails closed on any path-shaped token in it that
+names a real directory. This script happens to carry none today, so do not read a working bare-path
+invocation as licence to drop the `python3` — one `sys.path.append("/opt/…")` is all it would take.
 
 | Subcommand                          | Answers                                                   |
 | ----------------------------------- | --------------------------------------------------------- |
@@ -53,7 +57,10 @@ per call:
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run.
 - `--severity`, `--cluster` and `--check` on `findings`, and `--cluster` and `--check` on `checks`,
   are exact matches, case-insensitive.
-- `findings`, `checks` and `diff` cap at 100 rows and report `matched`, `returned` and `truncated`.
+- `findings`, `checks` and `diff` cap at 100 rows, raisable with `--limit`. `findings` and `checks`
+  report `matched`, `returned` and `truncated`; `diff` caps `added` and `resolved` independently
+  and reports `added_total`, `resolved_total`, `unchanged` and `truncated` instead — so a `diff`
+  whose `added` holds 100 rows may have had more, and `added_total` is the number to quote.
   Findings sort severity-first, so a cap only ever drops the least severe; `checks` keeps the
   document's order, so a capped answer lines up with the issue's table rather than a re-sort of it.
 - `--root` overrides the store root. In the pod, leave it alone.
@@ -63,8 +70,8 @@ per call:
 **"What did last night's compliance audit find?"**
 
 ```bash
-./skills/fleet-audit-reports/scripts/report_query.py show compliance-audit
-./skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
+python3 ./skills/fleet-audit-reports/scripts/report_query.py show compliance-audit
+python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
 ```
 
 `show` gives `status`, `findings`, `critical`, `partial`, the delta counts and `issue_url`; name the
@@ -74,21 +81,21 @@ is where a human acts.
 **"What changed since the last run?"**
 
 ```bash
-./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
+python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
 ```
 
 Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. For a wider
 span, list the ring first and name two stamps:
 
 ```bash
-./skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit
-./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit --from <stamp> --to <stamp>
+python3 ./skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit
+python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit --from <stamp> --to <stamp>
 ```
 
 **"Tell me about that finding."**
 
 ```bash
-./skills/fleet-audit-reports/scripts/report_query.py finding compliance-audit netpol-missing-payments
+python3 ./skills/fleet-audit-reports/scripts/report_query.py finding compliance-audit netpol-missing-payments
 ```
 
 The evidence command and excerpt, the impact, and all three `recommendation` fields. This is the
@@ -97,7 +104,7 @@ expensive call, so make it for the finding that was asked about and not for the 
 **"The issue says the commands were omitted for space — what were they?"**
 
 ```bash
-./skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
+python3 ./skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
 The ledger's evidence table is last in line for the body budget, so on a finding-heavy run it is

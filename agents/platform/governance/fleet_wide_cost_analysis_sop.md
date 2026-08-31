@@ -77,7 +77,7 @@ There is no report branch. Do not create branches, commit, push, or call `gh` yo
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-/opt/hermes/.venv/bin/python3 ./skills/fleet-audit/scripts/fleet_waste.py --project "$PROJECT" > /opt/data/scratch/manifest_fleet-wide-cost-analysis.json
+/opt/hermes/.venv/bin/python3 ./skills/fleet-audit/scripts/fleet_waste.py > /opt/data/scratch/manifest_fleet-wide-cost-analysis.json
 ```
 
 Run it under that interpreter, not a bare `python3`. `google-auth` is installed in the venv only, and this is the one collector that needs it — the overrequest check reads each workload's peak from Cloud Monitoring in process. Under `/usr/bin/python3` the import fails, and it fails quietly: the collector carries on, and every cluster comes back with an overrequest coverage gap reading "ADC credentials were unavailable at startup", which describes the interpreter rather than the credentials.

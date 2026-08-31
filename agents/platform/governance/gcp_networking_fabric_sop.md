@@ -41,6 +41,7 @@ gcloud compute networks subnets list --format=json
 This stream's targets are GCP compute resources, not GKE clusters, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for the field contracts it assumes of each `gcloud` command's JSON. It sweeps every project named by `MONITORED_PROJECT_IDS`/`GCP_PROJECT_ID` on its own; pass `--project <id>` only to scope a run to one project. Read the manifest before doing anything else:
 
 - Every entry in `manifest.clusters` is one target — a subnet (`<project>/<region>/<subnet>`, `subnet-ip-exhaustion` only) or a project (`project/<project>`, the other four checks) — carrying one `outcome`. `"collected"` means every check that applies to that target already ran; do not re-run it by hand. `"gate-failed"` means one of that target's `gcloud` reads failed; fall back to this section's commands for that target alone.
+- **A third target shape appears only on failure: `project/<project>/subnets`, always `"gate-failed"`.** It stands in for that project's whole subnet scope when the enumeration itself could not be read, so there are no per-subnet entries to carry the failure. Put it in `scope.skipped` with its `error` as the reason. Leaving it out reports the project as holding no subnets, which is the one reading the collector emits this entry to prevent — and its name is not a real subnet, so it does not belong in `scope.clusters`.
 - For a `"collected"` target, copy its `commands` list into that target's `checks_run` — minus any entry whose `check` that same target also lists in `checks_not_applicable`. A `commands` entry records that a command ran, not that the check reached a verdict on that target, so one read is routinely recorded against slugs it could not answer for; `finish` rejects a `checks_run` naming a slug the collector declared inapplicable there. Copy that target's `checks_not_applicable` and its `limitations` string verbatim too.
 - **On an auto-mode network this empties `checks_run` for most subnets, and that is the correct shape.** A subnet Network Analyzer did not measure owes only `subnet-ip-exhaustion` and has it declared not-applicable, so nothing survives the filter and `checks_run` is `[]` — which `finish` accepts because the collector wrote that target a `limitations` string saying why. Do not reinstate the command to avoid the empty list, and do not reword the `limitations`: leaving both as the collector wrote them is what keeps the run off `partial`.
 - Every entry in a `"collected"` target's `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed. What is still yours to write is the `recommendation` and, for a `kind: manifest` remediation, the manifest or Terraform file itself (§3).
@@ -62,7 +63,7 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 #### 2.2 Cloud NAT gateway port allocation saturation (`cloud-nat-exhaustion`)
 
 - **Command:** `gcloud compute routers get-nat-mapping-info $ROUTER --region=$REGION --project=$PROJECT --format=json`, corroborated by `routers list` (each NAT's `natIpAllocateOption`/`maxPortsPerVm`) and `routers get-status` (`result.natStatus[].autoAllocatedNatIps`).
-- **Flag when:** a NAT gateway is `AUTO_ONLY` with no auto-allocated external IP at all, or any VM's `interfaceNatMappings[].numTotalNatPorts` is `>= 80%` of that NAT's configured port ceiling (`maxPortsPerVm` when dynamic port allocation is on, `minPortsPerVm` otherwise).
+- **Flag when:** a NAT gateway is `AUTO_ONLY` with no auto-allocated external IP at all, or any VM's `interfaceNatMappings[].numTotalNatPorts` is `>= 80%` of that NAT's port ceiling (`maxPortsPerVm` when dynamic port allocation is on, `minPortsPerVm` otherwise). **A NAT that never overrode the field has no field:** `routers list` omits it, and the ceiling is then GCP's default — 65536 with dynamic allocation on, 64 without. Use the default rather than passing over the gateway, which reads as clearing it and skips exactly the NATs still on the stock 64 ports per VM.
 - **Do NOT flag:** a `MANUAL` NAT IP allocation that still has addresses assigned; a VM under 80% of its port ceiling.
 - **Severity:** `critical`.
 - **Impact:** "VMs that exhaust their NAT port allocation see new outbound connections silently fail, which for a GKE node means pods lose egress with no error at the workload layer."
@@ -90,7 +91,7 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 
 - **Command:** `gcloud compute security-policies list --project=$PROJECT --format=json`, cross-referenced against `gcloud compute backend-services list --project=$PROJECT --format=json` to find which policies protect a production-looking backend.
 - **Flag when:** a security policy attached to at least one production-looking backend service carries a rule in `preview` mode (excluding GCP's implicit default rule at priority `2147483647`), or the policy has two or more rules sharing one `priority`.
-- **Do NOT flag:** a policy attached only to backends whose name contains a non-production token (`test`, `staging`, `stage`, `dev`, `sandbox`, `qa`); the implicit default rule's own priority collision with itself.
+- **Do NOT flag:** a policy attached only to backends whose name contains a non-production token (`test`, `staging`, `stage`, `dev`, `sandbox`, `qa`); a policy attached to no backend service at all, which governs no traffic; the implicit default rule's own priority collision with itself. The production-backend condition governs both limbs above, the priority collision as much as the preview rule — an unenforced policy is a housekeeping note, not a finding this stream publishes.
 - **Severity:** `minor`.
 - **Impact:** "A preview-mode rule on a production backend logs matches without enforcing them, so the WAF looks like it is protecting traffic it is only observing; conflicting priorities make the effective policy unpredictable."
 - **Remediation:** `kind: manual`. Take the validated rule out of preview mode and resolve the conflicting priorities — which of two colliding rules should win is a policy-intent judgment this audit cannot make.
@@ -182,7 +183,7 @@ Every finding must conform to the full findings schema:
       "severity": "critical",
       "title": "Subnet gke-pods-subnet has < 10% secondary IP addresses remaining",
       "cluster": "proj-1/us-central1/gke-pods-subnet",
-      "namespace": "default",
+      "namespace": "",
       "object": "Subnet/gke-pods-subnet",
       "impact": "Pod scheduling will fail when secondary IP allocation is exhausted.",
       "evidence": {
@@ -227,5 +228,5 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networki
 - **Read-only audit.** Never delete VPC subnets, modify live firewall rules, or tear down NAT gateways directly.
 - **No hand-written issues or PRs.** `audit_report.py` owns the entire git/GitHub write path.
 - **Never print raw credentials.** Secret tokens, certificates, private keys, and authorization headers must never reach an excerpt.
-- **No unstable finding identity.** Name the durable resource identifier (`Subnet/<name>`, `Router/<name>`), never an ephemeral execution timestamp.
+- **No unstable finding identity.** Name the durable resource identifier (`Subnet/<name>`, `Router/<region>/<name>`, `ForwardingRule/<region|global>/<name>`), never an ephemeral execution timestamp. Regional resources carry their region because the four project-scoped checks all report against one target, `project/<project>`, where two same-named routers in two regions would otherwise be one finding identity and `finish` would refuse the document.
 - **Never emit a manifest that directly deletes a network or subnet.** Deletion remediations are `kind: manual` or `kind: gcloud` only.

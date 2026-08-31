@@ -17,7 +17,9 @@ produced here, deterministically.
 Two-command lifecycle, plus one on-demand command:
 
     audit_report.py start     --audit <audit-id>
-    audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
+    audit_report.py finish    --audit <audit-id> --findings-file <path>
+                          (--manifest-file <path> | --no-collector-manifest <why>)
+                          [--dry-run]
     audit_report.py remediate --audit <audit-id> --findings-file <path>
                           --finding <id> [--finding <id>...] [--dry-run]
 
@@ -3120,7 +3122,7 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
         )
         raise ValidationError(
             f"scope.clusters omits {', '.join(repr(n) for n, _ in unread)}, which the "
-            f"collect.py manifest for {audit_id} enumerated but could not read "
+            f"collect.py manifest for {audit_id} enumerated but did not audit "
             f"({detail}). A target the collector failed on is the one this document "
             "least gets to be quiet about: nothing else in the run mentions it, so "
             "leaving it out reports the fleet as covered without it. Put it in "
@@ -7701,12 +7703,22 @@ def handle_finish(args: argparse.Namespace) -> None:
         # claims no ledger fails the next run's trust check by design, which
         # is the outcome an unreadable body should have.
         body_untouched = bool(existing_issue) and bool(gaps)
+        # `document` carries forward for the same reason and on the same
+        # condition. It is documented as the document the ledger rendered, and
+        # an untouched body rendered the previous run's — so storing this run's
+        # empty one leaves the envelope contradicting its own `current_ids`.
+        # `unverifiable_findings` reads exactly this key and has no `current_ids`
+        # fallback, so the second consecutive clean-over-gaps run found no
+        # findings to hold back, called every carried-forward id resolved, and
+        # closed their remediation pull requests — the outcome the carry-forward
+        # above exists to prevent, reached one run later by the other key.
+        carried = (memory or {}).get("document") if body_untouched else None
         write_report(
             audit_id,
             report_envelope(
                 audit_id,
                 payload,
-                data,
+                carried if isinstance(carried, dict) else data,
                 now,
                 issue_number=(
                     None if body_untouched and not delta_known else existing_issue

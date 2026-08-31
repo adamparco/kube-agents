@@ -744,6 +744,23 @@ class TestDumpStateGate(unittest.TestCase):
         _, _, gate_ok = self.run_dump(json.dumps({"error": "no"}))
         self.assertFalse(gate_ok)
 
+    def test_two_same_named_clusters_in_two_projects_write_two_files(self):
+        """The design's thread-safety rule is that a worker writes only to
+        paths keyed by its own cluster, and named this file as the case no two
+        threads can collide on. A cluster name is unique within a project, not
+        across the eight this collector runs at once: two clusters called
+        `prod` wrote one path, and the loser re-read the winner's dump — one
+        cluster's workloads published under the other's name."""
+
+        def run(argv, **kwargs):
+            return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "SCRATCH_DIR", tmp):
+                a, _, _ = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-a", location="us-central1", run=run)
+                b, _, _ = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-b", location="us-central1", run=run)
+        self.assertNotEqual(a, b)
+
 
 class TestCollectCluster(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
@@ -950,6 +967,40 @@ class TestCollectFleet(unittest.TestCase):
         self.assertIn("STOPPING", stopping["error"])
         self.assertNotIn("commands", stopping)
 
+    def test_one_cluster_crashing_costs_that_cluster_and_no_other(self):
+        """`future.result()` re-raises, and every SOP redirects this
+        collector's stdout into the manifest — so an unmodelled exception on
+        one cluster used to leave a zero-byte file and lose the whole fleet.
+        Only `GateFailure` was modelled; a `TypeError` off an unexpected API
+        shape was not."""
+        clusters_json = json.dumps(
+            [
+                {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+                {"name": "boom", "location": "us-central1", "status": "RUNNING"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            if "list" in argv:
+                return Run(argv, 0, clusters_json, "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"]:
+                if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
+                    raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.05)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
+
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
+        self.assertEqual(outcomes, {"c1": "collected", "boom": "gate-failed"})
+        boom = next(c for c in manifest["clusters"] if c["name"] == "boom")
+        self.assertIn("TypeError", boom["error"])
+
     def test_an_unknown_audit_id_refuses_rather_than_collecting_nothing(self):
         with self.assertRaises(ValueError):
             collect.collect_fleet("no-such-stream", "acme")
@@ -1144,6 +1195,15 @@ def netpol(name, ns="default", pod_selector=None, ingress=None, policy_types=Non
 
 def namespace(name, labels=None):
     return {"kind": "Namespace", "metadata": {"name": name, "labels": labels or {}}}
+
+
+def ccnp(name, selector=None, ingress=None):
+    """A Dataplane V2 ClusterNetworkPolicy. Defaults to the shape that
+    suppresses §2.6 everywhere: every endpoint, ingress-isolating."""
+    spec = {"endpointSelector": selector if selector is not None else {}, "ingress": ingress if ingress is not None else []}
+    if not spec["ingress"]:
+        spec["ingress"] = [{"fromEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": "kube-system"}}]}]
+    return {"kind": "ClusterNetworkPolicy", "metadata": {"name": name}, "spec": spec}
 
 
 def default_sa(ns, automount=None):
@@ -1439,9 +1499,45 @@ class TestNetpolMissing(unittest.TestCase):
             namespaces=[namespace("payments")],
             networkpolicies=[],
             workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
-            cluster_network_policies=[{"kind": "ClusterNetworkPolicy", "metadata": {"name": "fleet-wide"}}],
+            cluster_network_policies=[ccnp("fleet-wide")],
         )
         self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_a_narrow_cluster_policy_does_not_suppress_every_namespace(self):
+        """The suppression was `bool(cluster_network_policies)`: one policy
+        anywhere silenced §2.6 across the whole cluster. GKE ships Dataplane V2
+        policies of its own, so a cluster could report no default-allow
+        namespaces on the strength of a policy selecting one workload's
+        labels."""
+        ctx = context_of(
+            namespaces=[namespace("payments"), namespace("shop")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}, {"kind": "Pod", "ns": "shop", "name": "web"}],
+            cluster_network_policies=[ccnp("just-shop", selector={"matchLabels": {"k8s:io.kubernetes.pod.namespace": "shop"}})],
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual([h["namespace"] for h in hits], ["payments"])
+
+    def test_a_cluster_policy_selecting_pod_labels_suppresses_nothing(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+            cluster_network_policies=[ccnp("by-app", selector={"matchLabels": {"app": "api"}})],
+        )
+        self.assertEqual(len(collect.check_netpol_missing(ctx)), 1)
+
+    def test_an_egress_only_cluster_policy_suppresses_nothing(self):
+        """§2.6 asks who can reach these pods. Cilium isolates ingress only for
+        a policy carrying an `ingress` section, so an egress-only cluster
+        policy leaves the namespace exactly as reachable as it was."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+            cluster_network_policies=[{"kind": "ClusterNetworkPolicy", "metadata": {"name": "egress"}, "spec": {"endpointSelector": {}, "egress": [{}]}}],
+        )
+        self.assertEqual(len(collect.check_netpol_missing(ctx)), 1)
 
     def test_no_cluster_network_policy_still_flags_zero_policy_namespaces(self):
         ctx = context_of(
@@ -1833,7 +1929,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(
             workload_items=[compliance_pod("api", ns="payments")],
             netpol_items=[namespace("payments")],
-            ccnp_run=Run(["x"], 0, json.dumps(dump_of({"kind": "ClusterNetworkPolicy", "metadata": {"name": "fleet-wide"}})), "", 0.1),
+            ccnp_run=Run(["x"], 0, json.dumps(dump_of(ccnp("fleet-wide"))), "", 0.1),
         )
         self.assertNotIn("netpol-missing", {c["check"] for c in result["candidates"]})
 
@@ -1867,6 +1963,24 @@ class TestComplianceCollectCluster(unittest.TestCase):
     def test_standard_cluster_carries_no_checks_not_applicable_key(self):
         result = self.run_with()
         self.assertNotIn("checks_not_applicable", result)
+
+    def test_a_check_that_found_something_is_not_also_declared_inapplicable(self):
+        """The filter reached `commands` and not `candidates`, so a privileged
+        pod on an Autopilot cluster produced a manifest saying both that the
+        check cannot apply here and that it fired — with no `commands` entry
+        behind the candidate. Each reason asserts the object cannot exist, so a
+        candidate falsifies the reason rather than the finding."""
+        privileged = compliance_pod("legacy", ns="payments")
+        privileged["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        result = self.run_with(workload_items=[privileged], cluster={**self.CLUSTER, "autopilot": True})
+        not_applicable = {e["check"] for e in result.get("checks_not_applicable") or []}
+        found = {c["check"] for c in result["candidates"]}
+        self.assertIn("privileged-container", found)
+        self.assertNotIn("privileged-container", not_applicable)
+        self.assertIn("privileged-container", {c["check"] for c in result["commands"]})
+        # The other three still are: they found nothing, so nothing falsifies
+        # the claim that they cannot apply here.
+        self.assertEqual(not_applicable, {"host-namespace", "hostpath-mount", "legacy-metadata"})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
         """The live regression: `node-pools list` 400s on Autopilot, and it was

@@ -429,12 +429,20 @@ every one of them is visible to a job author:
   Slack. A job that wants one voice names one target.
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
-  one. A job left on `all` therefore reports twice — once flat into the channel
-  and once through the Chat Agent — on either platform, now that
-  `home_target_env` restores the Google Chat channel too. So the whole Platform
-  Agent roster names `"chat"` rather than relying on the expansion, which is
-  also the only way to say "relay, and do not also post flat" at all: the token
-  is additive, so there is no value that subtracts a target from `all`.
+  one. A job left on `all` used to report twice — once flat into the channel and
+  once through the Chat Agent — on either platform, now that `home_target_env`
+  restores the Google Chat channel too. The relay leg now subtracts instead:
+  `adapter.sibling_delivery_targets` resolves the job's `deliver` in the cron
+  child, where alone `all` is known to have expanded, and sends the set as
+  `also_delivered_to`; `relay_specialist_report` skips those platforms, so a
+  channel gets the composed report or the raw one and never both. The
+  subtraction is deliberately one-sided — where it would empty the list it fans
+  out to every platform anyway, because `also_delivered_to` says what the
+  scheduler _intended_ to send and a channel that resolved can still fail on the
+  send. Two copies is a nuisance; none is a missed audit. So the whole Platform
+  Agent roster still names `"chat"`: the `deliver` token itself remains additive,
+  and `"chat"` is the only way to ask for one composed copy without depending on
+  a subtraction that is designed to give up rather than risk silence.
   No migration was needed to get there: `deliver` is
   an image-owned key on a named profile, so the entrypoint's existing cron merge
   rewrites it on every live volume at the next pod start (`agents/platform/cron/README.md`

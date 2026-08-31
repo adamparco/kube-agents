@@ -199,6 +199,22 @@ PLATFORM_GSA_ROLES = {
     "roles/mcp.toolUser",
 }
 
+# The tenth grant, and the one that cannot be a literal above: the IAM module
+# defines it as a project-scoped custom role, so its resource name carries the
+# project id and differs on every pool project. `local.read_only_roles` does
+# not list it -- the module creates and binds it alongside whatever
+# `project_roles` it was handed -- which is also why the regex in
+# `PlatformGsaRolesMatchTerraformTest` cannot see it and did not catch the
+# drift: it scans for `"roles/..."` string literals and this is a resource.
+# Left out, every correctly-provisioned project reported "holds 1 role(s)
+# beyond the read-only set" and failed verification.
+PLATFORM_GSA_CUSTOM_ROLE_ID = "kubeagentsSubnetUtilizationReader"
+
+
+def platform_gsa_roles(project_id: str) -> set:
+    """Every role the install grants the platform GSA on `project_id`."""
+    return PLATFORM_GSA_ROLES | {f"projects/{project_id}/roles/{PLATFORM_GSA_CUSTOM_ROLE_ID}"}
+
 
 class CheckResult:
     def __init__(
@@ -765,8 +781,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "will fail on the first gcloud call rather than at registration"
                 )
 
-            platform_missing = PLATFORM_GSA_ROLES - platform_held
-            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            expected_platform = platform_gsa_roles(project_id)
+            platform_missing = expected_platform - platform_held
+            platform_extra = platform_held - expected_platform
             if platform_missing:
                 passed = False
                 details.append(

@@ -1227,6 +1227,41 @@ class FleetConcurrencyTest(unittest.TestCase):
         self.assertEqual(len({c["name"] for c in manifest["clusters"]} & {f"c{i}" for i in range(cluster_count)}), cluster_count)
 
 
+class CrashIsolationTest(unittest.TestCase):
+    def test_one_cluster_crashing_costs_that_cluster_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects this collector's
+        stdout into the manifest — so an unmodelled exception on one cluster
+        used to leave a zero-byte file and lose the whole fleet."""
+        clusters_json = json.dumps(
+            [
+                {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+                {"name": "boom", "location": "us-central1", "status": "RUNNING"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
+                    raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"] if c["name"] in ("c1", "boom")}
+        self.assertEqual(outcomes, {"c1": "collected", "boom": "gate-failed"})
+        boom = next(c for c in manifest["clusters"] if c["name"] == "boom")
+        self.assertIn("TypeError", boom["error"])
+
+
 class GetTargetProjectsTest(unittest.TestCase):
     def test_project_override_skips_discovery(self):
         def run(argv, **kwargs):

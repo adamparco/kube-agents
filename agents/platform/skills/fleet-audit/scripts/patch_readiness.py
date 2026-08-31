@@ -55,7 +55,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, NamedTuple
 
 MANIFEST_VERSION = 1
@@ -188,14 +188,39 @@ def normalize_server_config(raw: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def _release_channel(cluster: dict) -> str:
+    """The cluster's channel, with `UNSPECIFIED` reported as no channel.
+
+    GKE spells "this cluster is on a static version" two ways: the
+    `releaseChannel` object absent, and `releaseChannel.channel:
+    "UNSPECIFIED"`. `check_no_channel` has always treated them alike; the
+    version checks did not, and truthiness let `UNSPECIFIED` into the
+    channel branch, where it missed in `baseline["channels"]` and returned
+    `None`. That exempted exactly the clusters that most need the check --
+    static-version ones, which take no automatic control-plane patches -- and
+    it did so silently, with `master-behind` still recorded in the manifest as
+    a check that ran and found nothing.
+    """
+    channel = (cluster.get("releaseChannel") or {}).get("channel") or ""
+    return "" if channel == "UNSPECIFIED" else channel
+
+
+def _upgrade_in_progress(cluster: dict) -> bool:
+    """§3's universal suppression gate, cluster half: a `RECONCILING` cluster
+    is mid-upgrade and its version drift is the upgrade, not a finding."""
+    return (cluster.get("status") or "") == "RECONCILING"
+
+
 def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
     if baseline is None:
+        return None
+    if _upgrade_in_progress(cluster):
         return None
     current = cluster.get("currentMasterVersion") or ""
     current_t = parse_version(current)
     if current_t is None:
         return None
-    channel = (cluster.get("releaseChannel") or {}).get("channel") or ""
+    channel = _release_channel(cluster)
     if channel:
         info = baseline["channels"].get(channel)
         if info is None:
@@ -204,6 +229,16 @@ def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
     else:
         valid, default = baseline["validMasterVersions"], None
 
+    # An empty roster is a baseline that did not carry the field, not a fleet
+    # where no version is offered. `current not in valid` is true of every
+    # cluster against `[]`, so the branch below would call the whole fleet
+    # critical -- "absent from validVersions" on clusters running the version
+    # the channel had just promoted. `get-server-config` returning a channel
+    # with no `validVersions` is the SOP's own "inspect the raw output before
+    # relying on a field" case (§2), and the honest answer to a baseline that
+    # says nothing is to say nothing.
+    if not valid:
+        return None
     if current not in valid:
         return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} absent from validVersions", "severity": "critical"}
     if not default:
@@ -219,7 +254,7 @@ def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
 
 
 def _pool_status_excludes(pool: dict, cluster: dict) -> bool:
-    return (pool.get("status") or "") in ("RECONCILING", "PROVISIONING") or (cluster.get("status") or "") == "RECONCILING"
+    return (pool.get("status") or "") in ("RECONCILING", "PROVISIONING") or _upgrade_in_progress(cluster)
 
 
 def check_pool_skew(cluster: dict) -> list[dict]:
@@ -261,8 +296,20 @@ def check_pool_skew(cluster: dict) -> list[dict]:
 
 
 def check_fleet_spread(clusters: list[dict]) -> list[dict]:
+    """§3.3, over the whole fleet. `clusters` is every cluster the run audited,
+    not one project's — the spread is a property of the fleet, and computing it
+    per project both misses a fleet whose two minors live in two projects and
+    emits one finding per project on a fleet where they do not.
+
+    §3's suppression gate applies here as it does to 3.1 and 3.2, and it has to
+    remove the cluster from the computation rather than only from the finding:
+    a cluster halfway through its upgrade is the one most likely to be the
+    outlier that makes the fleet look two minors wide.
+    """
     minors = {}
     for c in clusters:
+        if _upgrade_in_progress(c):
+            continue
         m = minor_of(c.get("currentMasterVersion") or "")
         if m is not None:
             minors.setdefault(m, []).append(c["name"])
@@ -281,8 +328,7 @@ def check_fleet_spread(clusters: list[dict]) -> list[dict]:
 
 
 def check_no_channel(cluster: dict) -> dict | None:
-    channel = (cluster.get("releaseChannel") or {}).get("channel") or ""
-    if channel and channel != "UNSPECIFIED":
+    if _release_channel(cluster):
         return None
     return {"object": f"Cluster/{cluster['name']}", "excerpt": "releaseChannel.channel is empty"}
 
@@ -357,7 +403,11 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
             continue
         if not (start <= now <= end):
             continue
-        long_freeze = (end - now).days > 30
+        # `.days` truncates, so a 30-day-23-hour freeze read as 30 and fell
+        # through: the SOP's threshold is "longer than 30 days", and comparing
+        # the timedelta itself is the only reading of that which does not lose
+        # the last day.
+        long_freeze = (end - now) > timedelta(days=30)
         if not (long_freeze or has_version_finding):
             continue
         severity = "major" if has_version_finding else "minor"
@@ -534,6 +584,89 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
     return slugs, candidates, not_applicable
 
 
+def crashed_entries(project: str, exc: BaseException) -> list[dict]:
+    """The `clusters[]` entries for a worker that raised something unmodelled.
+
+    `future.result()` re-raises, so one unhandled exception on one project
+    aborts `collect_fleet` — and the SOP invokes this collector as
+    `patch_readiness.py … > manifest_security-patch-orchestrator.json`, so by
+    then the shell has already truncated the file. The run loses every project
+    to one bad object instead of one. The shape is the one the gate-failed
+    branch above already uses, for the same reason it gives: a project missing
+    from the manifest reads as a project holding no clusters.
+    """
+    log(f"{project}: collector raised {type(exc).__name__}: {exc}")
+    return [
+        {
+            "name": f"project/{project}",
+            "project": project,
+            "location": "global",
+            "outcome": "gate-failed",
+            "error": f"collector raised {type(exc).__name__}: {exc}"[:300],
+        }
+    ]
+
+
+# §1.5's skip list, verbatim. A cluster in one of these states is not a
+# cluster this audit has an opinion about: mid-flight or broken means its
+# version data is meaningless, and an alpha cluster cannot be upgraded and
+# expires on its own. The SOP puts both in `scope.skipped`.
+_UNAUDITABLE_STATUSES = {
+    "PROVISIONING": "cluster status is PROVISIONING; version data is not yet meaningful",
+    "STOPPING": "cluster status is STOPPING; the object is mid-delete",
+    "ERROR": "cluster status is ERROR; the object is broken and its reported version is not trustworthy",
+}
+
+
+def out_of_scope_reason(cluster: dict) -> str | None:
+    """Why §1.5 puts this cluster in `scope.skipped`, or `None` to audit it.
+
+    The collector has to answer this, not the model. Marking such a cluster
+    `collected` makes `cross_check_manifest` demand it in `scope.clusters`
+    while §1.5 orders it into `scope.skipped` — and the two lists may not
+    overlap, so on a fleet holding one PROVISIONING or alpha cluster every
+    document was rejected whichever list the model chose. `RECONCILING` is
+    deliberately not here: §3's gate suppresses that cluster's *version*
+    findings and its policy checks still run, which is a different disposition
+    from not auditing it at all.
+    """
+    status = (cluster.get("status") or "").upper()
+    if status in _UNAUDITABLE_STATUSES:
+        return _UNAUDITABLE_STATUSES[status]
+    if cluster.get("enableKubernetesAlpha"):
+        return "enableKubernetesAlpha=true; alpha clusters cannot be upgraded and auto-expire by design"
+    return None
+
+
+def attach_fleet_spread(entries: list[dict]) -> None:
+    """Run §3.3 once over the whole fleet and attach its finding, in place.
+
+    Computing it inside `collect_project` made it per project, which §3.3 is
+    not: "across all audited clusters … emit exactly **one** finding". A fleet
+    running 1.28 in one project and 1.31 in another reported nothing, because
+    neither project spans two minors on its own; a fleet spread across three
+    projects reported it three times, each naming a different laggard, so the
+    run-over-run delta churned as clusters moved between them.
+    """
+    readable = [e for e in entries if e.get("outcome") == "collected"]
+    hits = check_fleet_spread(
+        [
+            {"name": e["name"], "currentMasterVersion": e.get("_master_version") or "", "status": e.get("_status") or ""}
+            for e in readable
+        ]
+    )
+    by_name: dict[str, dict] = {}
+    for entry in readable:
+        by_name.setdefault(entry["name"], entry)
+    for hit in hits:
+        target = by_name.get(hit["object"].split("/", 1)[1])
+        if target is not None:
+            target.setdefault("candidates", []).append(_emit("fleet-spread", hit))
+    for entry in entries:
+        entry.pop("_master_version", None)
+        entry.pop("_status", None)
+
+
 def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
@@ -571,11 +704,27 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         else:
             baselines[location] = (normalize_server_config(sc_parsed), _record(shlex.join(sc_argv), sc_result))
 
-    fleet_spread_hits = {hit["object"].split("/", 1)[1]: hit for hit in check_fleet_spread(parsed)}
-
     entries = []
     for c in parsed:
         location = c.get("location") or c.get("zone") or ""
+        skip_reason = out_of_scope_reason(c)
+        if skip_reason:
+            log(f"{project}/{c.get('name', '?')}: out of scope — {skip_reason}")
+            entries.append(
+                {
+                    "name": c.get("name", "?"),
+                    "project": project,
+                    "location": location,
+                    "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
+                    "outcome": "out-of-scope",
+                    # The key `cross_check_manifest` renders when it has to
+                    # explain why a target could not just be documented, and
+                    # the same one the two failure outcomes use. A reader of
+                    # the manifest needs the reason wherever it came from.
+                    "error": skip_reason,
+                }
+            )
+            continue
         baseline_pair = baselines.get(location)
         baseline = baseline_pair[0] if baseline_pair else None
         slugs, candidates, not_applicable = collect_one_cluster(c, baseline, now=now)
@@ -598,8 +747,6 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         # tight fleet indistinguishable from one nobody measured, and every
         # clean run reports a coverage gap it does not have.
         commands["fleet-spread"] = clusters_record
-        if c["name"] in fleet_spread_hits:
-            candidates.append(_emit("fleet-spread", fleet_spread_hits[c["name"]]))
         entry = {
             "name": c["name"],
             "project": project,
@@ -608,6 +755,12 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             "outcome": "collected",
             "commands": [{"check": slug, **record} for slug, record in commands.items()],
             "candidates": candidates,
+            # Consumed and removed by `attach_fleet_spread`, which needs every
+            # audited cluster's minor and cannot get it from one project's
+            # worker. Underscored so a leak shows up as an unknown manifest key
+            # rather than as plausible data.
+            "_master_version": c.get("currentMasterVersion") or "",
+            "_status": c.get("status") or "",
         }
         if not_applicable:
             entry["checks_not_applicable"] = not_applicable
@@ -624,14 +777,21 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_project, p, run=run, now=now): i for i, p in enumerate(projects)}
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 — see crashed_entries
+                results[index] = crashed_entries(projects[index], exc)
+
+    entries = [entry for group in results for entry in group]
+    attach_fleet_spread(entries)
 
     return {
         "version": MANIFEST_VERSION,
         "audit": "security-patch-orchestrator",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "clusters": [entry for group in results for entry in group],
+        "clusters": entries,
     }
 
 

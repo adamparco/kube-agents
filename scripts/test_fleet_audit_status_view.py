@@ -13,6 +13,7 @@ The subprocess boundary is stubbed everywhere; no test reaches a cluster.
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_audit_status_view as view  # noqa: E402
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
+#: A roster that parses and holds no fleet-audit job. Most tests here are about
+#: something other than the roster and want the ENABLED/SCHEDULE columns out of
+#: the way; they point at this rather than at a path that does not exist,
+#: because a roster that cannot be read is a finding in its own right — it
+#: disarms NEVER and STALE — and no longer a quiet way to ask for no roster.
+_ROSTER_DIR = TemporaryDirectory()
+NO_ROSTER = str(Path(_ROSTER_DIR.name) / "empty-jobs.json")
+
+
+def setUpModule():
+    Path(NO_ROSTER).write_text('{"jobs": []}', encoding="utf-8")
+
+
+def tearDownModule():
+    _ROSTER_DIR.cleanup()
 
 
 def latest(**overrides):
@@ -118,7 +135,7 @@ class FakeKubectl:
         self.calls = []
 
     def __call__(self, cmd, capture_output=False, text=False, input=None, timeout=None):
-        self.calls.append({"cmd": list(cmd), "input": input})
+        self.calls.append({"cmd": list(cmd), "input": input, "timeout": timeout})
         if "config" in cmd:
             answer = self.current if "current-context" in cmd else "\n".join(self.contexts)
             return CompletedProcess(cmd, 0, answer, "")
@@ -182,6 +199,29 @@ class TestNextFire(unittest.TestCase):
         self.assertIsNone(view.next_fire("*/5 * * * *", NOW))
         self.assertIsNone(view.next_fire("20 6 1 * *", NOW))
         self.assertIsNone(view.next_fire("garbage", NOW))
+
+    def test_an_out_of_range_field_abstains_rather_than_raising(self):
+        # These parse as ints and then blow up in `.replace()`. Uncaught, one
+        # mistyped roster entry took down all eight rows on its way through
+        # `render` — a worse outcome than the schedule column it belongs to.
+        for expr in ("99 3 * * *", "20 25 * * *", "-1 6 * * *"):
+            with self.subTest(expr=expr):
+                self.assertIsNone(view.next_fire(expr, NOW))
+
+    def test_one_bad_entry_does_not_take_down_the_table(self):
+        roster = {
+            "compliance-audit": {"enabled": True, "expr": "99 3 * * *"},
+            "ai-security-audit": {"enabled": True, "expr": "20 6 * * *"},
+        }
+        text = view.render(
+            projection({"compliance-audit": stream(last=latest())}),
+            roster,
+            NOW,
+            "/x/jobs.json",
+            "file",
+        )
+        self.assertIn("compliance-audit", text)
+        self.assertIn("ai-security-audit", text)
 
 
 class TestFlags(unittest.TestCase):
@@ -567,7 +607,9 @@ class TestContextDiscovery(unittest.TestCase):
 
         def __call__(self, cmd, **kwargs):
             if "--context" in cmd and cmd[cmd.index("--context") + 1] in self.hubs:
-                self.calls.append({"cmd": list(cmd), "input": None})
+                self.calls.append(
+                    {"cmd": list(cmd), "input": None, "timeout": kwargs.get("timeout")}
+                )
                 if "exec" in cmd:
                     return CompletedProcess(cmd, 0, self.exec_stdout, "")
                 return CompletedProcess(cmd, 0, "agent-0", "")
@@ -580,13 +622,13 @@ class TestContextDiscovery(unittest.TestCase):
 
     def test_the_failure_names_the_context_it_read(self):
         fake = FakeKubectl(pods=(), current="gke_p_z_managed")
-        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 2)
         self.assertIn("the context read was gke_p_z_managed", err)
 
     def test_the_one_context_holding_the_pod_is_used_and_named(self):
         fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
-        rc, out, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, out, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 0)
         # Read there, not merely suggested: the exec has to carry the context.
         self.assertEqual(fake.exec_call["cmd"][1:3], ["--context", "hub-b"])
@@ -597,26 +639,36 @@ class TestContextDiscovery(unittest.TestCase):
 
     def test_two_contexts_holding_a_pod_is_ambiguous_and_stops(self):
         fake = self.probing(("hub-a", "hub-b"), contexts=("hub-a", "hub-b"))
-        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 2)
         self.assertIn("--context hub-a", err)
         self.assertIn("--context hub-b", err)
 
     def test_an_explicit_context_is_never_second_guessed(self):
         fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
-        rc, _, err = run_main(["--roster", "/nonexistent", "--context", "hub-a"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER, "--context", "hub-a"], fake)
         self.assertEqual(rc, 2)
         self.assertNotIn("reading hub-b", err)
 
+    def test_one_other_context_is_not_reported_as_more_than_one(self):
+        # Reachable because an explicit `--context` is never second-guessed:
+        # that path raises before probing, so the hint does the probe itself
+        # and can come back with exactly one.
+        fake = self.probing(("hub-b",), contexts=("hub-a", "hub-b"))
+        rc, _, err = run_main(["--roster", NO_ROSTER, "--context", "hub-a"], fake)
+        self.assertEqual(rc, 2)
+        self.assertIn("--context hub-b", err)
+        self.assertNotIn("more than one context", err)
+
     def test_no_context_anywhere_says_so_rather_than_offering_nothing(self):
         fake = FakeKubectl(pods=(), contexts=("hub-a",), current="managed")
-        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 2)
         self.assertIn("no context in the kubeconfig has one", err)
 
     def test_an_explicit_context_reaches_both_kubectl_calls(self):
         fake = FakeKubectl()
-        run_main(["--roster", "/nonexistent", "--context", "hub"], fake)
+        run_main(["--roster", NO_ROSTER, "--context", "hub"], fake)
         for cmd in (fake.calls[0]["cmd"], fake.exec_call["cmd"]):
             self.assertEqual(cmd[1:3], ["--context", "hub"])
 
@@ -625,7 +677,7 @@ class TestContextDiscovery(unittest.TestCase):
             path = Path(tmp) / "p.json"
             path.write_text(json.dumps(projection()), encoding="utf-8")
             fake = FakeKubectl(pods=())
-            rc, _, _ = run_main(["--roster", "/nonexistent", "--file", str(path)], fake)
+            rc, _, _ = run_main(["--roster", NO_ROSTER, "--file", str(path)], fake)
         self.assertEqual(rc, 0)
         self.assertEqual(fake.calls, [])
 
@@ -633,7 +685,7 @@ class TestContextDiscovery(unittest.TestCase):
 class TestProjectionRead(unittest.TestCase):
     def test_the_script_is_streamed_in_on_stdin(self):
         fake = FakeKubectl()
-        rc, _, _ = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, _ = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 0)
         call = fake.exec_call
         self.assertEqual(call["cmd"][-3:], ["--", "python3", "-"])
@@ -642,26 +694,26 @@ class TestProjectionRead(unittest.TestCase):
 
     def test_the_container_defaults_to_the_agent_not_the_sidecar(self):
         fake = FakeKubectl()
-        run_main(["--roster", "/nonexistent"], fake)
+        run_main(["--roster", NO_ROSTER], fake)
         cmd = fake.exec_call["cmd"]
         self.assertEqual(cmd[cmd.index("-c") + 1], "platform-agent")
 
     def test_an_explicit_container_overrides_it(self):
         fake = FakeKubectl()
-        run_main(["--roster", "/nonexistent", "--container", "other"], fake)
+        run_main(["--roster", NO_ROSTER, "--container", "other"], fake)
         cmd = fake.exec_call["cmd"]
         self.assertEqual(cmd[cmd.index("-c") + 1], "other")
 
     def test_discovery_filters_by_label_and_running_phase(self):
         fake = FakeKubectl()
-        run_main(["--roster", "/nonexistent"], fake)
+        run_main(["--roster", NO_ROSTER], fake)
         get = fake.calls[0]["cmd"]
         self.assertIn("app.kubernetes.io/name=platform-agent", get)
         self.assertIn("status.phase=Running", get)
 
     def test_several_running_pods_pick_one_and_say_which(self):
         fake = FakeKubectl(pods=("agent-b", "agent-a"))
-        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 0)
         self.assertIn("2 Running agent pods", err)
         self.assertIn("agent-a", err)
@@ -670,46 +722,139 @@ class TestProjectionRead(unittest.TestCase):
 
     def test_an_explicit_pod_skips_discovery(self):
         fake = FakeKubectl()
-        run_main(["--roster", "/nonexistent", "--pod", "agent-9"], fake)
+        run_main(["--roster", NO_ROSTER, "--pod", "agent-9"], fake)
         self.assertEqual(fake.cmds("pods"), [])
         self.assertIn("agent-9", fake.exec_call["cmd"])
+
+
+class TestWatch(unittest.TestCase):
+    """`--watch` is the mode somebody leaves open on a second monitor, so the
+    first hiccup — a rolled agent pod, an API server restart, a slept laptop —
+    must draw itself into the frame rather than end the session."""
+
+    def watch_once(self, fake):
+        """One `--watch` frame: the second `time.sleep` ends the loop the way
+        ctrl-c does, so `main` returns after drawing exactly one."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(view.subprocess, "run", fake), \
+                mock.patch.object(view.time, "sleep", side_effect=KeyboardInterrupt):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = view.main(["--roster", NO_ROSTER, "--watch", "5"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_failed_frame_is_drawn_rather_than_ending_the_watch(self):
+        fake = FakeKubectl(exec_rc=1, exec_stderr="Error from server: pod is terminating")
+        rc, out, _ = self.watch_once(fake)
+        # Reached the sleep at all, which is what says the loop survived.
+        self.assertEqual(rc, 2)
+        self.assertIn("found but exec failed", out)
+        self.assertIn("refreshing every 5s", out)
+
+    def test_a_healthy_frame_still_renders(self):
+        doc = projection({"compliance-audit": stream(last=latest())})
+        rc, out, _ = self.watch_once(FakeKubectl(exec_stdout=json.dumps(doc)))
+        self.assertEqual(rc, 0)
+        self.assertIn("compliance-audit", out)
+        self.assertIn("refreshing every 5s", out)
+
+    def test_without_watch_the_same_failure_is_stderr_and_exit_2(self):
+        fake = FakeKubectl(exec_rc=1, exec_stderr="Error from server: pod is terminating")
+        rc, out, err = run_main(["--roster", NO_ROSTER], fake)
+        self.assertEqual(rc, 2)
+        self.assertIn("found but exec failed", err)
+        self.assertEqual(out, "")
+
+
+class TestSubprocessFailures(unittest.TestCase):
+    """The two reads that are not probes both used to run untimed and uncaught:
+    a hung API server hung the view forever, and a kubectl that is not installed
+    reached the operator as a traceback."""
+
+    def test_both_reads_carry_a_timeout(self):
+        fake = FakeKubectl()
+        run_main(["--roster", NO_ROSTER], fake)
+        get, exec_call = fake.calls[0], fake.exec_call
+        self.assertEqual(get["timeout"], view.DISCOVER_TIMEOUT)
+        self.assertEqual(exec_call["timeout"], view.EXEC_TIMEOUT)
+
+    def test_a_hung_pod_lookup_is_exit_2_and_says_it_timed_out(self):
+        def hang(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+        rc, _, err = run_main(["--roster", NO_ROSTER], hang)
+        self.assertEqual(rc, 2)
+        self.assertIn("timed out", err)
+        self.assertIn("agent pod lookup", err)
+
+    def test_a_hung_exec_is_exit_2_and_names_the_projection(self):
+        class Hangs(FakeKubectl):
+            def __call__(self, cmd, **kwargs):
+                if "exec" in cmd:
+                    raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+                return super().__call__(cmd, **kwargs)
+
+        rc, _, err = run_main(["--roster", NO_ROSTER], Hangs())
+        self.assertEqual(rc, 2)
+        self.assertIn("the projection in", err)
+        self.assertIn("timed out after %ds" % view.EXEC_TIMEOUT, err)
+
+    def test_no_kubectl_on_the_path_is_a_sentence_not_a_traceback(self):
+        def missing(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "kubectl")
+
+        rc, _, err = run_main(["--roster", NO_ROSTER], missing)
+        self.assertEqual(rc, 2)
+        self.assertIn("could not run kubectl", err)
+
+    def test_a_timeout_does_not_send_the_view_probing_other_contexts(self):
+        # "I could not ask" is not "nothing is here": the twelve-context sweep
+        # is for the second, and running it after a timeout turns one stalled
+        # read into twelve.
+        calls = []
+
+        def hang(cmd, **kwargs):
+            calls.append(list(cmd))
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+        run_main(["--roster", NO_ROSTER], hang)
+        self.assertEqual([c for c in calls if "config" in c], [])
 
 
 class TestExitCodes(unittest.TestCase):
     def test_no_pod_is_exit_2_and_names_the_namespace(self):
         rc, _, err = run_main(
-            ["--roster", "/nonexistent", "-n", "nope"], FakeKubectl(pods=())
+            ["--roster", NO_ROSTER, "-n", "nope"], FakeKubectl(pods=())
         )
         self.assertEqual(rc, 2)
         self.assertIn("no agent pod found in namespace nope", err)
 
     def test_a_failed_exec_is_exit_2_and_carries_kubectls_stderr(self):
         fake = FakeKubectl(exec_rc=1, exec_stderr="Error from server (Forbidden): denied")
-        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 2)
         self.assertIn("found but exec failed", err)
         self.assertIn("Forbidden", err)
 
     def test_output_that_is_not_json_is_exit_2(self):
         fake = FakeKubectl(exec_stdout="python3: command not found")
-        rc, _, err = run_main(["--roster", "/nonexistent"], fake)
+        rc, _, err = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 2)
         self.assertIn("not JSON", err)
 
     def test_a_missing_store_is_exit_1(self):
         fake = FakeKubectl(exec_stdout=json.dumps(projection(root_exists=False)))
-        rc, out, _ = run_main(["--roster", "/nonexistent"], fake)
+        rc, out, _ = run_main(["--roster", NO_ROSTER], fake)
         self.assertEqual(rc, 1)
         self.assertIn("store directory absent on the pod", out)
 
     def test_an_unreadable_stream_is_exit_1(self):
         doc = projection({"compliance-audit": stream(liveness="error", error="boom")})
-        rc, _, _ = run_main(["--roster", "/nonexistent"], FakeKubectl(exec_stdout=json.dumps(doc)))
+        rc, _, _ = run_main(["--roster", NO_ROSTER], FakeKubectl(exec_stdout=json.dumps(doc)))
         self.assertEqual(rc, 1)
 
     def test_a_readable_store_is_exit_0(self):
         doc = projection({"compliance-audit": stream(last=latest())})
-        rc, _, _ = run_main(["--roster", "/nonexistent"], FakeKubectl(exec_stdout=json.dumps(doc)))
+        rc, _, _ = run_main(["--roster", NO_ROSTER], FakeKubectl(exec_stdout=json.dumps(doc)))
         self.assertEqual(rc, 0)
 
 
@@ -721,14 +866,14 @@ class TestOfflineRoundTrip(unittest.TestCase):
 
     def test_json_output_is_what_file_consumes(self):
         fake = FakeKubectl(exec_stdout=json.dumps(self.doc))
-        rc, emitted, _ = run_main(["--roster", "/nonexistent", "--json"], fake)
+        rc, emitted, _ = run_main(["--roster", NO_ROSTER, "--json"], fake)
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(emitted), self.doc)
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "projection.json"
             path.write_text(emitted, encoding="utf-8")
             rc_file, rendered, _ = run_main(
-                ["--roster", "/nonexistent", "--file", str(path)], FakeKubectl(pods=())
+                ["--roster", NO_ROSTER, "--file", str(path)], FakeKubectl(pods=())
             )
         self.assertEqual(rc_file, 0)
         self.assertIn("compliance-audit", rendered)
@@ -740,7 +885,7 @@ class TestOfflineRoundTrip(unittest.TestCase):
             path = Path(tmp) / "projection.json"
             path.write_text(json.dumps(self.doc), encoding="utf-8")
             fake = FakeKubectl(pods=())
-            rc, out, _ = run_main(["--roster", "/nonexistent", "--file", str(path)], fake)
+            rc, out, _ = run_main(["--roster", NO_ROSTER, "--file", str(path)], fake)
         self.assertEqual(rc, 0)
         self.assertEqual(fake.calls, [])
         self.assertIn("compliance-audit", out)
@@ -751,13 +896,13 @@ class TestOfflineRoundTrip(unittest.TestCase):
         with mock.patch.object(view.subprocess, "run", fake), \
                 mock.patch.object(view.sys, "stdin", io.StringIO(json.dumps(self.doc))):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = view.main(["--roster", "/nonexistent", "--file", "-"])
+                rc = view.main(["--roster", NO_ROSTER, "--file", "-"])
         self.assertEqual(rc, 0)
         self.assertIn("compliance-audit", out.getvalue())
 
     def test_an_unreadable_file_is_exit_2(self):
         rc, _, err = run_main(
-            ["--roster", "/nonexistent", "--file", "/nonexistent/projection.json"]
+            ["--roster", NO_ROSTER, "--file", "/nonexistent/projection.json"]
         )
         self.assertEqual(rc, 2)
         self.assertIn("could not read", err)
@@ -765,14 +910,89 @@ class TestOfflineRoundTrip(unittest.TestCase):
 
 class TestRosterLoading(unittest.TestCase):
     def test_the_checked_in_roster_yields_the_eight_streams(self):
-        roster = view.load_roster(view.DEFAULT_ROSTER)
+        roster, error = view.load_roster(view.DEFAULT_ROSTER)
+        self.assertEqual(error, "")
         self.assertGreaterEqual(len(roster), 8)
         self.assertIn("compliance-audit", roster)
         for job in roster.values():
             self.assertIn("expr", job)
 
-    def test_a_missing_roster_degrades_to_empty(self):
-        self.assertEqual(view.load_roster(Path("/nonexistent")), {})
+    def test_a_roster_with_no_fleet_audit_job_is_empty_and_not_an_error(self):
+        roster, error = view.load_roster(Path(NO_ROSTER))
+        self.assertEqual((roster, error), ({}, ""))
+
+    def test_a_missing_roster_reports_why(self):
+        roster, error = view.load_roster(Path("/nonexistent"))
+        self.assertEqual(roster, {})
+        self.assertIn("/nonexistent", error)
+
+    def test_a_malformed_roster_reports_why(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.json"
+            path.write_text("{not json", encoding="utf-8")
+            roster, error = view.load_roster(path)
+        self.assertEqual(roster, {})
+        self.assertTrue(error)
+
+
+class TestUnreadableRoster(unittest.TestCase):
+    """An unreadable roster disarms NEVER and STALE, so the empty flag list it
+    produces must never be rendered as "all clear" — the same lie the retired
+    ConfigMap told for thirty hours, told about the other half of the inputs."""
+
+    def run_with_missing_roster(self):
+        doc = projection({"compliance-audit": stream(liveness="never")})
+        return run_main(
+            ["--roster", "/nonexistent/jobs.json"],
+            FakeKubectl(exec_stdout=json.dumps(doc)),
+        )
+
+    def test_it_is_exit_1_not_exit_0(self):
+        rc, _, _ = self.run_with_missing_roster()
+        self.assertEqual(rc, 1)
+
+    def test_the_lead_says_the_flags_were_not_checked(self):
+        _, out, _ = self.run_with_missing_roster()
+        self.assertNotIn("all clear", out)
+        self.assertIn("NEVER and STALE not checked", out)
+
+    def test_the_caveat_survives_a_stream_that_needs_attention(self):
+        # The case the first cut missed: a partial run elsewhere fills the
+        # attention count, and the caveat would then have been dropped — so the
+        # header would read "1 need attention" over a fleet where nothing had
+        # looked for a silent stream at all.
+        doc = projection(
+            {"compliance-audit": stream(last=latest(partial=True, coverage_gaps=["x: y"]))}
+        )
+        rc, out, _ = run_main(
+            ["--roster", "/nonexistent/jobs.json"],
+            FakeKubectl(exec_stdout=json.dumps(doc)),
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("need attention", out)
+        self.assertIn("NEVER and STALE not checked", out)
+
+    def test_the_roster_field_names_the_reason(self):
+        _, out, _ = self.run_with_missing_roster()
+        self.assertIn("unreadable", out)
+        self.assertIn("/nonexistent/jobs.json", out)
+
+    def test_an_empty_roster_is_still_all_clear(self):
+        # The distinction the fix turns on: a file that parses and lists no
+        # fleet-audit job is a fleet with nothing scheduled, not a failed read.
+        doc = projection({"compliance-audit": stream(last=latest())})
+        rc, out, _ = run_main(
+            ["--roster", NO_ROSTER], FakeKubectl(exec_stdout=json.dumps(doc))
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("all clear", out)
+
+    def test_a_store_failure_still_outranks_it(self):
+        # Both broken is still exit 1, and the store's own reason still prints.
+        fake = FakeKubectl(exec_stdout=json.dumps(projection(root_exists=False)))
+        rc, out, _ = run_main(["--roster", "/nonexistent/jobs.json"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("store directory absent on the pod", out)
 
 
 class TestFormatting(unittest.TestCase):
