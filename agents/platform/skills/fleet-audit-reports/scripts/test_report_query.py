@@ -201,6 +201,35 @@ class TestSharedHelpers(StoreTestCase):
         self.assertNotIn("streams", payload)
 
 
+class TestArgumentsStayInsideTheStore(StoreTestCase):
+    """The stream id and `--run` are joined onto the store root, so both have
+    to be names rather than paths. This subcommand set is the constrained way
+    to read the store; a `../` that escapes it defeats the whole point."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_run(AUDIT, "20260826T063100.000000Z", [])
+        self.outside = Path(self.root).parent / f"{Path(self.root).name}-outside.json"
+        self.outside.write_text(json.dumps(envelope(AUDIT, "2026-08-26T06:31:00+00:00", [])), encoding="utf-8")
+        self.addCleanup(self.outside.unlink, missing_ok=True)
+
+    def test_a_run_that_walks_out_of_the_ring_is_refused(self):
+        escape = os.path.relpath(self.outside, Path(self.root) / AUDIT / "runs")[: -len(".json")]
+        payload = self.refused("show", AUDIT, "--run", escape)
+        self.assertIn("not a name inside the report store", payload["error"])
+
+    def test_a_stream_that_walks_out_of_the_store_is_refused(self):
+        payload = self.refused("show", f"../{Path(self.root).name}/{AUDIT}")
+        self.assertIn("not a name inside the report store", payload["error"])
+
+    def test_the_ordinary_stamp_and_stream_still_resolve(self):
+        self.assertEqual(self.ok("show", AUDIT)["run"], "latest.json")
+        self.assertEqual(
+            self.ok("show", AUDIT, "--run", "20260826T063100.000000Z")["run"],
+            "20260826T063100.000000Z.json",
+        )
+
+
 class TestStreams(StoreTestCase):
     def test_a_completed_stream_reports_its_counts(self):
         self.write_run(

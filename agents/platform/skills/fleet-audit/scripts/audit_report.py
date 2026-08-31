@@ -1150,6 +1150,14 @@ def collector_seconds(manifest: dict | None) -> float | None:
         finished = datetime.fromisoformat(str(manifest.get("finished_at", "")).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if (started.tzinfo is None) != (finished.tzinfo is None):
+        # Subtracting an aware datetime from a naive one raises TypeError,
+        # which the `except ValueError` above does not catch and which no
+        # caller handles -- so a manifest carrying one bare timestamp failed
+        # the whole `finish` over a number the docstring above promises can
+        # only degrade to absent. Both-naive still measures fine: the two
+        # come from the same document, so they share whatever clock wrote it.
+        return None
     seconds = (finished - started).total_seconds()
     return round(seconds, 1) if seconds >= 0 else None
 

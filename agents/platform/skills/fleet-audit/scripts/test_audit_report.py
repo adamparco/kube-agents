@@ -5396,6 +5396,31 @@ class TestTiming(HarnessTestCase):
     def test_collector_seconds_degrades_on_a_garbage_timestamp(self):
         self.assertIsNone(audit_report.collector_seconds({"started_at": "not-a-time", "finished_at": "also-not"}))
 
+    def test_collector_seconds_degrades_when_one_endpoint_carries_no_zone(self):
+        """A manifest with one bare timestamp is a degraded number, not a crash.
+
+        `datetime.fromisoformat` parses both spellings happily and only the
+        subtraction fails, with a `TypeError` the `except ValueError` around
+        the parse does not catch and no caller handles -- so one missing `Z`
+        used to fail the whole `finish` over a duration that is allowed to be
+        absent. Both-naive still measures: the two come from the same manifest,
+        so they share whatever clock wrote it.
+        """
+        for started, finished in (
+            ("2026-08-26T06:00:00", "2026-08-26T06:03:30Z"),
+            ("2026-08-26T06:00:00Z", "2026-08-26T06:03:30"),
+        ):
+            with self.subTest(started=started, finished=finished):
+                self.assertIsNone(
+                    audit_report.collector_seconds({"started_at": started, "finished_at": finished})
+                )
+        self.assertEqual(
+            audit_report.collector_seconds(
+                {"started_at": "2026-08-26T06:00:00", "finished_at": "2026-08-26T06:03:30"}
+            ),
+            210.0,
+        )
+
     def test_an_unwritable_scratch_dir_does_not_fail_start(self):
         # Nothing `start` needs lives in SCRATCH_DIR any more — t0 moved into
         # the lock's claim (§4.5) and the body-file writer falls back to the

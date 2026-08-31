@@ -101,11 +101,28 @@ def _stream_ids(root: str) -> list[str]:
         raise QueryError(f"{root} could not be listed: {_oneline(exc)}") from exc
 
 
+def _inside_store(value: str, what: str) -> str:
+    """A stream id and a run stamp are each one name inside the store.
+
+    Both reach `os.path.join(root, audit_id, "runs", name)` straight from the
+    command line, and `join` walks wherever a `../` tells it to: `--run
+    ../../../../etc/hosts` read a file the store does not contain and printed
+    it as a run envelope. This subcommand set exists to be the constrained way
+    to read the store — an agent that can be handed a stream and a stamp
+    without being handed the filesystem — so the constraint has to hold against
+    the arguments, not just against well-behaved ones.
+    """
+    if value != os.path.basename(value) or value in ("", os.curdir, os.pardir) or os.sep in value:
+        raise QueryError(f"{what} {value!r} is not a name inside the report store")
+    return value
+
+
 def _require_stream(root: str, audit_id: str) -> None:
     """Absent store and absent stream are different answers, so they are
     different messages — one is "I could not look", the other "nothing to look
     at". Conflating them is how the retired ConfigMap reported thirty hours of
     refused writes as a fleet that had never run."""
+    _inside_store(audit_id, "stream")
     if not os.path.isdir(root):
         raise QueryError(
             f"report store not found at {root}. Nothing can be answered from "
@@ -144,7 +161,7 @@ def _run_name(run: str | None) -> str:
     same string with `.json` are the same run; no argument means the newest."""
     if run is None or run in ("latest", "latest.json"):
         return "latest.json"
-    return run if run.endswith(".json") else f"{run}.json"
+    return _inside_store(run if run.endswith(".json") else f"{run}.json", "run")
 
 
 def load_envelope(root: str, audit_id: str, run: str | None) -> tuple[str, dict]:
