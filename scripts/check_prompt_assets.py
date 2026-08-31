@@ -753,9 +753,14 @@ def check_cron_delivery() -> list[Finding]:
             # than reporting a shape it would have run happily.
             parts = deliver if isinstance(deliver, (list, tuple)) else str(deliver).split(",")
             for part in (str(p).strip() for p in parts):
-                # `platform:chat_id[:thread]` names its target outright, and the
-                # id is install-specific -- there is nothing here to check.
-                if not part or ":" in part or part in CRON_DELIVER_VALUES:
+                # `platform:chat_id[:thread]` names its target outright. The id
+                # is install-specific and unknowable here, but the platform in
+                # front of it is neither -- and a misspelled prefix drops
+                # exactly as a misspelled bare value does, so it is checked the
+                # same way. Skipping the whole part on sight of a colon let
+                # `gchat:spaces/AAA` through, which is the silent shape.
+                name = part.split(":", 1)[0].strip()
+                if not name or name in CRON_DELIVER_VALUES:
                     continue
                 findings.append(
                     Finding(
