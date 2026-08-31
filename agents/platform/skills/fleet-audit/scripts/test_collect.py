@@ -1467,6 +1467,33 @@ class TestNetpolMissing(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
 
+    def test_the_excerpt_never_claims_the_cluster_has_no_policies(self):
+        # kube-agents-host has eleven NetworkPolicies and none in cert-manager.
+        # The excerpt is rendered under a cluster-wide `-A` command, so a bare
+        # "zero NetworkPolicies" is a false statement beside a true finding.
+        ctx = context_of(
+            namespaces=[namespace("cert-manager"), namespace("argocd")],
+            networkpolicies=[netpol("deny", ns="argocd", policy_types=["Ingress"])],
+            workloads=[
+                {"kind": "Pod", "ns": "cert-manager", "name": "webhook"},
+                {"kind": "Pod", "ns": "argocd", "name": "server"},
+            ],
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual([h["namespace"] for h in hits], ["cert-manager"])
+        self.assertEqual(
+            hits[0]["excerpt"],
+            "no NetworkPolicy in this namespace; 1 elsewhere in the cluster, so this namespace is the gap",
+        )
+
+    def test_a_cluster_with_no_policies_at_all_says_only_the_namespace_part(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx)[0]["excerpt"], "no NetworkPolicy in this namespace")
+
     def test_zero_policies_and_zero_workloads_is_not_flagged(self):
         ctx = context_of(namespaces=[namespace("empty")], networkpolicies=[], workloads=[])
         self.assertEqual(collect.check_netpol_missing(ctx), [])

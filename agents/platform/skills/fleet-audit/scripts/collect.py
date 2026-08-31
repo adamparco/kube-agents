@@ -1069,9 +1069,17 @@ def check_netpol_missing(context: dict) -> list[dict]:
                 continue  # no pods, no exposure, pure churn
             if ccnp_all or ns in ccnp_covered:
                 continue
-            hits.append(
-                {"namespace": ns, "object": f"Namespace/{ns}", "excerpt": "zero NetworkPolicies", "severity": "major"}
-            )
+            # Namespace-scoped, because `adopt_collector_evidence` puts this
+            # string under a cluster-wide `kubectl get netpol -A` command. Bare
+            # "zero NetworkPolicies" then reads as a claim about the cluster,
+            # and on kube-agents-host -- which has eleven, none of them in
+            # cert-manager -- the one false line on an otherwise accurate
+            # finding is what gets the audit switched off.
+            elsewhere = sum(len(v) for k, v in netpols_by_ns.items() if k != ns)
+            excerpt = "no NetworkPolicy in this namespace"
+            if elsewhere:
+                excerpt += f"; {elsewhere} elsewhere in the cluster, so this namespace is the gap"
+            hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": excerpt, "severity": "major"})
             continue
         allow_all = [
             p
