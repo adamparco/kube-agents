@@ -340,9 +340,28 @@ def test_audit_report_ledger_dryrun_all_streams(
         "findings": [],
     }
 
+    # `finish` refuses to publish a document nothing checked, dry-run included --
+    # the rehearsal has to fail the same way the real call would, or an agent
+    # learns the flag is optional and discovers otherwise at publish time. The
+    # manifest here mirrors the document above, so the stream is exercised
+    # through the cross-check rather than around it.
+    mock_manifest = {
+        "audit": audit_id,
+        "clusters": [
+            {
+                "name": cluster,
+                "outcome": "collected",
+                "commands": [{"check": valid_check, "rc": 0}],
+            }
+        ],
+    }
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(mock_findings, f)
         temp_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(mock_manifest, f)
+        manifest_path = f.name
 
     try:
         proc = subprocess.run(
@@ -352,6 +371,7 @@ def test_audit_report_ledger_dryrun_all_streams(
                 "finish",
                 f"--audit={audit_id}",
                 f"--findings-file={temp_path}",
+                f"--manifest-file={manifest_path}",
                 "--dry-run",
             ],
             capture_output=True,
@@ -363,8 +383,9 @@ def test_audit_report_ledger_dryrun_all_streams(
             f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        for path in (temp_path, manifest_path):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 @pytest.mark.parametrize(
@@ -493,7 +514,27 @@ def test_audit_report_github_api_lifecycle_mocked(
         findings_file = tmp_path / f"findings_{audit_id}.json"
         findings_file.write_text(json.dumps(doc), encoding="utf-8")
 
-        exit_code = audit_report.main(["finish", f"--audit={audit_id}", f"--findings-file={findings_file}"])
+        # See the dry-run test above: `finish` will not publish without a
+        # manifest, so this one mirrors the document it publishes.
+        manifest_file = tmp_path / f"manifest_{audit_id}.json"
+        manifest_file.write_text(
+            json.dumps({
+                "audit": audit_id,
+                "clusters": [{
+                    "name": "platform-agent-host",
+                    "outcome": "collected",
+                    "commands": [{"check": valid_check, "rc": 0}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        exit_code = audit_report.main([
+            "finish",
+            f"--audit={audit_id}",
+            f"--findings-file={findings_file}",
+            f"--manifest-file={manifest_file}",
+        ])
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
         all_commands = [" ".join(c) for c in calls]

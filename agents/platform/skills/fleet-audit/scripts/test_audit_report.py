@@ -14,14 +14,17 @@ import contextlib
 import copy
 import io
 import json
+import multiprocessing
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from unittest.mock import patch
@@ -35,6 +38,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
 import gitops_workspace  # noqa: E402
+
+try:  # `report_status` projects the files this suite writes; see TestLiveness.
+    import report_status  # noqa: E402
+except Exception:  # noqa: BLE001 — this suite owns audit_report, not the reader
+    report_status = None
 
 AUDIT = "compliance-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
@@ -132,55 +140,6 @@ SHARED_RULES = (
 # constant is checked against it once (`test_the_budget_matches_github`).
 GITHUB_BODY_LIMIT = 65_536
 
-# The cron prompts spell their check counts out ("Its eleven checks are
-# section 2"), because a numeral in that sentence reads as a section number.
-NUMBER_WORDS = {
-    word: n
-    for n, word in enumerate(
-        (
-            "zero",
-            "one",
-            "two",
-            "three",
-            "four",
-            "five",
-            "six",
-            "seven",
-            "eight",
-            "nine",
-            "ten",
-            "eleven",
-            "twelve",
-            "thirteen",
-            "fourteen",
-            "fifteen",
-            "sixteen",
-            "seventeen",
-            "eighteen",
-            "nineteen",
-            "twenty",
-        )
-    )
-}
-
-
-def _outside_fences(lines):
-    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
-
-    Every heading scan below has to skip fenced blocks. A `### ` inside one is
-    a shell comment or a JSON fragment, and counting it as a section heading
-    shifts every span derived afterwards — silently, in the direction that
-    makes a stale citation look correct.
-    """
-    fenced = False
-    for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
-            yield number, line
-
-
 def render_body(doc, **kwargs):
     """The rendered issue text.
 
@@ -191,22 +150,6 @@ def render_body(doc, **kwargs):
     for the tuple directly.
     """
     return audit_report.render_issue_body(doc, **kwargs).body
-
-
-def published_body(doc, **kwargs):
-    """The ledger text a *previous* run would have left behind.
-
-    A real ledger is only ever written after `validate_findings` has stamped
-    the derived ids into the document, so its hidden `audit-findings` block
-    carries four-segment ids. A fixture that renders an unvalidated document
-    publishes the bare handles instead — `a`, `b` — which the migration guard
-    reads as the old scheme and suppresses the delta over. A delta test
-    written against such a body would then pass without a delta ever having
-    been computed, which is the opposite of what it claims to check.
-    """
-    doc = copy.deepcopy(doc)
-    audit_report.validate_findings(doc, doc.get("audit", AUDIT))
-    return render_body(doc, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -511,14 +454,89 @@ class BaseTestCase(unittest.TestCase):
         # tests ran before it.
         audit_report.set_workspace(None)
         self.addCleanup(audit_report.set_workspace, None)
+        # A third global in the same category: `take_run_lock` records the claim
+        # this process wrote so the failure path can give exactly that one back,
+        # and a test that takes a lock would otherwise leave the next one
+        # believing it holds a stream in a temp directory that no longer exists.
+        self.patch_attr("_HELD_LOCK", None)
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
         env = patch.dict(os.environ, {"GITOPS_BASE_BRANCH": ""})
         env.start()
         self.addCleanup(env.stop)
+        # Patched here rather than in HarnessTestCase so that no test anywhere
+        # can reach the real `/opt/data`. A store write is best-effort and
+        # swallows its own errors, so an unpatched path does not fail — it
+        # writes nothing and leaves every store assertion vacuously true.
+        self.patch_attr("REPORTS_DIR", str(self.tmp_path / "reports"))
+        # The same guarantee, for the other root that reaches `/opt/data`.
+        # `dry_run_repo_root` prefers the real GitOps clone and falls back to
+        # `repo_root_best_effort` only when it is absent — correct in
+        # production, and the reason the two `--dry-run` body tests below pass
+        # on a laptop for the wrong reason. They patch `repo_root_best_effort`
+        # and write their manifest under `tmp_path`; that is only the root the
+        # code consults because no laptop has `/opt/data/gitops`. Run the same
+        # tests in the agent pod, where the clone does exist, and they resolve
+        # `clusters/prod-us-east/payments-netpol.yaml` against this install's
+        # live infrastructure repository, find nothing, and fail. Rooting the
+        # workspace in the sandbox makes the fallback the deterministic answer
+        # everywhere instead of an accident of the host.
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
+
+    def stored_envelope(self, audit=AUDIT, name="latest.json"):
+        """The envelope `finish` wrote, parsed. Fails loudly when absent."""
+        path = Path(audit_report.REPORTS_DIR) / audit / name
+        self.assertTrue(path.is_file(), f"no report store entry at {path}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def stored_runs(self, audit=AUDIT):
+        """The history ring's entries, oldest first."""
+        return sorted((Path(audit_report.REPORTS_DIR) / audit / "runs").glob("*.json"))
+
+    def seed_store(self, doc, *, issue_number=42, audit=AUDIT, **overrides):
+        """The store entry a previous `finish` would have left behind.
+
+        Validated first: a real store is only ever written after
+        `validate_findings` has stamped the derived four-segment ids into the
+        document, and a fixture carrying the bare handles — `a`, `b` — would
+        make every delta test a test of the id-mismatch path instead, passing
+        without a delta ever having been computed.
+
+        Written straight to disk rather than through `write_report`, which
+        swallows its own failures — a fixture that silently wrote nothing would
+        leave the test asserting against the *absent-store* path it was
+        written to avoid.
+        """
+        doc = copy.deepcopy(doc)
+        audit_report.validate_findings(doc, doc.get("audit", audit))
+        rendered = audit_report.render_issue_body(
+            doc, generated_at=NOW, audit_id=audit
+        )
+        envelope = audit_report.report_envelope(
+            audit,
+            {
+                "status": "UPDATED",
+                "issue_url": f"https://github.com/acme/fleet/issues/{issue_number}",
+                "partial": False,
+                "coverage_gaps": [],
+            },
+            doc,
+            NOW,
+            issue_number=issue_number,
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=rendered.rendered_ids,
+        )
+        envelope.update(overrides)
+        directory = Path(audit_report.REPORTS_DIR) / audit
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "latest.json").write_text(
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return envelope
 
     def patch_attr(self, name, value):
         """monkeypatch.setattr(audit_report, name, value), undone at teardown."""
@@ -538,6 +556,23 @@ class BaseTestCase(unittest.TestCase):
     def stdout_json(self):
         return json.loads(self.out.strip())
 
+    def stdout_json_sans_timing(self, *keys):
+        """The exit payload minus its wall-clock keys, which are asserted by type.
+
+        Durations are real elapsed time and cannot appear in an exact-dict
+        assertion; everything semantic still can. Each named key must be
+        present — a payload that dropped one fails here, not silently.
+        """
+        payload = json.loads(self.out.strip())
+        for key in keys:
+            self.assertIn(key, payload)
+            value = payload.pop(key)
+            self.assertTrue(
+                value is None or isinstance(value, (int, float)),
+                f"{key}={value!r} is not a duration or None",
+            )
+        return payload
+
     def write_findings(self, doc):
         path = self.tmp_path / "findings.json"
         path.write_text(json.dumps(doc), encoding="utf-8")
@@ -551,6 +586,20 @@ class BaseTestCase(unittest.TestCase):
 
     def run_finish(self, doc, argv_extra=(), audit=AUDIT):
         findings_file = self.write_findings(doc)
+        argv_extra = list(argv_extra)
+        # `finish` refuses to publish unverified (see handle_finish's
+        # --manifest-file guard). A manifest enumerating no clusters
+        # cross-checks nothing and adds no coverage gap, so it satisfies the
+        # guard while leaving every test here measuring what it measured
+        # before. Tests about the guard itself, or about a real cross-check,
+        # pass their own flag and get it instead.
+        if not any(
+            a.startswith("--manifest-file") or a.startswith("--no-collector-manifest")
+            for a in argv_extra
+        ):
+            empty = self.tmp_path / "empty-manifest.json"
+            empty.write_text(json.dumps({"clusters": []}), encoding="utf-8")
+            argv_extra += ["--manifest-file", str(empty)]
         return self.run_main(
             ["finish", "--audit", audit, "--findings-file", findings_file, *argv_extra]
         )
@@ -924,7 +973,8 @@ class TestDeltaBlock(unittest.TestCase):
         )
         self.assertEqual(resolved, ["gone"])
 
-    def test_a_finding_that_becomes_renderable_is_announced_then(self):
+    def test_a_finding_that_becomes_renderable_is_announced_when_it_is_new(self):
+        # Nothing says the previous run knew about `b`, so it is new.
         new, resolved = audit_report.compute_delta(
             previous_ids=["a"],
             rendered_ids=["a", "b"],
@@ -932,6 +982,44 @@ class TestDeltaBlock(unittest.TestCase):
         )
         self.assertEqual(new, ["b"])
         self.assertEqual(resolved, [])
+
+    def test_a_finding_that_only_lost_a_budget_contest_is_not_new(self):
+        # `b` was found last run and cut from that body for space. Announcing
+        # it now points "look now" at something already reported. Live on
+        # 2026-08-30: seventeen false hpa-cannot-scale findings evicted six real
+        # probes-liveness ones, and their return was published as six new.
+        new, _ = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a", "b"],
+            all_current_ids=["a", "b"],
+            all_previous_ids=["a", "b"],
+        )
+        self.assertEqual(new, [])
+
+    def test_a_finding_cut_for_space_and_then_fixed_is_still_announced_resolved(self):
+        # The mirror of the case above, and the reason the wider set feeds both
+        # halves: `gone` never rendered, so a rendered-only yardstick can never
+        # credit the fix and the reader is never told it landed.
+        _, resolved = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a"],
+            all_current_ids=["a"],
+            all_previous_ids=["a", "gone"],
+        )
+        self.assertEqual(resolved, ["gone"])
+
+    def test_an_unreadable_previous_document_does_not_announce_everything_new(self):
+        # A missing or malformed stored document yields no wider set. Measured
+        # against that alone every live finding reads as new, so the union with
+        # the rendered ids is what keeps the old floor under this.
+        for wider in ([], None):
+            new, _ = audit_report.compute_delta(
+                previous_ids=["a", "b"],
+                rendered_ids=["a", "b"],
+                all_current_ids=["a", "b"],
+                all_previous_ids=wider,
+            )
+            self.assertEqual(new, [])
 
 
 class TestDeltaCommentOrdering(BaseTestCase):
@@ -977,30 +1065,41 @@ class TestDeltaCommentOrdering(BaseTestCase):
         self.assertLess(comment.index("`b`"), comment.index("`ghost`"))
 
     def test_delta_across_two_rendered_runs(self):
-        run_one = render_body(
-            make_doc(
-                findings=[
-                    make_finding(fid="a", title="Alpha finding"),
-                    make_finding(fid="b", title="Bravo finding"),
-                ]
-            ),
-            generated_at=NOW,
+        run_one_doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="b", title="Bravo finding"),
+            ]
         )
+        run_one = audit_report.render_issue_body(run_one_doc, generated_at=NOW)
         run_two_doc = make_doc(
             findings=[
                 make_finding(fid="b", title="Bravo finding"),
                 make_finding(fid="c", title="Charlie finding"),
             ]
         )
-        run_two = render_body(run_two_doc, generated_at=NOW)
+        run_two = audit_report.render_issue_body(run_two_doc, generated_at=NOW)
 
-        previous_ids = audit_report.parse_delta_block(run_one)
-        current_ids = audit_report.parse_delta_block(run_two)
-        new, resolved = audit_report.compute_delta(previous_ids, current_ids)
+        # The join is between what one run *stored* and what the next one
+        # rendered, which is the same pair the ledger's hidden block used to
+        # carry on both sides.
+        stored = audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED"},
+            run_one_doc,
+            NOW,
+            issue_number=42,
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=run_one.rendered_ids,
+        )
+        new, resolved = audit_report.compute_delta(
+            stored["current_ids"], run_two.rendered_ids
+        )
         self.assertEqual(new, ["c"])
         self.assertEqual(resolved, ["a"])
 
-        titles = audit_report.parse_finding_titles(run_one)
+        titles = audit_report.report_finding_titles(stored)
         self.assertEqual(titles["a"], "Alpha finding")
 
         comment = audit_report.render_delta_comment(
@@ -1009,7 +1108,8 @@ class TestDeltaCommentOrdering(BaseTestCase):
         self.assertIn("**1 new**", comment)
         self.assertIn("Charlie finding", comment)
         self.assertIn("**1 resolved**", comment)
-        # Resolved findings are named by the title recovered from the old body.
+        # Resolved findings are named from the stored document, which is the
+        # only place a finding that has left findings.json still has a title.
         self.assertIn("Alpha finding", comment)
 
     def test_no_comment_when_nothing_changed(self):
@@ -1280,6 +1380,43 @@ class TestDerivedFindingId(unittest.TestCase):
                     audit_report.validate_findings(doc, AUDIT)
                 self.assertIn(field, str(exc.exception))
 
+    def test_a_bare_kind_is_refused_because_it_names_no_object(self):
+        # The 2026-08-29 compliance run: `Cluster/kube-agents-host` on Friday,
+        # `Cluster` on Saturday, for four unchanged public control planes. The
+        # ledger reported all four resolved and re-opened them as new. Nothing
+        # downstream can tell that from a real fix, so it is refused here.
+        for value in ("Cluster", "Deployment", "Cluster/", "/kube-agents-host"):
+            with self.subTest(value=value):
+                doc = make_doc(findings=[make_finding(obj=value)])
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn("object", str(exc.exception))
+                self.assertIn("Kind/name", str(exc.exception))
+
+    def test_the_rejection_names_the_cluster_scoped_spelling_that_would_work(self):
+        # A worker told only "that is wrong" writes something else wrong. The
+        # cluster is already in the finding, so the message can name the exact
+        # string to use instead.
+        doc = make_doc(findings=[make_finding(obj="Cluster")])
+        doc["findings"][0]["cluster"] = "kube-agents-host"
+        doc["scope"]["clusters"][0]["name"] = "kube-agents-host"
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("'Cluster/kube-agents-host'", str(exc.exception))
+
+    def test_a_kind_slash_name_with_punctuation_in_the_name_still_passes(self):
+        # RBAC subjects carry colons and dots; the rule is "has a name", not a
+        # charset. `_id_segment` already flattens whatever survives.
+        for value in (
+            "ClusterRole/system:kubelet-api-admin",
+            "Deployment/argocd-repo-server",
+            "ServiceAccount/default/edge",
+        ):
+            with self.subTest(value=value):
+                doc = make_doc(findings=[make_finding(obj=value)])
+                got = audit_report.validate_findings(doc, AUDIT)
+                audit_report.validate_finding_id(got["findings"][0]["id"], "derived")
+
     def test_a_long_namespace_does_not_collapse_two_objects_into_one(self):
         # RFC 1123 allows a 63-character namespace. Trimming right-to-left —
         # what the retired SOPs asked for — spends the entire allowance on the
@@ -1475,105 +1612,92 @@ class TestIdSchemeStamp(unittest.TestCase):
 
 
 class TestSchemeMigration(HarnessTestCase):
-    """One run of withheld `resolved`, then the guard lifts by itself."""
+    """A memory minted under another id scheme is unknowable, not empty.
 
-    def previous(self, ids, scheme=None):
-        block = json.dumps(list(ids))
-        stamp = "" if scheme is None else f"<!-- audit-id-scheme: {scheme} -->\n"
-        return f"## Findings\n\n<!-- audit-findings: {block} -->\n{stamp}"
+    The 16:34 incident, in one sentence: a previous run's ids that the current
+    scheme cannot join against, and that nevertheless look entirely ordinary.
+    A naive join calls every one of them fixed and posts "4 resolved" in prose
+    on a security ledger whose body still lists the four as open.
 
-    def test_an_unstamped_ledger_reports_no_resolutions(self):
-        # This is the 16:34 run, replayed: a previous block the current scheme
-        # cannot join against, whose ids nevertheless look entirely ordinary. A
-        # naive join calls every one of them fixed.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {
-                    "body": self.previous(
-                        [
-                            "wildcard-rbac.prod-us-east._."
-                            "clusterrolebinding-argocd-application-controller"
-                        ]
-                    )
-                }
-            ),
-        }
+    The guard used to be three-way — new findings still announced, only
+    `resolved` withheld, and one run later the republished block lifted it by
+    itself. §4.8 moved the memory out of the ledger body and into the report
+    store, and collapsed that corner into the triad every other unknowable
+    memory already used: no delta claim at all. An id-scheme bump is a rare,
+    code-authored event, and one lost-memory semantics is worth more than a
+    preserved special case.
+    """
+
+    STALE = (
+        "wildcard-rbac.prod-us-east._."
+        "clusterrolebinding-argocd-application-controller"
+    )
+
+    def previous(self, ids, scheme="current"):
+        """Seed the store a previous run left, carrying `ids` under `scheme`.
+
+        `scheme="absent"` is the envelope that lost the key altogether — a
+        hand-edited or truncated file, which is untrusted for the same reason
+        a foreign scheme is: nothing says these ids are spelled the way this
+        code spells them.
+        """
+        overrides = {"current_ids": sorted(ids)}
+        if scheme == "absent":
+            overrides["id_scheme"] = None
+        elif scheme != "current":
+            overrides["id_scheme"] = scheme
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        return self.seed_store(make_doc(findings=[]), **overrides)
+
+    def test_an_older_scheme_reports_no_resolutions(self):
+        self.previous([self.STALE], scheme=audit_report.ID_SCHEME - 1)
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        out = self.stdout_json()
-        self.assertEqual(out["resolved"], 0)
-        self.assertIn("identity scheme 0", self.err)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+        self.assertIn("identity scheme", self.err)
 
-    def test_the_comment_a_human_reads_withholds_it_too(self):
+    def test_the_comment_a_human_reads_makes_no_claim_either(self):
         # The stdout counter and the posted comment are two renderings of one
-        # claim, and the incident was the *comment*: "4 resolved" in prose, on
-        # a security ledger, under a body still listing the four as open.
-        # Guarding only the counter leaves the half a human actually reads
-        # free to say the opposite.
-        stale = (
-            "wildcard-rbac.prod-us-east._."
-            "clusterrolebinding-argocd-application-controller"
+        # claim, and the incident was the *comment*. Guarding only the counter
+        # leaves the half a human actually reads free to say the opposite.
+        self.previous([self.STALE], scheme=audit_report.ID_SCHEME - 1)
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        self.assertFalse(
+            self.harness.bodies_for("issue", "comment"),
+            "an unjoinable memory must post no delta comment at all",
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous([stale])}),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+    def test_new_findings_are_withheld_too(self):
+        # The deliberate change from the three-way guard: `new` measured
+        # against an unjoinable memory is not a smaller claim than `resolved`,
+        # it is the same claim pointed the other way, and the finding itself
+        # is still in the ledger body for anyone to read. What is lost is one
+        # run of annotation, and the store this run writes restores it.
+        self.previous(["wra-something-old"], scheme=audit_report.ID_SCHEME - 1)
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
-        bodies = self.harness.bodies_for("issue", "comment")
-        self.assertTrue(bodies, "the run posted no delta comment at all")
-        for body in bodies:
-            with self.subTest(body=body):
-                self.assertNotIn(" resolved**", body)
-                self.assertNotIn(stale, body)
+        self.assertEqual(self.stdout_json()["new"], 0)
 
-    def test_the_new_findings_are_still_announced(self):
-        # `new` is noise, not a false claim of work done, so it is left alone:
-        # withholding it too would leave the stream silent about a real finding
-        # for a run, which is the failure mode the audit exists to prevent.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous(["wra-something-old"])}),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
-
-        self.assertEqual(self.run_finish(make_doc()), 0)
-
-        self.assertEqual(self.stdout_json()["new"], 1)
-
-    def test_an_empty_previous_block_is_not_a_migration(self):
+    def test_an_empty_memory_is_not_a_migration(self):
         # Nothing to join against, so nothing to withhold and nothing to warn
-        # about: a first run on a fresh ledger is not a scheme change.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": self.previous([])}),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        # about: a stream whose last run was clean is not a scheme change.
+        self.previous([])
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
         self.assertNotIn("identity scheme", self.err)
+        self.assertEqual(self.stdout_json()["new"], 1)
 
-    def test_the_guard_lifts_once_the_block_is_rewritten(self):
-        # The run above republished the ledger stamped, so the next one joins
-        # normally and a real disappearance reads as resolved.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {
-                    "body": self.previous(
-                        [derived_id(), derived_id(fid="gone")],
-                        scheme=audit_report.ID_SCHEME,
-                    )
-                }
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+    def test_the_guard_lifts_once_the_store_is_rewritten(self):
+        # The run above republished the ledger and rewrote the store under the
+        # current scheme, so the next one joins normally and a real
+        # disappearance reads as resolved.
+        self.previous([derived_id(), derived_id(fid="gone")])
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
@@ -1581,25 +1705,24 @@ class TestSchemeMigration(HarnessTestCase):
         self.assertNotIn("identity scheme", self.err)
 
     def test_a_future_scheme_is_withheld_too(self):
-        # Not just "older": a ledger a newer harness wrote is equally
+        # Not just "older": a store a newer harness wrote is equally
         # unjoinable, and rolling a deployment back must not turn its findings
         # into a page of fixes.
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {
-                    "body": self.previous(
-                        [derived_id(), derived_id(fid="gone")],
-                        scheme=audit_report.ID_SCHEME + 1,
-                    )
-                }
-            ),
-        }
-        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous(
+            [derived_id(), derived_id(fid="gone")], scheme=audit_report.ID_SCHEME + 1
+        )
 
         self.assertEqual(self.run_finish(make_doc()), 0)
 
         self.assertEqual(self.stdout_json()["resolved"], 0)
+
+    def test_a_store_missing_its_scheme_is_withheld_too(self):
+        self.previous([derived_id(), derived_id(fid="gone")], scheme="absent")
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        out = self.stdout_json()
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
 
 
 # --------------------------------------------------------------------------- #
@@ -1995,6 +2118,53 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{sop.name}. The SOP defines {found}",
                 )
 
+    def test_scopes_partition_the_roster(self):
+        """Every check a partitioned stream defines is owed by some target kind.
+
+        The union has to be exactly `checks`. A slug in the roster and in no
+        kind is owed by nobody: it would drop out of every denominator and the
+        stream would report full coverage without it ever running — the same
+        silent hole `checks` itself exists to close, reintroduced one level
+        down. A slug in a kind and not the roster is a typo that would quietly
+        widen that kind's denominator by a check no SOP defines.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            if not spec.scopes:
+                continue
+            with self.subTest(audit=audit_id):
+                kinds = [kind for kind, _ in spec.scopes]
+                self.assertEqual(
+                    sorted(kinds),
+                    sorted(set(kinds)),
+                    f"{audit_id} declares a target kind twice: {kinds}",
+                )
+                owned: set[str] = set()
+                for kind, checks in spec.scopes:
+                    self.assertTrue(checks, f"{audit_id}/{kind} owns no checks")
+                    owned |= set(checks)
+                self.assertEqual(
+                    owned,
+                    set(spec.checks),
+                    f"AUDITS[{audit_id!r}].scopes and .checks disagree: "
+                    f"unowned={sorted(set(spec.checks) - owned)} "
+                    f"unknown={sorted(owned - set(spec.checks))}",
+                )
+
+    def test_every_scope_kind_is_one_target_kind_can_produce(self):
+        """A kind no `scope.clusters` name can ever resolve to owns nothing.
+
+        `audit_target_checks` maps a name to a kind with `target_kind`, so a
+        `scopes` entry keyed anything else is dead data — and worse than dead,
+        because the checks parked under it are absent from the kinds that do
+        resolve, leaving them owed by nobody in practice while
+        `test_scopes_partition_the_roster` still sees them in the union.
+        """
+        reachable = {"cluster", "project", "subnet"}
+        for audit_id, spec in audit_report.AUDITS.items():
+            for kind, _ in spec.scopes:
+                with self.subTest(audit=audit_id, kind=kind):
+                    self.assertIn(kind, reachable)
+
     def test_one_system_namespace_set_spelled_three_ways(self):
         """Three SOPs suppress "system namespaces"; they must mean one set.
 
@@ -2095,110 +2265,61 @@ class TestAuditCatalogue(unittest.TestCase):
                 if sop_dir.is_dir():
                     self.assertTrue((sop_dir / spec.sop).is_file())
 
-    def test_cron_prompts_cite_the_real_sop_geography(self):
-        """A stale line number is worse than no line number.
+    def test_cron_prompts_name_the_real_collector_invocation(self):
+        """A prompt pointing at a renamed or moved collector script is worse
+        than one that says nothing about it.
 
-        Each audit prompt tells the worker how long its SOP is and where the
-        checks live, because a read that stops early lands in the preamble and
-        produces a confident all-clear over an audit that never ran. That only
-        helps while the numbers are true: a citation that has drifted teaches
-        the worker it has read enough when it has not. Re-derive both from the
-        file so that editing an SOP without re-measuring fails here rather than
-        at 06:20 in production.
+        Every stream now runs through a collector, so the anti-skim
+        line-count citation this test used to check is no longer the
+        strongest anti-fabrication guarantee available: `finish
+        --manifest-file` verifies `checks_run` against commands the
+        collector actually ran, a stronger check than a self-reported line
+        count ever was (docs/designs/fleet-audit-collectors-and-status.md
+        §4.1, §7). The check-roster-matches-the-SOP invariant the old test
+        also carried is independently covered by
+        test_check_rosters_match_the_sops, which scans the whole SOP file
+        rather than the prompt's own citation. What this test still owes a
+        reader: the prompt's named collector command must be the exact one
+        the SOP's own "Run the collector" instruction documents, re-derived
+        from the SOP file each run, so an SOP edited without also updating
+        the prompt (or vice versa) fails here rather than at 06:20 in
+        production.
         """
         jobs = self.cron_jobs()
         sop_dir = self.sop_dir()
-        total = re.compile(r"all (\d+) lines of it")
-        span = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
-        # "Its eleven checks are section 2" / "Its nineteen facets are section
-        # 4" — the noun differs by stream, the count must not.
-        counted = re.compile(r"\bIts ([a-z]+) \w+ are section\b")
-        # A `#### ` check heading names its slugs in a trailing parenthesis;
-        # same anchoring as test_check_rosters_match_the_sops, and same reason.
-        trailing = re.compile(r"\((((?:`[^`]+`)(?:,\s*)?)+)\)\s*$")
-        token = re.compile(r"`([^`]+)`")
         for audit_id, spec in audit_report.AUDITS.items():
             prompt = jobs[audit_id]["prompt"]
             name = SOP_FILENAMES[audit_id]
-            lines = (sop_dir / name).read_text(encoding="utf-8").splitlines()
+            sop_text = (sop_dir / name).read_text(encoding="utf-8")
             with self.subTest(audit=audit_id):
                 self.assertIn(
                     f"governance/{spec.sop}",
                     prompt,
                     f"the {audit_id} prompt does not send the worker to "
-                    f"{spec.sop}, which is the file these numbers describe",
+                    f"{spec.sop}",
                 )
-
-                claimed = total.search(prompt)
-                self.assertIsNotNone(
-                    claimed, f"{audit_id} prompt no longer states the SOP length"
+                idx = sop_text.find("Run the collector")
+                self.assertNotEqual(
+                    idx, -1,
+                    f"{name} has no 'Run the collector' instruction for the "
+                    f"prompt to cite",
                 )
-                self.assertEqual(
-                    len(lines),
-                    int(claimed.group(1)),
-                    f"{audit_id} prompt claims {claimed.group(1)} lines but "
-                    f"{name} has {len(lines)}",
-                )
-
-                cited = span.search(prompt)
-                self.assertIsNotNone(
-                    cited, f"{audit_id} prompt no longer locates the checks"
-                )
-                section, first, last = cited.groups()
-                # Sections are `### <n>. Title`; the section ends where the next
-                # one begins, so the checks span up to the line before it. Only
-                # headings outside a fenced block count — the compliance SOP
-                # opens with a bash fence, and a `### ` inside one is a comment
-                # or a shell heredoc, not a section.
-                starts = [n for n, line in _outside_fences(lines) if line.startswith("### ")]
-                heading = f"### {section}. "
-                where = [n for n in starts if lines[n - 1].startswith(heading)]
-                self.assertEqual(
-                    1,
-                    len(where),
-                    f"{name} has {len(where)} sections headed {heading!r}; "
-                    f"the {audit_id} prompt cites one",
-                )
-                after = [n for n in starts if n > where[0]]
-                first, last = int(first), int(last)
-                self.assertEqual(
-                    (where[0], (after[0] - 1) if after else len(lines)),
-                    (first, last),
-                    f"{audit_id} prompt cites lines {first}-{last} for section "
-                    f"{section} of {name}, which has moved",
-                )
-
-                # The span being *a* real section is not the claim the prompt
-                # makes. It says the checks are in there, and a worker that
-                # reads only that range has to come out holding the whole
-                # roster. Point it at the preamble and every number above still
-                # checks out while the worker reads nothing it needs.
-                inside = [
-                    slug
-                    for n, line in _outside_fences(lines)
-                    if first <= n <= last and line.startswith("#### ")
-                    for match in [trailing.search(line)]
-                    if match
-                    for slug in token.findall(match.group(1))
-                ]
-                self.assertEqual(
-                    sorted(spec.checks),
-                    sorted(inside),
-                    f"lines {first}-{last} of {name} do not define the roster "
-                    f"the {audit_id} stream validates against",
-                )
-
-                # And the prompt's own count, which is what tells a worker
-                # mid-read whether it has found them all.
-                says = counted.search(prompt)
-                self.assertIsNotNone(
-                    says, f"{audit_id} prompt no longer counts its checks"
-                )
-                self.assertEqual(
-                    len(spec.checks),
-                    NUMBER_WORDS.get(says.group(1)),
-                    f"{audit_id} prompt says {says.group(1)!r} but the stream "
-                    f"has {len(spec.checks)} checks",
+                fence_marker = "```bash\n"
+                fence_start = sop_text.index(fence_marker, idx) + len(fence_marker)
+                fence_end = sop_text.index("\n```", fence_start)
+                invocation_line = sop_text[fence_start:fence_end].splitlines()[0].strip()
+                # The script, not the first word: every documented invocation
+                # now names an interpreter first (see
+                # test_no_sop_invokes_the_harness_by_path), and the prompt
+                # cites the collector rather than a runnable command line.
+                script_token = next(
+                    token for token in invocation_line.split() if token.endswith(".py")
+                ).lstrip("./")
+                self.assertIn(
+                    script_token,
+                    prompt,
+                    f"the {audit_id} prompt does not name {script_token}, the "
+                    f"collector {name} actually documents",
                 )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
@@ -2415,7 +2536,19 @@ class TestStaging(unittest.TestCase):
                     [git, *args], cwd=root, check=True, capture_output=True, text=True, **kw
                 )
 
-            run("init", "-q", "-b", "main")
+            # On PATH is not the same as usable here. In the agent pod `git` is
+            # the credential proxy's shim, which refuses any working directory
+            # outside `/opt/data` — so the `which` check above passes and the
+            # first real command fails. This test is about git's own pathspec
+            # behaviour and has nothing to say about a sandbox that will not run
+            # it, so probe once and skip with the reason rather than erroring.
+            try:
+                run("init", "-q", "-b", "main")
+            except subprocess.CalledProcessError as exc:  # pragma: no cover
+                self.skipTest(
+                    "git will not run in a temp directory here: "
+                    f"{(exc.stderr or exc.stdout or '').strip()[:200]}"
+                )
             run("config", "user.email", "audit@example.invalid")
             run("config", "user.name", "audit")
             for name in ("*.yaml", "one.yaml", "two.yaml"):
@@ -2503,7 +2636,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.run_finish(make_doc())
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "OPENED",
                 "issue_url": "https://github.com/acme/fleet/issues/7",
@@ -2514,6 +2647,10 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": (
+                    "Security & RBAC Posture Audit: 1 critical, 0 major, 0 minor "
+                    "(1 new) — https://github.com/acme/fleet/issues/7"
+                ),
             },
         )
 
@@ -2529,19 +2666,15 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(label[0][:4], ["gh", "issue", "edit", "7"])
 
     def test_updates_in_place_and_posts_delta(self):
-        previous_body = published_body(
+        self.seed_store(
             make_doc(
                 findings=[
                     make_finding(fid="a", title="Alpha finding"),
                     make_finding(fid="b", title="Bravo finding"),
                 ]
-            ),
-            generated_at=NOW,
+            )
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(
             findings=[
@@ -2561,7 +2694,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertTrue(self.harness.gh_calls("issue", "comment", "42"))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "UPDATED",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -2572,16 +2705,17 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": (
+                    "Security & RBAC Posture Audit: 2 critical, 0 major, 0 minor "
+                    "(1 new, 1 resolved) — https://github.com/acme/fleet/issues/42"
+                ),
             },
         )
 
     def test_no_comment_when_findings_unchanged(self):
         doc = make_doc()
-        previous_body = published_body(doc, generated_at=NOW)
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.seed_store(doc)
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.run_finish(doc)
@@ -2594,11 +2728,12 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
 
-    def test_unreadable_previous_body_suppresses_the_delta(self):
-        # None is not "": an unreadable body makes the delta unknowable, and
-        # announcing every live finding as new is worse than announcing none.
+    def test_a_missing_store_suppresses_the_delta(self):
+        # A wiped PVC under an open ledger. Absent is not empty: the delta is
+        # unknowable, and announcing every live finding as new is worse than
+        # announcing none. This is the cost of the store being the only
+        # memory, and it is one run long — the write below restores it.
         self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"--json body": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
         self.assertEqual(self.run_finish(make_doc()), 0)
@@ -2608,7 +2743,39 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
-        self.assertIn("unreadable", self.err)
+        self.assertIn("no delta claim", self.err)
+        self.assertEqual(self.stored_envelope()["current_ids"], [derived_id()])
+
+    def test_a_store_written_for_another_ledger_suppresses_the_delta(self):
+        # Two ledgers, one stream: a human closed the old issue and the next
+        # run opened a new one, or two installs share a PVC. Joining the
+        # memory of one conversation against the other calls every id on the
+        # left fixed and every id on the right new.
+        self.seed_store(make_doc(), issue_number=41)
+        self.harness.replies = {"issue list": self.issue_list(number=42)}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+        result = self.stdout_json()
+        self.assertEqual((result["new"], result["resolved"]), (0, 0))
+        self.assertIn("#41", self.err)
+
+    def test_the_happy_path_never_fetches_the_ledger_body(self):
+        # The whole point of §4.8: the memory is local, so the round trip that
+        # re-read a public issue body to parse this harness's own breadcrumb
+        # back out of it is gone. The block is still *written* — bench grades
+        # against it — but nothing reads it back.
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        for call in self.harness.calls:
+            with self.subTest(call=call):
+                self.assertNotIn(("--json", "body"), list(zip(call, call[1:])))
 
     def test_gcloud_only_run_still_publishes(self):
         self.harness.replies = {
@@ -2654,6 +2821,129 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
 
+class TestCarryUnchangedFindings(unittest.TestCase):
+    """An unchanged finding keeps last run's words.
+
+    Every case here was drawn from this install's stored run history rather
+    than invented: 92 id-pairs with byte-identical evidence, all 92 rewritten,
+    83 of them in the remediation.
+    """
+
+    def before(self, **overrides):
+        finding = {
+            "id": "single-zone-nodepool.spot._.nodepool-spot-pool",
+            "title": "spot-pool is locked to a single zone",
+            "impact": "A zonal stockout halts autoscaling for this pool.",
+            "recommendation": {"action": "Add us-east4-b and us-east4-c."},
+            "remediation": {"kind": "manual", "note": "Add nodeLocations."},
+            "evidence": [{"command": "gcloud container node-pools list", "excerpt": "a"}],
+            "severity": "major",
+        }
+        finding.update(overrides)
+        return finding
+
+    def envelope(self, finding):
+        return {"document": {"findings": [finding]}}
+
+    def carry(self, before, now, exclude=frozenset()):
+        findings = [now]
+        ids = audit_report.carry_unchanged_findings(
+            findings, self.envelope(before), exclude=set(exclude)
+        )
+        return ids, findings[0]
+
+    def test_rewritten_prose_on_identical_evidence_is_reverted(self):
+        now = self.before(
+            title="spot-pool is a single-zone autoscaling node pool",
+            impact="This Standard cluster's Spot pool is locked to us-east4-a.",
+            recommendation={"action": "Add one or more additional zones."},
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, ["single-zone-nodepool.spot._.nodepool-spot-pool"])
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertEqual(out["impact"], "A zonal stockout halts autoscaling for this pool.")
+        self.assertEqual(out["recommendation"], {"action": "Add us-east4-b and us-east4-c."})
+
+    def test_a_remediation_that_drops_a_zone_does_not_survive(self):
+        # The live pair. One run proposed [us-east4-b, us-east4-c] for a pool
+        # whose only nodes are in us-east4-a; the next proposed all three.
+        keep = {"kind": "manual", "note": "nodeLocations: [a, b, c]"}
+        ids, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "nodeLocations: [b, c]"}),
+        )
+        self.assertEqual(out["remediation"], keep)
+        self.assertTrue(ids)
+
+    def test_a_gcloud_remediation_is_not_demoted_to_manual(self):
+        # Eight live pairs flip between an executable command and a paragraph.
+        keep = {"kind": "gcloud", "note": "gcloud container clusters update ..."}
+        _, out = self.carry(
+            self.before(remediation=keep),
+            self.before(remediation={"kind": "manual", "note": "Work it out."}),
+        )
+        self.assertEqual(out["remediation"], keep)
+
+    def test_evidence_that_moved_is_authored_fresh(self):
+        now = self.before(
+            title="a genuinely new title",
+            evidence=[{"command": "gcloud container node-pools list", "excerpt": "b"}],
+        )
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "a genuinely new title")
+
+    def test_a_finding_the_previous_run_never_saw_is_untouched(self):
+        now = self.before(id="single-zone-nodepool.other._.nodepool-x", title="fresh")
+        ids, out = self.carry(self.before(), now)
+        self.assertEqual(ids, [])
+        self.assertEqual(out["title"], "fresh")
+
+    def test_a_manifest_remediation_keeps_this_runs_path(self):
+        # Last run's path names a file *this* run never wrote, and this run's
+        # manifest is a real fix. Neither side may cross.
+        mine = {"kind": "manifest", "path": "clusters/spot/pool.yaml", "note": "n"}
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "by hand"}),
+            self.before(title="reworded", remediation=mine),
+        )
+        self.assertEqual(out["remediation"], mine)
+        # The prose still stabilises; only the remediation is held back.
+        self.assertEqual(out["title"], "spot-pool is locked to a single zone")
+        self.assertTrue(ids)
+
+    def test_a_degraded_finding_keeps_its_disclosure(self):
+        # `degrade_missing_remediations` has just rewritten this note to say a
+        # promised file never arrived. Carrying last run's note would drop it.
+        degraded = {"kind": "manual", "path": "", "note": "n _(The audit did not write it.)_"}
+        fid = "single-zone-nodepool.spot._.nodepool-spot-pool"
+        ids, out = self.carry(
+            self.before(remediation={"kind": "manual", "note": "clean"}),
+            self.before(title="reworded", remediation=degraded),
+            exclude={fid},
+        )
+        self.assertEqual(ids, [])
+        self.assertEqual(out["remediation"], degraded)
+        self.assertEqual(out["title"], "reworded")
+
+    def test_severity_is_never_carried(self):
+        # The collector computes severity. A change in it is a real change.
+        _, out = self.carry(self.before(), self.before(severity="critical"))
+        self.assertEqual(out["severity"], "critical")
+
+    def test_an_unknowable_memory_changes_nothing(self):
+        for envelope in (None, {}, {"document": None}, {"document": {"findings": "x"}}):
+            findings = [self.before(title="mine")]
+            self.assertEqual(
+                audit_report.carry_unchanged_findings(findings, envelope, exclude=set()), []
+            )
+            self.assertEqual(findings[0]["title"], "mine")
+
+    def test_an_identical_run_reports_nothing_carried(self):
+        ids, _ = self.carry(self.before(), self.before())
+        self.assertEqual(ids, [])
+
+
 class TestPublishedBodies(HarnessTestCase):
     """What reaches GitHub, read back off the `--body-file` the harness wrote.
 
@@ -2686,14 +2976,10 @@ class TestPublishedBodies(HarnessTestCase):
         )
 
     def test_the_refreshed_ledger_and_its_delta_carry_their_own_text(self):
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
-            generated_at=NOW,
+        self.seed_store(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
         self.assertEqual(self.run_finish(doc), 0)
@@ -2709,13 +2995,8 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertIn(f"`{derived_id(fid='a')}`", comments[0])
 
     def test_the_clean_comment_is_published_not_just_rendered(self):
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
-        )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.harness.replies = {"issue list": self.issue_list()}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
 
         comments = self.harness.bodies_for("issue", "comment")
@@ -2744,12 +3025,9 @@ class TestPublishedBodies(HarnessTestCase):
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
         # by default rather than by somebody remembering to add a test.
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
-        )
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
         self.harness.replies = {
             "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
             "pr create": "https://github.com/acme/fleet/pull/8\n",
         }
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
@@ -2764,14 +3042,10 @@ class TestPublishedBodies(HarnessTestCase):
 
 class TestFinishClean(HarnessTestCase):
     def test_clean_run_closes_the_open_ledger_as_completed(self):
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
-            generated_at=NOW,
+        self.seed_store(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")])
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
 
         rc = self.run_finish(make_doc(findings=[]))
         self.assertEqual(rc, 0)
@@ -2788,7 +3062,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("branch", "-D"))
 
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "CLEAN",
                 "issue_url": "https://github.com/acme/fleet/issues/42",
@@ -2799,6 +3073,10 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": (
+                    "Security & RBAC Posture Audit: clean, ledger closed "
+                    "(2 resolved) — https://github.com/acme/fleet/issues/42"
+                ),
             },
         )
 
@@ -2819,7 +3097,7 @@ class TestFinishClean(HarnessTestCase):
         self.assertFalse(self.harness.matching("issue", "close"))
         self.assertFalse(self.harness.gh_calls("issue", "comment"))
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("inspect_s", "publish_s", "collect_s"),
             {
                 "status": "CLEAN",
                 "issue_url": None,
@@ -2830,6 +3108,7 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
+                "chat_summary": "[SILENT]",
             },
         )
 
@@ -2954,6 +3233,67 @@ class TestStart(HarnessTestCase):
                     f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
                 )
 
+    def start_as(self, session, audit_id=AUDIT):
+        """Run `start` as a named hermes session, the way a cron dispatch does.
+
+        `_HELD_LOCK` is cleared first because every real `start` is its own
+        process and begins holding nothing. Left set, the second call in a test
+        looks like one process that took the lock and then met a refusal, and
+        the failure path hands back a claim this run never wrote.
+        """
+        self.out = ""
+        self.harness.replies = {"issue list": "[]"}
+        audit_report._HELD_LOCK = None
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": session}):
+            return self.run_main(["start", "--audit", audit_id])
+
+    def test_a_run_that_lost_its_context_resumes_rather_than_being_refused(self):
+        """The recovery that two runs reached for `--steal-lock` to get.
+
+        A long audit's context is compacted mid-flight; the agent re-reads the
+        skill from the top and calls `start` again. Refusing that used to be the
+        end of the road — and the refusal recommended `--steal-lock`, so twice a
+        run took the stream from itself ~21 minutes in, resetting the `t0` that
+        `inspect_s` is measured from. The stream is already this run's, so hand
+        it back: same workspace, same findings, same start time.
+        """
+        self.assertEqual(self.start_as("cron_compliance_1"), 0)
+        first = json.loads(self.out)
+        held = json.loads(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        )
+        # Work the compacted run had already done, which a scrub would destroy.
+        Path(first["findings_path"]).write_text('{"findings": []}', encoding="utf-8")
+
+        self.assertEqual(self.start_as("cron_compliance_1"), 0)
+        self.assertEqual(json.loads(self.out), first)
+        self.assertEqual(
+            Path(first["findings_path"]).read_text(encoding="utf-8"),
+            '{"findings": []}',
+        )
+        # Same claim, so `inspect_s` still measures from when the run really
+        # began rather than from the moment it re-entered.
+        self.assertEqual(
+            json.loads(audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")),
+            held,
+        )
+
+    def test_a_genuinely_different_run_is_still_refused(self):
+        # The resume must not become a way for a second dispatch to join the
+        # first: two runs writing one stream is what the lock exists to stop.
+        self.assertEqual(self.start_as("cron_compliance_1"), 0)
+        held = audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        self.assertEqual(self.start_as("cron_compliance_2"), 3)
+        self.assertEqual(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8"), held
+        )
+
+    def test_without_a_session_id_the_old_refusal_stands(self):
+        # Off-cluster there is no run identity to key on, so nothing is
+        # recognised as ours and the behaviour is the one from before resume.
+        self.assertEqual(self.start_as(""), 0)
+        self.assertEqual(self.start_as(""), 3)
+
     def test_the_workspace_is_named_so_manifests_can_be_written_into_it(self):
         # The agent does not start in a working tree, so a `remediation.path`
         # is meaningless unless `start` says what it is relative to.
@@ -3023,10 +3363,63 @@ class TestStart(HarnessTestCase):
         self.unclone()
         self.harness.replies = {"issue list": "[]"}
         self.run_main(["start", "--audit", AUDIT])
+        # The run in between. `start` holds the stream until a `finish`
+        # releases it (§4.3), so without this the second dispatch is refused
+        # before it reaches git at all — which is the next test.
+        audit_report.release_run_lock(AUDIT)
         self.harness.calls.clear()
         self.run_main(["start", "--audit", AUDIT])
         self.assertFalse([c for c in self.harness.calls if c[:2] == ["git", "clone"]])
         self.assertTrue(self.harness.matching("git", "fetch"))
+
+    def test_a_second_start_is_refused_while_a_live_run_holds_the_stream(self):
+        """A stream has two dispatchers, so this is an ordinary Tuesday.
+
+        The refusal has to land before `ensure_workspace(..., reset=True)`,
+        which scrubs the stream's GitOps tree: a second dispatch that got that
+        far would delete the live run's manifests on its way to being told no.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        holder = json.loads(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
+        )
+        self.harness.calls.clear()
+
+        # 3, not 1 or 2: a double dispatch is a normal outcome and a caller
+        # must be able to tell it from a rejected document or a crash.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 3)
+        self.assertIn("RUN IN PROGRESS", self.err)
+        self.assertIn(str(holder["pid"]), self.err)
+        self.assertIn(holder["t0"], self.err)
+        self.assertIn(str(audit_report.started_path_for(AUDIT)), self.err)
+        self.assertEqual(self.harness.calls, [])
+
+    def test_start_proceeds_once_the_held_claim_is_past_the_ceiling(self):
+        """The stream must recover on its own from a run that never finished."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        path = audit_report.started_path_for(AUDIT)
+        claim = json.loads(path.read_text(encoding="utf-8"))
+        dead = time.time() - audit_report.RUN_LOCK_CEILING_S - 60
+        claim["epoch"] = dead
+        claim["t0"] = datetime.fromtimestamp(dead, timezone.utc).isoformat()
+        path.write_text(json.dumps(claim), encoding="utf-8")
+
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertNotEqual(
+            json.loads(path.read_text(encoding="utf-8"))["nonce"], claim["nonce"]
+        )
+
+    def test_steal_lock_takes_the_stream_from_a_live_claim(self):
+        """The operator override, for a run known dead before its expiry."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        path = audit_report.started_path_for(AUDIT)
+        held = json.loads(path.read_text(encoding="utf-8"))["nonce"]
+
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--steal-lock"]), 0)
+        self.assertNotEqual(json.loads(path.read_text(encoding="utf-8"))["nonce"], held)
 
     def test_a_stale_findings_file_is_removed(self):
         # A crashed run must not leave a document for the next one to publish.
@@ -3406,6 +3799,29 @@ class TestRenderBudget(BaseTestCase):
         body = self.render(make_doc(findings=bulk_findings(250)))
         self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
 
+    def test_truncation_notice_breaks_the_omitted_set_down_by_severity(self):
+        # A count alone leaves the reader to guess what fell off, and the
+        # sentence that used to guess for them ("the omitted findings are the
+        # least severe") is wrong whenever one severity overflows the budget
+        # by itself. Live run 2026-08-29 omitted 31 criticals under it.
+        findings = bulk_findings(250, severity="critical") + bulk_findings(
+            40, severity="major", prefix="m"
+        )
+        body = self.render(make_doc(findings=findings))
+        self.assertRegex(body, r"are omitted from this description[^_]*\d+ critical")
+        self.assertRegex(body, r"are omitted from this description[^_]*\d+ major")
+        self.assertNotIn("the omitted findings are the least severe", body)
+
+    def test_truncation_notice_omits_severities_that_all_rendered(self):
+        # The breakdown lists only what was actually dropped: a "0 major" in a
+        # notice about omissions reads as a fourth thing to go and check.
+        body = self.render(make_doc(findings=bulk_findings(250, severity="critical")))
+        notice = re.search(r"_\d+ further finding\(s\) are omitted.*?_", body, re.S)
+        self.assertIsNotNone(notice)
+        self.assertIn("critical", notice.group(0))
+        self.assertNotIn("major", notice.group(0))
+        self.assertNotIn("minor", notice.group(0))
+
     def test_title_carries_the_true_total_even_when_truncated(self):
         findings = bulk_findings(250)
         body = self.render(make_doc(findings=findings))
@@ -3555,23 +3971,21 @@ class TestFindingAnchors(BaseTestCase):
         without_comments = re.sub(r"<!--.*?-->", "", rendered, flags=re.S)
         self.assertIn("`f-1`", without_comments)
 
-    def test_the_anchor_does_not_break_title_recovery(self):
-        """FINDING_MARKER_RE runs to end of line.
+    def test_the_marker_is_the_last_thing_on_its_heading_line(self):
+        """The `finding:` comment is a published join key, so its shape is a
+        contract with readers that did not generate the body.
 
-        Putting the anchor on the heading instead of above it would stop the
-        regex matching, and the failure would surface a run later as a resolved
-        finding the delta comment could not name.
+        The harness itself stopped parsing it when §4.8 moved resolved-finding
+        titles onto the report store's stored document, so nothing in this
+        repository fails if the anchor migrates onto the heading — which is
+        exactly why the shape is pinned here instead.
         """
-        findings = [make_finding(fid="f-1", title="A real title")]
-        titles = audit_report.parse_finding_titles(self.body(findings))
-        self.assertEqual(titles, {"f-1": "A real title"})
-
-    def test_a_recovered_title_carries_no_markup(self):
-        title = audit_report.parse_finding_titles(
-            self.body([make_finding(fid="f-1", title="A real title")])
-        )["f-1"]
-        self.assertNotIn("<a", title)
-        self.assertNotIn("href", title)
+        body = self.body([make_finding(fid="f-1", title="A real title")])
+        self.assertIn(
+            '<a id="user-content-finding-f-1"></a>\n\n'
+            "#### A real title <!-- finding:f-1 -->\n",
+            body,
+        )
 
 
 class TestIndexOverhead(BaseTestCase):
@@ -3740,6 +4154,25 @@ class TestScopeLimitations(BaseTestCase):
         )
         with self.assertRaises(audit_report.ValidationError):
             audit_report.validate_findings(doc, AUDIT)
+
+    def test_an_omitted_skipped_list_is_written_back_as_empty(self):
+        # Omitting the key is allowed, and the document that comes back is what
+        # the report store keeps. `report_status` projects an absent list as
+        # `None` and an empty one as 0, on purpose -- so a run that skipped
+        # nothing has to say so, or it reads as a run that does not report
+        # skips. Live, `stockout-prevention` was the one stream of eight whose
+        # published scope had no `skipped`, and the only one whose count came
+        # back `None`.
+        doc = make_doc(findings=[])
+        del doc["scope"]["skipped"]
+        out = audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(out["scope"]["skipped"], [])
+
+    def test_a_declared_skipped_list_survives_validation(self):
+        entries = [{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        doc = make_doc(findings=[], skipped=entries)
+        out = audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(out["scope"]["skipped"], entries)
 
 
 class TestFindingIdCharset(BaseTestCase):
@@ -4749,9 +5182,2130 @@ class TestLabelDescriptions(HarnessTestCase):
 
     def test_the_stale_closed_label_is_among_them(self):
         # The guard above is only worth having while this label is in scope.
-        self.assertIn(
-            audit_report.STALE_CLOSED_LABEL, self.descriptions(AUDIT)
+        self.assertIn(audit_report.STALE_CLOSED_LABEL, self.descriptions(AUDIT))
+
+
+class TestEnsureLabelsCaching(HarnessTestCase):
+    """One `label list`, then create only what is missing.
+
+    Seven unconditional creates per subcommand were fourteen network round
+    trips on a plain run. The list is a cache, not a gate: any failure to
+    read it falls back to creating everything, because under-creating is the
+    dangerous direction — `pr_closed_by_harness` reads STALE_CLOSED_LABEL,
+    and a label that quietly never exists makes every harness close read as
+    a human rejection.
+    """
+
+    def creates(self):
+        return [c for c in self.harness.calls if c[:3] == ["gh", "label", "create"]]
+
+    def all_label_names(self):
+        # Learned from the code path itself (list unavailable → create all),
+        # so this test cannot drift from the label roster.
+        self.harness.failures = {"label list": 1}
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        names = [c[3] for c in self.creates()]
+        self.harness.calls.clear()
+        self.harness.failures = {}
+        return names
+
+    def test_existing_labels_are_not_recreated(self):
+        names = self.all_label_names()
+        self.assertEqual(len(names), 7)
+        self.harness.replies = {
+            "label list": json.dumps([{"name": n} for n in names])
+        }
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual(self.creates(), [])
+
+    def test_missing_labels_are_created(self):
+        names = self.all_label_names()
+        present = [n for n in names if n != audit_report.STALE_CLOSED_LABEL]
+        self.harness.replies = {
+            "label list": json.dumps([{"name": n} for n in present])
+        }
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual([c[3] for c in self.creates()], [audit_report.STALE_CLOSED_LABEL])
+
+    def test_a_failed_list_falls_back_to_creating_everything(self):
+        self.harness.failures = {"label list": 1}
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual(len(self.creates()), 7)
+
+    def test_garbage_list_output_falls_back_to_creating_everything(self):
+        self.harness.replies = {"label list": "not json"}
+        audit_report.ensure_labels("acme/fleet", AUDIT)
+        self.assertEqual(len(self.creates()), 7)
+
+
+class TestTiming(HarnessTestCase):
+    """`inspect_s`/`publish_s`/`duration_s` are telemetry: measured when
+    possible, null when not, and never able to fail a run."""
+
+    def test_start_writes_a_parseable_t0(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        t0 = audit_report.read_phase_t0(AUDIT)
+        self.assertIsNotNone(t0)
+        self.assertIsNotNone(t0.tzinfo)
+
+    def test_the_claim_records_the_writing_process_pid(self):
+        # The pid is what a refusal names, so a person can go and look at the
+        # run that is holding the stream.
+        audit_report.take_run_lock(AUDIT, datetime.now(timezone.utc))
+        raw = json.loads(
+            audit_report.started_path_for(AUDIT).read_text(encoding="utf-8")
         )
+        self.assertEqual(raw["pid"], os.getpid())
+
+    def test_finish_measures_inspect_s_from_start_s_t0(self):
+        audit_report.take_run_lock(
+            AUDIT, datetime.now(timezone.utc) - timedelta(seconds=90)
+        )
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        payload = self.stdout_json()
+        self.assertGreaterEqual(payload["inspect_s"], 90.0)
+        self.assertIsInstance(payload["publish_s"], (int, float))
+
+    def test_finish_without_a_start_record_reports_null_not_an_error(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_a_garbage_start_record_degrades_to_null(self):
+        started = audit_report.started_path_for(AUDIT)
+        started.parent.mkdir(parents=True, exist_ok=True)
+        started.write_text("not json", encoding="utf-8")
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_a_t0_in_the_future_degrades_to_null(self):
+        # A clock that moved backwards between the two processes reads as "no
+        # measurement", never as a negative duration.
+        audit_report.take_run_lock(
+            AUDIT, datetime.now(timezone.utc) + timedelta(hours=1)
+        )
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["inspect_s"])
+
+    def test_read_phase_t0_reads_the_claim_start_wrote(self):
+        t0 = datetime(2026, 8, 26, 6, 0, 30, tzinfo=timezone.utc)
+        audit_report.take_run_lock(AUDIT, t0)
+        self.assertEqual(audit_report.read_phase_t0(AUDIT), t0)
+
+    def test_read_phase_t0_is_none_on_every_unusable_claim(self):
+        """Timing is telemetry: a t0 `finish` cannot use degrades, never raises.
+
+        A naive timestamp is in here because it is the one that does not look
+        broken. Subtracting it from an aware `now` raises `TypeError` deep
+        inside `inspect_seconds`, which no caller catches — so the whole
+        publish would fail over a telemetry field.
+        """
+        started = audit_report.started_path_for(AUDIT)
+        started.parent.mkdir(parents=True, exist_ok=True)
+        cases = {
+            "unparseable": "{ not json",
+            "not an object": '["a-claim"]',
+            "no t0": json.dumps({"pid": 7, "nonce": "abc", "epoch": 0.0}),
+            "naive t0": json.dumps({"t0": "2026-08-26T06:00:00", "pid": 7}),
+        }
+        # Asserted first so the loop below cannot pass by never writing a file.
+        audit_report._unlink(str(started))
+        self.assertIsNone(audit_report.read_phase_t0(AUDIT))
+        for label, body in cases.items():
+            with self.subTest(claim=label):
+                started.write_text(body, encoding="utf-8")
+                self.assertIsNone(audit_report.read_phase_t0(AUDIT))
+
+    def test_collector_seconds_from_a_manifests_endpoints(self):
+        manifest = {"started_at": "2026-08-26T06:00:00Z", "finished_at": "2026-08-26T06:03:30Z"}
+        self.assertEqual(audit_report.collector_seconds(manifest), 210.0)
+
+    def test_collector_seconds_is_none_without_a_manifest(self):
+        self.assertIsNone(audit_report.collector_seconds(None))
+
+    def test_collector_seconds_degrades_on_a_garbage_timestamp(self):
+        self.assertIsNone(audit_report.collector_seconds({"started_at": "not-a-time", "finished_at": "also-not"}))
+
+    def test_an_unwritable_scratch_dir_does_not_fail_start(self):
+        # Nothing `start` needs lives in SCRATCH_DIR any more — t0 moved into
+        # the lock's claim (§4.5) and the body-file writer falls back to the
+        # system temp directory — so a scratch directory it cannot create must
+        # cost nothing at all, not even a non-zero exit.
+        self.harness.replies = {"issue list": "[]"}
+        with patch.object(
+            audit_report.os, "makedirs", side_effect=OSError("read-only file system")
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertIsNotNone(audit_report.read_phase_t0(AUDIT))
+
+
+# --------------------------------------------------------------------------- #
+# The run lock (§4.3)
+# --------------------------------------------------------------------------- #
+
+# Four racers over three rounds: enough that every property below fails if the
+# protocol is wrong, cheap enough to run on every pull request. The exhaustive
+# version — 16 processes x 60 rounds against the deployed 9p/gVisor PVC — is
+# what found the steal-token bug, and it ran out of band (§4.3).
+LOCK_RACERS = 4
+LOCK_ROUNDS = 3
+# A racer that cannot make progress reports it instead of hanging the suite.
+LOCK_DEADLINE_S = 60
+
+
+def _race_for_the_lock(reports_dir, audit_id, barrier, results, steal):
+    """One racer, in its own process, released with the others at the barrier.
+
+    Spawned rather than forked, so it re-points the store itself: `REPORTS_DIR`
+    is a module global and the parent's `patch.object` does not cross a process
+    boundary.
+    """
+    audit_report.REPORTS_DIR = reports_dir
+    barrier.wait()
+    try:
+        nonce = audit_report.acquire_run_lock(
+            audit_id, datetime.now(timezone.utc), steal=steal
+        )
+    except audit_report.RunInProgress:
+        results.put(("refused", None))
+    except BaseException as exc:  # noqa: BLE001 — anything else *is* the finding
+        results.put(("raised", f"{type(exc).__name__}: {exc}"))
+    else:
+        results.put(("won", nonce))
+
+
+def _churn_the_lock(reports_dir, audit_id, barrier, results, rounds):
+    """Acquire, hold, release — `rounds` times, against every other racer.
+
+    Reports the first violation it sees rather than asserting: a failed
+    assertion in a child is an exit code the parent has to guess at.
+    """
+    audit_report.REPORTS_DIR = reports_dir
+    barrier.wait()
+    deadline = time.monotonic() + LOCK_DEADLINE_S
+    for _ in range(rounds):
+        while True:
+            if time.monotonic() > deadline:
+                results.put(("starved", None))
+                return
+            try:
+                nonce = audit_report.acquire_run_lock(
+                    audit_id, datetime.now(timezone.utc)
+                )
+                break
+            except audit_report.RunInProgress:
+                time.sleep(0.005)
+            except BaseException as exc:  # noqa: BLE001
+                results.put(("raised", f"{type(exc).__name__}: {exc}"))
+                return
+        # Nobody else may be admitted while this claim is young, so the file
+        # has to still name this nonce at both ends of the round. A second
+        # admission can only arrive as a steal, which replaces the nonce.
+        held = (audit_report.read_run_claim(audit_id) or {}).get("nonce")
+        time.sleep(0.005)
+        still = (audit_report.read_run_claim(audit_id) or {}).get("nonce")
+        if (held, still) != (nonce, nonce):
+            results.put(("double-admitted", f"{nonce}: saw {held} then {still}"))
+            return
+        audit_report.release_run_lock(audit_id)
+    results.put(("ok", None))
+
+
+class TestRunLock(BaseTestCase):
+    """§4.3's mutual exclusion, raced by real processes.
+
+    Threads share one file-descriptor table and one interpreter, so a protocol
+    that separate processes break can still pass under them. These therefore
+    spawn: N children, one barrier, one directory, and the parent counts who
+    got in.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = Path(audit_report.REPORTS_DIR) / AUDIT
+        self.store.mkdir(parents=True)
+
+    def held_nonce(self):
+        return (audit_report.read_run_claim(AUDIT) or {}).get("nonce")
+
+    def plant_claim(self, age_s, *, nonce="planted", **extra):
+        """The `started.json` a run started `age_s` ago would have left behind.
+
+        `instance` is None deliberately. The container-identity rule (§4.3)
+        would otherwise call every planted claim dead on a Linux runner and
+        alive on a developer's machine, and these tests are about the ceiling;
+        the identity rule has its own test below.
+        """
+        epoch = time.time() - age_s
+        claim = {
+            "audit": AUDIT,
+            "t0": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+            "epoch": epoch,
+            "pid": 4242,
+            "nonce": nonce,
+            "instance": None,
+        }
+        claim.update(extra)
+        audit_report.started_path_for(AUDIT).write_text(
+            json.dumps(claim), encoding="utf-8"
+        )
+        return claim
+
+    def race(self, worker, *args, racers=LOCK_RACERS):
+        """Release `racers` processes at one barrier; return what each reported."""
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(racers)
+        results = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=worker,
+                args=(str(audit_report.REPORTS_DIR), AUDIT, barrier, results, *args),
+            )
+            for _ in range(racers)
+        ]
+        for proc in procs:
+            proc.start()
+        try:
+            # Drained before the join, never after: a child blocks writing to a
+            # full pipe until somebody reads it, so joining first can deadlock.
+            outcomes = [results.get(timeout=LOCK_DEADLINE_S) for _ in procs]
+            for proc in procs:
+                proc.join(timeout=LOCK_DEADLINE_S)
+                self.assertEqual(proc.exitcode, 0, "a racer died instead of reporting")
+        finally:
+            for proc in procs:
+                if proc.is_alive():
+                    proc.terminate()
+                proc.join(timeout=LOCK_DEADLINE_S)
+        return outcomes
+
+    def winners(self, outcomes):
+        """The nonces that were admitted, having failed on anything unexpected."""
+        self.assertEqual([o for o in outcomes if o[0] == "raised"], [], outcomes)
+        self.assertEqual(
+            {state for state, _ in outcomes} - {"won", "refused"}, set(), outcomes
+        )
+        return [nonce for state, nonce in outcomes if state == "won"]
+
+    def test_a_cold_race_on_an_empty_store_admits_exactly_one(self):
+        winners = self.winners(self.race(_race_for_the_lock, False))
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.held_nonce(), winners[0])
+        # And the losers took their claim files with them. A `.claim-*` left
+        # behind is one file per refused dispatch, for the life of the volume.
+        self.assertEqual([p.name for p in self.store.iterdir()], ["started.json"])
+
+    def test_a_fresh_claim_is_never_stolen(self):
+        planted = self.plant_claim(0.0)
+        outcomes = self.race(_race_for_the_lock, False)
+        self.assertEqual(self.winners(outcomes), [])
+        self.assertEqual(self.held_nonce(), planted["nonce"])
+
+    def test_exactly_one_process_steals_a_claim_past_the_ceiling(self):
+        """The property whose first implementation was wrong.
+
+        The stealer used to unlink its `.steal-<nonce>` token in a `finally`,
+        so a racer that had read the same dead claim found the token free and
+        replaced the new owner — two winners on 5 of 25 rounds. The token now
+        survives its own steal, and this is the test that says so.
+        """
+        planted = self.plant_claim(audit_report.RUN_LOCK_CEILING_S + 60)
+        winners = self.winners(self.race(_race_for_the_lock, False))
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.held_nonce(), winners[0])
+        # Named for the dead claim rather than for the winner, and still here:
+        # deleting it is what let the second stealer in.
+        self.assertTrue((self.store / f".steal-{planted['nonce']}").exists())
+
+    def test_a_forced_steal_of_a_live_holder_has_one_winner(self):
+        """`--steal-lock` declares the holder observed at entry dead, so two
+        operators overriding at once still resolve to one run rather than
+        stealing past each other."""
+        self.plant_claim(0.0)
+        winners = self.winners(self.race(_race_for_the_lock, True))
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.held_nonce(), winners[0])
+
+    def test_the_refusal_never_advertises_the_override(self):
+        """The regression guard for two runs that stole their own lock.
+
+        A claim from a departed container, and one past the ceiling, are both
+        retired without anyone reading prose — so the only refusal that ever
+        reaches a reader is a *live* holder, and the message used to close with
+        "To override now, re-run `start --steal-lock`". That advice was wrong
+        every time it was shown. Twice an audit took it and stole the stream
+        from itself ~21 minutes into its own run.
+        """
+        message = str(
+            audit_report.RunInProgress(
+                AUDIT, {"t0": "2026-01-01T00:00:00+00:00", "pid": 7, "session": "cron_x"}
+            )
+        )
+        self.assertNotIn("steal", message.lower())
+        # Still says who holds it, so a report can name the run it lost to.
+        self.assertIn("cron_x", message)
+        self.assertIn("7", message)
+
+    def test_a_claim_records_the_run_that_wrote_it(self):
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "cron_x"}):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+            self.assertEqual(audit_report.own_run_claim(AUDIT), audit_report.read_run_claim(AUDIT))
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "cron_y"}):
+            self.assertIsNone(audit_report.own_run_claim(AUDIT))
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": ""}):
+            self.assertIsNone(audit_report.own_run_claim(AUDIT))
+
+    def test_acquire_release_churn_never_double_admits(self):
+        outcomes = self.race(_churn_the_lock, LOCK_ROUNDS)
+        self.assertEqual([o for o in outcomes if o != ("ok", None)], [], outcomes)
+        # Every round released, so the stream is free at the end.
+        self.assertFalse(audit_report.started_path_for(AUDIT).exists())
+
+
+class TestRunLockAntiWedge(BaseTestCase):
+    """Every way a claim is dead on sight, and each is its own test.
+
+    A lock that can block real work forever is worse than no lock at all — the
+    stream stops auditing and says nothing — so each of these is a route out
+    of a wedge rather than a variation on one theme.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = Path(audit_report.REPORTS_DIR) / AUDIT
+        self.store.mkdir(parents=True)
+        self.started = audit_report.started_path_for(AUDIT)
+
+    def plant(self, claim):
+        self.started.write_text(json.dumps(claim), encoding="utf-8")
+
+    def live_claim(self, **extra):
+        now = time.time()
+        claim = {
+            "audit": AUDIT,
+            "t0": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "epoch": now,
+            "pid": 4242,
+            "nonce": "planted",
+        }
+        claim.update(extra)
+        return claim
+
+    def acquired_nonce(self):
+        nonce = audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+        self.assertEqual(
+            json.loads(self.started.read_text(encoding="utf-8"))["nonce"], nonce
+        )
+        return nonce
+
+    def test_a_claim_from_another_container_is_dead_on_sight(self):
+        """The most common death is the pod: OOM-killed, evicted, or rolled.
+
+        No amount of waiting revives that claim, so the ceiling is collapsed to
+        zero rather than made to expire. `pod_instance` is patched so this runs
+        everywhere — CI has no `/proc/1/stat`, and a cover only exercised on a
+        cluster is a cover nothing gates on. The test below covers the reading.
+        """
+        self.patch_attr("pod_instance", lambda: "the-container-running-now")
+        self.plant(self.live_claim(instance="a-container-that-no-longer-runs"))
+        self.assertNotEqual(self.acquired_nonce(), "planted")
+
+    def test_a_claim_from_this_container_is_left_alone(self):
+        # The other side of the same rule, and the one that matters more: this
+        # signal may only ever make a claim *more* stealable. A bug here steals
+        # the lock out from under the run that is holding it.
+        self.patch_attr("pod_instance", lambda: "the-container-running-now")
+        self.plant(self.live_claim(instance="the-container-running-now"))
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    def test_a_claim_carrying_no_instance_is_judged_on_age_alone(self):
+        # Claims written before this field existed, and every off-cluster run.
+        # Abstaining is the safe direction; treating "absent" as "foreign" would
+        # make every such claim instantly stealable.
+        self.patch_attr("pod_instance", lambda: "the-container-running-now")
+        self.plant(self.live_claim())
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    @unittest.skipIf(
+        audit_report.pod_instance() is None,
+        "no /proc/1/stat here, so container identity cannot be read",
+    )
+    def test_the_container_identity_is_readable_and_stable(self):
+        # The reading half, which only a container can check: `/proc/1/stat`'s
+        # comm field can contain spaces and parentheses, so the parse splits on
+        # the last ") " rather than on whitespace. Verified on the live gVisor
+        # pod too (§4.3) — there /proc is node-scoped, so it is the start ticks
+        # rather than the boot id that turn over when the pod restarts.
+        first = audit_report.pod_instance()
+        self.assertTrue(first)
+        self.assertEqual(first, audit_report.pod_instance())
+
+    def test_a_future_dated_claim_is_dead_rather_than_immortal(self):
+        # A clock stepped backwards on the reader, or a bad write, dates a
+        # claim ahead of now — and a claim that never ages holds the stream
+        # for good. Past the ceiling in that direction it is not credible.
+        ahead = time.time() + audit_report.RUN_LOCK_CEILING_S + 60
+        self.plant(
+            self.live_claim(
+                epoch=ahead, t0=datetime.fromtimestamp(ahead, timezone.utc).isoformat()
+            )
+        )
+        self.assertNotEqual(self.acquired_nonce(), "planted")
+
+    def test_a_claim_just_inside_the_ceiling_is_still_live(self):
+        # The live side of the ceiling, bracketing
+        # `test_exactly_one_process_steals_a_claim_past_the_ceiling` above:
+        # without this pair, a ceiling quietly shortened to minutes reads as a
+        # working lock while every long audit gets stolen out from under
+        # itself. The slowest observed run is ~20 minutes.
+        inside = time.time() - audit_report.RUN_LOCK_CEILING_S + 60
+        self.plant(
+            self.live_claim(
+                epoch=inside,
+                t0=datetime.fromtimestamp(inside, timezone.utc).isoformat(),
+            )
+        )
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    def test_a_claim_dated_slightly_ahead_is_still_live(self):
+        # The other side of the same rule: a few seconds of skew between two
+        # pods is ordinary, and must not make a running audit stealable.
+        ahead = time.time() + 60
+        self.plant(
+            self.live_claim(
+                epoch=ahead, t0=datetime.fromtimestamp(ahead, timezone.utc).isoformat()
+            )
+        )
+        with self.assertRaises(audit_report.RunInProgress):
+            audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+
+    def test_an_unreadable_claim_is_dead_rather_than_a_permanent_wedge(self):
+        """One bad write must not cost the stream every future run.
+
+        A file nobody can parse carries no evidence that a run is in flight,
+        so it is treated as a holder already past its ceiling — the direction
+        that recovers rather than the one that stops the audit for good.
+        """
+        for label, body in {
+            "truncated json": '{"audit": "compliance-au',
+            "not json at all": "\x00\x01binary",
+            "a list": '["a-claim"]',
+            "empty": "",
+        }.items():
+            with self.subTest(claim=label):
+                # A fresh store per shape: each is its own incident, and a
+                # shared directory would carry the previous shape's steal
+                # token into the next one — see the test below, which is what
+                # that collision is.
+                shutil.rmtree(self.store)
+                self.store.mkdir(parents=True)
+                self.started.write_text(body, encoding="utf-8")
+                self.assertTrue(self.acquired_nonce())
+                audit_report.release_run_lock(AUDIT)
+
+    def test_a_second_corrupt_claim_is_not_wedged_by_the_first_steal_token(self):
+        """Two torn writes to one stream, hours apart, must both be stealable.
+
+        The prune-by-age rule is safe "unconditionally" only because a stolen
+        nonce can never be asked for again (§4.3), and an unparseable claim has
+        no nonce of its own to make that true. Stub every one of them with the
+        same literal and the second incident asks for the token the first left
+        behind, the link fails, and the stream is refused until the token ages
+        out — with `--steal-lock`, the override that exists for exactly this,
+        unable to clear it either. `_corrupt_claim_nonce` is why it does not:
+        the identity comes from the file's inode and mtime, so two torn writes
+        name two tokens, while two processes racing *one* torn write still name
+        the same one and only one of them steals.
+        """
+        self.started.write_text('{"audit": "compliance-au', encoding="utf-8")
+        audit_report.acquire_run_lock(AUDIT, datetime.now(timezone.utc))
+        audit_report.release_run_lock(AUDIT)
+
+        self.started.write_text("also { truncated", encoding="utf-8")
+        self.assertTrue(self.acquired_nonce())
+
+    def test_two_racers_on_one_corrupt_claim_still_yield_one_stealer(self):
+        """The other half of the rule above, and the one it must not break.
+
+        A per-file nonce fixes the wedge; a per-*reader* one would trade it for
+        the double-steal the 16-process torture run caught, because two racers
+        would name two tokens and both would link. Same file, two reads, one
+        name.
+        """
+        self.started.write_text("{ torn", encoding="utf-8")
+        first = audit_report.read_run_claim(AUDIT)["nonce"]
+        second = audit_report.read_run_claim(AUDIT)["nonce"]
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, "corrupt")
+
+    def test_a_start_that_fails_after_taking_the_lock_gives_it_back(self):
+        """The cover that fires most often, and the ceiling is wrong for it.
+
+        `start` claims the stream on its first line and holds it until `finish`,
+        so a `start` that dies on the next one — Minty unreachable, the clone
+        refused — has claimed a run that will never happen. Left in place that
+        claim costs the stream two hours for a minute of outage, and the status
+        surface shows a run that never began as running and then as DIED.
+        """
+        self.patch_attr("resolve_repo", lambda: 1 / 0)
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 1)
+        self.assertFalse(self.started.exists())
+        # The point of giving it back: the retry is not refused. Exit 3 here
+        # would mean the stream had been wedged by its own failed dispatch.
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 1)
+
+    def test_a_failed_start_does_not_release_a_claim_that_was_stolen_from_it(self):
+        """Give back your own claim, not whatever happens to be there.
+
+        A `start` slow enough to fail past the ceiling can have its claim stolen
+        while it fails, and an unconditional unlink on the way out would then
+        drop a live run's lock — turning one broken dispatch into two runs
+        publishing over each other, which is the failure the lock exists for.
+        """
+        audit_report.take_run_lock(AUDIT, datetime.now(timezone.utc))
+        self.plant(self.live_claim(nonce="stole-it-mid-failure"))
+        audit_report.release_own_lock()
+        self.assertEqual(
+            json.loads(self.started.read_text(encoding="utf-8"))["nonce"],
+            "stole-it-mid-failure",
+        )
+
+    def test_a_refused_start_does_not_release_the_holders_claim(self):
+        """The `RunInProgress` path took no lock, so it gives none back."""
+        self.plant(self.live_claim())
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 3)
+        self.assertEqual(
+            json.loads(self.started.read_text(encoding="utf-8"))["nonce"], "planted"
+        )
+
+    def test_an_unwritable_store_degrades_to_an_unlocked_run(self):
+        """A telemetry directory must not be able to stop the audit.
+
+        This is the ConfigMap's lesson (§4.5) applied to the lock itself: a
+        store that cannot be written at all costs the mutual exclusion and a
+        WARNING, never the fleet's audit. A *live holder* is still a refusal —
+        that is the point of the lock — and that is the test above.
+        """
+        blocker = self.tmp_path / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        self.patch_attr("REPORTS_DIR", str(blocker))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(
+                audit_report.take_run_lock(AUDIT, datetime.now(timezone.utc))
+            )
+        self.assertIn("running unlocked", err.getvalue())
+        self.assertIn(AUDIT, err.getvalue())
+
+
+class TestStealTokenPruning(BaseTestCase):
+    """The steal token is litter by design, and pruned by age (§4.3).
+
+    Both halves are load-bearing: removed on success it lets a late racer
+    replace the new owner, kept forever it is one file per dead run for the
+    life of the volume.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = Path(audit_report.REPORTS_DIR) / AUDIT
+        self.store.mkdir(parents=True)
+
+    def test_old_tokens_go_young_ones_stay_and_nothing_else_is_touched(self):
+        now = time.time()
+        expired = self.store / ".steal-2f9c"
+        young = self.store / ".steal-7a11"
+        # Everything else the directory holds, aged past the ceiling too, so
+        # what selects a file for deletion is provably the name and not the
+        # mtime.
+        bystanders = [
+            self.store / "started.json",
+            self.store / "latest.json",
+            self.store / ".claim-2f9c.json",
+            self.store / "steal-2f9c",
+        ]
+        for path in (expired, young, *bystanders):
+            path.write_text("{}", encoding="utf-8")
+        stale = now - audit_report.RUN_LOCK_CEILING_S - 60
+        for path in (expired, *bystanders):
+            os.utime(path, (stale, stale))
+
+        audit_report.prune_steal_tokens(AUDIT, now=now)
+
+        self.assertFalse(expired.exists())
+        self.assertTrue(young.exists())
+        for path in bystanders:
+            self.assertTrue(path.exists(), path.name)
+
+    def test_a_stream_with_no_store_yet_is_not_an_error(self):
+        # `start` prunes before the first run of a stream has written anything.
+        audit_report.prune_steal_tokens("obtainability-audit")
+
+
+# --------------------------------------------------------------------------- #
+# The status surface: two files, and liveness read off them (§4.5)
+# --------------------------------------------------------------------------- #
+
+
+LIVENESS_ROWS = (
+    # started.json age in seconds (None: no claim), latest.json present, state
+    (None, False, "never"),
+    (None, True, "completed"),
+    (0.0, False, "running"),
+    (0.0, True, "running"),
+    # Just inside the ceiling. Without this row a ceiling shortened to minutes
+    # still reads as a working table.
+    (audit_report.RUN_LOCK_CEILING_S - 60, False, "running"),
+    (audit_report.RUN_LOCK_CEILING_S + 60, False, "died"),
+    (audit_report.RUN_LOCK_CEILING_S + 60, True, "died"),
+)
+
+
+def _liveness(audit_id, now):
+    """§4.5's truth table, evaluated against the store.
+
+    Restated here rather than imported: `report_status.py` projects these files
+    for the view, and this suite owns the files it projects. The rule is short
+    enough to restate because it is two presence checks and one ceiling — and
+    it uses the lock's own `_claim_is_dead`, so what the surface calls DIED and
+    what the next `start` is allowed to steal cannot disagree.
+    """
+    claim = audit_report.read_run_claim(audit_id)
+    if claim is None:
+        latest = audit_report.reports_dir_for(audit_id) / "latest.json"
+        return "completed" if latest.exists() else "never"
+    if audit_report._claim_is_dead(claim, now, audit_report.RUN_LOCK_CEILING_S):
+        return "died"
+    return "running"
+
+
+class TestLiveness(HarnessTestCase):
+    """Which of §4.5's four states the two files describe.
+
+    Presence beats timestamp comparison here, and the ceiling is wall-clock
+    rather than schedule-derived: the retired rule computed staleness from a
+    cron expression `next_fire` could parse two shapes of, so DIED arrived a
+    day late on a daily stream and never at all on any other shape.
+    """
+
+    def store(self):
+        return Path(audit_report.REPORTS_DIR) / AUDIT
+
+    def build(self, age, published):
+        """One stream in a known state: a claim of a given age, a report or not."""
+        shutil.rmtree(self.store(), ignore_errors=True)
+        if published:
+            audit_report.write_report(AUDIT, {"audit_id": AUDIT}, NOW)
+        if age is not None:
+            # The real acquire, not a hand-written file: the surface reads what
+            # the lock writes.
+            audit_report.take_run_lock(
+                AUDIT, datetime.now(timezone.utc) - timedelta(seconds=age)
+            )
+        self.assertEqual(audit_report.started_path_for(AUDIT).exists(), age is not None)
+        self.assertEqual((self.store() / "latest.json").exists(), published)
+
+    def test_the_truth_table(self):
+        for age, published, expected in LIVENESS_ROWS:
+            with self.subTest(started=age, latest=published, expect=expected):
+                self.build(age, published)
+                self.assertEqual(_liveness(AUDIT, time.time()), expected)
+
+    @unittest.skipIf(report_status is None, "report_status.py not importable here")
+    def test_the_projection_reads_the_same_table_off_the_same_files(self):
+        """`report_status.py` re-derives §4.5; it may not derive it differently.
+
+        The reader parses the two files itself rather than calling the lock, so
+        nothing but this test stops the two from drifting — and the shape that
+        drift takes is a stream the view shows as RUNNING that the next `start`
+        is already entitled to steal.
+        """
+        root = str(audit_report.REPORTS_DIR)
+        for age, published, expected in LIVENESS_ROWS:
+            with self.subTest(started=age, latest=published, expect=expected):
+                self.build(age, published)
+                self.assertEqual(
+                    report_status.liveness(
+                        report_status.load_started(root, AUDIT),
+                        report_status.load_latest(root, AUDIT),
+                        time.time(),
+                    ),
+                    expected,
+                )
+
+    def test_a_real_run_moves_the_stream_from_running_to_completed(self):
+        """The two commands, in order, against one store.
+
+        `finish` releasing the claim is what makes "a start record exists" and
+        "a run holds the stream" the same fact — so the status surface and the
+        mutual exclusion cannot disagree about what is in flight.
+        """
+        self.assertEqual(_liveness(AUDIT, time.time()), "never")
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(_liveness(AUDIT, time.time()), "running")
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(_liveness(AUDIT, time.time()), "completed")
+        self.assertFalse(audit_report.started_path_for(AUDIT).exists())
+        self.assertEqual(self.stored_envelope()["status"], "CLEAN")
+
+
+class TestReportStore(HarnessTestCase):
+    """§4.8's local report store: what `finish` keeps of the run it published.
+
+    Best-effort — nothing here may change an exit code — and read back twice
+    over: as the next run's delta memory, and as the chat path's answer to
+    "what did the audit find?". So its shape is a contract with
+    `read_report_memory` and with a reader holding nothing but the file.
+    """
+
+    def open_ledger(self, issue=7):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": f"https://github.com/acme/fleet/issues/{issue}\n",
+        }
+
+    def test_the_store_path_does_not_move_with_hermes_home(self):
+        """Writer and reader disagree if it does, and nothing says so.
+
+        `finish` runs only under a cron or kanban worker, and the dispatcher
+        spawns those with HERMES_HOME pointed at the profile directory
+        (`kanban_db.py`: ``env["HERMES_HOME"] = resolve_profile_env(...)``).
+        The chat session that reads the store back runs in the gateway process,
+        whose HERMES_HOME is the container's /opt/data. Root the store at
+        $HERMES_HOME and it is written to one path and read from another.
+
+        The reason this needs a test rather than care is that the failure is
+        silent in the direction that would catch it: the run-to-run delta is
+        worker-to-worker, so it agrees with itself whichever path it lands on,
+        and every store test above passes against a patched REPORTS_DIR. The
+        only symptom is the chat path never finding a report — which is the one
+        job §4.8 was added to do.
+        """
+        probe = "import audit_report; print(audit_report.REPORTS_DIR)"
+        seen = {}
+        for home in ("/opt/data", "/opt/data/profiles/platform"):
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k != "FLEET_AUDIT_REPORTS_DIR"
+            }
+            env["HERMES_HOME"] = home
+            env["PYTHONPATH"] = str(Path(audit_report.__file__).resolve().parent)
+            done = subprocess.run(
+                [sys.executable, "-c", probe],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            seen[home] = done.stdout.strip()
+
+        self.assertEqual(
+            seen["/opt/data/profiles/platform"],
+            seen["/opt/data"],
+            "REPORTS_DIR moves with HERMES_HOME: a cron/kanban worker would "
+            f"write to {seen['/opt/data/profiles/platform']} while the chat "
+            f"path reads {seen['/opt/data']}",
+        )
+
+    def test_a_finishing_run_stores_the_document_it_published(self):
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["audit_id"], AUDIT)
+        self.assertEqual(stored["status"], "OPENED")
+        self.assertEqual(stored["issue_number"], 7)
+        self.assertEqual(stored["issue_url"], "https://github.com/acme/fleet/issues/7")
+        self.assertEqual(stored["id_scheme"], audit_report.ID_SCHEME)
+        # Offset-aware, so a reader comparing two runs never has to guess
+        # which clock the pod was on.
+        self.assertIsNotNone(
+            datetime.fromisoformat(stored["finished_at"]).tzinfo, stored["finished_at"]
+        )
+        # The document, not a summary of it: the chat path renders findings
+        # from this key without going near GitHub.
+        self.assertEqual(
+            [f["id"] for f in stored["document"]["findings"]], [derived_id()]
+        )
+        self.assertEqual(stored["new_ids"], [derived_id()])
+        self.assertEqual(stored["resolved_ids"], [])
+
+    def test_the_envelope_keys_are_pinned(self):
+        """A rename here breaks a chat session, not a test, unless it breaks this.
+
+        The store's reader is a person asking the agent a question — there is
+        no schema between them and this dict, so the key set is the schema.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(
+            sorted(self.stored_envelope()),
+            [
+                "audit_id",
+                # The line the run posted, kept beside what it found — the only
+                # part of a scheduled run an operator ever sees.
+                "chat_summary",
+                "collect_s",
+                "coverage_gaps",
+                "current_ids",
+                "document",
+                "finished_at",
+                "id_scheme",
+                "inspect_s",
+                "issue_number",
+                "issue_url",
+                "new_ids",
+                "partial",
+                # The three the retired status ConfigMap's row carried and the
+                # envelope did not (§4.5). Dropping the object loses no
+                # recorded fact only if these are here.
+                "prs_closed",
+                "prs_opened",
+                "publish_s",
+                "resolved_ids",
+                "silent_ok",
+                "status",
+            ],
+        )
+
+    def test_the_pr_keys_are_urls_and_silent_ok_is_a_verdict(self):
+        """The row carried counts because etcd rations bytes; a file does not.
+
+        A count cannot be clicked, and the reader here is a person asking the
+        agent what the audit did — so `prs_opened` has to be the pull request
+        itself, not the number 1.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/8\n"
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(stored["prs_closed"], [])
+        # A run that opened a pull request said something, so it is not silent.
+        self.assertIs(stored["silent_ok"], False)
+
+    def relink_drops_a_finding(self):
+        """A run whose pre-link and post-link bodies render *different* id sets.
+
+        Without that difference the two renders are identical and nothing here
+        can tell which one the store recorded — the mistake this covers would
+        be invisible. The lever is the body budget: charge it exactly what the
+        two findings cost unlinked, and the state line plus pull-request link
+        the promotion pass adds to the critical one is enough to push the
+        minor one out. Both callers assert the difference actually happened.
+        """
+        doc = make_doc(
+            findings=[
+                make_finding(),
+                make_finding(fid="wide-rbac", severity="minor",
+                             title="Wildcard RBAC verb", check="wildcard-rbac"),
+            ]
+        )
+        # Validated first: the budget is charged against the *derived* ids and
+        # the text they render into, and the fixture's bare handles are neither.
+        audit_report.validate_findings(doc, AUDIT)
+        # The budget covers the whole body, not the findings alone, so it is
+        # probed against the real renderer rather than computed: the tightest
+        # value at which the *pre-link* body still fits both findings. Anything
+        # the relink adds then costs the minor one its slot. The slack absorbs
+        # the footer timestamp, which is wall-clock in the run and fixed here.
+        plain = dict(
+            generated_at=NOW,
+            audit_id=AUDIT,
+            states={str(f["id"]): "open" for f in doc["findings"]},
+        )
+
+        def fitted(budget):
+            with patch.object(audit_report, "BODY_BUDGET", budget):
+                return len(audit_report.render_issue_body(doc, **plain).rendered_ids)
+
+        self.assertEqual(fitted(audit_report.BODY_BUDGET), 2)
+        low, high = 0, audit_report.BODY_BUDGET
+        while low < high:
+            middle = (low + high) // 2
+            if fitted(middle) == 2:
+                high = middle
+            else:
+                low = middle + 1
+        self.patch_attr("BODY_BUDGET", low + 40)
+        # The relink re-lists the repository's pull requests to pick up the one
+        # it just opened. The first listing has to come back empty or nothing
+        # is promoted and there is no relink at all, so the reply changes
+        # between the two calls the way GitHub's would.
+        groups = audit_report.remediation_groups(doc["findings"])
+        opened = json.dumps(
+            [pr(8, audit_report.group_branch_for(AUDIT, groups[0]))]
+        )
+        recorder = self.harness
+        listings = []
+
+        def once_the_pull_request_exists(cmd, **kwargs):
+            result = recorder(cmd, **kwargs)
+            if "pr list" in " ".join(cmd):
+                listings.append(1)
+                if len(listings) > 1:
+                    return CompletedProcess(list(cmd), 0, opened, "")
+            return result
+
+        self.patch_attr("run_cmd", once_the_pull_request_exists)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(doc), 0)
+        published = self.harness.bodies_for("issue")
+        self.assertGreater(len(published), 1, "the relink edit did not happen")
+        blocks = [sorted(audit_report.parse_delta_block(b)) for b in published]
+        self.assertNotEqual(
+            blocks[0],
+            blocks[-1],
+            "the fixture no longer makes the relink change the rendered set, so "
+            "this test cannot tell the two renders apart",
+        )
+        return blocks
+
+    def test_current_ids_is_what_the_last_published_body_rendered(self):
+        """Not the pre-link render: the findings branch rewrites the ledger once
+        the pull requests exist, and a link can push a finding over the body
+        budget. Storing the earlier set would announce the dropped finding as
+        new tomorrow — the bug `compute_delta`'s rendered-vs-rendered join
+        exists to prevent, reintroduced one layer down.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        blocks = self.relink_drops_a_finding()
+        self.assertEqual(self.stored_envelope()["current_ids"], blocks[-1])
+
+    def test_a_relink_that_never_landed_is_not_what_the_store_records(self):
+        """The relink edit is `check=False` — a run survives losing it. What a
+        run must not do is record the set that edit *would* have published:
+        the live body still carries the pre-link block, and a store that
+        disagrees with it calls the difference a change tomorrow.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        # Keyed tightly enough to miss `apply_severity_label`, which is also an
+        # `issue edit` and has no business failing here.
+        self.harness.failures = {"issue edit 7 -R acme/fleet --body-file": 1}
+        blocks = self.relink_drops_a_finding()
+        self.assertEqual(self.stored_envelope()["current_ids"], blocks[0])
+
+    def test_a_clean_run_that_closed_its_ledger_stores_no_rendered_ids(self):
+        """A clean run publishes no findings section, so there is nothing for
+        the next run to measure `new` against — and the next run, finding no
+        open ledger, is a first run anyway.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        stored = self.stored_envelope()
+        self.assertEqual(stored["status"], "CLEAN")
+        self.assertEqual(stored["current_ids"], [])
+        self.assertEqual(stored["document"]["findings"], [])
+        self.assertTrue(self.harness.gh_calls("issue", "close"))
+
+    def test_a_clean_run_over_gaps_stores_the_body_it_left_standing(self):
+        """The one clean path that does not rewrite the ledger.
+
+        Zero findings over incomplete coverage keeps the issue open and only
+        comments on it, so the body still renders whatever the previous run
+        put there. Recording `[]` against that still-open issue hands the next
+        run a *trusted* memory of an empty ledger, and every finding the body
+        has been carrying all along is announced as new.
+        """
+        seeded = self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        # Gapped on the seeded finding's own cluster: the run cannot vouch for
+        # its absence, so it stores no resolution against it.
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "stage-eu",
+                    "location": "europe-west1",
+                    "project": "acme-stage",
+                }
+            ],
+            skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+
+        self.assertFalse(self.harness.gh_calls("issue", "close"))
+        stored = self.stored_envelope()
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["current_ids"], seeded["current_ids"])
+        self.assertEqual(stored["resolved_ids"], [])
+
+    def test_a_clean_run_over_gaps_with_no_memory_claims_no_ledger(self):
+        """And when the previous set is itself unknowable there is nothing to
+        carry forward, so the envelope claims no issue at all — which is what
+        makes the next run's trust check reject it. Storing this run's number
+        beside an empty id set would be the same laundering by another route:
+        an unreadable body recorded as an empty one.
+        """
+        self.harness.replies = {"issue list": self.issue_list()}
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+
+        stored = self.stored_envelope()
+        self.assertIsNone(stored["issue_number"])
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 42))
+
+    def test_closing_a_ledger_off_an_unreadable_memory_is_not_silent(self):
+        """`silent_ok` says a scheduled run has nothing worth waking anyone for.
+
+        A run that just closed a ledger does. With no trusted memory the
+        resolved count is 0 — not because nothing was fixed but because the
+        run cannot count it — and reporting that as silent is the audit
+        swallowing the best news it ever gets to deliver.
+        """
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        payload = self.stdout_json()
+        self.assertTrue(self.harness.gh_calls("issue", "close"))
+        self.assertEqual(payload["resolved"], 0)
+        self.assertFalse(payload["silent_ok"])
+
+    def test_a_clean_run_with_no_ledger_at_all_stays_silent(self):
+        """The counterpart: nothing was open, nothing closed, nothing to say.
+        Without this the guard above could be an unconditional `False` and the
+        audit would page someone every morning it found nothing.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertTrue(self.stdout_json()["silent_ok"])
+
+    def test_the_stored_summary_is_the_line_the_run_printed(self):
+        """The envelope's `chat_summary` and the payload's are one string.
+
+        `finish` prints the payload for the model to copy and stores the
+        envelope for everyone afterwards. If those two disagree about what was
+        said, the store is a record of a message nobody received — so pin them
+        to each other rather than to a literal, which would only re-assert what
+        `chat_summary` renders.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        printed = self.stdout_json()["chat_summary"]
+        self.assertTrue(printed, "finish printed no summary to copy")
+        self.assertEqual(self.stored_envelope()["chat_summary"], printed)
+
+    def test_a_silent_run_stores_the_marker_it_did_not_send(self):
+        """Silence is a decision, and the store is where it is recorded.
+
+        Nothing reaches the home channel on a silent run, so the envelope is
+        the only place that can distinguish "this run chose to say nothing"
+        from "this run's delivery failed" — two states an operator reading a
+        quiet morning has no other way to tell apart.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertTrue(self.stdout_json()["silent_ok"])
+        self.assertEqual(
+            self.stored_envelope()["chat_summary"], audit_report.SILENT_MARKER
+        )
+
+    def test_a_dry_run_stores_nothing(self):
+        """`--dry-run` publishes nothing, so it must remember nothing: a store
+        written from one would make the next real run diff against a ledger
+        that was never updated.
+        """
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=("--dry-run",)), 0)
+        self.assertFalse(Path(audit_report.REPORTS_DIR).exists())
+
+    def test_a_validation_failure_stores_nothing(self):
+        self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
+        self.assertFalse(Path(audit_report.REPORTS_DIR).exists())
+
+    def test_remediate_stores_nothing(self):
+        """`remediate` promotes a fix; it changes no finding and publishes no
+        ledger, so the last `finish`'s memory has to survive it intact.
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        path = self.write_findings(make_doc())
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", path,
+             "--finding", derived_id()]
+        )
+        self.assertEqual(rc, 0)
+        self.assertFalse(Path(audit_report.REPORTS_DIR).exists())
+
+    def test_latest_is_a_byte_identical_copy_of_the_newest_ring_entry(self):
+        """`latest.json` is a copy rather than a symlink, so nothing but this
+        keeps the two from drifting — and a reader that finds them different
+        has no way to tell which one is the run that happened.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        runs = self.stored_runs()
+        self.assertEqual(len(runs), 1)
+        latest = Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json"
+        self.assertEqual(latest.read_bytes(), runs[-1].read_bytes())
+
+    def corrupt_store(self, text):
+        """Put `text` where the previous run's envelope should be."""
+        directory = Path(audit_report.REPORTS_DIR) / AUDIT
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "latest.json").write_text(text, encoding="utf-8")
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+    def assert_made_no_delta_claim(self):
+        """The triad's third state: the run published, and claimed nothing."""
+        payload = self.stdout_json()
+        self.assertEqual(payload["new"], 0)
+        self.assertEqual(payload["resolved"], 0)
+        self.assertFalse(
+            self.harness.bodies_for("issue", "comment"),
+            "an unreadable memory must post no delta comment",
+        )
+
+    def test_an_unparseable_envelope_is_unknowable_rather_than_empty(self):
+        """The failure mode this whole triad exists for, one layer down: a
+        `latest.json` that does not parse is a memory nobody can read, and
+        reading it as "the previous run found nothing" announces every live
+        finding as new.
+        """
+        self.corrupt_store("{ this is not json")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("unreadable", self.err)
+        self.assert_made_no_delta_claim()
+
+    def test_an_envelope_that_is_not_an_object_is_unknowable(self):
+        self.corrupt_store("[]\n")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("not an object", self.err)
+        self.assert_made_no_delta_claim()
+
+    def test_a_malformed_id_set_costs_a_delta_and_not_the_run(self):
+        """Well-formed JSON is not a well-formed envelope. `current_ids` is
+        iterated and `document` is walked, neither inside a try, so a file
+        that parses but holds the wrong types used to raise out of `finish` —
+        failing a run whose findings were already published. §8: a store
+        failure may cost a delta, never an exit code.
+        """
+        self.corrupt_store(
+            json.dumps(
+                {
+                    "issue_number": 42,
+                    "id_scheme": audit_report.ID_SCHEME,
+                    "current_ids": 5,
+                    "document": {"findings": 7},
+                }
+            )
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("no readable id set", self.err)
+        self.assert_made_no_delta_claim()
+        self.assertTrue(self.harness.gh_calls("issue", "edit"))
+
+    def test_a_malformed_document_costs_the_titles_and_not_the_run(self):
+        """The other half of the same rule, and it needs its own envelope: an
+        id set the trust check accepts, beside a `document` it never looks at.
+        `report_finding_titles` walks that document to name resolved findings,
+        so a non-list `findings` raises there instead — past every guard above
+        it, out of `finish`, and after the ledger has already been rewritten.
+        """
+        self.corrupt_store(
+            json.dumps(
+                {
+                    "issue_number": 42,
+                    "id_scheme": audit_report.ID_SCHEME,
+                    "current_ids": ["gone-yesterday"],
+                    "document": {"findings": 7},
+                }
+            )
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        # The delta itself is intact — only the *titles* were unreadable — so
+        # the run still reports the finding that disappeared, unnamed.
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+
+    def test_a_string_id_set_is_not_read_one_character_at_a_time(self):
+        """`current_ids: "abc"` iterates without raising, into three ids named
+        a, b and c. Silent, and every real finding then reads as new.
+        """
+        self.corrupt_store(
+            json.dumps(
+                {
+                    "issue_number": 42,
+                    "id_scheme": audit_report.ID_SCHEME,
+                    "current_ids": "abc",
+                    "document": {"findings": []},
+                }
+            )
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assert_made_no_delta_claim()
+
+    def test_the_stored_delta_is_the_delta_the_run_reported(self):
+        """Two renderings of one claim. A store that recorded a different one
+        would make the chat path's "what changed?" disagree with the comment
+        the ledger already posted, and nothing would flag the difference.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id()
+        arrived = make_finding(fid="wide-rbac", check="wildcard-rbac",
+                               title="Wildcard RBAC verb")
+        self.assertEqual(self.run_finish(make_doc(findings=[arrived])), 0)
+
+        payload = self.stdout_json()
+        stored = self.stored_envelope()
+        self.assertEqual(len(stored["new_ids"]), payload["new"])
+        self.assertEqual(len(stored["resolved_ids"]), payload["resolved"])
+        self.assertEqual(stored["resolved_ids"], [gone])
+        self.assertEqual(
+            stored["new_ids"], [derived_id(check="wildcard-rbac", fid="wide-rbac")]
+        )
+
+    def test_the_run_metadata_carries_values_and_not_just_keys(self):
+        """`test_the_envelope_keys_are_pinned` above proves the keys exist. A
+        reader asking "was this run partial, and what did it skip?" needs them
+        to be populated, and every one of these is `None`-by-default somewhere
+        upstream.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        audit_report.take_run_lock(
+            AUDIT, datetime.now(timezone.utc) - timedelta(seconds=90)
+        )
+        manifest = self.tmp_path / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "clusters": [],
+                    "started_at": "2026-08-26T06:00:00Z",
+                    "finished_at": "2026-08-26T06:03:30Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        doc = make_doc(
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}]
+        )
+        rc = self.run_finish(doc, ["--manifest-file", str(manifest)])
+        self.assertEqual(rc, 0)
+
+        stored = self.stored_envelope()
+        self.assertTrue(stored["partial"])
+        self.assertEqual(len(stored["coverage_gaps"]), 1)
+        self.assertIn("dr-west", stored["coverage_gaps"][0])
+        self.assertEqual(stored["collect_s"], 210.0)
+        self.assertGreaterEqual(stored["inspect_s"], 90.0)
+        self.assertIsInstance(stored["publish_s"], (int, float))
+
+    def test_a_secret_the_body_redacted_is_not_stored_in_the_clear(self):
+        """Redaction happens at the cell on the way into the body, so the
+        document object still holds whatever the model wrote. Storing it raw
+        gives a credential a fifteen-envelope life on the volume where it
+        previously had one scratch file the next run overwrote.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        leaked = "AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY"
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(excerpt=leaked)])), 0)
+
+        raw = (Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json").read_text()
+        self.assertNotIn("wJalrXUtnFEMI7K7MDENGbPxRfiCYEXAMPLEKEY", raw)
+        self.assertIn(audit_report.REDACTED, raw)
+
+    def test_two_runs_leave_two_ring_entries_and_the_newer_as_latest(self):
+        """The ring's whole purpose is run-over-run comparison, and every other
+        test here drives a single `finish`. Exercised through the real command
+        twice, this is also what pins the stamp: entries are named by the
+        run's own clock, so two runs a day apart must not land on one file
+        with the second silently replacing the first.
+        """
+        moment = datetime(2026, 8, 26, 6, 0, tzinfo=timezone.utc)
+
+        class FrozenClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment
+
+        self.patch_attr("datetime", FrozenClock)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        moment = moment + timedelta(days=1)
+        self.harness.replies = {"issue list": self.issue_list(number=7)}
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        runs = self.stored_runs()
+        self.assertEqual(
+            [p.name for p in runs],
+            ["20260826T060000.000000Z.json", "20260827T060000.000000Z.json"],
+        )
+        latest = Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json"
+        self.assertEqual(latest.read_bytes(), runs[-1].read_bytes())
+
+    def test_two_runs_in_the_same_second_leave_two_ring_entries(self):
+        """The stamp is `%Y%m%dT%H%M%S.%fZ`, and the microseconds are the point.
+
+        At second granularity two runs finishing inside the same second name
+        the same file and the second silently replaces the first — the ring
+        loses a run and nothing anywhere says so. The lock makes that near
+        impossible for one stream; the six digits cost nothing.
+        """
+        moment = datetime(2026, 8, 26, 6, 0, 0, tzinfo=timezone.utc)
+        audit_report.write_report(AUDIT, {"finished_at": "first"}, moment)
+        audit_report.write_report(
+            AUDIT, {"finished_at": "second"}, moment.replace(microsecond=1)
+        )
+        runs = self.stored_runs()
+        self.assertEqual(
+            [p.name for p in runs],
+            ["20260826T060000.000000Z.json", "20260826T060000.000001Z.json"],
+        )
+        self.assertEqual(
+            [json.loads(p.read_text())["finished_at"] for p in runs],
+            ["first", "second"],
+        )
+
+    def test_the_ring_keeps_the_newest_fourteen_runs(self):
+        for day in range(audit_report.REPORT_HISTORY + 3):
+            audit_report.write_report(
+                AUDIT, {"finished_at": day}, NOW + timedelta(days=day)
+            )
+        runs = self.stored_runs()
+        self.assertEqual(len(runs), audit_report.REPORT_HISTORY)
+        # The stamp sorts lexically in time order, so the survivors are the
+        # newest ones and the oldest three are gone.
+        self.assertEqual(
+            [json.loads(p.read_text())["finished_at"] for p in runs],
+            list(range(3, audit_report.REPORT_HISTORY + 3)),
+        )
+
+    def test_a_write_failure_logs_a_warning_and_leaves_the_exit_code_alone(self):
+        blocker = self.tmp_path / "not-a-directory"
+        blocker.write_text("", encoding="utf-8")
+        self.patch_attr("REPORTS_DIR", str(blocker))
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("report store write for", self.err)
+        self.assertIn(AUDIT, self.err)
+        # And the run still published: a lost store costs the next run's delta
+        # annotation, never this run's report.
+        self.assertTrue(self.harness.gh_calls("issue", "create"))
+
+    def test_a_failed_rename_raises_and_leaves_no_partial_file(self):
+        """`os.replace` is what keeps a reader from ever meeting a half-written
+        envelope — the chat path reads `latest.json` at arbitrary times,
+        including mid-write. When the rename fails, the partial goes with it
+        rather than accumulating in the stream's directory.
+        """
+        directory = self.tmp_path / "atomic"
+        directory.mkdir()
+        target = directory / "latest.json"
+        with patch.object(audit_report.os, "replace", side_effect=OSError("nospc")):
+            with self.assertRaises(OSError):
+                audit_report._atomic_write(target, "{}\n")
+        self.assertFalse(target.exists())
+        self.assertEqual(list(directory.iterdir()), [])
+
+    def test_a_failed_write_drops_the_memory_it_could_not_replace(self):
+        """Leaving the previous envelope standing is the wrong repair.
+
+        Nothing downstream can tell a stale `latest.json` from a current one —
+        same ledger, same id scheme, so `read_report_memory` trusts it — and
+        joining against a memory that predates everything this run published
+        announces all of it as new, every run, until a write succeeds. An
+        absent store is the state the failure actually left behind, and it
+        costs one delta-free run instead.
+        """
+        self.seed_store(make_doc(), issue_number=7)
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("no space left on device")
+
+        self.patch_attr("_atomic_write", refuse)
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("WARNING: report store write for", self.err)
+        self.assertFalse((Path(audit_report.REPORTS_DIR) / AUDIT / "latest.json").exists())
+
+    def test_a_failed_prune_keeps_the_memory_it_did_write(self):
+        """The other half of the rule above: the prune runs after the envelope
+        has landed, so its failure costs disk rather than accuracy. Dropping
+        `latest.json` here would throw away a memory that is correct.
+        """
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        real_glob = Path.glob
+
+        def refuse(self_path, pattern):
+            if pattern == "*.json":
+                raise OSError("stat: input/output error")
+            return real_glob(self_path, pattern)
+
+        with patch.object(Path, "glob", refuse):
+            self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertIn("WARNING: report store prune for", self.err)
+        self.assertEqual(self.stored_envelope()["issue_number"], 7)
+
+    def test_a_successful_write_leaves_no_temp_files(self):
+        self.open_ledger()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        directory = Path(audit_report.REPORTS_DIR) / AUDIT
+        # Asserted first: an empty `.tmp` glob is also what a store that wrote
+        # nothing at all looks like, and this test would pass on it.
+        self.assertTrue((directory / "latest.json").is_file())
+        self.assertEqual([p.name for p in directory.rglob("*.tmp")], [])
+
+    def test_the_temp_file_is_written_beside_its_target(self):
+        """`os.replace` is only atomic within a filesystem. On the pod the
+        reports directory is the PVC and the default temp directory is not, so
+        a temp file placed anywhere else makes every write raise `EXDEV` —
+        caught, logged, and silently never storing anything.
+        """
+        directory = self.tmp_path / "atomic"
+        directory.mkdir()
+        seen = []
+        real = audit_report.tempfile.NamedTemporaryFile
+
+        def record(*args, **kwargs):
+            seen.append(kwargs.get("dir"))
+            return real(*args, **kwargs)
+
+        with patch.object(audit_report.tempfile, "NamedTemporaryFile", record):
+            audit_report._atomic_write(directory / "latest.json", "{}\n")
+        self.assertEqual(seen, [str(directory)])
+
+    def test_each_stream_gets_its_own_directory(self):
+        """One store per audit id, because the memories are per-ledger: a
+        shared `latest.json` would make every stream but the last to run find
+        a report written for another stream's issue, and claim nothing.
+        """
+        audit_report.write_report("a-audit", {"audit_id": "a-audit"}, NOW)
+        audit_report.write_report("b-audit", {"audit_id": "b-audit"}, NOW)
+        self.assertEqual(self.stored_envelope(audit="a-audit")["audit_id"], "a-audit")
+        self.assertEqual(self.stored_envelope(audit="b-audit")["audit_id"], "b-audit")
+
+
+class TestCrossCheckManifest(unittest.TestCase):
+    """Manifest-scoped attestation upgrade: see
+    docs/designs/fleet-audit-collectors-and-status.md §6 and
+    `audit_report.cross_check_manifest`.
+    """
+
+    def manifest(self, **cluster_overrides):
+        cluster = {
+            "name": "prod-us-east",
+            "outcome": "collected",
+            "commands": [{"check": "no-requests", "rc": 0}, {"check": "no-memory-limit", "rc": 0}],
+        }
+        cluster.update(cluster_overrides)
+        return {"clusters": [cluster]}
+
+    def doc(self, checks_run):
+        return {
+            "audit": "obtainability-audit",
+            "scope": {
+                "clusters": [
+                    {"name": "prod-us-east", "checks_run": [{"check": c, "command": "x"} for c in checks_run]}
+                ]
+            },
+        }
+
+    def test_a_check_the_manifest_verified_passes(self):
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), self.manifest())
+
+    def test_a_check_the_manifest_never_ran_is_rejected(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())
+        self.assertIn("no-pdb", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_a_check_that_ran_but_failed_is_rejected(self):
+        manifest = self.manifest(commands=[{"check": "no-requests", "rc": 1}])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+
+    def with_limitations(self, checks_run, text="collector gate-failed; re-read by hand"):
+        doc = self.doc(checks_run)
+        doc["scope"]["clusters"][0]["limitations"] = text
+        return doc
+
+    def test_an_unreachable_clusters_checks_are_not_matched_against_commands(self):
+        # The SOP's manual fallback applies here -- attestation, not
+        # manifest-verification, exactly as it does for streams with no
+        # collector at all. `no-pdb` and `no-hpa` appear in no manifest command
+        # and are accepted anyway; the declared limitation is what buys that.
+        manifest = self.manifest(outcome="unreachable", commands=[])
+        audit_report.cross_check_manifest(self.with_limitations(["no-requests", "no-pdb", "no-hpa"]), manifest)
+
+    def test_a_gate_failed_clusters_checks_are_not_matched_either(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        audit_report.cross_check_manifest(self.with_limitations(["no-requests"]), manifest)
+
+    def test_a_target_the_collector_could_not_read_cannot_report_a_clean_full_read(self):
+        """The hole the `collected`-only cross-check left open, and what fell in.
+
+        On 2026-08-29 `fleet-wide-cost-analysis` published
+        `project/adamparco-kage` with three checks run, no limitations and no
+        coverage gap, over a manifest marking that same target `gate-failed` --
+        five compute reads gated as one and the disks read had never parsed.
+        Every rule here asks the manifest to confirm the document, and the one
+        target the manifest actively contradicted was the one it skipped.
+        """
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                manifest = self.manifest(outcome=outcome, commands=[], error="disks list rc=2")
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+                self.assertIn("prod-us-east", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_the_refusal_quotes_the_collectors_own_error(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[], error="PERMISSION_DENIED on compute.disks.list")
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("PERMISSION_DENIED", str(ctx.exception))
+
+    def test_an_unreadable_target_claiming_nothing_is_left_alone(self):
+        """No claim, no contradiction. A target the collector could not read and
+        the document does not say it checked needs no limitation -- the roster
+        rules in §6 already count it as uncovered."""
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        audit_report.cross_check_manifest(self.doc([]), manifest)
+
+    def test_whitespace_does_not_pass_for_a_limitation(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(self.with_limitations(["no-requests"], text="   "), manifest)
+
+    def test_a_cluster_absent_from_the_manifest_is_ignored(self):
+        # A stream only partially covered, or a manifest scoped narrower than
+        # the findings document -- not this function's concern. The manifest's
+        # own cluster stays in the document, so this isolates the extra one
+        # rather than also tripping the omitted-cluster rule below.
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"].append(
+            {"name": "some-other-cluster", "checks_run": [{"check": "no-pdb", "command": "x"}]}
+        )
+        audit_report.cross_check_manifest(doc, self.manifest())
+
+    def test_an_empty_manifest_cross_checks_nothing(self):
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), {"clusters": []})
+
+    def test_a_collected_cluster_the_document_omits_is_rejected(self):
+        """The direction the cross-check could not see, and the one that published.
+
+        On 2026-08-29 the security-patch collector read all four clusters and
+        recorded nine successful checks against each. The findings document
+        named one. Every rule above reads the document and asks the manifest to
+        confirm it, so the three absent clusters contradicted nothing, and
+        `finish` published "0 findings across 1 audited cluster(s)", called the
+        run CLEAN, and closed the ledger -- a full-fleet all-clear over a
+        quarter of the fleet, with no coverage gap reported anywhere.
+        """
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": "collected", "commands": [{"check": "no-requests", "rc": 0}]},
+            ]
+        }
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("prod-eu-west", str(ctx.exception))
+        self.assertNotIn("prod-us-east", str(ctx.exception))
+
+    def unreadable(self, outcome, error="boom"):
+        return {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": outcome, "error": error, "commands": []},
+            ]
+        }
+
+    def test_a_cluster_the_collector_could_not_read_may_not_be_omitted(self):
+        """The rule that an unreadable target claiming checks must carry
+        `limitations` only reaches a target the document mentions. Omitting it
+        evades that as thoroughly as it evades everything else, and a collector
+        failure is the likeliest place for a finding to be hiding.
+        """
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.cross_check_manifest(
+                        self.doc(["no-requests"]), self.unreadable(outcome)
+                    )
+                self.assertIn("prod-eu-west", str(ctx.exception))
+                self.assertIn(outcome, str(ctx.exception))
+
+    def test_the_refusal_to_omit_quotes_the_collectors_error(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(
+                self.doc(["no-requests"]),
+                self.unreadable("gate-failed", error="node-pools list rc=1: code=400"),
+            )
+        self.assertIn("code=400", str(ctx.exception))
+
+    def test_scope_skipped_accounts_for_an_unreadable_cluster(self):
+        """The honest shape when nobody covered it by hand: `coverage_gaps`
+        already renders a skipped entry as "not audited — <reason>", which is
+        the gap this rule exists to force. Requiring `scope.clusters`
+        specifically would reject it and push the run toward claiming checks."""
+        for outcome in ("unreachable", "gate-failed"):
+            with self.subTest(outcome=outcome):
+                doc = self.doc(["no-requests"])
+                doc["scope"]["skipped"] = [
+                    {"cluster": "prod-eu-west", "reason": "collector could not reach it"}
+                ]
+                audit_report.cross_check_manifest(doc, self.unreadable(outcome))
+
+    def test_scope_clusters_with_limitations_also_accounts_for_it(self):
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"].append(
+            {
+                "name": "prod-eu-west",
+                "checks_run": ["no-requests"],
+                "limitations": "collector gate-failed; no-requests checked by hand, the rest unread",
+            }
+        )
+        audit_report.cross_check_manifest(doc, self.unreadable("gate-failed"))
+
+    def test_a_collected_cluster_is_still_reported_as_the_collected_case(self):
+        """The two refusals must not collapse into one: a `collected` cluster
+        omitted from the document is a defect in the document, and its message
+        says so rather than telling the author to declare a gap they do not
+        have."""
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "prod-eu-west", "outcome": "collected", "commands": []},
+            ]
+        }
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("marks 'collected'", str(ctx.exception))
+
+    def not_applicable(self, checks_run, slug, reason="Autopilot cluster; Google owns the node pools"):
+        doc = self.doc(checks_run)
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [{"check": slug, "reason": reason}]
+        return doc
+
+    def test_an_inapplicable_check_the_collector_declared_is_accepted(self):
+        """The corroborated path. Until every collector emitted its own
+        `checks_not_applicable` this could not be told from a padded one, and
+        the rule below rejected every honest Autopilot run of
+        `security-patch-orchestrator`: patch_readiness issues one `clusters
+        describe` and records it against all nine slugs while returning [] for
+        the four node-pool checks. It now declares those four, so the manifest
+        answers for them."""
+        manifest = self.manifest(
+            checks_not_applicable=[{"check": "no-memory-limit", "reason": "no user node pools"}]
+        )
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), manifest)
+
+    def test_an_inapplicable_check_the_collector_never_ran_is_accepted(self):
+        """Nothing to contradict. A slug the collector does not carry, or a
+        target it could not read, still takes the model's judgment."""
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-pdb"), self.manifest())
+
+    def test_a_check_the_manifest_ran_cleanly_cannot_be_declared_inapplicable(self):
+        """The contradiction: the collector ran the check and completed it,
+        and the document takes it out of the coverage denominator anyway. That
+        reports the cluster as more fully audited than it was, and it is the
+        shape a padded `checks_not_applicable` has."""
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), self.manifest())
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_a_check_the_manifest_ran_and_failed_may_be_declared_inapplicable(self):
+        """rc != 0 is not a successful command, so there is no claim to
+        contradict — and a collector that tried and failed has said nothing
+        about whether the check applies."""
+        manifest = self.manifest(commands=[{"check": "no-requests", "rc": 0}, {"check": "no-memory-limit", "rc": 1}])
+        audit_report.cross_check_manifest(self.not_applicable(["no-requests"], "no-memory-limit"), manifest)
+
+    def test_an_unreachable_cluster_may_declare_anything_inapplicable(self):
+        """A `gate-failed` target never reaches the corroboration rule: the
+        manual fallback above returns before it, and there are no successful
+        commands to contradict in any case."""
+        manifest = self.manifest(outcome="gate-failed", commands=[], error="denied")
+        doc = self.not_applicable([], "no-memory-limit")
+        doc["scope"]["clusters"][0]["limitations"] = "collector gate-failed; re-read by hand"
+        audit_report.cross_check_manifest(doc, manifest)
+
+    def test_a_check_the_collector_declared_inapplicable_cannot_be_reported_as_run(self):
+        """The mirror of the rule above, and the hole `commands` leaves. One
+        command is routinely recorded against every slug it feeds, so
+        `ok_checks` corroborates a claim that `no-memory-limit` ran here --
+        the command really did run, for some other slug's benefit. Only the
+        collector's own `checks_not_applicable` can tell the two apart, and it
+        says the check had nothing to run against on this target."""
+        manifest = self.manifest(
+            checks_not_applicable=[{"check": "no-memory-limit", "reason": "no user node pools"}]
+        )
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests", "no-memory-limit"]), manifest)
+        self.assertIn("no-memory-limit", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+        # The honest counterpart -- same manifest, the disposition carried into
+        # `checks_not_applicable` instead -- is
+        # `test_an_inapplicable_check_the_collector_declared_is_accepted` above,
+        # which runs against this exact manifest shape.
+
+
+class TestAdoptCollectorEvidence(unittest.TestCase):
+    """`evidence` is observed, so the collector authors it — see
+    `audit_report.adopt_collector_evidence`.
+    """
+
+    COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+
+    def candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies",
+            "impact": "collector-authored impact",
+            "needs_triage": None,
+        }
+        cand.update(overrides)
+        return cand
+
+    def manifest(self, candidates, rc=0, name="prod-us-east", check="netpol-missing"):
+        return {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [{"check": check, "command": self.COMMAND, "rc": rc}],
+                    "candidates": candidates,
+                }
+            ]
+        }
+
+    def test_the_collectors_excerpt_and_command_replace_the_models(self):
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate()])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["excerpt"], "zero NetworkPolicies")
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
+    def test_a_candidate_without_a_cluster_field_still_joins(self):
+        """The shape the four procedural collectors emit.
+
+        `fleet_drift`, `patch_readiness`, `fleet_stockout` and `fleet_waste`
+        build the cluster name into `object` and never write a `cluster` key,
+        so an id derived from the candidate alone reads `check._._.object`.
+        Live, that was 35 candidates across four streams joining nothing at
+        all. The enclosing manifest entry names the cluster in both shapes,
+        which is why this is fixed here and not in four collectors.
+        """
+        cand = {
+            "check": "logging-components",
+            "namespace": "",
+            "object": "Cluster/drift-peer-std-4",
+            "severity": "minor",
+            "excerpt": "loggingConfig.componentConfig.enableComponents=[SYSTEM_COMPONENTS]",
+            "impact": "x",
+            "needs_triage": None,
+        }
+        self.assertNotIn("cluster", cand)
+        finding = make_finding(
+            check="logging-components",
+            cluster="drift-peer-std-4",
+            namespace="",
+            obj="Cluster/drift-peer-std-4",
+            excerpt="logging is partly off",
+        )
+        adopted = audit_report.adopt_collector_evidence(
+            [finding],
+            self.manifest([cand], name="drift-peer-std-4", check="logging-components"),
+        )
+        self.assertEqual(len(adopted), 1)
+        self.assertEqual(finding["evidence"]["excerpt"], cand["excerpt"])
+
+    def test_a_finding_the_collector_did_not_propose_is_left_alone(self):
+        """The manual fallback. A target the collector could not read yields no
+        candidates, and the agent's hand-run command is the only evidence there
+        is — overwriting or blanking it would delete the finding's only proof.
+        """
+        finding = make_finding(cluster="stage-eu")
+        before = json.loads(json.dumps(finding["evidence"]))
+        self.assertEqual(
+            audit_report.adopt_collector_evidence([finding], self.manifest([self.candidate()])),
+            [],
+        )
+        self.assertEqual(finding["evidence"], before)
+
+    def test_a_candidate_the_collector_cannot_back_is_left_whole(self):
+        """Half a swap is worse than none.
+
+        `rc != 0` produced no output, so it is not what the excerpt came from,
+        and an empty candidate excerpt has nothing to offer. Either way the
+        finding keeps *both* of the model's fields: a collector-computed
+        excerpt under a model-written command is the mismatch this function
+        exists to remove, not a partial fix.
+        """
+        for manifest in (
+            self.manifest([self.candidate()], rc=1),
+            self.manifest([self.candidate(excerpt="   ")]),
+        ):
+            finding = make_finding()
+            self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+            self.assertEqual(
+                finding["evidence"],
+                {
+                    "command": "kubectl get networkpolicy -n payments",
+                    "excerpt": "No resources found in payments namespace.",
+                },
+            )
+
+    def test_adoption_is_idempotent(self):
+        """The whole point: two runs over one unchanged fleet agree byte for
+        byte, which is the precondition `carry_unchanged_findings` compares on.
+        """
+        manifest = self.manifest([self.candidate()])
+        finding = make_finding()
+        self.assertEqual(len(audit_report.adopt_collector_evidence([finding], manifest)), 1)
+        self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+
+    def test_nothing_but_evidence_is_taken_from_the_candidate(self):
+        """The candidate also carries `severity` and `impact`, and neither may
+        cross. Severity is re-judged against the fleet's context (Autopilot,
+        blast radius) and impact is prose about consequence; only the command
+        and the output it produced are observations.
+        """
+        finding = make_finding(severity="critical", impact="model-authored impact")
+        audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate()])
+        )
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["impact"], "model-authored impact")
+
+    def test_no_manifest_changes_nothing(self):
+        finding = make_finding()
+        for manifest in (None, {}, {"clusters": []}):
+            self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
+
+
+class TestFinishManifestFlag(HarnessTestCase):
+    """The --manifest-file CLI wiring in handle_finish."""
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def test_a_passing_manifest_lets_the_run_publish(self):
+        self.harness.replies = {"issue list": "[]"}
+        manifest = {
+            "clusters": [
+                {"name": "prod-us-east", "outcome": "collected",
+                 "commands": [{"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)]},
+                {"name": "stage-eu", "outcome": "collected",
+                 "commands": [{"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)]},
+            ]
+        }
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+
+    def test_the_collectors_evidence_is_what_reaches_the_ledger(self):
+        """The wiring, asserted on the wire rather than on the return value.
+
+        `adopt_collector_evidence` is unit-tested above; this is the only thing
+        that fails if the call is dropped from `handle_finish` or moved after
+        the body is rendered.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        checks = list(audit_report.audit_checks(AUDIT))
+        command = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+        manifest = {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [
+                        {
+                            "check": c,
+                            "command": command if c == "netpol-missing" else f"ran {c}",
+                            "rc": 0,
+                        }
+                        for c in checks
+                    ],
+                    "candidates": (
+                        [
+                            {
+                                "check": "netpol-missing",
+                                "cluster": "prod-us-east",
+                                "namespace": "payments",
+                                "object": "Namespace/no-network-policy",
+                                "severity": "major",
+                                "excerpt": "zero NetworkPolicies in payments",
+                                "impact": "x",
+                                "needs_triage": None,
+                            }
+                        ]
+                        if name == "prod-us-east"
+                        else []
+                    ),
+                }
+                for name in ("prod-us-east", "stage-eu")
+            ]
+        }
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("zero NetworkPolicies in payments", body)
+        self.assertIn(command, body)
+        # The model's two strings are gone, not merely joined by the truth.
+        self.assertNotIn("No resources found in payments namespace.", body)
+        self.assertNotIn("kubectl get networkpolicy -n payments\n", body)
+
+    def test_a_failing_manifest_rejects_before_any_publish(self):
+        manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "commands": []}]}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_a_missing_manifest_file_is_rejected(self):
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
+        self.assertEqual(rc, 2)
+
+    def test_a_malformed_manifest_file_is_rejected(self):
+        path = self.tmp_path / "bad.json"
+        path.write_text("not json", encoding="utf-8")
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
+        self.assertEqual(rc, 2)
+
+    def bare_finish(self, doc, argv_extra=()):
+        """`finish` with exactly the flags given — no manifest injected.
+
+        `run_finish` supplies an empty manifest so the 600-odd tests that
+        predate the guard keep measuring what they measured. These three are
+        about the guard, so they go around it.
+        """
+        return self.run_main(
+            [
+                "finish",
+                "--audit",
+                AUDIT,
+                "--findings-file",
+                self.write_findings(doc),
+                *argv_extra,
+            ]
+        )
+
+    def test_publishing_without_a_manifest_is_refused(self):
+        """The flag four dry-runs carried and the publishing call did not.
+
+        On 2026-08-29 the security-patch stream ran `finish --dry-run
+        --manifest-file …` four times while it worked the document into shape,
+        then made the real call without the flag. Nothing cross-checked the
+        document that actually shipped, and the only trace was `collect_s:
+        null` in the stored record. Eight SOPs document the flag; that was not
+        enough, because the failure is dropping it from one line rather than
+        never knowing about it.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.bare_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
+        self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_a_waived_manifest_publishes_but_reports_a_coverage_gap(self):
+        # The cost SOP's documented exemption: a run where the collector
+        # produced nothing and every check came from the manual fallback. It
+        # publishes, but it cannot pass itself off as verified.
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.bare_finish(
+            make_doc(findings=[]),
+            ["--no-collector-manifest", "collector found no readable project"],
+        )
+        self.assertEqual(rc, 0)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertIn(
+            "the collector manifest was waived — collector found no readable project",
+            payload["coverage_gaps"],
+        )
+
+    def test_a_blank_waiver_reason_does_not_satisfy_the_guard(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.bare_finish(make_doc(findings=[]), ["--no-collector-manifest", "   "])
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
+
+    def test_a_passing_manifest_surfaces_collect_s_in_the_exit_payload(self):
+        self.harness.replies = {"issue list": "[]"}
+        manifest = {
+            "clusters": [
+                {"name": "prod-us-east", "outcome": "collected",
+                 "commands": [{"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)]},
+            ],
+            "started_at": "2026-08-26T06:00:00Z",
+            "finished_at": "2026-08-26T06:03:30Z",
+        }
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.stdout_json()["collect_s"], 210.0)
+
+    def test_no_manifest_flag_means_collect_s_is_none(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIsNone(self.stdout_json()["collect_s"])
 
 
 class TestSyncOpenRemediationLabels(HarnessTestCase):
@@ -5264,7 +7818,6 @@ class TestRemediateOnACleanRun(HarnessTestCase):
     def replies(self, comments):
         return {
             "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": "prior"}),
             "--json comments": json.dumps({"comments": comments}),
         }
 
@@ -5433,7 +7986,7 @@ class TestRemediateSubcommand(HarnessTestCase):
         rc = self.run_remediate(make_doc(), [derived_id()])
         self.assertEqual(rc, 0)
         self.assertEqual(
-            self.stdout_json(),
+            self.stdout_json_sans_timing("duration_s"),
             {
                 "status": "REMEDIATED",
                 "prs_opened": ["https://github.com/acme/fleet/pull/8"],
@@ -5675,13 +8228,8 @@ class TestFailurePaths(HarnessTestCase):
     def test_a_failed_delta_comment_is_survivable(self):
         # Losing the delta comment costs one notification; aborting would
         # leave the ledger correct but the run marked failed to the cron.
-        previous_body = published_body(
-            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
-        )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous_body}),
-        }
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"issue comment": 1}
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
 
@@ -6340,6 +8888,26 @@ class TestPathContainment(unittest.TestCase):
                     audit_report._require_repo_relative(path, "where")
 
 
+class TestReportStoreKeepsItsOwnPermissions(unittest.TestCase):
+    """The report store does not inherit the gh body file's widened mode.
+
+    `_write_temp` is group-readable on purpose — the sidecar running the real
+    `gh` is a different uid since #955, and `WriteTempTest` above owns that
+    contract. §4.8's store is the opposite case: this same uid writes it and
+    reads it back on the next run, and nothing else ever opens it, so it has
+    no reason to widen and no counterpart bug to fix. The two live a few
+    hundred lines apart in one file, which is exactly how a widen gets copied
+    into the wrong one.
+    """
+
+    def test_the_report_store_is_not_widened_with_it(self):
+        """The store keeps 0600 deliberately — same uid writes and reads it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "latest.json"
+            audit_report._atomic_write(target, '{"a": 1}')
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
+
+
 class TestFilesystemContainment(unittest.TestCase):
     """The string check is not containment; this is.
 
@@ -6459,8 +9027,101 @@ class TestCoverageGaps(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("partially audited", gaps[0])
 
+    def test_a_target_that_ran_nothing_is_not_called_partially_audited(self):
+        """"Partially" describes how much ran, and nothing ran.
+
+        `fleet-consistency-drift` excludes a cluster under 24h old from every
+        cohort, so every one of its comparative checks is missing. Thirteen of
+        sixteen clusters reported "partially audited — 14 of 14 applicable
+        checks did not run" — a stream that assessed nothing, in the words of
+        one that mostly succeeded.
+        """
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                clusters=[
+                    {
+                        "name": "drift-peer-std-1",
+                        "location": "us-east4-a",
+                        "project": "acme-prod",
+                        "checks_run": [],
+                        "limitations": "under 24h, excluded from every cohort",
+                    }
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("drift-peer-std-1: not audited —", gaps[0])
+        self.assertNotIn("partially audited", gaps[0])
+
+    def test_a_target_that_ran_some_checks_is_still_partially_audited(self):
+        roster = audit_report.audit_checks(AUDIT)
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                clusters=[
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": list(roster[:2]),
+                    }
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("partially audited", gaps[0])
+        self.assertNotIn("not audited", gaps[0])
+
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
+
+    def test_gap_targets_name_the_cluster_each_gap_is_about(self):
+        doc = make_doc(
+            findings=[],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(audit_report.coverage_gap_targets(doc), {"dr-west"})
+
+    def test_a_complete_run_blocks_no_target(self):
+        self.assertEqual(audit_report.coverage_gap_targets(make_doc()), set())
+
+    def test_a_kind_nobody_enumerated_blocks_the_whole_stream(self):
+        """`None`, not a set: the stranded checks ran against no target at all.
+
+        A subnet check in a run that produced no subnet entries is owed by
+        nobody, so there is no target name to hang it on and nothing may be
+        called resolved on the strength of it.
+        """
+        doc = make_doc(
+            findings=[],
+            audit="gcp-networking-fabric-audit",
+            clusters=[
+                {"name": "project/acme-prod", "location": "-", "project": "acme-prod"}
+            ],
+        )
+        self.assertIsNone(audit_report.coverage_gap_targets(doc))
+
+    def test_only_findings_on_a_blocked_target_are_held_back(self):
+        memory = {
+            "document": {
+                "findings": [
+                    {"id": "a", "cluster": "dr-west"},
+                    {"id": "b", "cluster": "prod-us-east"},
+                ]
+            }
+        }
+        self.assertEqual(
+            audit_report.unverifiable_findings(memory, {"dr-west"}), {"a"}
+        )
+        self.assertEqual(audit_report.unverifiable_findings(memory, set()), set())
+        # `None` is the widest answer, not the absence of one.
+        self.assertEqual(
+            audit_report.unverifiable_findings(memory, None), {"a", "b"}
+        )
+
+    def test_a_finding_with_no_readable_target_is_held_whenever_anything_is(self):
+        memory = {"document": {"findings": [{"id": "a", "cluster": ""}]}}
+        self.assertEqual(audit_report.unverifiable_findings(memory, {"dr-west"}), {"a"})
+        self.assertEqual(audit_report.unverifiable_findings(memory, set()), set())
 
     def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
         """The gap prose cannot catch a run that never admits to one."""
@@ -6503,6 +9164,742 @@ class TestCoverageGaps(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("1 of 11 applicable checks did not run", gaps[0])
         self.assertIn("Autopilot", gaps[0])
+
+
+class TestScopedCoverage(unittest.TestCase):
+    """Coverage is measured against what a target owes, not the whole roster.
+
+    Three SOPs enumerate `project/<id>` and subnet entries beside clusters, and
+    before the partition every one of those entries was rated against every
+    check in the stream. A live `stockout-prevention` run showed both halves of
+    the error at once: the `project/adamparco-kage` entry, which ran both of the
+    checks the SOP gives it, was reported as "10 of 12 applicable checks did not
+    run", and all four clusters were charged with `quota-exhaustion-risk` — a
+    check the SOP scopes to the project. Eleven fabricated gaps, and the stream
+    was `partial` on every run because of them.
+    """
+
+    STOCKOUT = "stockout-prevention"
+
+    def _doc(self, clusters):
+        return make_doc(findings=[], audit=self.STOCKOUT, clusters=clusters)
+
+    def _project(self, **extra):
+        base = {
+            "name": "project/acme-prod",
+            "location": "-",
+            "project": "acme-prod",
+        }
+        base.update(extra)
+        return base
+
+    def _clean_project(self):
+        """A project entry that owes nothing, so a cluster test isolates itself.
+
+        Every test here supplies both of `stockout-prevention`'s target kinds.
+        Omitting one is a gap in its own right — see `test_a_kind_with_no_targets_
+        is_a_gap` — and would leave these assertions counting that instead of
+        the thing under test.
+        """
+        return self._project(
+            checks_run=["quota-exhaustion-risk", "reservation-mismatch-risk"]
+        )
+
+    def _clean_cluster(self, name="stage-eu"):
+        return {
+            "name": name,
+            "location": "europe-west1",
+            "project": "acme-stage",
+            "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, name)),
+        }
+
+    def test_a_project_target_owes_only_the_project_scoped_checks(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc([self._clean_project(), self._clean_cluster()])
+        )
+        self.assertEqual(gaps, [])
+
+    def test_a_project_target_missing_a_project_scoped_check_is_still_a_gap(self):
+        """Narrowing the denominator must not excuse the checks that remain."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._project(checks_run=["reservation-mismatch-risk"]),
+                    self._clean_cluster(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("1 of 2 applicable checks did not run", gaps[0])
+        self.assertIn("quota-exhaustion-risk", gaps[0])
+
+    def test_a_cluster_is_not_charged_with_a_project_scoped_check(self):
+        cluster_owed = audit_report.audit_target_checks(self.STOCKOUT, "prod-us-east")
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": list(cluster_owed),
+                    },
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+        self.assertNotIn("quota-exhaustion-risk", cluster_owed)
+
+    def test_a_check_the_sop_gives_both_kinds_is_owed_by_both(self):
+        """`reservation-mismatch-risk` has a cluster form and a project form.
+
+        A partition that made every slug exclusive would silently drop one of
+        the two, and the check would go unrun against that kind for good.
+        """
+        for name in ("prod-us-east", "project/acme-prod"):
+            with self.subTest(target=name):
+                self.assertIn(
+                    "reservation-mismatch-risk",
+                    audit_report.audit_target_checks(self.STOCKOUT, name),
+                )
+
+    def test_a_subnet_target_owes_the_ipam_check_alone(self):
+        owed = audit_report.audit_target_checks(
+            "gcp-networking-fabric-audit", "acme-prod/us-east4/gke-nodes"
+        )
+        self.assertEqual(owed, ("subnet-ip-exhaustion",))
+
+    def test_networkings_project_target_owes_the_other_four(self):
+        owed = audit_report.audit_target_checks(
+            "gcp-networking-fabric-audit", "project/acme-prod"
+        )
+        self.assertNotIn("subnet-ip-exhaustion", owed)
+        self.assertEqual(len(owed), 4)
+
+    def test_an_unpartitioned_stream_still_owes_its_whole_roster(self):
+        """The streams that enumerate only clusters must be untouched by this."""
+        for audit_id in ("compliance-audit", "obtainability-audit"):
+            with self.subTest(audit=audit_id):
+                self.assertEqual(
+                    audit_report.audit_target_checks(audit_id, "prod-us-east"),
+                    audit_report.audit_checks(audit_id),
+                )
+
+    def test_an_undeclared_target_kind_owes_everything(self):
+        """A partitioned stream that meets an unexpected target must not go quiet.
+
+        `stockout-prevention` declares `cluster` and `project`. A subnet-shaped
+        name is not something its SOP asks for, so the safe reading is that the
+        target owes the whole roster and shows up as a gap — the alternative,
+        an empty denominator, reports the target as fully audited.
+        """
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
+
+    def test_a_kind_with_no_targets_is_a_gap(self):
+        """The hole the partition itself opens, and the guard that closes it.
+
+        This is the live `gcp-networking-fabric-audit` run: one project entry,
+        no subnet entries, `subnet-ip-exhaustion` owed by nobody. Before the
+        partition it surfaced — wrongly, as the project target's failing — and
+        the narrowed denominator would have made it vanish instead of fixing it.
+        """
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                findings=[],
+                audit="gcp-networking-fabric-audit",
+                clusters=[
+                    {
+                        "name": "project/acme-prod",
+                        "location": "-",
+                        "project": "acme-prod",
+                        "checks_run": [
+                            "cloud-nat-exhaustion",
+                            "psc-routing-deadlock",
+                            "mtu-packet-fragmentation",
+                            "cloud-armor-false-positive",
+                        ],
+                    }
+                ],
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no subnet targets were audited", gaps[0])
+        self.assertIn("subnet-ip-exhaustion", gaps[0])
+
+    def test_a_run_that_enumerates_every_kind_has_no_kind_gap(self):
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                findings=[],
+                audit="gcp-networking-fabric-audit",
+                clusters=[
+                    {
+                        "name": "project/acme-prod",
+                        "location": "-",
+                        "project": "acme-prod",
+                        "checks_run": [
+                            "cloud-nat-exhaustion",
+                            "psc-routing-deadlock",
+                            "mtu-packet-fragmentation",
+                            "cloud-armor-false-positive",
+                        ],
+                    },
+                    {
+                        "name": "acme-prod/us-east4/gke-nodes",
+                        "location": "us-east4",
+                        "project": "acme-prod",
+                        "checks_run": ["subnet-ip-exhaustion"],
+                    },
+                ],
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
+        """Streams with no `scopes` keep exactly the behaviour they had."""
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(
+                "compliance-audit", [{"name": "prod-us-east"}]
+            ),
+            [],
+        )
+
+    def test_an_empty_scope_does_not_trigger_a_gap_per_kind(self):
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("gcp-networking-fabric-audit", []),
+            [],
+        )
+
+    def test_the_scope_table_rates_a_project_row_against_its_own_checks(self):
+        """The rendered `Checks` column had the same scope-blind denominator."""
+        out = "\n".join(
+            audit_report._render_scope(
+                [
+                    self._project(
+                        checks_run=[
+                            {"check": "quota-exhaustion-risk", "command": "gcloud x"},
+                            {
+                                "check": "reservation-mismatch-risk",
+                                "command": "gcloud y",
+                            },
+                        ]
+                    )
+                ],
+                [],
+                NOW,
+                self.STOCKOUT,
+            )
+        )
+        self.assertIn("2/2", out)
+        self.assertNotIn("2/12", out)
+        self.assertNotIn("⚠", out)
+
+
+class TestScopeCountsTargetsByKind(unittest.TestCase):
+    """"Audited N cluster(s)" was `len(scope.clusters)`, which is not a count of
+    clusters.
+
+    The list holds all three kinds `target_kind` separates. The live
+    `gcp-networking-fabric-audit` run enumerated 42 subnets and the project
+    entry and read no cluster at all, and its Scope section opened "Audited 43
+    cluster(s)" against a 16-cluster fleet. Coverage is the one thing that line
+    exists to convey, and it overstated it in the direction that reads as
+    reassurance.
+    """
+
+    NET = "gcp-networking-fabric-audit"
+    STOCKOUT = "stockout-prevention"
+
+    def _subnets(self, n):
+        return [
+            {
+                "name": f"acme-prod/region-{i}/default",
+                "location": f"region-{i}",
+                "project": "acme-prod",
+                "checks_run": ["subnet-ip-exhaustion"],
+            }
+            for i in range(n)
+        ]
+
+    def _project(self):
+        return {
+            "name": "project/acme-prod",
+            "location": "-",
+            "project": "acme-prod",
+            "checks_run": ["vpc-peering-health"],
+        }
+
+    def _clusters(self, n):
+        return [
+            {
+                "name": f"prod-{i}",
+                "location": "us-east4",
+                "project": "acme-prod",
+                "checks_run": [],
+            }
+            for i in range(n)
+        ]
+
+    def test_subnets_and_the_project_are_not_counted_as_clusters(self):
+        out = "\n".join(
+            audit_report._render_scope(
+                self._subnets(42) + [self._project()], [], NOW, self.NET
+            )
+        )
+        self.assertIn("Audited 42 subnets and 1 project on", out)
+        self.assertNotIn("43 cluster", out)
+
+    def test_a_mixed_scope_names_each_kind(self):
+        out = "\n".join(
+            audit_report._render_scope(
+                self._clusters(16) + [self._project()], [], NOW, self.STOCKOUT
+            )
+        )
+        self.assertIn("Audited 16 clusters and 1 project on", out)
+        self.assertNotIn("17 cluster", out)
+
+    def test_an_all_cluster_scope_still_reads_as_clusters(self):
+        out = "\n".join(
+            audit_report._render_scope(self._clusters(16), [], NOW, AUDIT)
+        )
+        self.assertIn("Audited 16 clusters on", out)
+        self.assertIn("| Cluster | Location | Project |", out)
+
+    def test_the_table_heading_stops_calling_a_subnet_a_cluster(self):
+        out = "\n".join(
+            audit_report._render_scope(
+                self._subnets(2) + [self._project()], [], NOW, self.NET
+            )
+        )
+        self.assertIn("| Target | Location | Project |", out)
+        self.assertNotIn("| Cluster | Location | Project |", out)
+
+    def test_one_of_a_kind_is_singular(self):
+        self.assertEqual(
+            audit_report.scope_phrase([{"name": "solo"}]), "1 cluster"
+        )
+        self.assertEqual(
+            audit_report.scope_phrase([{"name": "project/acme"}]), "1 project"
+        )
+
+    def test_an_empty_scope_does_not_crash_the_heading(self):
+        # `scope.clusters` is validated non-empty, but `_render_scope` is also
+        # reached from paths that have not been through the validator.
+        self.assertEqual(audit_report.scope_phrase([]), "0 clusters")
+        self.assertEqual(audit_report.scope_phrase(None), "0 clusters")
+
+    def test_the_clean_comment_counts_by_kind_too(self):
+        """The all-clear says what it read; it was making the same claim."""
+        doc = make_doc(
+            findings=[],
+            audit=self.NET,
+            clusters=self._subnets(2) + [self._project()],
+        )
+        comment = audit_report.render_clean_comment(self.NET, doc, NOW)
+        self.assertIn("2 subnets and 1 project", comment)
+        self.assertNotIn("3 audited cluster", comment)
+
+
+class TestLimitationRestatingNotApplicable(unittest.TestCase):
+    """A disposition written twice must not count as a gap twice.
+
+    The live case: `gcp-networking-fabric-audit` against an auto-mode network.
+    42 subnets, one holding allocations and 41 empty. Network Analyzer
+    publishes no utilization for a subnet with nothing allocated, so the
+    collector declared `subnet-ip-exhaustion` not-applicable on each of the 41
+    with that reason — correctly, because a subnet holding no addresses cannot
+    exhaust them. The model then wrote the same reason into `limitations` as
+    well, and 41 targets that had refused nothing produced 41 coverage gaps and
+    a `partial: True` on a run whose every target came back `collected`.
+    """
+
+    NET = "gcp-networking-fabric-audit"
+    REASON = (
+        "subnet-ip-exhaustion could not be measured on this subnet: gcloud's "
+        "UsableSubnetwork omits ipUtilization and Network Analyzer's "
+        "ipAddressInsight published no stats for it (no allocations recorded)."
+    )
+
+    def _doc(self, clusters):
+        return make_doc(findings=[], audit=self.NET, clusters=clusters)
+
+    def _subnet(self, name="acme-prod/us-east4/default", **extra):
+        base = {"name": name, "location": "us-east4", "project": "acme-prod"}
+        base.update(extra)
+        return base
+
+    def _clean_project(self):
+        """Keeps `_unenumerated_kind_gaps` out of these assertions."""
+        return {
+            "name": "project/acme-prod",
+            "location": "global",
+            "project": "acme-prod",
+            "checks_run": list(
+                audit_report.audit_target_checks(self.NET, "project/acme-prod")
+            ),
+        }
+
+    def _measured_subnet(self):
+        return self._subnet(
+            name="acme-prod/us-east4/measured",
+            checks_run=["subnet-ip-exhaustion"],
+        )
+
+    def test_a_limitation_restating_the_na_reason_is_not_a_gap(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                        ],
+                        limitations=self.REASON,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_forty_one_empty_subnets_do_not_make_the_run_partial(self):
+        """The live shape, at its live size."""
+        subnets = [
+            self._subnet(
+                name=f"acme-prod/region-{i}/default",
+                checks_not_applicable=[
+                    {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                ],
+                limitations=self.REASON,
+            )
+            for i in range(41)
+        ]
+        gaps = audit_report.coverage_gaps(
+            self._doc([self._clean_project(), self._measured_subnet(), *subnets])
+        )
+        self.assertEqual(gaps, [])
+
+    def test_a_limitation_naming_no_check_stays_a_gap(self):
+        """Degradation prose the not-applicable entry cannot have dispositioned.
+
+        This is the reason the rule requires a slug rather than treating any
+        limitation on a target with an N/A entry as already answered: a check
+        that ran against less than it should have is exactly what `limitations`
+        is for, and nothing here suppresses it.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                        ],
+                        limitations="only 2 of 5 ranges on this subnet were readable",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("only 2 of 5 ranges", gaps[0])
+
+    def test_a_limitation_naming_a_check_that_ran_stays_a_gap(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    {
+                        "name": "project/acme-prod",
+                        "location": "global",
+                        "project": "acme-prod",
+                        "checks_run": list(
+                            audit_report.audit_target_checks(
+                                self.NET, "project/acme-prod"
+                            )
+                        ),
+                        "checks_not_applicable": [
+                            {"check": "subnet-ip-exhaustion", "reason": "n/a here"}
+                        ],
+                        "limitations": (
+                            "cloud-armor-false-positive saw 2 of 5 policies"
+                        ),
+                    },
+                    self._measured_subnet(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("cloud-armor-false-positive", gaps[0])
+
+    def test_a_limitation_naming_both_kinds_of_check_stays_a_gap(self):
+        """One slug outside `na` keeps the whole string.
+
+        Suppressing the mixed case would drop the half that describes a check
+        that ran, which is the half no other field records.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    {
+                        "name": "project/acme-prod",
+                        "location": "global",
+                        "project": "acme-prod",
+                        "checks_run": list(
+                            audit_report.audit_target_checks(
+                                self.NET, "project/acme-prod"
+                            )
+                        ),
+                        "checks_not_applicable": [
+                            {"check": "subnet-ip-exhaustion", "reason": "n/a here"}
+                        ],
+                        "limitations": (
+                            "subnet-ip-exhaustion has no data source and "
+                            "cloud-armor-false-positive saw 2 of 5 policies"
+                        ),
+                    },
+                    self._measured_subnet(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("cloud-armor-false-positive", gaps[0])
+
+    def test_a_limitation_with_no_na_entries_at_all_stays_a_gap(self):
+        """Nothing was dispositioned, so there is nothing to have said twice."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_run=["subnet-ip-exhaustion"],
+                        limitations="subnet-ip-exhaustion read a stale cache",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("stale cache", gaps[0])
+
+    def test_a_missing_check_is_still_reported_alongside_a_suppressed_string(self):
+        """Suppressing the prose must not suppress the roster half with it."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    {
+                        "name": "project/acme-prod",
+                        "location": "global",
+                        "project": "acme-prod",
+                        "checks_run": ["cloud-nat-exhaustion"],
+                        "checks_not_applicable": [
+                            {"check": "subnet-ip-exhaustion", "reason": self.REASON}
+                        ],
+                        "limitations": self.REASON,
+                    },
+                    self._measured_subnet(),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("applicable checks did not run", gaps[0])
+        self.assertNotIn("no allocations recorded", gaps[0])
+
+    def test_the_helper_is_false_without_a_limitation_or_without_na(self):
+        roster = audit_report.audit_target_checks(self.NET, "a/b/c")
+        self.assertFalse(
+            audit_report._limitation_restates_na("", {"subnet-ip-exhaustion"}, roster)
+        )
+        self.assertFalse(
+            audit_report._limitation_restates_na(self.REASON, set(), roster)
+        )
+
+    # --- the reason that names no slug ---------------------------------- #
+    #
+    # `REASON` above names `subnet-ip-exhaustion`, so every test to here is
+    # suppressed by the slug route. The reason the collector actually writes
+    # names the *surface* it could not read and no check at all -- a reason is
+    # written for a human, and the human is looking at the check's own row.
+    # Two live runs of the same fleet nine hours apart, nothing changed but
+    # this wording, reported 0 gaps and then 41.
+
+    SLUGLESS_REASON = (
+        "No IP-utilization figure for this subnet on either surface: gcloud's "
+        "UsableSubnetwork omits the field, and "
+        "google.networkanalyzer.vpcnetwork.ipAddressInsight published no stats "
+        "for it, which Network Analyzer does for subnets holding no allocations."
+    )
+
+    def test_a_reason_naming_no_slug_is_still_recognised_when_copied_verbatim(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {
+                                "check": "subnet-ip-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations=self.SLUGLESS_REASON,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_the_copy_still_matches_through_case_spacing_and_a_lost_full_stop(self):
+        """What survives a round trip through a model is not byte equality."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_not_applicable=[
+                            {
+                                "check": "subnet-ip-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations="  No IP-utilization Figure for this subnet on either surface: "
+                        "gcloud's UsableSubnetwork omits the field, and\n"
+                        "google.networkanalyzer.vpcnetwork.ipAddressInsight published no "
+                        "stats for it, which Network Analyzer does for subnets holding "
+                        "no allocations ",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_slugless_prose_that_is_not_one_of_the_reasons_stays_a_gap(self):
+        """The conservatism the slug route had, kept.
+
+        Degradation prose names no check either. Matching it against the
+        reasons is what tells the two apart -- without that, the new route
+        would swallow every unnamed limitation on any target that happened to
+        disposition something.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_run=["subnet-ip-exhaustion"],
+                        checks_not_applicable=[
+                            {
+                                "check": "cloud-nat-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations="Two of five Cloud Armor policies were unreadable this run.",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("Cloud Armor", gaps[0])
+
+    # --- the structural rule -------------------------------------------- #
+    #
+    # A third live run wrote a third restatement: all five reasons joined
+    # under "No checks ran against this target this run: ...". Neither route
+    # above matches it, and there is no reason to think a fourth wording would
+    # not find a fourth way past. What every one of them has in common is the
+    # state underneath -- a target whose whole roster is dispositioned and on
+    # which nothing ran -- and that is not the model's to phrase.
+
+    JOINED_REASONS = (
+        "No checks ran against this target this run: NAT gateways are "
+        "configured at the Cloud Router level, not per subnet.; Private "
+        "Service Connect endpoints are project-level resources, not subnet "
+        "resources."
+    )
+
+    def test_a_fully_dispositioned_target_is_not_a_gap_whatever_the_prose_says(self):
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        # Explicit, because `make_doc` reads an absent
+                        # `checks_run` as "ran the full roster" and the live
+                        # subnets this covers ran nothing at all.
+                        checks_run=[],
+                        checks_not_applicable=[
+                            {"check": "subnet-ip-exhaustion", "reason": "no allocations"},
+                            {"check": "cloud-nat-exhaustion", "reason": "router-scoped"},
+                        ],
+                        limitations=self.JOINED_REASONS,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(gaps, [])
+
+    def test_a_check_that_ran_keeps_the_prose_even_when_the_rest_is_dispositioned(self):
+        """The rule turns on nothing having run, not on `na` being large.
+
+        One check ran, so the prose can be describing how far it got — the
+        thing a limitation is actually for — and no disposition covers that.
+        """
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        checks_run=["subnet-ip-exhaustion"],
+                        checks_not_applicable=[
+                            {"check": "cloud-nat-exhaustion", "reason": "router-scoped"},
+                        ],
+                        limitations="subnet-ip-exhaustion read 3 of 4 secondary ranges.",
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("3 of 4 secondary ranges", gaps[0])
+
+    def test_prose_on_a_target_that_dispositioned_nothing_is_still_a_gap(self):
+        """`na` empty means nothing was accounted for, so nothing is excused."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(limitations="The whole subnet was unreachable."),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("unreachable", gaps[0])
+
+    def test_a_reason_from_a_different_target_does_not_suppress(self):
+        """Reasons are matched per target, not pooled across the document."""
+        gaps = audit_report.coverage_gaps(
+            self._doc(
+                [
+                    self._clean_project(),
+                    self._subnet(
+                        name="acme-prod/us-east4/one",
+                        checks_not_applicable=[
+                            {
+                                "check": "subnet-ip-exhaustion",
+                                "reason": self.SLUGLESS_REASON,
+                            }
+                        ],
+                        limitations=self.SLUGLESS_REASON,
+                    ),
+                    self._subnet(
+                        name="acme-prod/us-east4/two",
+                        checks_run=["subnet-ip-exhaustion"],
+                        checks_not_applicable=[
+                            {"check": "cloud-nat-exhaustion", "reason": "project-scoped"}
+                        ],
+                        limitations=self.SLUGLESS_REASON,
+                    ),
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("acme-prod/us-east4/two", gaps[0])
 
 
 class TestChecksRun(unittest.TestCase):
@@ -6744,6 +10141,38 @@ class TestCheckCommands(unittest.TestCase):
             "names none of",
         )
 
+    def test_an_in_process_cloud_api_read_counts_as_having_inspected(self):
+        """`fleet_waste.py`'s overrequest check issues the Monitoring GET itself.
+
+        It records the request rather than a shell line, because there is no
+        shell line -- the credential proxy refuses to hand out an access token,
+        so the read happens in process under ADC. Rejecting that shape cost a
+        live run 14 minutes of the agent improvising around the validator.
+        """
+        audit_report.validate_findings(
+            self._with(
+                {
+                    "check": "netpol-missing",
+                    "command": (
+                        "GET monitoring.googleapis.com/v3/projects/acme/timeSeries "
+                        'filter=resource.labels.cluster_name="prod-1" '
+                        "metrics=kubernetes.io/container/cpu/core_usage_time window=168h"
+                    ),
+                }
+            ),
+            AUDIT,
+        )
+
+    def test_naming_an_api_host_does_not_excuse_a_command_that_reads_nothing(self):
+        """The endpoint list widens what counts as inspecting, not what counts as a command."""
+        self._reject(
+            {
+                "check": "netpol-missing",
+                "command": "echo googleapis.com",
+            },
+            "cannot inspect",
+        )
+
     def test_calling_this_harness_is_not_inspecting_the_fleet(self):
         """`checks_run` records how the fleet was read, not how it was reported."""
         self._reject(
@@ -6836,6 +10265,31 @@ class TestCheckCommands(unittest.TestCase):
         self.assertIn("netpol-missing", body)
         self.assertIn("prod-us-east", body)
 
+    def test_the_appendix_says_which_of_its_rows_a_shell_will_not_take(self):
+        """"Re-runnable" is unqualified, and one row shape is not.
+
+        `fleet_waste.py` records the Monitoring read as `GET <host>/<path>`
+        because the credential proxy refuses to hand out an access token, so
+        there is no shell line to record. Sixteen such rows shipped in the
+        cost stream's last run under a sentence promising every row could be
+        re-run; pasted into a shell they answer `command not found: GET`, and
+        a reader who tries concludes the finding is junk rather than the
+        rendering.
+        """
+        doc = self._with(
+            {
+                "check": "netpol-missing",
+                "command": (
+                    "GET monitoring.googleapis.com/v3/projects/acme/timeSeries "
+                    'filter=resource.labels.cluster_name="prod-1" '
+                    "metrics=kubernetes.io/container/cpu/core_usage_time window=168h"
+                ),
+            }
+        )
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("beginning with an HTTP verb", body)
+        self.assertIn("rather than pasting the row into a shell", body)
+
     def test_the_evidence_table_is_dropped_whole_or_not_at_all(self):
         """Half a table reads as a short one, and "we ran three checks" is a worse lie than silence."""
         findings = [
@@ -6852,6 +10306,57 @@ class TestCheckCommands(unittest.TestCase):
         self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
         if "How this run checked the fleet" in body:
             self.assertIn("kubectl get netpol -A", body)
+
+    def _crowded_out(self, na=()):
+        """A run whose evidence table cannot fit: 30 long commands, 24 findings.
+
+        The live shape, not a synthetic one — obtainability-audit's run of
+        2026-08-30 carried 37 findings and a 49,965-character appendix into a
+        60,000-character budget, and the appendix lost.
+        """
+        doc = self._with({"check": "netpol-missing", "command": "kubectl get netpol -A"})
+        doc["scope"]["clusters"][0]["checks_run"] = [
+            {
+                "check": "netpol-missing",
+                "command": f"kubectl --context c{i} get networkpolicy -A "
+                + "--selector=x " * 200,
+            }
+            for i in range(30)
+        ]
+        doc["scope"]["clusters"][1]["checks_run"] = []
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = list(na)
+        doc["findings"] = [
+            make_finding(
+                fid=f"finding-{i}",
+                title=f"Finding {i} " + "padding " * 20,
+                impact="x" * 1400,
+            )
+            for i in range(24)
+        ]
+        return render_body(doc, generated_at=NOW)
+
+    def test_a_crowded_out_evidence_table_says_so_instead_of_vanishing(self):
+        """The falsifiability promise is broken silently, on the runs that most need it.
+
+        `validate_check_command` makes the model invent a re-runnable command
+        for every check on the stated promise that they are published here, and
+        this section is last in line for the body budget — so it disappears on
+        exactly the runs whose findings crowded it out. Three of the eight live
+        streams dropped it on 2026-08-30, none of them saying so; the reader
+        gets a document that looks complete.
+        """
+        body = self._crowded_out()
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertNotIn("How this run checked the fleet", body)
+        self.assertIn("The 30 command(s) behind this run's checks do not fit", body)
+        self.assertIn("kept in full in this run's stored report", body)
+
+    def test_the_dropped_table_notice_counts_the_exclusions_too(self):
+        """A check declared inapplicable leaves the coverage denominator, so its absence counts."""
+        body = self._crowded_out(
+            na=[{"check": "idle-nodepool", "reason": "Autopilot has no node pools"}]
+        )
+        self.assertIn("and the 1 exclusion(s) do not fit", body)
 
 
 class TestPartialCoverageGating(HarnessTestCase):
@@ -6942,23 +10447,181 @@ class TestPartialCoverageGating(HarnessTestCase):
             "2 gaps", audit_report.coverage_issue_title(AUDIT, ["a", "b"])
         )
 
+    def _coverage_ledger(self, title):
+        return {
+            "issue list": self.issue_list(),
+            "--json title": json.dumps({"title": title}),
+        }
+
+    def _retitles(self):
+        edits = [c for c in self.harness.gh_calls("issue", "edit") if "--title" in c]
+        return [c[c.index("--title") + 1] for c in edits]
+
+    def test_a_coverage_ledger_is_retitled_when_the_gap_count_moves(self):
+        """The findings path retitles on every update; this one used to never.
+
+        Live issue #112 was opened the morning one target was unreadable and
+        still read `1 gap` after a later run could not read forty-one. The
+        title is what someone scanning the issue list decides on.
+        """
+        self.harness.replies = self._coverage_ledger(
+            "[audit] Security & RBAC Posture Audit — coverage incomplete (1 gap, 0 findings)"
+        )
+        self.run_finish(
+            make_doc(
+                findings=[],
+                skipped=[
+                    {"cluster": "dr-west", "reason": "unreachable"},
+                    {"cluster": "dr-east", "reason": "unreachable"},
+                ],
+            )
+        )
+        self.assertEqual(
+            [t for t in self._retitles() if "coverage incomplete" in t],
+            [audit_report.coverage_issue_title(AUDIT, ["a", "b"])],
+        )
+
+    def test_an_unchanged_gap_count_still_refreshes_the_ledger(self):
+        """A steady gap count is not a steady ledger.
+
+        This used to return early on `current == wanted`, on the reasoning that
+        one `gh` call per run that changes nothing is one too many. The premise
+        was wrong: the count holding at four says nothing about *which* four
+        clusters went unread, and the body carries a scope table and a
+        generated timestamp that move regardless. Live #58 froze on exactly
+        this path — two consecutive `4 gaps` runs returned here without
+        publishing, and its body still described the fleet of 2026-08-10.
+        """
+        self.harness.replies = self._coverage_ledger(
+            audit_report.coverage_issue_title(AUDIT, ["only"])
+        )
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(
+            self._retitles(), [audit_report.coverage_issue_title(AUDIT, ["only"])]
+        )
+
+    def test_the_refreshed_ledger_body_describes_this_run(self):
+        """The title getting the count right is worth little if the body a
+        reader lands on describes a fleet from three weeks ago."""
+        self.harness.replies = self._coverage_ledger(
+            audit_report.coverage_issue_title(AUDIT, ["only"])
+        )
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        bodies = self.harness.bodies_for("issue", "edit")
+        self.assertEqual(len(bodies), 1)
+        # The cluster this run could not read, named in the body it published —
+        # not merely counted in the title.
+        self.assertIn("dr-west", bodies[0])
+
+    def test_a_findings_ledger_gone_gapped_keeps_its_own_title_and_body(self):
+        """The guard rules out both. Retitling to `0 findings` over a body
+        still listing seven trades a stale number for a contradictory one, and
+        rewriting that body would discard the seven outright."""
+        self.harness.replies = self._coverage_ledger(
+            "[audit] Security & RBAC Posture Audit — 7 findings (6 critical)"
+        )
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self._retitles(), [])
+
+    def test_an_unreadable_title_is_left_alone(self):
+        """`gh issue view` failing is not evidence the title is wrong."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json title": 1}
+        self.run_finish(make_doc(findings=[], skipped=self.PARTIAL))
+        self.assertEqual(self._retitles(), [])
+
+    def test_the_coverage_title_pattern_matches_only_its_own_output(self):
+        for gaps in (["a"], ["a", "b"], list("abcdefghijkl")):
+            with self.subTest(n=len(gaps)):
+                title = audit_report.coverage_issue_title(AUDIT, gaps)
+                self.assertRegex(title, audit_report.COVERAGE_TITLE_RE)
+        for other in (
+            audit_report.issue_title(AUDIT, []),
+            "[audit] Security & RBAC Posture Audit — 7 findings (6 critical)",
+            "coverage incomplete (1 gap, 0 findings) — but not at the end",
+        ):
+            with self.subTest(title=other):
+                self.assertIsNone(audit_report.COVERAGE_TITLE_RE.search(other))
+
     def test_a_gapped_clean_body_does_not_call_the_fleet_compliant(self):
         body = render_body(make_doc(findings=[], skipped=self.PARTIAL), generated_at=NOW)
         self.assertNotIn("Every audited cluster is compliant", body)
 
     def test_a_partial_run_announces_nothing_as_resolved(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
-        previous = published_body(
-            make_doc(findings=[make_finding(fid="gone"), make_finding()]),
-            generated_at=NOW,
+        # The vanished finding sits on the cluster the run could not read, so
+        # its absence is "not checked" rather than "fixed".
+        gone = derived_id(fid="gone", obj="Namespace/gone", cluster="dr-west")
+        self.seed_store(
+            make_doc(
+                findings=[make_finding(fid="gone", cluster="dr-west"), make_finding()]
+            )
         )
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": previous}),
-        }
+        self.harness.replies = {"issue list": self.issue_list()}
         self.run_finish(make_doc(skipped=self.PARTIAL))
         self.assertEqual(self.stdout_json()["resolved"], 0)
         self.assertTrue(self.stdout_json()["partial"])
+        # The counter and the comment are two renderings of one claim, and the
+        # comment is the half a human reads. A guard on the counter alone
+        # leaves the prose free to name a finding as fixed that the run never
+        # looked for.
+        for comment in self.harness.bodies_for("issue", "comment"):
+            self.assertNotIn(gone, comment)
+            self.assertNotIn("resolved", comment.lower())
+
+    def test_a_gap_on_one_cluster_still_resolves_a_finding_on_another(self):
+        """The other half of the rule, and the reason it is scoped at all.
+
+        "The audit did not look" is true of a target, not of a stream. Read
+        stream-wide it meant one unreachable cluster stopped every *other*
+        cluster's fixes being announced — and a gap that never clears stopped
+        them permanently. `fleet-consistency-drift` sat like that for six
+        consecutive runs: gapped on `kube-agents-host` for want of an
+        `environment` label, with both of its live findings on other clusters
+        and no way to report either one fixed.
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id(fid="gone", obj="Namespace/gone")
+        self.seed_store(make_doc(findings=[make_finding(fid="gone"), make_finding()]))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(make_doc(skipped=self.PARTIAL))
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+        # Still partial: the gap is reported as loudly as ever, it just no
+        # longer speaks for clusters it is not about.
+        self.assertTrue(self.stdout_json()["partial"])
+        self.assertTrue(
+            any(gone in body for body in self.harness.bodies_for("issue", "comment"))
+        )
+
+    def test_a_gap_elsewhere_still_closes_a_stale_pull_request(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id(fid="gone", obj="Namespace/gone")
+        self.seed_store(make_doc(findings=[make_finding(fid="gone"), make_finding()]))
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr list": json.dumps(
+                [pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block([gone]))]
+            ),
+        }
+        self.run_finish(make_doc(skipped=self.PARTIAL))
+        self.assertTrue(self.harness.gh_calls("pr", "close"))
+
+    def test_a_gap_on_the_findings_own_cluster_keeps_its_pull_request_open(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        gone = derived_id(fid="gone", obj="Namespace/gone", cluster="dr-west")
+        self.seed_store(
+            make_doc(
+                findings=[make_finding(fid="gone", cluster="dr-west"), make_finding()]
+            )
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr list": json.dumps(
+                [pr(8, "platform-agent/fix-x-gone", body=audit_report.delta_block([gone]))]
+            ),
+        }
+        self.run_finish(make_doc(skipped=self.PARTIAL))
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
 
     def test_a_truncated_body_is_not_a_coverage_gap(self):
         # `partial` used to be `bool(gaps) or rendered.partial`, which made
@@ -7883,11 +11546,8 @@ class TestSilentVerdict(HarnessTestCase):
     """
 
     def finish_json(self, doc, **replies):
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps({"body": published_body(doc, generated_at=NOW)}),
-            **replies,
-        }
+        self.seed_store(doc)
+        self.harness.replies = {"issue list": self.issue_list(), **replies}
         self.run_finish(doc)
         return self.stdout_json()
 
@@ -7914,12 +11574,8 @@ class TestSilentVerdict(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
 
     def test_new_findings_are_never_silent(self):
-        self.harness.replies = {
-            "issue list": self.issue_list(),
-            "--json body": json.dumps(
-                {"body": published_body(make_doc(findings=[]), generated_at=NOW)}
-            ),
-        }
+        self.seed_store(make_doc(findings=[]))
+        self.harness.replies = {"issue list": self.issue_list()}
         self.run_finish(make_doc(findings=[make_finding(fid="a")]))
         out = self.stdout_json()
         self.assertEqual(out["new"], 1)
@@ -7940,6 +11596,163 @@ class TestSilentVerdict(HarnessTestCase):
                         or out["prs_closed"]
                     ),
                 )
+
+
+class TestChatSummary(HarnessTestCase):
+    """`chat_summary` is the whole message, so `finish` renders it.
+
+    The SOPs asked for "one line: counts by severity, new vs. resolved, and the
+    `issue_url`" and got sixteen hundred characters on 2026-08-30 — the run's
+    own exit codes, then every finding in the ledger restated under a link to
+    the ledger. Prose was not holding the line, and every number it asked the
+    model to reassemble was already in the payload.
+    """
+
+    def finish_json(self, doc, **replies):
+        self.seed_store(doc)
+        self.harness.replies = {"issue list": self.issue_list(), **replies}
+        self.run_finish(doc)
+        return self.stdout_json()
+
+    def test_a_silent_run_summarises_to_the_marker_alone(self):
+        out = self.finish_json(make_doc(findings=[]))
+        self.assertTrue(out["silent_ok"])
+        self.assertEqual(out["chat_summary"], "[SILENT]")
+
+    def test_the_marker_and_the_flag_never_disagree(self):
+        """Copying the field verbatim has to be the same as obeying the flag."""
+        for findings in ([], [make_finding(fid="a")]):
+            with self.subTest(findings=len(findings)):
+                out = self.finish_json(make_doc(findings=findings))
+                self.assertEqual(
+                    out["chat_summary"] == "[SILENT]", bool(out["silent_ok"])
+                )
+
+    def test_a_reporting_run_is_one_line_carrying_the_ledger_url(self):
+        self.seed_store(make_doc(findings=[]))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(make_doc(findings=[make_finding(fid="a")]))
+        out = self.stdout_json()
+        summary = out["chat_summary"]
+        self.assertNotIn("\n", summary)
+        self.assertIn(out["issue_url"], summary)
+        self.assertIn("1 new", summary)
+
+    def test_the_summary_never_restates_the_findings(self):
+        """The link is the report; the line is the notification."""
+        self.seed_store(make_doc(findings=[]))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(
+            make_doc(
+                findings=[
+                    make_finding(fid="a", title="Privileged container in kube-system"),
+                    make_finding(fid="b", title="Public control plane endpoint"),
+                ]
+            )
+        )
+        summary = self.stdout_json()["chat_summary"]
+        self.assertNotIn("Privileged container", summary)
+        self.assertNotIn("Public control plane", summary)
+        self.assertLess(len(summary), 200)
+
+    def test_severity_counts_lead_and_the_delta_follows(self):
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 2,
+                "resolved": 1,
+                "prs_opened": ["https://example.invalid/pull/1"],
+                "prs_closed": [],
+                "coverage_gaps": [],
+                "issue_url": "https://example.invalid/issues/7",
+            },
+            [
+                make_finding(fid="a", severity="critical"),
+                make_finding(fid="b", severity="major"),
+                make_finding(fid="c", severity="major"),
+            ],
+        )
+        self.assertEqual(
+            summary,
+            f"{audit_report.audit_name('compliance-audit')}: "
+            "1 critical, 2 major, 0 minor (2 new, 1 resolved, 1 PR opened) "
+            "— https://example.invalid/issues/7",
+        )
+
+    def test_a_run_that_moved_nothing_but_speaks_says_so(self):
+        """`silent_ok: false` with an empty delta still owes a reason to read."""
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 0,
+                "prs_opened": [],
+                "prs_closed": [],
+                "coverage_gaps": [],
+                "issue_url": "https://example.invalid/issues/7",
+            },
+            [make_finding(fid="a", severity="minor")],
+        )
+        self.assertIn("(no change)", summary)
+
+    def test_a_gap_is_named_in_the_delta_and_counted_not_quoted(self):
+        summary = audit_report.chat_summary(
+            "fleet-consistency-drift",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 1,
+                "prs_opened": [],
+                "prs_closed": [],
+                "coverage_gaps": [
+                    "cluster kube-agents-host: nodes unreadable (RBAC)",
+                    "cluster drift-peer-std-2: skipped",
+                ],
+                "issue_url": "https://example.invalid/issues/9",
+            },
+            [],
+        )
+        self.assertIn("nothing found, coverage incomplete", summary)
+        self.assertIn("2 gaps", summary)
+        self.assertNotIn("RBAC", summary)
+
+    def test_a_closed_ledger_says_so_rather_than_counting_to_zero(self):
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 4,
+                "prs_opened": [],
+                "prs_closed": ["https://example.invalid/pull/2"],
+                "coverage_gaps": [],
+                "issue_url": "https://example.invalid/issues/7",
+            },
+            [],
+        )
+        self.assertIn("clean, ledger closed", summary)
+        self.assertIn("4 resolved", summary)
+        self.assertIn("1 PR closed", summary)
+
+    def test_a_stream_with_no_ledger_still_renders_a_line(self):
+        """`issue_url` is `None` on a clean stream that never had an issue."""
+        summary = audit_report.chat_summary(
+            "compliance-audit",
+            {
+                "silent_ok": False,
+                "new": 0,
+                "resolved": 2,
+                "prs_opened": [],
+                "prs_closed": [],
+                "coverage_gaps": [],
+                "issue_url": None,
+            },
+            [],
+        )
+        self.assertNotIn("None", summary)
+        self.assertIn("2 resolved", summary)
 
 
 class TestDispatchAndHandover(unittest.TestCase):
@@ -8008,6 +11821,112 @@ class TestDispatchAndHandover(unittest.TestCase):
                 text = self.read(f"governance/{audit_report.audit_sop(audit_id)}")
                 self.assertIn("silent_ok", text)
                 self.assertIn("on-demand", text.lower())
+
+    def test_no_sop_invokes_the_harness_by_path(self):
+        """Every documented invocation names an interpreter.
+
+        `./skills/fleet-audit/scripts/audit_report.py start …` -- the spelling
+        eight SOPs shipped -- is refused by the gateway's lifecycle guard,
+        which reads a by-path script's text and walks every path-shaped token
+        in it as another script to scan. Two of audit_report.py's own tokens,
+        `/opt/defaults/scripts` and `/opt/data/scripts`, are directories; the
+        guard fails closed on a reference it cannot read as a script and the
+        command comes back "cannot restart or stop the gateway". Every stream
+        burnt its first turn on that message before recovering with `python3`.
+        Naming an interpreter makes the file an argument, so nothing reads it.
+        """
+        pattern = re.compile(r"(?m)^\s*\./skills/fleet-audit/scripts/\w+\.py |Run `\./skills/")
+        docs = [f"governance/{audit_report.audit_sop(a)}" for a in audit_report.AUDITS]
+        docs.append("skills/fleet-audit/SKILL.md")
+        for doc in docs:
+            with self.subTest(doc=doc):
+                self.assertEqual([], pattern.findall(self.read(doc)))
+
+    def test_every_sop_passes_the_manifest_to_finish(self):
+        """`--manifest-file` is optional to the parser and mandatory in practice.
+
+        Every cross-check `cross_check_manifest` performs -- a fabricated
+        `checks_run` entry, a cluster the collector read and the document
+        dropped, a check declared inapplicable that the collector ran -- is
+        reachable only through this flag, and omitting it is silent: `finish`
+        publishes, and nothing in the output says the run went unverified. The
+        SOP text is what actually requires it, so this test is what keeps the
+        SOP text honest. Every stream has a collector
+        (test_cron_prompts_name_the_real_collector_invocation re-derives the
+        invocation from each SOP), so there is no stream for which the flag is
+        genuinely optional.
+        """
+        for audit_id in audit_report.AUDITS:
+            doc = f"governance/{audit_report.audit_sop(audit_id)}"
+            with self.subTest(audit=audit_id):
+                text = self.read(doc)
+                index = text.find(f"audit_report.py finish --audit {audit_id}")
+                self.assertNotEqual(index, -1, f"{doc} documents no `finish` invocation")
+                # Most SOPs wrap the invocation across backslash-continued
+                # lines; take the whole command, not its first line.
+                command = ""
+                for line in text[index:].splitlines():
+                    command += line
+                    if not line.rstrip().endswith("\\"):
+                        break
+                self.assertIn(
+                    "--manifest-file",
+                    command,
+                    f"{doc}'s `finish` invocation omits --manifest-file, which "
+                    "turns every manifest cross-check off without saying so",
+                )
+
+    def test_every_documented_finding_example_carries_its_check_slug(self):
+        """The worked example is what the model copies, so it has to be legal.
+
+        SKILL.md's own field rules say `check` is required on a finding and
+        that any `id` is derived and discarded. The example seventy-five lines
+        above those rules said the opposite: it wrote
+        `"id": "netpol-missing-payments"` and no `check` at all, hiding the
+        omission by spelling the slug inside the id, where it reads as though
+        the check has been named. Every stream whose SOP carries no findings
+        example of its own falls back to that one, and the cost stream
+        reproduced the mistake on four consecutive runs -- 2026-08-27, -29,
+        -30 and -31 -- each time losing a round trip to `findings[0].check:
+        expected a string, got NoneType` before rewriting the file. The
+        networking SOP, the one SOP shipping a correct example of its own,
+        never hit it once. Prose stating the rule is not enough when an
+        illustration next to it demonstrates the violation.
+        """
+        docs = [f"governance/{audit_report.audit_sop(a)}" for a in audit_report.AUDITS]
+        docs.append("skills/fleet-audit/SKILL.md")
+        examples = 0
+        for doc in docs:
+            for block in re.findall(r"(?ms)^```json\n(.*?)^```", self.read(doc)):
+                try:
+                    document = json.loads(block)
+                except ValueError:
+                    continue  # an abridged fragment, not a document
+                if not isinstance(document, dict):
+                    continue
+                findings = document.get("findings")
+                if not isinstance(findings, list):
+                    continue
+                for index, finding in enumerate(findings):
+                    if not isinstance(finding, dict):
+                        continue
+                    examples += 1
+                    with self.subTest(doc=doc, finding=index):
+                        self.assertIsInstance(
+                            finding.get("check"),
+                            str,
+                            f"{doc} findings[{index}] names no `check` slug. The "
+                            "validator rejects such a document, and this example "
+                            "is what the model writes its findings from.",
+                        )
+                        self.assertNotIn(
+                            "id",
+                            finding,
+                            f"{doc} findings[{index}] writes an `id`. The harness "
+                            "derives it from check/cluster/namespace/object and "
+                            "discards any the document carries.",
+                        )
+        self.assertTrue(examples, "no documented findings example was found to check")
 
 
 if __name__ == "__main__":

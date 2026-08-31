@@ -28,14 +28,17 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
@@ -81,12 +84,32 @@ class AuditSpec(NamedTuple):
     ledger open forever. `fleet-consistency-drift`'s split-cluster guard is the
     standing example: it fires when a cluster is an outlier on six or more
     facets, which is not something you can run against a cluster in isolation.
+
+    `scopes` partitions the roster by the *kind* of target a check runs against,
+    for the streams whose SOPs enumerate more than clusters. Three SOPs do: a
+    `project/<id>` entry carries the checks that read project-level GCP objects,
+    and networking additionally gives every subnet its own entry. Without the
+    partition the denominator is the whole roster for every target, so a project
+    entry is charged with the ten cluster checks it was never meant to run and
+    each cluster is charged with the project ones — `stockout-prevention`
+    reported "10 of 12 applicable checks did not run" against a target that ran
+    both of its two, on every run, and stayed `partial` forever on the strength
+    of it. A slug may appear under two kinds when the SOP defines a form of the
+    check for each, as `reservation-mismatch-risk` does. Streams that leave this
+    empty measure every target against the whole roster, which is what every
+    stream did before the partition existed.
+
+    `test_scopes_partition_the_roster` asserts the union across kinds is exactly
+    `checks`, so a check added to a partitioned stream cannot land in the roster
+    without an owning target kind — it would otherwise be a check the harness
+    silently stops requiring of anyone.
     """
 
     title: str
     sop: str
     checks: tuple[str, ...]
     derived: tuple[str, ...] = ()
+    scopes: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
@@ -162,6 +185,24 @@ AUDITS: dict[str, AuditSpec] = {
             "terminal-pods",
             "idle-namespace",
         ),
+        # §3.4–3.6 read Compute Engine objects that belong to a project, not to
+        # a cluster; the SOP's §3 project-scoped rule puts them on their own
+        # `project/<id>` entry.
+        scopes=(
+            (
+                "cluster",
+                (
+                    "overrequest",
+                    "orphan-pv",
+                    "unconsumed-pvc",
+                    "idle-nodepool",
+                    "scaledown-blocked",
+                    "terminal-pods",
+                    "idle-namespace",
+                ),
+            ),
+            ("project", ("unattached-disk", "idle-address", "orphan-lb")),
+        ),
     ),
     "fleet-consistency-drift": AuditSpec(
         "Fleet Consistency Drift Audit",
@@ -222,6 +263,29 @@ AUDITS: dict[str, AuditSpec] = {
             "autoscaler-out-of-resources",
             "dangling-compute-class",
         ),
+        # §4's manifest note: the `project/<id>` entry carries the two
+        # project-scoped checks. `reservation-mismatch-risk` sits under both
+        # kinds because the SOP gives it a cluster form and a project
+        # idle-capacity form.
+        scopes=(
+            (
+                "cluster",
+                (
+                    "ccc-missing-fallbacks",
+                    "ccc-no-ondemand-floor",
+                    "ccc-large-vm-scarcity",
+                    "ccc-priority-starvation",
+                    "ccc-mixed-disk-generations",
+                    "ccc-hyperdisk-incompatible",
+                    "spot-scarcity-risk",
+                    "single-zone-nodepool",
+                    "reservation-mismatch-risk",
+                    "autoscaler-out-of-resources",
+                    "dangling-compute-class",
+                ),
+            ),
+            ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
+        ),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
         "GCP Networking Fabric & VPC IPAM Audit",
@@ -232,6 +296,21 @@ AUDITS: dict[str, AuditSpec] = {
             "psc-routing-deadlock",
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
+        ),
+        # §2's target rule: one entry per subnet for the IPAM check, one
+        # `project/<id>` entry for the other four. This stream enumerates no
+        # clusters at all.
+        scopes=(
+            ("subnet", ("subnet-ip-exhaustion",)),
+            (
+                "project",
+                (
+                    "cloud-nat-exhaustion",
+                    "psc-routing-deadlock",
+                    "mtu-packet-fragmentation",
+                    "cloud-armor-false-positive",
+                ),
+            ),
         ),
     ),
 }
@@ -357,26 +436,23 @@ DELTA_RE = re.compile(
 # for a check that judges the ClusterRole; correcting the object to the role
 # leaves an id of exactly the current shape and would have read as a fix.
 #
-# A stamp needs no cleverness: a previous body whose stamp is missing or
-# different was written by a scheme this one cannot join against, whatever the
-# ids look like. `resolved` is withheld for the single run it takes to rewrite
-# the block, then the stamp matches and the guard lifts by itself.
+# A stamp needs no cleverness: a memory whose stamp is missing or different
+# was written by a scheme this one cannot join against, whatever the ids look
+# like. It costs one run: the stored report is rejected as unjoinable and the
+# run makes no delta claim at all, then the run's own write carries the
+# current stamp and the guard lifts by itself. The same stamp on a
+# remediation-PR body decides whether that pull request's findings can be
+# joined against this run's — see `close_stale_remediation_prs`.
 #
 # 2: `_shorten_id` now appends a digest when it truncates, so any id that was
 # over `MAX_FINDING_ID` before shortening is spelled differently. Only those
 # ids move, but the stamp is per-document and cannot say which — and the cost
-# of bumping is one run of withheld `resolved`, against announcing a
-# re-spelled finding as fixed.
+# of bumping is one delta-free run, against announcing a re-spelled finding as
+# fixed.
 ID_SCHEME = 2
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
-# Per-finding marker on each heading, so a *resolved* finding can still be named
-# by title when it no longer exists in the current findings.json.
-FINDING_MARKER_RE = re.compile(
-    r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
-)
-
 # Idempotency markers. Design §3.1 deliberately never mutates a `/remediate`
 # comment — a repo writer must be able to re-issue one after closing a PR — so
 # "act exactly once" is carried instead by hidden markers in the bodies this
@@ -900,6 +976,66 @@ def audit_checks(audit_id: str) -> tuple[str, ...]:
     return spec.checks if spec else ()
 
 
+def target_kind(name: str) -> str:
+    """Which kind of thing a `scope.clusters` entry names.
+
+    The SOPs already encode this in the name they ask for, so nothing new has to
+    be carried per entry: `project/<id>` is the project-scoped entry, a name with
+    a `/` in it is one of networking's `<project>/<region>/<subnet>` targets, and
+    a bare name is a cluster.
+    """
+    if name.startswith("project/"):
+        return "project"
+    return "subnet" if "/" in name else "cluster"
+
+
+def scope_phrase(clusters: object) -> str:
+    """What a run read, counted by what the entries actually are.
+
+    `scope.clusters` holds all three kinds `target_kind` distinguishes, so its
+    length is not a cluster count. Networking enumerates a subnet per region and
+    reads no cluster at all, which rendered as "Audited 43 cluster(s)" against a
+    16-cluster fleet — an overstatement in the one line the report offers for
+    judging coverage, and in the direction that manufactures confidence.
+    """
+    counts: dict[str, int] = {}
+    for entry in clusters if isinstance(clusters, list) else ():
+        if isinstance(entry, dict):
+            kind = target_kind(str(entry.get("name", "")).strip())
+            counts[kind] = counts.get(kind, 0) + 1
+    parts = [
+        f"{counts[kind]} {kind}" + ("" if counts[kind] == 1 else "s")
+        for kind in ("cluster", "subnet", "project")
+        if counts.get(kind)
+    ]
+    if not parts:
+        return "0 clusters"
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
+    """The roster subset `target_name` is answerable for.
+
+    The whole roster for an unpartitioned stream, and for a target whose kind a
+    partitioned stream does not declare. That second case is deliberate: an
+    unexpected target reads as answerable for everything and so shows up as a
+    coverage gap, which is the loud failure. Narrowing it to nothing would
+    excuse the target from the audit and report the result as complete.
+    """
+    spec = AUDITS.get(audit_id)
+    if not spec:
+        return ()
+    if not spec.scopes:
+        return spec.checks
+    kind = target_kind(str(target_name).strip())
+    for declared, checks in spec.scopes:
+        if declared == kind:
+            return checks
+    return spec.checks
+
+
 def audit_finding_checks(audit_id: str) -> frozenset[str]:
     """Every slug a `finding.check` may cite: the roster plus the derived ones."""
     spec = AUDITS.get(audit_id)
@@ -959,6 +1095,807 @@ def checks_na(cluster: object) -> list[str]:
 
 def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
+
+
+def read_phase_t0(audit_id: str) -> datetime | None:
+    """The t0 `start` recorded in `started.json`, or None if unusable.
+
+    `start` and `finish` are separate processes with the whole LLM inspection
+    phase between them, so the only way `finish` can time that phase is a
+    timestamp `start` left behind. That timestamp is the run lock's own claim
+    (`started_path_for`, §4.3): one file is the lock, the liveness record, and
+    the t0, because "is a run in flight, and since when" is the same question
+    all three ask. A missing or unparseable file degrades to `inspect_s: null`,
+    never to an error — timing is telemetry and must not be able to fail a run.
+    """
+    holder = read_run_claim(audit_id)
+    if holder is None:
+        return None
+    try:
+        t0 = datetime.fromisoformat(str(holder.get("t0", "")))
+    except (TypeError, ValueError):
+        return None
+    if t0.tzinfo is None:
+        return None
+    return t0
+
+
+def inspect_seconds(audit_id: str, now: datetime) -> float | None:
+    """Wall-clock from `start`'s t0 to `now`, or None without a usable t0.
+
+    Clamped at zero: a clock that moved backwards between the two processes
+    should read as "no measurement", not as evidence of time travel.
+    """
+    t0 = read_phase_t0(audit_id)
+    if t0 is None:
+        return None
+    seconds = (now - t0).total_seconds()
+    return round(seconds, 1) if seconds >= 0 else None
+
+
+def collector_seconds(manifest: dict | None) -> float | None:
+    """The collector's own wall-clock, from a `collect.py`-shaped manifest's
+    top-level `started_at`/`finished_at` -- the "collector's totals" §4.4
+    promises alongside `inspect_s`/`publish_s`. `None` without a manifest or
+    with an unparseable timestamp: timing is telemetry, so a malformed
+    manifest degrades this to absent rather than raising, the same rule
+    `inspect_seconds` follows for a missing or garbage phase file.
+    """
+    if not manifest:
+        return None
+    try:
+        started = datetime.fromisoformat(str(manifest.get("started_at", "")).replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(str(manifest.get("finished_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    seconds = (finished - started).total_seconds()
+    return round(seconds, 1) if seconds >= 0 else None
+
+
+# --------------------------------------------------------------------------- #
+# Local report store — the run's structured output, kept where it was produced.
+# See docs/designs/fleet-audit-collectors-and-status.md §4.8.
+#
+# Two readers, both annotating and neither gating (§8). The chat path answers
+# "what did the audit find?" from `latest.json` instead of a `gh issue view`
+# plus a re-parse of rendered prose, and "what changed?" by comparing two
+# entries in `runs/` — the only place run-over-run documents exist anywhere,
+# because the ledger rewrites itself in place. And `finish`'s own delta reads
+# the previous run's ids from here rather than re-fetching the ledger body to
+# parse its own breadcrumb back out.
+#
+# The write shares the status writer's discipline exactly: any failure logs a
+# WARNING and returns, never changing a subcommand's exit code. The cost of a
+# failed write lands on the *next* run's delta, which makes no claim and says
+# why — and it only lands there because a failed write deletes `latest.json`
+# on its way out. Left in place, the previous run's envelope is
+# indistinguishable from a current one and the next run would join against a
+# memory that predates everything this run published.
+# --------------------------------------------------------------------------- #
+
+# A fixed root, not $HERMES_HOME, and the distinction is the whole feature.
+# `finish` only ever runs under a cron or kanban worker, which the dispatcher
+# spawns with HERMES_HOME pointed at the profile directory
+# (kanban_db.py: env["HERMES_HOME"] = resolve_profile_env(...)), while the chat
+# session that reads the store back runs in the gateway process, whose
+# HERMES_HOME is the container's /opt/data. Interpolating it therefore wrote to
+# profiles/platform/fleet-audit/reports and read from /opt/data/fleet-audit/
+# reports — and the failure is silent in the direction that would catch it,
+# because the run-to-run delta is worker-to-worker and agrees with itself. Chat
+# just sees a store that is permanently empty, which is the one job it has.
+#
+# Overridable for the suite, on the same reasoning as SCRATCH_DIR: off-cluster
+# /opt/data does not exist, and a store whose failure paths can only be
+# exercised where it is deployed is a store whose failure paths are untested.
+REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or "/opt/data/fleet-audit/reports"
+
+# Two weeks of a daily stream, a quarter of a weekly one. At the ledger's own
+# 60k-character body ceiling that bounds the store near 1 MB per stream.
+REPORT_HISTORY = 14
+
+
+def reports_dir_for(audit_id: str) -> Path:
+    return Path(REPORTS_DIR) / audit_id
+
+
+# --------------------------------------------------------------------------- #
+# The run lock — one run of a stream at a time, enforced. See §4.3.
+#
+# Every path in the store is keyed by *stream*, not by run, so two concurrent
+# runs of the same audit overwrite each other's in-flight state. Within a run
+# that cannot happen (per-cluster path keys plus `_atomic_write`); across runs
+# it is ordinary, because a stream has two dispatchers — the cron scheduler and
+# a kanban card — and a manual dispatch on top of a scheduled one is a normal
+# Tuesday.
+#
+# `started.json` is the lock and the liveness record at once, because "is a run
+# in flight, and since when" is the same question both ask. Acquire is an
+# atomic `os.link` of a uniquely-named claim onto it. A holder past the ceiling
+# is dead by §4.5's rule and is stolen through a *second* atomic link, named
+# for the dead claim's own nonce, so exactly one process can ever steal that
+# particular claim.
+#
+# Every primitive was raced on the deployed PVC before this was written —
+# `O_CREAT|O_EXCL`, `os.link`, `os.mkdir`, 12 threads x 60 rounds, one winner
+# every round; `os.replace` over a live name, 2000 rounds against 4 readers,
+# never a visible gap — and the protocol itself at 16 separate processes x 60
+# rounds per property. It is not assumed atomic; it was measured, on a mount
+# the container reports as ext4 rather than the 9p this comment used to claim.
+# --------------------------------------------------------------------------- #
+
+# Longer than any observed run (the slowest is ~20 minutes) and shorter than
+# every stream's schedule, so a claim left by an OOM-killed run expires on its
+# own before the next scheduled dispatch meets it.
+RUN_LOCK_CEILING_S = 7200
+
+
+# `(audit_id, nonce)` once this process has taken a lock, so the failure path
+# can tell "the claim I wrote" from "the claim I found". Only `take_run_lock`
+# writes it, and only `release_own_lock` reads it.
+_HELD_LOCK: tuple[str, str] | None = None
+
+
+class RunInProgress(Exception):
+    """Another run holds this stream. Carries the holder so the caller can name it."""
+
+    def __init__(self, audit_id: str, holder: dict) -> None:
+        self.audit_id = audit_id
+        self.holder = holder
+        # This deliberately does not name `--steal-lock`. It used to, and that
+        # was the whole of two incidents: a claim from a dead container or one
+        # past the ceiling is retired automatically, so the only refusal anyone
+        # can ever read is a live claim — exactly the one case where stealing is
+        # wrong. Two runs then write one stream, and the stolen t0 is the one
+        # `inspect_s` measures from, so the run also mis-reports its own
+        # duration. The override still exists for an operator; it is documented
+        # in `start --help`, where a human looking for it will find it and an
+        # agent reading an error will not.
+        super().__init__(
+            f"{audit_id}: a run started {holder.get('t0') or 'at an unknown time'} "
+            f"(pid {holder.get('pid')}, session {holder.get('session') or 'unknown'}) "
+            f"still holds this stream. Wait: a holder is released when its run "
+            f"finishes, is retired the moment the pod restarts under it, and "
+            f"expires on its own {RUN_LOCK_CEILING_S // 3600}h after it started. "
+            f"Do not take it from a run that is still going — both runs then write "
+            f"this one stream and corrupt each other. The file itself is "
+            f"{started_path_for(audit_id)}."
+        )
+
+
+def started_path_for(audit_id: str) -> Path:
+    """The lock file, the liveness stamp, and `finish`'s t0: one file (§4.5)."""
+    return reports_dir_for(audit_id) / "started.json"
+
+
+def pod_instance() -> str | None:
+    """An id that changes whenever this container restarts, or None off-cluster.
+
+    A claim written by a container that is no longer running cannot be revived
+    by waiting, so this collapses the ceiling to zero for the most common death
+    — the pod was OOM-killed, evicted, or rolled mid-run. pid 1 is the
+    container's entrypoint, so its start time is the container's start time;
+    the boot id disambiguates the same tick across two nodes.
+
+    None whenever /proc is not the shape this expects (a dev machine, the test
+    suite), and the caller then falls back to the ceiling alone. This signal may
+    only ever make a claim *more* stealable, never less.
+    """
+    try:
+        with open("/proc/1/stat", encoding="utf-8") as handle:
+            # `pid (comm) state ppid ...` — comm can contain spaces and
+            # parentheses, so split after the last ") ". starttime is field 22
+            # overall, index 19 of what remains.
+            fields = handle.read().rsplit(") ", 1)[-1].split()
+        starttime = fields[19]
+    except (OSError, IndexError):
+        return None
+    boot = ""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as handle:
+            boot = handle.read().strip()
+    except OSError:
+        pass
+    return f"{boot}:{starttime}"
+
+
+def run_session() -> str:
+    """The hermes session this process belongs to, or "" when there is none.
+
+    One cron dispatch is one session, held across every tool call the run makes,
+    so this is what tells "another run holds this stream" apart from "my own run
+    is asking again". The second is what happens when a long audit's context is
+    compacted: the agent re-reads the skill from the top and calls `start` a
+    second time. Empty off-cluster and under the test suite, and every caller
+    reads empty as "cannot tell", so the behaviour there is the one from before
+    this existed.
+    """
+    return (os.environ.get("HERMES_SESSION_ID") or "").strip()
+
+
+def _corrupt_claim_nonce(path: str) -> str:
+    """A nonce for an unreadable claim: same in every reader, different per file.
+
+    Both halves are load-bearing, and they pull in opposite directions. The
+    steal token is named for the holder's nonce and is deliberately never
+    deleted on success (see `acquire_run_lock`), so a *constant* here makes
+    `.steal-corrupt` a one-shot — the first bad write on a stream is stealable
+    and every later one is wedged until the token ages out, which is the
+    permanent-wedge this whole section exists to rule out. A *unique* one is
+    worse: two processes racing the same corrupt claim would name two different
+    tokens, both would link, and both would steal.
+
+    So the identity comes from the file. `os.replace` from a fresh `.claim-*`
+    temp gives every new claim its own inode, and a later write its own mtime,
+    while two racers stat'ing one file agree exactly.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        # Not even stat'able. Keep the constant: a shared token name costs at
+        # worst a wedge the ceiling and `prune_steal_tokens` clear on their own,
+        # and that is the cheaper of the two failures above.
+        return "corrupt"
+    return f"corrupt-{stat.st_ino:x}-{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
+def read_run_claim(audit_id: str) -> dict | None:
+    """The current holder's claim, None if absent, a dead stub if corrupt.
+
+    A file that cannot be parsed is treated as a holder whose start time is
+    zero — i.e. already dead — because the alternative is a stream wedged for
+    good by one bad write. Its nonce comes from the file rather than from its
+    contents, for the reason `_corrupt_claim_nonce` gives.
+    """
+    path = str(started_path_for(audit_id))
+    try:
+        with open(path, encoding="utf-8") as handle:
+            claim = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        claim = None
+    if not isinstance(claim, dict):
+        return {"nonce": _corrupt_claim_nonce(path), "t0": None, "epoch": 0.0, "pid": None}
+    if not isinstance(claim.get("nonce"), str) or not claim["nonce"]:
+        # Parsed, but with nothing to name a steal token after — a partial
+        # write, or a hand-edited file. Same treatment: an identity from the
+        # file, so that two such claims on one stream do not share a token.
+        return dict(claim, nonce=_corrupt_claim_nonce(path))
+    return claim
+
+
+def own_run_claim(audit_id: str) -> dict | None:
+    """The claim on this stream if *this same run* wrote it, else None.
+
+    Rules 2 and 3 of `_claim_is_dead` already retire a claim from a container
+    that is gone and one past the ceiling, so the only refusal a caller can
+    actually meet is a claim from this container, inside the ceiling — and the
+    most likely author of that claim is the caller itself. Recognising it
+    matters because `start` is destructive: it scrubs the stream's GitOps tree
+    and deletes the findings file, so a re-entering run has to be spotted before
+    any of that runs and handed back what it already has.
+    """
+    session = run_session()
+    if not session:
+        return None
+    holder = read_run_claim(audit_id) or {}
+    return holder if holder.get("session") == session else None
+
+
+def _claim_is_dead(
+    claim: dict, now: float, ceiling: float, steal_nonce: str | None = None
+) -> bool:
+    """Is this claim safe to steal? Three independent ways to say yes.
+
+    Every one of them exists so that a lock cannot wedge a stream permanently,
+    which is the failure this whole mechanism has to avoid being.
+    """
+    # 1. An operator named this exact holder dead (`start --steal-lock`). Scoped
+    #    to the nonce observed at entry, not to "whatever holds it now", so two
+    #    simultaneous overrides still resolve to one winner rather than both
+    #    stealing past each other.
+    if steal_nonce is not None and claim.get("nonce") == steal_nonce:
+        return True
+    # 2. The container that wrote it is gone. No amount of waiting revives it.
+    recorded, current = claim.get("instance"), pod_instance()
+    if current and recorded and recorded != current:
+        return True
+    try:
+        epoch = float(claim.get("epoch") or 0)
+    except (TypeError, ValueError):
+        epoch = 0.0
+    age = now - epoch
+    # 3. Age. Including *negative* age past the ceiling: a claim dated in the
+    #    future — a clock stepped backwards on the reader, a bad write — would
+    #    otherwise never age out and would hold the stream for good. A start
+    #    time two hours in the future is not credible, so it is not honoured.
+    if age <= -ceiling:
+        return True
+    return age >= ceiling
+
+
+def acquire_run_lock(
+    audit_id: str,
+    t0: datetime,
+    *,
+    ceiling: float = RUN_LOCK_CEILING_S,
+    attempts: int = 8,
+    steal: bool = False,
+) -> str:
+    """Claim the stream for this run, or raise RunInProgress. Returns the nonce.
+
+    `epoch` rides alongside the ISO `t0` deliberately: staleness is arithmetic
+    on a wall clock, and doing it on a float avoids re-parsing a timestamp
+    written by a process that may have had a different idea of the timezone.
+
+    `steal` is the operator override. It does not unlink anything by hand — it
+    declares the holder *observed right now* dead and then goes through the
+    ordinary atomic steal, so a forced dispatch is exactly as race-safe as an
+    expiry-driven one, and two of them still produce one winner.
+    """
+    now = t0.timestamp()
+    directory = reports_dir_for(audit_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    started = str(started_path_for(audit_id))
+    steal_nonce = None
+    if steal:
+        observed = read_run_claim(audit_id) or {}
+        steal_nonce = observed.get("nonce")
+    nonce = uuid.uuid4().hex
+    claim = str(directory / f".claim-{nonce}.json")
+    with open(claim, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "audit": audit_id,
+                "t0": t0.isoformat(),
+                "epoch": now,
+                "pid": os.getpid(),
+                "nonce": nonce,
+                "instance": pod_instance(),
+                "session": run_session(),
+            },
+            handle,
+        )
+    try:
+        for _ in range(attempts):
+            try:
+                os.link(claim, started)  # atomic: exactly one winner
+                return nonce
+            except FileExistsError:
+                pass
+            holder = read_run_claim(audit_id)
+            if holder is None:
+                continue  # released underneath us; retry the link
+            if not _claim_is_dead(holder, now, ceiling, steal_nonce):
+                raise RunInProgress(audit_id, holder)
+            # A dead holder, and the stream must not stay wedged. Exactly one
+            # process may steal THIS claim: the token is named for the dead
+            # claim's nonce, so the link is the gate.
+            #
+            # The token is NOT removed on success, and that is load-bearing
+            # rather than sloppy. A racer that read the same dead claim before
+            # the steal would otherwise find the token free and replace the new
+            # owner — which is exactly what a 16-process torture run caught.
+            # It is pruned by age instead (`prune_steal_tokens`), which is safe
+            # unconditionally: once a claim is stolen its nonce is gone from
+            # `started.json` for good, so no later acquire can ask for it again.
+            token = str(directory / f".steal-{holder.get('nonce')}")
+            try:
+                os.link(claim, token)
+            except FileExistsError:
+                time.sleep(0.02)  # another stealer got there first
+                continue
+            os.replace(claim, started)  # safe: we hold the only steal right
+            return nonce
+        raise RunInProgress(audit_id, read_run_claim(audit_id) or {})
+    finally:
+        _unlink(claim)
+
+
+def take_run_lock(audit_id: str, t0: datetime, *, steal: bool = False) -> str | None:
+    """`start`'s entry point to the lock. Refuses a live run; never blocks on I/O.
+
+    A stream held by a live run is a refusal — that is the whole point. A store
+    that cannot be written *at all* is not: refusing to audit the fleet because
+    a telemetry directory is full or read-only would make the observability
+    surface able to stop the work it exists to observe, which is precisely the
+    property the ConfigMap was deleted for (§4.5). So an OSError degrades to a
+    warning and an unlocked run — exactly the behaviour every run had before
+    this lock existed — and returns None.
+    """
+    global _HELD_LOCK
+    try:
+        nonce = acquire_run_lock(audit_id, t0, steal=steal)
+    except RunInProgress:
+        raise
+    except OSError as exc:
+        log(
+            f"WARNING: could not take the run lock for {audit_id} ({exc}); "
+            "running unlocked. A concurrent run of this stream would now "
+            "overwrite this one's state."
+        )
+        return None
+    _HELD_LOCK = (audit_id, nonce)
+    return nonce
+
+
+def release_run_lock(audit_id: str) -> None:
+    """`finish` drops the lock; `latest.json` becomes the record of the run.
+
+    Because release is an unlink, "a start record exists" and "a run holds the
+    stream" are the same fact — so the status surface (§4.5) and the mutual
+    exclusion cannot disagree with each other, and liveness needs no comparison
+    between two files' timestamps.
+    """
+    _unlink(str(started_path_for(audit_id)))
+
+
+def release_own_lock() -> None:
+    """Drop the claim *this process* took, if it still holds it. Never raises.
+
+    The sixth anti-wedge cover, and the one that fires most often. `start` takes
+    the lock on its first line and hands it to the agent — nothing between there
+    and `finish` releases it — so a `start` that dies partway has claimed a run
+    that will never happen, and the stream would sit unavailable until the
+    ceiling for work nobody is doing. A minute of Minty being unreachable would
+    cost two hours of the stream. So every exit from `main` that is not a
+    successful command releases what this process took.
+
+    Ownership is checked rather than assumed, which is the difference between
+    this and `release_run_lock`: that one is unconditional because `finish`
+    legitimately releases a claim a *different* process wrote. Here an
+    unconditional unlink could drop a live holder's lock, if this run's claim
+    aged past the ceiling and was stolen while it was failing. The nonce is the
+    proof, and a mismatch is a no-op.
+
+    Between that read and the unlink another process could still steal, and no
+    filesystem here offers an atomic unlink-if-unchanged. The window is the
+    handful of microseconds between two syscalls, and it can only open at all if
+    this run has already been alive for the full two-hour ceiling — by which
+    point leaving the claim in place is the worse of the two outcomes.
+    """
+    global _HELD_LOCK
+    held, _HELD_LOCK = _HELD_LOCK, None
+    if held is None:
+        return
+    audit_id, nonce = held
+    if (read_run_claim(audit_id) or {}).get("nonce") == nonce:
+        release_run_lock(audit_id)
+
+
+def prune_steal_tokens(
+    audit_id: str, now: float | None = None, ceiling: float = RUN_LOCK_CEILING_S
+) -> None:
+    """Drop steal tokens older than the ceiling. Never fatal, never load-bearing."""
+    now = time.time() if now is None else now
+    directory = reports_dir_for(audit_id)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(".steal-"):
+            continue
+        path = directory / name
+        try:
+            if now - path.stat().st_mtime >= ceiling:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _redact_document(value: object) -> object:
+    """Every string in a document, through the backstop the rendered body uses.
+
+    Redaction happens at the cell on the way into the body (`clip_text`), so
+    the document object itself still holds whatever the model wrote. Storing
+    that raw would leave the store carrying a credential shape the issue it
+    copies blanked, and carrying it for longer: one scratch file the next run
+    overwrote becomes fifteen envelopes on the volume.
+    """
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {key: _redact_document(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_document(item) for item in value]
+    return value
+
+
+def report_envelope(
+    audit_id: str,
+    payload: dict,
+    document: dict,
+    now: datetime,
+    *,
+    issue_number: int | None,
+    new_ids: list[str],
+    resolved_ids: list[str],
+    rendered_ids: list[str],
+) -> dict:
+    """One run's outcome, delta and document, as keys rather than paragraphs.
+
+    `current_ids` is the **rendered** set — exactly what the body's hidden
+    block published — because that is the claim the key makes, and its other
+    readers take it literally: `report_status` counts it as what the ledger
+    shows, and the clean-run path feeds it back as the body it left untouched.
+    The wider set is not lost by keeping this one narrow; it is derivable from
+    `document`, and `compute_delta` reads both, one for each half of the delta.
+
+    `document` is the post-validation, post-degradation document the ledger
+    rendered, with the body's redaction backstop applied to every string, so
+    this key never carries a credential shape the public issue blanked. It is
+    deliberately *not* clipped or budget-selected the way the body's cells
+    are: a finding the body had no room for is still a finding the chat path
+    should be able to answer about.
+
+    `audit_id` and `finished_at` are carried in the envelope and not left to
+    the filename alone: `latest.json` is a copy of a ring entry, and a copy
+    that cannot say which stream and which run it is would need its own
+    reading rule. `finished_at` is the run's single generation timestamp — the
+    same clock reading the ledger footer prints, not a second one taken here,
+    so the envelope and the body it describes never disagree about when the
+    run happened.
+    """
+    return {
+        "audit_id": audit_id,
+        "finished_at": now.isoformat(),
+        "status": payload.get("status"),
+        "issue_number": issue_number,
+        "issue_url": payload.get("issue_url"),
+        "partial": payload.get("partial"),
+        "coverage_gaps": payload.get("coverage_gaps") or [],
+        "collect_s": payload.get("collect_s"),
+        "inspect_s": payload.get("inspect_s"),
+        "publish_s": payload.get("publish_s"),
+        # The three keys the retired status ConfigMap's row carried and the
+        # envelope did not (§4.5). `prs_opened`/`prs_closed` are URL lists
+        # rather than the row's counts — a file has no 1 MiB etcd ceiling to
+        # ration bytes against, and a count cannot be clicked.
+        "prs_opened": list(payload.get("prs_opened") or []),
+        "prs_closed": list(payload.get("prs_closed") or []),
+        "silent_ok": payload.get("silent_ok"),
+        # What the run actually said, kept beside what it found. Every other
+        # key here describes the audit; this one describes the message, and it
+        # is the only part of a scheduled run an operator ever sees. It is
+        # derivable — `chat_summary` reads `status`, the two id lists and
+        # `issue_url`, all of which are in this envelope — but deriving it
+        # means re-running the renderer against a payload reassembled from an
+        # envelope, and the answer to "what did last night's run post?" should
+        # not depend on reproducing a computation. Storing it also makes the
+        # silent case legible: `[SILENT]` here says the run deliberately sent
+        # nothing, which is otherwise indistinguishable from a run whose
+        # delivery failed.
+        "chat_summary": payload.get("chat_summary"),
+        "new_ids": sorted(new_ids),
+        "resolved_ids": sorted(resolved_ids),
+        "current_ids": sorted(set(rendered_ids)),
+        "id_scheme": ID_SCHEME,
+        "document": _redact_document(document),
+    }
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace `path` in one step, from a temp file in its own directory.
+
+    Same directory because `os.replace` is only atomic within a filesystem,
+    and a reader must never meet a half-written envelope — the chat path
+    reads `latest.json` at arbitrary times, including mid-write.
+    """
+    handle = tempfile.NamedTemporaryFile(
+        "w", dir=str(path.parent), suffix=".tmp", delete=False, encoding="utf-8"
+    )
+    try:
+        with handle:
+            handle.write(text)
+        os.replace(handle.name, path)
+    except OSError:
+        _unlink(handle.name)
+        raise
+
+
+def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
+    """Keep the document this run just published. Best-effort, never fatal.
+
+    Called on the exit-0 publish path only — never from `--dry-run`, never
+    after a validation failure (both return before reaching it), and never
+    from `remediate`, which changes no findings.
+    """
+    directory = reports_dir_for(audit_id)
+    runs = directory / "runs"
+    try:
+        runs.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
+        # A UTC stamp that sorts lexically in time order, so the prune below
+        # and the chat path's "the run before this one" are both a sort.
+        # Microseconds, not seconds: at second granularity two runs finishing
+        # in the same second collide and one silently replaces the other in the
+        # ring. The lock makes that near impossible for one stream, but the
+        # extra six digits cost nothing and make the filenames total-ordered.
+        stamp = now.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        _atomic_write(runs / f"{stamp}.json", text)
+        # A copy, not a symlink: one fewer behaviour to ask of the mount,
+        # for zero saved bytes.
+        _atomic_write(directory / "latest.json", text)
+    except Exception as exc:  # noqa: BLE001 — a store write must never fail a run
+        log(f"WARNING: report store write for {audit_id} failed: {exc}")
+        # `latest.json` now holds an *older* run, and nothing downstream can
+        # tell that from a current one: same ledger, same id scheme, so the
+        # next run trusts a memory that is missing everything this run
+        # published and announces all of it as new — every run, until a write
+        # succeeds. Drop it instead. An absent store is unknowable, which is
+        # the state the failure actually left the harness in, and it costs one
+        # delta-free run rather than a stream of false claims.
+        _unlink(str(directory / "latest.json"))
+        return
+    try:
+        for stale in sorted(runs.glob("*.json"))[:-REPORT_HISTORY]:
+            stale.unlink()
+    except Exception as exc:  # noqa: BLE001 — the memory is already written
+        # Deliberately not the invalidating path above: the envelope landed
+        # and is correct, and an over-long ring costs disk rather than
+        # accuracy.
+        log(f"WARNING: report store prune for {audit_id} failed: {exc}")
+
+
+def read_report_memory(audit_id: str, issue_number: int | None) -> dict | None:
+    """The previous run's envelope, or None when it cannot be trusted.
+
+    Trust is two equalities, both required. The envelope's `issue_number` must
+    match the ledger `find_existing_issue` just returned — a store written for
+    a different issue is a memory of a different conversation, and joining
+    against it would call every id on one side new and every id on the other
+    resolved. And its `id_scheme` must match the code's, for the same reason
+    at the level of individual ids: the same finding is spelled differently
+    across a scheme bump.
+
+    None is *unknowable*, not empty, and the caller must keep them apart —
+    treating an absent store as an empty one would announce every live finding
+    as new the first morning after a PVC is wiped.
+    """
+    if issue_number is None:
+        return None
+    path = reports_dir_for(audit_id) / "latest.json"
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log(
+            f"No stored report for {audit_id} at {path}, but issue "
+            f"#{issue_number} is open; the previous run's findings are "
+            "unknowable, so this run makes no delta claim."
+        )
+        return None
+    except (OSError, ValueError) as exc:
+        log(f"WARNING: stored report for {audit_id} is unreadable ({exc}).")
+        return None
+    if not isinstance(envelope, dict):
+        log(f"WARNING: stored report for {audit_id} is not an object.")
+        return None
+    stored_issue = envelope.get("issue_number")
+    if stored_issue != issue_number:
+        log(
+            f"Stored report for {audit_id} was written for issue "
+            f"#{stored_issue}, not the open #{issue_number}; this run makes "
+            "no delta claim rather than joining two different ledgers."
+        )
+        return None
+    if envelope.get("id_scheme") != ID_SCHEME:
+        log(
+            f"Stored report for {audit_id} carries finding-identity scheme "
+            f"{envelope.get('id_scheme')} and this run uses {ID_SCHEME}; this "
+            "run makes no delta claim rather than reporting a rename as a fix."
+        )
+        return None
+    # Well-formed JSON is not a well-formed envelope. `current_ids` is iterated
+    # by the caller and `document` is walked by `report_finding_titles`, and
+    # neither is inside a try — so a file that parses but holds a number where
+    # the id set belongs raises out of `finish` and kills a run whose findings
+    # are already published. A store failure may cost a delta; it may never
+    # cost an exit code (design §8).
+    if not isinstance(envelope.get("current_ids"), list):
+        log(
+            f"WARNING: stored report for {audit_id} has no readable id set; "
+            "this run makes no delta claim."
+        )
+        return None
+    return envelope
+
+
+def report_finding_titles(envelope: dict | None) -> dict[str, str]:
+    """{finding id: title} from a stored document, to name resolved findings.
+
+    Every finding the previous run published, not just the ones its body had
+    room to render — the delta comment and the stale-PR close comments both
+    name findings by title, and a truncated one is still a finding that got
+    fixed.
+    """
+    if not envelope:
+        return {}
+    document = envelope.get("document")
+    if not isinstance(document, dict):
+        return {}
+    findings = document.get("findings")
+    if not isinstance(findings, list):
+        return {}
+    titles: dict[str, str] = {}
+    for finding in findings:
+        if isinstance(finding, dict) and finding.get("id"):
+            titles[str(finding["id"])] = str(finding.get("title") or "").strip()
+    return titles
+
+
+def _remediation_is_file_backed(remediation: object) -> bool:
+    if not isinstance(remediation, dict):
+        return False
+    return remediation.get("kind") == "manifest" or bool(
+        str(remediation.get("path") or "").strip()
+    )
+
+
+def carry_unchanged_findings(
+    findings: list[dict], envelope: dict | None, *, exclude: set[str]
+) -> list[str]:
+    """Reuse the previous run's prose for a finding whose evidence did not move.
+
+    An id that survives with byte-identical `evidence` is the same finding about
+    the same object, observed in the same state. Everything the model authors
+    about it — title, impact, recommendation, remediation note — describes that
+    state, so a rewrite is the model saying the same thing differently rather
+    than the fleet having changed, and `render_findings` already means to be
+    byte-identical across an unchanged fleet.
+
+    Re-asking does not converge. Of the 92 such id-pairs in this install's
+    stored history on 2026-08-30, *all 92* had at least one authored field
+    rewritten between consecutive runs, and 83 changed the remediation. Two of
+    those rewrites were not wording. `no-notifications` on ap-ap-deploy-test
+    flipped `kind` from `gcloud` to `manual`, turning a command the reader could
+    run into a paragraph telling them to work it out — eight pairs flip that way
+    in one direction or the other. And `single-zone-nodepool` on
+    spot-capacity-test proposed `nodeLocations: [us-east4-b, us-east4-c]` one
+    morning and `[us-east4-a, us-east4-b, us-east4-c]` the next: the first drops
+    the only zone the pool has nodes in.
+
+    The remediation carries only when neither side is file-backed. A `manifest`
+    remediation names a file *this* run had to write, so the previous run's path
+    would point at nothing; and overwriting a manifest the model just wrote with
+    last run's manual note would discard a real fix. `exclude` holds the ids
+    `degrade_missing_remediations` rewrote, whose notes now disclose a promised
+    file that never arrived — carrying over that disclosure would drop it.
+
+    Nothing here freezes a finding permanently: evidence that moves, or a
+    finding that resolves and later returns, is authored fresh.
+
+    Returns the ids stabilised, for the caller to log.
+    """
+    document = (envelope or {}).get("document")
+    if not isinstance(document, dict) or not isinstance(document.get("findings"), list):
+        return []
+    previous = {
+        str(f["id"]): f
+        for f in document["findings"]
+        if isinstance(f, dict) and f.get("id")
+    }
+    carried: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        before = previous.get(fid)
+        if before is None or fid in exclude:
+            continue
+        if before.get("evidence") != finding.get("evidence"):
+            continue
+        fields = ["title", "impact", "recommendation"]
+        if not _remediation_is_file_backed(
+            before.get("remediation")
+        ) and not _remediation_is_file_backed(finding.get("remediation")):
+            fields.append("remediation")
+        stabilised = False
+        for field in fields:
+            if field in before and before[field] != finding.get(field):
+                finding[field] = copy.deepcopy(before[field])
+                stabilised = True
+        if stabilised:
+            carried.append(fid)
+    return carried
 
 
 def base_branch() -> str:
@@ -1045,6 +1982,24 @@ NON_INSPECTING_COMMAND_RE = re.compile(
 # binary adds it here and `test_check_commands_use_an_inspection_binary` says so.
 INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl")
 
+# The same bar, met by a check that read the cloud API directly instead of
+# shelling out to a CLI. `fleet_waste.py`'s overrequest check holds ADC
+# credentials and issues the Monitoring GET in process -- it has to, because
+# the credential proxy refuses `gcloud auth print-access-token` and a token on
+# stdout is a token in the model's context. What it records is therefore the
+# request rather than a shell line:
+#
+#   GET monitoring.googleapis.com/v3/projects/<p>/timeSeries filter=... window=168h
+#
+# Every property the binary list is defending survives that form. It is as
+# expensive to fabricate per cluster, it is published in the ledger, and a
+# reader can re-issue it -- which is the whole argument in
+# `validate_check_command`'s docstring. Requiring a binary name here would
+# instead push the collector toward recording a `curl` it never ran, and a
+# command that did not execute is the one thing this file exists to keep out
+# of the document.
+INSPECTION_ENDPOINTS = ("googleapis.com",)
+
 MIN_CHECK_COMMAND_CHARS = 8
 
 
@@ -1093,11 +2048,12 @@ def validate_check_command(value: object, where: str, check: str) -> str:
             f"cannot be how check {check!r} ran. Give the kubectl or gcloud "
             "command you actually issued."
         )
-    if not any(binary in text for binary in INSPECTION_BINARIES):
+    if not any(probe in text for probe in INSPECTION_BINARIES + INSPECTION_ENDPOINTS):
         raise ValidationError(
             f"{where}: the command for {check!r} names none of "
-            f"{', '.join(INSPECTION_BINARIES)}, so it did not read a cluster or "
-            "the cloud API. A check is only 'run' if something was queried."
+            f"{', '.join(INSPECTION_BINARIES)}, nor an API host "
+            f"({', '.join(INSPECTION_ENDPOINTS)}), so it did not read a cluster "
+            "or the cloud API. A check is only 'run' if something was queried."
         )
     return command
 
@@ -1331,12 +2287,16 @@ def _shorten_id(fid: str) -> str:
 def parse_id_scheme(body: str | None) -> int:
     """Which identity scheme wrote this body's delta block. 0 when unstamped.
 
-    0 is the honest answer for every ledger written before the stamp existed,
+    0 is the honest answer for every body written before the stamp existed,
     and it is also what an unparseable or hand-edited stamp collapses to — in
     both cases the correct behaviour is the same, so they need not be told
     apart. Zero can never equal `ID_SCHEME`, so an unstamped body is always
-    treated as unjoinable, which is the safe direction: the cost is one run of
-    withheld `resolved`, and the alternative is announcing a fix nobody made.
+    treated as unjoinable, which is the safe direction.
+
+    The one caller left is `close_stale_remediation_prs`, reading the block a
+    remediation pull request wrote about itself: unjoinable there means the
+    pull request stays open for a run rather than being closed on a "none of
+    these still reproduce" nobody could actually check.
     """
     body = normalise_newlines(body)
     if not body:
@@ -1539,6 +2499,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
         raise ValidationError(
             "scope.skipped: must be a list (use [] when nothing was skipped)"
         )
+    # Write the default back. A collector that skipped nothing may leave the
+    # key off, and every reader here copes -- but the document this returns is
+    # what the report store keeps, and `report_status` projects an absent list
+    # as `None` rather than 0 on purpose, so that "did not say" stays apart
+    # from "nothing". Omitting it makes a stream that skipped nothing read as
+    # one that does not report skips at all: of the eight live streams only
+    # `stockout-prevention` published a scope without the key, and it was the
+    # only one whose `skipped` came back `None` instead of 0.
+    scope["skipped"] = skipped
     skipped_names: set[str] = set()
     for i, entry in enumerate(skipped):
         if not isinstance(entry, dict):
@@ -1624,6 +2593,34 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "digit in it, so it names nothing and cannot carry the "
                     "finding's identity"
                 )
+
+        # `object` must name an object, and a bare Kind does not. Deriving the
+        # id from four fields fixed the model *spelling* an id three ways; it
+        # cannot fix the model spelling one of the four ways, because a
+        # different `object` is a different finding by construction. On
+        # 2026-08-29 the compliance stream wrote `Cluster/kube-agents-host` one
+        # day and `Cluster` the next for the same four public control planes,
+        # and the ledger duly announced all four as resolved and re-opened them
+        # as new -- the identical failure SKILL.md records against 2026-08-03,
+        # arriving through the one field derivation left free.
+        #
+        # `Kind/name` is the shape every honest finding this fleet has produced
+        # already uses, across all five streams that have ever published one,
+        # and it is the shape SKILL.md asks for in prose ("name the durable
+        # object"). Requiring it turns a whole class of re-spellings into no
+        # change at all: `Cluster` alone stops being sayable, so the name that
+        # distinguishes one control plane from another cannot go missing.
+        obj = str(finding["object"])
+        kind, _, obj_name = obj.partition("/")
+        if not kind.strip() or not obj_name.strip():
+            raise ValidationError(
+                f"findings[{i}].object: {obj!r} must name an object as "
+                "'Kind/name' — a bare kind names every object of that kind and "
+                "none in particular. A cluster-scoped finding is against "
+                f"'Cluster/{finding['cluster']}', not 'Cluster'. The id is "
+                "derived from this string, so a run that spells it differently "
+                "reports the same finding as resolved and re-opens it as new."
+            )
 
         # Identity, computed now that its four components are validated. Any
         # `id` the document arrived with is discarded rather than rejected: a
@@ -1780,8 +2777,13 @@ def manifest_paths(findings: list[dict]) -> list[str]:
     return sorted(paths)
 
 
-def coverage_gaps(data: dict) -> list[str]:
+def _coverage_gaps(data: dict) -> list[tuple[str | None, str]]:
     """Why this run cannot speak for the whole fleet, if it cannot.
+
+    Each gap is paired with the target it is about, or `None` when it is about
+    the stream — `coverage_gaps` drops the pairing and `coverage_gap_targets`
+    keeps it. The pairing is what stops one target's gap silencing resolution
+    accounting for every other target; see `unverifiable_findings`.
 
     Three different gaps, one consequence. A cluster in `scope.skipped` was
     never read; a cluster carrying `limitations` was read but not fully checked;
@@ -1801,10 +2803,15 @@ def coverage_gaps(data: dict) -> list[str]:
     the roster for that cluster rather than counting as unread. Without that,
     "this check cannot exist here" and "nobody looked" were the same state, and
     two Autopilot clusters were enough to keep a stream partial in perpetuity.
+    A target whose whole roster leaves that way has nothing left to be uncovered,
+    so its `limitations` prose is not a gap either, whatever it says.
+
+    The roster is per target, not per stream, because three SOPs enumerate
+    project and subnet entries alongside clusters — see `AuditSpec.scopes`.
     """
     scope = data.get("scope") or {}
-    roster = audit_checks(str(data.get("audit") or ""))
-    gaps: list[str] = []
+    audit_id = str(data.get("audit") or "")
+    gaps: list[tuple[str | None, str]] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
         # Redacted here rather than at render time, unlike every other piece of
@@ -1812,16 +2819,37 @@ def coverage_gaps(data: dict) -> list[str]:
         # which redacts, and the run-summary JSON on stdout — which the agent
         # reads back and relays into chat, and which never sees a cell.
         reason = redact_secrets(entry.get("reason", "no reason given"))
-        gaps.append(f"{cluster}: not audited — {reason}")
+        gaps.append((cluster, f"{cluster}: not audited — {reason}"))
     for cluster in scope.get("clusters") or []:
         limitation = redact_secrets(cluster.get("limitations", "")).strip()
+        name = str(cluster.get("name", "")).strip() or "(unnamed)"
         ran = set(checks_ran(cluster))
         na = set(checks_na(cluster))
+        roster = audit_target_checks(audit_id, name)
         applicable = [check for check in roster if check not in na]
         missing = [check for check in applicable if check not in ran]
+        reasons = [str(entry.get("reason", "")) for entry in cluster.get("checks_not_applicable") or []
+                   if isinstance(entry, dict)]
+        if limitation and na and not applicable and not ran:
+            # Every check this target owes was dispositioned not-applicable,
+            # each carrying its own reason, and none ran. There is no check
+            # left for prose to report as uncovered, so whatever the string
+            # says it is not naming one -- and the run is not partial on
+            # account of a target that refused nothing.
+            #
+            # This is the structural form of the test below, and it is here
+            # because the textual one cannot be made to hold. Three live
+            # `gcp-networking-fabric-audit` runs over the same 42 subnets
+            # produced three restatements of the same 41 dispositions: prose
+            # naming the check, one reason copied verbatim, and all five
+            # reasons joined under a prefix. Matching the wording caught two
+            # of the three and would go on losing, because the wording is a
+            # model's to choose and `partial` is not.
+            limitation = ""
+        elif _limitation_restates_na(limitation, na, roster, reasons):
+            limitation = ""
         if not limitation and not missing:
             continue
-        name = str(cluster.get("name", "")).strip() or "(unnamed)"
         # One line per cluster, not one per gap: the same cluster explaining
         # itself twice reads as two broken clusters in the ledger comment.
         reasons: list[str] = []
@@ -1832,8 +2860,516 @@ def coverage_gaps(data: dict) -> list[str]:
             )
         if limitation:
             reasons.append(limitation)
-        gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
+        # "partially" is a claim about how much ran, and when nothing ran it
+        # reads as reassurance. Drift excludes a cluster under 24h old from
+        # every cohort, so all fourteen of its checks are missing and thirteen
+        # of sixteen clusters reported "partially audited — 14 of 14 applicable
+        # checks did not run": a stream that assessed nothing, described in the
+        # words of one that mostly succeeded.
+        extent = (
+            "not audited"
+            if missing and len(missing) == len(applicable)
+            else "partially audited"
+        )
+        gaps.append((name, f"{name}: {extent} — {'; '.join(reasons)}"))
+    # A kind nobody enumerated is nobody's gap in particular: the checks it
+    # stranded ran against no target at all, so there is no target to scope it
+    # to and it covers the stream.
+    gaps.extend(
+        (None, text)
+        for text in _unenumerated_kind_gaps(audit_id, scope.get("clusters") or [])
+    )
     return gaps
+
+
+def coverage_gaps(data: dict) -> list[str]:
+    """`_coverage_gaps` as the caller-facing list of reasons."""
+    return [text for _, text in _coverage_gaps(data)]
+
+
+def coverage_gap_targets(data: dict) -> set[str] | None:
+    """Which targets this run's gaps cover; `None` when one covers the stream.
+
+    `None` is not "no gaps" — it is the widest possible answer, and callers
+    read it as "every finding is unverifiable". An empty set is the narrow one:
+    the run has gaps against nothing, so nothing is held back.
+    """
+    targets: set[str] = set()
+    for name, _ in _coverage_gaps(data):
+        if name is None:
+            return None
+        targets.add(name)
+    return targets
+
+
+def unverifiable_findings(memory: dict | None, blocked: set[str] | None) -> set[str]:
+    """Findings the previous run published that this one could not re-check.
+
+    Absence is evidence of a fix only where the audit looked, and where it
+    looked is a *target*. Reading that stream-wide is what this replaces: one
+    subnet whose IP utilization Network Analyzer had not published yet, or one
+    cluster held out of every drift cohort for want of an `environment` label,
+    made the whole stream unable to announce any finding resolved or retire any
+    remediation pull request — permanently, because neither gap is the kind
+    that clears on its own. `fleet-consistency-drift` carried exactly that gap
+    on `kube-agents-host` for six consecutive runs while both of its live
+    findings sat on other clusters, so a fix to either could never have been
+    reported.
+
+    Scoped to the target rather than to the (target, check) pair, which would
+    be narrower still. A gap naming three unrun checks says nothing about the
+    other eight on that cluster — but a target is the unit a collector fails at
+    and the unit a gap is written about, and over-holding a finding is the
+    error that costs a reader nothing except silence.
+
+    Returned as ids so the caller can treat them the way the rest of the
+    harness already treats a finding that is still there: not resolved, not
+    announced, and not a reason to close a pull request.
+    """
+    if blocked is not None and not blocked:
+        return set()
+    document = (memory or {}).get("document")
+    findings = document.get("findings") if isinstance(document, dict) else None
+    if not isinstance(findings, list):
+        return set()
+    held: set[str] = set()
+    for finding in findings:
+        if not isinstance(finding, dict) or not finding.get("id"):
+            continue
+        # A finding whose target cannot be read is held whenever anything is:
+        # it cannot be shown to sit outside the gap, and claiming it fixed is
+        # the failure this whole function exists to prevent.
+        target = str(finding.get("cluster") or "").strip()
+        if blocked is None or not target or target in blocked:
+            held.add(str(finding["id"]))
+    return held
+
+
+def _limitation_restates_na(limitation: str, na: set, roster: tuple, reasons: object = ()) -> bool:
+    """Is this `limitations` string just the not-applicable reason said twice?
+
+    A limitation normally means a check ran against less than it should have —
+    two of five Cloud Armor policies readable, so the check's silence covers
+    three it never saw. That is a real gap and stays one.
+
+    What this catches is the other thing a collector produces: a check it
+    already declared inapplicable, whose reason the model then also writes into
+    `limitations`. Both halves are correct in isolation and together they
+    double-count, because the entry is dispositioned twice and only the prose
+    half reaches this function's caller as an uncovered check. A live
+    `gcp-networking-fabric-audit` run turned 41 empty auto-mode subnets — every
+    one of them with `subnet-ip-exhaustion` properly declared not-applicable
+    because a subnet holding no allocations has no utilization to read — into
+    41 gaps and a `partial: True` on a run that had refused nothing.
+
+    Two routes, both conservative, because a false negative here hides an
+    uncovered check.
+
+    The first is the limitation being a `checks_not_applicable` reason from
+    this same target, word for word — the model copied the disposition into the
+    prose field, so the prose adds nothing the disposition has not already
+    said. Compared with case and whitespace flattened and trailing punctuation
+    dropped, since that is all a copy tends to change. This route exists
+    because the slug rule below misses exactly the clearest case of the
+    double-count: a reason written for a human names the surface it could not
+    read, not the slug of the check that would have read it. The same live
+    `gcp-networking-fabric-audit` fleet reported 0 gaps on one run and 41 on
+    the next with nothing changed but that wording.
+
+    The second is by slug:
+
+    - The limitation must name at least one check. Prose naming none and
+      matching no reason is the degradation case above, so it stays a gap.
+    - Every slug it names must be one this target declared not-applicable. One
+      slug outside `na` means the prose is also talking about a check that ran,
+      and the whole string stays.
+
+    Slugs are looked for in the roster *and* in `na`, because a target
+    routinely declares a check it does not owe: the live project entry above
+    carries `subnet-ip-exhaustion` as not-applicable, and that check belongs to
+    the subnet kind, not the project one. Searching the roster alone would find
+    no slug in that entry's prose and call it degradation.
+    """
+    if not limitation or not na:
+        return False
+    squashed = " ".join(limitation.lower().split()).strip(" .;:")
+    if any(squashed == " ".join(str(reason).lower().split()).strip(" .;:")
+           for reason in reasons or ()):
+        return True
+    na = set(na)
+    named = {check for check in set(roster) | na if check in limitation}
+    return bool(named) and named <= na
+
+
+def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
+    """A target kind the run enumerated none of, and the checks it stranded.
+
+    Scoping the denominator per target (`AuditSpec.scopes`) opens a hole that
+    the whole-roster denominator did not have: a check owed only by subnets is
+    owed by nobody in a run that produced no subnet entries, so it drops out of
+    every count and the report reads as complete without it having run anywhere.
+    A live `gcp-networking-fabric-audit` run did exactly this — one
+    `project/<id>` entry, no subnets, and `subnet-ip-exhaustion` unperformed
+    against a fleet of 42 subnets.
+
+    An empty `scope.clusters` is left alone. That run has bigger problems and
+    `validate_findings` already speaks to them; naming every kind here as well
+    would bury the real error under a gap per kind.
+    """
+    spec = AUDITS.get(audit_id)
+    if not spec or not spec.scopes or not targets:
+        return []
+    seen = {target_kind(str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
+    gaps = []
+    for kind, checks in spec.scopes:
+        if kind in seen:
+            continue
+        gaps.append(
+            f"no {kind} targets were audited — {len(checks)} check(s) ran "
+            f"against nothing ({', '.join(checks)})"
+        )
+    return gaps
+
+
+def cross_check_manifest(data: dict, manifest: dict) -> None:
+    """Raise if `checks_run` names a check a collect.py manifest says did
+    not run. See docs/designs/fleet-audit-collectors-and-status.md §6.
+
+    Scoped per cluster, not per stream: a manifest cluster marked `collected`
+    is cross-checked in full — every `checks_run` entry for it must name a
+    (check, cluster) pair the manifest recorded at `rc == 0` — but a cluster
+    the manifest marks `unreachable` or `gate-failed` is left to the SOP's
+    ordinary attestation rules, because the collector could not cover it and
+    a human may have hand-collected it instead. The two regimes never mix
+    within one cluster: a `collected` cluster's entries are all
+    manifest-checked, so a fabricated extra check cannot hide behind a real
+    manual fallback on the same cluster.
+
+    Absent-from-the-manifest is silent: a cluster in `checks_run` that the
+    manifest never enumerated is not this function's business (a stream only
+    partially converted to a collector, or a manifest built for a narrower
+    scope) — `coverage_gaps` and the ordinary roster checks already govern
+    clusters the manifest says nothing about.
+
+    The reverse is not silent, and that asymmetry is the point. Everything
+    above reads the document and asks the manifest to confirm it, which cannot
+    see a cluster the document simply left out. On 2026-08-29 the
+    security-patch collector read all four clusters and recorded nine
+    successful checks against each; the findings document named one, and this
+    function had nothing to say about the other three. `finish` published "0
+    findings across 1 audited cluster(s)", declared the run CLEAN, and closed
+    the ledger — a full-fleet all-clear off a quarter of the fleet, with no gap
+    reported anywhere, because a cluster that is absent has no `checks_run` to
+    contradict. So a `collected` cluster missing from `scope.clusters` is a
+    rejection rather than a coverage gap: the collector already proved the
+    cluster readable, so its absence is a defect in the document and not a
+    condition of the fleet, and a gap would still let the run publish.
+
+    A target the collector could *not* read is missing just as loudly, for a
+    reason that took a second incident to see. The rule below — an unreadable
+    target claiming checks must carry `limitations` — only reaches a target the
+    document mentions, and omitting it entirely evades that as thoroughly as it
+    evades everything else. A collector failure is also the likeliest place for
+    a finding to be hiding, so of the two ways to lose a target this is the
+    worse one to lose silently.
+    """
+    audit_id = str(data.get("audit") or "")
+    manifest_clusters = {
+        c["name"]: c
+        for c in (manifest.get("clusters") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+    documented = {
+        str(c.get("name", ""))
+        for c in data.get("scope", {}).get("clusters") or []
+        if isinstance(c, dict)
+    }
+    undocumented = [
+        (name, c) for name, c in sorted(manifest_clusters.items()) if name not in documented
+    ]
+    missing = [name for name, c in undocumented if c.get("outcome") == "collected"]
+    if missing:
+        raise ValidationError(
+            f"scope.clusters omits {', '.join(repr(n) for n in missing)}, which the "
+            f"collect.py manifest for {audit_id} marks 'collected'. Every cluster the "
+            "collector read must appear in the document — a run that drops one "
+            "publishes as an all-clear over a fleet it did not report on. Add the "
+            "cluster with its checks_run, or re-run collect.py if the manifest is "
+            "from a different scope."
+        )
+    # `scope.skipped` is the other honest home for a target the collector could
+    # not read, and it is the *better* one when nobody checked it by hand:
+    # `coverage_gaps` already turns a skipped entry into "not audited — <reason>"
+    # without the target having to claim any checks. So an unreadable target is
+    # accounted for by either surface, and only by neither is it missing.
+    skipped = {
+        str(entry.get("cluster", ""))
+        for entry in data.get("scope", {}).get("skipped") or []
+        if isinstance(entry, dict)
+    }
+    unread = [
+        (name, c)
+        for name, c in undocumented
+        if c.get("outcome") != "collected" and name not in skipped
+    ]
+    if unread:
+        detail = "; ".join(
+            f"{name}: {str(c.get('outcome'))}"
+            + (f" ({str(c.get('error'))[:150]})" if c.get("error") else "")
+            for name, c in unread
+        )
+        raise ValidationError(
+            f"scope.clusters omits {', '.join(repr(n) for n, _ in unread)}, which the "
+            f"collect.py manifest for {audit_id} enumerated but could not read "
+            f"({detail}). A target the collector failed on is the one this document "
+            "least gets to be quiet about: nothing else in the run mentions it, so "
+            "leaving it out reports the fleet as covered without it. Put it in "
+            "scope.skipped with the reason if nobody covered it, or in scope.clusters "
+            "with `limitations` naming what the collector could not read and what you "
+            "checked by hand — either way the run reports the gap."
+        )
+    for cluster in data.get("scope", {}).get("clusters") or []:
+        name = str(cluster.get("name", ""))
+        manifest_cluster = manifest_clusters.get(name)
+        if not manifest_cluster:
+            continue
+        if manifest_cluster.get("outcome") != "collected":
+            # The collector could not read this target, and the document says it
+            # was checked anyway. That is allowed -- falling back to manual
+            # commands is what an agent is supposed to do with a gate-failed
+            # target -- but it cannot be reported as an ordinary full read,
+            # because nothing corroborates it. The `collected` cross-check below
+            # is the only thing standing between `checks_run` and free text, and
+            # it does not reach here by construction.
+            #
+            # On 2026-08-29 `fleet-wide-cost-analysis` published
+            # `project/adamparco-kage` with three checks run, no limitations and
+            # no coverage gap, over a manifest that marks that same target
+            # `gate-failed` -- the disks read had been failing since it was
+            # written. The document was the only surface saying the project was
+            # fully audited, and it was the one surface with nothing behind it.
+            #
+            # Requiring `limitations` rather than refusing outright keeps the
+            # fallback legal and makes it visible: §6 turns the limitation into
+            # a coverage gap, so the run reports itself partial and names the
+            # target whose coverage rests on work the manifest cannot check.
+            if checks_ran(cluster) and not str(cluster.get("limitations", "")).strip():
+                raise ValidationError(
+                    f"scope.clusters: {name!r} claims "
+                    f"{len(checks_ran(cluster))} check(s) ran, but the collect.py "
+                    f"manifest for {audit_id} marks it "
+                    f"{str(manifest_cluster.get('outcome'))!r}"
+                    + (
+                        f" ({str(manifest_cluster.get('error'))[:200]})"
+                        if manifest_cluster.get("error")
+                        else ""
+                    )
+                    + ". A target the collector could not read may still be "
+                    "checked by hand, but it cannot be reported as a clean full "
+                    "read: nothing corroborates those checks. Put what you ran "
+                    "and what the collector could not into this target's "
+                    "`limitations`, so the run reports the gap instead of "
+                    "publishing over it."
+                )
+            continue
+        verified = {
+            (entry.get("check"), entry.get("rc"))
+            for entry in manifest_cluster.get("commands") or []
+        }
+        ok_checks = {check for check, rc in verified if rc == 0}
+        for entry in checks_ran(cluster):
+            if entry not in ok_checks:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_run names {entry!r}, but the "
+                    f"collect.py manifest for {audit_id} marks {name!r} 'collected' "
+                    f"and records no successful command for that check there. A "
+                    "collected cluster's checks_run must match the manifest that "
+                    "collected it — see collect.py's manifest and "
+                    "cross_check_manifest."
+                )
+        # `checks_not_applicable` is the one field that used to be
+        # uncontradictable -- free text, outside the coverage denominator, and a
+        # check moved into it turns a partial run clean. The obvious rule, "a
+        # check the manifest ran at rc == 0 cannot be inapplicable", was wrong
+        # for as long as a `commands` entry recorded that the *command* ran
+        # rather than that the *check* was evaluable: patch_readiness issued one
+        # `clusters describe` and recorded it against all nine slugs while
+        # returning [] for four of them on Autopilot, so the rule rejected every
+        # honest run of that stream against this fleet.
+        #
+        # What it needed was the collector saying which checks it skipped and
+        # why, in every collector at once. That now holds -- collect.py,
+        # fleet_waste, patch_readiness, fleet_stockout and fleet_drift each emit
+        # `checks_not_applicable` for the checks their target's shape rules out
+        # -- so the manifest can finally be asked.
+        #
+        # The rule is therefore corroboration, not prohibition: a slug is
+        # inapplicable if the collector said so, or if the collector never
+        # claimed a successful command for it. Only the contradiction is
+        # rejected -- the manifest recording a check as run and clean while the
+        # document takes it out of the denominator. That is the shape a padded
+        # `checks_not_applicable` has, and it is the one this cannot tell from
+        # an honest one by any other means.
+        #
+        # It stays legal to declare a check the collector never reached: a
+        # target it could not read, or one whose slug it does not carry, still
+        # takes the model's judgment. "The command ran, found zero objects of
+        # that kind, so the check does not apply" is the case this deliberately
+        # rejects -- zero objects is a clean result, and reporting it as
+        # inapplicable shrinks the denominator over a check that was covered.
+        collector_not_applicable = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("checks_not_applicable") or []
+        }
+        # The mirror of the rule below, and the hole the `commands` convention
+        # leaves open. A `commands` entry records that a *command* ran, not that
+        # a check reached a verdict on this target -- one `gcloud` call is
+        # routinely recorded against every slug it feeds. So `ok_checks` alone
+        # cannot refuse a document that claims one of those slugs ran on a
+        # target the collector had already declared it inapplicable for: the
+        # manifest corroborates the claim, because the command really did run.
+        #
+        # `gcp-networking-fabric-audit` on 2026-08-29 is the live shape. One
+        # project-wide `subnets list-usable` is recorded against all 43 subnet
+        # units, and the collector separately declares `subnet-ip-exhaustion`
+        # inapplicable on the 41 Network Analyzer published no figures for. The
+        # document that run published put those 41 in `checks_not_applicable`
+        # and was honest. A document that instead listed `subnet-ip-exhaustion`
+        # under `checks_run` for all 43 passes every other rule here and claims
+        # IP-exhaustion coverage over 41 subnets nobody measured.
+        #
+        # The collector is the authority on applicability -- that is what the
+        # rule below rests on -- so a document contradicting it in this
+        # direction is the same error in the same field, and is refused the same
+        # way.
+        for entry in checks_ran(cluster):
+            if entry in collector_not_applicable:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_run names {entry!r}, but the "
+                    f"collect.py manifest for {audit_id} declares {entry!r} not "
+                    f"applicable on {name!r}. The collector knows this target's "
+                    "shape and already said the check has nothing to run against "
+                    "there; a command recorded for it covers some other target the "
+                    "same call served. Reporting it as run counts coverage this "
+                    "run does not have — carry the collector's disposition into "
+                    "checks_not_applicable instead."
+                )
+        for entry in cluster.get("checks_not_applicable") or []:
+            slug = str((entry or {}).get("check", ""))
+            if slug in ok_checks and slug not in collector_not_applicable:
+                raise ValidationError(
+                    f"scope.clusters: {name!r} reports {slug!r} as not applicable, "
+                    f"but the collect.py manifest for {audit_id} records a "
+                    f"successful command for it on {name!r} and does not itself "
+                    "declare it inapplicable. A check the collector ran and "
+                    "completed was covered, so moving it out of the coverage "
+                    "denominator reports the cluster as more fully audited than "
+                    "it was. If the check genuinely cannot apply to this target, "
+                    "the collector is where that belongs — it is the same answer "
+                    "on every run. If it applies but you could not evaluate it, "
+                    "that is this target's `limitations`, which §6 turns into a "
+                    "coverage gap."
+                )
+
+
+def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Replace each finding's `evidence` with what the collector recorded for
+    the same identity. Returns the ids changed.
+
+    `evidence` is the one part of the document that claims to be *observed* —
+    a command, and the output it produced — and the model wrote both. It is
+    not usually wrong: spot-checked against the live API, the excerpts it
+    types are faithful projections of data the collector really did fetch.
+    What it does is retype them differently every run, and lose detail while
+    it does. Between the two most recent runs of every stream on this install,
+    not one finding survived with byte-identical evidence — 37 of 37 excerpts
+    rewritten on `obtainability-audit` alone, `argocd-applicationset-controller:
+    missing cpu,memory` coming back as `argocd-applicationset-controller:
+    requests=`, and a full securityContext breakdown as `containers:
+    litellm-container`. Nothing downstream can tell that from a fleet that
+    moved, so `carry_unchanged_findings` never fires and the ledger re-derives
+    prose it already had.
+
+    The collector computed the same excerpt deterministically, so take it from
+    there and treat the model's as a draft. Commit 69b612e5 settled the same
+    question for finding titles the same way: the collector writes the
+    sentence rather than the model.
+
+    The command has to come with it, and that is the part worth being careful
+    about, because in isolation the model's is often the *better* string — a
+    narrow `gcloud container clusters describe … --format="json(maintenancePolicy)"`
+    against the collector's one broad `clusters list --format json`. But the
+    two fields are one claim. Once the excerpt is the collector's computed
+    line, a narrow command beside it no longer produces what it sits above:
+    `describe --format="json(maintenancePolicy)"` prints a JSON object, not
+    `no maintenancePolicy.window configured`. Keeping the model's command
+    would manufacture exactly the mismatch this exists to remove, so both
+    fields move together or neither does.
+
+    Nothing is invented. A finding with no matching candidate keeps what it
+    arrived with, which is what keeps the manual fallback working: a target
+    the collector could not read yields no candidates, and the agent's
+    hand-run command is then the only evidence there is.
+    """
+    if not manifest:
+        return []
+    by_id: dict[str, tuple[dict, str]] = {}
+    for entry in manifest.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        # A candidate's cluster comes from the entry containing it. Only
+        # collect.py's check-table path writes `cluster` into the candidate
+        # itself; fleet_drift, patch_readiness, fleet_stockout and fleet_waste
+        # build the name into `object` and omit the field, so an id derived
+        # from such a candidate alone reads `check._._.object` and matches
+        # nothing — which is exactly what those four streams did, 35 candidates
+        # joining zero findings. Reading the name from the enclosing entry is
+        # true of both shapes and needs no change in any collector.
+        cluster_name = str(entry.get("name") or "")
+        commands = {
+            str(command.get("check")): str(command.get("command") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict)
+            and command.get("rc") == 0
+            and str(command.get("command") or "").strip()
+        }
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            by_id[derive_finding_id(keyed)] = (
+                candidate,
+                commands.get(str(candidate.get("check")), ""),
+            )
+
+    adopted = []
+    for finding in findings:
+        match = by_id.get(derive_finding_id(finding))
+        evidence = finding.get("evidence")
+        if match is None or not isinstance(evidence, dict):
+            continue
+        candidate, command = match
+        excerpt = str(candidate.get("excerpt") or "").strip()
+        # All of it or none of it, for the reason in the docstring: a
+        # collector-computed excerpt under a model-written command is the
+        # mismatch this function exists to remove, so a candidate missing
+        # either half is left alone entirely. Nothing on this install is —
+        # every one of the 91 live candidates has a successful recorded
+        # command behind it — so the branch costs no coverage; it is here so
+        # that a collector which someday emits a candidate it cannot back
+        # degrades to the model's pair rather than to a spliced one.
+        if not excerpt or not command:
+            continue
+        changed = False
+        if evidence.get("excerpt") != excerpt:
+            evidence["excerpt"] = excerpt
+            changed = True
+        if evidence.get("command") != command:
+            evidence["command"] = command
+            changed = True
+        if changed:
+            adopted.append(str(finding.get("id") or ""))
+    return adopted
 
 
 class ContainmentError(ValidationError):
@@ -1944,6 +3480,64 @@ def coverage_issue_title(audit_id: str, gaps: list[str]) -> str:
     )
 
 
+# Recognises a title the function above minted, so a later run can correct its
+# gap count without touching a findings ledger's title. Anchored at the end and
+# tolerant of the audit name, which is the only part that varies between
+# streams.
+COVERAGE_TITLE_RE = re.compile(r"— coverage incomplete \(\d+ gaps?, 0 findings\)$")
+
+SILENT_MARKER = "[SILENT]"
+
+
+def chat_summary(audit_id: str, payload: dict, findings: list[dict]) -> str:
+    """The one line a scheduled run puts in the home channel.
+
+    Rendered here for the reason `silent_ok` is computed here. Every SOP has
+    asked for "one line: counts by severity, new vs. resolved, and the
+    `issue_url`" since the first stream shipped, and on 2026-08-30 a scheduled
+    run answered it with sixteen hundred characters — its own exit codes, a
+    markdown heading, and every finding in the ledger restated underneath a
+    link to the ledger. The numbers were all in this payload. Asking the model
+    to reassemble them into a sentence was asking it to reproduce a
+    computation, and what came back was a second copy of the issue.
+
+    The delta is the parenthesis, and it is what an operator reads: a stream
+    that found the same eleven things it found last week says `(no change)`
+    where one that fixed two says `(2 resolved)`.
+    """
+    if payload.get("silent_ok"):
+        return SILENT_MARKER
+    gaps = len(payload.get("coverage_gaps") or [])
+    if findings:
+        counts = severity_counts(findings)
+        state = (
+            f"{counts['critical']} critical, {counts['major']} major, "
+            f"{counts['minor']} minor"
+        )
+    elif gaps:
+        # Not "clean": a gap is why this run found nothing on some target, and
+        # it is why the ledger is still open. Read `coverage_gaps` rather than
+        # `partial` — the two are set from each other one line apart, and one
+        # source of truth per sentence is what keeps them from drifting.
+        state = "nothing found, coverage incomplete"
+    else:
+        state = "clean, ledger closed"
+    delta = [
+        f"{count} {one if count == 1 else many}"
+        for count, one, many in (
+            (payload.get("new") or 0, "new", "new"),
+            (payload.get("resolved") or 0, "resolved", "resolved"),
+            (len(payload.get("prs_opened") or []), "PR opened", "PRs opened"),
+            (len(payload.get("prs_closed") or []), "PR closed", "PRs closed"),
+            (gaps, "gap", "gaps"),
+        )
+        if count
+    ]
+    line = f"{audit_name(audit_id)}: {state} ({', '.join(delta) or 'no change'})"
+    url = payload.get("issue_url")
+    return f"{line} — {url}" if url else line
+
+
 def delta_block(ids: list[str]) -> str:
     """The hidden, machine-read block that carries this run's finding ids.
 
@@ -1977,40 +3571,43 @@ def parse_delta_block(body: str | None) -> list[str]:
     return [i for i in ids if isinstance(i, str)]
 
 
-def parse_finding_titles(body: str | None) -> dict[str, str]:
-    """Recover {finding id: title} from a previous issue body, to name resolved findings."""
-    body = normalise_newlines(body)
-    if not body:
-        return {}
-    return {fid: title.strip() for title, fid in FINDING_MARKER_RE.findall(body)}
-
-
 def compute_delta(
     previous_ids: list[str],
     rendered_ids: list[str],
     all_current_ids: list[str] | None = None,
+    all_previous_ids: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Return (newly appeared ids, newly resolved ids), both sorted.
 
-    The two halves are deliberately measured against *different* sets, because
-    "appeared" and "was fixed" are different claims and the body budget breaks
-    them apart.
+    Both halves turn on what the previous run *knew*, which is wider than what
+    its body had room to show: `previous_ids` is what that body rendered,
+    `all_previous_ids` is every finding in its stored document, and the union
+    of the two is the yardstick.
 
-    `previous_ids` comes out of the last run's hidden block, which records what
-    that body **rendered** — so `new` has to be measured against what this body
-    rendered too. Compare a rendered set to a full finding set and every
-    finding the budget dropped is announced as new, every run, forever.
+    Measuring `new` against the rendered set alone announces a finding that
+    merely lost one budget contest and won the next. On 2026-08-30
+    obtainability-audit did exactly that — seventeen false `hpa-cannot-scale`
+    findings crowded six real `probes-liveness` ones out of the body, and when
+    the false ones were fixed the six came back and the comment called all six
+    new, pointing "look now" at findings two earlier runs had already reported.
+    A reader who cannot see a truncated finding is told so by the comment's own
+    `omitted` line, which claims partial coverage and nothing about novelty.
 
-    `all_current_ids` is every finding in the document, rendered or not, and
+    The union rather than `all_previous_ids` on its own, because a stored
+    document that is absent or malformed yields an empty set, and measuring
+    `new` against that would announce every live finding as new — the failure
+    this function exists to prevent, let back in through the wider set.
+
+    `all_current_ids` is every finding in this document, rendered or not, and
     resolution is judged against it alone. A finding cut for space still
     reproduces; calling it resolved claims a fix that never happened, in
     writing, on a finding nobody can see. It defaults to `rendered_ids` for
     callers where nothing was truncated.
     """
-    previous = set(previous_ids)
+    known = set(previous_ids) | set(all_previous_ids or ())
     rendered = set(rendered_ids)
     current = set(rendered_ids if all_current_ids is None else all_current_ids)
-    return sorted(rendered - previous), sorted(previous - current)
+    return sorted(rendered - known), sorted(known - current)
 
 
 # --------------------------------------------------------------------------- #
@@ -3045,10 +4642,11 @@ def render_finding(
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
 
     # The anchor is a line of its own *above* the heading rather than markup
-    # appended to it. FINDING_MARKER_RE matches the heading through to end of
-    # line, so anything after the comment stops it matching — and that regex is
-    # how a resolved finding's title is recovered from the previous body once
-    # the finding is gone from findings.json.
+    # appended to it, so the `finding:` comment stays the last thing on the
+    # heading line: it is the per-finding join key a reader or an external tool
+    # uses on a body it did not generate. The harness no longer parses it —
+    # resolved findings are named from the report store's stored document
+    # (§4.8) — but the published marker is part of the body's contract.
     lines = [
         f'<a id="{_anchor_id(fid)}"></a>',
         "",
@@ -3144,10 +4742,14 @@ def select_rendered_findings(
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
     Selection walks the severity-first order and stops at the first finding that
-    does not fit, so the rendered set is always a prefix: truncation only ever
-    eats the least-severe end, and criticals are structurally safe. At least one
-    finding always renders — a body with a single oversized finding is still
-    more useful than a body with none.
+    does not fit, so the rendered set is always a prefix and truncation only ever
+    eats the least-severe end. That is a statement about the *cut*, not about the
+    findings: when one severity overflows the budget on its own the end of the
+    list is that same severity, and criticals are dropped like anything else. A
+    live `stockout-prevention` run rendered 18 of 49 criticals. Callers that
+    describe the omitted set must read its severities rather than assume. At
+    least one finding always renders — a body with a single oversized finding is
+    still more useful than a body with none.
 
     Each finding is charged for its own rendered text *and* for the slot its id
     occupies in the hidden delta block, because that block is itself unbounded:
@@ -3245,8 +4847,10 @@ def _render_scope(
     show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
     roster = audit_checks(audit_id)
 
-    out = ["", "## Scope", "", f"Audited {len(clusters)} cluster(s) on {stamp}."]
-    header = "| Cluster | Location | Project |"
+    out = ["", "## Scope", "", f"Audited {scope_phrase(clusters)} on {stamp}."]
+    kinds = {target_kind(str(c.get("name", "")).strip()) for c in clusters}
+    noun = "Cluster" if kinds <= {"cluster"} else "Target"
+    header = f"| {noun} | Location | Project |"
     rule = "| ------- | -------- | ------- |"
     if roster:
         header += " Checks |"
@@ -3262,14 +4866,18 @@ def _render_scope(
             f"| `{_cell(cluster.get('project', ''))}` "
         )
         if roster:
+            # Per target, not per stream: a `project/<id>` row is answerable for
+            # the project-scoped checks alone, and rating it against the whole
+            # roster printed "2/12 ⚠" beside a row that ran everything it owed.
+            owed = set(audit_target_checks(audit_id, str(cluster.get("name", ""))))
             ran = set(checks_ran(cluster))
-            na = set(checks_na(cluster)) & set(roster)
+            na = set(checks_na(cluster)) & owed
             # The denominator is what *could* have run here, so the ⚠ means
             # "unread", not "inapplicable". The n/a count stays visible beside
             # it: a cluster excusing itself from half the roster is something a
             # reader should see, even when its coverage is technically complete.
-            applicable = len(roster) - len(na)
-            complete = len(ran & set(roster))
+            applicable = len(owed) - len(na)
+            complete = len(ran & owed)
             flag = "" if complete >= applicable else " ⚠"
             note = f" ({len(na)} n/a)" if na else ""
             row += f"| {complete}/{applicable}{note}{flag} "
@@ -3376,12 +4984,27 @@ def _render_findings(
             )
 
     if omitted:
+        # "The omitted findings are the least severe" described the cut and was
+        # read as a description of the findings. They are not the same claim:
+        # `select_rendered_findings` walks a severity-ordered list, so when one
+        # severity is large enough to overflow the budget by itself, the tail it
+        # cuts is that severity. Live run 2026-08-29 rendered 18 of 49 criticals
+        # and closed with a sentence telling the reader the other 31 were the
+        # least severe ones. Name the breakdown; it cannot be read wrong.
+        omitted_counts = severity_counts(omitted)
+        breakdown = ", ".join(
+            f"{omitted_counts[severity]} {severity}"
+            for severity in SEVERITIES
+            if omitted_counts[severity]
+        )
         out += [
             "",
-            f"_{len(omitted)} further finding(s) are omitted from this description to "
-            "stay inside GitHub's body limit. The counts in the title and in the "
-            "summary above are the true totals; the omitted findings are the "
-            "least severe._",
+            f"_{len(omitted)} further finding(s) are omitted from this description "
+            f"to stay inside GitHub's body limit: {breakdown}. The counts in the "
+            "title and in the summary above are the true totals. Findings are cut "
+            "from the least-severe end of the list, which is not the same as the "
+            "omitted ones being less severe than those shown — the per-severity "
+            "headings above give how many of each made it._",
         ]
     return out, omitted
 
@@ -3496,7 +5119,10 @@ def _render_check_evidence(
         "",
         "One row per check that ran, with the command that ran it, as reported "
         "by the audit. The harness cannot confirm a command was issued — these "
-        "are re-runnable so that it does not have to be taken on trust.",
+        "are re-runnable so that it does not have to be taken on trust. A row "
+        "beginning with an HTTP verb is the exception: the collector issued "
+        "that request in-process against the API it names, so re-running it "
+        "means calling that API rather than pasting the row into a shell.",
         "",
         "| Cluster | Check | Command |",
         "| ------- | ----- | ------- |",
@@ -3528,7 +5154,24 @@ def _render_check_evidence(
             out.append(f"| `{_cell(name)}` | `{_cell(check)}` | {_cell(reason)} |")
     out.append("")
     out.append("</details>")
-    return out if len("\n".join(out)) <= budget else []
+    if len("\n".join(out)) <= budget:
+        return out
+    # Dropping the table whole is right; dropping it silently is not.
+    # `validate_check_command` makes the model invent a re-runnable command for
+    # every check on the stated promise that they get published here, and this
+    # section is last in line for the budget — so it disappears on exactly the
+    # runs whose findings crowded it out, which are the runs where a fabricated
+    # check would matter most. Silence there leaves a document that looks
+    # complete. Name the omission and say where the commands survive.
+    excluded = f" and the {len(na_rows)} exclusion(s)" if na_rows else ""
+    notice = [
+        "",
+        f"_The {len(rows)} command(s) behind this run's checks{excluded} do not "
+        "fit GitHub's body limit and are omitted here. They are kept in full in "
+        "this run's stored report; ask the agent for that report to re-run any "
+        "of them._",
+    ]
+    return notice if len("\n".join(notice)) <= budget else []
 
 
 def render_issue_body(
@@ -3712,7 +5355,7 @@ def render_clean_comment(
             f"### `{audit_id}` found nothing — but did not see the whole fleet",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(clusters)}: {names}.",
             "",
             "**This is not an all-clear, and the ledger stays open.** A finding's "
             "absence only means it was fixed if the audit actually looked, so "
@@ -3728,7 +5371,7 @@ def render_clean_comment(
             f"### `{audit_id}` is now clean — closing",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{len(clusters)} audited cluster(s): {names}.",
+            f"{scope_phrase(clusters)}: {names}.",
             "",
             "Every finding previously reported here is gone, so this ledger is being "
             "closed as completed. The next run that finds anything opens a fresh one.",
@@ -4037,7 +5680,11 @@ def run_cmd(
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
-    log("$ " + " ".join(cmd) + where)
+    # `shlex.join`, not `" ".join`: this line is prefixed `$ ` and read as
+    # something to paste. A `--title` with spaces or a `--format json(...)`
+    # space-joined is not the command that just ran, it is one the shell
+    # refuses.
+    log("$ " + shlex.join(cmd) + where)
     try:
         result = subprocess.run(
             cmd,
@@ -4047,7 +5694,7 @@ def run_cmd(
             cwd=str(target) if target is not None else None,
         )
     except subprocess.CalledProcessError as exc:
-        log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
+        log(f"FAILED ({exc.returncode}): {shlex.join(cmd)}")
         if exc.stderr:
             log(exc.stderr.strip())
         raise
@@ -4055,7 +5702,7 @@ def run_cmd(
     # except arm, which a non-raising call never reaches, so a `gh` outage on
     # the comment path left no trace anywhere in the run's output.
     if result.returncode != 0:
-        log(f"FAILED ({result.returncode}): {' '.join(cmd)}")
+        log(f"FAILED ({result.returncode}): {shlex.join(cmd)}")
         if capture and result.stderr:
             log(result.stderr.strip())
     return result
@@ -4202,7 +5849,29 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         ("severity:major", "D93F0B", "Highest audit finding severity: major"),
         ("severity:minor", "FBCA04", "Highest audit finding severity: minor"),
     ]
+    # One list, then create only what is missing. This used to be seven
+    # unconditional `label create --force` calls, from `start`, `finish`, and
+    # `remediate` alike — fourteen network round trips on a plain run,
+    # twenty-one with a promotion, to assert labels that have existed since the
+    # stream's first run. A failed or unparseable list degrades to the old
+    # behaviour (create everything, `check=False`), never to skipped labels:
+    # `pr_closed_by_harness` reads STALE_CLOSED_LABEL, so under-creating is the
+    # failure mode that matters and over-creating is free.
+    existing: set[str] = set()
+    listed = gh(
+        ["label", "list", "-R", repo, "--limit", "100", "--json", "name"],
+        check=False,
+    )
+    if listed.returncode == 0 and (listed.stdout or "").strip():
+        try:
+            existing = {
+                str(entry.get("name", "")) for entry in json.loads(listed.stdout)
+            }
+        except (ValueError, AttributeError):
+            existing = set()
     for name, color, description in labels:
+        if name in existing:
+            continue
         gh(
             [
                 "label",
@@ -4283,24 +5952,16 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
     return int(chosen["number"]), chosen.get("url")
 
 
-def fetch_issue_body(repo: str, number: int) -> str | None:
-    """The ledger's current body, or None when it could not be read.
+def issue_number_from_url(url: str | None) -> int | None:
+    """The trailing number of an issue URL `gh issue create` printed, if any.
 
-    None and "" are different answers. An unreadable body means the delta is
-    unknowable; treating it as empty would announce every live finding as new.
+    `gh` reports a created issue as a URL and nothing else; the number is what
+    the report store's trust check joins on next run.
     """
-    res = gh(["issue", "view", str(number), "-R", repo, "--json", "body"], check=False)
-    if res.returncode != 0:
-        log(
-            f"WARNING: could not read issue #{number} (gh exited {res.returncode}); "
-            "skipping the delta comment rather than reporting every finding as new."
-        )
+    if not url:
         return None
-    try:
-        return str(json.loads(res.stdout or "{}").get("body") or "")
-    except json.JSONDecodeError:
-        log(f"WARNING: issue #{number} body came back as non-JSON; skipping the delta.")
-        return None
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else None
 
 
 def fetch_issue_url(repo: str, number: int) -> str | None:
@@ -4311,6 +5972,75 @@ def fetch_issue_url(repo: str, number: int) -> str | None:
         return json.loads(res.stdout or "{}").get("url")
     except json.JSONDecodeError:
         return None
+
+
+def fetch_issue_title(repo: str, number: int) -> str | None:
+    res = gh(["issue", "view", str(number), "-R", repo, "--json", "title"], check=False)
+    if res.returncode != 0:
+        return None
+    try:
+        return json.loads(res.stdout or "{}").get("title")
+    except json.JSONDecodeError:
+        return None
+
+
+def refresh_coverage_ledger(
+    repo: str,
+    number: int,
+    audit_id: str,
+    gaps: list[str],
+    data: dict,
+    now: datetime,
+) -> None:
+    """Keep an open coverage ledger's title and body honest across runs.
+
+    The findings path rewrites both on every update. This one rewrote the title
+    only, and only when the gap count moved, so a ledger opened the morning one
+    target was unreadable still read `1 gap` after a later run could not read
+    forty-one — and its Scope table still described the fleet as it stood the
+    day the ledger opened. On 2026-08-29 `fleet-consistency-drift`'s #58 showed
+    both halves of that: a title correctly reporting five gaps over a body
+    dated 2026-08-10 listing four clusters, one of them `platform-agent-host`,
+    deleted since. The body is what someone reads once the title gets them to
+    open the issue, and it opens by promising it "is rewritten in full on every
+    run".
+
+    Only a ledger this code minted is touched. A findings ledger that has since
+    gone clean-with-gaps keeps both of its own: rewriting there would replace a
+    body still listing seven findings with one claiming none. The title guard
+    below is what rules that out, which is why it runs before anything else and
+    not at the call site.
+    """
+    current = fetch_issue_title(repo, number)
+    if current is None or not COVERAGE_TITLE_RE.search(current):
+        return
+
+    # No `current == wanted` early exit. The gap *count* holding steady across
+    # runs says nothing about which clusters went unread or when — the two runs
+    # that froze #58's body were both "4 gaps", unchanged, and returned here
+    # before touching anything. The body carries a scope table and a generated
+    # timestamp, so a run that changed neither number still has something newer
+    # to say than what is published.
+    wanted = coverage_issue_title(audit_id, gaps)
+    body_file = _write_temp(render_issue_body(data, generated_at=now, audit_id=audit_id).body)
+    try:
+        gh(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                repo,
+                "--title",
+                wanted,
+                "--body-file",
+                body_file,
+            ],
+            check=False,
+        )
+    finally:
+        _unlink(body_file)
+    log(f"Refreshed coverage ledger #{number}: {wanted}")
 
 
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
@@ -5178,13 +6908,34 @@ def _workspace_runner(
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
+    # Take the lock before anything else this run does. `ensure_workspace(...,
+    # reset=True)` below scrubs the stream's GitOps tree, so a second dispatch
+    # that reached it would delete a live run's working files — the refusal has
+    # to come first, not after the damage.
+    t0 = datetime.now(timezone.utc)
+    # `start` twice in one run is not a double dispatch — it is an audit whose
+    # context was compacted mid-flight, re-reading the skill and asking again.
+    # Resume it: keep the lock it already holds, keep the t0 `inspect_s`
+    # measures from, and skip the scrub and the unlink below, because the run
+    # this would be destroying is the caller's own.
+    resumed = own_run_claim(audit_id)
+    if resumed is None:
+        take_run_lock(audit_id, t0, steal=bool(getattr(args, "steal_lock", False)))
+        prune_steal_tokens(audit_id, now=t0.timestamp())
+    else:
+        log(
+            f"RESUMING {audit_id}: this run already holds the stream "
+            f"(started {resumed.get('t0')}). Keeping its workspace and findings."
+        )
+
     # Resolve first, then mint: the token is repo-scoped, and the repository
     # cannot be read off a clone that does not exist yet.
     repo = resolve_repo()
     refresh_credentials(repo)
     # The one place a scrub is correct: the audit has not written anything yet,
-    # so whatever is in the tree is debris from a run that did not finish.
-    root = ensure_workspace(repo, audit_id, reset=True)
+    # so whatever is in the tree is debris from a run that did not finish. On a
+    # resume that reasoning inverts — the tree holds this run's own work.
+    root = ensure_workspace(repo, audit_id, reset=resumed is None)
     ensure_labels(repo, audit_id)
 
     # No branch is created or reset here. The report branch is gone: the ledger
@@ -5201,9 +6952,12 @@ def handle_start(args: argparse.Namespace) -> None:
         pass
 
     # A crashed run must not leave a document behind for the next one to
-    # publish as if it were fresh.
+    # publish as if it were fresh. A resume is not the next run, though: the
+    # findings there are the ones this run has already written, and deleting
+    # them would throw away the inspection the compaction interrupted.
     findings_path = findings_path_for(audit_id)
-    Path(findings_path).unlink(missing_ok=True)
+    if resumed is None:
+        Path(findings_path).unlink(missing_ok=True)
 
     print(
         json.dumps(
@@ -5485,6 +7239,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
+    entry_mono = time.monotonic()
 
     by_id = {str(f.get("id", "")): f for f in findings}
     unknown = [fid for fid in args.finding if fid not in by_id]
@@ -5638,24 +7393,71 @@ def handle_remediate(args: argparse.Namespace) -> None:
         issue_number=issue_number,
         generated_at=now,
     )
-    print(
-        json.dumps(
-            {
-                "status": "REMEDIATED",
-                "prs_opened": opened,
-                "already_open": plan.already_open,
-                "superseded": plan.superseded,
-                "refused": refused,
-            }
-        )
-    )
+    payload = {
+        "status": "REMEDIATED",
+        "prs_opened": opened,
+        "already_open": plan.already_open,
+        "superseded": plan.superseded,
+        "refused": refused,
+        "duration_s": round(time.monotonic() - entry_mono, 1),
+    }
+    # No store write and no status write. `remediate` changes no findings, and
+    # the ConfigMap row it used to patch is what made a `/remediate` blank the
+    # preceding audit's row: one slot, two writers, a sparse row winning.
+    print(json.dumps(payload))
 
 
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
+    manifest = None
+    if getattr(args, "manifest_file", None):
+        manifest_path = Path(args.manifest_file)
+        if not manifest_path.is_file():
+            raise ValidationError(f"--manifest-file: {args.manifest_file} does not exist")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"--manifest-file: {args.manifest_file} is not valid JSON: {exc}"
+            ) from exc
+        cross_check_manifest(data, manifest)
+        # Before anything reads `evidence` — the dry-run preview, the ledger
+        # body, and the carry-forward's before/after comparison all do.
+        adopted = adopt_collector_evidence(data["findings"], manifest)
+        if adopted:
+            shown = ", ".join(adopted[:5]) + (", …" if len(adopted) > 5 else "")
+            log(
+                f"evidence: adopted the collector's command and excerpt for "
+                f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
+            )
+    # Every cross-check above is reachable only through --manifest-file, and
+    # until now omitting it was silent. The security-patch run on 2026-08-29
+    # is what that costs: four dry-runs carrying the flag, then a fifth,
+    # publishing call without it. Nothing verified the document that actually
+    # shipped, and nothing in the output said so. Documenting the flag in eight
+    # SOPs did not hold -- the agent simply did not repeat it on the last line
+    # -- so the omission has to be refused rather than described.
+    waiver = str(getattr(args, "no_collector_manifest", "") or "").strip()
+    if manifest is None and not waiver:
+        raise ValidationError(
+            "--manifest-file is required: without it nothing checks the document "
+            "against what the collector actually ran, and a fabricated or "
+            "truncated scope publishes unchallenged. Pass the manifest the "
+            "collector wrote, or, on a run where the collector produced none, "
+            "--no-collector-manifest '<why>' — which publishes but reports the "
+            "run as partial."
+        )
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
+    # Timing: `inspect_s` is t0 → here (the LLM-inclusive inspection phase),
+    # `publish_s` is here → the exit payload, and `collect_s` — present only
+    # when a manifest was given — is the collector's own wall-clock. All
+    # three ride the payload as telemetry; none can fail the run (see
+    # read_phase_t0).
+    inspect_s = inspect_seconds(audit_id, now)
+    collect_s = collector_seconds(manifest)
+    entry_mono = time.monotonic()
 
     if args.dry_run:
         _handle_finish_dry_run(audit_id, data, now)
@@ -5668,7 +7470,8 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report.
-    for fid in degrade_missing_remediations(findings, root):
+    degraded = degrade_missing_remediations(findings, root)
+    for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
@@ -5679,32 +7482,57 @@ def handle_finish(args: argparse.Namespace) -> None:
     # announced as resolved, no remediation pull request is retired, and the
     # ledger is not closed.
     gaps = coverage_gaps(data)
+    # A waived run is a run whose scope nothing checked, which is the same
+    # thing coverage gaps already describe: the audit cannot fully vouch for
+    # what it saw. Carrying it as a gap rather than a quiet flag is what stops
+    # it closing a ledger or retiring a remediation pull request on the
+    # strength of an absence.
+    if waiver:
+        gaps.append(f"the collector manifest was waived — {waiver}")
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
 
     existing_issue, existing_url = find_existing_issue(repo, audit_id)
-    previous_body = fetch_issue_body(repo, existing_issue) if existing_issue else ""
-    # None means the body was unreadable, which is not the same as empty: the
-    # delta is unknowable, so report no delta rather than a fabricated one.
-    delta_known = previous_body is not None
-    previous_ids = parse_delta_block(previous_body or "")
-    previous_titles = parse_finding_titles(previous_body or "")
-    # A block written under a different identity scheme cannot be joined
-    # against this one: the same finding is spelled differently on the two
-    # sides, so every id on the left looks fixed and every id on the right
-    # looks new. `new` is merely noisy that way and is left alone; `resolved`
-    # is a claim that somebody fixed something, so it is withheld for the one
-    # run it takes for the block to be rewritten. Self-clearing, and it costs a
-    # single run of silence on a question nothing can answer.
-    previous_scheme = parse_id_scheme(previous_body)
-    stale_scheme = bool(previous_ids) and previous_scheme != ID_SCHEME
-    if stale_scheme:
+    # The previous run's ids come from the store this harness wrote (§4.8),
+    # not from a round trip that re-fetches the public issue body to parse the
+    # harness's own breadcrumb back out of it. The hidden block is still
+    # written into every body — it is bench's grading interface and the
+    # artifact's published contract — but nothing reads it back.
+    #
+    # `read_report_memory` returning None means the memory is *unknowable*,
+    # not empty, and the two must not be conflated: an absent store (a wiped
+    # PVC), one written for a different ledger, or one minted under a
+    # superseded id scheme would each announce every live finding as new if
+    # read as "the previous run found nothing". No open ledger is the one case
+    # that genuinely is empty — the run is first, and everything present is
+    # new.
+    memory = read_report_memory(audit_id, existing_issue)
+    delta_known = existing_issue is None or memory is not None
+    previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
+    previous_titles = report_finding_titles(memory)
+    # Which of the previous run's findings this run is not entitled to call
+    # fixed. A waiver is stream-wide by definition — nothing was collected, so
+    # no target can be vouched for — and reaches `unverifiable_findings` as the
+    # `None` that holds everything back.
+    unverifiable = unverifiable_findings(
+        memory, None if waiver else coverage_gap_targets(data)
+    )
+    # A gap with no stored memory to scope it against. The run knows it missed
+    # something and has no way to say which findings sat there, so pull-request
+    # retirement falls back to the blanket rule it had before the scoping
+    # existed. Resolution needs no fallback: an unreadable memory is an empty
+    # `previous_ids`, and a run that remembers no findings announces none fixed.
+    coverage_unscopable = bool(gaps) and memory is None
+    if unverifiable:
         log(
-            f"Previous ledger's {len(previous_ids)} finding id(s) were written "
-            f"under identity scheme {previous_scheme} and this run uses "
-            f"{ID_SCHEME}; withholding 'resolved' this run rather than reporting "
-            "a rename as a fix."
+            f"{len(unverifiable)} finding(s) sit on a target this run could not "
+            "cover; they are carried as still-present rather than resolved."
         )
+    # Before anything reads a title or renders a body: a finding whose evidence
+    # is unchanged keeps the words the last run gave it, so an unchanged fleet
+    # reads as unchanged instead of being re-described every morning.
+    for fid in carry_unchanged_findings(findings, memory, exclude=set(degraded)):
+        log(f"{fid} is unchanged since the last run; its wording is carried forward.")
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -5715,11 +7543,14 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
+        # `unverifiable` stands in for the current ids this branch does not
+        # have: a pull request whose finding this run could not re-check is not
+        # stale, and one whose target the run covered cleanly is.
         prs_closed = (
             []
-            if gaps
+            if coverage_unscopable
             else close_stale_remediation_prs(
-                repo, audit_id, remediation_prs, set(), previous_titles, {}, now
+                repo, audit_id, remediation_prs, unverifiable, previous_titles, {}, now
             )
         )
         if existing_issue:
@@ -5750,6 +7581,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 render_clean_comment(audit_id, data, now),
                 what="partial all-clear comment",
             )
+            refresh_coverage_ledger(repo, existing_issue, audit_id, gaps, data, now)
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
@@ -5809,6 +7641,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 _unlink(body_file)
             lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
             existing_url = lines[-1] if lines else None
+            existing_issue = issue_number_from_url(existing_url)
             log(
                 f"Audit {audit_id} found nothing and had no ledger, but "
                 f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
@@ -5816,32 +7649,76 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
-        # No `stale_scheme` guard here on purpose. This branch is not a join —
-        # the run produced no findings at all, so everything the ledger knew
-        # about is gone whatever it was called. The coverage guard still
+        # This branch is not a join — the run produced no findings at all, so
+        # everything the previous run knew about is gone whatever it was
+        # called. An untrusted memory reaches here as an empty `previous_ids`
+        # and therefore claims nothing, which is the same answer the join
+        # branch reaches by way of `delta_known`. The coverage guard still
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
-        clean_resolved = 0 if gaps else len(previous_ids)
-        print(
-            json.dumps(
-                {
-                    "status": "CLEAN",
-                    "issue_url": existing_url,
-                    "new": 0,
-                    "resolved": clean_resolved,
-                    "prs_opened": [],
-                    "prs_closed": prs_closed,
-                    # Same rule as the findings branch below — see the long note
-                    # there. A clean run is the *usual* silent one, but not
-                    # unconditionally: `resolved > 0` is the fleet getting
-                    # better and is the best news this audit ever delivers, and
-                    # a gap means it could not look rather than found nothing.
-                    "silent_ok": not (clean_resolved or gaps or prs_closed),
-                    "partial": bool(gaps),
-                    "coverage_gaps": gaps,
-                }
-            )
+        clean_resolved_ids = [fid for fid in previous_ids if fid not in unverifiable]
+        clean_resolved = len(clean_resolved_ids)
+        payload = {
+            "status": "CLEAN",
+            "issue_url": existing_url,
+            "new": 0,
+            "resolved": clean_resolved,
+            "prs_opened": [],
+            "prs_closed": prs_closed,
+            # Same rule as the findings branch below — see the long note
+            # there. A clean run is the *usual* silent one, but not
+            # unconditionally: `resolved > 0` is the fleet getting
+            # better and is the best news this audit ever delivers, and
+            # a gap means it could not look rather than found nothing.
+            #
+            # `delta_known` is the same guard one step further out. An
+            # untrusted memory reaches here as an empty `previous_ids`, so
+            # `clean_resolved` is 0 for a run that just closed a ledger full
+            # of findings — and staying silent about that is the audit
+            # swallowing its own good news because it could not count it. It
+            # still claims no number; it just does not claim there was
+            # nothing to say.
+            "silent_ok": not (clean_resolved or gaps or prs_closed) and delta_known,
+            "partial": bool(gaps),
+            "coverage_gaps": gaps,
+            "inspect_s": inspect_s,
+            "publish_s": round(time.monotonic() - entry_mono, 1),
+            "collect_s": collect_s,
+        }
+        payload["chat_summary"] = chat_summary(audit_id, payload, findings)
+        # `current_ids` is a claim about what a *live ledger body* renders, so
+        # it may only be empty where a body this run wrote is empty. Two of the
+        # three clean paths qualify: the ledger was closed, or a fresh coverage
+        # ledger was opened with no findings in it. The third does not — zero
+        # findings over incomplete coverage leaves the ledger open and only
+        # comments on it, so the body still renders whatever the previous run
+        # put there. Recording `[]` against that still-open issue hands the
+        # next run a *trusted* memory of an empty ledger, and it announces
+        # every finding the body has been carrying all along as new.
+        #
+        # Carry the previous set forward instead, and where the previous set
+        # is itself unknowable, write no issue number at all: an envelope that
+        # claims no ledger fails the next run's trust check by design, which
+        # is the outcome an unreadable body should have.
+        body_untouched = bool(existing_issue) and bool(gaps)
+        write_report(
+            audit_id,
+            report_envelope(
+                audit_id,
+                payload,
+                data,
+                now,
+                issue_number=(
+                    None if body_untouched and not delta_known else existing_issue
+                ),
+                new_ids=[],
+                resolved_ids=clean_resolved_ids,
+                rendered_ids=previous_ids if body_untouched else [],
+            ),
+            now,
         )
+        release_run_lock(audit_id)
+        print(json.dumps(payload))
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
@@ -5892,14 +7769,26 @@ def handle_finish(args: argparse.Namespace) -> None:
             "the true totals."
         )
 
-    # Now, and not before: `new` is measured against what this body rendered,
-    # because that is what the hidden block records and what the next run will
-    # read back. Measured against the full finding set instead, every finding
-    # the budget dropped is announced as new every single morning. `resolved`
-    # keeps its own, wider yardstick — see `compute_delta`.
+    # Now, and not before: both halves need this body's rendered set, which
+    # does not exist until it is rendered. What they are measured *against* is
+    # `compute_delta`'s business — the previous run's rendered ids widened by
+    # the findings its body had no room for, which `previous_titles` already
+    # carries because the resolved half needs their titles anyway.
     new_ids, resolved_ids = compute_delta(
-        previous_ids, rendered.rendered_ids, current_ids
+        previous_ids,
+        rendered.rendered_ids,
+        current_ids,
+        all_previous_ids=sorted(previous_titles),
     )
+    # Filtered here, once, so everything downstream can read `resolved_ids` as
+    # "resolved" without re-deriving the coverage rule. A finding held back
+    # this way is not new either — it was in `previous_ids`, so `compute_delta`
+    # never offered it as new — and it reappears in the delta the moment its
+    # target is covered again and it is still gone.
+    resolved_ids = [fid for fid in resolved_ids if fid not in unverifiable]
+    # What the published body's hidden block ends up carrying, and so what the
+    # store records as this run's memory. The relink edit below can change it.
+    published_ids = rendered.rendered_ids
     body_file = _write_temp(rendered.body)
     try:
         if existing_issue is None:
@@ -5922,10 +7811,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             status = "OPENED"
             lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
             issue_url = lines[-1] if lines else None
-            number = None
-            if issue_url:
-                tail = issue_url.rstrip("/").rsplit("/", 1)[-1]
-                number = int(tail) if tail.isdigit() else None
+            number = issue_number_from_url(issue_url)
         else:
             gh(
                 [
@@ -5955,20 +7841,29 @@ def handle_finish(args: argparse.Namespace) -> None:
     comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now)
 
     # Retiring a pull request means asserting its finding no longer reproduces.
-    # Over incomplete coverage that assertion is unfounded, so nothing is
-    # closed and every open fix survives to the next complete run.
-    if gaps:
+    # Over a target this run could not cover that assertion is unfounded, so
+    # the finding is passed in as though it were still current and its pull
+    # request survives to the next run that does cover it.
+    if coverage_unscopable:
         prs_closed = []
         log(
-            "Coverage is partial, so no remediation pull request was closed as "
-            "stale; a fix cannot be retired on evidence the audit never gathered."
+            "Coverage is partial and there is no stored memory to say which "
+            "findings the gap covers, so no remediation pull request was closed "
+            "as stale; a fix cannot be retired on evidence the audit never "
+            "gathered."
         )
     else:
+        if unverifiable:
+            log(
+                f"{len(unverifiable)} finding(s) are on uncovered targets, so "
+                "their remediation pull requests stay open; a fix cannot be "
+                "retired on evidence the audit never gathered."
+            )
         prs_closed = close_stale_remediation_prs(
             repo,
             audit_id,
             remediation_prs,
-            set(current_ids),
+            set(current_ids) | unverifiable,
             previous_titles,
             {},
             now,
@@ -6005,23 +7900,31 @@ def handle_finish(args: argparse.Namespace) -> None:
         }
         # One extra edit is cheaper than making a reader wait a day.
         if number is not None:
-            relink = _write_temp(
-                render_issue_body(
-                    data,
-                    generated_at=now,
-                    audit_id=audit_id,
-                    states=states,
-                    pr_urls=pr_urls,
-                    withheld=plan.withheld,
-                ).body
+            relinked = render_issue_body(
+                data,
+                generated_at=now,
+                audit_id=audit_id,
+                states=states,
+                pr_urls=pr_urls,
+                withheld=plan.withheld,
             )
+            relink = _write_temp(relinked.body)
             try:
-                gh(
+                edit = gh(
                     ["issue", "edit", str(number), "-R", repo, "--body-file", relink],
                     check=False,
                 )
             finally:
                 _unlink(relink)
+            # Rebound only once the edit lands, so the store's `current_ids`
+            # stays exactly the hidden block the ledger ended up carrying. The
+            # pull-request links can push a finding over the body budget that
+            # fit a moment ago, so recording the pre-link set would call that
+            # finding new again tomorrow — but this edit is `check=False` and
+            # a run survives losing it, and recording a set the live body does
+            # not have is the same bug in the other direction.
+            if edit.returncode == 0:
+                published_ids = relinked.rendered_ids
 
     # A command that succeeds silently is indistinguishable from one that was
     # never read, so every accepted `/remediate` gets an answer naming what it
@@ -6039,18 +7942,19 @@ def handle_finish(args: argparse.Namespace) -> None:
     if status == "UPDATED" and number is not None:
         if not delta_known:
             log(
-                "Previous ledger body was unreadable; skipping the delta comment "
-                "rather than announcing every live finding as new."
+                "The previous run's report is unavailable (see above); skipping "
+                "the delta comment rather than announcing every live finding as "
+                "new. This run's own store write restores the delta from the "
+                "next run on."
             )
         else:
             comment = render_delta_comment(
                 audit_id,
                 new_ids,
                 # Absence is only evidence of a fix when the audit looked, and
-                # only when the two sides are comparable. Over a coverage gap
-                # absence means "not checked"; across a scheme change it means
-                # "spelled differently". Neither is a fix.
-                [] if (gaps or stale_scheme) else resolved_ids,
+                # `resolved_ids` has already had the findings it did not look at
+                # taken out of it.
+                resolved_ids,
                 findings,
                 previous_titles,
                 now,
@@ -6062,12 +7966,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                 log("No new or resolved findings; body refreshed without a comment.")
 
     reported_new = len(new_ids) if delta_known else 0
-    reported_resolved = (
-        0 if (gaps or stale_scheme or not delta_known) else len(resolved_ids)
-    )
-    print(
-        json.dumps(
-            {
+    reported_resolved = 0 if not delta_known else len(resolved_ids)
+    payload = {
                 "status": status,
                 "issue_url": issue_url,
                 "new": reported_new,
@@ -6109,9 +8009,10 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # explain it with.
                 #
                 # The two are not the same kind of incomplete. A coverage gap
-                # means the audit did not *look*, which is why it suppresses
-                # the resolved count and the stale-closes above: absence of a
-                # finding is not evidence of a fix. Truncation means it looked,
+                # means the audit did not *look*, which is why the findings on
+                # the target it names are held out of the resolved count and
+                # the stale-closes above: absence of a finding is not evidence
+                # of a fix. Truncation means it looked,
                 # found everything, and could not *print* it all — the counts
                 # in the title are still true, the delta block still lists
                 # exactly what the body rendered, and resolution accounting is
@@ -6120,9 +8021,34 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # WARNING in the run log.
                 "partial": bool(gaps),
                 "coverage_gaps": gaps,
-            }
-        )
+                "inspect_s": inspect_s,
+                "publish_s": round(time.monotonic() - entry_mono, 1),
+                "collect_s": collect_s,
+    }
+    payload["chat_summary"] = chat_summary(audit_id, payload, findings)
+    # The delta stored is the one *reported*, so a run that made no claim
+    # stores no claim — and `current_ids` is what this body rendered, which is
+    # what the next run's `new` is measured against.
+    write_report(
+        audit_id,
+        report_envelope(
+            audit_id,
+            payload,
+            data,
+            now,
+            issue_number=number,
+            new_ids=new_ids if delta_known else [],
+            resolved_ids=[] if not delta_known else resolved_ids,
+            rendered_ids=published_ids,
+        ),
+        now,
     )
+    # Release last, and only on the publish path. A `finish` that raised before
+    # here keeps the lock, which is right: the agent fixes its findings.json and
+    # re-runs `finish` — which never acquires — while a *fresh* `start` stays
+    # refused until the run is genuinely over or the ceiling expires.
+    release_run_lock(audit_id)
+    print(json.dumps(payload))
 
 
 # --------------------------------------------------------------------------- #
@@ -6144,6 +8070,17 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--audit", required=True, help=f"Audit id: one of {', '.join(sorted(AUDITS))}."
     )
+    start_parser.add_argument(
+        "--steal-lock",
+        action="store_true",
+        help="Operator override: take this stream's run lock even though another "
+        "run holds it. For a run a human has confirmed is dead but that has not "
+        f"reached its {RUN_LOCK_CEILING_S // 3600}h expiry. Not a retry, and not "
+        "the answer to a RUN IN PROGRESS message — if the holder is still going, "
+        "the two runs overwrite each other's state. A run that lost its context "
+        "and needs its workspace back should just re-run `start`, which resumes "
+        "a stream its own session already holds.",
+    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -6156,6 +8093,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git/gh side effects.",
+    )
+    finish_parser.add_argument(
+        "--manifest-file",
+        default=None,
+        help=(
+            "The collect.py run manifest (see collect.py's module docstring). "
+            "checks_run entries for a manifest cluster marked 'collected' are "
+            "cross-checked against the manifest's own rc=0 commands, and a "
+            "'collected' cluster the document omits is refused — see "
+            "cross_check_manifest. Required unless --no-collector-manifest is "
+            "given."
+        ),
+    )
+    finish_parser.add_argument(
+        "--no-collector-manifest",
+        default=None,
+        metavar="REASON",
+        help=(
+            "Publish without a manifest, on a run where the collector produced "
+            "none and every check came from the manual fallback. REASON is "
+            "reported as a coverage gap, so the run is partial and closes no "
+            "ledger."
+        ),
     )
 
     remediate_parser = subparsers.add_parser(
@@ -6201,12 +8161,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.subcommand == "start":
-            handle_start(args)
-        elif args.subcommand == "remediate":
-            handle_remediate(args)
-        else:
-            handle_finish(args)
+        try:
+            if args.subcommand == "start":
+                handle_start(args)
+            elif args.subcommand == "remediate":
+                handle_remediate(args)
+            else:
+                handle_finish(args)
+        except BaseException:
+            # Every abnormal exit, Ctrl-C included, gives back a lock this
+            # process took and no longer has any run to use it for. A no-op
+            # unless `start` got as far as claiming the stream — which is why
+            # this can sit outside the dispatch rather than inside `handle_start`
+            # and why the `RunInProgress` path below does not drop somebody
+            # else's claim: that failure never wrote one.
+            release_own_lock()
+            raise
+    except RunInProgress as exc:
+        # Its own exit code, distinct from a rejected document and from a
+        # crash: "someone else is already doing this" is a normal outcome of a
+        # double dispatch, and a caller should be able to tell it apart from a
+        # broken run without reading prose.
+        log(f"RUN IN PROGRESS: {exc}")
+        return 3
     except ValidationError as exc:
         log(f"FINDINGS REJECTED: {exc}")
         return 2

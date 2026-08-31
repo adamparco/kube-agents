@@ -96,6 +96,11 @@ API_KEY_ENV = "SESSION_KV_API_KEY"
 #: written down as a failure.
 RELAY_TIMEOUT_SECONDS = 360.0
 
+#: Markdown a model wraps around a bare token: emphasis, code spans, and the
+#: whitespace either side. Stripped from both ends of a report before it is
+#: tested for silence — see :func:`is_silent_report`.
+_MARKDOWN_DRESS = "`*_~ \t\r\n"
+
 #: ``_deliver_result``'s wrapper. Matched, not assumed — see
 #: :func:`parse_cron_wrapper`.
 _WRAPPER_RE = re.compile(
@@ -143,6 +148,107 @@ def profile_name() -> str:
 
 def relay_url() -> str:
     return (os.getenv(RELAY_URL_ENV, "") or "").strip() or DEFAULT_RELAY_URL
+
+
+#: Suffix of the variable a platform's home channel is configured in
+#: (``SLACK_HOME_CHANNEL``, ``GOOGLE_CHAT_HOME_CHANNEL``, and this plugin's own
+#: ``CHAT_HOME_CHANNEL``). The scheduler resolves a delivery target by reading
+#: exactly this, so scanning for it answers "which platforms would ``all``
+#: expand to *here*" without importing anything from ``cron.scheduler``.
+_HOME_CHANNEL_SUFFIX = "_HOME_CHANNEL"
+
+
+def sibling_delivery_targets(job_id: str) -> list[str]:
+    """Platforms the scheduler is posting this same report to, besides the relay.
+
+    ``deliver`` takes a list, and the relay is one entry in it. ``deliver:
+    "chat"`` is relay-only and this returns nothing; ``deliver: "all"`` also
+    posts the raw report to every home channel, so unless the relay is told, its
+    fan-out puts a second, composed copy in each of those channels. The route
+    subtracts what this names — see ``relay_cron_report``.
+
+    Answered here rather than on the server because this process is the one that
+    knows. ``all`` expands over the platforms with a home channel in the *cron
+    child*, and ``profile_cron_tick.home_target_env`` rebuilds those from the
+    root ``config.yaml``: an install whose config carries ``slack: {}`` has no
+    ``SLACK_HOME_CHANNEL`` here, the scheduler silently drops Slack from the
+    expansion, and the relay leg is the only thing that reaches it. The server
+    cannot see any of that — it runs in the gateway, with the full pod
+    environment — so deciding there would suppress a leg nobody sent.
+
+    Best effort in both directions, and the direction matters: an unreadable
+    roster returns nothing, which relays as before rather than dropping a
+    channel. Over-reporting would lose a delivery; under-reporting only risks
+    the duplicate this exists to prevent.
+    """
+    home = Path(os.getenv("HERMES_HOME", "") or "/opt/data")
+    try:
+        with open(home / "cron" / "jobs.json", encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+    jobs = store.get("jobs") if isinstance(store, dict) else store
+    deliver = ""
+    for job in jobs if isinstance(jobs, list) else []:
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+            deliver = str(job.get("deliver") or "")
+            break
+
+    tokens = {t.strip().lower() for t in deliver.replace(";", ",").split(",") if t.strip()}
+    if not tokens or tokens <= {PLATFORM_NAME}:
+        return []
+
+    if "all" in tokens:
+        # What `all` resolves to in this process: every platform whose home
+        # channel is actually set. A variable that is present but empty is not a
+        # target -- the scheduler requires a non-empty chat id -- so the value is
+        # tested, not just the key.
+        tokens = {
+            key[: -len(_HOME_CHANNEL_SUFFIX)].lower()
+            for key, value in os.environ.items()
+            if key.endswith(_HOME_CHANNEL_SUFFIX) and value.strip()
+        }
+
+    return sorted(
+        name
+        for name in tokens
+        if name != PLATFORM_NAME and os.getenv(f"{name.upper()}{_HOME_CHANNEL_SUFFIX}", "").strip()
+    )
+
+
+def is_silent_report(report: str) -> bool:
+    """Should this report be swallowed rather than relayed?
+
+    True for an empty report, and for one whose entire content is the silence
+    marker however the model dressed it. The scheduler's own matcher is already
+    generous — ``[SILENT]`` bare, lowercased, or on its own line among prose all
+    suppress delivery — and where it applies, ``standalone_send`` is never
+    reached at all. What it does not accept is the marker wearing markdown:
+    ``` `[SILENT]` ``` and ``**[SILENT]**`` both test False and are delivered.
+
+    Which is the form to expect. These reports are written by agents that write
+    markdown by default, and every audit SOP now tells the run to copy
+    ``chat_summary`` — a field whose value *is* ``[SILENT]`` on a quiet run —
+    verbatim into its final response. Emphasise it once and the run that meant
+    to say nothing posts the word "[SILENT]" to the home channel instead, which
+    is the one outcome the silent path exists to prevent.
+
+    So undress the report before testing it. On a real report this changes
+    nothing: stripping punctuation off the two ends of a multi-line audit
+    summary cannot turn it into the marker.
+    """
+    bare = report.strip(_MARKDOWN_DRESS)
+    if not bare:
+        return True
+    try:
+        from cron.scheduler import _is_cron_silence_response
+    except Exception:
+        # Outside the Hermes tree — the unit tests, and any caller that imports
+        # this module on its own. Fall back to the marker itself rather than
+        # failing open, because failing open here means posting the marker.
+        return bare.strip().upper() == "[SILENT]"
+    return bool(_is_cron_silence_response(bare))
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -252,7 +358,12 @@ async def standalone_send(
     # Ahead of the credential check on purpose. There is nothing to send, so a
     # missing key is not this tick's problem, and reporting one would be the
     # same error-every-ten-minutes by another name.
-    if not report.strip():
+    #
+    # :func:`is_silent_report` also covers the marker upstream lets through
+    # because a model emphasised it. Relaying that would be worse than posting
+    # it raw: the route runs a Chat Agent turn over the text, and the Chat Agent
+    # asked to relay "[SILENT]" writes a sentence about it.
+    if is_silent_report(report):
         logger.info(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
         )
@@ -278,6 +389,10 @@ async def standalone_send(
         "profile": profile_name(),
         "title": title,
         "report": report,
+        # Without this the route fans the composed report out to every enabled
+        # platform, and `deliver: "all"` -- which posts the raw report to those
+        # same platforms itself -- lands twice in each of them.
+        "also_delivered_to": sibling_delivery_targets(job_id),
     }
     error, verdict = await asyncio.to_thread(_post, relay_url(), payload, api_key)
     if error:

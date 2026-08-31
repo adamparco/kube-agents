@@ -581,6 +581,8 @@ spec:
               value: "true"
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
             - name: CREDENTIAL_PROXY_URL
               value: http://127.0.0.1:8765
             - name: PATH
@@ -670,6 +672,8 @@ spec:
               value: /opt/data
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
             - name: HOME
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
@@ -800,6 +804,8 @@ spec:
               value: /tmp/credential-proxy/home
             - name: CREDENTIAL_PROXY_POLICY
               value: /etc/credential-proxy/policy.json
+            - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
+              value: "33554432"
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET

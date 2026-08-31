@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/obtainability-audit/org__repo", "findings_path":"/opt/data/scratch/findings_obtainability-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
@@ -29,11 +29,13 @@ The helper owns every `git`/`gh` operation and renders the ledger issue body and
 
 ### 1. Enumerate the target fleet
 
+**Run Step 2's collector before doing any of this by hand.** Its manifest enumerates the fleet itself and reports one outcome per cluster; the rules below build `scope.clusters` and `scope.skipped` from that outcome for every stream, whether the collector covered a cluster or not. The commands in this step are the manual path, needed only for a cluster the manifest marks `"unreachable"` or `"gate-failed"`.
+
 ```bash
 gcloud container clusters list --format=json
 ```
 
-- Target every cluster with `status == "RUNNING"`. Record `{name, location, project, checks_run}` into `scope.clusters`. Note each cluster's `autopilot.enabled` — Step 3 changes behaviour on Autopilot. Carry that in each affected finding's `impact` (§3.1 and §3.2 are the two it moves), and surface it in `evidence.excerpt` where it changes a verdict. **Not in `limitations`:** every non-empty `limitations` string is read as a coverage gap, and a fleet with one Autopilot cluster would then publish `partial: true` on every run it ever makes, with the ledger permanently unclosable. Autopilot changes how severe a finding is, not how much of the cluster you saw.
+- Target every cluster with `status == "RUNNING"`. Record `{name, location, project, checks_run}` into `scope.clusters`. Note each cluster's mode — Step 3 changes behaviour on Autopilot. When Step 2's collector ran, that mode is the `autopilot` boolean on the cluster's own manifest entry; this section's `clusters list` is the fallback for when it did not. Carry that in each affected finding's `impact` (§3.1 and §3.2 are the two it moves), and surface it in `evidence.excerpt` where it changes a verdict. **Not in `limitations`:** every non-empty `limitations` string is read as a coverage gap, and a fleet with one Autopilot cluster would then publish `partial: true` on every run it ever makes, with the ledger permanently unclosable. Autopilot changes how severe a finding is, not how much of the cluster you saw.
 - **`checks_run` is mandatory on every cluster,** and each entry is an object, never a bare string:
 
   ```json
@@ -45,7 +47,7 @@ gcloud container clusters list --format=json
 
   `check` is the backticked slug from the §3 heading that defines it — `no-requests`, `no-pdb`, and so on — never the section number and never prose. (`start` prints the full roster of eleven; the SOP still says what each check _is_.) `command` is the literal invocation you issued on that cluster for that check, with its `--context` and the namespace or resource it targeted. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected, as is anything under eight characters.
 
-  The validator rejects an unknown slug, a duplicate, a missing or unusable command, the field being absent, and an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could read but ran nothing against is not a clean cluster, it is an audit that did not happen. Anything short of the checks that apply to that cluster makes the run **partial** exactly as a `limitations` note does, so the ledger stays open and nothing is announced as resolved. Append the entry when its check completes, not when you intend to run it, and paste the command rather than reconstructing it — every one is published verbatim in the ledger under _How this run checked the fleet_.
+  The validator rejects an unknown slug, a duplicate, a missing or unusable command, the field being absent, and an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could read but ran nothing against is not a clean cluster, it is an audit that did not happen. Anything short of the checks that apply to that cluster makes the run **partial** exactly as a `limitations` note does, so the ledger stays open and nothing on that cluster is announced as resolved. Append the entry when its check completes, not when you intend to run it, and paste the command rather than reconstructing it — every one is published verbatim in the ledger under _How this run checked the fleet_.
 
 - **A check the cluster's shape rules out is not a gap — declare it.** Alongside `checks_run`, a cluster may carry `checks_not_applicable` as a list of `{check, reason}`:
 
@@ -66,22 +68,27 @@ gcloud container clusters list --format=json
   export KC="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml"
   KUBECONFIG=$KC gcloud container clusters get-credentials <cluster> --location=<location> --project=<project>
   ```
+- **Manual fallback only** — a cluster the collector marks `"unreachable"` or `"gate-failed"` still needs this cluster's workload state dumped once, the same object kinds Step 2's collector reads, so every `$STATE` reference in Step 3 has something to derive from:
+  ```bash
+  export STATE="/opt/data/scratch/state_<cluster>.json"
+  KUBECONFIG=$KC kubectl get deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,services,limitranges -A -o json > "$STATE"
+  ```
 - If **zero** clusters land in `scope.clusters`, do **not** call `finish` — the helper hard-fails on an empty scope. Report the enumeration failure as your one-line summary and stop.
 
-### 2. Collect workload state
-
-One JSON dump per cluster answers every check in Step 3. **Do not run a separate full-fleet query per check.**
+### 2. Run the collector
 
 ```bash
-KUBECONFIG=$KC kubectl get deployments,statefulsets,daemonsets,poddisruptionbudgets,\
-horizontalpodautoscalers,services,limitranges -A -o json > /opt/data/scratch/wra_state_<cluster>.json
+python3 ./skills/fleet-audit/scripts/collect.py obtainability-audit --project "$(gcloud config get-value project)" > /opt/data/scratch/manifest_obtainability-audit.json
 ```
 
-- Because multiple kinds are requested, every element of `.items[]` carries its own `kind` — filter with `select(.kind=="…")`. (A single-kind `kubectl get` omits per-item `kind`; do not build the checks on that shape.)
-- Read workload **templates** (`spec.template.spec`), not live Pods. Templates are what an admin edits, and they are unaffected by admission-time defaulting.
-- Pods, Jobs, CronJobs, and Events are deliberately excluded: Events expire in roughly an hour, so a fixed 06:50 run samples an arbitrary window, and pod-level data doubles the payload without changing any verdict.
+This is the tested, procedural implementation of every check in Step 3 — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers. It enumerates the fleet itself, dumps workload state once per cluster behind a fail-closed gate, and evaluates all eleven checks against that one dump. Read the manifest it prints before doing anything else:
 
-**Autopilot adjustments.** Autopilot injects resource requests (and, absent explicit limits, mirrors limits from requests) at Pod admission, so a missing-request or missing-memory-limit template is a cost-attribution and predictability problem there, not a scheduling failure. On an Autopilot cluster: downgrade checks 3.1 and 3.2 by one severity level and say so in `impact`, naming the mode there. That is the only place the mode is recorded. Autopilot is never a skip — you read the cluster and every check ran — and it is not a `limitations` note either: that field is the coverage flag, and a mode note parked in it would mark a fully audited cluster as partially audited for as long as the cluster exists. Hostname pinning (3.7) stays `critical` on Autopilot — nodes are ephemeral and are replaced on every upgrade, so a hostname-pinned pod has a guaranteed outage. All other checks are mode-independent.
+- Every entry in `manifest.clusters` carries one `outcome`. `"collected"` means every check already ran there — do not re-run any of them by hand, and do not re-dump the cluster. `"unreachable"` or `"gate-failed"` means the collector could not cover this cluster; fall back to Step 1's manual enumeration and dump commands for it alone, then evaluate Step 3's Flag-when/Do-NOT-flag rules yourself against what you read. An `"unreachable"` entry whose `error` says the cluster is not `RUNNING` is the one case not worth a manual retry: the state that stopped the collector will stop you too, so put it straight into `scope.skipped` with that reason. Every entry also carries an `autopilot` boolean — the mode, already resolved, and on the error shapes too, because a cluster does not stop being Autopilot when a read of it fails. Take the mode from there for any cluster the manifest lists rather than re-deriving it from `clusters list`, and never transcribe a fleet-wide mode map into a script: that hand-copy goes wrong the moment a cluster is added or converted.
+- For a `"collected"` cluster, copy its `commands` list verbatim into that cluster's `checks_run` — each entry already carries `{check, command}` in the exact shape the validator wants; do not retype it.
+- Every entry in a `"collected"` cluster's `candidates` is a verified finding: `check`, `cluster`, `namespace`, `object`, `severity`, and `excerpt` are already computed, including the Autopilot severity downgrade on 3.1/3.2. What is not computed — and is still yours to write — is the `recommendation` (Step 4) and, for a `kind: manifest` remediation, the manifest file itself (Step 3.5's declaration rule).
+- Pass `--manifest-file <path>` to `finish` (Step 6) so it cross-checks your `checks_run` against what the collector actually ran — a check you claim ran on a `"collected"` cluster with no matching manifest command is rejected before publication, not after.
+
+**A cluster the collector covered is not a cluster you dump or query again.** The manual dump command in Step 1 and the per-check reads below exist for the `"unreachable"`/`"gate-failed"` fallback — never for confirming a candidate the collector already produced, whose evidence `finish` takes from the collector's manifest, and never for re-deriving a verdict the manifest already gives you.
 
 ### 3. Checks
 
@@ -93,7 +100,7 @@ horizontalpodautoscalers,services,limitranges -A -o json > /opt/data/scratch/wra
 - **S4 — explicit opt-out:** the workload carries `kubeagents.x-k8s.io/reliability-audit: exempt` as a label or annotation.
 - **S5 — not running:** `spec.replicas == 0`, or the workload is a Job/CronJob or is owned by one.
 
-**Evidence discipline.** The dump is the _detector_; a live single-object read is the _confirmer_. For every candidate finding, run the object-scoped command below, capture a trimmed excerpt, and store that exact string in `evidence.command`. If the confirm command fails or the condition no longer holds, **drop the finding — do not soften it.**
+**Evidence discipline for the manual fallback.** The dump is the _detector_; a live single-object read is the _confirmer_. For a candidate you could not get from the collector, run the object-scoped command below, capture a trimmed excerpt, and store that exact string in `evidence.command`. If the confirm command fails or the condition no longer holds, **drop the finding — do not soften it.** A candidate the collector _did_ produce needs no confirm read: `finish` replaces both evidence fields with the collector's computed pair before publishing, so the object-scoped command you ran is not the one the ledger shows. Fill the two fields from the manifest instead — the candidate's own `excerpt`, and the `commands` entry for that check on that cluster — and the document says what the ledger will.
 
 ```bash
 KUBECONFIG=$KC kubectl get <kind> -n <ns> <name> -o yaml
@@ -251,20 +258,23 @@ Worked example, for a 3.3 finding on `payments/api`:
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit obtainability-audit \
-  --findings-file /opt/data/scratch/findings_obtainability-audit.json
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit obtainability-audit \
+  --findings-file /opt/data/scratch/findings_obtainability-audit.json \
+  --manifest-file /opt/data/scratch/manifest_obtainability-audit.json
 ```
 
-One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+`--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where Step 2's collector never produced one — every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether; a cluster the manifest marked `"unreachable"` or `"gate-failed"` is left to this SOP's ordinary attestation rules.
 
-`partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload you never queried is not a workload that got its PDB: `resolved` comes back `0` and no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out.
+One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled run replies), and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+
+`partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload you never queried is not a workload that got its PDB — but it refuses only for the cluster the gap names: a finding that sat on that cluster stays out of `resolved` and keeps its remediation PR open, while a fix on a cluster this run did read is still announced and its stale PR still retired. The ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out.
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
+- On a **scheduled** run, your entire final response is `chat_summary`, copied verbatim from the JSON with nothing before it and nothing after it. On `silent_ok: true` that string is exactly `[SILENT]`, so obeying the flag and copying the field are the same act; on anything else it is the one line, already carrying the counts, the delta, and `issue_url`. Silence is a message not sent, never a message about silence: do not preface the marker, quote it inside a sentence, restate `silent_ok`, or explain that the run is staying quiet — a response that describes its own silence has already spoken. Nor announce the copying: a run that opens `Per the skill's instructions my entire final response must be chat_summary copied verbatim` and then prints the line has put two sentences in the channel ahead of the one that was wanted, and quoting the rule is not following it.
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
 
-What to report in each case:
+What to say when a person dispatched the run — a scheduled one sends `chat_summary` and nothing else:
 
 - `silent_ok: true` — `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the ledger issue closed as completed and every open remediation PR for this stream closed with it; on `UPDATED` the ledger was rewritten but nothing moved. Dispatched on demand, say which in one line and give the issue URL.
 - `status: "CLEAN"` with `resolved: > 0` — every reliability gap this ledger tracked has been closed. Report the issue URL and the count. A fleet that just became drain-safe is news, and it is the only good news this audit has.

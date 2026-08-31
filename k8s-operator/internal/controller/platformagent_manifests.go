@@ -558,6 +558,12 @@ const (
 	// it explicitly anyway, so the policy is visible in `kubectl get pod -o yaml`.
 	managedScopeDir = "/etc/hermes"
 
+	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
+	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
+	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
+	// is not an alternative.
+	hermesHomeMode = "2770"
+
 	// managedConfigKey holds the render in the config ConfigMap. Deliberately NOT of the
 	// `profile-<name>.overlay.yaml` shape: that glob is what the entrypoint walks to find
 	// overlays to merge, and the whole point here is that this file is not merged.
@@ -1899,6 +1905,27 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "HERMES_MANAGED_DIR",
 		Value: managedScopeDir,
 	})
+	// The other half of the umask note at the top of this file. That umask governs what
+	// the entrypoints create; this governs what Hermes then re-tightens. Hermes chmods
+	// HERMES_HOME and ten named subdirectories to 0700 on every process start, and a cron
+	// or kanban worker runs with HERMES_HOME pointed at profiles/platform — the directory
+	// the credential proxy has to write into when `gcloud container clusters
+	// get-credentials` files a kubeconfig under .kubeconfigs/ and a pin under workspace/.
+	// The proxy is uid 10001 since the uid split, so 0700 leaves it nothing and the mkdir
+	// fails with EACCES. Group access is the whole fix: both containers that mount this
+	// volume are in gid 10000, and no uid on it reaches `other`. Setgid so children keep
+	// inheriting the group the way the umask already assumes.
+	//
+	// A chmod cannot substitute for this. `ensure_hermes_home` re-applies the mode before
+	// the worker does any work, so a directory widened by hand is 0700 again by the time
+	// the first proxied command runs.
+	//
+	// Appended after the plugin merge like the two above it: an arbitrary value here would
+	// widen every directory Hermes secures on the PVC, so it is not a plugin's to set.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HERMES_HOME_MODE",
+		Value: hermesHomeMode,
+	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
 		Value: credentialProxyBaseURL(agent),
@@ -2516,6 +2543,21 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
 		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
+		// 32 MiB, eight times the proxy's own default. Every command an agent
+		// runs arrives here -- its `kubectl` is a shim that posts an argv
+		// vector to this sidecar -- so this cap, not the API server, is what
+		// bounds a cluster dump. On 2026-08-30 the fleet-audit workload dump
+		// for kube-agents-host measured 3,866,719 bytes against the 4 MiB
+		// default: 92% of it, roughly twelve more workloads from the edge.
+		// Crossing it truncates the JSON mid-string, which fails the
+		// collectors' parse gate and drops that whole cluster out of
+		// compliance-audit and ai-security-audit as a coverage gap.
+		//
+		// Raising it costs no memory. `_execute` reads the subprocess to
+		// completion with `communicate()` and only then slices to the cap, so
+		// the full output is resident whatever this says; the value decides
+		// how much of it travels back, not the peak.
+		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "33554432"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
@@ -3053,6 +3095,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// agent had changed for itself.
 				Name:  "HERMES_MANAGED_DIR",
 				Value: managedScopeDir,
+			},
+			{
+				// Same value as the gateway's for a second reason: this container runs
+				// Hermes against the same directories, so a different mode here would mean
+				// the two containers took turns re-chmod'ing the PVC out from under each
+				// other on every start.
+				Name:  "HERMES_HOME_MODE",
+				Value: hermesHomeMode,
 			},
 			{
 				Name:  "HOME",

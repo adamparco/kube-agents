@@ -19,12 +19,12 @@ Follow the authoritative SOP at `governance/gcp_networking_fabric_sop.md` to exe
 - `mtu-packet-fragmentation`
 - `cloud-armor-false-positive`
 
-Optional helper runner:
+Run the collector before evaluating any check by hand — see the SOP's §2 for the manifest-reading rules:
 
 ```bash
-./skills/gcp-networking-fabric-audit/scripts/networking_audit.py --output /opt/data/scratch/networking_raw.json
+./skills/gcp-networking-fabric-audit/scripts/networking_audit.py > /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
 ```
 
 ## 2. Hand Findings to Fleet Audit
 
-Emit findings using the `fleet-audit` harness lifecycle (`start` ... `finish`).
+Emit findings using the `fleet-audit` harness lifecycle (`start` ... `finish`), passing `--manifest-file` to `finish` as the SOP's §5 directs.

@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/stockout-prevention/org__repo", "findings_path":"/opt/data/scratch/findings_stockout-prevention.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
@@ -69,14 +69,37 @@ gcloud compute reservations list --project=<project> --format=json > /opt/data/s
 # 3. Inspect GCP Regional Quotas for the cluster's region (e.g. us-central1)
 gcloud compute regions describe <region> --project=<project> --format="json(quotas)"
 
-# 4. Check Spot Capacity & Preemption Advice History
-gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json
+# 4. Check Spot Capacity & Preemption Advice History.
+#    One machine type per call -- `--machine-type` is singular. Repeat for each
+#    shape the fleet's Spot ComputeClasses actually request.
+gcloud beta compute advice capacity-history --region=<region> --machine-type=g2-standard-4 --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json
 
 # 5. Autoscaler Visibility Logs (Stage 1 Triage Query)
 gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format="value(timestamp,resource.labels.cluster_name,jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[0].napFailureReasons[0].messageId)"
 ```
 
 ### 3. Checks
+
+**Run the collector before evaluating a covered check below by hand.**
+
+```bash
+python3 ./skills/fleet-audit/scripts/fleet_stockout.py --project "$PROJECT" > /opt/data/scratch/manifest_stockout-prevention.json
+```
+
+This covers all twelve checks below — the ten built on a `ComputeClass`/`Deployment`/`StatefulSet`/`StorageClass`/`Node` dump, `gcloud container node-pools list`, `gcloud compute reservations list`, or `gcloud compute regions describe --format=json(quotas)`, plus `spot-scarcity-risk` (3.8) off `gcloud beta compute advice capacity-history` and `autoscaler-out-of-resources` (3.11) off `gcloud logging read`. The `Node` dump exists only so 3.9's "`>= 90%` of `maxNodeCount`" test can count each pool's _live_ nodes — `initialNodeCount` is creation-time and the autoscaler never updates it. Two sub-conditions it does not reach — 3.10(b) and 3.12(b), both listed below — stay yours to check by hand. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` carries an `outcome`. For `"collected"`, copy its `commands` list verbatim into that cluster's `checks_run` — the slugs that actually applied there, never a slug this manifest does not list. `"unreachable"` means the collector evaluated no check against that cluster, and its `error` says why; a cluster that is not `RUNNING` is not worth a manual retry, because the state that stopped the collector will stop you too. Put it in `scope.skipped` with that reason. `"gate-failed"` means the object dump came back short and the collector refused to score a truncated cluster; that one is worth a manual retry, so fall back to this section's reads for it alone.
+- Every cluster entry also carries `autopilot` and `has_nap` booleans — the mode, and whether node auto-provisioning is on. Both are already resolved, and both ride on the error shapes too, because neither stops being true because a read of the cluster failed. Take them from there rather than re-issuing `gcloud container clusters describe`: `--format='value(autoscaling.enableNodeAutoprovisioning)'` prints an empty line when NAP is off, which reads as unreadable rather than as false and sends you round again for a fact the manifest already gave you.
+- Every entry in `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed, including `ccc-no-ondemand-floor`'s escalation to `critical` for an inference workload and `reservation-mismatch-risk`'s two forms (an `Automatic`/`AnyBestEffort` affinity binding under a `ComputeClass/<name>` object, an idle reservation under a `Reservation/<name>` object). What is still yours to write is the `recommendation` (§4) and, for a `kind: manifest` remediation, the manifest file itself.
+- The manifest also carries a `project/<project-id>` entry for the two project-scoped checks (`quota-exhaustion-risk`, `reservation-mismatch-risk`'s idle-capacity form), per §3's project-scoped object rule.
+- Pass `--manifest-file <path>` to `finish` (§6) so it cross-checks your `checks_run` against what the collector actually ran.
+- 3.10(b) — a `ComputeClass` targeting a specific reservation that does not exist or sits in an unreachable zone — is not in the collector; check it by hand.
+- 3.12(b) — a ComputeClass whose own `status.conditions` reports invalid configuration — is not in the collector either; check it by hand alongside 3.10(b).
+- A cluster's `checks_not_applicable` may declare `spot-scarcity-risk` when nothing on it requests Spot capacity, and its `limitations` may name a Spot priority that gives a machine family but no machine type — `capacity-history` takes one `--machine-type` and has nothing to answer for a family. Carry both into §6 as they stand; neither is a finding.
+
+**A cluster the collector covered is not a cluster you dump or query again.** The per-check reads below exist for a `"gate-failed"` cluster and for 3.10(b) and 3.12(b), the two sub-conditions the collector does not reach — never for re-deriving a candidate it already produced, whose evidence `finish` takes from the manifest. The object dump is where that goes wrong at fleet scale: `computeclasses`, `deployments`, `statefulsets`, `storageclasses`, and `nodes` were read once for every `"collected"` cluster, and `gcloud container node-pools list` was run against each of them, so a loop that re-reads any of those across the fleet buys nothing `candidates` does not already hold. Scanning workloads for a `cloud.google.com/compute-class` nodeSelector is 3.12(a)/(c)/(d) and is already done; re-listing node pools is 3.9 and is already done. When 3.10(b) and 3.12(b) send you to the ComputeClass objects, read them once and answer both from that one copy.
+
+The `project/<project-id>` entry is covered on the same terms. `gcloud compute regions describe --format=json(quotas)` and `gcloud compute reservations list` were run for you, and their candidates are in that entry — re-running either to see the raw numbers reads a quota that has not moved since the collector read it minutes ago, and `check_quota`'s threshold has already been applied to every metric the region returns.
 
 **Standard exclusions — apply to every check below:**
 
@@ -85,13 +108,14 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 - **S3 — operator-owned:** non-empty `metadata.ownerReferences`.
 - **S4 — explicit opt-out:** carries `kubeagents.x-k8s.io/stockout-audit: exempt`.
 - **S5 — not running:** `spec.replicas == 0`, or completed batch Jobs.
+- **"Non-production" — every check below that names it:** an explicit opt-out (S4), a namespace or workload name containing `test`, `staging`, `stage`, `dev`, `sandbox`, or `qa` as a `-`/`_`-delimited token, or a `resourceLabels`/label value of `environment`/`env`/`stage`/`tier` matching one of those tokens. Anything else is production for this SOP's purposes — the same name-token heuristic the Fleet Waste and GCP Networking Fabric audits already use, so a workload does not read as production in one ledger and non-production in another.
 
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
 - **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count).
-- **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); standard exclusions.
+- **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); ComputeClasses whose every priority names a `podFamily` rather than a `machineFamily`/`machineType`, which pins no machine family at all and leaves the shape to GKE's capacity broker — this is what the built-in Autopilot classes (`autopilot`, `autopilot-arm`, `autopilot-spot`) do, and they are GKE-managed besides, so a finding against one has no manifest to remediate; standard exclusions.
 - **Severity:** `critical`. When GCE encounters a zonal shortage or stockout on that machine family, Cluster Autoscaler has no fallback path and scale-up fails completely.
 - **Impact:** "Pinned to a single machine family or narrow configuration: any zonal capacity exhaustion causes scale-up to fail and leaves pods unschedulable."
 - **Remediation:** `kind: manifest`. Add multi-zone distribution and secondary fallback machine families (e.g., fallback from `c3` to `n4` and `n2`) to the ComputeClass manifest in GitOps.
@@ -100,9 +124,9 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
-- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end, or a latency-sensitive inference workload is configured Spot-first.
-- **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`; workloads with explicit non-production/test opt-out.
-- **Severity:** `major`.
+- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end.
+- **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`; the built-in Autopilot class `autopilot-spot`, whose every priority names a `podFamily` and which GKE manages, so the `kind: manifest` remediation below has no manifest to append to — the same exclusion and the same reason as §3.1, and the reason it is scoped to `podFamily`-only chains rather than to the name; workloads with explicit non-production/test opt-out. The one exception is an `autopilot-spot` an inference workload actually selects: the `critical` escalation below describes a real and immediate risk, so it is reported even though its remediation has to be `kind: manual`.
+- **Severity:** `major`, escalated to `critical` when a workload referencing the ComputeClass is an inference workload per the AI Workload Security audit's own discriminator (`governance/ai_security_audit_sop.md` §2: a container image naming a known inference or serving runtime, or a container requesting an accelerator) — a Spot preemption there breaches a user-facing latency SLA immediately rather than delaying a batch job, and reusing that audit's own definition means this SOP names no second "which workloads count as inference" rule for the two to drift apart on.
 - **Impact:** "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state."
 - **Remediation:** `kind: manifest`. Append an On-Demand priority rule at the lowest priority in the ComputeClass manifest to act as a guaranteed capacity floor.
 
@@ -159,8 +183,8 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
-- **Command:** `gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json`
-- **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks.
+- **Command:** run by the §3 collector — `gcloud beta compute advice capacity-history --region=<region> --machine-type=<machine-type> --provisioning-model=SPOT --types=PREEMPTION,PRICE --format=json`, once per Spot machine shape the fleet requests. `--machine-type` is singular and required, as are `--provisioning-model` and `--types`; the plural `--instance-selection-machine-types`/`--size` spelling belongs to the sibling `gcloud beta compute advice capacity` and this command rejects it.
+- **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks. The collector reads the **mean** of the daily `preemptionRate` values, over at least seven of them — one bad afternoon inside a calm month is a zonal incident that already resolved, and a shape with less history than that is reported as unmeasured rather than clean.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
 - **Severity:** `major`.
 - **Impact:** "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk."
@@ -170,7 +194,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
-- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or node pools near `autoscaling.maxNodeCount` ceilings.
+- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or a node pool's current node count is `>= 90%` of its `autoscaling.maxNodeCount` — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); regional clusters with multi-zone node pools.
 - **Severity:** `major`.
 - **Impact:** "Node pool is locked to a single zone: any zonal stockout in that zone halts all cluster auto-scaling."
@@ -180,7 +204,7 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `gcloud compute reservations list --project=<project> --format=json`
-- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) Substantial reservation capacity is unallocated (`inUseCount << count`) while production workloads in the same region run unreserved. (Note: CUDs are financial commitments, not physical capacity reservations).
+- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) `inUseCount / count <= 0.5` **and** `count - inUseCount >= 4` — at most half the reservation is in use, and at least four whole instances of headroom sit idle, while production workloads in the same region run unreserved. Both conditions together, not either alone: the ratio catches a large reservation nobody uses, the absolute floor keeps a tiny reservation's normal one-or-two-instance headroom from reading as a leak. (Note: CUDs are financial commitments, not physical capacity reservations).
 - **Do NOT flag:** ComputeClasses with valid targeted reservation bindings; non-production workloads.
 - **Severity:** `critical` for broken/bypassed bindings, `major` for unallocated capacity mismatches.
 - **Impact:** "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts."
@@ -189,8 +213,8 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 #### 3.11 Autoscaler out-of-resources leading indicators (`autoscaler-out-of-resources`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-debug.md`
-- **Command:** `gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format="value(timestamp,resource.labels.cluster_name,jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[0].napFailureReasons[0].messageId)"`
-- **Flag when:** Cluster autoscaler visibility logs emit `scale.up.error.out.of.resources`, `scale.up.error.quota.exceeded`, or `scale.up.error.ip.space.exhausted` within the past 24 hours, indicating that scale-up attempts failed before fallback recovery.
+- **Command:** run by the §3 collector — `gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format=json`. JSON rather than the `value(...)` projection: a stockout is written under **two** schemas, and that projection reads only one of them. `jsonPayload.resultInfo.results[].errorMsg` is a scale-up that was attempted and failed, carrying the affected instance group in `parameters[0]`; `jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[].napFailureReasons[]` is the node-auto-provisioning side, which never gets as far as an attempt.
+- **Flag when:** Cluster autoscaler visibility logs emit `scale.up.error.out.of.resources`, `scale.up.error.quota.exceeded`, or `scale.up.error.ip.space.exhausted` within the past 24 hours, indicating that scale-up attempts failed before fallback recovery. One finding per distinct message id, not per log entry: a wedged cluster emits the same id every autoscaler tick and the remediation below branches on the id.
 - **Do NOT flag:** Clusters with clean autoscaler visibility logs over 24h.
 - **Severity:** `critical`.
 - **Impact:** "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion."
@@ -232,20 +256,23 @@ Write the schema exactly as the helper validates it to the `findings_path` retur
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
-  --findings-file /opt/data/scratch/findings_stockout-prevention.json
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
+  --findings-file /opt/data/scratch/findings_stockout-prevention.json \
+  --manifest-file /opt/data/scratch/manifest_stockout-prevention.json
 ```
 
-One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+`--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §3's collector never produced one — it crashed, or the fleet was unreachable, and every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether.
 
-`partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload or ComputeClass you never queried is not one that got resolved: `resolved` comes back `0` and no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out.
+One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled run replies), and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+
+`partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence, because a workload or ComputeClass you never queried is not one that got resolved — but it refuses only for the cluster the gap names: a finding that sat on that cluster stays out of `resolved` and keeps its remediation PR open, while a fix on a cluster this run did read is still announced and its stale PR still retired. The ledger issue stays open even at zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming what went unread. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Nothing else raises it — it is `true` if and only if `coverage_gaps` is non-empty. A fleet big enough that the description had to drop findings is not a coverage gap: those workloads were queried, the title counts them, and the body says which ones it left out.
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → your entire final response is exactly `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
+- On a **scheduled** run, your entire final response is `chat_summary`, copied verbatim from the JSON with nothing before it and nothing after it. On `silent_ok: true` that string is exactly `[SILENT]`, so obeying the flag and copying the field are the same act; on anything else it is the one line, already carrying the counts, the delta, and `issue_url`. Silence is a message not sent, never a message about silence: do not preface the marker, quote it inside a sentence, restate `silent_ok`, or explain that the run is staying quiet — a response that describes its own silence has already spoken. Nor announce the copying: a run that opens `Per the skill's instructions my entire final response must be chat_summary copied verbatim` and then prints the line has put two sentences in the channel ahead of the one that was wanted, and quoting the rule is not following it.
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
 
-What to report in each case:
+What to say when a person dispatched the run — a scheduled one sends `chat_summary` and nothing else:
 
 - `silent_ok: true` — `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the ledger issue closed as completed and every open remediation PR for this stream closed with it; on `UPDATED` the ledger was rewritten but nothing moved. Dispatched on demand, say which in one line and give the issue URL.
 - `status: "CLEAN"` with `resolved: > 0` — every capacity gap this ledger tracked has been closed. Report the issue URL and the count.

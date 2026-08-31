@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -177,6 +179,9 @@ class TestStandaloneSend(unittest.TestCase):
                     "profile": "platform",
                     "title": "GitHub Repo Watcher",
                     "report": "the issues sweep failed",
+                    # Empty because this HERMES_HOME has no roster to read, which
+                    # is the safe answer: the field only ever removes targets.
+                    "also_delivered_to": [],
                 },
             )
 
@@ -228,6 +233,61 @@ class TestStandaloneSend(unittest.TestCase):
                 result = asyncio.run(mod.standalone_send(None, "c", "   \n\t "))
             self.assertEqual(result.get("skipped"), "empty_report")
             self.assertEqual(relay.requests, [])
+
+    def test_an_emphasised_silence_marker_is_still_silence(self):
+        """The leak this guard exists for.
+
+        Upstream's matcher takes `[SILENT]` bare, lowercased, or among prose,
+        and where it applies `standalone_send` is never called. It does not
+        take the marker in a code span or in bold -- and the audit SOPs tell
+        every run to copy `chat_summary` verbatim, on a quiet run that field is
+        exactly `[SILENT]`, and these agents write markdown. Emphasise it once
+        and the operator gets a message reading "[SILENT]" from a run whose
+        whole point was to stay quiet.
+        """
+        for dressed in ("`[SILENT]`", "**[SILENT]**", "_[SILENT]_", "  **`[silent]`**  "):
+            with self.subTest(report=dressed):
+                with RecordingRelay() as relay:
+                    with patch.dict(
+                        os.environ,
+                        {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+                    ):
+                        result = asyncio.run(
+                            mod.standalone_send(
+                                None, "c", wrapped("Compliance Audit", "ca", dressed)
+                            )
+                        )
+                self.assertTrue(result.get("success"), result)
+                self.assertEqual(result.get("skipped"), "empty_report")
+                self.assertEqual(relay.requests, [], f"{dressed!r} was relayed")
+
+    def test_a_real_report_is_never_mistaken_for_silence(self):
+        """Undressing strips punctuation off both ends; it must not eat a report.
+
+        The summary line the harness renders is the exact shape at risk -- it
+        ends in a URL and can begin with an emphasised count -- so it is the
+        one checked, alongside a report that merely mentions the marker.
+        """
+        real = [
+            "2 critical, 5 medium (3 new, 1 resolved) — https://github.com/x/y/issues/41",
+            "**3 high** (no change) — https://github.com/x/y/issues/12",
+            "The run emitted [SILENT] on its first attempt, then found 4 criticals.",
+            "---",  # a horizontal rule: punctuation, but not the dress this strips
+        ]
+        for report in real:
+            with self.subTest(report=report[:40]):
+                self.assertFalse(mod.is_silent_report(report))
+
+    def test_a_report_of_nothing_but_emphasis_is_silence(self):
+        """`***` undresses to empty, and that is the wanted answer.
+
+        It carries no content, so the alternative is posting three asterisks to
+        the operator's home channel -- which is what the previous
+        `report.strip()` guard did.
+        """
+        for report in ("***", "_", "~~~", "  **  ", "`"):
+            with self.subTest(report=report):
+                self.assertTrue(mod.is_silent_report(report))
 
     def test_silence_is_not_a_missing_key(self):
         """A quiet tick has nothing to authenticate, so an unset key is not its problem.
@@ -414,6 +474,115 @@ class TestStandaloneSend(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(mod.relay_url(), mod.DEFAULT_RELAY_URL)
         self.assertTrue(mod.DEFAULT_RELAY_URL.startswith("http://127.0.0.1:8699/"))
+
+
+class TestSiblingDeliveryTargets(unittest.TestCase):
+    """Which platforms the scheduler is posting this same report to itself.
+
+    Verified against the live install on 2026-08-30 before being written: two
+    probes addressed to Google Chat, one from the relay fan-out and one from
+    ``deliver: "all"``'s direct leg, both arrived. That is the duplicate this
+    function exists to subtract.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        os.makedirs(os.path.join(self.home, "cron"))
+        # Only the home-channel variables matter, and an ambient one on the
+        # machine running the suite would change the answer.
+        env = patch.dict(os.environ, {"HERMES_HOME": self.home})
+        env.start()
+        self.addCleanup(env.stop)
+        for key in [k for k in os.environ if k.endswith("_HOME_CHANNEL")]:
+            del os.environ[key]
+
+    def _roster(self, deliver):
+        path = os.path.join(self.home, "cron", "jobs.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "audit", "deliver": deliver}]}, handle)
+
+    def test_relay_only_delivery_has_no_siblings(self):
+        """``deliver: "chat"`` is the relay and nothing else, so fan out freely."""
+        self._roster("chat")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_all_names_every_platform_with_a_home_channel(self):
+        self._roster("all")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        self.assertEqual(
+            mod.sibling_delivery_targets("audit"), ["google_chat", "slack"]
+        )
+
+    def test_all_skips_the_platform_this_install_cannot_address(self):
+        """The live shape: no ``SLACK_HOME_CHANNEL`` in the cron child.
+
+        ``home_target_env`` rebuilds home channels from ``config.yaml``, whose
+        ``slack:`` section carries none — so the scheduler drops Slack from
+        ``all`` and the relay leg is the only thing that reaches it. Naming it
+        here would suppress that leg and leave Slack with nothing at all.
+        """
+        self._roster("all")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["google_chat"])
+
+    def test_an_explicit_list_names_only_what_it_lists(self):
+        self._roster("chat,slack")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["slack"])
+
+    def test_a_platform_named_without_a_home_channel_is_not_a_sibling(self):
+        """It resolves to nothing, so the scheduler sends it nowhere."""
+        self._roster("chat,slack")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_an_empty_home_channel_is_not_a_target(self):
+        """The scheduler requires a non-empty chat id, so test the value."""
+        self._roster("all")
+        os.environ["SLACK_HOME_CHANNEL"] = "   "
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["google_chat"])
+
+    def test_a_job_the_roster_does_not_carry_names_nothing(self):
+        self._roster("all")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("no-such-job"), [])
+
+    def test_an_unreadable_roster_names_nothing(self):
+        """Fails toward relaying. Over-reporting would drop a delivery."""
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_a_corrupt_roster_names_nothing(self):
+        with open(os.path.join(self.home, "cron", "jobs.json"), "w") as handle:
+            handle.write("{not json")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_the_field_rides_along_on_the_relay_payload(self):
+        self._roster("all")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                asyncio.run(
+                    mod.standalone_send(
+                        None, "cron-reports", wrapped("Audit", "audit", "a finding")
+                    )
+                )
+        self.assertEqual(
+            relay.requests[0]["body"]["also_delivered_to"], ["google_chat"]
+        )
 
 
 class TestRegistration(unittest.TestCase):
