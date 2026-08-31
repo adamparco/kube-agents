@@ -756,10 +756,11 @@ class RepositoryTests(unittest.TestCase):
 class CronDeliveryTests(unittest.TestCase):
     """A scheduled job that reports `ok` and posts nowhere.
 
-    `deliver: "chat"` was on nine of ten platform jobs. It is a real registered
-    platform with no home channel, so the scheduler resolved it to no target and
-    delivered nothing, while the run recorded `last_status: ok` and
-    `last_delivery_error: None`. Nothing in the repository objected.
+    An unresolvable `deliver` part is dropped by the scheduler rather than
+    raising, so a job whose every part drops records `last_status: ok` with
+    `last_delivery_error: None` while reaching nobody. `gchat` stands in for that
+    typo throughout: it is the abbreviation someone reaches for, it is not a
+    registered platform, and nothing outside this check would object to it.
     """
 
     def _findings(self, *jobs):
@@ -769,16 +770,28 @@ class CronDeliveryTests(unittest.TestCase):
         ):
             return cpa.check_cron_delivery()
 
-    def test_a_platform_with_no_home_channel_is_caught(self):
-        findings = self._findings({"id": "compliance-audit", "deliver": "chat"})
+    def test_a_target_that_resolves_to_nothing_is_caught(self):
+        findings = self._findings({"id": "compliance-audit", "deliver": "gchat"})
         self.assertEqual(len(findings), 1, findings)
         message = str(findings[0])
         self.assertIn("compliance-audit", message)
-        self.assertIn("'chat'", message)
+        self.assertIn("'gchat'", message)
         self.assertIn("post", message.lower())
 
+    def test_chat_is_this_repositorys_own_relay_and_not_a_typo(self):
+        """The check shipped with `chat` missing, calling nine live jobs broken.
+
+        `deploy/docker/plugins/chat/` posts the report through the Session KV
+        server, which runs a Chat Agent turn over it and delivers the result --
+        so `chat` is the value eight of the fleet audits are supposed to carry.
+        It looks dead from outside a cron child, because `profile_cron_tick.py`
+        is the only setter of its `CHAT_HOME_CHANNEL`; that is what a checker
+        author sees, and it is what this test exists to contradict.
+        """
+        self.assertEqual(self._findings({"id": "compliance-audit", "deliver": "chat"}), [])
+
     def test_the_values_that_mean_something_all_pass(self):
-        for deliver in ("all", "local", "origin", "slack", "google_chat"):
+        for deliver in ("all", "chat", "local", "origin", "slack", "google_chat"):
             with self.subTest(deliver=deliver):
                 self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
 
@@ -794,9 +807,9 @@ class CronDeliveryTests(unittest.TestCase):
         This is the shape the bug would most plausibly come back in: someone
         adds `all` alongside the value that was already there.
         """
-        findings = self._findings({"id": "j", "deliver": "all,chat"})
+        findings = self._findings({"id": "j", "deliver": "all,gchat"})
         self.assertEqual(len(findings), 1, findings)
-        self.assertIn("'chat'", str(findings[0]))
+        self.assertIn("'gchat'", str(findings[0]))
 
     def test_a_list_is_flattened_the_way_the_scheduler_flattens_it(self):
         """`_normalize_deliver_value` accepts a list, so reading one is not a bug.
@@ -805,7 +818,7 @@ class CronDeliveryTests(unittest.TestCase):
         something the scheduler runs happily.
         """
         self.assertEqual(self._findings({"id": "j", "deliver": ["all"]}), [])
-        self.assertEqual(len(self._findings({"id": "j", "deliver": ["chat"]})), 1)
+        self.assertEqual(len(self._findings({"id": "j", "deliver": ["gchat"]})), 1)
 
     def test_an_absent_deliver_is_local_and_not_a_finding(self):
         self.assertEqual(self._findings({"id": "j"}), [])

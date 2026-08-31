@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 from contextlib import closing
 
 import logging
@@ -706,6 +706,37 @@ def get_active_platform() -> str:
     return "google_chat"
 
 
+# The same question as get_active_platform, asked without forcing an answer of
+# one. Order matters: the first entry is the primary, and it matches the
+# precedence above so a single-platform install resolves identically either way.
+PLATFORM_ENABLED_SIGNALS = (
+    ("slack", ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN")),
+    ("google_chat", ("GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_HOME_CHANNEL")),
+)
+
+
+def enabled_platforms() -> list[str]:
+    """Every chat platform this install has wired up, primary first.
+
+    `get_active_platform` returns one string because the paths that predate this
+    — the RCA alert, the event-triage card — address a single thread and cannot
+    mean two. A relayed cron report is the case where that is wrong: the home
+    channel is wherever the operator is reading, and on a dual-platform install
+    it is both. Picking one silently dropped every scheduled report from the
+    other, which on this install meant Google Chat never saw a governance audit
+    while the log recorded a clean delivery to Slack.
+
+    Falls back to `[get_active_platform()]` at the call site rather than here, so
+    an install whose signals are all absent keeps the old single-target
+    behaviour instead of delivering nowhere.
+    """
+    return [
+        name
+        for name, signals in PLATFORM_ENABLED_SIGNALS
+        if any(os.environ.get(s) for s in signals)
+    ]
+
+
 def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     """Send initial warning alert via hermes CLI and return the thread/message ID."""
     try:
@@ -789,7 +820,9 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
         return True, 0
 
 
-def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
+def _register_session_routing(
+    session_id: str, platform: str, thread_id: str, primary: bool = True
+) -> None:
     """Save thread configurations in session_metadata SQLite table.
 
     These three fields — `platform`, `chat_id`, `thread_id` — are the address
@@ -807,6 +840,13 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
     the patch treats as non-chat and declines to substitute — so a session that
     never reached this function keeps today's behaviour instead of being
     re-addressed to a guess.
+
+    `routes` is how one session holds a thread on each platform without making
+    that constraint false. A relayed cron report goes to every enabled platform
+    and each one answers with its own thread id, but a card still has exactly
+    one place to go — so the per-platform threads live under `routes` and the
+    three flat keys keep describing the primary. `primary=False` writes only the
+    `routes` entry, which is what leaves the card's address alone.
     """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -817,13 +857,22 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                 ).fetchone()
                 if row:
                     meta = json.loads(row[0])
-                    meta["thread_id"] = thread_id
-                    meta["platform"] = platform
                     if platform == "slack":
-                        meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
+                        chat_id = os.environ.get("SLACK_HOME_CHANNEL", "")
                     else:
-                        meta["chat_id"] = thread_id.split("/threads/")[0]
-                    
+                        chat_id = thread_id.split("/threads/")[0]
+
+                    routes = meta.get("routes")
+                    if not isinstance(routes, dict):
+                        routes = {}
+                    routes[platform] = {"chat_id": chat_id, "thread_id": thread_id}
+                    meta["routes"] = routes
+
+                    if primary:
+                        meta["thread_id"] = thread_id
+                        meta["platform"] = platform
+                        meta["chat_id"] = chat_id
+
                     # Update SQLite metadata table
                     conn.execute(
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
@@ -1060,37 +1109,51 @@ def trigger_agent_troubleshooter(
     event_row_id: Optional[int] = None,
 ) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
-    active_platform = get_active_platform()
+    targets = enabled_platforms() or [get_active_platform()]
 
-    # 1. Post initial warning notification to Google Chat or Slack
-    thread_id = _post_initial_alert(active_platform, alert_msg)
-    
+    # 1. Post the initial warning notification to every platform the operator
+    #    reads. An incident announced only in Slack while the on-call is in
+    #    Google Chat is an incident nobody was told about.
     # 2. Register thread-to-session mappings for two-way chat routing. This has
     #    to happen before the turn in step 5: the card that turn files reads
     #    this row to address its completion back to the alert's thread (see
-    #    deploy/docker/patches/kanban_event_routing.py).
-    if thread_id:
-        _register_session_routing(session_id, active_platform, thread_id)
-    else:
+    #    deploy/docker/patches/kanban_event_routing.py). A card has one address,
+    #    so the first platform that actually returns a thread is the primary and
+    #    the rest are recorded under `routes` — which keeps the reply routing
+    #    working in either channel without giving the card two destinations.
+    primary_thread = ""
+    for platform in targets:
+        thread_id = _post_initial_alert(platform, alert_msg)
+        if not thread_id:
+            logger.error(f"Alert for session {session_id} was not delivered to '{platform}'")
+            continue
+        _register_session_routing(
+            session_id, platform, thread_id, primary=not primary_thread
+        )
+        primary_thread = primary_thread or thread_id
+
+    if not primary_thread:
         # The ledger row already says this alert was announced; it was written
         # before the post was attempted. Correct it now, or the daily recap
         # counts a message nobody received into "went to chat as it happened"
         # and drops the workload from the body.
         #
-        # Only this branch. A failure further down means chat *did* get the
-        # alert and the triage turn did not start, which is a different defect
-        # and leaves `notified` correctly set: the reader saw the alert, just
-        # never the follow-up. `_post_initial_alert` also lands here when the
-        # send succeeded but returned no parseable `message_id`, so the record
-        # says the delivery is unconfirmed rather than certainly lost — the
-        # honest reading, and the safe direction for a report whose failure
-        # mode is false reassurance.
+        # Only when every platform failed. One leg landing means chat *did* get
+        # the alert, so `notified` is correct as it stands. A failure further
+        # down means the same thing for a different reason — the triage turn did
+        # not start, which leaves the reader with the alert but not the
+        # follow-up. `_post_initial_alert` also lands here when the send
+        # succeeded but returned no parseable `message_id`, so the record says
+        # the delivery is unconfirmed rather than certainly lost — the honest
+        # reading, and the safe direction for a report whose failure mode is
+        # false reassurance.
         mark_delivery_failed(
             event_row_id,
-            f"no message id from '{active_platform}'; see the session server log",
+            f"no message id from {', '.join(repr(p) for p in targets)}; "
+            "see the session server log",
         )
         logger.error(
-            f"Alert for session {session_id} was not delivered to '{active_platform}'; "
+            f"Alert for session {session_id} reached none of {targets}; "
             "the daily recap will report it as undelivered"
         )
 
@@ -1165,6 +1228,13 @@ _LABEL_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A platform name as the registry spells one: `slack`, `google_chat`. Used to
+# filter `also_delivered_to`, whose entries are compared against the names
+# `enabled_platforms` returns and are never rendered anywhere. Anything that
+# does not match is dropped rather than scrubbed into something that might
+# accidentally match a real platform and suppress a delivery.
+_PLATFORM_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}", re.IGNORECASE)
+
 
 def _sanitize_label(value: str) -> str:
     """Flatten and bound a caller-supplied `job_id` or `title`.
@@ -1220,8 +1290,16 @@ def _cron_report_session_id(profile: str, job_id: str, day: str) -> str:
     return f"cron-{slug[:80]}-{day.replace('-', '')}"
 
 
-def _lookup_session_routing(session_id: str) -> tuple[str, str]:
-    """Read back (chat_id, thread_id) for a session, or ("", "") if unrouted."""
+def _lookup_session_routing(session_id: str, platform: str = "") -> tuple[str, str]:
+    """Read back (chat_id, thread_id) for a session, or ("", "") if unrouted.
+
+    Naming a `platform` asks for that platform's thread specifically, which is
+    the question a multi-platform relay has to ask: addressing Slack with the
+    Google Chat thread this session also holds is not a degraded send, it is a
+    rejected one. Rows written before `routes` existed carry only the primary
+    inline, so an unrecognised platform reads as unrouted and its first send
+    opens a fresh thread rather than inheriting somebody else's.
+    """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             row = conn.execute(
@@ -1231,6 +1309,12 @@ def _lookup_session_routing(session_id: str) -> tuple[str, str]:
         if not row:
             return "", ""
         meta = json.loads(row[0])
+        if platform:
+            route = (meta.get("routes") or {}).get(platform)
+            if isinstance(route, dict):
+                return str(route.get("chat_id") or ""), str(route.get("thread_id") or "")
+            if meta.get("platform") != platform:
+                return "", ""
         return str(meta.get("chat_id") or ""), str(meta.get("thread_id") or "")
     except Exception as exc:
         logger.error(f"Failed to read session routing for {session_id}: {exc}")
@@ -1466,14 +1550,51 @@ def _unrelayed_notice(profile: str, job_id: str) -> str:
 
 
 def relay_cron_report(
-    session_id: str, profile: str, job_id: str, title: str, report: str
+    session_id: str,
+    profile: str,
+    job_id: str,
+    title: str,
+    report: str,
+    also_delivered_to: Sequence[str] = (),
 ) -> tuple[str | None, bool]:
     """Hand a specialist's finished report to the Chat Agent, then post its reply.
 
-    Returns `(error, degraded)`. `error` is None when the report reached chat,
-    else a short description of what went wrong; the caller turns that into a
-    non-2xx and the string ends up in the job's `last_delivery_error` — see
-    :func:`submit_cron_report`.
+    The report goes to every platform :func:`enabled_platforms` names, each into
+    its own thread, because "the home channel" on a dual-platform install is two
+    channels and picking one silently dropped the other.
+
+    Minus `also_delivered_to`, which is how the fan-out avoids double-posting.
+    The relay is one leg of the job's `deliver` value, not the whole of it:
+    `deliver: "chat"` is relay-only, but `deliver: "all"` asks the scheduler to
+    post the raw report to every home channel *and* routes a leg through here,
+    so fanning out unconditionally puts two copies in each channel — the raw one
+    from the scheduler and the composed one from here. The caller names the
+    platforms the scheduler is handling itself and this function skips them, so
+    a channel gets the composed report or the raw one, never both.
+
+    The subtraction only ever removes a strict subset. `also_delivered_to` says
+    what the scheduler *intends* to deliver — it is built from which home
+    channels resolve in the cron child, and a channel that resolves can still
+    fail on the send. Honouring a set that covers every platform would therefore
+    trade a duplicate for silence, so where the subtraction would empty the list
+    this fans out to all of them instead. Two copies of a report is a nuisance;
+    none is a missed audit.
+
+    The set comes from the cron child rather than from this process because only
+    the child knows what `deliver` actually resolved to. `all` expands over the
+    platforms with a home channel *in that child*, and `home_target_env` rebuilds
+    those from the root `config.yaml` — an install whose config carries `slack:
+    {}` drops Slack from the expansion silently. Deciding here, from this
+    process's environment, would subtract a leg the scheduler never sent and
+    leave that channel with nothing at all.
+
+    Returns `(error, degraded)`. `error` is None when the report reached at
+    least one platform, else a short description of what went wrong; the caller
+    turns that into a non-2xx and the string ends up in the job's
+    `last_delivery_error` — see :func:`submit_cron_report`. A leg that fails
+    while another succeeds is not an error — the report is in a channel and the
+    run did its job — but it does set `degraded`, so a Google Chat send that has
+    been failing all week is visible in the response rather than only in a log.
 
     `degraded` is the half that a boolean-or-nothing return used to swallow. The
     Chat Agent's turn can fail while the send still succeeds, and posting the raw
@@ -1495,6 +1616,25 @@ def relay_cron_report(
     should not be lost because the front door was busy.
     """
     active_platform = get_active_platform()
+
+    # Floored at the full set, so a wrong sibling list cannot silence the report:
+    # `handled` is what the scheduler said it would post, never proof that it
+    # did.
+    all_targets = enabled_platforms() or [active_platform]
+    handled = {str(name).strip().lower() for name in also_delivered_to if str(name).strip()}
+    targets = [p for p in all_targets if p not in handled] or all_targets
+    if len(targets) < len(all_targets):
+        logger.info(
+            f"Relay for {profile}/{job_id}: skipping "
+            f"{', '.join(sorted(set(all_targets) - set(targets)))} — the job's own deliver "
+            f"value posts the raw report there"
+        )
+    elif handled:
+        logger.info(
+            f"Relay for {profile}/{job_id}: the job's deliver value claims every platform "
+            f"({', '.join(sorted(handled))}); relaying anyway rather than risk sending nothing"
+        )
+
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
     headers = {"Content-Type": "application/json"}
     token = _gateway_api_token()
@@ -1516,18 +1656,37 @@ def relay_cron_report(
         logger.warning(f"Relay for {profile}/{job_id}: posting the raw report, unrelayed")
         message = _unrelayed_notice(profile, job_id) + report
 
-    chat_id, thread_id = _lookup_session_routing(session_id)
-    new_thread_id = _send_to_chat(active_platform, message, chat_id, thread_id)
-    if not new_thread_id:
-        logger.error(f"Relay for {profile}/{job_id}: report composed but not delivered")
-        return f"composed but not delivered to {active_platform}", degraded
+    delivered: list[str] = []
+    for platform in targets:
+        chat_id, thread_id = _lookup_session_routing(session_id, platform)
+        new_thread_id = _send_to_chat(platform, message, chat_id, thread_id)
+        if not new_thread_id:
+            logger.error(
+                f"Relay for {profile}/{job_id}: report composed but not delivered to {platform}"
+            )
+            degraded = True
+            continue
 
-    if new_thread_id != thread_id:
-        _register_session_routing(session_id, active_platform, new_thread_id)
-        chat_id, thread_id = _lookup_session_routing(session_id)
+        if new_thread_id != thread_id:
+            # The first platform that actually lands is the primary, not the
+            # first in precedence order: the flat keys are a card's address, and
+            # addressing it to a thread the send never opened is worse than
+            # addressing it to the second choice.
+            _register_session_routing(
+                session_id, platform, new_thread_id, primary=not delivered
+            )
+            chat_id, thread_id = _lookup_session_routing(session_id, platform)
 
-    _store_incident_report(chat_id, thread_id, message)
-    logger.info(f"Relayed {profile}/{job_id} report to {active_platform} thread {thread_id}")
+        # Per platform, because `incidents` is keyed on (chat_id, thread_id) and
+        # `incident_context` resolves a reply by the thread it arrived in. One
+        # row per thread is what lets a follow-up question in either channel
+        # reach an agent that has the report.
+        _store_incident_report(chat_id, thread_id, message)
+        delivered.append(platform)
+        logger.info(f"Relayed {profile}/{job_id} report to {platform} thread {thread_id}")
+
+    if not delivered:
+        return f"composed but not delivered to {', '.join(targets)}", degraded
     return None, degraded
 
 
@@ -1561,6 +1720,23 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     profile = _sanitize_label(str(request_data.get("profile") or "")) or "platform"
     title = _sanitize_label(str(request_data.get("title") or ""))
 
+    # Which platforms the scheduler is posting this same report to itself, so the
+    # fan-out can skip them. Absent on a payload from an older relay plugin,
+    # which then behaves as it did before: the field only ever removes targets,
+    # so a missing one cannot lose a delivery. Not a label — these are matched
+    # against platform names, never rendered — so it takes a name-shaped subset
+    # rather than `_sanitize_label`.
+    raw_handled = request_data.get("also_delivered_to") or []
+    also_delivered_to = (
+        [
+            name.strip().lower()
+            for name in raw_handled
+            if isinstance(name, str) and _PLATFORM_NAME_RE.fullmatch(name.strip())
+        ]
+        if isinstance(raw_handled, list)
+        else []
+    )
+
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id field is required")
     if not report:
@@ -1575,7 +1751,9 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     session_id = _cron_report_session_id(profile, job_id, day)
 
     try:
-        error, degraded = relay_cron_report(session_id, profile, job_id, title, report)
+        error, degraded = relay_cron_report(
+            session_id, profile, job_id, title, report, also_delivered_to
+        )
     except Exception as exc:  # never leak a stack trace into last_delivery_error
         logger.exception(f"Relay for {profile}/{job_id} raised")
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc

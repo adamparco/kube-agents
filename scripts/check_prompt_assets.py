@@ -724,27 +724,37 @@ def check_cron_assets() -> list[Finding]:
 # channel is added. A bare platform name binds to that one platform's home
 # channel and delivers nothing if it is unset. `origin` answers wherever the job
 # was created from, and `local` is the explicit "keep it, send nothing".
-CRON_DELIVER_VALUES = frozenset({"all", "origin", "local", "slack", "google_chat"})
+#
+# `chat` is this repository's own platform, not a synonym for Google Chat:
+# `deploy/docker/plugins/chat/` relays the report to the Session KV server,
+# which runs one Chat Agent turn over it and posts the result. It is enabled
+# only inside a cron child, because `profile_cron_tick.py` is the sole setter of
+# its `CHAT_HOME_CHANNEL`, so probing for it anywhere else -- a `kubectl exec`,
+# the gateway process -- finds it unset and reads like a dead value. It is not.
+CRON_DELIVER_VALUES = frozenset(
+    {"all", "chat", "origin", "local", "slack", "google_chat"}
+)
 
 
 def check_cron_delivery() -> list[Finding]:
     """A scheduled job that reports `ok` and posts nowhere is the failure here.
 
-    `deliver: "chat"` sat in this roster on nine of ten jobs. It reads like the
-    obvious value and it is a real registered platform, so nothing rejected it;
-    but it is not the Google Chat platform, its home channel is unset, and
-    `_resolve_single_delivery_target` returns None for a platform with no
-    chat_id. The scheduler treats that as "no target" rather than as an error,
-    so every one of those jobs ran green for weeks with `last_status: ok` and
-    `last_delivery_error: None` while the audits they published reached nobody.
-    The one job still set to `all` was the only one anyone ever saw, which read
-    as that job being special rather than as the other nine being broken.
+    A `deliver` the scheduler cannot resolve is not an error to it: unresolvable
+    parts are dropped, and a job whose every part drops records `last_status:
+    ok` with `last_delivery_error: None` while reaching nobody. So a typo in
+    this field buys weeks of green runs and silence, and the roster is the only
+    place left to catch it.
 
     Nothing offline can know which home channels a given install configures, so
-    this does not try. It asks the cheaper question that would have caught it:
-    is this a value we have decided means something? Adding a platform is then a
-    one-line edit to `CRON_DELIVER_VALUES` -- which is the review moment the
+    this does not try -- a value here can be spelled correctly and still deliver
+    nowhere, and that is a deployment question. It asks the cheaper one: is this
+    a value we have decided means something? Adding a platform is then a
+    one-line edit to `CRON_DELIVER_VALUES`, which is the review moment the
     silent version never had.
+
+    Deliberately not a check that every job reaches a *human*. `local` is a
+    legitimate answer -- `agents/chat/defaults/cron/jobs.json` uses it on all
+    four of its jobs -- and a checker that forbade it would be wrong about them.
     """
     findings = []
     for path, jobs in cron_rosters():

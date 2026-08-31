@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -177,6 +179,9 @@ class TestStandaloneSend(unittest.TestCase):
                     "profile": "platform",
                     "title": "GitHub Repo Watcher",
                     "report": "the issues sweep failed",
+                    # Empty because this HERMES_HOME has no roster to read, which
+                    # is the safe answer: the field only ever removes targets.
+                    "also_delivered_to": [],
                 },
             )
 
@@ -414,6 +419,115 @@ class TestStandaloneSend(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(mod.relay_url(), mod.DEFAULT_RELAY_URL)
         self.assertTrue(mod.DEFAULT_RELAY_URL.startswith("http://127.0.0.1:8699/"))
+
+
+class TestSiblingDeliveryTargets(unittest.TestCase):
+    """Which platforms the scheduler is posting this same report to itself.
+
+    Verified against the live install on 2026-08-30 before being written: two
+    probes addressed to Google Chat, one from the relay fan-out and one from
+    ``deliver: "all"``'s direct leg, both arrived. That is the duplicate this
+    function exists to subtract.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        os.makedirs(os.path.join(self.home, "cron"))
+        # Only the home-channel variables matter, and an ambient one on the
+        # machine running the suite would change the answer.
+        env = patch.dict(os.environ, {"HERMES_HOME": self.home})
+        env.start()
+        self.addCleanup(env.stop)
+        for key in [k for k in os.environ if k.endswith("_HOME_CHANNEL")]:
+            del os.environ[key]
+
+    def _roster(self, deliver):
+        path = os.path.join(self.home, "cron", "jobs.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "audit", "deliver": deliver}]}, handle)
+
+    def test_relay_only_delivery_has_no_siblings(self):
+        """``deliver: "chat"`` is the relay and nothing else, so fan out freely."""
+        self._roster("chat")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_all_names_every_platform_with_a_home_channel(self):
+        self._roster("all")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        self.assertEqual(
+            mod.sibling_delivery_targets("audit"), ["google_chat", "slack"]
+        )
+
+    def test_all_skips_the_platform_this_install_cannot_address(self):
+        """The live shape: no ``SLACK_HOME_CHANNEL`` in the cron child.
+
+        ``home_target_env`` rebuilds home channels from ``config.yaml``, whose
+        ``slack:`` section carries none — so the scheduler drops Slack from
+        ``all`` and the relay leg is the only thing that reaches it. Naming it
+        here would suppress that leg and leave Slack with nothing at all.
+        """
+        self._roster("all")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["google_chat"])
+
+    def test_an_explicit_list_names_only_what_it_lists(self):
+        self._roster("chat,slack")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["slack"])
+
+    def test_a_platform_named_without_a_home_channel_is_not_a_sibling(self):
+        """It resolves to nothing, so the scheduler sends it nowhere."""
+        self._roster("chat,slack")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_an_empty_home_channel_is_not_a_target(self):
+        """The scheduler requires a non-empty chat id, so test the value."""
+        self._roster("all")
+        os.environ["SLACK_HOME_CHANNEL"] = "   "
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), ["google_chat"])
+
+    def test_a_job_the_roster_does_not_carry_names_nothing(self):
+        self._roster("all")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("no-such-job"), [])
+
+    def test_an_unreadable_roster_names_nothing(self):
+        """Fails toward relaying. Over-reporting would drop a delivery."""
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_a_corrupt_roster_names_nothing(self):
+        with open(os.path.join(self.home, "cron", "jobs.json"), "w") as handle:
+            handle.write("{not json")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
+    def test_the_field_rides_along_on_the_relay_payload(self):
+        self._roster("all")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                asyncio.run(
+                    mod.standalone_send(
+                        None, "cron-reports", wrapped("Audit", "audit", "a finding")
+                    )
+                )
+        self.assertEqual(
+            relay.requests[0]["body"]["also_delivered_to"], ["google_chat"]
+        )
 
 
 class TestRegistration(unittest.TestCase):
