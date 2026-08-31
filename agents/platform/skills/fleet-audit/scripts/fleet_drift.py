@@ -175,13 +175,23 @@ def cluster_eligibility(c: dict, *, now: datetime) -> str | None:
     status = c.get("status", "")
     if status != "RUNNING":
         return f"status {status}: excluded from every cohort, no facet compared."
-    created = c.get("createTime", "")
-    try:
-        created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-        if (now - created_dt).total_seconds() < 24 * 3600:
-            return f"created {created}: under 24h, excluded from every cohort."
-    except ValueError:
-        pass
+    # `.get("createTime", "")` returns `None` for a key that is present and null,
+    # and `None.replace` is an `AttributeError` that `except ValueError` does not
+    # catch. There is no caller between here and `main` that catches it either,
+    # and the SOP invokes this module as `fleet_drift.py > manifest_….json`, so
+    # the shell has already truncated the manifest by the time the traceback
+    # prints: one cluster with an unexpected `createTime` loses the whole fleet.
+    # An unreadable creation time means "cannot tell how old this is", which is
+    # the same answer as an absent one -- treat the cluster as settled rather
+    # than excluding it from every cohort on a field it may simply not carry.
+    created = c.get("createTime")
+    if isinstance(created, str) and created:
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            if (now - created_dt).total_seconds() < 24 * 3600:
+                return f"created {created}: under 24h, excluded from every cohort."
+        except ValueError:
+            pass
     return None
 
 
@@ -542,33 +552,55 @@ def _emit(slug: str, cluster_name: str, excerpt: str, severity: str) -> dict:
     }
 
 
-def cohort_layout(clusters: list[dict], *, now: datetime) -> tuple[dict[str, str], dict[tuple, list[dict]], dict[str, tuple[str, str]]]:
-    """§1's eligibility and §2's cohorting, as `(ineligible, cohorts, env_of)`.
+def ckey(c: dict) -> tuple[str, str, str]:
+    """A cluster's identity inside this collector.
+
+    Not its name. Cluster names are project-scoped in GKE, so `prod` in two
+    projects is two clusters -- and this is the one collector that sweeps every
+    project in the fleet by design, which is exactly where the collision lands.
+    Keying the per-cluster dicts by bare name merged the pair three ways:
+    `checks_run` accumulated both clusters' facets into one list, which §6's
+    validator rejects as a duplicate `checks_run` entry and which fails the run;
+    `candidates` handed each manifest entry the other cluster's findings, each
+    published under its own `Cluster/<name>` object and so indistinguishable;
+    and `outlier_facet_count` summed the two, which trips §3.6's six-facet
+    split-cluster guard on a pair of clusters that each diverge on three.
+    `ineligible` and `env_of` were last-write-wins on top of that.
+
+    The finding's `object` stays `Cluster/<name>` -- §6 specifies that, and the
+    harness derives identity from `cluster` alongside it.
+    """
+    return (c.get("_project", ""), c.get("location") or c.get("zone") or "", c.get("name", ""))
+
+
+def cohort_layout(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, str], dict[tuple, list[dict]], dict[tuple, tuple[str, str]], str]:
+    """§1's eligibility and §2's cohorting, as `(ineligible, cohorts, env_of,
+    strategy)`, the first three keyed by `ckey`.
 
     Shared by the vote and by `cohort_limitations`, which has to agree with it
     exactly: a cluster the vote skipped and the limitations did not explain is
     the silent-clean failure this stream is most prone to.
     """
-    ineligible: dict[str, str] = {}
+    ineligible: dict[tuple, str] = {}
     eligible: list[dict] = []
     for c in clusters:
         why = cluster_eligibility(c, now=now)
         if why is None:
             eligible.append(c)
         else:
-            ineligible[c["name"]] = why
+            ineligible[ckey(c)] = why
 
     strategy = decide_cohort_strategy(eligible)
-    env_of: dict[str, tuple[str, str]] = {c["name"]: environment_of(c) for c in eligible}
+    env_of: dict[tuple, tuple[str, str]] = {ckey(c): environment_of(c) for c in eligible}
 
     cohorts: dict[tuple, list[dict]] = {}
     for c in eligible:
-        env, _ = env_of[c["name"]]
+        env, _ = env_of[ckey(c)]
         cohorts.setdefault(cohort_key(c, strategy, env), []).append(c)
-    return ineligible, cohorts, env_of
+    return ineligible, cohorts, env_of, strategy
 
 
-def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]:
+def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, str]:
     """§2.4's `limitations` sentence for every cluster no facet could compare.
 
     Drift is comparative, so a cluster with too few peers has nothing to drift
@@ -590,7 +622,7 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]
     §4 is explicit that a facet returning no token excludes the cluster from
     that facet's vote alone.
     """
-    ineligible, cohorts, env_of = cohort_layout(clusters, now=now)
+    ineligible, cohorts, env_of, _strategy = cohort_layout(clusters, now=now)
     out = dict(ineligible)
     labelled = sum(1 for _, source in env_of.values() if source == "label")
     for key, members in cohorts.items():
@@ -602,7 +634,7 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[str, str]
         # hits on every run -- the most-read sentence the stream emits.
         noun = "cluster" if len(members) == 1 else "clusters"
         for c in members:
-            out[c["name"]] = (
+            out[ckey(c)] = (
                 f"cohort {label} has only {len(members)} comparable {noun} "
                 f"(minimum {COHORT_FLOOR}), no facet compared"
                 f"{_unlabelled_cause(key, labelled, len(env_of))}"
@@ -641,7 +673,7 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int) -> str:
     )
 
 
-def autopilot_not_applicable(clusters: list[dict]) -> dict[str, list[dict]]:
+def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     """§6's `checks_not_applicable` for the facets `compute_drift` refuses to
     compute on Autopilot.
 
@@ -668,11 +700,11 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[str, list[dict]]:
     makes a claim about it that this table would contradict.
     """
     standard_only_slugs = [f.slug for f in FACETS if f.standard_only]
-    out: dict[str, list[dict]] = {}
+    out: dict[tuple, list[dict]] = {}
     for c in clusters:
         if cluster_mode(c) != "autopilot":
             continue
-        out[c["name"]] = [
+        out[ckey(c)] = [
             {
                 "check": slug,
                 "reason": (
@@ -686,15 +718,55 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
-def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[str, list[str]], dict[str, list[dict]]]:
+def _autoscaling_countable_pools(c: dict) -> list[dict]:
+    """The pools `norm_pool_autoscaling` actually votes over -- the same
+    `exclude_pool` predicate it hands `_pool_fraction`, which drops the tainted
+    pools §4.8 calls deliberately fixed-size."""
+    return [p for p in c.get("nodePools") or [] if not (p.get("config") or {}).get("taints")]
+
+
+def _shape_mismatch(facet: Facet, cluster: dict, baseline_clusters: list[dict]) -> bool:
+    """§4.8's "do NOT flag single-pool clusters against multi-pool peers".
+
+    A one-pool cluster can only ever normalize to `ALL` or `NONE`; `SOME` is
+    unreachable for it. So against a cohort whose baseline is `SOME` -- a
+    baseline only multi-pool clusters can hold -- it is an outlier that no
+    change can bring into line: enabling autoscaling on its single pool moves it
+    to `ALL`, still not `SOME`, and the finding returns next week having cost a
+    node-pool update. That is the same unclosable shape `_flag_less_only`
+    already guards in the other direction, and §4.8 names it explicitly.
+
+    Scoped to `pool-autoscaling` because that is the facet §4.8 says it for.
+    §4.3's `secure-boot` and `integrity-monitoring` share the ALL/SOME/NONE
+    scale but list a different set of suppressions and not this one.
+    """
+    if facet.slug != "pool-autoscaling":
+        return False
+    if len(_autoscaling_countable_pools(cluster)) != 1:
+        return False
+    return any(len(_autoscaling_countable_pools(peer)) > 1 for peer in baseline_clusters)
+
+
+def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, list[str]], dict[tuple, list[dict]]]:
     """Returns `(checks_run_by_cluster, candidates_by_cluster)` -- the
     facets actually voted on for each cluster, and the outlier findings
-    that survived the severity ladder."""
-    checks_run: dict[str, list[str]] = {c["name"]: [] for c in clusters}
-    candidates: dict[str, list[dict]] = {c["name"]: [] for c in clusters}
-    outlier_facet_count: dict[str, int] = {c["name"]: 0 for c in clusters}
+    that survived the severity ladder. Both are keyed by `ckey`, not by
+    cluster name; see `ckey` for why a name is not an identity here."""
+    checks_run: dict[tuple, list[str]] = {ckey(c): [] for c in clusters}
+    candidates: dict[tuple, list[dict]] = {ckey(c): [] for c in clusters}
+    outlier_facet_count: dict[tuple, int] = {ckey(c): 0 for c in clusters}
 
-    _, cohorts, env_of = cohort_layout(clusters, now=now)
+    _, cohorts, env_of, strategy = cohort_layout(clusters, now=now)
+    # §3.5 downgrades a finding whose "cohort membership rests on an inferred
+    # environment". Under the `project` and `mode-only` strategies no cohort key
+    # holds an environment at all, so no membership rests on one -- but
+    # `environment_of` still reports `inferred` for any cluster with `test` or
+    # `prod` somewhere in its name, and reading that unconditionally downgraded
+    # every finding in the cohort (`baseline_inferred` is an `any()` over the
+    # baseline holders, so one such name was enough). That is a step the SOP
+    # does not ask for, and a step is the difference between a `minor` finding
+    # and a dropped one.
+    env_matters = strategy == "environment"
 
     for key, members in cohorts.items():
         if len(members) < COHORT_FLOOR:
@@ -704,42 +776,56 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[str, lis
         for facet in FACETS:
             if facet.standard_only and mode == "autopilot":
                 continue
-            tokens: dict[str, str] = {}
+            tokens: dict[tuple, str] = {}
             for c in members:
                 token = facet.normalize(c)
                 if token is not None:
-                    tokens[c["name"]] = token
+                    tokens[ckey(c)] = token
             baseline = compute_baseline(tokens)
             if baseline is None:
                 continue
             t_star, m, n, r = baseline
-            for c in members:
-                if c["name"] not in tokens:
-                    continue
-                checks_run[c["name"]].append(facet.slug)
+            voters = [c for c in members if ckey(c) in tokens]
+            for c in voters:
+                checks_run[ckey(c)].append(facet.slug)
             if facet.autopilot_excluded and mode == "autopilot":
                 continue
-            baseline_members = [name for name, tok in tokens.items() if tok == t_star]
-            baseline_inferred = any(env_of[name][1] == "inferred" for name in baseline_members)
-            outliers = {name: tok for name, tok in tokens.items() if facet.should_flag(tok, t_star)}
-            k = len(outliers)
-            for name, observed in outliers.items():
-                inferred = baseline_inferred or env_of[name][1] == "inferred"
+            baseline_clusters = [c for c in voters if tokens[ckey(c)] == t_star]
+            baseline_inferred = env_matters and any(env_of[ckey(c)][1] == "inferred" for c in baseline_clusters)
+            peer_names = sorted(c.get("name", "") for c in voters)
+            # §3.2 defines `k` as `n - m`, the count of voting members not on
+            # the baseline token -- how split the cohort is. `len(outliers)` is
+            # a different number wherever `should_flag` is narrower than "differs
+            # from `t*`", which is every facet except the two on `_flag_ne`: a
+            # cluster that diverges upward is not flagged but is still divergent.
+            # `len(outliers) <= n - m` always, so reading it here under-counted
+            # the split and under-applied §3.5's `k >= 3` step -- publishing at a
+            # severity above the one the SOP specifies, and keeping findings the
+            # SOP would have dropped below `minor`.
+            k = n - m
+            for c in voters:
+                observed = tokens[ckey(c)]
+                if not facet.should_flag(observed, t_star):
+                    continue
+                if _shape_mismatch(facet, c, baseline_clusters):
+                    continue
+                name = c.get("name", "")
+                inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
                 base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
                 sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
                 if sev is None:
                     continue
-                excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, sorted(tokens), observed, sev, base_sev, downgrades, r)
-                candidates[name].append(_emit(facet.slug, name, excerpt, sev))
-                outlier_facet_count[name] += 1
+                excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, peer_names, observed, sev, base_sev, downgrades, r)
+                candidates[ckey(c)].append(_emit(facet.slug, name, excerpt, sev))
+                outlier_facet_count[ckey(c)] += 1
 
     # §3.6 split-cluster guard
-    for name, count in outlier_facet_count.items():
+    for cluster_key, count in outlier_facet_count.items():
         if count >= 6:
-            facet_names = sorted({cand["check"] for cand in candidates[name]})
-            candidates[name] = [
+            facet_names = sorted({cand["check"] for cand in candidates[cluster_key]})
+            candidates[cluster_key] = [
                 _emit(
-                    "uncohorted", name,
+                    "uncohorted", cluster_key[-1],
                     f"outlier on {count} facets in one run: {', '.join(facet_names)} -- likely a cohort-labelling problem, not {count} independent drifts.",
                     "major",
                 )
@@ -788,7 +874,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     for c in all_clusters:
         project_name = c.get("_project", "")
         record = command_by_project.get(project_name)
-        commands = [{"check": slug, **record} for slug in checks_run.get(c["name"], [])] if record else []
+        cluster_key = ckey(c)
+        commands = [{"check": slug, **record} for slug in checks_run.get(cluster_key, [])] if record else []
         entry = {
             "name": c["name"],
             "project": project_name,
@@ -801,12 +888,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             # carries the truth, and §6's coverage arithmetic reads it.
             "outcome": "collected",
             "commands": commands,
-            "candidates": candidates.get(c["name"], []),
+            "candidates": candidates.get(cluster_key, []),
         }
-        note = limitations.get(c["name"])
+        note = limitations.get(cluster_key)
         if note:
             entry["limitations"] = note
-        skipped = not_applicable.get(c["name"])
+        skipped = not_applicable.get(cluster_key)
         if skipped:
             entry["checks_not_applicable"] = skipped
         entries.append(entry)

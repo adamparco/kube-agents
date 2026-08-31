@@ -52,6 +52,25 @@ def cluster(name, project="acme", location="us-central1", autopilot=False, statu
     return doc
 
 
+def pool(name, *, secure_boot=True, integrity=True, autoscaling=True, image="COS_CONTAINERD", taints=None):
+    """A node pool for the cohorts below, varying one `_pool_fraction` input
+    at a time so a fleet differs on exactly the facet a test is about."""
+    config = {"shieldedInstanceConfig": {"enableSecureBoot": secure_boot, "enableIntegrityMonitoring": integrity}, "imageType": image}
+    if taints:
+        config["taints"] = taints
+    return {"name": name, "config": config, "autoscaling": {"enabled": autoscaling}}
+
+
+def K(name, project="acme", location="us-central1"):
+    """`fd.ckey` for a cluster built by `cluster()` above.
+
+    The collector keys its per-cluster dicts by `(project, location, name)`
+    rather than by name, because a GKE cluster name is only unique inside its
+    project and this is the collector that sweeps every project.
+    """
+    return (project, location, name)
+
+
 class DiscoverProjectsTest(unittest.TestCase):
     @staticmethod
     def _discovery_run(projects_stdout, clusters_by_project=None):
@@ -569,7 +588,7 @@ class ComputeDriftTest(unittest.TestCase):
     def test_a_clean_cohort_produces_no_findings(self):
         checks_run, candidates = fd.compute_drift(self.cohort(), now=NOW)
         self.assertTrue(all(v == [] for v in candidates.values()))
-        self.assertIn("shielded-nodes", checks_run["c0"])
+        self.assertIn("shielded-nodes", checks_run[K("c0")])
 
     def test_a_single_outlier_is_flagged(self):
         # n=20 keeps r=0.95, well clear of the confidence ladder's r<0.90
@@ -578,16 +597,16 @@ class ComputeDriftTest(unittest.TestCase):
         clusters = self.cohort(n=20, outlier_overrides={"shieldedNodes.enabled": False})
         _, candidates = fd.compute_drift(clusters, now=NOW)
         outlier_name = clusters[-1]["name"]
-        self.assertEqual(len(candidates[outlier_name]), 1)
-        self.assertEqual(candidates[outlier_name][0]["check"], "shielded-nodes")
-        self.assertEqual(candidates[outlier_name][0]["severity"], "major")
-        self.assertEqual(candidates["c0"], [])
+        self.assertEqual(len(candidates[K(outlier_name)]), 1)
+        self.assertEqual(candidates[K(outlier_name)][0]["check"], "shielded-nodes")
+        self.assertEqual(candidates[K(outlier_name)][0]["severity"], "major")
+        self.assertEqual(candidates[K("c0")], [])
 
     def test_cohort_under_the_floor_produces_nothing(self):
         clusters = [cluster("a"), cluster("b")]
         _, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertEqual(candidates["a"], [])
-        self.assertEqual(fd.compute_drift(clusters, now=NOW)[0]["a"], [])
+        self.assertEqual(candidates[K("a")], [])
+        self.assertEqual(fd.compute_drift(clusters, now=NOW)[0][K("a")], [])
 
     def test_autopilot_and_standard_are_never_compared_together(self):
         clusters = self.cohort(n=3, outlier_overrides={"shieldedNodes.enabled": False})
@@ -595,27 +614,27 @@ class ComputeDriftTest(unittest.TestCase):
         _, candidates = fd.compute_drift(clusters, now=NOW)
         # the autopilot cluster is alone in its mode's cohort -- under the
         # floor, so it gets no findings regardless of its shielded-nodes value
-        self.assertEqual(candidates["c-auto"], [])
+        self.assertEqual(candidates[K("c-auto")], [])
 
     def test_standard_only_facets_are_never_computed_for_autopilot(self):
         clusters = [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(4)]
         checks_run, _ = fd.compute_drift(clusters, now=NOW)
-        self.assertNotIn("secure-boot", checks_run["a0"])
-        self.assertNotIn("image-type", checks_run["a0"])
+        self.assertNotIn("secure-boot", checks_run[K("a0")])
+        self.assertNotIn("image-type", checks_run[K("a0")])
 
     def test_datapath_provider_is_computed_but_never_flagged_on_autopilot(self):
         clusters = [cluster(f"a{i}", autopilot=True, labels={"environment": "prod"}) for i in range(3)]
         clusters.append(cluster("a-outlier", autopilot=True, labels={"environment": "prod"}, **{"networkConfig.datapathProvider": "LEGACY_DATAPATH"}))
         checks_run, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertIn("datapath-provider", checks_run["a-outlier"])
-        self.assertEqual(candidates["a-outlier"], [])
+        self.assertIn("datapath-provider", checks_run[K("a-outlier")])
+        self.assertEqual(candidates[K("a-outlier")], [])
 
     def test_ineligible_cluster_gets_no_facets_compared(self):
         clusters = self.cohort(n=3)
         clusters.append(cluster("reconciling", status="RECONCILING", labels={"environment": "prod"}))
         checks_run, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertEqual(checks_run["reconciling"], [])
-        self.assertEqual(candidates["reconciling"], [])
+        self.assertEqual(checks_run[K("reconciling")], [])
+        self.assertEqual(candidates[K("reconciling")], [])
 
     def test_split_cluster_guard_replaces_many_findings_with_one(self):
         # n=20 keeps r=0.95 for every facet -- comfortably clear of the
@@ -638,15 +657,15 @@ class ComputeDriftTest(unittest.TestCase):
                 target = target.setdefault(key, {})
             target[keys[-1]] = value
         _, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertEqual(len(candidates[outlier["name"]]), 1)
-        self.assertEqual(candidates[outlier["name"]][0]["check"], "uncohorted")
+        self.assertEqual(len(candidates[K(outlier["name"])]), 1)
+        self.assertEqual(candidates[K(outlier["name"])][0]["check"], "uncohorted")
 
     def test_environment_strategy_separates_cohorts(self):
         prod = self.cohort(n=4)
         staging = [cluster(f"s{i}", labels={"environment": "staging"}, **{"shieldedNodes.enabled": False}) for i in range(4)]
         _, candidates = fd.compute_drift(prod + staging, now=NOW)
         # staging's own majority is shieldedNodes=False, so none of them are outliers there
-        self.assertEqual(candidates["s0"], [])
+        self.assertEqual(candidates[K("s0")], [])
 
     def test_baseline_at_exactly_two_thirds_still_fires_for_a_critical_facet(self):
         # r = 2/3 = 0.667 triggers both the r<0.90 and r<0.80 downgrade
@@ -659,8 +678,8 @@ class ComputeDriftTest(unittest.TestCase):
             cluster("c2", labels={"environment": "prod"}, **{"privateClusterConfig.enablePrivateNodes": False}),
         ]
         _, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertEqual(len(candidates["c2"]), 1)
-        self.assertEqual(candidates["c2"][0]["severity"], "minor")
+        self.assertEqual(len(candidates[K("c2")]), 1)
+        self.assertEqual(candidates[K("c2")][0]["severity"], "minor")
 
     def test_baseline_at_exactly_two_thirds_drops_a_major_facet_entirely(self):
         clusters = [
@@ -669,7 +688,152 @@ class ComputeDriftTest(unittest.TestCase):
             cluster("c2", labels={"environment": "prod"}, **{"shieldedNodes.enabled": False}),
         ]
         _, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertEqual(candidates["c2"], [])
+        self.assertEqual(candidates[K("c2")], [])
+
+
+class ClusterIdentityTest(unittest.TestCase):
+    """A GKE cluster name is unique inside its project, not across the fleet,
+    and this is the collector that sweeps every project."""
+
+    @staticmethod
+    def _two_projects():
+        fleet = []
+        for proj in ("p1", "p2"):
+            fleet.append(cluster("web", project=proj, labels={"team": "x"}))
+            fleet += [cluster(f"{proj}-{i}", project=proj, labels={"team": "x"}) for i in range(9)]
+        fleet[0]["shieldedNodes"] = {"enabled": False}  # p1/web only
+        return fleet
+
+    def test_the_same_name_in_two_projects_stays_two_clusters(self):
+        fleet = self._two_projects()
+        self.assertEqual(fd.decide_cohort_strategy(fleet), "project")
+        checks_run, candidates = fd.compute_drift(fleet, now=NOW)
+        p1, p2 = K("web", project="p1"), K("web", project="p2")
+        self.assertEqual([c["check"] for c in candidates[p1]], ["shielded-nodes"])
+        # Keyed by name, p2/web was handed p1/web's finding as well as its own
+        # empty list, and published it under an indistinguishable Cluster/web.
+        self.assertEqual(candidates[p2], [])
+        # §6 rejects a duplicated `checks_run` entry, and the merge produced one
+        # by concatenating both clusters' facet lists into a single value.
+        self.assertEqual(len(checks_run[p1]), len(set(checks_run[p1])))
+        self.assertEqual(sorted(checks_run[p1]), sorted(checks_run[p2]))
+
+
+class SplitCountTest(unittest.TestCase):
+    """§3.2 defines `k` as `n - m` -- how split the cohort is -- not the number
+    of clusters that ended up flagged."""
+
+    @staticmethod
+    def _fleet():
+        # 27 SOME, 2 ALL, 1 NONE on secure-boot. r = 27/30 = 0.90 clears both
+        # consensus steps, and k = 30 - 27 = 3 lands exactly on §3.5's `k >= 3`
+        # step. Only `none0` is flagged -- `_flag_less_only` stays quiet for the
+        # two clusters covering more pools than the cohort does -- so a `k` read
+        # off the flagged count is 1 and skips the step.
+        fleet = [cluster(f"s{i}", labels={"team": "x"}, nodePools=[pool("a"), pool("b", secure_boot=False)]) for i in range(27)]
+        fleet += [cluster(f"all{i}", labels={"team": "x"}, nodePools=[pool("a"), pool("b")]) for i in range(2)]
+        fleet.append(cluster("none0", labels={"team": "x"}, nodePools=[pool("a", secure_boot=False), pool("b", secure_boot=False)]))
+        return fleet
+
+    def test_off_baseline_clusters_count_toward_k_even_when_unflagged(self):
+        _, candidates = fd.compute_drift(self._fleet(), now=NOW)
+        found = [c for c in candidates[K("none0")] if c["check"] == "secure-boot"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "minor")  # major, one step for k
+        self.assertIn("k=3>=3", found[0]["excerpt"])
+
+    def test_a_cluster_that_diverges_upward_is_still_not_flagged(self):
+        _, candidates = fd.compute_drift(self._fleet(), now=NOW)
+        self.assertEqual(candidates[K("all0")], [])
+
+
+class InferredEnvironmentTest(unittest.TestCase):
+    """§3.5 downgrades a finding whose cohort membership rests on an inferred
+    environment -- which is only ever true under the `environment` strategy."""
+
+    def test_a_name_token_does_not_downgrade_when_cohorts_ignore_environment(self):
+        fleet = [cluster(n, labels={"team": "x"}) for n in ("alpha", "beta", "gamma", "delta", "prod-eps")]
+        fleet[0]["shieldedNodes"] = {"enabled": False}
+        # One name token out of five does not earn the environment strategy, so
+        # no cohort key holds an environment and no membership rests on one.
+        self.assertEqual(fd.decide_cohort_strategy(fleet), "mode-only")
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        found = candidates[K("alpha")]
+        self.assertEqual([f["check"] for f in found], ["shielded-nodes"])
+        self.assertEqual(found[0]["severity"], "minor")  # r=0.80<0.90 only
+        self.assertNotIn("inferred environment", found[0]["excerpt"])
+
+    def test_an_inferred_environment_still_downgrades_when_it_drew_the_cohort(self):
+        fleet = [cluster(f"prod-{i}") for i in range(10)]
+        for c in fleet:
+            c["resourceLabels"] = {"team": "x"}
+        fleet[0]["shieldedNodes"] = {"enabled": False}
+        self.assertEqual(fd.decide_cohort_strategy(fleet), "environment")
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        found = candidates[K("prod-0")]
+        self.assertEqual(found[0]["severity"], "minor")  # major, one step
+        self.assertIn("inferred environment", found[0]["excerpt"])
+
+
+class PoolShapeTest(unittest.TestCase):
+    """§4.8: do not flag single-pool clusters against multi-pool peers."""
+
+    @staticmethod
+    def _fleet(solo_pools):
+        fleet = [cluster(f"m{i}", labels={"team": "x"}, nodePools=[pool("a"), pool("b", autoscaling=False)]) for i in range(9)]
+        fleet.append(cluster("solo", labels={"team": "x"}, nodePools=solo_pools))
+        return fleet
+
+    def test_a_single_pool_cluster_is_not_flagged_against_a_some_baseline(self):
+        # A one-pool cluster can only normalize to ALL or NONE, so against a
+        # SOME baseline it is an outlier no change can close: turning
+        # autoscaling on moves it to ALL, still not SOME.
+        _, candidates = fd.compute_drift(self._fleet([pool("a", autoscaling=False)]), now=NOW)
+        self.assertEqual([c for c in candidates[K("solo")] if c["check"] == "pool-autoscaling"], [])
+
+    def test_a_multi_pool_cluster_is_still_flagged_against_the_same_baseline(self):
+        fleet = self._fleet([pool("a", autoscaling=False), pool("b", autoscaling=False)])
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        found = [c for c in candidates[K("solo")] if c["check"] == "pool-autoscaling"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "minor")
+
+    def test_the_suppression_does_not_reach_the_other_pool_fraction_facets(self):
+        # §4.3's secure-boot shares the ALL/SOME/NONE scale but lists a
+        # different set of suppressions, and not this one.
+        fleet = [cluster(f"m{i}", labels={"team": "x"}, nodePools=[pool("a"), pool("b", secure_boot=False)]) for i in range(9)]
+        fleet.append(cluster("solo", labels={"team": "x"}, nodePools=[pool("a", secure_boot=False)]))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual([c["check"] for c in candidates[K("solo")]], ["secure-boot"])
+
+
+class EligibilityCreateTimeTest(unittest.TestCase):
+    def test_a_null_create_time_is_treated_as_settled(self):
+        self.assertIsNone(fd.cluster_eligibility(cluster("c", created=None), now=NOW))
+
+    def test_an_unparseable_create_time_is_treated_as_settled(self):
+        self.assertIsNone(fd.cluster_eligibility(cluster("c", created="not-a-date"), now=NOW))
+
+    def test_a_genuinely_fresh_cluster_is_still_excluded(self):
+        why = fd.cluster_eligibility(cluster("c", created="2026-07-31T18:00:00Z"), now=NOW)
+        self.assertIn("under 24h", why or "")
+
+    def test_a_null_create_time_does_not_truncate_the_manifest(self):
+        """`None.replace` is an AttributeError no caller catches, and the SOP
+        runs this module as `fleet_drift.py > manifest.json` -- so the shell had
+        already truncated the manifest by the time the traceback printed, and
+        one cluster with an odd createTime lost the whole fleet."""
+        docs = [cluster(f"c{i}", labels={"team": "x"}) for i in range(3)]
+        docs[1]["createTime"] = None
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, json.dumps(docs))
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        self.assertEqual(len(manifest["clusters"]), 3)
+        self.assertTrue(all(c["outcome"] == "collected" for c in manifest["clusters"]))
 
 
 class CollectFleetTest(unittest.TestCase):
@@ -869,21 +1033,21 @@ class CohortLimitationsTest(unittest.TestCase):
     def test_every_member_of_an_undersized_cohort_is_explained(self):
         lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
         self.assertEqual(len(lim), 4)
-        self.assertIn("only 2 comparable clusters", lim["auto-a"])
-        self.assertIn("only 2 comparable clusters", lim["auto-b"])
+        self.assertIn("only 2 comparable clusters", lim[K("auto-a")])
+        self.assertIn("only 2 comparable clusters", lim[K("auto-b")])
         # Singular for a one-member cohort: the sentence a lone cluster like
         # kube-agents-host gets on every run.
-        self.assertIn("only 1 comparable cluster ", lim["auto-test"])
-        self.assertIn("only 1 comparable cluster ", lim["std-a"])
+        self.assertIn("only 1 comparable cluster ", lim[K("auto-test")])
+        self.assertIn("only 1 comparable cluster ", lim[K("std-a")])
         for text in lim.values():
             self.assertIn(f"minimum {fd.COHORT_FLOOR}", text)
             self.assertIn("no facet compared", text)
 
     def test_the_sentence_names_the_cohort_it_floored_out_of(self):
         lim = fd.cohort_limitations(self._floored_fleet(), now=NOW)
-        self.assertIn("cohort autopilot/prod", lim["auto-a"])
-        self.assertIn("cohort autopilot/test", lim["auto-test"])
-        self.assertIn("cohort standard/prod", lim["std-a"])
+        self.assertIn("cohort autopilot/prod", lim[K("auto-a")])
+        self.assertIn("cohort autopilot/test", lim[K("auto-test")])
+        self.assertIn("cohort standard/prod", lim[K("std-a")])
 
     def test_the_lone_unlabelled_cluster_is_told_a_label_is_the_difference(self):
         # The live fleet's shape: fifteen of sixteen carry `environment=test`,
@@ -894,10 +1058,10 @@ class CohortLimitationsTest(unittest.TestCase):
         fleet = [cluster(f"c{i}", labels={"environment": "test"}) for i in range(3)]
         fleet.append(cluster("host", labels={}))
         lim = fd.cohort_limitations(fleet, now=NOW)
-        self.assertEqual(list(lim), ["host"])
+        self.assertEqual(list(lim), [K("host")])
         self.assertIn("cohort standard/unknown has only 1 comparable cluster",
-                      lim["host"])
-        self.assertIn("no environment label while 3 of 4 do", lim["host"])
+                      lim[K("host")])
+        self.assertIn("no environment label while 3 of 4 do", lim[K("host")])
 
     def test_a_fleet_nobody_labelled_is_not_told_to_add_a_label(self):
         # Every cluster unknown together cohorts by mode alone, so there is no
@@ -922,8 +1086,8 @@ class CohortLimitationsTest(unittest.TestCase):
         fleet = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(3)]
         fleet.append(cluster("broken", labels={"environment": "prod"}, status="DEGRADED"))
         lim = fd.cohort_limitations(fleet, now=NOW)
-        self.assertEqual(set(lim), {"broken"})
-        self.assertIn("status DEGRADED", lim["broken"])
+        self.assertEqual(set(lim), {K("broken")})
+        self.assertIn("status DEGRADED", lim[K("broken")])
 
     def test_the_manifest_carries_the_sentence(self):
         clusters_json = json.dumps(self._floored_fleet())
