@@ -243,8 +243,10 @@ resolving the kubeconfig per request. Two rules the implementation must keep:
   document's scope is a rejection, in exactly the register of the existing scope validations.
 
 The fail-closed dump gate is non-negotiable and gains a second justification here: the
-credential proxy caps command output at 4 MiB and _preserves the command's exit code_ when it
-truncates, so a big cluster's dump can arrive incomplete at exit 0. The shim does warn — a
+credential proxy caps command output — at 32 MiB as the operator deploys it
+(`CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` in `platformagent_manifests.go`; the script's own default
+is 4 MiB) — and _preserves the command's exit code_ when it truncates, so a big cluster's dump
+can arrive incomplete at exit 0. The shim does warn — a
 "credential proxy output truncated" line on stderr — but a warning an agent or a
 stdout-redirecting script can ignore is a signal, not a gate. `jq -e` over the dump (the
 ai-security pattern) is the check that fails closed on both the zero-byte and the truncated
@@ -1118,7 +1120,7 @@ with redaction as backstop. New ones:
   uncovered clusters (§6's manifest-scoped rule), the run goes partial where nothing collected,
   and an empty candidate list with a failed gate publishes nothing.
 - **The dump gate ships with every dump.** Removing `jq -e` to save a line reintroduces the
-  false all-clear shape at 4 MiB scale.
+  false all-clear shape at the output cap.
 - **On a `collected` cluster, `checks_run` never names a check whose manifest command did not
   run** (enforced by `finish`); everywhere else the existing attestation rules apply verbatim.
 
@@ -1126,7 +1128,7 @@ with redaction as backstop. New ones:
 
 - **Collector unit tests per check table**: golden dumps in, expected candidates out — the jq
   filters finally get the tests prose cannot have. Fault injection: zero-byte dump, truncated
-  dump (4 MiB boundary), one cluster's get-credentials failing under parallelism, all
+  dump (the output-cap boundary), one cluster's get-credentials failing under parallelism, all
   asserting `outcome` ≠ shorter candidate lists.
 - **Manifest cross-check tests in `test_audit_report.py`**: on a `collected` cluster, a
   `checks_run` entry without an rc=0 manifest command is rejected; a manifest cluster missing
