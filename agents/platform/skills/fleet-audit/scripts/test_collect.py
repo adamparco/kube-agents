@@ -2311,6 +2311,28 @@ class TestModelArtifactUnpinnedSource(unittest.TestCase):
         hit = self.hit({"args": ["--model", "x"]})
         self.assertNotIn("severity", hit)
 
+    def test_excerpt_names_the_offending_url(self):
+        hit = self.hit({"args": ["--weights", "http://example.com/model.bin"]})
+        self.assertIn("http://example.com/model.bin", hit["excerpt"])
+
+    def test_excerpt_names_the_model_a_bare_flag_leaves_in_the_next_argument(self):
+        hit = self.hit({"args": ["--model", "meta-llama/Llama-3"]})
+        self.assertIn("--model meta-llama/Llama-3", hit["excerpt"])
+        self.assertIn("no --revision", hit["excerpt"])
+
+    def test_excerpt_reports_both_conditions_on_one_container(self):
+        hit = self.hit({"args": ["--model", "m", "--weights", "http://example.com/w.bin"]})
+        self.assertIn("plaintext URL", hit["excerpt"])
+        self.assertIn("no --revision", hit["excerpt"])
+
+    def test_excerpt_strips_url_userinfo_and_query_string(self):
+        # The ledger is a public GitHub issue; a signed-URL token or a
+        # basic-auth password in the manifest must not be republished there.
+        hit = self.hit({"args": ["--weights", "http://user:pw@example.com/m.bin?sig=SECRET"]})
+        self.assertNotIn("SECRET", hit["excerpt"])
+        self.assertNotIn("pw", hit["excerpt"])
+        self.assertIn("example.com/m.bin", hit["excerpt"])
+
 
 class TestModelCredentialPlaintextEnv(unittest.TestCase):
     def hit(self, env):

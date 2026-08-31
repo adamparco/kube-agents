@@ -1402,6 +1402,14 @@ def check_weights_mount_writable(workload: dict, context: dict) -> dict | None:
 AI_URL_RE = re.compile(r"(^|=)(http|ftp)://")
 AI_MODEL_FLAG_RE = re.compile(r"^--model(-id)?(=|$)")
 AI_REVISION_FLAG_RE = re.compile(r"^--revision(=|$)")
+# Userinfo and query string are where a signed-URL token or a basic-auth
+# password rides along, and this excerpt is published to a public GitHub
+# issue. The scheme, host and path are the whole of what the finding needs.
+AI_URL_CREDENTIAL_RE = re.compile(r"://[^/@\s]*@|\?\S*")
+
+
+def _ai_safe_url(value: str) -> str:
+    return AI_URL_CREDENTIAL_RE.sub(lambda m: "://" if m.group(0).endswith("@") else "?…", value)
 
 
 def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict | None:
@@ -1410,16 +1418,33 @@ def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict 
     for c in _ai_containers(workload["spec"]):
         args_cmd = [str(a) for a in (c.get("args") or [])] + [str(a) for a in (c.get("command") or [])]
         env_vals = [str(e.get("value", "")) for e in (c.get("env") or [])]
-        has_url = any(AI_URL_RE.search(v) for v in args_cmd + env_vals)
-        has_model_flag = any(AI_MODEL_FLAG_RE.search(a) for a in args_cmd)
+        urls = [v for v in args_cmd + env_vals if AI_URL_RE.search(v)]
+        # `--model=x` carries its value; bare `--model x` leaves it in the next
+        # argument, and reporting the flag without the model name names nothing.
+        models = [
+            a if "=" in a else " ".join(args_cmd[i : i + 2])
+            for i, a in enumerate(args_cmd)
+            if AI_MODEL_FLAG_RE.search(a)
+        ]
         has_revision_flag = any(AI_REVISION_FLAG_RE.search(a) for a in args_cmd)
-        if has_url or (has_model_flag and not has_revision_flag):
-            bad.append(c.get("name", ""))
+        # Name the value that tripped the check, not just the container it sat
+        # in. The two conditions fail for different reasons and take different
+        # fixes -- a plaintext URL wants a digest-addressed source, an
+        # unpinned `--model` wants a `--revision` -- and an excerpt reading
+        # `containers: inference` distinguishes neither, nor says what to go
+        # and look at. Both can hold on one container, so both are reported.
+        reasons = []
+        if urls:
+            reasons.append("plaintext URL " + ", ".join(_ai_safe_url(u) for u in urls[:3]))
+        if models and not has_revision_flag:
+            reasons.append(f"{', '.join(models[:3])} with no --revision")
+        if reasons:
+            bad.append(f"{c.get('name', '')}: {'; '.join(reasons)}")
             if _container_trusts_remote_code(c):
                 escalate = True  # §3.4: escalates to critical alongside a 3.2 finding on the same container
     if not bad:
         return None
-    hit = {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
+    hit = {"object": f"{workload['kind']}/{workload['name']}", "excerpt": " | ".join(bad)}
     if escalate:
         hit["severity"] = "critical"
     return hit
