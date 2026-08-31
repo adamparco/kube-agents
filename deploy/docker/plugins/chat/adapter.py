@@ -63,6 +63,7 @@ instead of a per-job one, and says so in the log.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -260,6 +261,60 @@ def is_silent_report(report: str) -> bool:
     return bool(_is_cron_silence_response(bare))
 
 
+#: Where ``audit_report.py finish`` records each stream's last run. Same
+#: environment variable and same default, so an install that moves the store
+#: moves this lookup with it.
+_REPORTS_DIR = os.getenv("FLEET_AUDIT_REPORTS_DIR", "") or "/opt/data/fleet-audit/reports"
+
+#: How old ``finished_at`` may be and still describe the delivery in hand.
+#: Measured rather than guessed: across 92 runs on the reference install the
+#: gap from ``finish`` returning to the run's final response was 21s median and
+#: 237s at worst, so this is roughly four times the observed ceiling.
+_SILENCE_WINDOW_SECONDS = 900
+
+
+def declared_silent(job_id: str) -> bool:
+    """Did this audit stream's own run just decide it had nothing to say?
+
+    :func:`is_silent_report` catches the marker. This catches the run that was
+    supposed to emit the marker and wrote a paragraph instead — "the audit
+    published successfully: ``silent_ok: true``, ledger #38 rewritten, nothing
+    moved". Fourteen of the reference install's fifty-three silent runs posted
+    prose like that. It carries no marker for the text test to find, and it is
+    the exact message the silent path exists to prevent.
+
+    The cause is structural rather than a wording problem, so the SOPs cannot
+    fix it: every audit stream ends by telling the model to copy ``chat_summary``
+    verbatim, which makes staying quiet an instruction to be followed rather
+    than a decision already taken. Read the decision from where ``finish``
+    wrote it down instead. ``job_id`` is the audit stream, which is also the
+    report store's directory name, so a cron job that is not an audit stream
+    finds nothing here and is unaffected.
+
+    Freshness is what stops an old report from silencing a later delivery: the
+    report is written seconds before the response it belongs to, so one older
+    than :data:`_SILENCE_WINDOW_SECONDS` was decided by some earlier run and
+    says nothing about this message.
+    """
+    if not job_id:
+        return False
+    try:
+        report = json.loads((Path(_REPORTS_DIR) / job_id / "latest.json").read_text("utf-8"))
+        if not report.get("silent_ok"):
+            return False
+        age = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.datetime.fromisoformat(report["finished_at"])
+        ).total_seconds()
+    except Exception:
+        # No store, no report for this job, unreadable JSON, missing or
+        # unparseable timestamp. This is a second opinion on top of the text
+        # test, so failing open leaves exactly the behaviour that shipped
+        # before it rather than dropping a message on a bad read.
+        return False
+    return 0 <= age <= _SILENCE_WINDOW_SECONDS
+
+
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     """FastAPI's ``detail`` off an error response, as ``": <detail>"`` or ``""``.
 
@@ -379,7 +434,7 @@ async def standalone_send(
     # because a model emphasised it. Relaying that would be worse than posting
     # it raw: the route runs a Chat Agent turn over the text, and the Chat Agent
     # asked to relay "[SILENT]" writes a sentence about it.
-    if is_silent_report(report):
+    if is_silent_report(report) or declared_silent(job_id):
         logger.info(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
         )

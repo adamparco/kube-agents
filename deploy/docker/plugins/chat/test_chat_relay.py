@@ -536,6 +536,127 @@ class TestStandaloneSend(unittest.TestCase):
         self.assertTrue(mod.DEFAULT_RELAY_URL.startswith("http://127.0.0.1:8699/"))
 
 
+class TestDeclaredSilent(unittest.TestCase):
+    """The guard for a silent run that described its silence instead of emitting it.
+
+    Every text-based test above needs the marker to be somewhere in the
+    message. The failure this covers has no marker at all: the run decided to
+    stay quiet, and then wrote "the audit published successfully, `silent_ok:
+    true`, nothing moved" — which is a message, delivered, from a run whose
+    whole point was that there was nothing to deliver.
+    """
+
+    PROSE = (
+        "The audit published successfully: `status: \"UPDATED\"`, `new: 0`, "
+        "`resolved: 0`, `silent_ok: true`, `partial: false` — ledger issue #38 "
+        "was rewritten with the same 31 findings as last run."
+    )
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def write(self, stream: str, *, silent: bool, age_s: float = 20.0) -> None:
+        import datetime
+
+        finished = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=age_s
+        )
+        os.makedirs(os.path.join(self.root, stream), exist_ok=True)
+        with open(os.path.join(self.root, stream, "latest.json"), "w") as handle:
+            json.dump(
+                {"silent_ok": silent, "finished_at": finished.isoformat()}, handle
+            )
+
+    def declared(self, job_id: str) -> bool:
+        with patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root}):
+            with patch.object(mod, "_REPORTS_DIR", self.root):
+                return mod.declared_silent(job_id)
+
+    def test_a_fresh_silent_report_silences_whatever_the_run_wrote(self):
+        self.write("compliance-audit", silent=True)
+        self.assertTrue(self.declared("compliance-audit"))
+
+    def test_a_loud_report_is_left_alone(self):
+        """The ordinary case: findings moved, so the summary must reach the channel."""
+        self.write("compliance-audit", silent=False)
+        self.assertFalse(self.declared("compliance-audit"))
+
+    def test_a_stale_report_decides_nothing(self):
+        """It belongs to an earlier run, so it must not silence this delivery."""
+        self.write("compliance-audit", silent=True, age_s=mod._SILENCE_WINDOW_SECONDS + 60)
+        self.assertFalse(self.declared("compliance-audit"))
+
+    def test_a_report_from_the_future_decides_nothing(self):
+        """A clock that jumped would otherwise silence deliveries indefinitely."""
+        self.write("compliance-audit", silent=True, age_s=-3600)
+        self.assertFalse(self.declared("compliance-audit"))
+
+    def test_a_job_that_is_not_an_audit_stream_is_unaffected(self):
+        self.write("compliance-audit", silent=True)
+        for job_id in ("", "github-repo-watcher", "../compliance-audit"):
+            with self.subTest(job_id=job_id):
+                self.assertFalse(self.declared(job_id))
+
+    def test_an_unreadable_store_fails_open(self):
+        """A bad read must not drop a report — it leaves the text test in charge."""
+        os.makedirs(os.path.join(self.root, "compliance-audit"))
+        with open(os.path.join(self.root, "compliance-audit", "latest.json"), "w") as h:
+            h.write("{not json")
+        self.assertFalse(self.declared("compliance-audit"))
+        self.write("obtainability-audit", silent=True)
+        os.remove(os.path.join(self.root, "obtainability-audit", "latest.json"))
+        with open(os.path.join(self.root, "obtainability-audit", "latest.json"), "w") as h:
+            json.dump({"silent_ok": True}, h)  # no finished_at
+        self.assertFalse(self.declared("obtainability-audit"))
+
+    def test_prose_about_silence_is_not_relayed(self):
+        """End to end through the sender, which is where the leak happened."""
+        self.write("compliance-audit", silent=True)
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {
+                    "SESSION_KV_API_KEY": "k",
+                    "CRON_REPORT_RELAY_URL": relay.url,
+                    "FLEET_AUDIT_REPORTS_DIR": self.root,
+                },
+            ):
+                with patch.object(mod, "_REPORTS_DIR", self.root):
+                    result = asyncio.run(
+                        mod.standalone_send(
+                            None,
+                            "c",
+                            wrapped("Compliance Audit", "compliance-audit", self.PROSE),
+                        )
+                    )
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(relay.requests, [], "the silent run's prose was relayed")
+
+    def test_the_same_prose_from_a_loud_run_is_relayed(self):
+        """The control. Without it the test above passes on a sender that drops everything."""
+        self.write("compliance-audit", silent=False)
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ,
+                {
+                    "SESSION_KV_API_KEY": "k",
+                    "CRON_REPORT_RELAY_URL": relay.url,
+                    "FLEET_AUDIT_REPORTS_DIR": self.root,
+                },
+            ):
+                with patch.object(mod, "_REPORTS_DIR", self.root):
+                    result = asyncio.run(
+                        mod.standalone_send(
+                            None,
+                            "c",
+                            wrapped("Compliance Audit", "compliance-audit", self.PROSE),
+                        )
+                    )
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(len(relay.requests), 1, "the loud run's report was dropped")
+
+
 class TestSiblingDeliveryTargets(unittest.TestCase):
     """Which platforms the scheduler is posting this same report to itself.
 

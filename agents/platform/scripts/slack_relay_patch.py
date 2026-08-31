@@ -94,13 +94,24 @@ def is_silent_text(message: Any) -> bool:
 
     Falling back to the blank test leaves a deployment with no chat platform
     installed behaving exactly as it did.
+
+    ``declared_silent`` is the same import for the same reason. It answers the
+    case no reading of the text can: an audit run that decided to stay quiet
+    and then described the decision instead of emitting the marker. The job id
+    comes out of the wrapper this message still carries; a formatted leg that
+    has lost the wrapper yields no id, and the text test carries that leg alone
+    exactly as before.
     """
     text = "" if message is None else str(message)
     try:
-        from plugins.platforms.chat.adapter import is_silent_report
+        from plugins.platforms.chat.adapter import (
+            declared_silent,
+            is_silent_report,
+            parse_cron_wrapper,
+        )
     except Exception:
         return not text.strip()
-    return bool(is_silent_report(text))
+    return bool(is_silent_report(text) or declared_silent(parse_cron_wrapper(text)[0]))
 
 
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
