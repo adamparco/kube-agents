@@ -5,13 +5,16 @@ about how to measure a coloured cell is two bugs, and a renderer that knows
 what a finding or an audit stream is cannot be shared. Everything here takes
 strings and `Column` specs and returns lines.
 
-Measurement is the part that is easy to get wrong. `plain()` is the only
-correct way to ask how wide a cell is, because SGR colour codes and OSC 8
-hyperlinks both occupy zero columns and a raw `len()` over either one
-misaligns every border below it. Callers are expected to have scrubbed
-control characters out of untrusted text before it reaches a cell: an escape
-sequence arriving from a model-written field would measure as zero columns
-here and defeat the very assertions that exist to catch misalignment.
+Measurement is the part that is easy to get wrong. `display_width()` is the
+only correct way to ask how wide a cell is, and it corrects for two things a
+raw `len()` gets wrong in opposite directions: SGR colour codes and OSC 8
+hyperlinks occupy zero columns while counting as many characters, and an
+emoji or a CJK character occupies two columns while counting as one. Callers
+are expected to have scrubbed control characters out of untrusted text before
+it reaches a cell -- `scrub()` in `fleet_audit_status_view` is where this
+repository does it -- because an escape sequence arriving from a model-written
+field would measure as zero columns here and defeat the very assertions that
+exist to catch misalignment.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import os
 import re
 import sys
 import textwrap
+import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -74,15 +78,35 @@ def want_colour(choice: str, stream=None) -> bool:
     return bool(getattr(stream, "isatty", lambda: False)())
 
 def plain(text: str) -> str:
-    """Width-measuring view of a string: what it looks like with colour off.
+    """Colour-off view of a string: the two escape forms this file emits, gone.
 
-    This strips the two forms this file emits and nothing else, which is only a
-    correct measurement because `scrub_document` has already taken the control
+    This strips those two and nothing else, which is only safe because
+    `scrub()` in `fleet_audit_status_view` has already taken the control
     characters out of everything else. An escape sequence that reached a cell
     from the ledger would measure here as zero columns wide, so the table would
     both misalign and pass the assertions that exist to catch misalignment.
+
+    Use `display_width` to measure. `len(plain(...))` is a character count, and
+    the characters most likely to arrive from a model-written finding or a
+    GitHub pull-request title are exactly the ones where a character is not a
+    column.
     """
     return _ANSI.sub("", text)
+
+def display_width(text: str) -> int:
+    """Terminal columns `text` occupies once colour is stripped.
+
+    `len()` is wrong here in both directions, and each direction was reachable:
+    an emoji in a pull-request title or a CJK cluster name counts one character
+    and draws two columns, and a combining accent counts one and draws none. A
+    single one of either shifted every border below its row -- and the test
+    that exists to catch that measured with `len(plain(...))` too, so it agreed
+    with the renderer and reported the table aligned.
+    """
+    return sum(
+        0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        for ch in plain(text)
+    )
 
 _PR_URL = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)/?$")
 
@@ -155,7 +179,7 @@ class Column:
         self.expendable = expendable
 
 def _pad(text: str, width: int, align: str) -> str:
-    gap = max(0, width - len(plain(text)))
+    gap = max(0, width - display_width(text))
     if align == "r":
         return " " * gap + text
     if align == "c":
@@ -184,18 +208,44 @@ def _cell_lines(text: str, width: int) -> List[Tuple[str, int]]:
             textwrap.wrap(para, width=max(1, width), break_long_words=True, break_on_hyphens=False)
             or [""]
         ):
-            out.append((line, index))
+            for piece in _to_width(line, max(1, width)):
+                out.append((piece, index))
     return out or [("", 0)]
+
+def _to_width(line: str, width: int) -> List[str]:
+    """Break a line `textwrap` left too wide, measuring in columns not characters.
+
+    `textwrap` counts characters, so a paragraph of double-width text comes back
+    at or under `width` characters and up to twice `width` columns -- which is
+    the one overflow `break_long_words` cannot catch, because as far as it is
+    concerned the line already fits. Only a line that actually overruns is
+    touched, so an ASCII cell takes the identical path it always has.
+    """
+    if display_width(line) <= width:
+        return [line]
+    out: List[str] = []
+    current: List[str] = []
+    used = 0
+    for ch in line:
+        step = display_width(ch)
+        if used + step > width and current:
+            out.append("".join(current))
+            current, used = [], 0
+        current.append(ch)
+        used += step
+    if current:
+        out.append("".join(current))
+    return out
 
 def _natural_widths(columns: Sequence[Column], rows: Sequence[Sequence[Sequence[Any]]]) -> List[int]:
     """The width each column would take if nothing had to give."""
     natural = []
     for index, column in enumerate(columns):
-        widest = len(plain(column.title))
+        widest = display_width(column.title)
         for row in rows:
             text = row[index][0] if index < len(row) else ""
             for line in str(text).split("\n"):
-                widest = max(widest, len(plain(line)))
+                widest = max(widest, display_width(line))
         natural.append(widest)
     return natural
 

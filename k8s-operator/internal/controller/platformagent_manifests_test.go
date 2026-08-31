@@ -3068,6 +3068,15 @@ func TestHermesHomeModeGrantsTheCredentialProxyGroupAccess(t *testing.T) {
 		t.Errorf("HERMES_HOME_MODE = %q grants `other` %03o, but no uid on this volume reaches it "+
 			"— both containers that mount the PVC are in gid 10000", raw, mode&0o007)
 	}
+	// Setgid is the half of this the permission bits above cannot see. Group rwx lets the
+	// proxy mkdir inside $HERMES_HOME; setgid is what makes the directory it creates carry
+	// gid 10000 rather than the creating process's own primary group, so the *next* writer
+	// still gets in. 0770 passes every assertion above and loses that on the second hop.
+	if mode&0o2000 == 0 {
+		t.Errorf("HERMES_HOME_MODE = %q has no setgid bit; directories the credential proxy "+
+			"creates under $HERMES_HOME would not inherit gid 10000 and the agent could not "+
+			"write into them", raw)
+	}
 
 	// The dashboard runs hermes against the same directories. A different mode there means
 	// the two containers re-chmod the PVC out from under each other on every start.

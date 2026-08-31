@@ -48,24 +48,15 @@ fails if the two drift apart. Do not restate a title anywhere else.
 ## Running a stream on demand
 
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
-for one command per stream:
+for one trigger per stream. `AGENTS.md`'s "Run the `<x>` cron job now" bullet owns the procedure and
+owns why neither `hermes cron run` nor `cronjob(action='run')` is it: move the job's schedule a
+couple of minutes ahead, let `profile-cron-tick` take it, put the schedule back. `cron/jobs.json`
+holds the value to restore.
 
-```
-HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run compliance-audit
-```
-
-Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
-`profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
-picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
-stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
-
-`cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
-one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the
-dispatch pool is full, it
-executes the job synchronously inside the session that calls it, which is the re-enactment the next
-paragraph exists to prevent. Elsewhere it hands the run to the background delegation executor and
-returns a handle; that is closer to what you want, but `hermes cron run` is the one route that
-behaves identically on every runtime and always runs in a fresh process.
+The tick runs the stream through the identical path the 06:20 tick uses, with its prompt verbatim,
+its `skills` preloaded, and this profile's `max_turns`. `started.json` appearing in the stream's
+report-store directory is the run having taken the lock; `hermes cron list` shows `Execution:
+running` from the same moment.
 
 **Do not run the audit yourself in the session that received the request.** A triggered run gets its
 own process and its own turn budget. A session that improvises the audit instead has neither — and
@@ -553,7 +544,7 @@ run's ids, not this run's states.
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
 | `open`               | `open`                                | Reproduces; no pull request                | Nothing, unless it qualifies for auto-promotion              |
 | `pr-open`            | `fix proposed`                        | Reproduces; a fix is open on its branch    | **Labels re-asserted.** The pull request itself is untouched |
-| `pr-merged-persists` | `⚠ fix merged, still reproduces`     | Reproduces; the fix **merged anyway**      | Comments once on the merged PR; never reopens it             |
+| `pr-merged-persists` | `⚠ fix merged, still reproduces`      | Reproduces; the fix **merged anyway**      | Comments once on the merged PR; never reopens it             |
 | `refused`            | `fix refused`                         | Reproduces; a **human closed** the fix     | Nothing. The close stands until someone says `/remediate`    |
 | `withdrawn`          | `fix withdrawn, awaiting re-proposal` | Reproduces; the **harness closed** the fix | Treats it as having no pull request — it is promotable again |
 

@@ -25,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fleet_audit_status_view as view  # noqa: E402
+import terminal_table  # noqa: E402
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -495,17 +496,49 @@ class TestDashboard(unittest.TestCase):
         self.assertNotIn("┌", out)
         self.assertIn("+-", out)
 
+    def border_widths(self, out):
+        """Every border line's width in *columns*, which is the only measure
+        that can catch this.
+
+        Measuring with `len(plain(...))` — what this did until an emoji in a
+        cell was tried — is the renderer's own arithmetic, so the assertion
+        agreed with the bug: a cell one column wide per character came back
+        the same length as the border that failed to contain it.
+        """
+        return {
+            terminal_table.display_width(line)
+            for line in out.splitlines()
+            if view.plain(line).startswith(("┌", "│", "├", "└"))
+        }
+
     def test_every_border_line_is_the_same_width(self):
         # The one failure a coloured table produces silently: a cell measured
         # with its escape sequences included pads short and the column below
         # it steps sideways.
         out = self.render(self.two(), palette=view.Palette(True))
-        widths = {
-            len(view.plain(line))
-            for line in out.splitlines()
-            if view.plain(line).startswith(("┌", "│", "├", "└"))
-        }
-        self.assertEqual(len(widths), 1, widths)
+        self.assertEqual(len(self.border_widths(out)), 1, self.border_widths(out))
+
+    def test_a_cell_whose_characters_are_not_one_column_wide_still_aligns(self):
+        """A character is not a column, and both directions were reachable.
+
+        Cell text arrives from a model-written finding title and from GitHub
+        pull-request titles, where an emoji is ordinary. Each one drew two
+        columns and counted as one character, so the row ran past its own
+        border; a combining accent did the reverse. The wide cases also have to
+        survive *wrapping*, because `textwrap` counts characters too and hands
+        back a line that fits by its measure and overflows by the terminal's.
+        """
+        for label, name in (
+            ("emoji", "\U0001f680 compliance-audit"),
+            ("cjk", "コンプライアンス監査"),
+            ("combining", "compliance-áudit"),
+            ("wide and long enough to wrap", "コンプライアンス" * 12),
+        ):
+            with self.subTest(cell=label):
+                streams = {name: stream(last=latest(audit_id=name))}
+                out = self.render(streams, roster={name: {"enabled": True, "expr": "20 6 * * *"}})
+                widths = self.border_widths(out)
+                self.assertEqual(len(widths), 1, "%s: %s" % (label, sorted(widths)))
 
     def test_colour_is_off_unless_asked_for(self):
         self.assertNotIn("\x1b[", self.render(self.two()))

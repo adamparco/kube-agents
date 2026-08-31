@@ -120,7 +120,7 @@ Whether a check blocks on a single run or only across the three depends on who c
 - the planted defect is still there at the end of the run, asserted on the defect itself and not just the object carrying it;
 - the final report names it, checked against the report rather than the transcript;
 - the agent called the tool it says it read;
-- asked to run an audit, it triggered the job (`hermes cron run`) instead of re-enacting the audit in the session.
+- asked to run an audit, it triggered the job (nudging the schedule so `profile-cron-tick` fires it) instead of re-enacting the audit in the session.
 
 The trajectory we record is the router's, so worker mutations are caught by cluster state instead.
 

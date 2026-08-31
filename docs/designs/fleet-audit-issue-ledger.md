@@ -288,7 +288,7 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
 | `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
 | `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
-| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`     | comment once on the merged PR; never reopen it          |
+| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
 | `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
 | `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
 | `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
@@ -830,9 +830,9 @@ the second half of the rule lives with the agent and cannot be moved into the ha
 on-demand run is never silent.** A run a person asked for — a kanban card naming the stream, or a
 request straight from chat — reports its outcome and its ledger URL whatever `silent_ok` says, and
 every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule
-cannot reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks
-the job due for the next `profile-cron-tick` instead of re-enacting the audit in the session that
-fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
+cannot reach: "run the `<x>` cron job now" is answered by nudging the job's schedule so the next
+`profile-cron-tick` fires it, instead of re-enacting the audit in the session that fielded the
+request. That run takes the same execute → save → deliver → mark path as a scheduled
 one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
 the session that triggered it says only that the job is queued and leaves the report to the run.
 
@@ -1104,9 +1104,10 @@ remediation PR opened or closed — asserted on both `finish` branches, since ea
 JSON. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
 governance-job bullet names the Platform Agent's own roster
 (`/opt/data/profiles/platform/cron/jobs.json`) and `profile-cron-tick`, the on-demand bullet names
-`hermes cron run` and `cronjob(action='run')` so that "run it now" stays a trigger rather than a
-re-enactment, `SOUL.md` requires the artifact URL in the card summary before its first numbered
-section, and every SOP in `audit_report.AUDITS` contains both `silent_ok` and "on-demand".
+the schedule nudge and both shortcuts it rules out — `hermes cron run` and `cronjob(action='run')` —
+so that "run it now" stays a trigger rather than a re-enactment, `SOUL.md` requires the artifact URL
+in the card summary before its first numbered section, and every SOP in `audit_report.AUDITS`
+contains both `silent_ok` and "on-demand".
 
 **Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than
 the recorded runner, and it is the one whose defect is invisible to a mock: `ensure_workspace`

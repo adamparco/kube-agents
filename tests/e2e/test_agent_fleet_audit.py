@@ -433,6 +433,12 @@ def test_audit_report_github_api_lifecycle_mocked(
     # seven ways, so anything missed here leaks into the next parameter's run.
     original_workspace = audit_report.GITOPS_WORKSPACE
     original_scratch = audit_report.SCRATCH_DIR
+    # REPORTS_DIR joins it for a second reason: `finish` below is a real one, so
+    # it reaches `write_report`. Unpatched, that is the *live* store on the
+    # install this suite runs against -- seven synthetic runs written over seven
+    # streams' `latest.json`, and the next real run of each reads that memory
+    # and announces its whole finding set as new.
+    original_reports = audit_report.REPORTS_DIR
     original_repo_root = audit_report.repo_root
     original_run_cmd = audit_report.run_cmd
     original_refresh = audit_report.refresh_credentials
@@ -471,6 +477,7 @@ def test_audit_report_github_api_lifecycle_mocked(
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
         audit_report.SCRATCH_DIR = str(tmp_path)
+        audit_report.REPORTS_DIR = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
         audit_report.refresh_credentials = lambda repo=None: None
@@ -559,6 +566,14 @@ def test_audit_report_github_api_lifecycle_mocked(
             "SECURITY/SAFETY VIOLATION: Audit unexpectedly attempted to create a pull request!"
         )
 
+        # 5. Assert this run's report landed in the redirected store. Without
+        #    it the REPORTS_DIR patch above is invisible: `write_report` never
+        #    raises, so dropping the patch would move these writes back onto the
+        #    live store and nothing here would notice.
+        assert (tmp_path / "reports" / audit_id / "latest.json").is_file(), (
+            f"Expected '{audit_id}' finish to write latest.json under the test store."
+        )
+
     finally:
         audit_report.run_cmd = original_run_cmd
         audit_report.refresh_credentials = original_refresh
@@ -566,4 +581,5 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.repo_root = original_repo_root
         audit_report.GITOPS_WORKSPACE = original_workspace
         audit_report.SCRATCH_DIR = original_scratch
+        audit_report.REPORTS_DIR = original_reports
         audit_report.set_workspace(None)

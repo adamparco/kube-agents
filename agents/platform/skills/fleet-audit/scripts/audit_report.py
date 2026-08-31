@@ -1699,7 +1699,11 @@ def _atomic_write(path: Path, text: str) -> None:
         with handle:
             handle.write(text)
         os.replace(handle.name, path)
-    except OSError:
+    except BaseException:
+        # Not `except OSError`: anything that leaves the temp file behind
+        # leaves it in the store, where the ring prune globs `*.json` and so
+        # never collects it. An encode error is a `ValueError` and a Ctrl-C is
+        # not an `Exception` at all; both used to leak a `.tmp` per attempt.
         _unlink(handle.name)
         raise
 

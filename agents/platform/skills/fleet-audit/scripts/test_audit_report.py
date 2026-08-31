@@ -9030,6 +9030,21 @@ class TestReportStoreKeepsItsOwnPermissions(unittest.TestCase):
             audit_report._atomic_write(target, '{"a": 1}')
             self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
 
+    def test_a_failed_write_leaves_no_temp_file_in_the_store(self):
+        """Whatever the failure was — the ring prune will not collect it.
+
+        `write_report` drops its temp file into the store directory, and the
+        prune that bounds the ring globs `*.json`, so a leaked `.tmp` stays
+        for the life of the volume. An encode error is a `ValueError` and a
+        Ctrl-C is not an `Exception`; neither is the `OSError` the cleanup
+        used to be scoped to.
+        """
+        for label, text in (("encode error", "\ud800"), ("bad type", 7)):
+            with self.subTest(failure=label), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises((ValueError, TypeError)):
+                    audit_report._atomic_write(Path(tmp) / "latest.json", text)
+                self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), [])
+
 
 class TestFilesystemContainment(unittest.TestCase):
     """The string check is not containment; this is.
@@ -11922,16 +11937,25 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("profile-cron-tick", bullet)
 
     def test_an_on_demand_run_triggers_the_schedule_rather_than_re_enacting_it(self):
-        """On demand means trigger the job, never run the audit inline.
+        """On demand means get the tick to fire the job, never run it inline.
 
-        `hermes cron run` marks the job due and the next tick runs it in its
-        own process; `cronjob(action='run')` falls back to executing it inside
-        the calling session — which is the one turn budget five audits used to
-        share — wherever the runtime cannot take a detached result.
+        Both shortcuts run the job in the wrong process. `hermes cron run`
+        executes it in the CLI, which holds no gateway connection, so a
+        `deliver: chat` job — every governance job — is refused with
+        `blocked_config` and the schedule is left untouched; verified on the
+        live install on 2026-08-31. `cronjob(action='run')` falls back to
+        executing it inside the calling session — the one turn budget five
+        audits used to share — wherever the runtime cannot take a detached
+        result. What works is moving the schedule ahead and letting
+        `profile-cron-tick` take it.
         """
-        bullet = self.bullet("trigger the schedule, do not re-enact it")
-        self.assertIn("hermes cron run", bullet)
+        bullet = self.bullet("make the tick fire it early, do not re-enact it")
+        self.assertIn("hermes cron edit", bullet)
+        self.assertIn("--schedule", bullet)
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
+        # Both shortcuts named, so an agent that reaches for either is stopped
+        # by the bullet rather than by the failure.
+        self.assertIn("Do **not** use `hermes cron run", bullet)
         self.assertIn("cronjob(action='run')", bullet)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
