@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -1462,21 +1463,46 @@ AI_CREDENTIAL_ENV_NAME_RE = re.compile(
 AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE = re.compile(r"_(PATH|FILE|ID)$", re.IGNORECASE)
 
 
+# The name rule says a literal is there; only the value says whether it is a
+# secret. `HF_TOKEN=hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN` -- shipped in this
+# fleet's own ai-inference demo -- is the same shape to a name-only rule as a
+# live Hugging Face token, so any fleet carrying example manifests turns this
+# check into noise at `major`.
+AI_CREDENTIAL_PLACEHOLDER_RE = re.compile(
+    r"EXAMPLE|PLACEHOLDER|CHANGE_?ME|YOUR_|DUMMY|FAKE|SAMPLE|REDACTED|NOT_?A_?REAL|TODO|XXXX",
+    re.IGNORECASE,
+)
+# `$(FOO)` is Kubernetes' own env expansion, `${FOO}` and `{{ FOO }}` a
+# templater's: the literal holds a reference to a value kept elsewhere, which
+# is the opposite of the thing this check is looking for.
+AI_CREDENTIAL_REFERENCE_RE = re.compile(r"\$\(|\$\{|\{\{")
+
+
 def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict | None:
-    bad = []
+    bad, inert = [], []
     for c in _ai_containers(workload["spec"]):
         for e in c.get("env") or []:
-            name = e.get("name") or ""
+            name, value = e.get("name") or "", e.get("value")
             if (
-                e.get("value")
+                value
                 and e.get("valueFrom") is None
                 and AI_CREDENTIAL_ENV_NAME_RE.search(name)
                 and not AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE.search(name)
             ):
                 bad.append(f"{c.get('name', '')}:{name}")
+                if AI_CREDENTIAL_PLACEHOLDER_RE.search(value) or AI_CREDENTIAL_REFERENCE_RE.search(value):
+                    inert.append(f"{c.get('name', '')}:{name}")
     if not bad:
         return None
-    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"set with a literal value: {', '.join(bad)}"}
+    hit = {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"set with a literal value: {', '.join(bad)}"}
+    # Downgraded, never dropped: looking like a placeholder is not proof of
+    # being one, and suppressing a real credential is the worse error by far.
+    # A mixed workload keeps `major` -- one live token is not made safe by the
+    # placeholders beside it.
+    if len(inert) == len(bad):
+        hit["severity"] = "minor"
+        hit["excerpt"] += "; every value reads as a placeholder or an unexpanded reference, not a live secret"
+    return hit
 
 
 AI_FLOATING_TAG_RE = re.compile(r":(latest|main|master|dev|nightly|stable)$")
@@ -1495,6 +1521,19 @@ def check_model_image_floating_tag(workload: dict, context: dict) -> dict | None
     if not bad:
         return None
     return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": "; ".join(bad)}
+
+
+def _is_private_address(value: str) -> bool:
+    """Is this load-balancer address unreachable from the public internet?
+
+    A hostname is not resolved -- the collector makes no network calls -- so it
+    counts as public. That keeps the finding on something unverifiable rather
+    than dropping it, which is the safe direction for this check.
+    """
+    try:
+        return ipaddress.ip_address(value).is_private
+    except ValueError:
+        return False
 
 
 def check_inference_endpoint_public(context: dict) -> list[dict]:
@@ -1518,11 +1557,32 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         )
         if not matched:
             continue
+        # An annotation records what was asked for; `status.loadBalancer` records
+        # what was handed out, and it is already in the same dump. A Service whose
+        # every assigned address is private is not reachable from the internet
+        # whatever its annotations say, so calling it a public endpoint is just
+        # wrong. With no address yet the load balancer is still provisioning and
+        # the annotations are all there is -- the behaviour before this check
+        # looked at status at all.
+        assigned = [
+            addr
+            for addr in (
+                (ing.get("ip") or ing.get("hostname") or "")
+                for ing in ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+            )
+            if addr
+        ]
+        public = [addr for addr in assigned if not _is_private_address(addr)]
+        if assigned and not public:
+            continue
         hits.append(
             {
                 "namespace": ns,
                 "object": f"Service/{meta.get('name', '')}",
-                "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace",
+                # Naming the address makes the finding checkable: a reviewer can
+                # reach the endpoint, or fail to, without re-deriving it.
+                "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace"
+                + (f"; reachable at {', '.join(public)}" if public else ""),
             }
         )
     return hits

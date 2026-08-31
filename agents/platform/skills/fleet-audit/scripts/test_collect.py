@@ -2097,12 +2097,18 @@ def ai_workload(kind="Deployment", name="vllm-llama", ns="default", image="acme/
     return {"kind": kind, "metadata": {"namespace": ns, "name": name, "labels": {}}, "spec": spec}
 
 
-def ai_service(name, ns="default", selector=None, svc_type="LoadBalancer", annotations=None):
-    return {
+def ai_service(name, ns="default", selector=None, svc_type="LoadBalancer", annotations=None, ingress=None):
+    svc = {
         "kind": "Service",
         "metadata": {"namespace": ns, "name": name, "annotations": annotations or {}},
         "spec": {"type": svc_type, "selector": selector if selector is not None else {"app": name}},
     }
+    # Omitted entirely rather than left empty when `ingress` is None: a load
+    # balancer that has not been assigned an address yet has no `ingress` key,
+    # and that is the case the check falls back to annotations for.
+    if ingress is not None:
+        svc["status"] = {"loadBalancer": {"ingress": [{"ip": addr} for addr in ingress]}}
+    return svc
 
 
 class TestIsAiWorkload(unittest.TestCase):
@@ -2362,6 +2368,37 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
         self.assertIsNone(self.hit([{"name": "OPENAI_API_KEY_FILE", "value": "/etc/openai/key"}]))
         self.assertIsNone(self.hit([{"name": "MODEL_REGISTRY_KEY_ID", "value": "key-2026-01"}]))
 
+    def test_a_live_looking_token_keeps_the_default_severity(self):
+        self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": "hf_qMBpTvKzLdWnXaHrYuEjCiSoPfGb"}]).get("severity"))
+
+    def test_a_placeholder_is_reported_but_downgraded(self):
+        # The exact value the ai-inference demo ships in this fleet. Reported
+        # so nobody has to trust the heuristic, minor so it does not read as
+        # a leaked credential.
+        hit = self.hit([{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}])
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn("placeholder", hit["excerpt"])
+        self.assertIn("server:HF_TOKEN", hit["excerpt"])
+
+    def test_an_unexpanded_reference_is_downgraded(self):
+        for value in ("$(HF_TOKEN_REF)", "${HF_TOKEN}", "{{ .Values.hfToken }}"):
+            self.assertEqual(self.hit([{"name": "HF_TOKEN", "value": value}])["severity"], "minor")
+
+    def test_a_placeholder_beside_a_live_token_stays_major(self):
+        # One real credential is not made safe by the placeholders next to it,
+        # so the downgrade requires every value to be inert.
+        hit = self.hit(
+            [
+                {"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER"},
+                {"name": "OPENAI_API_KEY", "value": "sk-qMBpTvKzLdWnXaHrYuEj"},
+            ]
+        )
+        self.assertIsNone(hit.get("severity"))
+
+    def test_the_placeholder_value_still_never_reaches_the_excerpt(self):
+        hit = self.hit([{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}])
+        self.assertNotIn("NOT_A_REAL_TOKEN", hit["excerpt"])
+
 
 class TestModelImageFloatingTag(unittest.TestCase):
     def hit(self, image):
@@ -2433,6 +2470,43 @@ class TestInferenceEndpointPublic(unittest.TestCase):
     def test_the_selector_must_be_a_subset_not_an_exact_match(self):
         w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm", "tier": "serving"})
         svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        self.assertEqual(len(self.result(svc, [w])), 1)
+
+    def test_an_rfc1918_address_is_not_a_public_endpoint(self):
+        # The annotation says what was asked for; the assigned address says
+        # what was given. A private address means unreachable, so the finding
+        # would be untrue however the annotations read.
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["10.150.0.78"])
+        self.assertEqual(self.result(svc, [w]), [])
+
+    def test_a_routable_address_is_flagged_and_named_in_the_excerpt(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["136.70.153.197"])
+        hits = self.result(svc, [w])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("136.70.153.197", hits[0]["excerpt"])
+
+    def test_one_public_address_among_private_ones_still_counts(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["10.0.0.5", "136.70.153.197"])
+        hits = self.result(svc, [w])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("136.70.153.197", hits[0]["excerpt"])
+        self.assertNotIn("10.0.0.5", hits[0]["excerpt"])
+
+    def test_a_pending_load_balancer_still_falls_back_to_annotations(self):
+        # No address assigned yet, so status says nothing and the annotation
+        # is all there is -- the behaviour before this check read status.
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        self.assertEqual(len(self.result(ai_service("vllm-svc", selector={"app": "vllm"}, ingress=[]), [w])), 1)
+
+    def test_a_hostname_is_treated_as_public_rather_than_dropped(self):
+        # The collector resolves nothing, so an unresolvable address keeps the
+        # finding instead of silently clearing it.
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        svc["status"] = {"loadBalancer": {"ingress": [{"hostname": "a1b2.elb.amazonaws.com"}]}}
         self.assertEqual(len(self.result(svc, [w])), 1)
 
 
