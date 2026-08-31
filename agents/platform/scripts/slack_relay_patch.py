@@ -78,6 +78,31 @@ def relay_without_token() -> bool:
     return not os.getenv("SLACK_BOT_TOKEN", "").strip()
 
 
+def is_silent_text(message: Any) -> bool:
+    """Is this delivery a silent cron tick rather than something to post?
+
+    The sibling sender's predicate, imported rather than restated. Both senders
+    are handed the same cron output by the same ``_deliver_result``, and until
+    this they disagreed about it. ``is_silent_report`` undresses the marker
+    before testing; this end only tested for blank. So a scheduled audit that
+    emphasised its ``chat_summary`` — and every audit SOP tells a run to copy
+    that field verbatim, which on a quiet run makes the marker the whole of
+    what it emits — was suppressed on Google Chat and posted to Slack as
+    ``*[SILENT]*``. Upstream's matcher takes the marker bare and stops delivery
+    before either sender runs, so only the dressed form ever reaches here, and
+    only this end was still delivering it.
+
+    Falling back to the blank test leaves a deployment with no chat platform
+    installed behaving exactly as it did.
+    """
+    text = "" if message is None else str(message)
+    try:
+        from plugins.platforms.chat.adapter import is_silent_report
+    except Exception:
+        return not text.strip()
+    return bool(is_silent_report(text))
+
+
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
     """Read an upload without allowing it to grow past the relay limit."""
     if path.stat().st_size > max_file_bytes:
@@ -609,12 +634,14 @@ def install() -> None:
             # before formatting as well as after: a formatter that decorates
             # its input turns whitespace into a message worth sending, and
             # upstream's own guard — which only sees the formatted text —
-            # would let that through.
+            # would let that through. ``is_silent_text`` is the sibling
+            # sender's predicate, so a dressed ``[SILENT]`` is dropped on both
+            # legs rather than on one.
             blank = {"success": True, "platform": "slack", "skipped": "empty_text"}
-            if not message or not str(message).strip():
+            if is_silent_text(message):
                 return blank
             formatted = format_mrkdwn(module, message)
-            if not formatted or not str(formatted).strip():
+            if is_silent_text(formatted):
                 return blank
 
             target = str(chat_id or "")
