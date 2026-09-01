@@ -179,10 +179,15 @@ DEFAULT_MAX_PORTS_PER_VM = 65536
 # the old reading to see anything at all.
 DEFAULT_NETWORK_MTU = 1460
 
-# The segment a network self-link or peering URL is truncated at to key it. Both
-# arrive as full `https://.../compute/v1/projects/<p>/global/networks/<n>` URLs;
-# everything before this marker is API-version boilerplate that two equal
-# networks can still disagree about.
+# Where a network reference starts carrying meaning. A `selfLink` is always a
+# full `https://.../compute/v1/projects/<p>/global/networks/<n>` URL, and
+# everything before this marker is API-version boilerplate two equal networks
+# can still disagree about — so the key is the URL truncated here.
+#
+# A `peerings[].network` is *not* always full: the API documents a partial
+# reference as meaning the current network's own project. Those carry no
+# `projects/` segment at all, so `_network_key` uses the same marker the other
+# way round, as the prefix it synthesises the missing qualification onto.
 NETWORK_URL_PROJECT_MARKER = "projects/"
 
 SEVERITY = {
