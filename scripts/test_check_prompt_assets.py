@@ -801,6 +801,43 @@ class CronDeliveryTests(unittest.TestCase):
             self._findings({"id": "j", "deliver": "slack:D0BKGRBM6RH:17"}), []
         )
 
+    def test_a_misspelled_prefix_drops_exactly_as_a_misspelled_bare_value_does(self):
+        """Skipping a part on sight of a colon let this shape through.
+
+        `gchat:spaces/AAA` resolves to no platform and drops silently, which
+        is the same silence a bare `gchat` buys -- so the prefix is checked
+        the same way the bare value is.
+        """
+        for deliver in ("gchat:spaces/AAA", "gchat:spaces/AAA:thread-1"):
+            with self.subTest(deliver=deliver):
+                findings = self._findings({"id": "j", "deliver": deliver})
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn(f"'{deliver}'", str(findings[0]))
+
+    def test_an_empty_prefix_is_caught_where_an_empty_part_is_not(self):
+        """Two different things that both look like "nothing before the colon".
+
+        `"chat,,slack"` is a stray comma -- the scheduler ignores it and no
+        delivery is lost. `":C123"` names no platform, resolves to nothing and
+        drops silently, so it is the failure this check exists for. One
+        emptiness test cannot serve both.
+        """
+        self.assertEqual(self._findings({"id": "j", "deliver": "chat,,slack"}), [])
+        for deliver in (":C123", ":", "slack:C1,:C2"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(len(self._findings({"id": "j", "deliver": deliver})), 1)
+
+    def test_the_gate_is_no_stricter_than_the_parser_it_guards(self):
+        """`sibling_delivery_targets` lowercases and splits on `;` as well as `,`.
+
+        Both shapes run; flagging them would block a pull request over a value
+        the runtime delivers fine.
+        """
+        for deliver in ("Slack:C123", "ALL", "chat;slack", "chat; slack"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
+        self.assertEqual(len(self._findings({"id": "j", "deliver": "chat;gchat"})), 1)
+
     def test_every_part_of_a_comma_separated_list_is_checked(self):
         """One good part must not vouch for a bad one.
 

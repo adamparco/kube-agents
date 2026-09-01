@@ -751,16 +751,26 @@ def check_cron_delivery() -> list[Finding]:
             deliver = job.get("deliver", "local")
             # The scheduler accepts a list and flattens it; so do we, rather
             # than reporting a shape it would have run happily.
-            parts = deliver if isinstance(deliver, (list, tuple)) else str(deliver).split(",")
+            # `;` as well as `,`, and case-folded below, because that is what
+            # the runtime splitter does (`sibling_delivery_targets` in
+            # `deploy/docker/plugins/chat/adapter.py`). A gate stricter than
+            # the parser it guards rejects values that would have worked.
+            parts = deliver if isinstance(deliver, (list, tuple)) else re.split(r"[,;]", str(deliver))
             for part in (str(p).strip() for p in parts):
+                # An empty part is `"chat,,slack"` -- a stray comma, which the
+                # scheduler ignores and which costs no delivery. An empty
+                # *prefix* is `":C123"`, which resolves to no platform and
+                # drops silently, so the two cannot share a skip.
+                if not part:
+                    continue
                 # `platform:chat_id[:thread]` names its target outright. The id
                 # is install-specific and unknowable here, but the platform in
                 # front of it is neither -- and a misspelled prefix drops
                 # exactly as a misspelled bare value does, so it is checked the
                 # same way. Skipping the whole part on sight of a colon let
                 # `gchat:spaces/AAA` through, which is the silent shape.
-                name = part.split(":", 1)[0].strip()
-                if not name or name in CRON_DELIVER_VALUES:
+                name = part.split(":", 1)[0].strip().lower()
+                if name in CRON_DELIVER_VALUES:
                     continue
                 findings.append(
                     Finding(
