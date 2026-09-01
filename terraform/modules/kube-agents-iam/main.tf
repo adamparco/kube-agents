@@ -55,9 +55,9 @@ resource "google_service_account_iam_member" "workload_identity" {
 resource "google_project_iam_custom_role" "subnet_utilization_reader" {
   count = length(var.project_roles) > 0 ? 1 : 0
 
-  project     = var.project_id
-  role_id     = "kubeagentsSubnetUtilizationReader"
-  title       = "Kube-Agents Subnet Utilization Reader"
+  project = var.project_id
+  role_id = "kubeagentsSubnetUtilizationReader"
+  title   = "Kube-Agents Subnet Utilization Reader"
   # This string is what the GCP console shows an operator reviewing the role, so it
   # carries the same correction as the comment above rather than the read-framing the
   # comment rejects. Changing it is an in-place update of the role on the next apply;
