@@ -2908,10 +2908,12 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// loopback bearer, which is not conditional on anything; see the next test.
+	// two unconditional pins, neither of which is about chat: the loopback bearer (see
+	// the next test) and the PVC's directory mode.
 	bare := renderManagedEnv(newTestPlatformAgent())
-	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"; got != want {
-		t.Errorf("renderManagedEnv with no integration = %q, want %q", got, want)
+	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\nHERMES_HOME_MODE=" + hermesHomeMode + "\n"
+	if bare != want {
+		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
 }
 
@@ -3110,6 +3112,19 @@ func TestHermesHomeModeGrantsTheCredentialProxyGroupAccess(t *testing.T) {
 	if dashMode, ok := envValue(dash, "HERMES_HOME_MODE"); !ok || dashMode != raw {
 		t.Errorf("HERMES_HOME_MODE = %q on the dashboard but %q on the gateway (found=%v); both run "+
 			"hermes against the same PVC, so they must agree", dashMode, raw, ok)
+	}
+
+	// Container.Env is the LOWEST of the three layers hermes reads — the managed .env
+	// beats the PVC .env beats the process environment — so the two assertions above
+	// establish the operator's intent and not the outcome. One `HERMES_HOME_MODE=0777`
+	// line in $HERMES_HOME/.env outranks them, the agent can write that line, and
+	// sandbox-credential-cleanup does not remove it, so it survives upgrades. Every
+	// directory hermes secures on the shared PVC widens and the pod stays green.
+	// The pin in renderManagedEnv is what makes the mode above the value that holds.
+	managed := renderManagedEnv(newTestPlatformAgent())
+	if !strings.Contains(managed, "HERMES_HOME_MODE="+raw+"\n") {
+		t.Errorf("HERMES_HOME_MODE is %q in the container env but not pinned in the managed .env:\n%s",
+			raw, managed)
 	}
 }
 
@@ -3603,6 +3618,11 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// every directory hermes secures on the shared PVC — 0777 would open the agent's
 	// sessions, memories and logs to anything else that mounts it — and nothing about the
 	// widened tree surfaces as an unhealthy pod.
+	//
+	// A plugin is not the only writer that can reach this name, and this assertion covers
+	// only the plugin. The PVC .env outranks Container.Env whatever a plugin does, which
+	// is why the value is pinned in renderManagedEnv too; see the tail of
+	// TestHermesHomeModeGrantsTheCredentialProxyGroupAccess.
 	if env["HERMES_HOME_MODE"] != hermesHomeMode {
 		t.Errorf("plugin must not be able to override HERMES_HOME_MODE, got %q",
 			env["HERMES_HOME_MODE"])
