@@ -56,3 +56,21 @@ variable "project_roles" {
     "roles/mcp.toolUser",
   ]
 }
+
+variable "subnet_utilization_role_id" {
+  description = <<-EOT
+    Role ID of the custom role carrying the fleet audit's subnet-utilization
+    permissions. Change it only to get past a name GCP is still holding: a
+    terraform destroy soft-deletes the role and the name stays reserved for
+    between 7 and 37 days, during most of which it can be neither created nor
+    updated. Ignored when project_roles is empty, since the role is not
+    created then.
+  EOT
+  type        = string
+  default     = "kubeagentsSubnetUtilizationReader"
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9_.]{3,64}$", var.subnet_utilization_role_id))
+    error_message = "subnet_utilization_role_id must be 3-64 characters of letters, digits, underscores or dots. GCP rejects hyphens in a custom role id."
+  }
+}

@@ -225,9 +225,10 @@ module "gke_backup_plan" {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id    = var.project_id
-  namespace     = var.namespace
-  project_roles = local.agent_project_roles
+  project_id                 = var.project_id
+  namespace                  = var.namespace
+  project_roles              = local.agent_project_roles
+  subnet_utilization_role_id = var.subnet_utilization_role_id
 
   # module.gke_cluster, and not only the API enablements, because the module's
   # workload_identity binding names the pool as an interpolated string

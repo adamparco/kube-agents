@@ -114,6 +114,12 @@ variable "project_roles" {
   default     = null
 }
 
+variable "subnet_utilization_role_id" {
+  description = "Role ID of the custom role carrying the fleet audit's subnet-utilization permissions. The installer never writes this into terraform.tfvars, so TF_VAR_subnet_utilization_role_id reaches it. Change it only to get past a name GCP is still holding: uninstalling soft-deletes the role and the name stays reserved for between 7 and 37 days, during most of which a reinstall cannot recreate it."
+  type        = string
+  default     = "kubeagentsSubnetUtilizationReader"
+}
+
 variable "image_tag" {
   description = "Image tag for both the operator and the platform agent. Required because a checkout's Chart.yaml carries an appVersion placeholder that never matches a published image tag, so the chart's tag defaulting cannot work from a checkout. `latest` is fine for evaluation; set an `X.Y.Z` release tag for production."
   type        = string
