@@ -1493,6 +1493,11 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
         # [coming back] as `containers: litellm-container`" as the detail loss
         # it exists to stop -- and then publishes this excerpt over the model's,
         # so the collector has to be the one carrying the detail.
+        # `allowPrivilegeEscalation` and `capabilities` have no pod-level
+        # fallback to read: `PodSecurityContext` carries neither field, so the
+        # container's own value is the only one there is.
+        allow_escalation = c_sc.get("allowPrivilegeEscalation")
+        dropped = [str(cap).upper() for cap in ((c_sc.get("capabilities") or {}).get("drop") or [])]
         reasons = []
         if non_root is not True:
             reasons.append(f"runAsNonRoot={json.dumps(non_root)}")
@@ -1500,6 +1505,10 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
             reasons.append("runAsUser=0")
         if seccomp_type not in ("RuntimeDefault", "Localhost"):
             reasons.append(f"seccompProfile.type={seccomp_type or 'absent'}")
+        if allow_escalation is not False:
+            reasons.append(f"allowPrivilegeEscalation={json.dumps(allow_escalation)}")
+        if "ALL" not in dropped:
+            reasons.append(f"capabilities.drop={json.dumps(dropped)}")
         if reasons:
             bad.append(f"{container.get('name', '')} ({', '.join(reasons)})")
     if not bad:
@@ -2151,9 +2160,11 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         check_podsecurity_gaps,
         "minor",
         None,
-        "Containers run as root and/or without a seccomp filter, so a "
-        "runtime escape has an unfiltered syscall surface and immediate "
-        "root in the namespace it reaches.",
+        "Containers miss the container-level settings the restricted Pod "
+        "Security Standard requires: running as root, an unfiltered syscall "
+        "surface, retained Linux capabilities, or privilege escalation left "
+        "enabled. A runtime escape starts with capabilities to use rather "
+        "than having to acquire them.",
     ),
 )
 

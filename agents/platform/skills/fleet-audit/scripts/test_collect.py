@@ -2184,6 +2184,18 @@ class TestPublicControlPlane(unittest.TestCase):
 
 
 class TestPodSecurityGaps(unittest.TestCase):
+    # Every container-level setting the restricted Pod Security Standard
+    # requires. A fixture short of one of these is a non-compliant container,
+    # so "compliant" has to name them all or the control tests are asserting
+    # against the check's blind spot rather than against compliance.
+    COMPLIANT = {
+        "runAsNonRoot": True,
+        "runAsUser": 10001,
+        "seccompProfile": {"type": "RuntimeDefault"},
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+    }
+
     def wl(self, container_sc=None, pod_sc=None):
         d = compliance_pod("x")
         if container_sc is not None:
@@ -2196,46 +2208,85 @@ class TestPodSecurityGaps(unittest.TestCase):
         self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(), context_of()))
 
     def test_full_compliant_context_is_not_flagged(self):
-        sc = {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}}
-        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(container_sc=self.COMPLIANT), context_of()))
 
     def test_explicit_false_over_a_compliant_pod_default_is_still_flagged(self):
         # The has()-vs-// distinction the SOP is emphatic about: a container
         # explicitly setting runAsNonRoot: false must not inherit a
         # compliant pod-level true.
-        wl = self.wl(
-            container_sc={"runAsNonRoot": False, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}},
-            pod_sc={"runAsNonRoot": True},
-        )
-        self.assertIsNotNone(collect.check_podsecurity_gaps(wl, context_of()))
+        wl = self.wl(container_sc={**self.COMPLIANT, "runAsNonRoot": False}, pod_sc={"runAsNonRoot": True})
+        hit = collect.check_podsecurity_gaps(wl, context_of())
+        self.assertEqual(hit["excerpt"], "containers: app (runAsNonRoot=false)")
 
     def test_runAsUser_zero_is_flagged_even_with_nonroot_true(self):
-        sc = {"runAsNonRoot": True, "runAsUser": 0, "seccompProfile": {"type": "RuntimeDefault"}}
-        self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+        hit = collect.check_podsecurity_gaps(self.wl(container_sc={**self.COMPLIANT, "runAsUser": 0}), context_of())
+        self.assertEqual(hit["excerpt"], "containers: app (runAsUser=0)")
 
-    def test_the_excerpt_names_which_of_the_three_settings_failed(self):
-        """Three independent settings decide this check, and the excerpt is
+    def test_the_excerpt_names_which_of_the_five_settings_failed(self):
+        """Five independent settings decide this check, and the excerpt is
         published verbatim -- `adopt_collector_evidence` overwrites whatever the
         model wrote with it. A bare container name would tell a reader a
         workload is non-compliant without telling them what to change, and the
         fix for `runAsUser=0` is not the fix for a missing seccomp profile."""
-        sc = {"runAsNonRoot": True, "runAsUser": 0, "seccompProfile": {"type": "RuntimeDefault"}}
-        only_uid = collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of())
+        only_uid = collect.check_podsecurity_gaps(
+            self.wl(container_sc={**self.COMPLIANT, "runAsUser": 0}), context_of()
+        )
         self.assertEqual(only_uid["excerpt"], "containers: app (runAsUser=0)")
+
+        only_caps = collect.check_podsecurity_gaps(
+            self.wl(container_sc={**self.COMPLIANT, "capabilities": {"drop": ["NET_RAW"]}}), context_of()
+        )
+        self.assertEqual(only_caps["excerpt"], 'containers: app (capabilities.drop=["NET_RAW"])')
 
         everything = collect.check_podsecurity_gaps(self.wl(), context_of())
         self.assertEqual(
             everything["excerpt"],
-            "containers: app (runAsNonRoot=null, seccompProfile.type=absent)",
+            "containers: app (runAsNonRoot=null, seccompProfile.type=absent, "
+            "allowPrivilegeEscalation=null, capabilities.drop=[])",
         )
 
     def test_missing_seccomp_profile_is_flagged(self):
-        sc = {"runAsNonRoot": True, "runAsUser": 10001}
+        sc = {k: v for k, v in self.COMPLIANT.items() if k != "seccompProfile"}
         self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
 
+    def test_privilege_escalation_left_enabled_is_flagged(self):
+        """A container hardened on the other four still escalates to root the
+        moment a setuid binary runs, which is the whole point of the setting."""
+        sc = {k: v for k, v in self.COMPLIANT.items() if k != "allowPrivilegeEscalation"}
+        hit = collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of())
+        self.assertEqual(hit["excerpt"], "containers: app (allowPrivilegeEscalation=null)")
+
+    def test_retained_capabilities_are_flagged(self):
+        """`drop: [ALL]` is what restricted requires; dropping some of them is
+        not most of the way there, it is a container that kept CAP_NET_ADMIN."""
+        sc = {**self.COMPLIANT, "capabilities": {"drop": ["NET_RAW", "SYS_CHROOT"]}}
+        self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+
+    def test_dropping_all_in_lower_case_still_counts(self):
+        sc = {**self.COMPLIANT, "capabilities": {"drop": ["all"]}}
+        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+
     def test_pod_level_inheritance_is_honored_when_container_is_silent(self):
-        sc = {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}}
-        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(pod_sc=sc), context_of()))
+        """Only for the fields that have it. `runAsNonRoot`, `runAsUser` and
+        `seccompProfile` exist on `PodSecurityContext` and inherit; the
+        container is silent on all three here and still grades clean."""
+        inheritable = {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}}
+        container_only = {k: v for k, v in self.COMPLIANT.items() if k not in inheritable}
+        self.assertIsNone(
+            collect.check_podsecurity_gaps(self.wl(container_sc=container_only, pod_sc=inheritable), context_of())
+        )
+
+    def test_allow_privilege_escalation_does_not_inherit_from_the_pod(self):
+        """`PodSecurityContext` carries neither `allowPrivilegeEscalation` nor
+        `capabilities`, so a pod-level value is not a value the kubelet reads.
+        Falling back to one would grade a container clean on a setting nothing
+        applied to it."""
+        container_only = {k: v for k, v in self.COMPLIANT.items() if k != "allowPrivilegeEscalation"}
+        hit = collect.check_podsecurity_gaps(
+            self.wl(container_sc=container_only, pod_sc={"allowPrivilegeEscalation": False}), context_of()
+        )
+        self.assertIsNotNone(hit)
+        self.assertIn("allowPrivilegeEscalation", hit["excerpt"])
 
     def test_already_flagged_by_privileged_container_is_suppressed_here(self):
         d = compliance_pod("x")
