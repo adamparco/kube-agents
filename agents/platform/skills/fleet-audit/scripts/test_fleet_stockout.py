@@ -200,6 +200,50 @@ class CccMissingFallbacksTest(unittest.TestCase):
         self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
 
     def test_does_not_flag_multi_zone_and_family(self):
+        # `location.zones` is the CRD field. This fixture used to write a
+        # top-level `zones`, which no ComputeClass has, so it passed on the
+        # family dimension alone and never exercised the zone one.
+        cc = compute_class(
+            "cc1",
+            [
+                {"machineFamily": "c3", "location": {"zones": ["us-central1-a"]}},
+                {"machineFamily": "n4", "location": {"zones": ["us-central1-b"]}},
+            ],
+        )
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
+
+    def test_zone_variation_alone_is_a_dimension_and_the_excerpt_shows_it(self):
+        """Zone was scored 0 on every class in the fleet: the code read a
+        top-level `priorities[].zones` and the CRD spells it `location.zones`,
+        so §3.1 counted three dimensions while publishing "N/4"."""
+        cc = compute_class(
+            "cc1",
+            [
+                {"machineFamily": "c3", "location": {"zones": ["us-central1-a"]}},
+                {"machineFamily": "c3", "location": {"zones": ["us-central1-b"]}},
+            ],
+        )
+        hit = fs.check_ccc_missing_fallbacks(cc)
+        self.assertIsNotNone(hit)  # one dimension varies, not two
+        self.assertIn("1/4", hit["excerpt"])
+        self.assertIn("us-central1-b", hit["excerpt"])
+
+    def test_specific_reservation_zones_count_as_zone_variation(self):
+        # `location.zones` cannot be combined with `affinity: Specific`, so a
+        # chain using specific reservations spells its spread in
+        # `reservations.specific[].zones` instead.
+        cc = compute_class(
+            "cc1",
+            [
+                {"machineFamily": "c3", "reservations": {"affinity": "Specific", "specific": [{"zones": ["us-central1-a"]}]}},
+                {"machineFamily": "n4", "reservations": {"affinity": "Specific", "specific": [{"zones": ["us-central1-b"]}]}},
+            ],
+        )
+        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
+
+    def test_a_top_level_zones_key_is_not_the_crd_field(self):
+        # The spelling that masked the bug. Nothing reads it, so a chain
+        # varying only this still scores 1/4 on family alone.
         cc = compute_class(
             "cc1",
             [
@@ -207,7 +251,9 @@ class CccMissingFallbacksTest(unittest.TestCase):
                 {"machineFamily": "n4", "zones": ["us-central1-b"]},
             ],
         )
-        self.assertIsNone(fs.check_ccc_missing_fallbacks(cc))
+        hit = fs.check_ccc_missing_fallbacks(cc)
+        self.assertIsNotNone(hit)
+        self.assertIn("zones=[]", hit["excerpt"])
 
     def test_no_priorities_is_not_a_crash(self):
         self.assertIsNone(fs.check_ccc_missing_fallbacks(compute_class("cc1", [])))

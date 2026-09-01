@@ -283,6 +283,29 @@ def _priority_size_class(p: dict) -> str:
     return m.group(1) if m else ""
 
 
+def _priority_zones(p: dict) -> tuple[str, ...]:
+    """The zones a priority will attempt, from either of the CRD's two homes.
+
+    `location.zones` is the field, per
+    `skills/gke-compute-classes/references/compute-class-crd-fields.md`. There
+    is no top-level `priorities[].zones`, so reading one scored the Zone
+    dimension 0 on every ComputeClass in the fleet and left §3.1 counting three
+    dimensions while calling it four -- a chain whose priorities differ only in
+    zone and one other dimension scored 1/4 and published `critical`.
+
+    `reservations.specific[].zones` is the second home: the same reference notes
+    that `location.zones` cannot be combined with `affinity: Specific`, so a
+    chain using specific reservations expresses its zone spread there instead.
+    """
+    location_zones = (p.get("location") or {}).get("zones") or []
+    reserved_zones = [
+        zone
+        for entry in ((p.get("reservations") or {}).get("specific") or [])
+        for zone in (entry.get("zones") or [])
+    ]
+    return tuple(sorted(set(location_zones) | set(reserved_zones)))
+
+
 def _priority_is_pod_family(p: dict) -> bool:
     """Does this priority delegate the machine shape to GKE rather than name one?
 
@@ -321,13 +344,13 @@ def check_ccc_missing_fallbacks(cc: dict) -> dict | None:
     families = {_priority_family(p) for p in priorities if _priority_family(p)}
     spots = {_priority_is_spot(p) for p in priorities}
     sizes = {_priority_size_class(p) for p in priorities if _priority_size_class(p)}
-    zones = {tuple(sorted(p.get("zones") or [])) for p in priorities if p.get("zones")}
+    zones = {_priority_zones(p) for p in priorities if _priority_zones(p)}
     dimensions_varied = sum(1 for s in (families, spots, sizes, zones) if len(s) > 1)
     if dimensions_varied >= 2:
         return None
     return {
         "object": f"ComputeClass/{cc['metadata']['name']}",
-        "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)})",
+        "excerpt": f"priorities vary {dimensions_varied}/4 obtainability dimensions (families={sorted(families)}, spot-mix={sorted(spots)}, sizes={sorted(sizes)}, zones={sorted(zones)})",
     }
 
 
