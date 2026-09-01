@@ -227,8 +227,15 @@ class TestNoRequests(unittest.TestCase):
 
     def test_a_besteffort_pod_keeps_the_checks_own_impact(self):
         # Nothing declared anywhere: the pod really is BestEffort and really is
-        # evicted first, so the hit must NOT override the Impact.
-        self.assertNotIn("impact", self.check(self.wl(resources={})))
+        # evicted first, so this arm publishes the check's own sentence. It is
+        # set on the hit rather than left to `CheckSpec.impact` so the arm is
+        # flagged authoritative like the other two -- an arm that falls through
+        # to the table is one `adopt_arm_impact` never reaches, and the model
+        # is then free to publish a Burstable sentence over a BestEffort pod.
+        hit = self.check(self.wl(resources={}))
+        self.assertEqual(hit["impact"], collect._IMPACT_BEST_EFFORT)
+        self.assertIn("first evicted", hit["impact"])
+        self.assertNotIn("Burstable", hit["impact"])
 
     def test_a_burstable_pod_is_not_called_first_evicted(self):
         # A cpu request and no memory request. Ubiquitous as a shape --
@@ -364,12 +371,14 @@ class TestNoRequests(unittest.TestCase):
         # own "first evicted" is true. Calling it Burstable would state the
         # exact inverse.
         hit = self.check(self.wl(resources={"limits": {"nvidia.com/gpu": "1"}}))
-        self.assertNotIn("impact", hit)
+        self.assertEqual(hit["impact"], collect._IMPACT_BEST_EFFORT)
 
     def test_an_explicit_zero_request_leaves_the_pod_besteffort(self):
         # A quantity has to be greater than zero to count.
-        self.assertNotIn("impact", self.check(self.wl(resources={"requests": {"cpu": "0"}})))
-        self.assertNotIn("impact", self.check(self.wl(resources={"limits": {"memory": "0Mi"}})))
+        for resources in ({"requests": {"cpu": "0"}}, {"limits": {"memory": "0Mi"}}):
+            with self.subTest(resources=resources):
+                hit = self.check(self.wl(resources=resources))
+                self.assertEqual(hit["impact"], collect._IMPACT_BEST_EFFORT)
 
     def test_a_zero_limit_does_not_make_a_pod_guaranteed(self):
         hit = self.check(self.wl(resources={"limits": {"cpu": "1", "memory": "0"}}))
@@ -1318,6 +1327,32 @@ class TestCollectCluster(unittest.TestCase):
         by_slug = {c["check"]: c for c in result["candidates"]}
         self.assertEqual(by_slug["no-requests"]["severity"], "minor")
         self.assertEqual(by_slug["no-memory-limit"]["severity"], "major")
+        # The downgrade rewrites `impact`, and the arm flag has to survive it:
+        # an Autopilot candidate whose sentence lost the marker would let the
+        # model's guess at the QoS class publish on exactly the clusters where
+        # the platform, not the manifest, decides it.
+        self.assertIs(by_slug["no-requests"]["impact_authoritative"], True)
+        self.assertIn("Autopilot: severity downgraded", by_slug["no-requests"]["impact"])
+
+    def test_only_a_check_whose_hit_wrote_its_own_impact_is_authoritative(self):
+        """The flag `adopt_arm_impact` keys off, at the point it is set.
+
+        `no-requests` picks one of several QoS sentences per hit, so which one
+        fired is an observation the model cannot reliably infer from the
+        excerpt. `no-memory-limit` means one thing, its `impact` is the spec
+        constant, and the model's object-specific rewrite of a constant is
+        usually the better sentence -- so it must stay unflagged.
+        """
+        result, _ = self.collect([deployment("api")])
+        by_slug = {c["check"]: c for c in result["candidates"]}
+        self.assertIs(by_slug["no-requests"]["impact_authoritative"], True)
+        for slug in ("no-memory-limit", "no-pdb"):
+            with self.subTest(check=slug):
+                self.assertNotIn("impact_authoritative", by_slug[slug])
+                self.assertEqual(
+                    by_slug[slug]["impact"],
+                    next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == slug).impact,
+                )
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])

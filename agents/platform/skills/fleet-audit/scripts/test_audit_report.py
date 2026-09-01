@@ -7849,6 +7849,115 @@ class TestAdoptCollectorEvidence(unittest.TestCase):
             self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
 
 
+class TestAdoptArmImpact(unittest.TestCase):
+    """A multi-arm check's `impact` reports *which arm fired*, so the collector
+    authors it — see `audit_report.adopt_arm_impact`. Everywhere else the
+    model's sentence stands, which is the narrowness the class below defends.
+    """
+
+    ARM = (
+        "Node pool is locked to a single zone: a stockout in that zone halts "
+        "scale-up of this pool, and pods only this pool can host stay Pending."
+    )
+
+    def candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies",
+            "impact": self.ARM,
+            "impact_authoritative": True,
+            "needs_triage": None,
+        }
+        cand.update(overrides)
+        return cand
+
+    def manifest(self, candidates, name="prod-us-east"):
+        return {"clusters": [{"name": name, "outcome": "collected", "candidates": candidates}]}
+
+    def test_the_collectors_arm_sentence_replaces_the_models(self):
+        finding = make_finding(impact="model guessed the other arm")
+        adopted = audit_report.adopt_arm_impact([finding], self.manifest([self.candidate()]))
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["impact"], self.ARM)
+
+    def test_an_unflagged_candidate_leaves_the_models_impact_alone(self):
+        """The reason this function is not `adopt_collector_evidence` for prose.
+
+        Measured over the 106 findings in this install's eight latest reports,
+        67 published the check's constant verbatim and 39 diverged — and the
+        divergences are what the constant cannot say. `idle-namespace` reads
+        "a namespace with no running workload still holds a load balancer or
+        bound storage" in the table; the model published the namespace's actual
+        `ResourceQuota` and the 10 vCPU / 20 GiB of headroom it strands.
+        Adopting the table everywhere would delete all 39.
+        """
+        cand = self.candidate()
+        del cand["impact_authoritative"]
+        finding = make_finding(impact="names the actual ResourceQuota")
+        self.assertEqual(audit_report.adopt_arm_impact([finding], self.manifest([cand])), [])
+        self.assertEqual(finding["impact"], "names the actual ResourceQuota")
+
+    def test_nothing_but_impact_is_taken_from_the_candidate(self):
+        """The mirror of `adopt_collector_evidence`'s own rule. Severity is
+        re-judged against fleet context and evidence has its own adopter; this
+        function has one field.
+        """
+        finding = make_finding(severity="critical", excerpt="model excerpt")
+        audit_report.adopt_arm_impact([finding], self.manifest([self.candidate()]))
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["evidence"]["excerpt"], "model excerpt")
+
+    def test_a_candidate_without_a_cluster_field_still_joins(self):
+        """The shape the four procedural collectors emit — `fleet_stockout`
+        among them, which is the collector that has a two-arm check at all.
+        """
+        cand = self.candidate()
+        del cand["cluster"]
+        finding = make_finding(impact="model guessed the other arm")
+        self.assertEqual(
+            audit_report.adopt_arm_impact([finding], self.manifest([cand])),
+            ["no-network-policy"],
+        )
+        self.assertEqual(finding["impact"], self.ARM)
+
+    def test_a_blank_arm_impact_adopts_nothing(self):
+        """A flag over an empty string would blank the finding's only statement
+        of consequence — worse than the sentence it was meant to correct.
+        """
+        for impact in ("", "   ", None):
+            finding = make_finding(impact="model sentence")
+            self.assertEqual(
+                audit_report.adopt_arm_impact(
+                    [finding], self.manifest([self.candidate(impact=impact)])
+                ),
+                [],
+            )
+            self.assertEqual(finding["impact"], "model sentence")
+
+    def test_adoption_is_idempotent(self):
+        manifest = self.manifest([self.candidate()])
+        finding = make_finding(impact="model guessed the other arm")
+        self.assertEqual(len(audit_report.adopt_arm_impact([finding], manifest)), 1)
+        self.assertEqual(audit_report.adopt_arm_impact([finding], manifest), [])
+
+    def test_a_finding_the_collector_did_not_propose_is_left_alone(self):
+        finding = make_finding(cluster="stage-eu", impact="model sentence")
+        self.assertEqual(
+            audit_report.adopt_arm_impact([finding], self.manifest([self.candidate()])), []
+        )
+        self.assertEqual(finding["impact"], "model sentence")
+
+    def test_no_manifest_changes_nothing(self):
+        finding = make_finding(impact="model sentence")
+        for manifest in (None, {}, {"clusters": []}):
+            self.assertEqual(audit_report.adopt_arm_impact([finding], manifest), [])
+            self.assertEqual(finding["impact"], "model sentence")
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The --manifest-file CLI wiring in handle_finish."""
 
@@ -7925,6 +8034,86 @@ class TestFinishManifestFlag(HarnessTestCase):
         # The model's two strings are gone, not merely joined by the truth.
         self.assertNotIn("No resources found in payments namespace.", body)
         self.assertNotIn("kubectl get networkpolicy -n payments\n", body)
+
+    def test_a_corrected_arm_sentence_beats_the_carry(self):
+        """The ordering, asserted end to end. `adopt_arm_impact` is unit-tested
+        above; nothing but this fails if the call moves back above
+        `carry_unchanged_findings`.
+
+        Carry's trigger is byte-identical evidence and `adopt_collector_evidence`
+        exists to make evidence byte-identical, so the two together freeze a
+        multi-arm check's published sentence the moment it first appears in the
+        ledger. Live, `single-zone-nodepool` published "locked to a single zone
+        **or** near its scaling ceiling: any zonal stockout **or scale event**
+        halts cluster auto-scaling" over a pool that is zone-locked and at half
+        its ceiling. Correcting the collector fixes nothing without this: the
+        finding already exists, its evidence has not moved, and the run would
+        keep republishing the old text forever.
+        """
+        command = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
+        excerpt = "zero NetworkPolicies in payments"
+        stale = (
+            "locked to a single zone or near its scaling ceiling: any zonal "
+            "stockout or scale event halts cluster auto-scaling"
+        )
+        corrected = (
+            "Node pool is locked to a single zone: a stockout in that zone "
+            "halts scale-up of this pool. Other pools keep scaling."
+        )
+        # The previous run, with the collector's evidence already adopted --
+        # which is what makes this run's evidence byte-identical to it.
+        self.seed_store(
+            make_doc(
+                findings=[make_finding(command=command, excerpt=excerpt, impact=stale)]
+            )
+        )
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [
+                        {
+                            "check": c,
+                            "command": command if c == "netpol-missing" else f"ran {c}",
+                            "rc": 0,
+                        }
+                        for c in audit_report.audit_checks(AUDIT)
+                    ],
+                    "candidates": (
+                        [
+                            {
+                                "check": "netpol-missing",
+                                "cluster": "prod-us-east",
+                                "namespace": "payments",
+                                "object": "Namespace/no-network-policy",
+                                "severity": "major",
+                                "excerpt": excerpt,
+                                "impact": corrected,
+                                "impact_authoritative": True,
+                                "needs_triage": None,
+                            }
+                        ]
+                        if name == "prod-us-east"
+                        else []
+                    ),
+                }
+                for name in ("prod-us-east", "stage-eu")
+            ]
+        }
+        doc = make_doc(
+            findings=[
+                make_finding(command=command, excerpt=excerpt, impact="the model's own guess")
+            ]
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+        body = self.harness.bodies_for("issue", "edit")[0]
+        self.assertIn(corrected, body)
+        self.assertNotIn(stale, body)
+        self.assertNotIn("the model's own guess", body)
 
     def test_a_failing_manifest_rejects_before_any_publish(self):
         manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "commands": []}]}

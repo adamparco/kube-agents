@@ -567,6 +567,17 @@ _IMPACT_CEILING_RESERVED = (
 # kubelet does not rank by class -- it sorts on whether usage exceeds requests,
 # then Pod Priority, then usage relative to requests. Replacing one false
 # eviction claim with another is the mistake this Impact already made once.
+# §3.1's third arm. Named rather than left to `CheckSpec.impact` so the hit can
+# set it like the other two: an arm that falls through to the table default is
+# an arm `adopt_arm_impact` never sees, and the model is then free to publish a
+# Burstable sentence over a BestEffort pod -- the exact substitution the two
+# constants above exist to prevent. `OBTAINABILITY_CHECKS` points its table
+# entry at this same string, so the fallback and the arm cannot drift apart.
+_IMPACT_BEST_EFFORT = (
+    "The scheduler and cluster autoscaler size this cluster as if this "
+    "workload costs nothing; its pods are the first evicted under node "
+    "pressure and its cost cannot be attributed."
+)
 _IMPACT_BY_QOS = {
     _QOS_GUARANTEED: (
         " Every container carries both limits with a request that matches, so "
@@ -693,7 +704,10 @@ def check_no_requests(workload: dict, context: dict) -> dict | None:
     }
     qos = _qos_class(_qos_containers(workload), limitranges, workload["ns"])
     if qos == _QOS_BEST_EFFORT:
-        return hit  # The check's own Impact is the true one, and only here.
+        # Same string the table carries, set here so this arm is flagged
+        # authoritative like the other two rather than falling through.
+        hit["impact"] = _IMPACT_BEST_EFFORT
+        return hit
     if unbacked_missing:
         head = _IMPACT_UNRESERVED.format(resources=" or ".join(sorted(unbacked_missing)))
     else:
@@ -2294,9 +2308,10 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         check_no_requests,
         "major",
         "minor",
-        "The scheduler and cluster autoscaler size this cluster as if this "
-        "workload costs nothing; its pods are the first evicted under node "
-        "pressure and its cost cannot be attributed.",
+        # Every arm of §3.1 sets its own, so this is unreachable in practice;
+        # it stays as the BestEffort arm's own string rather than a fourth
+        # sentence nothing produces.
+        _IMPACT_BEST_EFFORT,
     ),
     CheckSpec(
         "no-memory-limit",
@@ -2831,10 +2846,18 @@ def collect_cluster(
         # whose arms differ in what they prove cannot state one consequence for
         # all of them, and the arm is only known where the hit is built.
         impact = hit.get("impact") or spec.impact
+        # Which arm fired is an observation, not prose, and only the hit knows
+        # it. Flagged so `adopt_arm_impact` can hold the model to this sentence
+        # the way `adopt_collector_evidence` holds it to the excerpt -- and so
+        # a later run cannot carry a stale arm sentence forward over a
+        # corrected one. The `spec.impact` default is deliberately *not*
+        # flagged: there the model's object-specific rewrite is usually the
+        # better sentence, naming the quota or the cluster the constant cannot.
+        arm_specific = bool(hit.get("impact"))
         if severity == spec.severity and cluster.get("autopilot") and spec.autopilot_severity:
             severity = spec.autopilot_severity
             impact = f"{impact} (Autopilot: severity downgraded — the platform injects requests at admission.)"
-        return {
+        emitted = {
             "check": spec.slug,
             "cluster": name,
             "namespace": hit.get("namespace", default_namespace),
@@ -2844,6 +2867,9 @@ def collect_cluster(
             "impact": impact,
             "needs_triage": None,
         }
+        if arm_specific:
+            emitted["impact_authoritative"] = True
+        return emitted
 
     candidates = []
     for spec in checks:

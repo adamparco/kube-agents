@@ -3545,6 +3545,60 @@ def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> lis
     return adopted
 
 
+def adopt_arm_impact(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Take the collector's `impact` for a candidate that marked it arm-specific.
+
+    Deliberately narrower than `adopt_collector_evidence`. Most checks mean one
+    thing, their `impact` is a constant, and the model's rewrite of it is
+    usually *better* than the constant: measured over the 106 findings in this
+    install's eight latest reports, 67 published the constant verbatim and 39
+    diverged — and the divergences are things the constant cannot say.
+    `idle-namespace` reads "a namespace with no running workload still holds a
+    load balancer or bound storage" in the table, and the model published the
+    namespace's actual `ResourceQuota` and the 10 vCPU / 20 GiB of headroom it
+    strands. Adopting the table everywhere would delete that.
+
+    A check with more than one arm is the exception, and the collector marks
+    those with `impact_authoritative`. There the sentence is not prose about
+    consequence but a report of *which arm fired*, which the model has to infer
+    from an excerpt and repeatedly infers wrong — the failure this codebase has
+    now hit twelve times, where one universal sentence is false for one arm.
+    `single-zone-nodepool` published "locked to a single zone or near its
+    scaling ceiling: any zonal stockout or scale event halts cluster
+    auto-scaling" over a pool that is zone-locked and at 50% of its ceiling.
+
+    Runs *after* `carry_unchanged_findings` on purpose. Carry reuses the
+    previous run's prose whenever evidence is byte-identical, and
+    `adopt_collector_evidence` exists precisely to make evidence byte-identical
+    — so without this ordering a corrected arm sentence could never reach a
+    finding that already exists in the ledger, and every fix to one of these
+    would ship into a report that keeps publishing the old text forever.
+    """
+    if not manifest:
+        return []
+    authoritative: dict[str, str] = {}
+    for entry in manifest.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict) or not candidate.get("impact_authoritative"):
+                continue
+            impact = str(candidate.get("impact") or "").strip()
+            if not impact:
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            authoritative[derive_finding_id(keyed)] = impact
+
+    adopted = []
+    for finding in findings:
+        impact = authoritative.get(derive_finding_id(finding))
+        if impact and finding.get("impact") != impact:
+            finding["impact"] = impact
+            adopted.append(str(finding.get("id") or ""))
+    return adopted
+
+
 class ContainmentError(ValidationError):
     """A remediation path that passed the string check still escapes the repo."""
 
@@ -7897,6 +7951,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     # reads as unchanged instead of being re-described every morning.
     for fid in carry_unchanged_findings(findings, memory, exclude=set(degraded)):
         log(f"{fid} is unchanged since the last run; its wording is carried forward.")
+    # ...except the sentence naming which arm of a multi-arm check fired, which
+    # is an observation rather than wording. It has to come after the carry: the
+    # carry's trigger is byte-identical evidence, `adopt_collector_evidence`
+    # makes evidence byte-identical by design, and between them a corrected arm
+    # sentence would otherwise never reach a finding already in the ledger.
+    for fid in adopt_arm_impact(findings, manifest):
+        log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
