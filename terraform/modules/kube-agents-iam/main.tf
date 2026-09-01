@@ -75,13 +75,14 @@ resource "google_project_iam_custom_role" "subnet_utilization_reader" {
     # publishes that measurement as google.networkanalyzer.vpcnetwork.
     # ipAddressInsight, and the two permissions below are what read it. This
     # role grants them directly rather than binding a predefined role,
-    # because the two predefined roles that carry the pair both carry more:
+    # because all thirteen predefined roles that carry the pair carry more:
+    # the narrowest, roles/recommender.networkAnalyzerIpAddressViewer, adds
+    # recommender.locations.get/.list and resourcemanager.projects.get/.list;
     # roles/recommender.viewer runs to some three hundred permissions --
-    # viewer on every recommender in the project -- and the narrow
-    # roles/recommender.networkAnalyzerIpAddressViewer adds
-    # recommender.locations.get/.list and resourcemanager.projects.get/.list
-    # on top of them. Neither carries compute.subnetworks.use, so either
-    # would leave a second grant to make anyway.
+    # viewer on every recommender in the project -- and the list ends at
+    # roles/editor and roles/owner. Only those last two also carry
+    # compute.subnetworks.use, so any predefined role narrow enough to be
+    # worth binding would leave a second grant to make anyway.
     "recommender.networkAnalyzerIpAddressInsights.list",
     "recommender.networkAnalyzerIpAddressInsights.get",
   ]

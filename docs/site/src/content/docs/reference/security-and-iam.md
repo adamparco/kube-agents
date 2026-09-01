@@ -78,12 +78,14 @@ Alongside them the composition defines one project-level custom role,
 `kubeagentsSubnetUtilizationReader`, and binds it to the same service account. It grants three
 permissions directly: `compute.subnetworks.use`, and
 `recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the Network Analyzer insight that
-reports subnet IP utilization — the only place that measurement is published. Two predefined roles
-carry that pair of reads and both carry more. `roles/recommender.viewer` is viewer on every
-recommender in the project, some three hundred permissions;
-`roles/recommender.networkAnalyzerIpAddressViewer` is narrow but adds
-`recommender.locations.get`/`.list` and `resourcemanager.projects.get`/`.list`. Neither carries
-`compute.subnetworks.use`, so binding one would leave a second grant to make.
+reports subnet IP utilization — the only place that measurement is published. Thirteen predefined
+roles carry that pair of reads and every one of them carries more. The narrowest,
+`roles/recommender.networkAnalyzerIpAddressViewer`, adds `recommender.locations.get`/`.list` and
+`resourcemanager.projects.get`/`.list`; `roles/recommender.viewer` is viewer on every recommender in
+the project, some three hundred permissions; the list ends at `roles/editor` and `roles/owner`.
+Only those last two also carry `compute.subnetworks.use`, so every predefined role narrow enough to
+be worth binding would leave a second grant to make. `roles/iam.securityReviewer`, already in the
+bundle above, carries the `.list` but not the `.get`.
 
 `compute.subnetworks.use` is not a read. `roles/compute.viewer` does not carry it: it is the
 permission that authorizes attaching a NIC, a node pool or a load balancer to a subnet, and the API
