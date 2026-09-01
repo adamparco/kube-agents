@@ -1218,6 +1218,50 @@ def _has_restrictive_authorized_networks(describe: dict) -> bool:
     return False
 
 
+def _json_scalar(value: object) -> str:
+    """A field's value the way the `gcloud … --format=json` output spelled it.
+
+    An excerpt quotes a JSON read, so `true` belongs there rather than Python's
+    `True`, and a field GKE omitted has to read as omitted rather than as the
+    `False` a `.get()` default would put in its place -- absent and `false` are
+    different states on every field this renders.
+    """
+    if value is None:
+        return "absent"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def _authorized_networks_excerpt(describe: dict) -> str:
+    """Both authorized-networks surfaces, as read, for the finding's excerpt.
+
+    Named even when empty. GKE carries the config on one surface or the other
+    and returns the unused one as `{}`, so a reader who sees only the populated
+    field cannot tell a cluster that left the feature off from one this check
+    forgot to look at. `gcpPublicCidrsAccessEnabled` is rendered where GKE set
+    it because it is the field that distinguishes clusters this check otherwise
+    grades identically -- it is what GKE writes into an otherwise-empty
+    `masterAuthorizedNetworksConfig` on a cluster that never enabled the
+    feature.
+    """
+    ip_cfg = (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
+    parts: list[str] = []
+    for label, cfg in (
+        ("masterAuthorizedNetworksConfig", describe.get("masterAuthorizedNetworksConfig")),
+        ("ipEndpointsConfig.authorizedNetworksConfig", ip_cfg.get("authorizedNetworksConfig")),
+    ):
+        cfg = cfg or {}
+        blocks = [str(b.get("cidrBlock") if isinstance(b, dict) else b) for b in (cfg.get("cidrBlocks") or [])]
+        part = f"{label}.enabled={_json_scalar(cfg.get('enabled'))}, cidrBlocks=[{','.join(blocks)}]"
+        if cfg.get("gcpPublicCidrsAccessEnabled") is not None:
+            part += f", gcpPublicCidrsAccessEnabled={_json_scalar(cfg.get('gcpPublicCidrsAccessEnabled'))}"
+        parts.append(part)
+    return "; ".join(parts)
+
+
 def check_public_control_plane(context: dict) -> list[dict]:
     """Whether the API server answers from the internet.
 
@@ -1240,13 +1284,30 @@ def check_public_control_plane(context: dict) -> list[dict]:
     ).get("enablePublicEndpoint")
     if public_endpoint_enabled is None:
         reachable = private_cfg.get("enablePrivateEndpoint") is not True
+        decided = (
+            "privateClusterConfig.enablePrivateEndpoint="
+            f"{_json_scalar(private_cfg.get('enablePrivateEndpoint'))}"
+        )
     else:
         reachable = public_endpoint_enabled is True
+        decided = (
+            "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint="
+            f"{_json_scalar(public_endpoint_enabled)}"
+        )
     if not reachable:
         return []
     if _has_restrictive_authorized_networks(describe):
         return []
-    return [{"namespace": "", "object": _cluster_object(context), "excerpt": "public endpoint reachable with no restrictive authorized networks"}]
+    # Name the fields and the values, not the conclusion. `adopt_collector_evidence`
+    # overwrites the model's excerpt with this string, so it is the only evidence
+    # the finding will ever carry, and the constant sentence it used to be --
+    # "public endpoint reachable with no restrictive authorized networks" -- was
+    # byte-identical on all sixteen clusters of this fleet. That is unfalsifiable
+    # by a reader and it hid a real difference: a cluster serving the endpoint
+    # through the current field with `gcpPublicCidrsAccessEnabled` set read the
+    # same as one caught by the legacy inversion with the whole config absent.
+    excerpt = f"{decided}; {_authorized_networks_excerpt(describe)}"
+    return [{"namespace": "", "object": _cluster_object(context), "excerpt": excerpt}]
 
 
 def _namespace_labels(context: dict, ns: str) -> dict:

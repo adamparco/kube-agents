@@ -1789,6 +1789,72 @@ class TestPublicControlPlane(unittest.TestCase):
         )
         self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
 
+    def test_the_excerpt_names_the_field_that_decided_the_verdict(self):
+        """Two clusters that both fire must not produce the same evidence.
+
+        This excerpt used to be the constant sentence "public endpoint
+        reachable with no restrictive authorized networks", and
+        `adopt_collector_evidence` overwrites whatever the model measured with
+        it -- so on a live fleet of sixteen clusters all sixteen findings
+        carried byte-identical evidence naming no field, no value, and no
+        cluster. A reader could not check one against the API, and the two
+        shapes below, which are materially different postures reached through
+        different fields, were indistinguishable in the ledger.
+        """
+        current = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "masterAuthorizedNetworksConfig": {"gcpPublicCidrsAccessEnabled": True},
+                    "controlPlaneEndpointsConfig": {"ipEndpointsConfig": {"enablePublicEndpoint": True}},
+                }
+            )
+        )
+        legacy = collect.check_public_control_plane(
+            context_of(cluster_describe={"privateClusterConfig": {}, "masterAuthorizedNetworksConfig": {}})
+        )
+        self.assertEqual((len(current), len(legacy)), (1, 1))
+        self.assertNotEqual(current[0]["excerpt"], legacy[0]["excerpt"])
+
+        # The deciding field, spelled the way the JSON read spelled it.
+        self.assertIn(
+            "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true",
+            current[0]["excerpt"],
+        )
+        self.assertIn("privateClusterConfig.enablePrivateEndpoint=absent", legacy[0]["excerpt"])
+
+        # Absent is not `false`: a field GKE omitted has to read as omitted, or
+        # the excerpt asserts a value nobody observed.
+        self.assertIn("masterAuthorizedNetworksConfig.enabled=absent", current[0]["excerpt"])
+        self.assertIn("gcpPublicCidrsAccessEnabled=true", current[0]["excerpt"])
+        self.assertNotIn("gcpPublicCidrsAccessEnabled", legacy[0]["excerpt"])
+
+        # Both surfaces are named even where GKE returned only one of them, so
+        # "not mentioned" cannot be confused with "not read".
+        for excerpt in (current[0]["excerpt"], legacy[0]["excerpt"]):
+            self.assertIn("ipEndpointsConfig.authorizedNetworksConfig.enabled=", excerpt)
+
+    def test_the_excerpt_quotes_the_cidr_that_made_it_unrestricted(self):
+        # A cluster caught by the allow-all branch is caught *because of* a
+        # specific block. Leaving it out of the excerpt makes the one finding
+        # whose evidence is genuinely checkable read like the ones that are not.
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [
+                            {"displayName": "office", "cidrBlock": "203.0.113.0/24"},
+                            {"displayName": "everywhere", "cidrBlock": "::/0"},
+                        ],
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("masterAuthorizedNetworksConfig.enabled=true", found[0]["excerpt"])
+        self.assertIn("cidrBlocks=[203.0.113.0/24,::/0]", found[0]["excerpt"])
+
     def test_a_private_endpoint_is_never_flagged(self):
         ctx = context_of(cluster_describe={"privateClusterConfig": {"enablePrivateEndpoint": True}})
         self.assertEqual(collect.check_public_control_plane(ctx), [])
