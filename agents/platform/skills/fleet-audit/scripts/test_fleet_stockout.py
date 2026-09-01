@@ -492,6 +492,24 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIn("90%", hit["excerpt"])
 
+    def test_the_ceiling_arm_names_itself_and_the_zones_the_pool_spans(self):
+        """3.9 publishes two unrelated conditions under one slug, and the
+        ceiling one has nothing to do with zones. A bare "9/10 live nodes"
+        under a slug called `single-zone-nodepool` is how a two-zone pool got
+        told to enable multi-zone node pools it already had, so the excerpt has
+        to carry both the arm and the span for 3.9 to key off."""
+        pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9)
+        self.assertTrue(hit["excerpt"].startswith("at its autoscaling ceiling:"), hit["excerpt"])
+        self.assertIn("us-central1-b", hit["excerpt"])
+        self.assertNotIn("single-zone", hit["excerpt"])
+
+    def test_the_zone_locked_arm_still_starts_with_single_zone(self):
+        # The other half of the discriminator 3.9 reads.
+        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        hit = fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1)
+        self.assertTrue(hit["excerpt"].startswith("single-zone "), hit["excerpt"])
+
     def test_does_not_flag_comfortably_under_ceiling(self):
         pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=3))

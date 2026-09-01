@@ -190,15 +190,15 @@ The `project/<project-id>` entry is covered on the same terms. `gcloud compute r
 - **Impact:** "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk."
 - **Remediation:** `kind: manifest`. Expand instance selection to include lower-preemption machine types and add secondary on-demand fallback priorities in GitOps.
 
-#### 3.9 Single-zone node pools on Standard clusters (`single-zone-nodepool`)
+#### 3.9 Single-zone node pool, or one at its autoscaling ceiling (`single-zone-nodepool`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
 - **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or a node pool's current node count is `>= 90%` of its `autoscaling.maxNodeCount` — that ceiling is a hard stop, not a soft one, so "close to it" means measurably close, not a judgment call.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); regional clusters with multi-zone node pools.
 - **Severity:** `major`.
-- **Impact:** "Node pool is locked to a single zone: any zonal stockout in that zone halts all cluster auto-scaling."
-- **Remediation:** `kind: manifest`. Propose enabling multi-zone node pools or configuring Node Auto-Provisioning (NAP) in Terraform/Kustomize declarations.
+- **Impact:** two unrelated conditions share this check, so read which arm the excerpt names before writing either sentence. An excerpt beginning `single-zone` is the zone-locked arm: "Node pool is locked to a single zone: any zonal stockout in that zone halts all cluster auto-scaling." An excerpt beginning `at its autoscaling ceiling` is **not** that arm — it lists the zones the pool spans, which is frequently more than one — and the zonal-stockout sentence is false of it. Say instead: "The pool is within 10% of its `maxNodeCount`; the next scale-up stops at that ceiling whatever capacity the zone has."
+- **Remediation:** `kind: manifest`, and the same arm decides the change. Zone-locked: propose enabling multi-zone node pools or configuring Node Auto-Provisioning (NAP) in the Terraform/Kustomize declaration. At the ceiling: propose raising `autoscaling.maxNodeCount` in that declaration. Never propose multi-zone for the ceiling arm — the excerpt's zone list usually shows the operator already has it.
 
 #### 3.10 Reservation bypass, unreachable zones, or unallocated capacity mismatch (`reservation-mismatch-risk`)
 

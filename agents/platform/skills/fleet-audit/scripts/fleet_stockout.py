@@ -479,7 +479,13 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     if len(locations) <= 1 and autoscaling.get("enabled") and not has_nap:
         return {"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"single-zone ({locations}), autoscaling enabled, no NAP and no regional multi-zone configuration"}
     if max_nodes and current_node_count >= 0.9 * max_nodes:
-        return {"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"{current_node_count}/{max_nodes} live nodes ({current_node_count / max_nodes * 100:.0f}% of maxNodeCount)"}
+        # Name the arm and the zone span. This condition has nothing to do with
+        # zones -- it fires on a regional pool spanning three of them -- but it
+        # is published under a slug called `single-zone-nodepool`, and a bare
+        # "9/10 live nodes" left the reader nothing to tell the two arms apart.
+        # 3.9 keys its impact and its remediation off this prefix, so a run
+        # stops proposing multi-zone node pools to an operator who has them.
+        return {"object": f"NodePool/{pool.get('name', '')}", "excerpt": f"at its autoscaling ceiling: {current_node_count}/{max_nodes} live nodes ({current_node_count / max_nodes * 100:.0f}% of maxNodeCount), zones {locations}"}
     return None
 
 
