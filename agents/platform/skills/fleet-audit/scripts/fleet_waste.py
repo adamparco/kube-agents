@@ -927,7 +927,19 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         cap = ((pvc.get("status") or {}).get("capacity") or {}).get("storage", "0")
         pvc_gib_by_ns[ns] = pvc_gib_by_ns.get(ns, 0) + _gib(cap)
     lb_ns = {s.get("metadata", {}).get("namespace", "") for s in context["services"] if (s.get("spec") or {}).get("type") == "LoadBalancer"}
-    quota_ns = {rq.get("metadata", {}).get("namespace", "") for rq in context["resourcequotas"]}
+    # A ResourceQuota used to be a third way in here, and it is not billable.
+    # Kubernetes reserves nothing for one: it is an admission gate on the sum of
+    # the requests of the pods in its namespace, it holds no capacity, no
+    # scheduler consults it on behalf of anyone else, and deleting it frees
+    # nothing and saves nothing. Nothing in the fleet-waste dump is cheaper to
+    # keep. The arm was untested -- every case passed `resourcequotas: []` --
+    # and on the reference fleet it produced exactly one finding, an empty
+    # `gitops-managed` whose only object was a quota with `used` all zeroes, for
+    # which the model wrote that the quota reserved "10 vCPU / 20 GiB of request
+    # headroom ... that no other namespace on this Autopilot cluster can use".
+    # Every clause of that is false, and it is the kind of false a cost audit
+    # can least afford: a reader who checks one savings number and finds it
+    # imaginary stops believing the ones that are real.
 
     hits = []
     for ns_obj in context["namespaces"]:
@@ -942,7 +954,7 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         age = _age_days(ns_obj.get("metadata", {}).get("creationTimestamp", ""), now=now)
         if age is None or age < 30:
             continue
-        billable = name in lb_ns or pvc_gib_by_ns.get(name, 0) > 0 or name in quota_ns
+        billable = name in lb_ns or pvc_gib_by_ns.get(name, 0) > 0
         if not billable:
             continue
         # Floor the capacity for the same reason `_whole_days` floors an age:
@@ -958,7 +970,8 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         # "<1" rather than "0" when there really is a claim: flooring a 500Mi
         # PVC to "0 GiB of PVCs" would deny the storage that made the namespace
         # billable three lines up. A namespace billable only through a
-        # LoadBalancer or a ResourceQuota holds no PVCs and still prints "0".
+        # LoadBalancer holds no PVCs and still prints "0", which the excerpt
+        # names the LoadBalancer alongside so the reason is never absent.
         gib_text = str(whole_gib) if whole_gib or not gib else "<1"
         severity = "major" if name in lb_ns or whole_gib >= 100 else "minor"
         hits.append(
@@ -1099,7 +1112,7 @@ IMPACT = {
     "idle-nodepool": "Nodes reserved by a non-zero autoscaler floor sit idle instead of being reclaimed.",
     "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
     "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
-    "idle-namespace": "A namespace with no running workload still holds billable or quota-reserving objects.",
+    "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
 }
 
 

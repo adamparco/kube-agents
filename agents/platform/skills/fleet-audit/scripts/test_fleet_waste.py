@@ -741,6 +741,28 @@ class IdleNamespaceTest(unittest.TestCase):
         context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [self.ns("demo")]}
         self.assertIn("a LoadBalancer Service, 0 GiB of PVCs", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
 
+    def test_a_resourcequota_does_not_make_an_empty_namespace_billable(self):
+        # A quota reserves nothing and bills nothing -- it gates admission on
+        # the requests of the pods in its own namespace, of which there are
+        # none. This namespace is the live `gitops-managed`: no pods, no PVCs,
+        # no Services, one quota with `used` all zeroes, costing zero. Flagged,
+        # it drew the impact "reserving 10 vCPU / 20 GiB of request headroom
+        # ... that no other namespace on this Autopilot cluster can use", which
+        # is false in all three of its claims.
+        rq = obj("ResourceQuota", "platform-baseline-quota", ns="demo", **{"status.hard": {"requests.cpu": "10"}})
+        context = {"pods": [], "pvcs": [], "services": [], "resourcequotas": [rq], "namespaces": [self.ns("demo")]}
+        self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_a_resourcequota_beside_a_real_billable_object_still_flags(self):
+        # Dropping the quota arm must not suppress a namespace that a PVC or a
+        # LoadBalancer would have flagged on its own.
+        rq = obj("ResourceQuota", "q", ns="demo", **{"status.hard": {"requests.cpu": "10"}})
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [rq], "namespaces": [self.ns("demo")]}
+        hits = fw.check_idle_namespace(context, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("uota", hits[0]["excerpt"])
+
 
 class OverrequestTest(unittest.TestCase):
     def deployment_pod(self, ns="default", name="api-1", cpu_req="12", mem_req="48Gi", cpu_lim=None, mem_lim=None, started="2026-01-01T00:00:00Z", owner_kind="ReplicaSet", owner_name="api"):

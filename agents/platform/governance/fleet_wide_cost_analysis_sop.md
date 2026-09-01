@@ -198,8 +198,9 @@ Identity is only as stable as those four fields, so **never** let a timestamp, a
 
 #### 3.10 Idle namespaces holding billable objects (`idle-namespace`)
 
-- **Command:** `kubectl get ns -o json` cross-referenced against the pod, PVC, Service, and ResourceQuota dumps from Step 2.
-- **Flag when:** a non-`SYSTEM_NS` namespace has zero `Running`/`Pending` pods, `AGE ≥ 30d`, and still holds at least one billable or quota-holding object: a PVC, a `type: LoadBalancer` Service, or a ResourceQuota reserving capacity. _Justification:_ a namespace with no workload but a bound volume or a live load balancer is paying for nothing; 30 days covers a monthly release cycle and a pre-provisioned environment awaiting its first deploy.
+- **Command:** `kubectl get ns -o json` cross-referenced against the pod, PVC, and Service dumps from Step 2.
+- **Flag when:** a non-`SYSTEM_NS` namespace has zero `Running`/`Pending` pods, `AGE ≥ 30d`, and still holds a billable object: a PVC, or a `type: LoadBalancer` Service. _Justification:_ a namespace with no workload but a bound volume or a live load balancer is paying for nothing; 30 days covers a monthly release cycle and a pre-provisioned environment awaiting its first deploy.
+- **A ResourceQuota is not one of them**, and must never be offered as the reason a namespace costs anything. Kubernetes reserves nothing for a quota: it is an admission gate on the sum of the requests of the pods in its own namespace, it holds no capacity, it constrains no other namespace, and on Autopilot there is no pool for it to carve up in the first place. An idle namespace whose only object is a quota bills exactly zero, so it is not a finding here at all.
 - **Do NOT flag:** `SYSTEM_NS`; namespaces holding only Secrets, ConfigMaps, RBAC, or CRs (free); namespaces under an active GitOps sync (`configsync.gke.io/*`, `kustomize.toolkit.fluxcd.io/*` annotations) — the controller owns their lifecycle; namespaces that are the target of a suspended or infrequent CronJob (idle by design); namespaces carrying an explicit ownership or retention annotation; namespaces in `Terminating`.
 - **Severity:** `major` if it holds a `LoadBalancer` Service or ≥ 100 GiB of PVCs; else `minor`.
 - **Impact:** "Namespace `demo-q1` has run no pods for 30+ days but still holds a `LoadBalancer` Service and 250 GiB of PVCs."
