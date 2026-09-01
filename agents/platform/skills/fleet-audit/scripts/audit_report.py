@@ -1084,12 +1084,15 @@ def checks_unevaluated(cluster: object) -> list[str]:
     nobody looked, and it can flip back the moment the surface catches up.
 
     Both leave the coverage denominator, and for the second one that is
-    deliberate: `gcp-networking-fabric-audit` sees 42 auto-mode `default`
-    subnets, of which Network Analyzer measures the one holding allocations and
-    omits 41 that hold none. Counting those 41 as gaps would make every
-    auto-mode fleet permanently `partial` -- and a partial run closes no
-    ledger -- over subnets that cannot be IP-exhausted because nothing is in
-    them.
+    deliberate: a subnet in a Shared VPC host project is returned by
+    `list-usable` and never mentioned by the audited project's Network Analyzer
+    insight, so `gcp-networking-fabric-audit` declares it unevaluated on every
+    run there will ever be. Counting that as a gap would make the fleet
+    permanently `partial` -- and a partial run closes no ledger -- over a
+    subnet the stream is not the one measuring. (Until the collector learned to
+    read absence-from-the-insight as 0%, the same applied to all 41 empty
+    auto-mode `default` subnets; those are measured now, which is why this is
+    the rarer shape it always should have been.)
 
     What must not follow is treating the second disposition as evidence of a
     fix. `unverifiable_findings` reads absence-of-finding as "resolved" for any

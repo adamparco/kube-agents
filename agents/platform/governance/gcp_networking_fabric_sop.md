@@ -43,7 +43,8 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 - Every entry in `manifest.clusters` is one target — a subnet (`<project>/<region>/<subnet>`, `subnet-ip-exhaustion` only) or a project (`project/<project>`, the other four checks) — carrying one `outcome`. `"collected"` means every check that applies to that target already ran; do not re-run it by hand. `"gate-failed"` means one of that target's `gcloud` reads failed; fall back to this section's commands for that target alone.
 - **A third target shape appears only on failure: `project/<project>/subnets`, always `"gate-failed"`.** It stands in for that project's whole subnet scope when the enumeration itself could not be read, so there are no per-subnet entries to carry the failure. Put it in `scope.skipped` with its `error` as the reason. Leaving it out reports the project as holding no subnets, which is the one reading the collector emits this entry to prevent — and its name is not a real subnet, so it does not belong in `scope.clusters`.
 - For a `"collected"` target, copy its `commands` list into that target's `checks_run` — minus any entry whose `check` that same target also lists in `checks_not_applicable`. A `commands` entry records that a command ran, not that the check reached a verdict on that target, so one read is routinely recorded against slugs it could not answer for; `finish` rejects a `checks_run` naming a slug the collector declared inapplicable there. Copy that target's `checks_not_applicable` and its `limitations` string verbatim too.
-- **On an auto-mode network this empties `checks_run` for most subnets, and that is the correct shape.** A subnet Network Analyzer did not measure owes only `subnet-ip-exhaustion` and has it declared not-applicable, so nothing survives the filter and `checks_run` is `[]` — which `finish` accepts because the collector wrote that target a `limitations` string saying why. Do not reinstate the command to avoid the empty list, and do not reword the `limitations`: leaving both as the collector wrote them is what keeps the run off `partial`.
+- **A target owes only the checks its own shape carries, and the collector has already declared the rest.** A subnet target owes `subnet-ip-exhaustion` and nothing else; the other four are the project target's. Do not add `checks_not_applicable` entries of your own saying so — a row per subnet per project-scoped check is 168 constant rows on this fleet, all of them restating the target shape §1 just gave you, and every one renders under _Not applicable_ where it buries the handful of exclusions a reader needs to see. The list you publish is the collector's, unchanged: copy it, and where a target has none, publish none.
+- **Where the collector did leave a subnet unmeasured, `checks_run` comes out `[]` and that is the correct shape.** Nothing survives the filter, and `finish` accepts it because the collector wrote that target a `limitations` string saying why. Do not reinstate the command to avoid the empty list, and do not reword the `limitations`: leaving both as the collector wrote them is what keeps the gap honest.
 - Every entry in a `"collected"` target's `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed. What is still yours to write is the `recommendation` and, for a `kind: manifest` remediation, the manifest or Terraform file itself (§3).
 - Pass `--manifest-file <path>` to `finish` (§5) so it cross-checks your `checks_run` against what the collector actually ran.
 
@@ -54,7 +55,7 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 - **`list-usable` never carries `ipUtilization`, so it cannot answer this check on its own.** The field is absent from gcloud's `UsableSubnetwork` in v1, `beta` and `alpha` alike — an install can return every subnet and still have nothing to measure. The measurement lives in Network Analyzer, and the collector reads it from there, writing each ratio onto the `ipUtilization` field above so the threshold is unchanged:
   `gcloud recommender insights list --project=$PROJECT --location=global --insight-type=google.networkanalyzer.vpcnetwork.ipAddressInsight --format=json`
   Within `content.ipUtilizationSummaryInfo[].networkStats[].subnetStats[]`, each `subnetRangeStats` entry carries `allocationRatio`; **the entry with no `subnetRangeName` is the primary range** and every named entry is the secondary range of that name. Requires `recommender.googleapis.com` and `recommender.networkAnalyzerIpAddressInsights.list`. Do not use `google.compute.subnetwork.IpUtilizationInsight` — it reads plausibly, but it is not a real insight type and the API rejects it with `INVALID_ARGUMENT`.
-- **A subnet the insight does not cover is unmeasured, not healthy.** Network Analyzer omits subnets holding no allocations, so an auto-mode network reports one measured subnet and 41 untouched ones. The collector marks those `subnet-ip-exhaustion` not-applicable per target rather than passing them; report them that way and flag nothing. Never substitute `ipCidrRange` alone, which gives a range's size and says nothing about how much of it is used.
+- **A subnet the insight omits entirely is a subnet holding nothing, and the collector records it at 0%.** Network Analyzer omits a subnet with no allocation, so on an auto-mode network 41 of 42 regional `default` subnets are absent from it and every one of them is empty. Absence is the reading, not the lack of one — the collector zero-fills them once the insight has published for that project at all, and they carry an ordinary `checks_run`. Two absences it will not zero-fill, and reports unmeasured instead: a subnet in a Shared VPC host project, which `list-usable` reaches across and the insight never mentions; and a range skipped inside a subnet the insight did cover, which says nothing about that range being empty. Report those as the collector wrote them and flag nothing. Never substitute `ipCidrRange` alone, which gives a range's size and says nothing about how much of it is used.
 - **Do NOT flag:** a primary or secondary range at or under 85% utilization.
 - **Severity:** `critical`.
 - **Impact:** "New pods or nodes cannot be scheduled once this range's addresses run out, and GKE has no way to expand a live cluster's Pod CIDR after creation."
@@ -125,24 +126,6 @@ Every finding must conform to the full findings schema:
             "check": "subnet-ip-exhaustion",
             "command": "gcloud compute networks subnets list-usable --project=proj-1 --format=json && gcloud recommender insights list --project=proj-1 --location=global --insight-type=google.networkanalyzer.vpcnetwork.ipAddressInsight --format=json"
           }
-        ],
-        "checks_not_applicable": [
-          {
-            "check": "cloud-nat-exhaustion",
-            "reason": "NAT gateways are configured at the Cloud Router level, not per subnet."
-          },
-          {
-            "check": "psc-routing-deadlock",
-            "reason": "Private Service Connect endpoints are project-level resources, not subnet resources."
-          },
-          {
-            "check": "mtu-packet-fragmentation",
-            "reason": "VPC network MTU is defined at the VPC level, not per subnet."
-          },
-          {
-            "check": "cloud-armor-false-positive",
-            "reason": "Cloud Armor security policies are backend service resources, not subnet resources."
-          }
         ]
       },
       {
@@ -165,12 +148,6 @@ Every finding must conform to the full findings schema:
           {
             "check": "cloud-armor-false-positive",
             "command": "gcloud compute security-policies list --project=proj-1 --format=json"
-          }
-        ],
-        "checks_not_applicable": [
-          {
-            "check": "subnet-ip-exhaustion",
-            "reason": "Subnet IP capacity is audited per individual subnet scope entry."
           }
         ]
       }
