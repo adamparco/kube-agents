@@ -125,13 +125,19 @@ UNMEASURED_SUBNET_LIMITATION = (
 # `_collect_subnet_targets` refuses one layer up, surviving inside a subnet
 # because the gate is satisfied by a single reading.
 #
-# Network Analyzer produces the shape routinely. On this fleet it published 14
-# of `us-east4/default`'s 16 pod ranges, omitting the two belonging to Autopilot
-# clusters parked at zero nodes; those two are genuinely empty, so the silence
-# happened to be correct. The same omission covers a range Network Analyzer has
-# not got to yet, which for a freshly created cluster runs about a day -- and
-# that is exactly the window in which an undersized Pod CIDR fills up. Being
-# right by luck on the empty case is not a reason to stay silent on the other.
+# Network Analyzer produces the shape routinely, and its silence about a range
+# is not evidence the range is empty. On this fleet it published 15 of
+# `us-east4/default`'s 17 ranges, omitting the Pod ranges of `drift-peer-ap-1`
+# and `drift-peer-ap-2` -- each of which was running a node and 15 Pods when
+# this was measured on 2026-09-01, so both omitted ranges hold allocations.
+# Staleness does not explain it either: both clusters predate the insight's
+# refresh by two days. Whatever the cause, a range the insight skips can be
+# filling up, so the check reports it as unmeasured instead of clearing it.
+#
+# This is the case `_zero_fill_unallocated` deliberately does not touch. A whole
+# subnet absent from the insight is absent because it holds nothing; a range
+# skipped inside a subnet the insight covers is these two, and guessing 0% for
+# them would clear a range nobody read.
 #
 # `cross_check_manifest` states where this belongs: a check that applies but
 # could not be evaluated is the target's `limitations`, which §6 turns into a
@@ -291,6 +297,20 @@ def _region_of_subnet_link(self_link: str) -> str:
     """`.../regions/<region>/subnetworks/<name>` -> `<region>`."""
     head = (self_link or "").split("/subnetworks/", 1)[0]
     return _last_segment(head)
+
+
+def _project_of_subnet_link(self_link: str) -> str:
+    """`.../projects/<project>/regions/...` -> `<project>`, or `""`.
+
+    `list-usable` reaches across a Shared VPC, so a subnet it returns is not
+    necessarily in the project being audited; the Network Analyzer insight is
+    scoped to one project and never mentions the host project's subnets.
+    `_zero_fill_unallocated` needs to tell those two absences apart.
+    """
+    head, sep, _ = (self_link or "").partition("/regions/")
+    if not sep:
+        return ""
+    return _last_segment(head) if "/projects/" in head else ""
 
 
 def get_target_projects(cli_project: str | None = None) -> list[str]:
@@ -641,6 +661,48 @@ def _backfill_utilization(parsed: list[dict], by_subnet: dict[str, dict]) -> int
     return filled
 
 
+def _zero_fill_unallocated(parsed: list[dict], by_subnet: dict[str, dict], project: str) -> int:
+    """Record a subnet the insight omits entirely at 0% rather than unmeasured.
+
+    Network Analyzer publishes one project-scoped insight -- "Summary of IP
+    utilization for all subnet ranges" -- and omits a subnet that has no
+    allocation. `_collect_subnet_targets` already says so in prose; this acts on
+    it. Once the insight has published for this project at all, which a non-zero
+    `_backfill_utilization` establishes, a subnet missing from it is missing
+    because nothing is allocated in it, and 0% is a reading rather than a blank.
+
+    Declaring those UNEVALUATED instead turns every empty auto-mode regional
+    `default` into a coverage gap. On a stock project that is 41 of 42 targets,
+    and a ledger carrying 41 limitations and one measurement reads as an audit
+    that could not run -- which is how issue #122 came out.
+
+    Two absences are deliberately left alone:
+
+    * A subnet in another project. `list-usable` reaches across a Shared VPC and
+      the insight does not, so the host project's subnets are absent for a
+      reason that says nothing about their allocations.
+    * A range skipped inside a subnet the insight *does* cover. That keeps
+      `PARTIAL_SUBNET_LIMITATION`, because there the omission is not evidence of
+      emptiness -- `us-east4/default`'s two Autopilot Pod ranges are absent from
+      the insight while each carries a node's worth of Pod IPs.
+
+    Returns the number of subnets recorded at 0%.
+    """
+    zeroed = 0
+    for item in parsed:
+        link = item.get("subnetwork", "")
+        if _utilization_key(link) in by_subnet or _carries_utilization(item):
+            continue
+        if _project_of_subnet_link(link) != project:
+            continue
+        item["ipUtilization"] = 0.0
+        for sec in item.get("secondaryIpRanges") or []:
+            if not isinstance(sec.get("ipUtilization"), (int, float)):
+                sec["ipUtilization"] = 0.0
+        zeroed += 1
+    return zeroed
+
+
 def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
     argv = ["gcloud", "compute", "networks", "subnets", "list-usable", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
@@ -764,6 +826,9 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                     ),
                 }
             ]
+        empty = _zero_fill_unallocated(parsed, by_subnet, project)
+        if empty:
+            log(f"{project}: {empty} subnet(s) absent from the insight recorded at 0% (nothing allocated)")
         measured_by_insight = True
     # Publish the commands that produced the reading, in the order they ran.
     # On the backfill path `list-usable` only enumerated the subnets -- the

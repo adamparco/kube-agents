@@ -437,11 +437,20 @@ class CollectProjectTest(unittest.TestCase):
     )
 
     def _two_subnets(self) -> str:
+        """One subnet the insight covers, and one it can never cover.
+
+        `s2` sits in a Shared VPC host project. `list-usable` reaches across the
+        share and the insight does not, so `s2` is absent from the insight for a
+        reason that says nothing about its allocations -- which is the one
+        absence `_zero_fill_unallocated` refuses to read as 0%. A same-project
+        subnet the insight omits is empty and gets measured; see
+        `test_a_same_project_subnet_the_insight_omits_is_measured_at_zero`.
+        """
         return (
             '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
             '"ipCidrRange": "10.0.0.0/20", '
             '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
-            '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/s2", '
             '"ipCidrRange": "10.1.0.0/20"}]'
         )
 
@@ -465,11 +474,11 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("primary range 10.0.0.0/20", excerpt)
         self.assertIn("secondary range pods", excerpt)
 
-    def test_a_subnet_the_insight_does_not_cover_is_not_applicable_not_clean(self):
-        # Network Analyzer omits subnets holding no allocations, which on an
-        # auto-mode network means it reports 1 of 42. Running the check
-        # against the other 41 would return None for each -- "nothing wrong
-        # here" -- so they have to be declared unmeasured instead.
+    def test_a_subnet_the_insight_cannot_cover_is_not_applicable_not_clean(self):
+        # A Shared VPC host project's subnet is visible to `list-usable` and
+        # invisible to this project's insight, so no surface measures it.
+        # Running the check against it would return None -- "nothing wrong
+        # here" -- so it has to be declared unmeasured instead.
         responses = {
             "subnets list-usable": run_of(0, self._two_subnets()),
             "recommender insights list": run_of(0, self.INSIGHT),
@@ -656,6 +665,76 @@ class CollectProjectTest(unittest.TestCase):
         s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
         self.assertIn("secondary range pods", s1["candidates"][0]["excerpt"])
         self.assertIn("ap-pods", s1["limitations"])
+
+    def _same_project_pair(self) -> str:
+        """Both subnets in the audited project; the insight covers only `s1`."""
+        return (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
+            '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+
+    def _same_project_responses(self) -> dict:
+        return {
+            "subnets list-usable": run_of(0, self._same_project_pair()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+
+    def test_a_same_project_subnet_the_insight_omits_is_measured_at_zero(self):
+        # The 41-of-42 case, and the whole reason issue #122 read as an audit
+        # that could not run. Network Analyzer publishes one project-wide
+        # summary and omits a subnet holding no allocation, so on an auto-mode
+        # network it covers `us-east4/default` and skips the 41 empty regional
+        # `default`s. Absent means empty, and empty is 0% -- a reading, not a
+        # blank. Calling it UNEVALUATED made 41 targets into coverage gaps.
+        entries = na.collect_project("proj-1", run=self.fake_run(self._same_project_responses()))
+        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        self.assertEqual(s2["outcome"], "collected")
+        self.assertEqual(s2["checks_not_applicable"], [])
+        # Measured and healthy, so nothing to report and nothing to disclose.
+        self.assertEqual(s2["candidates"], [])
+        self.assertNotIn("limitations", s2)
+        # Still credited with the reads that measured it.
+        self.assertEqual([c["check"] for c in s2["commands"]], ["subnet-ip-exhaustion"])
+
+    def test_zero_filling_leaves_a_subnet_the_insight_did_cover_alone(self):
+        # 0% is inferred from whole-subnet absence, never written over a figure
+        # the insight actually published -- `s1` is at 0.9/0.95 and must keep
+        # both, or the fix silently clears the findings it was meant to keep.
+        entries = na.collect_project("proj-1", run=self.fake_run(self._same_project_responses()))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        excerpt = s1["candidates"][0]["excerpt"]
+        self.assertIn("90.0% utilized", excerpt)
+        self.assertIn("95.0% utilized", excerpt)
+
+    def test_zero_fill_needs_the_insight_to_have_published_something(self):
+        # An insight that covers nothing at all is Network Analyzer not yet
+        # warmed up, not a fleet of empty subnets. The existing gate returns
+        # gate-failed there, and zero-filling must not run ahead of it and
+        # declare all 42 subnets clean.
+        responses = self._same_project_responses()
+        responses["recommender insights list"] = run_of(0, "[]")
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        gate = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(gate["outcome"], "gate-failed")
+        self.assertEqual([e for e in entries if e["name"].startswith("proj-1/us-east4/")], [])
+
+    def test_zero_fill_skips_a_subnet_outside_the_audited_project(self):
+        # Unit-level guard for the Shared VPC case the fixtures above rely on.
+        subnets = [
+            {"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/mine"},
+            {"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/theirs"},
+        ]
+        self.assertEqual(na._zero_fill_unallocated(subnets, {}, "proj-1"), 1)
+        self.assertEqual(subnets[0]["ipUtilization"], 0.0)
+        self.assertNotIn("ipUtilization", subnets[1])
 
     def test_a_fully_covered_subnet_carries_no_limitation(self):
         # The other half: the limitation appears because a range was missed,
@@ -1061,10 +1140,14 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             '"subnetRangeStats": [{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}]'
             "}]}]}]}}]"
         )
+        # `s2` is a Shared VPC host project's subnet: enumerated by
+        # `list-usable`, outside this project's insight, so genuinely
+        # unmeasured. A same-project subnet the insight omits is empty and
+        # `_zero_fill_unallocated` measures it at 0% instead.
         subnets = (
             '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
             '"ipCidrRange": "10.0.0.0/20"}, '
-            '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/s2", '
             '"ipCidrRange": "10.1.0.0/20"}]'
         )
 
