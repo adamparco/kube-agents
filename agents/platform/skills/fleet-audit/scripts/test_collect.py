@@ -221,7 +221,9 @@ class TestNoRequests(unittest.TestCase):
 
     # -- Impact, per arm. §3.1 flags a container missing cpu *or* memory, so
     # the check's own "first evicted under node pressure" describes only the
-    # BestEffort arm. The other two carry their own sentence.
+    # BestEffort arm. The other two carry their own sentence, composed of two
+    # independently-varying halves: what the missing requests cost, and what
+    # the pod's real QoS class means for eviction order.
 
     def test_a_besteffort_pod_keeps_the_checks_own_impact(self):
         # Nothing declared anywhere: the pod really is BestEffort and really is
@@ -233,24 +235,185 @@ class TestNoRequests(unittest.TestCase):
         # cluster in the fleet with a CPU request and no memory request.
         hit = self.check(self.wl(resources={"requests": {"cpu": "100m"}}))
         self.assertIn("Burstable, not BestEffort", hit["impact"])
-        self.assertIn("after every BestEffort pod", hit["impact"])
-        self.assertIn("without memory ", hit["impact"])
+        self.assertIn("memory goes unreserved", hit["impact"])
         self.assertNotIn("first evicted", hit["impact"])
+        # And it must not swap one false eviction claim for another. The
+        # kubelet does not rank by QoS class at all -- it sorts on whether
+        # usage exceeds requests, then Pod Priority -- so "Burstable is evicted
+        # after every BestEffort pod" is as wrong as "first evicted" was.
+        self.assertIn("Eviction does not follow the class", hit["impact"])
+        self.assertNotIn("after every BestEffort pod", hit["impact"])
 
     def test_a_limit_with_no_request_is_reserved_at_its_ceiling(self):
         # Kubernetes copies the limit into the request at admission, so this pod
         # is Guaranteed -- the last thing evicted. Still flagged, because §3.1
         # wants the request declared, but for the opposite reason.
         hit = self.check(self.wl(resources={"limits": {"cpu": "1", "memory": "1Gi"}}))
-        self.assertIn("defaults the request to that limit", hit["impact"])
-        self.assertIn("last thing evicted", hit["impact"])
+        self.assertIn("copies that limit into the request", hit["impact"])
+        self.assertIn("Guaranteed", hit["impact"])
+        self.assertIn("last group evicted", hit["impact"])
         self.assertNotIn("costs nothing", hit["impact"])
+
+    # -- The eviction half is the *pod's* QoS class, which a sibling container
+    # can decide. Reading it off the reported container's own limits is the
+    # mistake these four pin: each has every missing request limit-backed, so
+    # the ceiling sentence is right and "Guaranteed" is wrong.
+
+    def test_a_sibling_without_a_limit_makes_a_backed_pod_burstable(self):
+        # `app` declares limits and no requests -- backed, ceiling-reserved. But
+        # `proxy` declares requests and no ceiling, and Guaranteed needs *every*
+        # container to carry both limits. The pod is Burstable.
+        hit = self.check(
+            self.wl(
+                resources={"limits": {"cpu": "1", "memory": "1Gi"}},
+                init_containers=[
+                    {
+                        "name": "proxy",
+                        "restartPolicy": "Always",
+                        "resources": {"requests": {"cpu": "10m", "memory": "8Mi"}},
+                    }
+                ],
+            )
+        )
+        self.assertIn("copies that limit into the request", hit["impact"])
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+        self.assertNotIn("Guaranteed", hit["impact"])
+
+    def test_a_request_below_its_own_limit_is_not_guaranteed(self):
+        # `memory` is missing and backed by its limit, so the ceiling sentence
+        # holds -- but the declared cpu request is under the cpu limit, which is
+        # the textbook Burstable pod.
+        hit = self.check(
+            self.wl(resources={"requests": {"cpu": "500m"}, "limits": {"cpu": "1", "memory": "1Gi"}})
+        )
+        self.assertIn("copies that limit into the request", hit["impact"])
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+        self.assertNotIn("Guaranteed", hit["impact"])
+
+    def test_a_limitrange_default_below_the_limit_is_not_guaranteed(self):
+        # The LimitRange covers cpu, so cpu drops out of `missing` and memory is
+        # the only finding -- backed by its limit. But the injected cpu request
+        # is 50m against a 1-core limit, so the admitted pod is Burstable.
+        limitranges = {"default": [{"spec": {"limits": [{"defaultRequest": {"cpu": "50m"}}]}}]}
+        hit = self.check(self.wl(resources={"limits": {"cpu": "1", "memory": "1Gi"}}), limitranges)
+        self.assertIn("memory", hit["excerpt"])
+        self.assertNotIn("cpu", hit["excerpt"])
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+        self.assertNotIn("Guaranteed", hit["impact"])
+
+    def test_a_sibling_with_matching_requests_and_limits_stays_guaranteed(self):
+        # The control for the three above: `proxy` declares both limits with
+        # requests that match them, so nothing disqualifies the pod and the
+        # Guaranteed sentence is the true one.
+        hit = self.check(
+            self.wl(
+                resources={"limits": {"cpu": "1", "memory": "1Gi"}},
+                init_containers=[
+                    {
+                        "name": "proxy",
+                        "restartPolicy": "Always",
+                        "resources": {
+                            "requests": {"cpu": "10m", "memory": "8Mi"},
+                            "limits": {"cpu": "10m", "memory": "8Mi"},
+                        },
+                    }
+                ],
+            )
+        )
+        self.assertIn("Guaranteed", hit["impact"])
+        self.assertNotIn("Burstable", hit["impact"])
+
+    # -- Which containers, and which quantities, Kubernetes counts. The QoS
+    # computation reads a different container set from §3.1's flag-when and
+    # ignores quantities §3.1 does not, so both had to be answered separately.
+
+    def test_a_plain_init_containers_requests_decide_the_class(self):
+        # `_effective_containers` drops a plain init container, correctly: it
+        # never counts toward the pod's effective request. QoS is the other
+        # question -- upstream iterates *all* of `spec.initContainers` with no
+        # restartPolicy filter -- so this pod is Burstable, not BestEffort, and
+        # must not fall through to the check's own "first evicted".
+        hit = self.check(
+            self.wl(
+                resources={},
+                init_containers=[{"name": "setup", "resources": {"requests": {"cpu": "100m"}}}],
+            )
+        )
+        self.assertEqual(hit["excerpt"], "app: missing cpu,memory")
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+
+    def test_a_resourceless_plain_init_container_breaks_guaranteed(self):
+        # Same container set, opposite direction: `app` alone would be
+        # Guaranteed, but `migrate` carries no limits and every container needs
+        # both for the class.
+        hit = self.check(
+            self.wl(
+                resources={"limits": {"cpu": "1", "memory": "1Gi"}},
+                init_containers=[{"name": "migrate", "resources": {}}],
+            )
+        )
+        self.assertIn("copies that limit into the request", hit["impact"])
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+        self.assertNotIn("Guaranteed", hit["impact"])
+
+    def test_an_extended_resource_alone_leaves_the_pod_besteffort(self):
+        # Kubernetes counts cpu and memory and nothing else, so a container
+        # asking only for a GPU is BestEffort -- the one arm where the check's
+        # own "first evicted" is true. Calling it Burstable would state the
+        # exact inverse.
+        hit = self.check(self.wl(resources={"limits": {"nvidia.com/gpu": "1"}}))
+        self.assertNotIn("impact", hit)
+
+    def test_an_explicit_zero_request_leaves_the_pod_besteffort(self):
+        # A quantity has to be greater than zero to count.
+        self.assertNotIn("impact", self.check(self.wl(resources={"requests": {"cpu": "0"}})))
+        self.assertNotIn("impact", self.check(self.wl(resources={"limits": {"memory": "0Mi"}})))
+
+    def test_a_zero_limit_does_not_make_a_pod_guaranteed(self):
+        hit = self.check(self.wl(resources={"limits": {"cpu": "1", "memory": "0"}}))
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+        self.assertNotIn("Guaranteed", hit["impact"])
+
+    def test_the_unreserved_claim_is_scoped_to_a_container_not_the_pod(self):
+        # Two containers, each limiting a different resource. Both are missing
+        # both requests, so the union is {cpu, memory} -- but the pod is sized
+        # with cpu (from `app`) *and* memory (from `proxy`), both defaulted from
+        # their limits. A pod-level "sized without cpu or memory" would be
+        # flatly false; the container-scoped sentence is true.
+        hit = self.check(
+            self.wl(
+                resources={"limits": {"cpu": "1"}},
+                init_containers=[
+                    {
+                        "name": "proxy",
+                        "restartPolicy": "Always",
+                        "resources": {"limits": {"memory": "1Gi"}},
+                    }
+                ],
+            )
+        )
+        self.assertIn("cpu or memory goes unreserved on at least one container", hit["impact"])
+        self.assertNotIn("size this cluster without", hit["impact"])
+
+    def test_two_spellings_of_one_quantity_fall_to_burstable(self):
+        # `0.1` and `100m` are the same quantity and Kubernetes would call this
+        # Guaranteed. `_qos_class` compares strings, so it says Burstable --
+        # wrong, but in the direction that claims less. Pinned so a later change
+        # to real quantity parsing is a deliberate one.
+        self.assertEqual(
+            collect._qos_class(
+                [{"resources": {"requests": {"cpu": "0.1", "memory": "1Gi"}, "limits": {"cpu": "100m", "memory": "1Gi"}}}],
+                {},
+                "default",
+            ),
+            "Burstable",
+        )
 
     def test_a_limit_covering_only_one_resource_leaves_the_other_unreserved(self):
         # A memory limit backs the memory request; CPU is backed by nothing, so
         # the sentence must name CPU and only CPU as unreserved.
         hit = self.check(self.wl(resources={"limits": {"memory": "1Gi"}}))
-        self.assertIn("without cpu ", hit["impact"])
+        self.assertIn("cpu goes unreserved", hit["impact"])
         self.assertNotIn("memory", hit["impact"].split("Burstable")[0])
 
     def test_the_unreserved_resources_are_named_in_sorted_order(self):
@@ -264,7 +427,7 @@ class TestNoRequests(unittest.TestCase):
                 ],
             )
         )
-        self.assertIn("without cpu or memory ", hit["impact"])
+        self.assertIn("cpu or memory goes unreserved", hit["impact"])
 
     def test_a_plain_init_container_is_never_flagged(self):
         hit = self.check(

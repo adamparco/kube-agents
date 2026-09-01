@@ -531,40 +531,140 @@ _REQUEST_RESOURCES = ("cpu", "memory")
 # owner told they are first goes looking for a pressure event that reached them
 # before it reached anything else.
 #
-# Keyed off what the check already computed rather than off the check firing at
-# all -- a fourth shape reaching here falls to the Burstable branch, which
-# claims the least.
-_IMPACT_LIMIT_BACKED = (
+# The sentence is two independent halves: what the missing requests cost, and
+# what the pod's QoS class means. They vary separately -- a pod whose every
+# missing request is limit-backed can still be Burstable because a *different*
+# container declared a request and no ceiling -- so composing them is the only
+# way each stays true. Deriving the class from the first half is what made the
+# original single sentence wrong.
+_QOS_BEST_EFFORT = "BestEffort"
+_QOS_BURSTABLE = "Burstable"
+_QOS_GUARANTEED = "Guaranteed"
+
+# Scoped to a container, not to the pod. `unbacked_missing` is a union across
+# containers, so a pod-level "sized without cpu or memory" is false as soon as
+# a sibling declares one of them: two containers each limiting a different
+# resource put both into the union while the pod is sized with both.
+_IMPACT_UNRESERVED = (
+    "{resources} goes unreserved on at least one container here, so the "
+    "scheduler and cluster autoscaler size this cluster below the pod's real "
+    "demand and that share of the cost cannot be attributed."
+)
+_IMPACT_CEILING_RESERVED = (
     "Every missing request is backed by a limit on the same container, so "
-    "Kubernetes defaults the request to that limit at admission: the scheduler "
-    "reserves this workload at its ceiling rather than at its steady-state "
-    "size, and the pod is Guaranteed — the last thing evicted, not the first. "
-    "The cost is bin-packing headroom held against a peak that may never "
-    "arrive, and a reservation nobody wrote down and can review."
+    "Kubernetes copies that limit into the request: the scheduler reserves this "
+    "workload at its ceiling rather than at its steady-state size. The cost is "
+    "bin-packing headroom held against a peak that may never arrive, and a "
+    "reservation nobody wrote down and can review."
 )
-_IMPACT_BURSTABLE = (
-    "The scheduler and cluster autoscaler size this cluster without {resources} "
-    "for this workload, so a node can be packed past its real demand and this "
-    "pod's share of the cost cannot be attributed. It is Burstable, not "
-    "BestEffort — other containers here do declare a request — so the kubelet "
-    "evicts it after every BestEffort pod on the node, ranking it by how far "
-    "usage exceeds a request of zero."
-)
+# Neither of these says "evicted first" or "evicted last by class", because the
+# kubelet does not rank by class -- it sorts on whether usage exceeds requests,
+# then Pod Priority, then usage relative to requests. Replacing one false
+# eviction claim with another is the mistake this Impact already made once.
+_IMPACT_BY_QOS = {
+    _QOS_GUARANTEED: (
+        " Every container carries both limits with a request that matches, so "
+        "the pod is Guaranteed: its usage cannot exceed its requests, which is "
+        "the kubelet's first sort key under node pressure. It is in the last "
+        "group evicted, not the first."
+    ),
+    _QOS_BURSTABLE: (
+        " The pod is Burstable, not BestEffort. Eviction does not follow the "
+        "class, though: the kubelet sorts on whether usage exceeds requests and "
+        "then on Pod Priority, so a memory request left at zero puts a pod in "
+        "the same first group as a BestEffort one, while an unreserved cpu "
+        "request does not affect eviction at all."
+    ),
+}
+
+# A quantity Kubernetes does not count: `0`, `0m`, `0Mi`, `0.0`. Anything that
+# will not parse counts as non-zero -- a quantity this cannot read is far more
+# likely to be a real reservation than a zero spelled strangely.
+_QUANTITY_NUMBER = re.compile(r"^\s*([+-]?[0-9.]+)")
+
+
+def _is_zero_quantity(quantity) -> bool:
+    match = _QUANTITY_NUMBER.match(str(quantity))
+    if not match:
+        return False
+    try:
+        return float(match.group(1)) == 0.0
+    except ValueError:
+        return False
+
+
+def _declared(resources: dict, field: str, resource: str) -> bool:
+    """Whether `field` carries a countable quantity for `resource`.
+
+    Kubernetes' QoS computation reads cpu and memory alone and skips any
+    quantity that is not greater than zero, so `nvidia.com/gpu: 1`,
+    `ephemeral-storage: 1Gi` and `cpu: 0` all leave a container silent.
+    """
+    quantity = (resources.get(field) or {}).get(resource)
+    return quantity is not None and not _is_zero_quantity(quantity)
+
+
+def _qos_containers(workload: dict) -> list[dict]:
+    """Every container Kubernetes' QoS computation reads.
+
+    Deliberately not `_effective_containers`. QoS iterates `spec.containers`
+    and *all* of `spec.initContainers` with no `restartPolicy` filter, so a
+    plain init container's requests decide the class even though they never
+    count toward the pod's effective request — the two questions need two
+    container sets, and reusing one for both is how the class came out wrong.
+    Ephemeral containers are absent from both; upstream excludes them because
+    they cannot declare resources.
+    """
+    template = workload["template"]
+    return list(template.get("containers") or []) + list(template.get("initContainers") or [])
+
+
+def _qos_class(containers: list[dict], limitranges: dict, namespace: str) -> str:
+    """Kubernetes' QoS algorithm, read off the workload spec.
+
+    Guaranteed needs every container to carry a `cpu` *and* a `memory` limit
+    above zero with a request equal to it; an absent request is copied from the
+    limit, so a container declaring limits alone qualifies. A pod where no
+    container declares cpu or memory at all is BestEffort. Everything else is
+    Burstable.
+
+    Wrong in one direction on purpose. Two spellings of one quantity (`100m`
+    and `0.1`) compare unequal, and a LimitRange `defaultRequest` can inject a
+    request below the limit; both send the pod to Burstable. Burstable is the
+    branch that claims the least, so an unmodelled shape landing there
+    understates rather than misstates.
+    """
+    declares_compute = False
+    guaranteed = True
+    for container in containers:
+        resources = container.get("resources") or {}
+        for resource in _REQUEST_RESOURCES:
+            has_request = _declared(resources, "requests", resource)
+            has_limit = _declared(resources, "limits", resource)
+            declares_compute = declares_compute or has_request or has_limit
+            if not has_limit:
+                guaranteed = False
+            elif has_request:
+                if resources["requests"][resource] != resources["limits"][resource]:
+                    guaranteed = False
+            elif _has_default(limitranges, namespace, "defaultRequest", resource):
+                guaranteed = False
+    if not declares_compute:
+        return _QOS_BEST_EFFORT
+    return _QOS_GUARANTEED if guaranteed else _QOS_BURSTABLE
 
 
 def check_no_requests(workload: dict, context: dict) -> dict | None:
     limitranges = context["limitranges"]
+    containers = _effective_containers(workload)
     missing_by_container = {}
-    # Whether the pod is BestEffort, and whether a limit already covers every
-    # request the check is about to report missing. Both decide the Impact, and
-    # both are properties of the pod rather than of one container.
-    declares_something = False
+    # Whether a limit already covers every request the check is about to report
+    # missing. A property of the pod, not of one container, and half of the
+    # Impact; the QoS class below is the other half.
     unbacked_missing: set[str] = set()
-    for container in _effective_containers(workload):
+    for container in containers:
         resources = container.get("resources") or {}
         requests, limits = resources.get("requests") or {}, resources.get("limits") or {}
-        if requests or limits:
-            declares_something = True
         missing = [
             resource
             for resource in _REQUEST_RESOURCES
@@ -585,13 +685,14 @@ def check_no_requests(workload: dict, context: dict) -> dict | None:
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": "; ".join(f"{c}: missing {','.join(m)}" for c, m in missing_by_container.items()),
     }
-    if not declares_something:
-        return hit  # BestEffort: the check's own Impact is the true one.
-    if not unbacked_missing:
-        hit["impact"] = _IMPACT_LIMIT_BACKED
+    qos = _qos_class(_qos_containers(workload), limitranges, workload["ns"])
+    if qos == _QOS_BEST_EFFORT:
+        return hit  # The check's own Impact is the true one, and only here.
+    if unbacked_missing:
+        head = _IMPACT_UNRESERVED.format(resources=" or ".join(sorted(unbacked_missing)))
     else:
-        resources = " or ".join(sorted(unbacked_missing))
-        hit["impact"] = _IMPACT_BURSTABLE.format(resources=resources)
+        head = _IMPACT_CEILING_RESERVED
+    hit["impact"] = head + _IMPACT_BY_QOS[qos]
     return hit
 
 
