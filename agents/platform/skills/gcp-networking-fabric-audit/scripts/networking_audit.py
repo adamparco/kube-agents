@@ -647,17 +647,29 @@ def _utilization_by_subnet(project: str, *, run: RunFn) -> dict[str, dict] | Non
     return by_subnet
 
 
-def _backfill_utilization(parsed: list[dict], by_subnet: dict[str, dict]) -> int:
+def _backfill_utilization(parsed: list[dict], by_subnet: dict[str, dict], project: str) -> int:
     """Write insight ratios onto the `ipUtilization` field the check already
     reads, so `check_subnet_ip_exhaustion` itself needs no change.
 
     Only fills where the field is absent -- if a future gcloud starts
     populating it, the first-party value wins. Returns the number of subnets
     that gained at least one reading.
+
+    Scoped to `project` for the reason `_utilization_key` gives and the two
+    zero-fill helpers already act on: the key is `region/name` with no project
+    segment, because the two surfaces spell the project the same way but the
+    URI prefixes differ. `list-usable` reaches across a Shared VPC and the
+    insight does not, so a host-project `us-east4/default` collides with the
+    audited project's own `us-east4/default` and would be written that
+    subnet's ratio -- publishing another project's subnet as 97% utilized on
+    the strength of a reading that was never about it.
     """
     filled = 0
     for item in parsed:
-        slot = by_subnet.get(_utilization_key(item.get("subnetwork", "")))
+        link = item.get("subnetwork", "")
+        if _project_of_subnet_link(link) != project:
+            continue
+        slot = by_subnet.get(_utilization_key(link))
         if not slot:
             continue
         touched = False
@@ -888,7 +900,7 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
                     ),
                 }
             ]
-        covered = _backfill_utilization(parsed, by_subnet)
+        covered = _backfill_utilization(parsed, by_subnet, project)
         log(f"{project}: Network Analyzer covered {covered}/{len(parsed)} subnets")
         if not covered:
             return [

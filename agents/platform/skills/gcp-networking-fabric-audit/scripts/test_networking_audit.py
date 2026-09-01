@@ -986,7 +986,7 @@ class CollectProjectTest(unittest.TestCase):
             }
         ]
         by_subnet = {"us-east4/s1": {"primary": 0.9, "secondary": {"pods": 0.95}}}
-        self.assertEqual(na._backfill_utilization(subnets, by_subnet), 0)
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet, "p"), 0)
         self.assertEqual(subnets[0]["ipUtilization"], 0.2)
         self.assertEqual(subnets[0]["secondaryIpRanges"][0]["ipUtilization"], 0.3)
 
@@ -996,9 +996,29 @@ class CollectProjectTest(unittest.TestCase):
             {"subnetwork": "https://x/projects/p/regions/us-west1/subnetworks/s2"},
         ]
         by_subnet = {"us-east4/s1": {"primary": 0.4, "secondary": {}}}
-        self.assertEqual(na._backfill_utilization(subnets, by_subnet), 1)
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet, "p"), 1)
         self.assertEqual(subnets[0]["ipUtilization"], 0.4)
         self.assertNotIn("ipUtilization", subnets[1])
+
+    def test_backfill_does_not_bleed_a_ratio_onto_another_projects_subnet(self):
+        """The insight is scoped to one project; `list-usable` is not.
+
+        `_utilization_key` is `region/name` with no project segment, so a
+        Shared VPC host project's `us-east4/default` matches the audited
+        project's `us-east4/default` exactly. Without the guard the host
+        subnet inherits the audited one's ratio and publishes as a critical
+        on the strength of a measurement that was never about it -- the same
+        absence `_zero_fill_unallocated` and `_zero_fill_skipped_ranges`
+        already refuse to act on.
+        """
+        subnets = [
+            {"subnetwork": "https://x/projects/host-proj/regions/us-east4/subnetworks/default"},
+            {"subnetwork": "https://x/projects/p/regions/us-east4/subnetworks/default"},
+        ]
+        by_subnet = {"us-east4/default": {"primary": 0.97, "secondary": {}}}
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet, "p"), 1)
+        self.assertNotIn("ipUtilization", subnets[0])
+        self.assertEqual(subnets[1]["ipUtilization"], 0.97)
 
     def test_a_subnet_measured_at_zero_utilization_is_not_treated_as_unmeasured(self):
         # 0.0 is a measurement. Testing presence rather than truthiness is the
