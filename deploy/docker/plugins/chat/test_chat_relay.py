@@ -304,6 +304,32 @@ class TestStandaloneSend(unittest.TestCase):
                 self.assertTrue(report.strip() == "", "fixture is not whitespace")
                 self.assertTrue(mod.is_silent_report(report))
 
+    def test_an_upstream_matcher_that_raises_costs_the_test_not_the_send(self):
+        """The `try` guarded the import and left the call outside it.
+
+        This predicate is no longer cron-only: `slack_relay_patch` routes every
+        out-of-process Slack send through it, so it runs over arbitrary
+        interactive text rather than a scheduler's own output. A raise inside
+        the private upstream matcher therefore propagated out of a silence test
+        and failed the whole send. Degrade to the marker comparison instead --
+        the same answer the import failure already gives.
+        """
+        import sys
+        import types
+
+        fake = types.ModuleType("cron.scheduler")
+
+        def explode(_text):
+            raise RuntimeError("upstream matcher blew up")
+
+        fake._is_cron_silence_response = explode
+        pkg = types.ModuleType("cron")
+        pkg.scheduler = fake
+        with patch.dict(sys.modules, {"cron": pkg, "cron.scheduler": fake}):
+            # Reached the matcher and survived it, answering from the marker.
+            self.assertTrue(mod.is_silent_report("[SILENT]"))
+            self.assertFalse(mod.is_silent_report("3 critical findings"))
+
     def test_the_marker_padded_with_non_ascii_whitespace_is_still_silence(self):
         # The dress strip stops at the NBSP, leaving the asterisks in place, so
         # the fallback compared "**[SILENT]**" against the marker and relayed it.

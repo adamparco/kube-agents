@@ -263,12 +263,21 @@ def is_silent_report(report: str) -> bool:
         return True
     try:
         from cron.scheduler import _is_cron_silence_response
+
+        return bool(_is_cron_silence_response(bare))
     except Exception:
-        # Outside the Hermes tree — the unit tests, and any caller that imports
-        # this module on its own. Fall back to the marker itself rather than
-        # failing open, because failing open here means posting the marker.
+        # Two cases, one answer. The import fails outside the Hermes tree — the
+        # unit tests, and any caller that imports this module on its own. The
+        # call fails if that private matcher ever raises on an input, which is
+        # no longer a hypothetical worth leaving uncovered: this predicate now
+        # gates every out-of-process Slack send, not just cron reports, so it
+        # runs over arbitrary interactive text rather than a scheduler's own
+        # output. Guarding only the import left the call able to take the whole
+        # send down over a silence test.
+        #
+        # Fall back to the marker itself rather than failing open, because
+        # failing open here means posting the marker.
         return bare.strip().upper() == "[SILENT]"
-    return bool(_is_cron_silence_response(bare))
 
 
 #: Where ``audit_report.py finish`` records each stream's last run. Same
