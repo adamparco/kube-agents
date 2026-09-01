@@ -125,19 +125,13 @@ UNMEASURED_SUBNET_LIMITATION = (
 # `_collect_subnet_targets` refuses one layer up, surviving inside a subnet
 # because the gate is satisfied by a single reading.
 #
-# Network Analyzer produces the shape routinely, and its silence about a range
-# is not evidence the range is empty. On this fleet it published 15 of
-# `us-east4/default`'s 17 ranges, omitting the Pod ranges of `drift-peer-ap-1`
-# and `drift-peer-ap-2` -- each of which was running a node and 15 Pods when
-# this was measured on 2026-09-01, so both omitted ranges hold allocations.
-# Staleness does not explain it either: both clusters predate the insight's
-# refresh by two days. Whatever the cause, a range the insight skips can be
-# filling up, so the check reports it as unmeasured instead of clearing it.
-#
-# This is the case `_zero_fill_unallocated` deliberately does not touch. A whole
-# subnet absent from the insight is absent because it holds nothing; a range
-# skipped inside a subnet the insight covers is these two, and guessing 0% for
-# them would clear a range nobody read.
+# Network Analyzer is not that case, though: its silence about a range is the
+# report of an empty one, and `_zero_fill_skipped_ranges` reads it as such. What
+# is left for this limitation is a range carrying no figure from either surface
+# -- a subnet `list-usable` measures on some ranges and not others, which no
+# released gcloud does today but which `_backfill_utilization` already defers
+# to, and a partially measured subnet in a Shared VPC host project, which the
+# insight cannot reach at all.
 #
 # `cross_check_manifest` states where this belongs: a check that applies but
 # could not be evaluated is the target's `limitations`, which §6 turns into a
@@ -676,15 +670,11 @@ def _zero_fill_unallocated(parsed: list[dict], by_subnet: dict[str, dict], proje
     and a ledger carrying 41 limitations and one measurement reads as an audit
     that could not run -- which is how issue #122 came out.
 
-    Two absences are deliberately left alone:
-
-    * A subnet in another project. `list-usable` reaches across a Shared VPC and
-      the insight does not, so the host project's subnets are absent for a
-      reason that says nothing about their allocations.
-    * A range skipped inside a subnet the insight *does* cover. That keeps
-      `PARTIAL_SUBNET_LIMITATION`, because there the omission is not evidence of
-      emptiness -- `us-east4/default`'s two Autopilot Pod ranges are absent from
-      the insight while each carries a node's worth of Pod IPs.
+    One absence is deliberately left alone: a subnet in another project.
+    `list-usable` reaches across a Shared VPC and the insight does not, so the
+    host project's subnets are absent for a reason that says nothing about their
+    allocations. A range skipped inside a subnet the insight *does* cover is the
+    same signal one level down; `_zero_fill_skipped_ranges` reads that one.
 
     Returns the number of subnets recorded at 0%.
     """
@@ -700,6 +690,49 @@ def _zero_fill_unallocated(parsed: list[dict], by_subnet: dict[str, dict], proje
             if not isinstance(sec.get("ipUtilization"), (int, float)):
                 sec["ipUtilization"] = 0.0
         zeroed += 1
+    return zeroed
+
+
+def _zero_fill_skipped_ranges(parsed: list[dict], by_subnet: dict[str, dict], project: str) -> int:
+    """Record a range the insight skipped inside a subnet it covers at 0%.
+
+    `_zero_fill_unallocated`'s rule, one level down, and resting on the same
+    measurement. The insight is one project-scoped summary of "IP utilization
+    for all subnet ranges", and it lists a range only when something is
+    allocated in it: on this fleet it published 15 range records for the whole
+    project and not one carried `allocationRatio: 0`, the smallest being
+    0.0009765625 -- a single node's /24 out of a /14. The 14 secondary ranges it
+    named are exactly the 14 that GCE instances hold alias IP ranges in, and the
+    two it skipped, the Pod ranges of the `drift-peer-ap-1` and `drift-peer-ap-2`
+    Autopilot clusters, hold no alias ranges and run no nodes. Absence is the
+    report of zero rather than a failure to look, measured 2026-09-01.
+
+    Reading those two as unmeasured instead cost `us-east4/default` a standing
+    `PARTIAL_SUBNET_LIMITATION`, which made the one subnet on the fleet with
+    anything in it the only one §6 called a coverage gap. Issue #122 then said
+    "this run did not see the whole fleet" about a run that saw all of it, and
+    could never close.
+
+    Only subnets the insight covered, so a subnet it omitted entirely stays
+    `_zero_fill_unallocated`'s to judge and a Shared VPC host project's subnets
+    stay nobody's. Returns the number of subnets that gained a 0% range.
+    """
+    zeroed = 0
+    for item in parsed:
+        link = item.get("subnetwork", "")
+        if _utilization_key(link) not in by_subnet:
+            continue
+        if _project_of_subnet_link(link) != project:
+            continue
+        touched = False
+        if not isinstance(item.get("ipUtilization"), (int, float)):
+            item["ipUtilization"] = 0.0
+            touched = True
+        for sec in item.get("secondaryIpRanges") or []:
+            if not isinstance(sec.get("ipUtilization"), (int, float)):
+                sec["ipUtilization"] = 0.0
+                touched = True
+        zeroed += touched
     return zeroed
 
 
@@ -829,6 +862,9 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
         empty = _zero_fill_unallocated(parsed, by_subnet, project)
         if empty:
             log(f"{project}: {empty} subnet(s) absent from the insight recorded at 0% (nothing allocated)")
+        skipped = _zero_fill_skipped_ranges(parsed, by_subnet, project)
+        if skipped:
+            log(f"{project}: {skipped} covered subnet(s) had a range the insight skipped, recorded at 0%")
         measured_by_insight = True
     # Publish the commands that produced the reading, in the order they ran.
     # On the backfill path `list-usable` only enumerated the subnets -- the

@@ -631,40 +631,94 @@ class CollectProjectTest(unittest.TestCase):
             "backend-services list": run_of(0, "[]"),
         }
 
-    def test_a_range_the_insight_omits_is_named_rather_than_silently_cleared(self):
-        # The subnet-level gate asks `any`, so two measured ranges mark this
-        # subnet measured and `check_subnet_ip_exhaustion` returns nothing for
-        # the third -- indistinguishable from clearing it. The subnet keeps its
-        # verdict for what was measured; the limitation says what it does not
-        # cover, which is what §6 turns into a coverage gap.
+    def test_a_range_the_insight_skips_is_read_as_empty_not_as_a_gap(self):
+        # The insight lists a range only when something is allocated in it: on
+        # the live fleet it published 15 range records for the whole project and
+        # not one sat at `allocationRatio: 0`. So a range it skipped inside a
+        # subnet it covered is empty, the same signal a skipped subnet carries.
+        # Reading it as unmeasured instead put a standing coverage gap on the one
+        # subnet that had anything in it, and issue #122 could never close.
         entries = na.collect_project("proj-1", run=self.fake_run(self._partial_responses()))
         s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
         self.assertEqual(s1["outcome"], "collected")
-        self.assertIn("ap-pods", s1["limitations"])
-        self.assertIn("2 of 3 ranges", s1["limitations"])
-        # Named by the check that could not reach it, so `coverage_gaps` sees a
-        # slug outside `checks_not_applicable` and keeps the string.
-        self.assertIn("subnet-ip-exhaustion", s1["limitations"])
-        # It stays measured: declaring the check inapplicable here would take a
-        # check that ran on two thirds of the subnet out of the denominator,
-        # and `cross_check_manifest` rejects exactly that.
-        self.assertNotIn(
-            "subnet-ip-exhaustion",
-            {entry["check"] for entry in s1["checks_not_applicable"]},
-        )
+        self.assertNotIn("limitations", s1)
+        # Cleared by measuring the range, not by excusing the check: the slug
+        # stays out of `checks_not_applicable` and in the coverage denominator.
+        self.assertEqual(s1["checks_not_applicable"], [])
         self.assertEqual([c["check"] for c in s1["commands"]], ["subnet-ip-exhaustion"])
+        # 0% is a reading, so the empty range reaches a verdict like any other.
+        # Nothing here is over the threshold, so there is nothing to report.
+        self.assertEqual(s1["candidates"], [])
 
-    def test_the_measured_ranges_still_reach_a_verdict(self):
-        # The limitation must not cost the subnet the finding it did earn. Same
-        # fixture, with the one published secondary over the threshold.
+    def test_a_skipped_range_does_not_cost_the_subnet_its_finding(self):
+        # The zero-fill must not write over what the insight did publish. Same
+        # fixture with the one published secondary over the threshold: the
+        # finding survives, and the skipped range stays out of the excerpt
+        # because 0% is nowhere near it.
         responses = self._partial_responses()
         responses["recommender insights list"] = run_of(
             0, self.PARTIAL_INSIGHT.replace('"allocationRatio": 0.2', '"allocationRatio": 0.95')
         )
         entries = na.collect_project("proj-1", run=self.fake_run(responses))
         s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
-        self.assertIn("secondary range pods", s1["candidates"][0]["excerpt"])
-        self.assertIn("ap-pods", s1["limitations"])
+        excerpt = s1["candidates"][0]["excerpt"]
+        self.assertIn("secondary range pods", excerpt)
+        self.assertIn("95.0% utilized", excerpt)
+        self.assertNotIn("ap-pods", excerpt)
+        self.assertNotIn("limitations", s1)
+
+    def test_zero_fill_skipped_ranges_only_touches_covered_in_project_subnets(self):
+        # Unit-level guards for the two subnets this must keep its hands off.
+        # `theirs` is in `by_subnet` only to make the project guard the thing
+        # under test -- a project-scoped insight never names a Shared VPC host
+        # subnet, so without the entry the `in by_subnet` check would carry the
+        # assertion and the guard could be deleted with the suite still green.
+        subnets = [
+            {
+                "subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/covered",
+                "ipUtilization": 0.1,
+                "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.2}, {"rangeName": "ap-pods"}],
+            },
+            {"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/omitted"},
+            {"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/theirs"},
+        ]
+        by_subnet = {
+            "us-east4/covered": {"primary": 0.1, "secondary": {"pods": 0.2}},
+            "us-east4/theirs": {"primary": 0.3, "secondary": {}},
+        }
+        self.assertEqual(na._zero_fill_skipped_ranges(subnets, by_subnet, "proj-1"), 1)
+        self.assertEqual(subnets[0]["secondaryIpRanges"][1]["ipUtilization"], 0.0)
+        # Published figures survive untouched.
+        self.assertEqual(subnets[0]["ipUtilization"], 0.1)
+        self.assertEqual(subnets[0]["secondaryIpRanges"][0]["ipUtilization"], 0.2)
+        # A subnet the insight omitted entirely is `_zero_fill_unallocated`'s to
+        # judge, and a host project's subnet is nobody's.
+        self.assertNotIn("ipUtilization", subnets[1])
+        self.assertNotIn("ipUtilization", subnets[2])
+
+    def test_a_partly_measured_shared_vpc_subnet_still_reports_the_gap(self):
+        # `PARTIAL_SUBNET_LIMITATION` survives the zero-fill, for the case it is
+        # now actually about: a subnet neither zero-fill will touch, measured on
+        # some ranges and not others. The insight cannot reach a Shared VPC host
+        # project, so if `list-usable` ever starts carrying `ipUtilization` --
+        # `_backfill_utilization` already defers to it if it does -- a host
+        # subnet can arrive half-measured, and half-measured must not read clean.
+        responses = self._partial_responses()
+        responses["subnets list-usable"] = run_of(
+            0,
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/shared", '
+            '"ipCidrRange": "10.1.0.0/20", "ipUtilization": 0.5, '
+            '"secondaryIpRanges": [{"rangeName": "svc", "ipCidrRange": "10.16.0.0/20"}]}]',
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        shared = next(e for e in entries if e["name"] == "proj-1/us-east4/shared")
+        self.assertIn("1 of 2 ranges", shared["limitations"])
+        self.assertIn("svc", shared["limitations"])
+        self.assertIn("subnet-ip-exhaustion", shared["limitations"])
+        self.assertEqual(shared["checks_not_applicable"], [])
 
     def _same_project_pair(self) -> str:
         """Both subnets in the audited project; the insight covers only `s1`."""
