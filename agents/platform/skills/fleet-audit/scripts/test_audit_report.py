@@ -3266,7 +3266,7 @@ class TestFinishClean(HarnessTestCase):
 
     def test_clean_comment_names_date_and_scope(self):
         comment = audit_report.render_clean_comment(
-            AUDIT, make_doc(findings=[]), NOW, closing=True
+            AUDIT, make_doc(findings=[]), NOW, closing=True, gaps=[]
         )
         self.assertIn("2026-08-01 09:30 UTC", comment)
         self.assertIn("0 findings", comment)
@@ -3282,7 +3282,9 @@ class TestFinishClean(HarnessTestCase):
             findings=[],
             skipped=[{"cluster": "prod-eu-1", "reason": "API server unreachable"}],
         )
-        comment = audit_report.render_clean_comment(AUDIT, doc, NOW, closing=False)
+        comment = audit_report.render_clean_comment(
+            AUDIT, doc, NOW, closing=False, gaps=audit_report.coverage_gaps(doc)
+        )
         self.assertNotIn("closing", comment)
         self.assertNotIn("closed as completed", comment)
         self.assertIn("did not see the whole fleet", comment)
@@ -3305,7 +3307,9 @@ class TestFinishClean(HarnessTestCase):
                 }
             ],
         )
-        comment = audit_report.render_clean_comment(AUDIT, doc, NOW, closing=False)
+        comment = audit_report.render_clean_comment(
+            AUDIT, doc, NOW, closing=False, gaps=audit_report.coverage_gaps(doc)
+        )
         self.assertNotIn("closed as completed", comment)
         self.assertIn("Autopilot: node-level checks did not run", comment)
 
@@ -3318,7 +3322,7 @@ class TestFinishClean(HarnessTestCase):
         `coverage_gaps` — empty here — and post "closed as completed" onto it.
         """
         comment = audit_report.render_clean_comment(
-            AUDIT, make_doc(findings=[]), NOW, closing=False
+            AUDIT, make_doc(findings=[]), NOW, closing=False, gaps=[]
         )
         self.assertNotIn("closing", comment)
         self.assertNotIn("closed as completed", comment)
@@ -3330,14 +3334,19 @@ class TestFinishClean(HarnessTestCase):
 
     def test_a_moved_collector_qualifies_the_all_clear(self):
         comment = audit_report.render_clean_comment(
-            AUDIT, make_doc(findings=[]), NOW, closing=True, checks_changed=True
+            AUDIT,
+            make_doc(findings=[]),
+            NOW,
+            closing=True,
+            gaps=[],
+            checks_changed=True,
         )
         self.assertIn("closed as completed", comment)
         self.assertIn("The collector's checks changed since the previous run", comment)
 
     def test_an_unmoved_collector_leaves_the_all_clear_alone(self):
         comment = audit_report.render_clean_comment(
-            AUDIT, make_doc(findings=[]), NOW, closing=True
+            AUDIT, make_doc(findings=[]), NOW, closing=True, gaps=[]
         )
         self.assertIn("closed as completed", comment)
         self.assertNotIn("checks changed", comment)
@@ -4086,7 +4095,9 @@ class TestRenderBudget(BaseTestCase):
                 {"cluster": f"s-{i:04d}", "reason": "unreachable"} for i in range(900)
             ],
         )
-        comment = audit_report.render_clean_comment(AUDIT, doc, NOW, closing=False)
+        comment = audit_report.render_clean_comment(
+            AUDIT, doc, NOW, closing=False, gaps=audit_report.coverage_gaps(doc)
+        )
         self.assertLess(len(comment), GITHUB_BODY_LIMIT)
 
     def test_delta_comment_stays_under_the_limit(self):
@@ -5074,7 +5085,7 @@ class TestRemediateCommands(BaseTestCase):
                 AUDIT, ["netpol-missing"], ["gone"], findings, {"gone": "t"}, NOW
             ),
             "clean": audit_report.render_clean_comment(
-                AUDIT, make_doc(findings=[]), NOW, closing=True
+                AUDIT, make_doc(findings=[]), NOW, closing=True, gaps=[]
             ),
             "refusal": audit_report.render_refusal_comment(
                 {"comment_id": "IC_1", "author": "a", "reasons": ["nope"]}, NOW
@@ -6970,6 +6981,70 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["current_ids"], seeded["current_ids"])
         self.assertFalse(self.harness.gh_calls("issue", "close"))
 
+    def test_the_comment_on_that_hold_open_does_not_announce_a_close(self):
+        """The test above proves the ledger stays open; this proves it says so.
+
+        The two fail apart. Nothing in this branch calls `gh issue close`, so
+        rendering the *closing* all-clear here leaves every store and `gh`
+        assertion above green while the ledger carries a comment reading
+        "closed as completed" — posted onto an issue that is still open. That
+        is what shipped, because the renderer inferred `closing` from
+        `coverage_gaps`, and this branch is the one hold-open with none.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        checks = list(audit_report.audit_checks(AUDIT))
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": checks[:-1],
+                    "checks_not_applicable": [
+                        {
+                            "check": checks[-1],
+                            "reason": audit_report.UNEVALUATED_MARKER
+                            + "the surface published no figure for this target",
+                        }
+                    ],
+                },
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(posted), 1)
+        self.assertNotIn("closed as completed", posted[0])
+        self.assertIn("the ledger stays open", posted[0].lower())
+        self.assertIn("returned no reading this run", posted[0])
+
+    def test_a_waived_run_names_the_waiver_as_the_reason(self):
+        """A waiver is a coverage gap `handle_finish` appends by hand.
+
+        `coverage_gaps` reads the document and cannot see it, so a renderer
+        that recomputed the list took the *no gaps* arm and told a run whose
+        collector never executed that "every cluster was reached and every
+        applicable check ran" — then omitted the only reason the ledger was
+        staying open.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--no-collector-manifest", "the collector crashed"],
+        )
+        self.assertEqual(rc, 0)
+
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(posted), 1)
+        self.assertIn("the collector manifest was waived", posted[0])
+        self.assertIn("the collector crashed", posted[0])
+        self.assertNotIn("every applicable check ran", posted[0])
+        self.assertFalse(self.harness.gh_calls("issue", "close"))
+
     def test_a_structural_na_still_lets_the_finding_resolve(self):
         """The control for the test above: without the marker, nothing changes.
 
@@ -8373,6 +8448,42 @@ class TestChecksRevision(HarnessTestCase):
                 self.seed_store(make_doc(), issue_number=7, checks_revision=seeded)
                 self.assertEqual(self.run_finish(make_doc(), current), 0)
                 self.assertNotIn("The collector's checks changed", self.err)
+
+    def test_the_caveat_reaches_the_all_clear_a_real_run_posts(self):
+        """Every other test of the caveat hands the renderer the flag itself.
+
+        Between them and a run sits the wiring, and it can be cut without
+        failing one of them: pass `checks_changed=False` at both call sites in
+        `handle_finish` and the renderer tests, which supply their own, all
+        stay green while no run ever emits a caveat again.
+        """
+        self.harness.replies = {"issue list": self.issue_list(number=7)}
+        self.seed_store(make_doc(), issue_number=7, checks_revision="old-rev")
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--manifest-file", self.manifest("new-rev")]
+        )
+        self.assertEqual(rc, 0)
+        posted = "\n".join(self.harness.bodies_for("issue", "comment"))
+        self.assertIn("closed as completed", posted)
+        self.assertIn("The collector's checks changed since the previous run", posted)
+
+    def test_the_caveat_reaches_the_delta_comment_too(self):
+        """The other wiring point. A run that still has findings takes the
+        delta path and never reaches the all-clear above."""
+        self.harness.replies = {"issue list": self.issue_list(number=7)}
+        self.seed_store(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
+            issue_number=7,
+            checks_revision="old-rev",
+        )
+        rc = self.run_finish(
+            make_doc(findings=[make_finding(fid="a")]),
+            ["--manifest-file", self.manifest("new-rev")],
+        )
+        self.assertEqual(rc, 0)
+        posted = "\n".join(self.harness.bodies_for("issue", "comment"))
+        self.assertIn("1 resolved", posted)
+        self.assertIn("The collector's checks changed since the previous run", posted)
 
 
 class TestSyncOpenRemediationLabels(HarnessTestCase):
@@ -10697,7 +10808,9 @@ class TestScopeCountsTargetsByKind(unittest.TestCase):
             audit=self.NET,
             clusters=self._subnets(2) + [self._project()],
         )
-        comment = audit_report.render_clean_comment(self.NET, doc, NOW, closing=True)
+        comment = audit_report.render_clean_comment(
+            self.NET, doc, NOW, closing=True, gaps=[]
+        )
         self.assertIn("2 subnets and 1 project", comment)
         self.assertNotIn("3 audited cluster", comment)
 

@@ -5760,6 +5760,7 @@ def render_clean_comment(
     generated_at: datetime,
     *,
     closing: bool,
+    gaps: list[str],
     checks_changed: bool = False,
 ) -> str:
     """Comment posted when an audit that previously had findings comes back clean.
@@ -5778,12 +5779,18 @@ def render_clean_comment(
     inference reached the closing branch and posted "closed as completed" onto
     an issue `handle_finish` had just decided to leave open.
 
+    `gaps` is the caller's too, for the same reason and one more: a waived
+    collector manifest is a coverage gap `handle_finish` appends by hand, and
+    `coverage_gaps(data)` — which reads only the document — cannot see it. A
+    renderer that recomputed the list told a waived run "every cluster was
+    reached and every applicable check ran", which is the opposite of what
+    happened, and then omitted the actual reason the ledger stayed open.
+
     `checks_changed` qualifies the closing branch only. The other branch
     announces nothing resolved, so a moved collector adds nothing to it.
     """
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
-    gaps = coverage_gaps(data)
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     shown = clusters[:MAX_SCOPE_ROWS]
     names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
@@ -5955,8 +5962,19 @@ def render_stale_close_comment(
     *,
     pr_number: int | str = 0,
     reason: str = "",
+    checks_changed: bool = False,
 ) -> str:
-    """Why a remediation pull request is being closed unmerged."""
+    """Why a remediation pull request is being closed unmerged.
+
+    `checks_changed` qualifies the default reason the same way the delta and
+    all-clear comments are qualified, and it matters more here than in either
+    of them: those misinform a reader, this one closes a reviewed fix. "Something
+    else fixed them" is the one sentence a moved collector can make false while
+    the pull request that would have fixed the finding is being retired for it.
+
+    A caller-supplied `reason` is left alone — it names a different staleness
+    (an orphaned branch), which a collector edit does not explain.
+    """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [
         reason
@@ -5967,6 +5985,14 @@ def render_stale_close_comment(
         ),
         "",
     ]
+    if checks_changed and not reason:
+        out += [
+            "**The collector's checks changed since the previous run**, so the "
+            "finding may have stopped being *looked for* rather than stopped "
+            "happening. The branch is kept; re-open this pull request if the "
+            "fix is still wanted.",
+            "",
+        ]
     for finding in sort_findings(findings):
         out += [
             f"**`{finding.get('id', '')}` — {_cell(finding.get('title', ''))}**",
@@ -6997,6 +7023,7 @@ def close_stale_remediation_prs(
     generated_at: datetime,
     *,
     branch_by_finding: dict[str, str] | None = None,
+    checks_changed: bool = False,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -7129,7 +7156,12 @@ def close_stale_remediation_prs(
                 repo,
                 number,
                 render_stale_close_comment(
-                    audit_id, findings, generated_at, pr_number=number, reason=reason
+                    audit_id,
+                    findings,
+                    generated_at,
+                    pr_number=number,
+                    reason=reason,
+                    checks_changed=checks_changed,
                 ),
                 what="stale-close comment",
             )
@@ -7518,10 +7550,11 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
             )
         else:
             log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
-        # The preview reads no stored memory, so a coverage gap is the only
-        # hold-open it can see; an unevaluable target is invisible here and the
-        # preview may therefore promise a closure `finish` will not make.
-        print(render_clean_comment(audit_id, data, now, closing=not gaps))
+        # The preview reads no stored memory and takes no `--no-collector-
+        # manifest`, so a document-derived coverage gap is the only hold-open it
+        # can see; an unevaluable target and a waiver are both invisible here,
+        # and the preview may therefore promise a closure `finish` will not make.
+        print(render_clean_comment(audit_id, data, now, closing=not gaps, gaps=gaps))
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
@@ -8085,7 +8118,14 @@ def handle_finish(args: argparse.Namespace) -> None:
             []
             if coverage_unscopable
             else close_stale_remediation_prs(
-                repo, audit_id, remediation_prs, unverifiable, previous_titles, {}, now
+                repo,
+                audit_id,
+                remediation_prs,
+                unverifiable,
+                previous_titles,
+                {},
+                now,
+                checks_changed=checks_changed,
             )
         )
         if existing_issue:
@@ -8113,7 +8153,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now, closing=False),
+                render_clean_comment(audit_id, data, now, closing=False, gaps=gaps),
                 what="partial all-clear comment",
             )
             body_rewritten = refresh_coverage_ledger(
@@ -8135,7 +8175,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now, closing=False),
+                render_clean_comment(audit_id, data, now, closing=False, gaps=gaps),
                 what="all-clear comment held by unevaluated targets",
             )
             log(
@@ -8148,7 +8188,12 @@ def handle_finish(args: argparse.Namespace) -> None:
                 repo,
                 existing_issue,
                 render_clean_comment(
-                    audit_id, data, now, closing=True, checks_changed=checks_changed
+                    audit_id,
+                    data,
+                    now,
+                    closing=True,
+                    gaps=gaps,
+                    checks_changed=checks_changed,
                 ),
                 what="all-clear comment",
             )
@@ -8452,6 +8497,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 for group in remediation_groups(findings)
                 for finding in group
             },
+            checks_changed=checks_changed,
         )
 
     prs_opened = _open_promoted_prs(
