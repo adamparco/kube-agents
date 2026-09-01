@@ -565,6 +565,28 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
     return words, None
 
 
+#: Surfaces where `--help` does not buy its way past the allowlist.
+#:
+#: The help escape below rests on gcloud short-circuiting to a synopsis before
+#: it acts. That was measured and it holds -- but it is gcloud's behaviour, not
+#: this module's, so the question worth asking is what happens on the day some
+#: surface parses `--help` late. For an API-calling verb the answer is nothing:
+#: `container clusters delete --help` that failed to short-circuit would reach
+#: GCP as the agent's own identity, which holds no delete permission on
+#: anything (`tests/test_agent_iam_ceiling.py` pins that ceiling). IAM is the
+#: backstop and the allowlist is defence in depth.
+#:
+#: These three have no backstop. They change local state inside the pod -- the
+#: active project, the active credentials, the installed toolchain -- and need
+#: no IAM permission to do it, so a short-circuit failure here is directly
+#: exploitable and silently repoints or re-identifies every command that runs
+#: afterwards. Excluding them costs nothing anyone asked for: the SOP that
+#: motivated the escape wants flag syntax for `container clusters update`, and
+#: no skill in this repository runs `gcloud auth`, `gcloud config set`, or
+#: `gcloud components` at all.
+_NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config"})
+
+
 def _gcloud_asks_for_help(argv: list[str]) -> bool:
     """Does argv carry --help or -h in flag position?
 
@@ -1024,8 +1046,10 @@ def evaluate(argv: list[str]) -> Decision:
 
         # After the words parse, so an unknown flag is still refused, and after
         # the three guards above, so --help cannot smuggle a file write or an
-        # identity change past them.
-        if _gcloud_asks_for_help(argv):
+        # identity change past them. `words[:1]` rather than `words[0]`: bare
+        # `gcloud --help` parses to no words at all and is the one form of this
+        # that is unambiguously a documentation request.
+        if _gcloud_asks_for_help(argv) and not set(words[:1]) & _NO_HELP_ESCAPE_SURFACES:
             return _ALLOWED
 
         if not _gcloud_is_read_only(words):

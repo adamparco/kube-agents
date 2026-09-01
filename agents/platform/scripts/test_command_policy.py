@@ -743,6 +743,52 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.unreadable-command", decision.rule_id)
 
+    def test_help_buys_nothing_on_a_surface_that_mutates_local_state(self):
+        """`auth`, `config` and `components` are outside the escape.
+
+        The escape is sound only because gcloud short-circuits to a synopsis
+        before acting, which is gcloud's behaviour rather than this module's.
+        For an API verb that assumption failing is survivable -- the request
+        arrives at GCP as an identity with no write permission. For these three
+        it is not: they rewrite the active project, the active credentials and
+        the installed toolchain from inside the pod, with no IAM check to fail
+        back to, and every command afterwards inherits the result.
+        """
+        for argv in (
+            ["gcloud", "auth", "activate-service-account", "--help"],
+            ["gcloud", "auth", "login", "--help"],
+            ["gcloud", "config", "set", "project", "elsewhere", "--help"],
+            # Help ahead of the operands, not just trailing them.
+            ["gcloud", "config", "set", "--help", "project", "elsewhere"],
+            ["gcloud", "config", "unset", "project", "-h"],
+            ["gcloud", "components", "update", "--help"],
+            ["gcloud", "components", "install", "beta", "-h"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_the_exclusion_does_not_reach_reads_on_those_surfaces(self):
+        """Excluding a surface removes the escape, not the allowlist.
+
+        `gcloud config list` is a listed read and stays one; the exclusion only
+        stops `--help` from standing in for allowlist membership. Without this
+        the narrowing would be a regression for anything introspecting its own
+        configuration.
+        """
+        for argv in (
+            ["gcloud", "config", "list"],
+            ["gcloud", "config", "list", "--help"],
+            ["gcloud", "auth", "list"],
+            ["gcloud", "auth", "list", "--help"],
+            # No surface word at all -- the one unambiguous documentation request.
+            ["gcloud", "--help"],
+            ["gcloud", "-h"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
     def test_help_does_not_smuggle_a_file_write_or_an_identity_change(self):
         for argv, rule in (
             (["gcloud", "container", "clusters", "update", "--help",
