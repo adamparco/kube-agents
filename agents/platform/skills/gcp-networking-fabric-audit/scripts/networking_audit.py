@@ -29,11 +29,16 @@ exhausted is this":
   ratio comes from the `google.networkanalyzer.vpcnetwork.ipAddressInsight`
   insight, whose `subnetRangeStats[].allocationRatio` `_backfill_utilization`
   writes onto each range's `ipUtilization` so the threshold in
-  `check_subnet_ip_exhaustion` reads one field whatever supplied it. A range
-  neither surface measures is unmeasured, never healthy: Network Analyzer
-  omits subnets holding no allocations, and `_collect_subnet_targets` turns
-  that silence into a not-applicable declaration plus a `limitations` string
-  rather than a pass.
+  `check_subnet_ip_exhaustion` reads one field whatever supplied it. The
+  insight names a range only when something is allocated in it, so two
+  silences are readings of zero and get zero-filled: a subnet it omits
+  entirely (`_zero_fill_unallocated`) and a secondary range it never names
+  inside a subnet it does cover (`_zero_fill_skipped_ranges`). Every other
+  gap is unmeasured, never healthy — a primary the insight did not publish, a
+  range it named but whose `allocationRatio` will not parse, and a Shared VPC
+  host project's subnets, which `list-usable` reaches across and the insight
+  cannot see. Those `_collect_subnet_targets` turns into a not-applicable
+  declaration plus a `limitations` string rather than a pass.
 - `cloud-nat-exhaustion` combines three real GCP surfaces: `routers list` for
   each NAT gateway's `natIpAllocateOption` and (when dynamic port allocation
   is on) `maxPortsPerVm`; `routers get-status` for
@@ -125,13 +130,15 @@ UNMEASURED_SUBNET_LIMITATION = (
 # `_collect_subnet_targets` refuses one layer up, surviving inside a subnet
 # because the gate is satisfied by a single reading.
 #
-# Network Analyzer is not that case, though: its silence about a range is the
-# report of an empty one, and `_zero_fill_skipped_ranges` reads it as such. What
-# is left for this limitation is a range carrying no figure from either surface
-# -- a subnet `list-usable` measures on some ranges and not others, which no
-# released gcloud does today but which `_backfill_utilization` already defers
-# to, and a partially measured subnet in a Shared VPC host project, which the
-# insight cannot reach at all.
+# One shape of that is not a failure to look: a secondary range Network
+# Analyzer never names inside a subnet it covers is an empty range, and
+# `_zero_fill_skipped_ranges` reads it as such. Everything else still reaches
+# this limitation -- a primary the insight did not publish, which no alias-IP
+# evidence speaks to; a range it named but whose `allocationRatio` will not
+# parse, which is a read that failed rather than a zero; a subnet `list-usable`
+# measures on some ranges and not others, which no released gcloud does today
+# but which `_backfill_utilization` already defers to; and a partially measured
+# subnet in a Shared VPC host project, which the insight cannot reach at all.
 #
 # `cross_check_manifest` states where this belongs: a check that applies but
 # could not be evaluated is the target's `limitations`, which §6 turns into a
@@ -596,9 +603,17 @@ def _ip_insight_argv(project: str) -> list[str]:
 def _utilization_by_subnet(project: str, *, run: RunFn) -> dict[str, dict] | None:
     """Per-subnet IP utilization from Network Analyzer, keyed by `region/name`.
 
-    Each value is `{"primary": ratio|None, "secondary": {range_name: ratio}}`.
-    The insight marks the primary range by *omitting* `subnetRangeName`; every
-    named entry is a secondary range.
+    Each value is `{"primary": ratio|None, "secondary": {range_name: ratio},
+    "listed": {range_name}}`. The insight marks the primary range by *omitting*
+    `subnetRangeName`; every named entry is a secondary range.
+
+    `listed` holds every secondary range the insight *mentioned*, before asking
+    whether its ratio could be read, and it is the set `_zero_fill_skipped_ranges`
+    reads. Keeping it separate from `secondary` is the whole point: that helper
+    turns a range's absence into 0%, so a range the insight named but gave a
+    figure this parser rejects must not land in the same bucket as one the
+    insight never mentioned at all. The first is unreadable; only the second is
+    empty.
 
     Returns None when the read gates closed, so the caller can tell "could not
     read" from "read fine, covers nothing".
@@ -615,12 +630,16 @@ def _utilization_by_subnet(project: str, *, run: RunFn) -> dict[str, dict] | Non
                     uri = subnet.get("subnetUri") or ""
                     if not uri:
                         continue
-                    slot = by_subnet.setdefault(_utilization_key(uri), {"primary": None, "secondary": {}})
+                    slot = by_subnet.setdefault(
+                        _utilization_key(uri), {"primary": None, "secondary": {}, "listed": set()}
+                    )
                     for rng in subnet.get("subnetRangeStats") or []:
+                        name = rng.get("subnetRangeName")
+                        if name:
+                            slot["listed"].add(name)
                         ratio = rng.get("allocationRatio")
                         if not isinstance(ratio, (int, float)):
                             continue
-                        name = rng.get("subnetRangeName")
                         if name:
                             slot["secondary"][name] = ratio
                         else:
@@ -673,8 +692,9 @@ def _zero_fill_unallocated(parsed: list[dict], by_subnet: dict[str, dict], proje
     One absence is deliberately left alone: a subnet in another project.
     `list-usable` reaches across a Shared VPC and the insight does not, so the
     host project's subnets are absent for a reason that says nothing about their
-    allocations. A range skipped inside a subnet the insight *does* cover is the
-    same signal one level down; `_zero_fill_skipped_ranges` reads that one.
+    allocations. A secondary range the insight never names inside a subnet it
+    *does* cover is the same signal one level down; `_zero_fill_skipped_ranges`
+    reads that one.
 
     Returns the number of subnets recorded at 0%.
     """
@@ -694,11 +714,12 @@ def _zero_fill_unallocated(parsed: list[dict], by_subnet: dict[str, dict], proje
 
 
 def _zero_fill_skipped_ranges(parsed: list[dict], by_subnet: dict[str, dict], project: str) -> int:
-    """Record a range the insight skipped inside a subnet it covers at 0%.
+    """Record a secondary range the insight never named, inside a subnet it
+    covers, at 0%.
 
     `_zero_fill_unallocated`'s rule, one level down, and resting on the same
     measurement. The insight is one project-scoped summary of "IP utilization
-    for all subnet ranges", and it lists a range only when something is
+    for all subnet ranges", and it names a range only when something is
     allocated in it: on this fleet it published 15 range records for the whole
     project and not one carried `allocationRatio: 0`, the smallest being
     0.0009765625 -- a single node's /24 out of a /14. The 14 secondary ranges it
@@ -713,26 +734,54 @@ def _zero_fill_skipped_ranges(parsed: list[dict], by_subnet: dict[str, dict], pr
     "this run did not see the whole fleet" about a run that saw all of it, and
     could never close.
 
-    Only subnets the insight covered, so a subnet it omitted entirely stays
-    `_zero_fill_unallocated`'s to judge and a Shared VPC host project's subnets
-    stay nobody's. Returns the number of subnets that gained a 0% range.
+    Three things it deliberately will not touch, because for each one absence
+    means something other than empty:
+
+    - **The primary range.** The evidence above is entirely alias-IP: it says
+      where Pod ranges are used, and nothing about the addresses a primary
+      carries. ILB VIPs, PSC endpoints and reserved static internal addresses
+      all consume a primary without an alias range in sight, and a primary the
+      insight did not publish is exactly the shape a partial read takes. It
+      stays unmeasured and `PARTIAL_SUBNET_LIMITATION` still fires for it.
+    - **A range the insight named but whose figure this parser could not
+      read** -- `allocationRatio` null, a string, absent. `_utilization_by_subnet`
+      records every name it sees in `listed` before testing the ratio, so a
+      named-but-unreadable range is distinguishable from one never mentioned.
+      The first is a read that failed and must stay a limitation; only the
+      second is a measured zero.
+    - **A subnet the insight omitted entirely**, which stays
+      `_zero_fill_unallocated`'s to judge, and a Shared VPC host project's
+      subnets, which stay nobody's.
+
+    One residual it accepts, the same one the subnet-level zero-fill already
+    accepts: a range created after the insight last refreshed is absent because
+    the insight has not looked yet, and reads 0% here. `list-usable` carries no
+    per-range creation time to gate on, so there is nothing to compare the
+    refresh against. A new range is empty at creation and the insight refreshes
+    daily, so the window where this is wrong is the window where 0% is also
+    nearly true.
+
+    Returns the number of subnets that gained a 0% range.
     """
     zeroed = 0
     for item in parsed:
         link = item.get("subnetwork", "")
-        if _utilization_key(link) not in by_subnet:
+        slot = by_subnet.get(_utilization_key(link))
+        if slot is None:
             continue
         if _project_of_subnet_link(link) != project:
             continue
         touched = False
-        if not isinstance(item.get("ipUtilization"), (int, float)):
-            item["ipUtilization"] = 0.0
-            touched = True
         for sec in item.get("secondaryIpRanges") or []:
-            if not isinstance(sec.get("ipUtilization"), (int, float)):
-                sec["ipUtilization"] = 0.0
-                touched = True
-        zeroed += touched
+            name = sec.get("rangeName")
+            if not name or name in slot["listed"]:
+                continue
+            if isinstance(sec.get("ipUtilization"), (int, float)):
+                continue
+            sec["ipUtilization"] = 0.0
+            touched = True
+        if touched:
+            zeroed += 1
     return zeroed
 
 

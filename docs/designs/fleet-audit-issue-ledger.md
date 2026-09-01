@@ -5,7 +5,7 @@
 > back to it. It replaces the model in which each audit stream owned one continuously-rewritten Pull
 > Request.
 
-**Scope:** How the six autonomous audit watchdogs publish findings and propose fixes.
+**Scope:** How the eight autonomous audit watchdogs publish findings and propose fixes.
 **Supersedes:** the PR-as-report model introduced in `424a345`.
 
 ---

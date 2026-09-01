@@ -667,12 +667,62 @@ class CollectProjectTest(unittest.TestCase):
         self.assertNotIn("ap-pods", excerpt)
         self.assertNotIn("limitations", s1)
 
+    def test_a_named_range_the_insight_could_not_measure_is_not_zero_filled(self):
+        # The one distinction this whole helper rests on. The insight *named*
+        # `ap-pods` and gave a figure `_utilization_by_subnet` will not accept
+        # -- null here, a string or a missing key elsewhere. That is a read that
+        # failed, not a measured zero, and zero-filling it would clear a range
+        # that could be at 99% with no evidence either way. Only a range the
+        # insight never mentioned is empty.
+        responses = self._partial_responses()
+        responses["recommender insights list"] = run_of(
+            0,
+            self.PARTIAL_INSIGHT.replace(
+                '{"allocationRatio": 0.2, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}',
+                '{"allocationRatio": 0.2, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}, '
+                '{"allocationRatio": null, "subnetRangeName": "ap-pods", "subnetRangePrefix": "10.8.0.0/14"}',
+            ),
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertIn("limitations", s1, "an unreadable range was silently zero-filled")
+        self.assertEqual(s1["limitations"], na.PARTIAL_SUBNET_LIMITATION.format(
+            measured=2, total=3, names="ap-pods"
+        ))
+        # A gap in the reading, not an excuse for the check: the slug stays in
+        # the coverage denominator and the subnet keeps its verdict on the two
+        # ranges that were measured.
+        self.assertEqual(s1["checks_not_applicable"], [])
+        self.assertEqual(s1["outcome"], "collected")
+
+    def test_a_primary_the_insight_never_published_is_not_zero_filled(self):
+        # The evidence behind the zero-fill is entirely alias-IP: it says where
+        # Pod ranges are used and nothing about a primary, which ILB VIPs, PSC
+        # endpoints and reserved static internal addresses all consume without
+        # an alias range in sight. So an unpublished primary stays unmeasured
+        # even though the skipped secondary beside it is zero-filled.
+        responses = self._partial_responses()
+        responses["recommender insights list"] = run_of(
+            0, self.PARTIAL_INSIGHT.replace(
+                '{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}, ', ""
+            )
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertIn("limitations", s1, "an unpublished primary was silently zero-filled")
+        self.assertEqual(s1["limitations"], na.PARTIAL_SUBNET_LIMITATION.format(
+            measured=2, total=3, names="the primary range"
+        ))
+        self.assertEqual(s1["checks_not_applicable"], [])
+
     def test_zero_fill_skipped_ranges_only_touches_covered_in_project_subnets(self):
         # Unit-level guards for the two subnets this must keep its hands off.
         # `theirs` is in `by_subnet` only to make the project guard the thing
         # under test -- a project-scoped insight never names a Shared VPC host
         # subnet, so without the entry the `in by_subnet` check would carry the
         # assertion and the guard could be deleted with the suite still green.
+        # `primaryless` guards the other direction: covered, in project, and its
+        # primary still must not be touched.
         subnets = [
             {
                 "subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/covered",
@@ -680,11 +730,19 @@ class CollectProjectTest(unittest.TestCase):
                 "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.2}, {"rangeName": "ap-pods"}],
             },
             {"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/omitted"},
-            {"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/theirs"},
+            {
+                "subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/theirs",
+                "secondaryIpRanges": [{"rangeName": "svc"}],
+            },
+            {
+                "subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/primaryless",
+                "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.4}],
+            },
         ]
         by_subnet = {
-            "us-east4/covered": {"primary": 0.1, "secondary": {"pods": 0.2}},
-            "us-east4/theirs": {"primary": 0.3, "secondary": {}},
+            "us-east4/covered": {"primary": 0.1, "secondary": {"pods": 0.2}, "listed": {"pods"}},
+            "us-east4/theirs": {"primary": 0.3, "secondary": {}, "listed": set()},
+            "us-east4/primaryless": {"primary": None, "secondary": {"pods": 0.4}, "listed": {"pods"}},
         }
         self.assertEqual(na._zero_fill_skipped_ranges(subnets, by_subnet, "proj-1"), 1)
         self.assertEqual(subnets[0]["secondaryIpRanges"][1]["ipUtilization"], 0.0)
@@ -694,31 +752,8 @@ class CollectProjectTest(unittest.TestCase):
         # A subnet the insight omitted entirely is `_zero_fill_unallocated`'s to
         # judge, and a host project's subnet is nobody's.
         self.assertNotIn("ipUtilization", subnets[1])
-        self.assertNotIn("ipUtilization", subnets[2])
-
-    def test_a_partly_measured_shared_vpc_subnet_still_reports_the_gap(self):
-        # `PARTIAL_SUBNET_LIMITATION` survives the zero-fill, for the case it is
-        # now actually about: a subnet neither zero-fill will touch, measured on
-        # some ranges and not others. The insight cannot reach a Shared VPC host
-        # project, so if `list-usable` ever starts carrying `ipUtilization` --
-        # `_backfill_utilization` already defers to it if it does -- a host
-        # subnet can arrive half-measured, and half-measured must not read clean.
-        responses = self._partial_responses()
-        responses["subnets list-usable"] = run_of(
-            0,
-            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
-            '"ipCidrRange": "10.0.0.0/20", '
-            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
-            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/shared", '
-            '"ipCidrRange": "10.1.0.0/20", "ipUtilization": 0.5, '
-            '"secondaryIpRanges": [{"rangeName": "svc", "ipCidrRange": "10.16.0.0/20"}]}]',
-        )
-        entries = na.collect_project("proj-1", run=self.fake_run(responses))
-        shared = next(e for e in entries if e["name"] == "proj-1/us-east4/shared")
-        self.assertIn("1 of 2 ranges", shared["limitations"])
-        self.assertIn("svc", shared["limitations"])
-        self.assertIn("subnet-ip-exhaustion", shared["limitations"])
-        self.assertEqual(shared["checks_not_applicable"], [])
+        self.assertNotIn("ipUtilization", subnets[2]["secondaryIpRanges"][0])
+        self.assertNotIn("ipUtilization", subnets[3])
 
     def _same_project_pair(self) -> str:
         """Both subnets in the audited project; the insight covers only `s1`."""
