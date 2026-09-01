@@ -14,7 +14,9 @@ near-misses the tree does not have.
 
 `hack/scan-cron-prompts.awk` is driven directly rather than through the shell
 script, because the script reads the repository it ships in — `git ls-files`,
-the real rosters, `audit_report.py` — and none of that can be fixtured.
+the real rosters, `audit_report.py` — and none of that can be fixtured. The one
+test that does run the script runs it against that real repository, and asks
+only whether it started.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_docs_terminology_guard.py' -v
@@ -22,6 +24,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -247,6 +250,51 @@ class GuardWiringTest(unittest.TestCase):
         report = source.index("A terminology check could not run")
         scan_call = source.index('-f "$SCAN_AWK"')
         self.assertLess(report, scan_call)
+
+    def test_the_guard_runs_from_a_directory_that_is_not_the_repository_root(self):
+        # Every other test in this class reads the source; this one executes it,
+        # because the defect it covers is invisible to a source read. The script
+        # cd's to the repository root on line 16 and then resolved the awk
+        # program against `$0`, which is still relative to the *caller's*
+        # directory -- so `cd hack && ./check-docs-terminology.sh` exited 1 on
+        # "not found" before checking a single prompt, while CI, which runs it
+        # from the root, stayed green.
+        # Invoked by a *relative* path, which is how a person types it and the
+        # only spelling that reproduces the break: `dirname` on an absolute
+        # `$0` lands on the right directory from any cwd, so a test that runs
+        # the script by its full path passes either way.
+        for cwd in (REPO_ROOT / "hack", REPO_ROOT / "docs"):
+            with self.subTest(cwd=cwd.name):
+                proc = subprocess.run(
+                    ["./" + os.path.relpath(GUARD, cwd)],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotIn("cannot run", proc.stdout + proc.stderr)
+                self.assertEqual(
+                    proc.returncode, 0, (proc.stdout + proc.stderr)[-2000:]
+                )
+
+    def test_the_scan_refuses_to_grade_a_document_without_a_roster(self):
+        # Without `-v idfile`, BSD awk and gawk abort, but mawk reads the empty
+        # string as a missing file and calls every rendered entry an orphan --
+        # a page of failures that look like findings. Both are wrong answers to
+        # "the caller forgot the roster", so the program says so itself.
+        document = f'```json\n{{ "id": "{KNOWN_ID}", "prompt": "a" }}\n```\n'
+        for awk in [a for a in ("awk", "mawk", "gawk") if shutil.which(a)]:
+            with self.subTest(awk=awk):
+                proc = subprocess.run(
+                    [awk, "-f", str(SCAN_AWK)],
+                    input=textwrap.dedent(document),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("idfile", proc.stderr)
 
     def test_no_floor_fires_on_a_search_that_did_not_run(self):
         # A "no document states this any more" error is a wrong diagnosis when

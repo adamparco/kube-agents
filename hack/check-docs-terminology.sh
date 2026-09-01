@@ -440,7 +440,7 @@ trap 'rm -f "$FILE_LIST" "$GREP_ERR" "$GREP_FAILURES" "$PROMPT_HITS" "$ORPHAN_HI
 # `2>/dev/null` a parse error silently *narrowed* the id set -- to one roster's
 # ids, or to none -- and every document the missing ids covered dropped out of
 # the check without a word.
-# shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+# shellcheck disable=SC2086 # CRON_JOBS is a deliberate word-split list.
 if ! jq -r '(.jobs // .)[].id' $CRON_JOBS | sort -u > "$ROSTER_ID_FILE"; then
   echo "ERROR: could not read job ids from ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
   exit 1
@@ -455,7 +455,11 @@ fi
 # why; it lives in its own file so tests/test_docs_terminology_guard.py can
 # drive it against fixtures rather than against the repository it happens to
 # ship in. The ids reach it through -v rather than through interpolation.
-SCAN_AWK=$(dirname "$0")/scan-cron-prompts.awk
+# Relative to the repository root, because line 16 already cd'd there. Deriving
+# it from `$0` instead resolved against the *original* working directory, so
+# `cd hack && ./check-docs-terminology.sh` — the likeliest way anyone runs this
+# by hand — died on "not found" before checking a single prompt.
+SCAN_AWK=hack/scan-cron-prompts.awk
 if [ ! -f "$SCAN_AWK" ]; then
   echo "ERROR: ${SCAN_AWK} not found; the cron-prompt guard cannot run." >&2
   exit 1
@@ -527,7 +531,7 @@ while IFS= read -r HIT; do
 "
       break
     fi
-    # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+    # shellcheck disable=SC2086 # CRON_JOBS is a deliberate word-split list.
     grep -qF -- "$QUOTED" $CRON_JOBS
     MATCH_STATUS=$?
     if [ "$MATCH_STATUS" -ge 2 ]; then

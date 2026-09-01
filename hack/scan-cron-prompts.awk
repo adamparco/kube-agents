@@ -81,7 +81,18 @@ function endfile(   i, kind) {
   m = 0; dochasid = 0; infence = 0
 }
 
-BEGIN { while ((getline id < idfile) > 0) if (id != "") ids["\"" id "\""] = 1 }
+# The `idfile` guard is not redundant with the caller's. Driven without one,
+# BSD awk and gawk abort, but mawk reads the empty string as a missing file,
+# leaves `ids` empty, and reports every rendered entry as an orphan -- a full
+# page of failures that look like findings. A wrapper that forgot to pass the
+# roster should be told so, not graded against nothing.
+BEGIN {
+  if (idfile == "") {
+    print "scan-cron-prompts.awk: -v idfile=<path> is required" > "/dev/stderr"
+    exit 2
+  }
+  while ((getline id < idfile) > 0) if (id != "") ids["\"" id "\""] = 1
+}
 
 FNR == 1 { endfile() }
 
