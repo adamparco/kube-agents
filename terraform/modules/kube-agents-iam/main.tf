@@ -35,23 +35,29 @@ resource "google_service_account_iam_member" "workload_identity" {
 # means "grant nothing and manage roles outside the module", as its
 # description promises.
 #
-# The role id is a variable rather than a literal because of how GCP retires a
-# custom role name. `uninstall.sh` reaches terraform destroy, which soft-deletes
-# this role; the name is then held for between 7 and 37 days. Reinstalling
-# inside the first 7 is fine -- the provider finds the soft-deleted role and
-# undeletes it -- but past that the role can be neither created nor changed
-# until the window closes, and terraform apply fails with nothing an operator
-# can do to the composition to get past it. Setting a different id is that
-# something: TF_VAR_subnet_utilization_role_id reaches this through the
-# full-install passthrough without editing a generated tfvars file. It is also
-# what would let this module be instantiated twice against one project with
-# project_roles on both, which a shared literal could not survive.
+# The role id is a constant, and that has a sharp edge worth knowing about
+# before you reach for it. `uninstall.sh` reaches terraform destroy, which
+# soft-deletes this role; GCP then holds the name for between 7 and 37 days.
+# Reinstalling inside the first 7 is fine -- the provider finds the soft-deleted
+# role and undeletes it -- but past that the role can be neither created nor
+# changed until the window closes, and terraform apply fails. Wait it out, or
+# `gcloud iam roles undelete` the id in the affected project.
+#
+# Making the id a variable looks like the fix and is not, which is why it was
+# tried and taken back out. Nothing in the installer's state model persists such
+# a value: it is absent from vars.sh and from the tfvars emitter in
+# installer_common.sh, so a later `./upgrade.sh` -- which applies with
+# -auto-approve -- would fall back to the default, and role_id is ForceNew. That
+# plans a destroy-and-recreate that fails against the still-held original name,
+# turning a wedge on one id into a wedge on two, unprompted. Persisting it means
+# teaching vars.sh, the tfvars emitter and verify_ci_pool_project.py, which
+# pins this literal; do that first if the variable is wanted.
 resource "google_project_iam_custom_role" "subnet_utilization_reader" {
   count = length(var.project_roles) > 0 ? 1 : 0
 
-  project = var.project_id
-  role_id = var.subnet_utilization_role_id
-  title   = "Kube-Agents Subnet Utilization Reader"
+  project     = var.project_id
+  role_id     = "kubeagentsSubnetUtilizationReader"
+  title       = "Kube-Agents Subnet Utilization Reader"
   # This string is what the GCP console shows an operator reviewing the role, so it
   # carries the same correction as the comment above rather than the read-framing the
   # comment rejects. Changing it is an in-place update of the role on the next apply;

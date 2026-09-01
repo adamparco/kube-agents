@@ -577,21 +577,6 @@ class TerraformCustomRolePermissionsTest(unittest.TestCase):
                         "through IAM independently of its Kubernetes RBAC",
                     )
 
-    def test_the_role_id_stays_overridable(self):
-        """A literal id cannot be changed while GCP holds a soft-deleted one.
-
-        `terraform destroy` soft-deletes the role and the name is reserved for
-        7-37 days, most of which it can be neither created nor updated in. The
-        variable is the only in-band way past that, so a refactor back to a
-        literal is a regression rather than a simplification.
-        """
-        self.assertRegex(
-            self.module,
-            r"role_id\s*=\s*var\.subnet_utilization_role_id",
-            "the custom role's id is no longer a variable; an operator "
-            "reinstalling inside GCP's soft-delete window has no way past it",
-        )
-
 
 class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
     """The catch-all: whatever the shape of the engine, nothing hands the agent admin.
