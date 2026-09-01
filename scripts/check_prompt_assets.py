@@ -760,7 +760,19 @@ def check_cron_delivery() -> list[Finding]:
             # the runtime splitter does (`sibling_delivery_targets` in
             # `deploy/docker/plugins/chat/adapter.py`). A gate stricter than
             # the parser it guards rejects values that would have worked.
-            parts = deliver if isinstance(deliver, (list, tuple)) else re.split(r"[,;]", str(deliver))
+            #
+            # Join *then* split, in that order, because that is the order the
+            # runtime uses. Splitting only the string branch left a list entry
+            # that itself carries a separator -- `["chat", "google_chat,slack"]`
+            # -- checked whole, so the gate reported a target the relay resolves
+            # into two working ones, and `make prompt-check` runs on every pull
+            # request in the repository.
+            joined = (
+                ",".join(str(entry) for entry in deliver)
+                if isinstance(deliver, (list, tuple))
+                else str(deliver)
+            )
+            parts = re.split(r"[,;]", joined)
             for part in (str(p).strip() for p in parts):
                 # An empty part is `"chat,,slack"` -- a stray comma, which the
                 # scheduler ignores and which costs no delivery. An empty

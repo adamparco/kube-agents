@@ -869,6 +869,23 @@ class CronDeliveryTests(unittest.TestCase):
         self.assertEqual(self._findings({"id": "j", "deliver": ["all"]}), [])
         self.assertEqual(len(self._findings({"id": "j", "deliver": ["gchat"]})), 1)
 
+    def test_a_list_entry_that_carries_a_separator_is_split_like_the_relay(self):
+        """`sibling_delivery_targets` joins the list on `,` and *then* splits.
+
+        Checking each list entry whole instead reads `"google_chat,slack"` as
+        one unknown target and fails the roster over a value the relay resolves
+        into two working ones. `make prompt-check` gates every pull request
+        here, so the false positive is repository-wide, not roster-local.
+        """
+        self.assertEqual(
+            self._findings({"id": "j", "deliver": ["chat", "google_chat,slack"]}), []
+        )
+        self.assertEqual(self._findings({"id": "j", "deliver": ["chat;slack"]}), [])
+        # Still finds the bad half, rather than passing the whole entry.
+        findings = self._findings({"id": "j", "deliver": ["chat", "slack,gchat"]})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("'gchat'", str(findings[0]))
+
     def test_an_absent_deliver_is_local_and_not_a_finding(self):
         self.assertEqual(self._findings({"id": "j"}), [])
 
