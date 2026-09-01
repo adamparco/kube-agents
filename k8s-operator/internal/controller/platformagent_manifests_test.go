@@ -1271,7 +1271,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 		t.Fatalf("spec.deployment.env never reached the sidecar, so the override below proves nothing")
 	}
 
-	const want = "33554432" // 32 MiB
+	const want = "16777216" // 16 MiB
 	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
 		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
 	}
@@ -1300,11 +1300,18 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// default is overridable and resolveResources sizes the agent container
 	// for the five-way fan-out it has actually observed. The sidecar is sized
 	// for the same install.
+	//
+	// And two capped streams per command, not one. `_execute` truncates stdout
+	// and stderr in two independent calls -- see the pair of `self._truncate`
+	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
+	// single command can hold 2x it. Modelling one stream understates the
+	// burst by half, which is the direction that lets a too-large cap pass.
 	const copiesPerCommand = 5
+	const streamsPerCommand = 2
 	const steadyStateBytes = 250 << 20
 	const observedFanOut = 5
 	inFlight := int64(observedFanOut + 1)
-	burst := int64(capBytes) * copiesPerCommand * inFlight
+	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
 	limits := buildCredentialProxySidecar(agent, "/opt/hermes").Resources.Limits
 	limit := limits.Memory().Value()
 	if burst+steadyStateBytes > limit {

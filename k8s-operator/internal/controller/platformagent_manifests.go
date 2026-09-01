@@ -2604,7 +2604,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// takes gcloud, kubectl, gh and git away from the whole Pod. Raising
 		// this means raising the limit with it, and the cap test asserts the
 		// pair so the two cannot drift apart silently.
-		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "33554432"},
+		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "16777216"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},

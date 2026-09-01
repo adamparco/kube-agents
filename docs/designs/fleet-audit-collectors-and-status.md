@@ -243,7 +243,7 @@ resolving the kubeconfig per request. Two rules the implementation must keep:
   document's scope is a rejection, in exactly the register of the existing scope validations.
 
 The fail-closed dump gate is non-negotiable and gains a second justification here: the
-credential proxy caps command output — at 32 MiB as the operator deploys it
+credential proxy caps command output — at 16 MiB per stream as the operator deploys it
 (`CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` in `platformagent_manifests.go`; the script's own default
 is 4 MiB) — and _preserves the command's exit code_ when it truncates, so a big cluster's dump
 can arrive incomplete at exit 0. The shim does warn — a

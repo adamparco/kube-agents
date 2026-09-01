@@ -243,9 +243,9 @@ def run_and_gate(argv: list[str], kubeconfig: Path, *, run: RunFn = default_run)
     such envelope, so it gates on parsing as an object at all. Both share
     the same failure mode this function exists to catch: exit 0 with
     truncated or empty output, which the credential proxy's output cap makes
-    a real possibility, not a theoretical one. That cap is 32 MiB as the
-    operator deploys it, 4 MiB if `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` is
-    unset; either way a 16-cluster `-A -o json` dump can reach it.
+    a real possibility, not a theoretical one. That cap is 16 MiB per stream
+    as the operator deploys it, 4 MiB if `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`
+    is unset; either way a 16-cluster `-A -o json` dump can reach it.
     """
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     result = run(argv, env=env, timeout=DEFAULT_TIMEOUT_S)
