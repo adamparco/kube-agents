@@ -80,15 +80,31 @@ MAX_WORKERS = 8
 # provenance below would publish nothing at all.
 MAX_COMMAND_CHARS = 2000
 
-SUBNET_SCOPE_NOT_APPLICABLE = (
-    ("cloud-nat-exhaustion", "NAT gateways are configured at the Cloud Router level, not per subnet."),
-    ("psc-routing-deadlock", "Private Service Connect endpoints are project-level resources, not subnet resources."),
-    ("mtu-packet-fragmentation", "VPC network MTU is defined at the VPC level, not per subnet."),
-    ("cloud-armor-false-positive", "Cloud Armor security policies are backend service resources, not subnet resources."),
-)
-PROJECT_SCOPE_NOT_APPLICABLE = (
-    ("subnet-ip-exhaustion", "Subnet IP capacity is audited per individual subnet scope entry."),
-)
+# `AuditSpec.scopes` already partitions this stream's roster by target kind: a
+# `<project>/<region>/<subnet>` target owes `subnet-ip-exhaustion` and nothing
+# else, a `project/<id>` target owes the other four. `audit_target_checks` is
+# what the coverage denominator reads, so declaring a check inapplicable to a
+# target kind that was never asked for it subtracts nothing from anything --
+# it is a row in the ledger's "Not applicable" table and no more. This module
+# used to declare all four cross-kind slugs on every subnet, which on a fleet
+# whose auto-mode network has one `default` subnet per region is 4 x 42 = 168
+# identical rows on every run, plus one more on the project target.
+
+# Opens the `reason` of a check that *applies* to its target and was attempted
+# without reaching a verdict, as against one the target's shape rules out.
+#
+# The distinction has to be carried because `checks_not_applicable` is doing
+# two jobs at once here. The disposition is what stops the model claiming, in
+# §6, that a check ran against a target where nothing could have run it --
+# `cross_check_manifest` keys that guard on the slug alone, so it is unaffected
+# by this marker. But the same key is what leaves the coverage denominator, and
+# a check that was owed and went unanswered must stay in it. Conflating the two
+# inverted the accounting: a subnet Network Analyzer measured on 14 of its 16
+# ranges reported a coverage gap, while one it measured on 0 of 16 reported
+# none, so the less a target was measured the cleaner it read.
+#
+# `audit_report.checks_unevaluated` is the reader.
+UNEVALUATED_MARKER = "UNEVALUATED: "
 # An unmeasured subnet owes exactly one check and could not run it, so §6's
 # `checks_run` comes out empty for it -- and `finish` rejects an empty
 # `checks_run` unless the target says in `limitations` why nothing ran. The
@@ -769,13 +785,14 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
         # Network Analyzer omits subnets with no allocations, which is why an
         # auto-mode network shows 1 measured subnet and 41 untouched ones.
         measured = _carries_utilization(item)
-        not_applicable = [{"check": slug, "reason": reason} for slug, reason in SUBNET_SCOPE_NOT_APPLICABLE]
+        not_applicable: list[dict] = []
         if not measured:
             not_applicable.append(
                 {
                     "check": "subnet-ip-exhaustion",
                     "reason": (
-                        "No IP-utilization figure for this subnet on either "
+                        UNEVALUATED_MARKER
+                        + "No IP-utilization figure for this subnet on either "
                         "surface: gcloud's UsableSubnetwork omits the field, and "
                         f"{_IP_INSIGHT_TYPE} published no stats for it, which "
                         "Network Analyzer does for subnets holding no allocations."
@@ -886,7 +903,8 @@ def _collect_project_target(project: str, *, run: RunFn) -> dict:
         "outcome": "collected",
         "commands": [{"check": slug, **_joined_record(slug_reads)} for slug, slug_reads in reads.items()],
         "candidates": candidates,
-        "checks_not_applicable": [{"check": slug, "reason": reason} for slug, reason in PROJECT_SCOPE_NOT_APPLICABLE],
+        # Empty rather than absent: three tests subscript this key directly.
+        "checks_not_applicable": [],
     }
 
 

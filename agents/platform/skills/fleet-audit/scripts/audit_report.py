@@ -1068,6 +1068,78 @@ def checks_ran(cluster: object) -> list[str]:
     return out
 
 
+# Mirrors `networking_audit.UNEVALUATED_MARKER`, restated rather than imported
+# because that collector ships standalone beside its own SOP.
+UNEVALUATED_MARKER = "UNEVALUATED: "
+
+
+def checks_unevaluated(cluster: object) -> list[str]:
+    """The `checks_not_applicable` slugs that were attempted, not exempted.
+
+    `checks_not_applicable` carries two dispositions that read the same and
+    mean opposite things. "This cluster is Autopilot, so a node-pool check has
+    nothing to run against" is permanent and structural: absence of a finding
+    there is as good as a clean verdict. "This check applies, the collector
+    read the surface, and no figure came back" is neither -- it says only that
+    nobody looked, and it can flip back the moment the surface catches up.
+
+    Both leave the coverage denominator, and for the second one that is
+    deliberate: `gcp-networking-fabric-audit` sees 42 auto-mode `default`
+    subnets, of which Network Analyzer measures the one holding allocations and
+    omits 41 that hold none. Counting those 41 as gaps would make every
+    auto-mode fleet permanently `partial` -- and a partial run closes no
+    ledger -- over subnets that cannot be IP-exhausted because nothing is in
+    them.
+
+    What must not follow is treating the second disposition as evidence of a
+    fix. `unverifiable_findings` reads absence-of-finding as "resolved" for any
+    target the run covered, so a `subnet-ip-exhaustion` finding published
+    yesterday on a subnet Network Analyzer stopped publishing for today was
+    announced fixed and its remediation pull request closed, on the strength of
+    a read that never happened. Network Analyzer takes about a day to reach a
+    freshly created cluster's ranges, which is exactly the window in which an
+    undersized Pod CIDR fills up. `unevaluated_targets` is what feeds this back
+    into that gate.
+
+    A marker on the reason rather than a new field, so the document schema,
+    `cross_check_manifest`'s two guards, and every collector that does not
+    write it are unchanged. The disposition still has to be *declared* -- it is
+    what stops §6 claiming the check ran against a target nothing ran on -- so
+    the marker annotates it rather than replacing it.
+    """
+    out: list[str] = []
+    entries = (
+        (cluster.get("checks_not_applicable") or []) if isinstance(cluster, dict) else []
+    )
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("reason", "")).startswith(UNEVALUATED_MARKER):
+            slug = str(entry.get("check", "")).strip()
+            if slug:
+                out.append(slug)
+    return out
+
+
+def unevaluated_targets(data: dict) -> set[str]:
+    """Targets carrying at least one attempted-but-unanswered check.
+
+    Unioned into `coverage_gap_targets` at the one place that decides which of
+    the previous run's findings may be called fixed. Deliberately not folded
+    into `_coverage_gaps` itself: these targets are not coverage gaps, they do
+    not make the run `partial`, and they do not stop the ledger closing -- see
+    `checks_unevaluated` for why all three would be wrong. They are only
+    targets this run cannot vouch for.
+    """
+    scope = (data or {}).get("scope") or {}
+    targets: set[str] = set()
+    for cluster in scope.get("clusters") or []:
+        if not isinstance(cluster, dict) or not checks_unevaluated(cluster):
+            continue
+        name = str(cluster.get("name", "")).strip()
+        if name:
+            targets.add(name)
+    return targets
+
+
 def checks_na(cluster: object) -> list[str]:
     """The check slugs a `scope.clusters` entry declares inapplicable.
 
@@ -2963,6 +3035,46 @@ def unverifiable_findings(memory: dict | None, blocked: set[str] | None) -> set[
         if blocked is None or not target or target in blocked:
             held.add(str(finding["id"]))
     return held
+
+
+def carry_unverifiable_into_document(
+    document: dict, memory: dict | None, unverifiable: set[str]
+) -> dict:
+    """`document` widened by the previous findings this run could not re-check.
+
+    Holding a finding back stops *this* run announcing it fixed. Without this
+    it does nothing about the next one. `unverifiable_findings` reads exactly
+    one key -- the stored `document` -- and has no `current_ids` fallback, so a
+    run that drops the held finding from what it stores leaves the following
+    run with no record of it: nothing to hold back, nothing for `compute_delta`
+    to resolve against, and `close_stale_remediation_prs` retires the pull
+    request on the evidence this run refused to gather. The hold lasts one run
+    and then loses the argument by forfeit.
+
+    That is the same defect the clean-run path already carries `document`
+    forward to prevent; this is the findings-branch half of it, where there is
+    no untouched body to carry and the set has to be rebuilt from the ids.
+
+    `current_ids` is deliberately left narrow. It is a claim about what the
+    published body rendered, and the body did not render these -- the wider set
+    is what `document` is for, and `compute_delta` already reads the two
+    separately. So a held finding is not announced, and the day its target is
+    measured again and it is genuinely gone, it resolves.
+    """
+    if not unverifiable:
+        return document
+    previous = ((memory or {}).get("document") or {}).get("findings") or []
+    keep = [
+        f
+        for f in previous
+        if isinstance(f, dict) and str(f.get("id", "")) in unverifiable
+    ]
+    if not keep:
+        return document
+    findings = list((document or {}).get("findings") or [])
+    have = {str(f.get("id", "")) for f in findings if isinstance(f, dict)}
+    findings.extend(f for f in keep if str(f.get("id", "")) not in have)
+    return {**(document or {}), "findings": findings}
 
 
 def _limitation_restates_na(limitation: str, na: set, roster: tuple, reasons: object = ()) -> bool:
@@ -7520,9 +7632,16 @@ def handle_finish(args: argparse.Namespace) -> None:
     # fixed. A waiver is stream-wide by definition — nothing was collected, so
     # no target can be vouched for — and reaches `unverifiable_findings` as the
     # `None` that holds everything back.
-    unverifiable = unverifiable_findings(
-        memory, None if waiver else coverage_gap_targets(data)
-    )
+    #
+    # A target whose check was attempted and went unanswered joins the gap
+    # targets here and only here. It is not a coverage gap — it does not make
+    # the run partial and does not hold the ledger open, both of which would be
+    # wrong for the 41 empty subnets that produce this state on every run — but
+    # it is equally not somewhere absence proves a fix. See `unevaluated_targets`.
+    blocked = coverage_gap_targets(data)
+    if blocked is not None:
+        blocked = blocked | unevaluated_targets(data)
+    unverifiable = unverifiable_findings(memory, None if waiver else blocked)
     # A gap with no stored memory to scope it against. The run knows it missed
     # something and has no way to say which findings sat there, so pull-request
     # retirement falls back to the blanket rule it had before the scoping
@@ -7546,6 +7665,19 @@ def handle_finish(args: argparse.Namespace) -> None:
     current_ids = finding_ids(findings)
 
     remediation_prs = list_remediation_prs(repo, audit_id)
+
+    # Zero findings is an all-clear only where this run could vouch for every
+    # target the previous run's findings sat on. A coverage gap says it could
+    # not reach one; an `UNEVALUATED:` check says it reached one and the surface
+    # returned no figure. Either way a previous finding went un-rechecked, and
+    # closing the ledger over it retires it on evidence nobody gathered.
+    #
+    # `unverifiable` is already scoped to findings the previous run recorded, so
+    # this stays quiet for the ordinary case that produces unevaluated targets:
+    # 41 empty auto-mode subnets carry no findings, contribute nothing here, and
+    # a fleet with none of its findings on an unevaluated target closes its
+    # ledger exactly as before.
+    held_open = bool(gaps) or bool(unverifiable)
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
@@ -7572,7 +7704,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                     repo,
                     existing_issue,
                     render_clean_remediate_answer(
-                        audit_id, request, now, closing=not gaps
+                        audit_id, request, now, closing=not held_open
                     ),
                     what="/remediate answer on a clean run",
                 )
@@ -7592,6 +7724,25 @@ def handle_finish(args: argparse.Namespace) -> None:
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
                 "open and no remediation pull request was closed."
+            )
+        elif existing_issue and unverifiable:
+            # Full coverage on paper, and still not an all-clear. Every cluster
+            # was reached and every applicable check ran, so there is no gap to
+            # render a coverage ledger from -- but a previous finding sits on a
+            # target whose check came back unanswered, and closing here would
+            # retire it silently: out of `resolved_ids` because it was never
+            # re-checked, and out of `current_ids` because this run found
+            # nothing. Neither fixed nor open, just gone.
+            post_comment(
+                repo,
+                existing_issue,
+                render_clean_comment(audit_id, data, now),
+                what="all-clear comment held by unevaluated targets",
+            )
+            log(
+                f"Audit {audit_id} found nothing, but {len(unverifiable)} "
+                "finding(s) sit on targets whose checks returned no reading; "
+                f"issue #{existing_issue} stays open until a run measures them."
             )
         elif existing_issue:
             post_comment(
@@ -7706,7 +7857,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         # is itself unknowable, write no issue number at all: an envelope that
         # claims no ledger fails the next run's trust check by design, which
         # is the outcome an unreadable body should have.
-        body_untouched = bool(existing_issue) and bool(gaps)
+        body_untouched = bool(existing_issue) and held_open
         # `document` carries forward for the same reason and on the same
         # condition. It is documented as the document the ledger rendered, and
         # an untouched body rendered the previous run's — so storing this run's
@@ -8050,7 +8201,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         report_envelope(
             audit_id,
             payload,
-            data,
+            carry_unverifiable_into_document(data, memory, unverifiable),
             now,
             issue_number=number,
             new_ids=new_ids if delta_known else [],

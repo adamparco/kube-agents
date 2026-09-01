@@ -6419,6 +6419,126 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(second["current_ids"], seeded["current_ids"])
         self.assertFalse(self.harness.gh_calls("issue", "close"))
 
+    def test_an_unevaluated_check_holds_its_finding_without_making_the_run_partial(self):
+        """Both halves of the `UNEVALUATED:` disposition, in one run.
+
+        The gapped cases above hold a finding back by refusing to cover its
+        cluster at all, which also makes the run `partial`. This target is
+        fully covered — every applicable check ran, so `coverage_gaps` is
+        empty and the ledger is free to close — and still cannot vouch for the
+        one check whose surface returned no figure. Getting only the first
+        half right announces the finding fixed; getting only the second makes
+        every auto-mode fleet permanently partial over 41 empty subnets.
+        """
+        seeded = self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        checks = list(audit_report.audit_checks(AUDIT))
+        unread = checks[-1]
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": checks[:-1],
+                    "checks_not_applicable": [
+                        {
+                            "check": unread,
+                            "reason": audit_report.UNEVALUATED_MARKER
+                            + "the surface published no figure for this target",
+                        }
+                    ],
+                },
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+
+        # Not a gap: the check was declared inapplicable, so it leaves the
+        # denominator exactly as an Autopilot node-pool exemption would.
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+        self.assertEqual(self.run_finish(doc), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["resolved_ids"], [])
+        self.assertEqual(stored["current_ids"], seeded["current_ids"])
+        self.assertFalse(self.harness.gh_calls("issue", "close"))
+
+    def test_a_structural_na_still_lets_the_finding_resolve(self):
+        """The control for the test above: without the marker, nothing changes.
+
+        Same document, same untaken check, only the reason differs. An
+        Autopilot-style exemption means absence really is a clean verdict, so
+        the seeded finding retires and the issue closes. If this passes only
+        because the marker is never read, the test above passes vacuously.
+        """
+        self.seed_store(make_doc())
+        self.harness.replies = {"issue list": self.issue_list()}
+        checks = list(audit_report.audit_checks(AUDIT))
+        unread = checks[-1]
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": checks[:-1],
+                    "checks_not_applicable": [
+                        {"check": unread, "reason": "Autopilot: Google owns the node pools"}
+                    ],
+                },
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+        self.assertEqual(self.run_finish(doc), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["current_ids"], [])
+        self.assertTrue(stored["resolved_ids"])
+        self.assertTrue(self.harness.gh_calls("issue", "close"))
+
+    def test_a_run_that_finds_something_still_stores_what_it_held_back(self):
+        """The findings-branch half of the clean path's carry-forward.
+
+        Holding a finding out of `resolved_ids` costs the next run nothing
+        unless the finding is still there to hold. `unverifiable_findings`
+        reads the stored `document` and nothing else, so a run that publishes
+        its own findings and drops the held one leaves the next run with no
+        record of it — free to resolve it and close its pull request on the
+        read neither run performed. `current_ids` stays narrow: the body did
+        not render it.
+        """
+        held = derived_id(cluster="prod-us-east")
+        kept = derived_id(cluster="stage-eu", fid="no-network-policy")
+        self.seed_store(
+            make_doc(
+                findings=[
+                    make_finding(),
+                    make_finding(cluster="stage-eu"),
+                ]
+            )
+        )
+        self.harness.replies = {"issue list": self.issue_list()}
+        doc = make_doc(
+            findings=[make_finding(cluster="stage-eu")],
+            clusters=[
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}
+            ],
+            skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["resolved_ids"], [])
+        self.assertEqual(stored["current_ids"], [kept])
+        self.assertEqual(
+            sorted(f["id"] for f in stored["document"]["findings"]),
+            sorted([held, kept]),
+        )
+
     def test_a_clean_run_over_gaps_with_no_memory_claims_no_ledger(self):
         """And when the previous set is itself unknowable there is nothing to
         carry forward, so the envelope claims no issue at all — which is what

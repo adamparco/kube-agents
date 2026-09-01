@@ -491,6 +491,67 @@ class CollectProjectTest(unittest.TestCase):
             {na_entry["check"] for na_entry in s1["checks_not_applicable"]},
         )
 
+    def test_the_unmeasured_reason_is_marked_so_the_ledger_can_tell_it_apart(self):
+        """`checks_not_applicable` carries two dispositions that read alike.
+
+        "Autopilot owns the node pools" is permanent, and absence of a finding
+        under it is a clean verdict. "The surface published no figure" is not:
+        nobody looked, and it flips back the day Network Analyzer catches up.
+        `audit_report` reads this prefix to decide which of the two it has, so
+        the collector has to stamp it — the wording alone is not a contract.
+        """
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        entry = next(
+            d for d in s2["checks_not_applicable"] if d["check"] == "subnet-ip-exhaustion"
+        )
+        self.assertTrue(entry["reason"].startswith(na.UNEVALUATED_MARKER))
+
+    def test_no_target_declares_a_check_outside_its_own_scope_inapplicable(self):
+        """The 168 rows this replaced said nothing and cost a reader real time.
+
+        Every subnet used to declare the four project-scoped checks
+        not-applicable and the project declared the subnet one, on every run.
+        `audit_report.audit_target_checks` already scopes each check to a
+        target kind, so none of those slugs was ever in the denominator they
+        appeared to be shrinking — 169 rows of a table asserting that a subnet
+        is not a project.
+        """
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        import audit_report
+
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertTrue(entries, "no targets; this test would pass vacuously")
+        for entry in entries:
+            owned = set(
+                audit_report.audit_target_checks(
+                    "gcp-networking-fabric-audit", entry["name"]
+                )
+            )
+            declared = {d["check"] for d in entry.get("checks_not_applicable") or []}
+            self.assertLessEqual(
+                declared,
+                owned,
+                f"{entry['name']} declares a check it was never asked to run",
+            )
+
     def test_an_unmeasured_subnet_carries_the_limitation_finish_will_ask_for(self):
         # An unmeasured subnet owes one check and has it declared
         # not-applicable, so §6 filters its `checks_run` down to []. `finish`
