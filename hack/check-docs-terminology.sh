@@ -450,68 +450,18 @@ if [ ! -s "$ROSTER_ID_FILE" ]; then
   exit 1
 fi
 
-# The scan below decides three things at once, per fenced block rather than per
-# document, and the block is the point:
-#
-#   R  the block renders a roster id, so every `"prompt"` in it is graded.
-#   O  the block is shaped like a roster entry -- `schedule`, `skills`,
-#      `deliver` or `no_agent` sits beside its prompt -- but names no id this
-#      roster knows. That is reported, not skipped.
-#
-# Deciding by document, the way this used to, meant a page that named a job in
-# one section and rendered an unrelated `"prompt"` key in another failed CI with
-# an error about cron prompts, pointing at a block that was never claiming to
-# quote anything. A block is what a reader sees as one manifest, so the id and
-# the prompt it labels have to be in the same fence.
-#
-# `O` closes the other half of the same hole. Eliding the `"id"` line from a
-# rendered entry used to remove it from the check entirely -- no error, no
-# coverage -- so deleting one line was all it took to silence the guard on a
-# quotation. A block that still looks like a roster entry now has to name a job.
-#
-# The ids are compared whole, inside awk, and never become part of a pattern.
-# Interpolated into an alternation instead, a single `(`, `|` or `+` in a job id
-# made `grep -E` reject the pattern outright; the error went to /dev/null, the
-# status went to `|| true`, and the guard reported PASS having read nothing.
-#
-# Matching the key wherever on the line it falls and however it is spaced is
-# deliberate. An anchor that insisted on the key starting the line, followed by
-# exactly one space, saw only prettier's rendering of a multi-line object — a
-# one-line `{"id": …, "prompt": …}` entry, or a hand-spaced one, went unchecked,
-# which is the same silent skip the structural anchor was adopted to end.
-# Prettier normalises much of this back, but only inside a fence tagged `json`,
-# and CI does not run it over `.mdx` at all. What no line-based anchor can see
-# is a quotation whose value sits on the line after its key; those are unchecked.
-#
-# The awk program is single-quoted on purpose; `$0` below is awk's, not the
-# shell's, and the ids reach it through -v rather than through interpolation.
-# shellcheck disable=SC2016
-if ! SCAN=$(tr '\n' '\0' < "$FILE_LIST" | xargs -0 awk -v idfile="$ROSTER_ID_FILE" '
-  function flush(   i, kind) {
-    kind = hasid ? "R" : (cronish ? "O" : "")
-    if (kind != "")
-      for (i = 1; i <= n; i++)
-        printf "%s:%s:%s:%s\n", kind, pfile[i], pline[i], ptext[i]
-    n = 0; hasid = 0; cronish = 0
-  }
-  BEGIN { while ((getline id < idfile) > 0) if (id != "") ids["\"" id "\""] = 1 }
-  FNR == 1 { flush() }
-  /^[ \t]*(```|~~~)/ { flush(); next }
-  {
-    rest = $0
-    while (match(rest, /"id"[ \t]*:[ \t]*"[^"]*"/)) {
-      seg = substr(rest, RSTART, RLENGTH)
-      sub(/^"id"[ \t]*:[ \t]*/, "", seg)
-      if (seg in ids) hasid = 1
-      rest = substr(rest, RSTART + RLENGTH)
-    }
-    if ($0 ~ /"(schedule|skills|deliver|no_agent)"[ \t]*:/) cronish = 1
-    if ($0 ~ /"prompt"[ \t]*:[ \t]*"/) {
-      n++; pfile[n] = FILENAME; pline[n] = FNR; ptext[n] = $0
-    }
-  }
-  END { flush() }
-'); then
+# Which prompts are claiming to quote the roster, and which render an entry
+# naming no job at all. `hack/scan-cron-prompts.awk` decides both and documents
+# why; it lives in its own file so tests/test_docs_terminology_guard.py can
+# drive it against fixtures rather than against the repository it happens to
+# ship in. The ids reach it through -v rather than through interpolation.
+SCAN_AWK=$(dirname "$0")/scan-cron-prompts.awk
+if [ ! -f "$SCAN_AWK" ]; then
+  echo "ERROR: ${SCAN_AWK} not found; the cron-prompt guard cannot run." >&2
+  exit 1
+fi
+if ! SCAN=$(tr '\n' '\0' < "$FILE_LIST" \
+  | xargs -0 awk -v idfile="$ROSTER_ID_FILE" -f "$SCAN_AWK"); then
   echo "ERROR: could not scan the documentation for cron prompts; the guard cannot run." >&2
   exit 1
 fi
