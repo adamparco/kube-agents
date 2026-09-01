@@ -1076,6 +1076,69 @@ class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
             "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
         self.assertEqual(self._read()["origin"], "k8s-watcher")
 
+    def test_two_platforms_answering_at_once_both_keep_their_route(self):
+        """`routes` is read-modify-written, and both writers are the same run.
+
+        A relayed cron report calls this once per enabled platform for one
+        session id, so the two calls race by design rather than by accident.
+        Under sqlite3's implicit deferred transaction nothing is locked until
+        the UPDATE, so both read `routes` before either wrote it back and the
+        second commit dropped the first's entry -- a row naming one platform
+        when two answered, which stays invisible until a card is addressed to
+        the one that lost.
+
+        Deterministic rather than timing-hopeful: the slack writer is released
+        the instant the google_chat writer has read the row, which is exactly
+        the interleaving that loses an entry. The sleep is the *window*, not
+        the synchronisation -- it holds the transaction open long enough for
+        the other thread to reach its own read, so a slow machine makes this
+        test more reliable rather than less.
+        """
+        import threading
+
+        google_chat_has_read = threading.Event()
+        real_loads = session_kv_server.json.loads
+
+        def loads_then_let_the_other_writer_in(*args, **kwargs):
+            parsed = real_loads(*args, **kwargs)
+            if threading.current_thread().name == "google-chat-writer":
+                google_chat_has_read.set()
+                time.sleep(0.4)
+            return parsed
+
+        def write_google_chat():
+            session_kv_server._register_session_routing(
+                "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
+
+        def write_slack():
+            google_chat_has_read.wait(timeout=5)
+            session_kv_server._register_session_routing(
+                "k8s-evt-abc123", "slack", "1712345678.000100", primary=False)
+
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        threads = [
+            threading.Thread(target=write_google_chat, name="google-chat-writer"),
+            threading.Thread(target=write_slack, name="slack-writer"),
+        ]
+        with patch.object(session_kv_server.json, "loads", loads_then_let_the_other_writer_in):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+        self.assertFalse(any(t.is_alive() for t in threads), "a writer never finished")
+
+        routes = self._read().get("routes") or {}
+        self.assertEqual(
+            sorted(routes),
+            ["google_chat", "slack"],
+            "a concurrent writer's route was overwritten",
+        )
+        self.assertEqual(routes["slack"]["chat_id"], "C0123456789")
+        self.assertEqual(routes["google_chat"]["thread_id"], "spaces/AAQA123/threads/xYz")
+        # `primary=False` on the slack call, so the flat keys still describe
+        # google_chat -- the card's single address is not up for grabs.
+        self.assertEqual(self._read()["platform"], "google_chat")
+
 
 class TestActivePlatformFallback(unittest.TestCase):
     """`get_active_platform` when config.yaml does not name a platform.

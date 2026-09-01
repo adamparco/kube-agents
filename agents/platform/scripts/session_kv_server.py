@@ -868,8 +868,22 @@ def _register_session_routing(
     `routes` entry, which is what leaves the card's address alone.
     """
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            with conn:
+        # isolation_level=None hands transaction control to us, as in
+        # `_charge_alert_quota`, so the BEGIN IMMEDIATE below is the real thing
+        # rather than sqlite3's implicit deferred transaction.
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            # IMMEDIATE takes the write lock before the read, because this row
+            # is read-modify-written rather than updated in place. Two calls
+            # racing on one session is the designed case and not a corner: the
+            # paragraph above describes a relayed report calling this once per
+            # enabled platform for the same session id. Under a deferred
+            # transaction sqlite3 opens nothing until the UPDATE, so both calls
+            # would read `routes` before either wrote it back and whichever
+            # committed second would drop the other's entry -- leaving a
+            # `routes` dict that names one platform when two answered. Nothing
+            # notices until a card tries to address the platform that lost.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 row = conn.execute(
                     "SELECT metadata FROM session_metadata WHERE session_id = ?",
                     (session_id,)
@@ -897,6 +911,10 @@ def _register_session_routing(
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
                         (json.dumps(meta), session_id)
                     )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
     except Exception as exc:
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
 
