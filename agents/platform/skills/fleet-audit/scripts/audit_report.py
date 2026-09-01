@@ -5595,6 +5595,7 @@ def render_issue_body(
     data: dict,
     *,
     generated_at: datetime,
+    gaps: list[str],
     audit_id: str | None = None,
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
@@ -5607,6 +5608,15 @@ def render_issue_body(
     ids the body actually **rendered**, not the full finding set — otherwise the
     next run would read a truncated finding as resolved and announce a fix that
     never happened.
+
+    `gaps` is required, and is the caller's list rather than
+    `coverage_gaps(data)` recomputed here, for the reason
+    `render_clean_comment` takes it: a waived collector manifest is a hold-open
+    the document cannot express, so a renderer that recomputed the list would
+    read zero gaps on a waived run and open a ledger titled *coverage
+    incomplete* whose body says every audited cluster is compliant. Required
+    rather than defaulted so a caller that forgets fails loudly instead of
+    publishing that sentence.
     """
     audit_id = audit_id or str(data.get("audit", ""))
     findings = list(data.get("findings") or [])
@@ -5635,7 +5645,7 @@ def render_issue_body(
         max(BODY_BUDGET - overhead, 0),
         states=states,
         pr_urls=pr_urls,
-        gaps=coverage_gaps(data),
+        gaps=gaps,
     )
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
@@ -6536,7 +6546,9 @@ def refresh_coverage_ledger(
     # timestamp, so a run that changed neither number still has something newer
     # to say than what is published.
     wanted = coverage_issue_title(audit_id, gaps)
-    body_file = _write_temp(render_issue_body(data, generated_at=now, audit_id=audit_id).body)
+    body_file = _write_temp(
+        render_issue_body(data, generated_at=now, audit_id=audit_id, gaps=gaps).body
+    )
     try:
         res = gh(
             [
@@ -7616,6 +7628,7 @@ def _handle_finish_dry_run(
         data,
         generated_at=now,
         audit_id=audit_id,
+        gaps=gaps,
         states=states,
         withheld=plan.withheld,
     )
@@ -8260,7 +8273,9 @@ def handle_finish(args: argparse.Namespace) -> None:
             # is that a fifth happened to have a ledger open from the day
             # before. Open one: an audit that cannot speak for the fleet has
             # something to say, and it must land somewhere durable.
-            rendered = render_issue_body(data, generated_at=now, audit_id=audit_id)
+            rendered = render_issue_body(
+                data, generated_at=now, audit_id=audit_id, gaps=gaps
+            )
             body_file = _write_temp(rendered.body)
             try:
                 res = gh(
@@ -8422,6 +8437,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         data,
         generated_at=now,
         audit_id=audit_id,
+        gaps=gaps,
         states=states,
         pr_urls=pr_urls,
         withheld=plan.withheld,
@@ -8569,6 +8585,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 data,
                 generated_at=now,
                 audit_id=audit_id,
+                gaps=gaps,
                 states=states,
                 pr_urls=pr_urls,
                 withheld=plan.withheld,

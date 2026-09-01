@@ -148,7 +148,12 @@ def render_body(doc, **kwargs):
     reader can see, not what the audit found. Most assertions here are about
     the prose, so they go through this; the ones that care about omission ask
     for the tuple directly.
+
+    `gaps` defaults to none here because most callers are asserting on prose
+    that has nothing to do with coverage; the ones that are pass it, and the
+    renderer itself requires it so a *production* caller cannot forget.
     """
+    kwargs.setdefault("gaps", [])
     return audit_report.render_issue_body(doc, **kwargs).body
 
 
@@ -513,7 +518,7 @@ class BaseTestCase(unittest.TestCase):
         doc = copy.deepcopy(doc)
         audit_report.validate_findings(doc, doc.get("audit", audit))
         rendered = audit_report.render_issue_body(
-            doc, generated_at=NOW, audit_id=audit
+            doc, generated_at=NOW, audit_id=audit, gaps=[]
         )
         envelope = audit_report.report_envelope(
             audit,
@@ -1113,14 +1118,14 @@ class TestDeltaCommentOrdering(BaseTestCase):
                 make_finding(fid="b", title="Bravo finding"),
             ]
         )
-        run_one = audit_report.render_issue_body(run_one_doc, generated_at=NOW)
+        run_one = audit_report.render_issue_body(run_one_doc, generated_at=NOW, gaps=[])
         run_two_doc = make_doc(
             findings=[
                 make_finding(fid="b", title="Bravo finding"),
                 make_finding(fid="c", title="Charlie finding"),
             ]
         )
-        run_two = audit_report.render_issue_body(run_two_doc, generated_at=NOW)
+        run_two = audit_report.render_issue_body(run_two_doc, generated_at=NOW, gaps=[])
 
         # The join is between what one run *stored* and what the next one
         # rendered, which is the same pair the ledger's hidden block used to
@@ -6627,6 +6632,7 @@ class TestReportStore(HarnessTestCase):
         plain = dict(
             generated_at=NOW,
             audit_id=AUDIT,
+            gaps=[],
             states={str(f["id"]): "open" for f in doc["findings"]},
         )
 
@@ -6722,6 +6728,7 @@ class TestReportStore(HarnessTestCase):
         plain = dict(
             generated_at=NOW,
             audit_id=AUDIT,
+            gaps=[],
             states={str(f["id"]): "open" for f in doc["findings"]},
         )
 
@@ -12071,8 +12078,37 @@ class TestPartialCoverageGating(HarnessTestCase):
                 self.assertIsNone(audit_report.COVERAGE_TITLE_RE.search(other))
 
     def test_a_gapped_clean_body_does_not_call_the_fleet_compliant(self):
-        body = render_body(make_doc(findings=[], skipped=self.PARTIAL), generated_at=NOW)
+        doc = make_doc(findings=[], skipped=self.PARTIAL)
+        body = render_body(
+            doc, generated_at=NOW, gaps=audit_report.coverage_gaps(doc)
+        )
         self.assertNotIn("Every audited cluster is compliant", body)
+
+    def test_a_waived_clean_body_does_not_call_the_fleet_compliant_either(self):
+        """The gap the *document* cannot express still suppresses the all-clear.
+
+        A waived collector manifest holds the ledger open, and the waiver lives
+        in the caller's `gaps` list rather than anywhere in the document. A
+        renderer that recomputed `coverage_gaps(data)` would see zero gaps here
+        and open an issue titled *coverage incomplete* whose first line reads
+        "Every audited cluster is compliant" — the exact false all-clear the
+        gapped case above exists to prevent, reached by a different route.
+        """
+        doc = make_doc(findings=[])
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+        waived = render_body(
+            doc,
+            generated_at=NOW,
+            gaps=[audit_report.waiver_gap("collectors unavailable in this run")],
+        )
+        self.assertNotIn("Every audited cluster is compliant", waived)
+        self.assertIn("not an all-clear", waived)
+        # And the same document with the waiver dropped still says it, so the
+        # assertion above is about the gap rather than about the fixture.
+        self.assertIn(
+            "Every audited cluster is compliant",
+            render_body(doc, generated_at=NOW, gaps=[]),
+        )
 
     def test_a_partial_run_announces_nothing_as_resolved(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
@@ -12708,13 +12744,13 @@ class TestRenderedIssue(unittest.TestCase):
         )
 
     def test_a_complete_render_reports_nothing_omitted(self):
-        rendered = audit_report.render_issue_body(make_doc(), generated_at=NOW)
+        rendered = audit_report.render_issue_body(make_doc(), generated_at=NOW, gaps=[])
         self.assertFalse(rendered.partial)
         self.assertEqual(rendered.omitted, [])
         self.assertEqual(rendered.rendered_ids, ["no-network-policy"])
 
     def test_a_truncated_render_says_which_ids_it_dropped(self):
-        rendered = audit_report.render_issue_body(self.flood(400), generated_at=NOW)
+        rendered = audit_report.render_issue_body(self.flood(400), generated_at=NOW, gaps=[])
         self.assertTrue(rendered.partial)
         self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
         self.assertEqual(
@@ -12725,7 +12761,7 @@ class TestRenderedIssue(unittest.TestCase):
         # The delta compares against the hidden block. If it listed findings
         # the body never rendered, every omitted finding would be announced as
         # newly resolved the moment the body got shorter.
-        rendered = audit_report.render_issue_body(self.flood(400), generated_at=NOW)
+        rendered = audit_report.render_issue_body(self.flood(400), generated_at=NOW, gaps=[])
         self.assertEqual(
             audit_report.parse_delta_block(rendered.body),
             sorted(rendered.rendered_ids),
