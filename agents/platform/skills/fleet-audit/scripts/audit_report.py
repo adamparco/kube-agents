@@ -1717,6 +1717,7 @@ def report_envelope(
     new_ids: list[str],
     resolved_ids: list[str],
     rendered_ids: list[str],
+    checks_revision: str | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -1741,6 +1742,12 @@ def report_envelope(
     same clock reading the ledger footer prints, not a second one taken here,
     so the envelope and the body it describes never disagree about when the
     run happened.
+
+    `checks_revision` is the collector's digest of its own source, carried so
+    the *next* run can tell a finding that stopped reproducing from a check
+    that stopped looking. Absent — a waived manifest, or a store entry written
+    before collectors published it — means unknown, which the readers treat as
+    "assume nothing changed" rather than as a change.
     """
     return {
         "audit_id": audit_id,
@@ -1776,6 +1783,7 @@ def report_envelope(
         "resolved_ids": sorted(resolved_ids),
         "current_ids": sorted(set(rendered_ids)),
         "id_scheme": ID_SCHEME,
+        "checks_revision": checks_revision,
         "document": _redact_document(document),
     }
 
@@ -5662,8 +5670,16 @@ def render_delta_comment(
     generated_at: datetime,
     *,
     omitted: int = 0,
+    checks_changed: bool = False,
 ) -> str | None:
-    """The delta comment, or None when nothing changed (silence beats noise)."""
+    """The delta comment, or None when nothing changed (silence beats noise).
+
+    `checks_changed` says the collector's source moved between the two runs
+    this delta spans, which makes every resolved row ambiguous: the finding
+    may be gone, or the arm that found it may be. It only qualifies the
+    resolved half — a finding appearing for the first time because a new check
+    started looking is still a finding, and reads correctly as new.
+    """
     if not new_ids and not resolved_ids and not omitted:
         return None
 
@@ -5695,6 +5711,18 @@ def render_delta_comment(
     if resolved_ids:
         out.append(f"**{len(resolved_ids)} resolved**")
         out.append("")
+        if checks_changed:
+            # Said before the list, not after it: a reader who takes the first
+            # row at face value has already drawn the wrong conclusion by the
+            # time a footnote arrives. The cost audit announced a finding fixed
+            # on the run that deleted the arm which had been emitting it.
+            out += [
+                "The collector's checks changed since the previous run, so a row "
+                "below may be a check that stopped looking rather than a problem "
+                "that stopped happening. Confirm against the fleet before "
+                "recording any of these as fixed.",
+                "",
+            ]
         # Id order, and it has to stay that way: a resolved finding is absent
         # from this run's document, so its severity is not knowable — only the
         # title the previous body recorded survives. Good news truncated in the
@@ -5727,17 +5755,31 @@ def render_delta_comment(
 
 
 def render_clean_comment(
-    audit_id: str, data: dict, generated_at: datetime
+    audit_id: str,
+    data: dict,
+    generated_at: datetime,
+    *,
+    closing: bool,
+    checks_changed: bool = False,
 ) -> str:
     """Comment posted when an audit that previously had findings comes back clean.
 
     Two comments, really, because a clean run has two very different endings and
     saying the wrong one is worse than saying nothing. Over complete coverage the
-    ledger closes and the comment is an all-clear. Over a coverage gap the ledger
-    stays open (see `handle_finish`), so the comment must not announce a closure
-    that is not happening — a reader who takes "closed as completed" at face
-    value on a still-open issue learns to distrust every other line the harness
-    writes.
+    ledger closes and the comment is an all-clear. Where something holds it open
+    (see `handle_finish`), the comment must not announce a closure that is not
+    happening — a reader who takes "closed as completed" at face value on a
+    still-open issue learns to distrust every other line the harness writes.
+
+    `closing` is the caller's, not inferred from `coverage_gaps` here. Reading
+    it off the gaps was right for one of the two things that hold a ledger
+    open and wrong for the other: a run with full coverage whose previous
+    finding sits on an *unevaluated* target has no gaps to see, so the
+    inference reached the closing branch and posted "closed as completed" onto
+    an issue `handle_finish` had just decided to leave open.
+
+    `checks_changed` qualifies the closing branch only. The other branch
+    announces nothing resolved, so a moved collector adds nothing to it.
     """
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
@@ -5747,38 +5789,62 @@ def render_clean_comment(
     names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
     if len(clusters) > len(shown):
         names += f", and {len(clusters) - len(shown)} more"
+    found_nothing = (
+        f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
+        f"{scope_phrase(clusters)}: {names}."
+    )
 
-    if gaps:
-        out = [
-            f"### `{audit_id}` found nothing — but did not see the whole fleet",
-            "",
-            f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{scope_phrase(clusters)}: {names}.",
-            "",
-            "**This is not an all-clear, and the ledger stays open.** A finding's "
-            "absence only means it was fixed if the audit actually looked, so "
-            "nothing has been reported as resolved and no remediation pull request "
-            "has been closed. The ledger closes on the next run that reads the "
-            "whole fleet and still finds nothing.",
-            "",
-            f"Not covered by this run ({len(gaps)}):",
-            "",
-        ]
-    else:
+    if closing:
         out = [
             f"### `{audit_id}` is now clean — closing",
             "",
-            f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-            f"{scope_phrase(clusters)}: {names}.",
+            found_nothing,
             "",
             "Every finding previously reported here is gone, so this ledger is being "
             "closed as completed. The next run that finds anything opens a fresh one.",
         ]
+        if checks_changed:
+            out += [
+                "",
+                "**The collector's checks changed since the previous run.** Some of "
+                "what is gone may be a check that stopped looking rather than a "
+                "problem that stopped happening; confirm against the fleet before "
+                "reading this as a fleet-wide fix.",
+            ]
+        return _clip_comment("\n".join(out))
 
+    # Not closing. Which of the two reasons decides the headline, because they
+    # are different news: a gap means the run could not read part of the fleet,
+    # while an unevaluated target means it read everything and one surface
+    # returned no figure.
+    headline = (
+        "did not see the whole fleet" if gaps else "cannot yet call the fleet fixed"
+    )
+    out = [
+        f"### `{audit_id}` found nothing — but {headline}",
+        "",
+        found_nothing,
+        "",
+        "**This is not an all-clear, and the ledger stays open.** A finding's "
+        "absence only means it was fixed if the audit actually looked, so "
+        "nothing has been reported as resolved and no remediation pull request "
+        "has been closed. The ledger closes on the next run that reads the "
+        "whole fleet and still finds nothing.",
+        "",
+    ]
     if gaps:
+        out.append(f"Not covered by this run ({len(gaps)}):")
+        out.append("")
         out += [f"- {_cell(gap)}" for gap in gaps[:MAX_SCOPE_ROWS]]
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
+    else:
+        out.append(
+            "Every cluster was reached and every applicable check ran. What holds "
+            "this open is narrower: a finding recorded here sits on a target whose "
+            "check returned no reading this run, so its absence from the report is "
+            "silence rather than a fix."
+        )
     return _clip_comment("\n".join(out))
 
 
@@ -7452,7 +7518,10 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
             )
         else:
             log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
-        print(render_clean_comment(audit_id, data, now))
+        # The preview reads no stored memory, so a coverage gap is the only
+        # hold-open it can see; an unevaluable target is invisible here and the
+        # preview may therefore promise a closure `finish` will not make.
+        print(render_clean_comment(audit_id, data, now, closing=not gaps))
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
@@ -7921,6 +7990,29 @@ def handle_finish(args: argparse.Namespace) -> None:
     delta_known = existing_issue is None or memory is not None
     previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
     previous_titles = report_finding_titles(memory)
+    # Whether the collector's own source moved between the two runs this delta
+    # spans. A finding vanishes for two reasons — the fleet was fixed, or the
+    # arm that found it was deleted — and the harness has no way to tell them
+    # apart from the documents alone, so it announced a fix either way. The
+    # cost audit did exactly that the morning `check_idle_namespace` lost its
+    # ResourceQuota arm.
+    #
+    # Both sides must be known for this to mean anything. A waived manifest
+    # publishes no revision, and a store entry written before collectors
+    # carried one has no previous revision to compare against; either way the
+    # answer is "cannot tell", and the quiet reading — say nothing extra — is
+    # the one that matches what every run before this change did.
+    checks_revision = (manifest or {}).get("checks_revision")
+    previous_revision = (memory or {}).get("checks_revision") if memory else None
+    checks_changed = bool(
+        checks_revision and previous_revision and checks_revision != previous_revision
+    )
+    if checks_changed:
+        log(
+            f"The collector's checks changed since the last run "
+            f"({previous_revision} → {checks_revision}); anything reported "
+            "resolved is qualified rather than claimed as a fix."
+        )
     # Which of the previous run's findings this run is not entitled to call
     # fixed. A waiver is stream-wide by definition — nothing was collected, so
     # no target can be vouched for — and reaches `unverifiable_findings` as the
@@ -8021,7 +8113,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now),
+                render_clean_comment(audit_id, data, now, closing=False),
                 what="partial all-clear comment",
             )
             body_rewritten = refresh_coverage_ledger(
@@ -8043,7 +8135,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now),
+                render_clean_comment(audit_id, data, now, closing=False),
                 what="all-clear comment held by unevaluated targets",
             )
             log(
@@ -8055,7 +8147,9 @@ def handle_finish(args: argparse.Namespace) -> None:
             post_comment(
                 repo,
                 existing_issue,
-                render_clean_comment(audit_id, data, now),
+                render_clean_comment(
+                    audit_id, data, now, closing=True, checks_changed=checks_changed
+                ),
                 what="all-clear comment",
             )
             # Completed, not "not planned": a closed ledger means the fleet is
@@ -8199,6 +8293,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 new_ids=[],
                 resolved_ids=clean_resolved_ids,
                 rendered_ids=previous_ids if body_untouched else [],
+                checks_revision=checks_revision,
             ),
             now,
         )
@@ -8444,6 +8539,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 previous_titles,
                 now,
                 omitted=len(rendered.omitted),
+                checks_changed=checks_changed,
             )
             if comment:
                 post_comment(repo, number, comment, what="delta comment")
@@ -8525,6 +8621,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             new_ids=new_ids if delta_known else [],
             resolved_ids=[] if not delta_known else resolved_ids,
             rendered_ids=published_ids,
+            checks_revision=checks_revision,
         ),
         now,
     )

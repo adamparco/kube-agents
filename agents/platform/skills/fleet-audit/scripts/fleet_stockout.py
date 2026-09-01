@@ -77,6 +77,12 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 MANIFEST_VERSION = 1
+
+# A digest of this file, published in the manifest. `audit_report.py` compares
+# it against the previous run's to tell a finding that stopped reproducing from
+# a check that stopped looking; see `render_delta_comment`.
+CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
@@ -1389,6 +1395,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
     return {
         "version": MANIFEST_VERSION,
+        "checks_revision": CHECKS_REVISION,
         "audit": "stockout-prevention",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

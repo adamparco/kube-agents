@@ -72,7 +72,8 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 
 #### 2.3 Private Service Connect endpoint routing deadlock (`psc-routing-deadlock`)
 
-- **Command:** `gcloud compute forwarding-rules list --filter="target:ServiceAttachment" --project=$PROJECT --format=json`
+- **Command:** `gcloud compute forwarding-rules list --project=$PROJECT --format=json`
+- **List unfiltered and select in the check.** `--filter="target:ServiceAttachment"` asks gcloud's `:` operator to match a plural, differently-cased substring inside a URL, and the check re-tests `serviceAttachments` in the target anyway. The filter therefore buys nothing, and if its semantics ever shift it returns an empty list, which reads as `CLEAN` rather than as an error — a blind check that reports the same word as a healthy one.
 - **Flag when:** a forwarding rule targeting a Private Service Connect service attachment carries `pscConnectionStatus: REJECTED` or `pscConnectionStatus: CLOSED`.
 - **Do NOT flag:** a PSC forwarding rule in `ACCEPTED` status; a forwarding rule whose target is not a service attachment at all.
 - **Severity:** `major`.
@@ -82,8 +83,9 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 #### 2.4 VPC network MTU packet fragmentation mismatch (`mtu-packet-fragmentation`)
 
 - **Command:** `gcloud compute networks list --project=$PROJECT --format=json`
-- **Flag when:** two networks are joined by an `ACTIVE` VPC peering and their `mtu` values differ. This is a mismatch between two peered networks, never an absolute threshold — a single network's own MTU (1460, 1500, or otherwise) is a choice, not a defect, and packets only fragment where two different choices meet at a peering.
-- **Do NOT flag:** a peering that is not `ACTIVE`; two peered networks whose `mtu` values agree, whatever the shared value is; a network with no peerings at all.
+- **Flag when:** two networks are joined by an `ACTIVE` VPC peering and their MTUs differ. This is a mismatch between two peered networks, never an absolute threshold — a single network's own MTU (1460, 1500, or otherwise) is a choice, not a defect, and packets only fragment where two different choices meet at a peering.
+- **A missing `mtu` key means 1460, not unknown.** `networks list` omits the field on every network still at the default, so treating absence as unreadable skips the pair and leaves the check unable to fire on the mismatch that actually happens: a default network peered with one raised to 8896. Both sides would have to have been overridden, to different values, before that reading saw anything at all.
+- **Do NOT flag:** a peering that is not `ACTIVE`; two peered networks at the same MTU, whatever the shared value is; a network with no peerings at all; a peering whose other end is not in this listing — a VPC in another project is genuinely unread, and defaulting it to 1460 would invent a mismatch.
 - **Severity:** `major`.
 - **Impact:** "Packets crossing this peering at the larger MTU get fragmented or dropped, which shows up as intermittent, hard-to-diagnose latency and retransmits rather than a clean failure."
 - **Remediation:** `kind: manual`. Align both networks' MTU to the smaller of the two, or to 1500 if the larger side can be raised — either changes a network's core configuration, which this audit does not have enough context to propose automatically.
@@ -139,7 +141,7 @@ Every finding must conform to the full findings schema:
           },
           {
             "check": "psc-routing-deadlock",
-            "command": "gcloud compute forwarding-rules list --filter=\"target:ServiceAttachment\" --project=proj-1 --format=json"
+            "command": "gcloud compute forwarding-rules list --project=proj-1 --format=json"
           },
           {
             "check": "mtu-packet-fragmentation",

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Unit tests for networking_audit.py."""
 
+import hashlib
 import os
 import sys
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 import networking_audit as na  # noqa: E402
@@ -216,6 +218,46 @@ class MtuMismatchTest(unittest.TestCase):
         networks = [{"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/other-project-vpc", "state": "ACTIVE"}]}]
         self.assertEqual(na.check_mtu_mismatch(networks), [])
 
+    def test_an_absent_mtu_key_is_the_default_and_still_mismatches(self):
+        """The shape `networks list` actually returns, and the only one that fires.
+
+        GCP omits `mtu` on every network left at 1460, so the mismatch that
+        happens in practice -- a default network peered with one raised to 8896
+        -- arrives with the key present on one side only.
+        """
+        networks = [
+            {"name": "vpc-default", "peerings": [{"network": ".../networks/vpc-jumbo", "state": "ACTIVE"}]},
+            {"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/vpc-default", "state": "ACTIVE"}]},
+        ]
+        hits = na.check_mtu_mismatch(networks)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/vpc-default--vpc-jumbo")
+        self.assertIn("vpc-default mtu=1460", hits[0]["excerpt"])
+        self.assertIn("vpc-jumbo mtu=8896", hits[0]["excerpt"])
+
+    def test_two_networks_both_silent_about_mtu_agree(self):
+        networks = [
+            {"name": "vpc-a", "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks), [])
+
+    def test_a_silent_network_matches_one_that_spells_the_default_out(self):
+        networks = [
+            {"name": "vpc-a", "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks), [])
+
+    def test_an_unlisted_peer_is_not_defaulted_into_a_mismatch(self):
+        """Absent from the listing is unknown; absent `mtu` on a listed network is 1460.
+
+        Collapsing the two would invent a finding against every jumbo-MTU VPC
+        peered out to another project.
+        """
+        networks = [{"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/elsewhere", "state": "ACTIVE"}]}]
+        self.assertEqual(na.check_mtu_mismatch(networks), [])
+
 
 class CloudArmorTest(unittest.TestCase):
     def test_flags_preview_rule_on_production_backend(self):
@@ -299,6 +341,28 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual({c["check"] for c in project_entry["commands"]}, {
             "cloud-nat-exhaustion", "psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
         })
+
+    def test_the_psc_read_carries_no_server_side_filter(self):
+        """`check_psc_routing` selects the PSC rules itself.
+
+        The filter it replaced asked gcloud's `:` operator to match
+        `ServiceAttachment` against a URL spelling it `serviceAttachments`. A
+        change to that operator returns an empty list, and an empty list is
+        indistinguishable from a healthy project -- the check would report
+        `CLEAN` while reading nothing.
+        """
+        seen = []
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "forwarding-rules list" in joined:
+                seen.append(argv)
+            return run_of(0, "[]")
+
+        na.collect_project("proj-1", run=run)
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("--filter", seen[0])
+        self.assertNotIn("target:ServiceAttachment", " ".join(seen[0]))
 
     def test_every_read_behind_a_check_reaches_that_checks_command(self):
         """Three checks take more than one read, and `commands[slug] = record`
@@ -1429,6 +1493,26 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         with self.assertRaises(audit_report.ValidationError) as caught:
             audit_report.validate_findings(data, "gcp-networking-fabric-audit")
         self.assertIn("checks_run", str(caught.exception))
+
+
+class ChecksRevisionTest(unittest.TestCase):
+    """This collector tells the harness which version of itself ran.
+
+    `audit_report.py` compares this run's revision with the previous run's to
+    decide whether a finding that stopped appearing was fixed or merely stopped
+    being looked for. Publishing nothing gives it no signal, and it falls back
+    to claiming a fix.
+    """
+
+    def test_the_revision_is_a_digest_of_this_collectors_source(self):
+        path = Path(na.__file__).resolve()
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        self.assertEqual(na.CHECKS_REVISION, expected)
+
+    def test_the_manifest_carries_it(self):
+        # Inert unless it reaches the manifest `audit_report.py` reads.
+        source = Path(na.__file__).resolve().read_text(encoding="utf-8")
+        self.assertIn('"checks_revision": CHECKS_REVISION,', source)
 
 
 if __name__ == "__main__":

@@ -46,16 +46,17 @@ exhausted is this":
   Google could not allocate an external IP at all); `routers
   get-nat-mapping-info` for each VM's `interfaceNatMappings[].numTotalNatPorts`
   against that ceiling.
-- `psc-routing-deadlock` reads `forwarding-rules list --filter
-  target:ServiceAttachment`. Each item's `target` names the Private Service
-  Connect service attachment it points at, and `pscConnectionStatus` carries
-  the connection's live state — `REJECTED` or `CLOSED` means traffic aimed at
-  it cannot reach the target service.
+- `psc-routing-deadlock` reads `forwarding-rules list`, unfiltered, and keeps
+  the Private Service Connect ones in Python. Each item's `target` names the
+  service attachment it points at, and `pscConnectionStatus` carries the
+  connection's live state — `REJECTED` or `CLOSED` means traffic aimed at it
+  cannot reach the target service.
 - `mtu-packet-fragmentation` reads `networks list`, whose `peerings[]` on
   each network names the peer network. A mismatch is an ACTIVE peering
-  between two networks with different `mtu` values, not an absolute MTU
-  threshold — a single network's MTU is a choice, but two peered networks at
-  different MTUs is where packets actually fragment.
+  between two networks with different MTUs, not an absolute MTU threshold —
+  a single network's MTU is a choice, but two peered networks at different
+  MTUs is where packets actually fragment. A network with no `mtu` key is on
+  GCP's default 1460, which is a value to compare and not a gap.
 - `cloud-armor-false-positive` cross-references `security-policies list`
   against `backend-services list` to find which policies protect a
   production backend (heuristic: the backend's name does not look like a
@@ -73,9 +74,16 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Callable, NamedTuple
 
 MANIFEST_VERSION = 1
+
+# A digest of this file, published in the manifest. `audit_report.py` compares
+# it against the previous run's to tell a finding that stopped reproducing from
+# a check that stopped looking; see `render_delta_comment`.
+CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
 # `audit_report.validate_check_command`'s ceiling, restated rather than
@@ -155,6 +163,14 @@ PARTIAL_SUBNET_LIMITATION = (
 # omits the field — which it does for any NAT that never overrode it.
 DEFAULT_MIN_PORTS_PER_VM = 64
 DEFAULT_MAX_PORTS_PER_VM = 65536
+
+# A VPC's MTU when nobody set one, applied for the same reason as the NAT
+# defaults above: `networks list` omits `mtu` for every network still on it.
+# Skipping those pairs made this check unable to fire on the only mismatch
+# that occurs in practice, a default network peered with one raised to 8896 --
+# both sides would have to have been overridden, and to different values, for
+# the old reading to see anything at all.
+DEFAULT_NETWORK_MTU = 1460
 
 SEVERITY = {
     "subnet-ip-exhaustion": "critical",
@@ -425,9 +441,10 @@ def check_router_nat(router: dict, status: dict | None, mapping: list | None) ->
 
 
 def check_psc_routing(forwarding_rules: list[dict]) -> list[dict]:
-    """`forwarding_rules` is `forwarding-rules list --filter
-    target:ServiceAttachment`'s response. One finding per rule whose PSC
-    connection has been rejected or closed at the target's end.
+    """`forwarding_rules` is every forwarding rule in the project. One finding
+    per rule whose PSC connection has been rejected or closed at the target's
+    end; the rest are dropped here rather than by a `--filter` on the list call,
+    so a change in gcloud's filter semantics cannot turn the check silent.
 
     Scoped by region for the same reason `check_router_nat` is: a forwarding
     rule's name is unique per region (or once globally), so the bare name
@@ -445,6 +462,19 @@ def check_psc_routing(forwarding_rules: list[dict]) -> list[dict]:
     return hits
 
 
+def _network_mtu(network: dict | None) -> int | None:
+    """A network's MTU, reading an absent key as GCP's default rather than unknown.
+
+    Only a network the caller could not find at all is unknown; a network that
+    is present and silent about `mtu` is on 1460, and that is a number this
+    check can compare.
+    """
+    if network is None:
+        return None
+    mtu = network.get("mtu")
+    return DEFAULT_NETWORK_MTU if mtu is None else mtu
+
+
 def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
     """One finding per unordered pair of ACTIVE-peered networks whose `mtu`
     values differ, named by both networks sorted so the pair reads the same
@@ -453,13 +483,15 @@ def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
     seen_pairs = set()
     hits = []
     for net in networks or []:
-        name, mtu = net.get("name"), net.get("mtu")
+        name, mtu = net.get("name"), _network_mtu(net)
         for peering in net.get("peerings") or []:
             if peering.get("state") != "ACTIVE":
                 continue
             peer_name = _last_segment(peering.get("network", ""))
-            peer = by_name.get(peer_name)
-            if peer is None or mtu is None or peer.get("mtu") is None or mtu == peer.get("mtu"):
+            peer_mtu = _network_mtu(by_name.get(peer_name))
+            # A peer outside this listing -- another project's VPC -- is the one
+            # shape still skipped: its MTU is genuinely unread, not defaulted.
+            if peer_mtu is None or mtu == peer_mtu:
                 continue
             pair = tuple(sorted((name, peer_name)))
             if pair in seen_pairs:
@@ -468,8 +500,8 @@ def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
             hits.append(
                 {
                     "object": f"NetworkPeering/{pair[0]}--{pair[1]}",
-                    "excerpt": f"{pair[0]} mtu={by_name[pair[0]].get('mtu')} peered with "
-                    f"{pair[1]} mtu={by_name[pair[1]].get('mtu')}",
+                    "excerpt": f"{pair[0]} mtu={_network_mtu(by_name[pair[0]])} peered with "
+                    f"{pair[1]} mtu={_network_mtu(by_name[pair[1]])}",
                 }
             )
     return hits
@@ -1041,9 +1073,15 @@ def _collect_project_target(project: str, *, run: RunFn) -> dict:
             if hit:
                 candidates.append(_emit("cloud-nat-exhaustion", hit))
 
+        # Listed unfiltered on purpose. `check_psc_routing` already re-tests
+        # `"serviceAttachments" in target` on every rule, so a server-side
+        # `--filter target:ServiceAttachment` bought nothing but a dependency on
+        # gcloud's `:` operator matching a plural, differently-cased substring
+        # inside a URL. If that ever stops matching, the filter returns nothing
+        # and the check reads CLEAN -- a silent blind spot, not an error.
         forwarding_rules = gated(
             [
-                "gcloud", "compute", "forwarding-rules", "list", "--filter", "target:ServiceAttachment",
+                "gcloud", "compute", "forwarding-rules", "list",
                 "--project", project, "--format", "json",
             ],
             "psc-routing-deadlock",
@@ -1128,6 +1166,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
     return {
         "version": MANIFEST_VERSION,
+        "checks_revision": CHECKS_REVISION,
         "audit": "gcp-networking-fabric-audit",
         "started_at": started_at,
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

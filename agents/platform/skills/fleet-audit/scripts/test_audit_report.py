@@ -1074,6 +1074,38 @@ class TestDeltaCommentOrdering(BaseTestCase):
         self.assertIn("`ghost`", comment)
         self.assertLess(comment.index("`b`"), comment.index("`ghost`"))
 
+    def test_a_moved_collector_qualifies_the_resolved_rows(self):
+        """And the caveat leads the section rather than following it.
+
+        A reader who takes the first row at face value has already drawn the
+        wrong conclusion by the time a footnote arrives.
+        """
+        findings = self.findings_at([("b", "critical")])
+        comment = audit_report.render_delta_comment(
+            AUDIT, [], ["gone"], findings, {"gone": "an idle namespace"}, NOW,
+            checks_changed=True,
+        )
+        self.assertIn("The collector's checks changed since the previous run", comment)
+        self.assertLess(
+            comment.index("checks changed"), comment.index("an idle namespace")
+        )
+
+    def test_an_unmoved_collector_leaves_the_resolved_rows_alone(self):
+        findings = self.findings_at([("b", "critical")])
+        comment = audit_report.render_delta_comment(
+            AUDIT, [], ["gone"], findings, {"gone": "an idle namespace"}, NOW
+        )
+        self.assertIn("an idle namespace", comment)
+        self.assertNotIn("checks changed", comment)
+
+    def test_the_caveat_does_not_reach_the_new_rows(self):
+        """A new check finding something is a finding, and reads correctly."""
+        findings = self.findings_at([("b", "critical")])
+        comment = audit_report.render_delta_comment(
+            AUDIT, ["b"], [], findings, {}, NOW, checks_changed=True
+        )
+        self.assertNotIn("checks changed", comment)
+
     def test_delta_across_two_rendered_runs(self):
         run_one_doc = make_doc(
             findings=[
@@ -3233,7 +3265,9 @@ class TestFinishClean(HarnessTestCase):
         )
 
     def test_clean_comment_names_date_and_scope(self):
-        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
+        comment = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, closing=True
+        )
         self.assertIn("2026-08-01 09:30 UTC", comment)
         self.assertIn("0 findings", comment)
         self.assertIn("`prod-us-east`", comment)
@@ -3248,7 +3282,7 @@ class TestFinishClean(HarnessTestCase):
             findings=[],
             skipped=[{"cluster": "prod-eu-1", "reason": "API server unreachable"}],
         )
-        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW, closing=False)
         self.assertNotIn("closing", comment)
         self.assertNotIn("closed as completed", comment)
         self.assertIn("did not see the whole fleet", comment)
@@ -3271,9 +3305,42 @@ class TestFinishClean(HarnessTestCase):
                 }
             ],
         )
-        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW, closing=False)
         self.assertNotIn("closed as completed", comment)
         self.assertIn("Autopilot: node-level checks did not run", comment)
+
+    def test_a_ledger_held_open_with_no_gap_still_does_not_announce_a_close(self):
+        """The other thing that holds a ledger open, and it has no gaps to see.
+
+        Full coverage, every applicable check run, and a previous finding
+        sitting on a target whose check returned no reading: `handle_finish`
+        leaves the issue open, and this comment used to infer `closing` from
+        `coverage_gaps` — empty here — and post "closed as completed" onto it.
+        """
+        comment = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, closing=False
+        )
+        self.assertNotIn("closing", comment)
+        self.assertNotIn("closed as completed", comment)
+        self.assertIn("the ledger stays open", comment.lower())
+        self.assertIn("returned no reading this run", comment)
+        # Not the gap headline: nothing here went unread.
+        self.assertNotIn("did not see the whole fleet", comment)
+        self.assertNotIn("Not covered by this run", comment)
+
+    def test_a_moved_collector_qualifies_the_all_clear(self):
+        comment = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, closing=True, checks_changed=True
+        )
+        self.assertIn("closed as completed", comment)
+        self.assertIn("The collector's checks changed since the previous run", comment)
+
+    def test_an_unmoved_collector_leaves_the_all_clear_alone(self):
+        comment = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, closing=True
+        )
+        self.assertIn("closed as completed", comment)
+        self.assertNotIn("checks changed", comment)
 
 
 # --------------------------------------------------------------------------- #
@@ -4019,7 +4086,7 @@ class TestRenderBudget(BaseTestCase):
                 {"cluster": f"s-{i:04d}", "reason": "unreachable"} for i in range(900)
             ],
         )
-        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW, closing=False)
         self.assertLess(len(comment), GITHUB_BODY_LIMIT)
 
     def test_delta_comment_stays_under_the_limit(self):
@@ -5006,7 +5073,9 @@ class TestRemediateCommands(BaseTestCase):
             "delta": audit_report.render_delta_comment(
                 AUDIT, ["netpol-missing"], ["gone"], findings, {"gone": "t"}, NOW
             ),
-            "clean": audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW),
+            "clean": audit_report.render_clean_comment(
+                AUDIT, make_doc(findings=[]), NOW, closing=True
+            ),
             "refusal": audit_report.render_refusal_comment(
                 {"comment_id": "IC_1", "author": "a", "reasons": ["nope"]}, NOW
             ),
@@ -6403,6 +6472,10 @@ class TestReportStore(HarnessTestCase):
                 # The line the run posted, kept beside what it found — the only
                 # part of a scheduled run an operator ever sees.
                 "chat_summary",
+                # The collector's digest of its own source, so the next run can
+                # tell a finding that stopped reproducing from a check that
+                # stopped looking.
+                "checks_revision",
                 "collect_s",
                 "coverage_gaps",
                 "current_ids",
@@ -8209,6 +8282,97 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
         self.assertIsNone(self.stdout_json()["collect_s"])
+
+
+class TestChecksRevision(HarnessTestCase):
+    """A finding stops appearing for two reasons, and only one is a fix.
+
+    The live case: the cost audit announced an `idle-namespace` finding
+    resolved on the morning `check_idle_namespace` lost the ResourceQuota arm
+    that had been emitting it. Nothing was fixed and nothing was wrong with the
+    document — the two runs were simply asking different questions, and the
+    harness had no way to know.
+    """
+
+    def manifest(self, revision, clusters=("prod-us-east", "stage-eu")):
+        path = self.tmp_path / "manifest.json"
+        payload = {
+            "checks_revision": revision,
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [
+                        {"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)
+                    ],
+                }
+                for name in clusters
+            ],
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_the_envelope_carries_the_collectors_revision(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest("abc123")])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.stored_envelope()["checks_revision"], "abc123")
+
+    def test_a_waived_manifest_stores_no_revision(self):
+        """Unknown, and it has to read as unknown rather than as a change.
+
+        A waiver publishes no collector at all, so comparing against the next
+        run's revision would report a moved collector on every waived run.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        rc = self.run_finish(
+            make_doc(), ["--no-collector-manifest", "collector unavailable"]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIsNone(self.stored_envelope()["checks_revision"])
+
+    def test_a_moved_collector_is_noticed(self):
+        self.harness.replies = {"issue list": self.issue_list(number=7)}
+        self.seed_store(make_doc(), issue_number=7, checks_revision="old-rev")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest("new-rev")])
+        self.assertEqual(rc, 0)
+        self.assertIn("old-rev → new-rev", self.err)
+        self.assertIn("The collector's checks changed", self.err)
+
+    def test_an_unmoved_collector_says_nothing(self):
+        self.harness.replies = {"issue list": self.issue_list(number=7)}
+        self.seed_store(make_doc(), issue_number=7, checks_revision="same-rev")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest("same-rev")])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("The collector's checks changed", self.err)
+
+    def test_one_side_unknown_is_not_a_change(self):
+        """A store written before collectors carried a revision, and a waiver.
+
+        Both leave one side `None`. Reading that as "changed" would put the
+        caveat on the first run after this feature ships and on every waived
+        run after it — noise that teaches a reader to skip the line.
+        """
+        for label, seeded, current in (
+            ("no previous revision", None, ["--manifest-file", self.manifest("rev")]),
+            (
+                "no current revision",
+                "rev",
+                ["--no-collector-manifest", "collector unavailable"],
+            ),
+        ):
+            with self.subTest(label):
+                self.setUp()
+                self.harness.replies = {"issue list": self.issue_list(number=7)}
+                self.seed_store(make_doc(), issue_number=7, checks_revision=seeded)
+                self.assertEqual(self.run_finish(make_doc(), current), 0)
+                self.assertNotIn("The collector's checks changed", self.err)
 
 
 class TestSyncOpenRemediationLabels(HarnessTestCase):
@@ -10533,7 +10697,7 @@ class TestScopeCountsTargetsByKind(unittest.TestCase):
             audit=self.NET,
             clusters=self._subnets(2) + [self._project()],
         )
-        comment = audit_report.render_clean_comment(self.NET, doc, NOW)
+        comment = audit_report.render_clean_comment(self.NET, doc, NOW, closing=True)
         self.assertIn("2 subnets and 1 project", comment)
         self.assertNotIn("3 audited cluster", comment)
 

@@ -768,7 +768,10 @@ the only symptom is a chat path that never finds a report:
   ledger rendered, carried whole rather than clipped to the cells the body had room for,
   because a finding the 60k budget pushed out is still a finding the chat path should answer
   about. The body's redaction backstop is applied to every string on the way in, so the
-  envelope never holds a credential shape the public issue blanked.
+  envelope never holds a credential shape the public issue blanked. `checks_revision` carries
+  the collector's digest of itself (§6) so the next run can tell a finding that stopped
+  reproducing from a check that stopped looking; it is null on a waived run, and null on
+  either side means "cannot tell", which reads as no change.
 - `latest.json` — a byte-identical copy of the newest envelope. A copy, not a symlink: one
   fewer behaviour to ask of the sandboxed mount, for zero saved bytes.
 
@@ -969,6 +972,7 @@ The manifest is the new machine boundary between collector and harness, so it ge
 ```json
 {
   "version": 1,
+  "checks_revision": "…",
   "audit": "compliance-audit",
   "started_at": "…",
   "finished_at": "…",
@@ -1009,6 +1013,13 @@ The manifest is the new machine boundary between collector and harness, so it ge
   ]
 }
 ```
+
+`checks_revision` is the collector's digest of its own source, and is not the same thing as
+`version`: `version` describes the manifest's shape and moves when a key does, while
+`checks_revision` moves whenever any check logic does. `finish` compares it against the
+previous run's (stored in the envelope, below) to answer the one question the two documents
+cannot: a finding that stopped appearing was either fixed or stopped being looked for, and
+before this key the harness announced a fix either way.
 
 Rules: every enumerated cluster appears with an `outcome` and an `autopilot` flag; a gate failure (zero-byte or
 truncated dump) is `outcome: "gate-failed"`, never a shorter candidate list; a cluster the

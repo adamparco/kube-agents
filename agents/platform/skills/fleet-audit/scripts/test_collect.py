@@ -7,6 +7,7 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import hashlib
 import inspect
 import json
 import re
@@ -4004,6 +4005,47 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
         if argv[:2] == ["gcloud", "container"] and argv[2] == "node-pools":
             return Run(argv, 0, "[]", "", 0.1)
         return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
+
+
+class TestChecksRevision(unittest.TestCase):
+    """Every collector tells the harness which version of itself ran.
+
+    `audit_report.py` compares this run's revision with the previous run's to
+    decide whether a finding that stopped appearing was fixed or merely stopped
+    being looked for. A collector that publishes nothing gives it no signal,
+    and the harness falls back to claiming a fix — which is what the cost audit
+    did the morning `check_idle_namespace` lost its ResourceQuota arm.
+    """
+
+    MODULES = TestEvidenceCommandsArePasteable.MODULES
+
+    def module(self, name):
+        return sys.modules[name] if name in sys.modules else __import__(name)
+
+    def test_every_collector_publishes_a_digest_of_its_own_source(self):
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                path = Path(__file__).resolve().parent / f"{name}.py"
+                expected = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+                self.assertEqual(self.module(name).CHECKS_REVISION, expected)
+
+    def test_the_revisions_are_distinct(self):
+        """Each reads its own file. A shared or constant value says nothing.
+
+        Five collectors publishing one digest would make every stream look
+        like it moved whenever any one of them was edited.
+        """
+        revisions = {self.module(n).CHECKS_REVISION for n in self.MODULES}
+        self.assertEqual(len(revisions), len(self.MODULES))
+
+    def test_the_manifest_carries_it(self):
+        # The constant is inert unless it reaches the manifest `audit_report.py`
+        # reads; asserted on the source because building five fleet-wide
+        # manifests here would test the collectors' plumbing, not this key.
+        for name in self.MODULES:
+            with self.subTest(module=name):
+                source = (Path(__file__).resolve().parent / f"{name}.py").read_text()
+                self.assertIn('"checks_revision": CHECKS_REVISION,', source)
 
 
 if __name__ == "__main__":
