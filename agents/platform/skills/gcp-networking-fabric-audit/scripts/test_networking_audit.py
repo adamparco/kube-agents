@@ -258,6 +258,62 @@ class MtuMismatchTest(unittest.TestCase):
         networks = [{"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/elsewhere", "state": "ACTIVE"}]}]
         self.assertEqual(na.check_mtu_mismatch(networks), [])
 
+    def test_a_peer_in_another_project_does_not_resolve_to_the_local_namesake(self):
+        """`default` is the most common network name in GCP, so a bare-name
+        lookup resolves a cross-project peering to this project's `default` and
+        compares the wrong two MTUs. Both sides here are 8896 — a healthy
+        peering — and the only way to report one is to have compared
+        `vpc-jumbo` against the local `default` instead.
+        """
+        networks = [
+            {
+                "name": "default",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                "peerings": [],
+            },
+            {
+                "name": "vpc-jumbo",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/other-proj/global/networks/default",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks), [])
+
+    def test_a_peer_in_this_project_still_resolves_through_its_self_link(self):
+        """The other half of the pair: same URL shape, same project, so the
+        lookup must hit. Without it the fix above would be a check that never
+        fires rather than one that stopped colliding.
+        """
+        networks = [
+            {
+                "name": "default",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+            {
+                "name": "vpc-jumbo",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [],
+            },
+        ]
+        hits = na.check_mtu_mismatch(networks)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
+        self.assertIn("default mtu=1460", hits[0]["excerpt"])
+        self.assertIn("vpc-jumbo mtu=8896", hits[0]["excerpt"])
+
 
 class CloudArmorTest(unittest.TestCase):
     def test_flags_preview_rule_on_production_backend(self):

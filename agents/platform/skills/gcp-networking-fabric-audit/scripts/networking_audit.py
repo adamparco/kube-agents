@@ -172,6 +172,12 @@ DEFAULT_MAX_PORTS_PER_VM = 65536
 # the old reading to see anything at all.
 DEFAULT_NETWORK_MTU = 1460
 
+# The segment a network self-link or peering URL is truncated at to key it. Both
+# arrive as full `https://.../compute/v1/projects/<p>/global/networks/<n>` URLs;
+# everything before this marker is API-version boilerplate that two equal
+# networks can still disagree about.
+NETWORK_URL_PROJECT_MARKER = "projects/"
+
 SEVERITY = {
     "subnet-ip-exhaustion": "critical",
     "cloud-nat-exhaustion": "critical",
@@ -462,6 +468,26 @@ def check_psc_routing(forwarding_rules: list[dict]) -> list[dict]:
     return hits
 
 
+def _network_key(url_or_name: str) -> str:
+    """A network URL reduced to `projects/<project>/global/networks/<name>`.
+
+    The project has to stay in the key. `networks list` returns one project's
+    networks, but a `peerings[].network` URL can point at another project's
+    VPC, and `default` is the most common network name in GCP — so matching a
+    peer on its last segment resolves a cross-project peering to the
+    same-named *local* network and compares the wrong two MTUs. That was
+    harmless while an absent `mtu` meant "skip this pair"; once it reads as
+    1460 the mis-resolved pair becomes a `major` finding naming a peering that
+    does not exist.
+
+    A string with no `projects/` segment — a bare name — is returned as itself,
+    which is what makes a peer outside the listing miss rather than collide.
+    """
+    text = (url_or_name or "").rstrip("/")
+    index = text.find(NETWORK_URL_PROJECT_MARKER)
+    return (text[index:] if index != -1 else _last_segment(text)).lower()
+
+
 def _network_mtu(network: dict | None) -> int | None:
     """A network's MTU, reading an absent key as GCP's default rather than unknown.
 
@@ -479,7 +505,9 @@ def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
     """One finding per unordered pair of ACTIVE-peered networks whose `mtu`
     values differ, named by both networks sorted so the pair reads the same
     regardless of which side's listing surfaced the peering."""
-    by_name = {n.get("name"): n for n in networks or []}
+    by_key = {
+        _network_key(n.get("selfLink") or n.get("name", "")): n for n in networks or []
+    }
     seen_pairs = set()
     hits = []
     for net in networks or []:
@@ -487,21 +515,26 @@ def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
         for peering in net.get("peerings") or []:
             if peering.get("state") != "ACTIVE":
                 continue
-            peer_name = _last_segment(peering.get("network", ""))
-            peer_mtu = _network_mtu(by_name.get(peer_name))
+            peer = by_key.get(_network_key(peering.get("network", "")))
+            peer_mtu = _network_mtu(peer)
             # A peer outside this listing -- another project's VPC -- is the one
             # shape still skipped: its MTU is genuinely unread, not defaulted.
+            # `_network_key` is what keeps that true now that an absent `mtu`
+            # has a value: keyed on the bare name, another project's `default`
+            # would resolve to this project's and be compared against it.
             if peer_mtu is None or mtu == peer_mtu:
                 continue
+            peer_name = peer.get("name", "")
             pair = tuple(sorted((name, peer_name)))
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
+            mtus = {name: mtu, peer_name: peer_mtu}
             hits.append(
                 {
                     "object": f"NetworkPeering/{pair[0]}--{pair[1]}",
-                    "excerpt": f"{pair[0]} mtu={_network_mtu(by_name[pair[0]])} peered with "
-                    f"{pair[1]} mtu={_network_mtu(by_name[pair[1]])}",
+                    "excerpt": f"{pair[0]} mtu={mtus[pair[0]]} peered with "
+                    f"{pair[1]} mtu={mtus[pair[1]]}",
                 }
             )
     return hits
