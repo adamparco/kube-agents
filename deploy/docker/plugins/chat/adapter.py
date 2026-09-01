@@ -308,7 +308,32 @@ def _fresh_report(job_id: str) -> dict:
     # sets the variable after this module loads writes to one store and would
     # otherwise be read from another, with no error either side.
     root = os.getenv("FLEET_AUDIT_REPORTS_DIR", "") or _REPORTS_DIR
+    # A run holds the stream, so `latest.json` is the run *before* this one and
+    # this delivery is not its. `audit_report.release_run_lock` unlinks
+    # `started.json` as the last act of a successful `finish`, after the
+    # envelope is written -- "a start record exists" and "a run holds the
+    # stream" are the same fact, as that function's docstring puts it -- so the
+    # file being here means no `finish` has completed since the current run
+    # began.
+    #
+    # The age test alone cannot see that. It asks how old the record is, not
+    # whose it is, and answers "recent enough" for any second run inside the
+    # window: a re-trigger, a retry, a nudged schedule. What arrives then is
+    # hermes' own failure text for the crashed run, and the two callers below
+    # would silence it as a silent tick or, worse, replace it with the previous
+    # run's `chat_summary` and post that as a success -- telling the channel
+    # "0 new, 2 open" about a run that never got that far.
+    #
+    # Ordering makes this safe in the other direction too. The envelope lands
+    # before the unlink, so the only window this closes wrongly is between those
+    # two writes, and it closes it by returning {} -- "no opinion", the
+    # pre-store behaviour both callers already fall back to.
+    #
+    # Inside the `try` with the read, not ahead of it, so a store that raises on
+    # stat costs the opinion rather than the delivery.
     try:
+        if (Path(root) / job_id / "started.json").exists():
+            return {}
         report = json.loads((Path(root) / job_id / "latest.json").read_text("utf-8"))
         finished = datetime.datetime.fromisoformat(report["finished_at"])
         # `finish` writes an aware stamp today. A naive one would otherwise

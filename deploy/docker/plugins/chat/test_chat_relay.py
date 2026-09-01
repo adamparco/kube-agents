@@ -630,6 +630,22 @@ class TestDeclaredSilent(unittest.TestCase):
         self.write("compliance-audit", silent=False)
         self.assertFalse(self.declared("compliance-audit"))
 
+    def test_a_run_in_flight_means_the_record_is_the_previous_run_s(self):
+        """The age test asks how old the record is, never whose it is.
+
+        `release_run_lock` unlinks `started.json` as the last act of a successful
+        `finish`, after the envelope lands, so the file being present means no
+        `finish` has completed since the current run began -- `latest.json` is
+        the run before this one. Without this the second run inside the 900s
+        window inherits the first's verdict: a re-trigger that crashes gets its
+        "RUN FAILED" text swallowed as a silent tick, `last_status=ok`, no
+        `last_delivery_error`, nothing in the channel.
+        """
+        self.write("compliance-audit", silent=True)
+        with open(os.path.join(self.root, "compliance-audit", "started.json"), "w") as h:
+            json.dump({"nonce": "n", "t0": "2026-09-01T06:25:00+00:00"}, h)
+        self.assertFalse(self.declared("compliance-audit"))
+
     def test_a_stale_report_decides_nothing(self):
         """It belongs to an earlier run, so it must not silence this delivery."""
         self.write("compliance-audit", silent=True, age_s=mod._SILENCE_WINDOW_SECONDS + 60)
@@ -795,6 +811,23 @@ class TestRecordedSummary(unittest.TestCase):
     def test_the_recorded_summary_replaces_a_composed_report(self):
         self.write("compliance-audit", {"silent_ok": False, "chat_summary": self.SUMMARY})
         self.assertEqual(self.relayed(self.COMPOSED), [self.SUMMARY])
+
+    def test_a_run_in_flight_does_not_lend_its_summary_to_a_failure(self):
+        """The worst shape of the stale read, and the reason it is not cosmetic.
+
+        A loud run finishes; a re-run starts inside the 900s window and dies
+        before `finish`; hermes delivers its own "RUN FAILED" text. Keyed on age
+        alone the previous run's `chat_summary` displaces that text and is posted
+        as a success -- the channel is told "16 critical, 2 major (3 new, 1
+        resolved)" about a run that never reached a cluster. Substituting a stale
+        report and reporting it delivered is the one failure the relay exists to
+        prevent, so the failure text has to survive intact.
+        """
+        self.write("compliance-audit", {"silent_ok": False, "chat_summary": self.SUMMARY})
+        with open(os.path.join(self.root, "compliance-audit", "started.json"), "w") as h:
+            json.dump({"nonce": "n", "t0": "2026-09-01T06:25:00+00:00"}, h)
+        failure = "RUN FAILED: audit_report.py start exited 1"
+        self.assertEqual(self.relayed(failure), [failure])
 
     def test_a_run_that_obeyed_is_relayed_unchanged(self):
         self.write("compliance-audit", {"silent_ok": False, "chat_summary": self.SUMMARY})
