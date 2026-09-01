@@ -197,7 +197,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 - **Flag when:** a container has no `readinessProbe` and the workload's pod labels are selected by a `Service` in the same namespace.
 - **Do NOT flag:** standard exclusions; workloads no Service selects (nothing routes to them); Services of `type: ExternalName` or with no `selector`; injected sidecars that manage their own readiness (`istio-proxy`, `cloud-sql-proxy`, `gke-metadata-server`).
 - **Severity:** `major`.
-- **Impact:** "Every rollout sends production traffic to pods that are not yet serving, and a broken new version is never detected as broken."
+- **Impact:** "Every rollout sends production traffic to pods that are not yet serving, and a broken new version is never detected as broken." — **unless the candidate's `selecting services:` line ends in `(metrics scrape only)`**, in which case that sentence is false and you must not write it. Every port every Service selecting this workload exposes is a Prometheus scrape port, so no user request reaches it and Prometheus retries a scrape it missed. Say instead: "Rollouts and node drains report success as soon as the container starts, before it can do its job, and a broken new version is never detected as broken." Keep the severity at `major` — the rollout and PDB-availability consequences are the same either way — and title the finding for what it is, `has no readiness probe behind its metrics Service`, not `is Service-backed`.
 - **Remediation:** `kind: manual`, always. A probe's path, port, and timings are application knowledge; a generated `/healthz` probe would break the workload the moment it was applied. **Do not generate probe YAML.**
 
 #### 3.10 Missing liveness probe (`probes-liveness`)

@@ -750,6 +750,61 @@ class TestProbes(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIn("app", hit["excerpt"])
 
+    def metrics_ctx(self, ports):
+        return context_of(services={"default": [service("s-metrics", selector={"app": "api"}, ports=ports)]})
+
+    def test_a_metrics_only_service_is_named_as_such(self):
+        """3.9's Impact line claims production traffic; say when there is none.
+
+        Live case, 2026-09-01: three of the six findings this check published
+        were on workloads whose only Service exposes one scrape port --
+        `cert-manager` and `cert-manager-cainjector` on `http-metrics/9402`,
+        `argocd-notifications-controller` on `metrics/9001`. Each shipped
+        "Every rollout sends production traffic to pods that are not yet
+        serving", which is not true of any of them.
+        """
+        hit = collect.check_probes_readiness(self.wl(), self.metrics_ctx([{"name": "http-metrics", "port": 9402}]))
+        self.assertIsNotNone(hit)
+        self.assertIn("s-metrics[http-metrics]", hit["excerpt"])
+        self.assertIn("(metrics scrape only)", hit["excerpt"])
+
+    def test_a_serving_port_alongside_a_metrics_port_is_still_serving(self):
+        # `argocd-applicationset-controller`: `webhook/7000` and
+        # `metrics/8080`. One real port is enough to make the traffic claim
+        # true, so the suppression must not trigger on "contains a metrics
+        # port".
+        hit = collect.check_probes_readiness(
+            self.wl(), self.metrics_ctx([{"name": "webhook", "port": 7000}, {"name": "metrics", "port": 8080}])
+        )
+        self.assertIn("(serving traffic)", hit["excerpt"])
+
+    def test_a_second_service_that_serves_traffic_defeats_the_suppression(self):
+        # `argocd-server` has both `argocd-server` (http/https) and
+        # `argocd-server-metrics`. Judging the Services one at a time would
+        # call the workload metrics-only on the strength of the wrong one.
+        ctx = context_of(
+            services={
+                "default": [
+                    service("s-metrics", selector={"app": "api"}, ports=[{"name": "metrics", "port": 8083}]),
+                    service("s", selector={"app": "api"}, ports=[{"name": "http", "port": 80}]),
+                ]
+            }
+        )
+        hit = collect.check_probes_readiness(self.wl(), ctx)
+        self.assertIn("(serving traffic)", hit["excerpt"])
+
+    def test_an_unnamed_port_is_not_assumed_to_be_metrics(self):
+        # Suppressing the impact claim wrongly is the expensive error, so an
+        # unnamed port -- common on a single-port Service -- keeps the finding
+        # reading exactly as it did before.
+        hit = collect.check_probes_readiness(self.wl(), self.metrics_ctx([{"port": 9402}]))
+        self.assertIn("(serving traffic)", hit["excerpt"])
+
+    def test_a_service_with_no_ports_at_all_is_not_metrics_only(self):
+        hit = collect.check_probes_readiness(self.wl(), self.metrics_ctx([]))
+        self.assertIn("(serving traffic)", hit["excerpt"])
+        self.assertIn("s-metrics[no ports]", hit["excerpt"])
+
     def test_liveness_missing_is_flagged_with_no_service_required(self):
         self.assertIsNotNone(collect.check_probes_liveness(self.wl(), context_of()))
 

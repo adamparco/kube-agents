@@ -789,6 +789,32 @@ def _containers_behind_a_service(workload: dict, services: list[dict]) -> list[d
     return behind or containers
 
 
+#: Port names the ecosystem reserves for a Prometheus scrape endpoint. The name
+#: is the discriminator and the number is not: `ServiceMonitor` and
+#: `PodMonitor` both select on `port` by name, so this is the convention a
+#: chart author is already following, while 9402 and 8080 mean nothing on their
+#: own.
+_METRICS_PORT_NAMES = frozenset({"metrics", "http-metrics", "https-metrics", "telemetry"})
+
+
+def _metrics_only_ports(services: list[dict]) -> bool:
+    """Every port every selecting Service exposes is a metrics scrape port.
+
+    A workload whose only Service is a scrape endpoint is "Service-backed" in
+    the sense 3.9 flags on, and in no other sense: nothing routes a user
+    request to it. Prometheus retries a failed scrape, so a probe-less pod
+    joining that Service early costs a gap in a graph, not a dropped request.
+
+    Named ports only, and conservatively: an unnamed port is not treated as
+    metrics, so a single-port Service that omits the name keeps the finding
+    exactly as it read before. That is the safe direction -- the line this
+    feeds suppresses an impact claim, and suppressing it wrongly is the
+    expensive error.
+    """
+    ports = [port for svc in services for port in (svc.get("spec") or {}).get("ports") or []]
+    return bool(ports) and all(port.get("name") in _METRICS_PORT_NAMES for port in ports)
+
+
 def check_probes_readiness(workload: dict, context: dict) -> dict | None:
     services = _selecting_services(workload, context)
     if not services:
@@ -800,9 +826,28 @@ def check_probes_readiness(workload: dict, context: dict) -> dict | None:
     ]
     if not missing:
         return None
+    # Name what the Services actually expose. The check's Impact line is a
+    # fixed sentence about production traffic, and on 2026-09-01 three of the
+    # six findings this check published on the live fleet carried it against a
+    # workload no user request reaches: `cert-manager` and
+    # `cert-manager-cainjector` are each selected by one Service whose only
+    # port is `http-metrics/9402`, and `argocd-notifications-controller` by one
+    # whose only port is `metrics/9001`. The model cannot tell those apart from
+    # `argocd-redis` (`tcp-redis/6379`) without being told, so tell it.
+    exposure = "; ".join(
+        "{}[{}]".format(
+            (svc.get("metadata") or {}).get("name", "?"),
+            ",".join(str(port.get("name") or port.get("port")) for port in (svc.get("spec") or {}).get("ports") or []) or "no ports",
+        )
+        for svc in services
+    )
+    scope = "metrics scrape only" if _metrics_only_ports(services) else "serving traffic"
     return {
         "object": f"{workload['kind']}/{workload['name']}",
-        "excerpt": f"Service-backed, containers missing a readiness probe: {', '.join(missing)}",
+        "excerpt": (
+            f"Service-backed, containers missing a readiness probe: {', '.join(missing)}\n"
+            f"selecting services: {exposure} ({scope})"
+        ),
     }
 
 
