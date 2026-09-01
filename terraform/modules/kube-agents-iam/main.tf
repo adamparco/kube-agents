@@ -73,9 +73,15 @@ resource "google_project_iam_custom_role" "subnet_utilization_reader" {
     # which subnets exist but carries no ipUtilization field on any API
     # version, so the check still had nothing to measure. Network Analyzer
     # publishes that measurement as google.networkanalyzer.vpcnetwork.
-    # ipAddressInsight, and only roles/recommender.viewer carries the read --
-    # a role that grants viewer on every recommender in the project, far
-    # wider than one check needs.
+    # ipAddressInsight, and the two permissions below are what read it. This
+    # role grants them directly rather than binding a predefined role,
+    # because the two predefined roles that carry the pair both carry more:
+    # roles/recommender.viewer runs to some three hundred permissions --
+    # viewer on every recommender in the project -- and the narrow
+    # roles/recommender.networkAnalyzerIpAddressViewer adds
+    # recommender.locations.get/.list and resourcemanager.projects.get/.list
+    # on top of them. Neither carries compute.subnetworks.use, so either
+    # would leave a second grant to make anyway.
     "recommender.networkAnalyzerIpAddressInsights.list",
     "recommender.networkAnalyzerIpAddressInsights.get",
   ]

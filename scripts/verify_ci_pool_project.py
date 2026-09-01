@@ -743,7 +743,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         if not _record_unreadable(
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
-            f"Could not read the project IAM policy on {project_id}, so the Prow runner's twelve roles, "
+            f"Could not read the project IAM policy on {project_id}, so the Prow runner's "
+            f"{len(PROW_RUNNER_ROLES)} roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,

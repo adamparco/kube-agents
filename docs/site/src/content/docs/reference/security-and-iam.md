@@ -75,12 +75,15 @@ one the custom role below describes.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
 Alongside them the composition defines one project-level custom role,
-`kubeagentsSubnetUtilizationReader`, and binds it to the same service account. It carries three
-permissions and exists because no predefined role carries them without carrying much more:
-`compute.subnetworks.use`, and `recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the
-Network Analyzer insight that reports subnet IP utilization — the only place that measurement is
-published, and otherwise reachable only through `roles/recommender.viewer`, which grants viewer on
-every recommender in the project.
+`kubeagentsSubnetUtilizationReader`, and binds it to the same service account. It grants three
+permissions directly: `compute.subnetworks.use`, and
+`recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the Network Analyzer insight that
+reports subnet IP utilization — the only place that measurement is published. Two predefined roles
+carry that pair of reads and both carry more. `roles/recommender.viewer` is viewer on every
+recommender in the project, some three hundred permissions;
+`roles/recommender.networkAnalyzerIpAddressViewer` is narrow but adds
+`recommender.locations.get`/`.list` and `resourcemanager.projects.get`/`.list`. Neither carries
+`compute.subnetworks.use`, so binding one would leave a second grant to make.
 
 `compute.subnetworks.use` is not a read. `roles/compute.viewer` does not carry it: it is the
 permission that authorizes attaching a NIC, a node pool or a load balancer to a subnet, and the API
