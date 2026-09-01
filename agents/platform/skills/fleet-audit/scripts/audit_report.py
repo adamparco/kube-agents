@@ -5240,6 +5240,29 @@ class RenderedIssue(NamedTuple):
         return bool(self.omitted)
 
 
+# How many targets an evidence row names before it gives a count instead.
+EVIDENCE_TARGETS_NAMED = 3
+
+
+def _evidence_targets(targets: list[str], total_for_check: int) -> str:
+    """The Target cell for one evidence row: who this command answered for.
+
+    Named while the list stays readable, counted past that. "all N targets" is
+    the shape a project-wide read produces and is worth saying outright: the
+    scope table above already names every target, so a reader who wants the
+    roster has it, and what this cell has to settle is whether the row covers
+    the fleet or a corner of it. A partial group names the first few and says
+    how many it did not, because there the identities are the point.
+    """
+    if len(targets) == 1:
+        return f"`{_cell(targets[0])}`"
+    if len(targets) == total_for_check:
+        return f"all {len(targets)} targets"
+    named = ", ".join(f"`{_cell(t)}`" for t in targets[:EVIDENCE_TARGETS_NAMED])
+    rest = len(targets) - EVIDENCE_TARGETS_NAMED
+    return named if rest <= 0 else f"{named} + {rest} more"
+
+
 def _render_check_evidence(
     clusters: list[dict], audit_id: str, budget: int
 ) -> list[str]:
@@ -5257,10 +5280,23 @@ def _render_check_evidence(
     open the issue for. It yields the whole section rather than half of one when
     the budget runs out: a truncated evidence list reads as "these are the
     commands", and it would not be.
+
+    One row per *distinct* command, not per target. Where a check reads a
+    project-wide surface once and derives every target's verdict from it, a row
+    per target is the same string over and over: `gcp-networking-fabric-audit`
+    published 42 identical rows out of 46 on 2026-09-01, because
+    `subnet-ip-exhaustion` measures 42 subnets from one `list-usable` and one
+    Network Analyzer read. Collapsing says what actually happened — one command,
+    these targets — and it is what the section costs the body budget that
+    matters, since this is the first thing dropped when findings crowd it out.
+    A stream whose command names its own target (`kubectl --context <cluster>`)
+    collapses nothing and renders exactly as it did before.
     """
     if not audit_checks(audit_id):
         return []
-    rows: list[tuple[str, str, str]] = []
+    # Keyed by (check, command) and ordered by first appearance, so a run where
+    # every command is distinct produces the table it produced before.
+    grouped: dict[tuple[str, str], list[str]] = {}
     na_rows: list[tuple[str, str, str]] = []
     for cluster in clusters:
         name = str(cluster.get("name", "")).strip() or "(unnamed)"
@@ -5270,7 +5306,7 @@ def _render_check_evidence(
             check = str(entry.get("check", "")).strip()
             command = str(entry.get("command", "")).strip()
             if check and command:
-                rows.append((name, check, command))
+                grouped.setdefault((check, command), []).append(name)
         for entry in cluster.get("checks_not_applicable") or []:
             if not isinstance(entry, dict):
                 continue
@@ -5278,30 +5314,39 @@ def _render_check_evidence(
             reason = str(entry.get("reason", "")).strip()
             if check and reason:
                 na_rows.append((name, check, reason))
-    if not rows and not na_rows:
+    ran = sum(len(targets) for targets in grouped.values())
+    if not grouped and not na_rows:
         return []
 
     out = [
         "",
         "<details>",
-        f"<summary>How this run checked the fleet ({len(rows)} checks)</summary>",
+        f"<summary>How this run checked the fleet ({ran} checks)</summary>",
         "",
-        "One row per check that ran, with the command that ran it, as reported "
-        "by the audit. The harness cannot confirm a command was issued — these "
-        "are re-runnable so that it does not have to be taken on trust. A row "
-        "beginning with an HTTP verb is the exception: the collector issued "
-        "that request in-process against the API it names, so re-running it "
-        "means calling that API rather than pasting the row into a shell.",
+        "One row per command, with the targets it checked, as reported by the "
+        "audit. A command that reads a whole project once and answers for every "
+        "target in it gets one row, not one per target. The harness cannot "
+        "confirm a command was issued — these are re-runnable so that it does "
+        "not have to be taken on trust. A row beginning with an HTTP verb is "
+        "the exception: the collector issued that request in-process against "
+        "the API it names, so re-running it means calling that API rather than "
+        "pasting the row into a shell.",
         "",
-        "| Cluster | Check | Command |",
-        "| ------- | ----- | ------- |",
+        "| Target | Check | Command |",
+        "| ------ | ----- | ------- |",
     ]
-    for name, check, command in rows:
+    # "all N targets" is only true against the targets that ran *this* check,
+    # not against the fleet: a subnet check that covers every subnet still says
+    # nothing about the project target sitting beside them.
+    per_check: dict[str, int] = {}
+    for (check, _), targets in grouped.items():
+        per_check[check] = per_check.get(check, 0) + len(targets)
+    for (check, command), targets in grouped.items():
         # The command keeps its own ceiling: validation already refused
         # anything over MAX_COMMAND_CHARS, so this clips only a value the
         # escaping above pushed past what was accepted.
         out.append(
-            f"| `{_cell(name)}` | `{_cell(check)}` "
+            f"| {_evidence_targets(targets, per_check[check])} | `{_cell(check)}` "
             f"| `{_cell(command, limit=MAX_COMMAND_CHARS)}` |"
         )
     if na_rows:
@@ -5335,7 +5380,7 @@ def _render_check_evidence(
     excluded = f" and the {len(na_rows)} exclusion(s)" if na_rows else ""
     notice = [
         "",
-        f"_The {len(rows)} command(s) behind this run's checks{excluded} do not "
+        f"_The {len(grouped)} command(s) behind this run's checks{excluded} do not "
         "fit GitHub's body limit and are omitted here. They are kept in full in "
         "this run's stored report; ask the agent for that report to re-run any "
         "of them._",

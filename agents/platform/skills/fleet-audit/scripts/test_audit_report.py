@@ -10847,6 +10847,94 @@ class TestCheckCommands(unittest.TestCase):
         self.assertIn("netpol-missing", body)
         self.assertIn("prod-us-east", body)
 
+    def _many_targets(self, count, command_for):
+        """A document with `count` subnet-shaped targets, one check each."""
+        return make_doc(
+            audit="gcp-networking-fabric-audit",
+            findings=[],
+            clusters=[
+                {
+                    "name": f"acme-net/us-east{i}/default",
+                    "location": f"us-east{i}",
+                    "project": "acme-net",
+                    "checks_run": [
+                        {
+                            "check": "subnet-ip-exhaustion",
+                            "command": command_for(i),
+                        }
+                    ],
+                }
+                for i in range(count)
+            ],
+        )
+
+    def test_one_project_wide_read_gets_one_row_not_one_per_target(self):
+        """42 identical rows is what a project-scoped read used to publish.
+
+        `subnet-ip-exhaustion` measures every subnet from one `list-usable`
+        and one Network Analyzer insight, and the collector attaches that same
+        pair to all 42 subnet targets as provenance. A row each made 42 of the
+        46 rows in #122's appendix byte-identical, and cost the body budget
+        ten kilobytes on the section that is first to be dropped when findings
+        crowd it out.
+        """
+        shared = (
+            "gcloud compute networks subnets list-usable --project acme-net "
+            "--format json && gcloud recommender insights list --project "
+            "acme-net --location global --insight-type "
+            "google.networkanalyzer.vpcnetwork.ipAddressInsight --format json"
+        )
+        body = render_body(
+            self._many_targets(42, lambda i: shared),
+            generated_at=NOW,
+            audit_id="gcp-networking-fabric-audit",
+        )
+        self.assertEqual(
+            body.count(shared), 1, "the shared command is still published per target"
+        )
+        self.assertIn("| all 42 targets | `subnet-ip-exhaustion` |", body)
+        # The summary counts checks, which is what the coverage table is about.
+        # Collapsing rows must not quietly restate 42 checks as one.
+        self.assertIn("How this run checked the fleet (42 checks)", body)
+
+    def test_a_per_target_command_still_gets_a_row_of_its_own(self):
+        """The control: collapsing must be a no-op where nothing repeats.
+
+        Every cluster-based stream names its target in the command
+        (`kubectl --context <cluster>`), so its appendix is one row per target
+        before this change and after it.
+        """
+        body = render_body(
+            self._many_targets(
+                3, lambda i: f"gcloud compute networks subnets describe s{i}"
+            ),
+            generated_at=NOW,
+            audit_id="gcp-networking-fabric-audit",
+        )
+        for i in range(3):
+            self.assertIn(f"| `acme-net/us-east{i}/default` |", body)
+        self.assertNotIn("all 3 targets", body)
+        self.assertIn("How this run checked the fleet (3 checks)", body)
+
+    def test_a_command_covering_some_targets_names_them_rather_than_counting(self):
+        """"all N" is a claim, so it may not stand in for "most of them".
+
+        A partial group is the case where the identities carry the
+        information — one region read differently from the rest is the thing a
+        reader is looking for.
+        """
+        body = render_body(
+            self._many_targets(6, lambda i: "shared-read" if i < 5 else "odd-one-out"),
+            generated_at=NOW,
+            audit_id="gcp-networking-fabric-audit",
+        )
+        self.assertNotIn("all 5 targets", body)
+        self.assertIn("`acme-net/us-east0/default`", body)
+        self.assertIn("`acme-net/us-east2/default`", body)
+        self.assertIn("+ 2 more", body)
+        # The lone target still renders as itself, not as "all 1 targets".
+        self.assertIn("| `acme-net/us-east5/default` |", body)
+
     def test_the_appendix_says_which_of_its_rows_a_shell_will_not_take(self):
         """"Re-runnable" is unqualified, and one row shape is not.
 
