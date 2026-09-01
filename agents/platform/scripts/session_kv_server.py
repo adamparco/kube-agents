@@ -709,9 +709,24 @@ def get_active_platform() -> str:
 # The same question as get_active_platform, asked without forcing an answer of
 # one. Order matters: the first entry is the primary, and it matches the
 # precedence above so a single-platform install resolves identically either way.
+#
+# The signal is the home channel, not the relay URL, because this list is read
+# to decide where a report goes and the home channel is where it goes. The
+# adapter already draws the line there -- `sibling_delivery_targets` keeps only
+# names whose `<NAME>_HOME_CHANNEL` is set and non-empty -- and the two files
+# disagreeing is not a style difference. The operator emits
+# GOOGLE_CHAT_RELAY_URL unconditionally once spec.integration.googleChat is
+# enabled and GOOGLE_CHAT_HOME_CHANNEL alongside it with whatever the CR holds,
+# which the provisioning template leaves as "". Keying on the relay URL
+# therefore called Google Chat a target on the default install, every relayed
+# cron report tried a leg with no destination, and all ten shipped jobs came
+# back `relay: degraded` -> `last_delivery_error` set on every run of every job.
+# That is the one field the runbook says to trust over `last_status`, so the
+# cost was not a stray log line: it was turning the delivery alarm into
+# background noise on an install where delivery was in fact fine.
 PLATFORM_ENABLED_SIGNALS = (
-    ("slack", ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN")),
-    ("google_chat", ("GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_HOME_CHANNEL")),
+    ("slack", ("SLACK_HOME_CHANNEL",)),
+    ("google_chat", ("GOOGLE_CHAT_HOME_CHANNEL",)),
 )
 
 
@@ -728,12 +743,16 @@ def enabled_platforms() -> list[str]:
 
     Falls back to `[get_active_platform()]` at the call site rather than here, so
     an install whose signals are all absent keeps the old single-target
-    behaviour instead of delivering nowhere.
+    behaviour instead of delivering nowhere. That fallback is what makes the
+    home-channel signal safe to require: an install that sets a relay URL and no
+    home channel anywhere returns [] here and resolves exactly as it did before
+    this function existed, rather than resolving to a platform that cannot be
+    addressed.
     """
     return [
         name
         for name, signals in PLATFORM_ENABLED_SIGNALS
-        if any(os.environ.get(s) for s in signals)
+        if any(os.environ.get(s, "").strip() for s in signals)
     ]
 
 

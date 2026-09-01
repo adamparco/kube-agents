@@ -2181,8 +2181,8 @@ class TestEnabledPlatforms(unittest.TestCase):
         # The order is the contract, not an accident: the first entry becomes the
         # primary route, and it matches get_active_platform's precedence so a
         # single-platform install resolves identically either way.
-        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
-        os.environ["GOOGLE_CHAT_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAQA123"
         self.assertEqual(
             session_kv_server.enabled_platforms(), ["slack", "google_chat"])
 
@@ -2191,7 +2191,7 @@ class TestEnabledPlatforms(unittest.TestCase):
         self.assertEqual(session_kv_server.enabled_platforms(), ["google_chat"])
 
     def test_a_slack_only_install_names_only_slack(self):
-        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
         self.assertEqual(session_kv_server.enabled_platforms(), ["slack"])
 
     def test_an_empty_value_is_not_a_signal(self):
@@ -2199,6 +2199,33 @@ class TestEnabledPlatforms(unittest.TestCase):
         # Chat is enabled, including empty; an install with no home channel set
         # must not read as one that has one.
         os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = ""
+        self.assertEqual(session_kv_server.enabled_platforms(), [])
+
+    def test_a_relay_url_without_a_home_channel_is_not_a_target(self):
+        """The shape a real operator-managed pod has, and the reason for the fix.
+
+        `spec.integration.googleChat.enabled: true` renders GOOGLE_CHAT_RELAY_URL
+        unconditionally and GOOGLE_CHAT_HOME_CHANNEL from the CR, which the
+        provisioning template leaves as "". Keying on the relay URL made Google
+        Chat a delivery target on that install; the send then had no destination,
+        every relayed cron report came back `relay: degraded`, and
+        `last_delivery_error` -- the field the runbook says to trust over
+        `last_status` -- was set on every run of every job.
+
+        The rule is the adapter's: `sibling_delivery_targets` keeps only names
+        whose `<NAME>_HOME_CHANNEL` is set and non-empty. One definition of
+        addressable, in both files.
+        """
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = ""
+        self.assertEqual(session_kv_server.enabled_platforms(), ["slack"])
+
+    def test_a_whitespace_only_home_channel_is_not_a_target(self):
+        # `sibling_delivery_targets` strips before testing; so does this, or the
+        # two disagree again on a value neither can send to.
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "   "
         self.assertEqual(session_kv_server.enabled_platforms(), [])
 
     def test_no_signals_is_empty_so_the_caller_can_fall_back(self):
@@ -2431,8 +2458,13 @@ class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
         self.addCleanup(env.stop)
         for key in PLATFORM_SIGNAL_KEYS:
             os.environ.pop(key, None)
-        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
-        os.environ["GOOGLE_CHAT_RELAY_URL"] = "http://127.0.0.1:8765"
+        # A home channel each, which is what makes this a dual-platform install:
+        # the relay URL says an integration is wired up, the home channel says a
+        # report sent to that platform has somewhere to land. `enabled_platforms`
+        # keys on the second, as the class docstring below already assumes when
+        # it says `all` expands over the platforms with a home channel.
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
 
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
         with sqlite3.connect(temp_db_path) as conn:
