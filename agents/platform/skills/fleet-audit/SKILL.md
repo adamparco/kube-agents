@@ -442,6 +442,18 @@ field, and publishes nothing:
 - `remediation.kind` is `manifest`, `gcloud`, or `manual`. `path` is required for `manifest`
   (repo-relative, no `..`, no absolute paths, no glob metacharacters) and forbidden for the other
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
+- **A `gcloud` note is a command that runs, not the finding restated in flag form.** A flag takes
+  the value `gcloud` accepts, which is routinely not the one the API reported, and pasting the
+  observed value straight through is how that goes wrong. Enum fields are the trap, because
+  `gcloud`'s choices are lowercase where the API's are not: the 2026-09-01
+  `fleet-consistency-drift` run read `.releaseChannel.channel=RAPID` and shipped
+  `--release-channel=REGULAR`, which fails on paste with _Invalid choice: 'REGULAR'. Did you mean
+  'regular'?_. A reader who pastes that reasonably concludes the finding is wrong rather than the
+  command, so one bad flag discredits a true finding. Names move too, not just cases — the fix for
+  a `loggingConfig.componentConfig.enableComponents` of `SYSTEM_COMPONENTS,WORKLOADS` is
+  `--logging=SYSTEM,WORKLOAD`. Write the flag's own vocabulary, and if you cannot confirm what
+  that is, the finding is `kind: manual` and the command belongs in `recommendation.action` as
+  prose.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
   namespace — grep the clone for `namespace: <namespace>`, then **open the hits and confirm one
