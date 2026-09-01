@@ -362,7 +362,16 @@ done
 
 PROMPT_HITS=$(mktemp)
 trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
-search '^[[:space:]]*"prompt": "' > "$PROMPT_HITS"
+#
+# Match the key wherever on the line it falls and however it is spaced. An
+# anchor that insisted on the key starting the line, followed by exactly one
+# space, saw only prettier's rendering of a multi-line object — a one-line
+# `{"id": …, "prompt": …}` entry, or a hand-spaced one, went unchecked, which
+# is the same silent skip the structural anchor was adopted to end. Prettier
+# normalises much of this back, but only inside a fence tagged `json`, and CI
+# does not run it over `.mdx` at all. What no line-based anchor can see is a
+# quotation whose value sits on the line after its key; those are unchecked.
+search '"prompt"[[:space:]]*:[[:space:]]*"' > "$PROMPT_HITS"
 
 # No floor here, unlike the caps above: the site owes nobody a quotation of a
 # cron prompt, and zero copies is zero stale copies. That is safe only because
@@ -370,13 +379,19 @@ search '^[[:space:]]*"prompt": "' > "$PROMPT_HITS"
 STALE_PROMPTS=""
 while IFS= read -r HIT; do
   [ -n "$HIT" ] || continue
-  # Strip the grep `path:line:` prefix, the JSON key, and the trailing `",`.
-  # A trailing `...` is an explicit elision — `concepts/skills.md` quotes the
+  # Strip the grep `path:line:` prefix and the JSON key, then cut at the first
+  # unescaped `"` — the close of the value, whether what follows it is nothing,
+  # a comma, `}`, or the rest of a one-line object. Matching only `"` and `",`
+  # at end of line left the tail attached and turned a verbatim quotation into
+  # a false stale report.
+  #
+  # A trailing ellipsis is an explicit elision — `concepts/skills.md` quotes the
   # first sentence to show the shape of an entry, not the prompt — so check as
   # far as the ellipsis and no further. Abbreviating is allowed; misquoting the
-  # part you did show is not.
+  # part you did show is not. Both spellings count: house style is `…`, and
+  # accepting only `...` failed the quotations that follow it.
   QUOTED=$(printf '%s\n' "$HIT" \
-    | sed -E 's/^.*"prompt": "//; s/",?[[:space:]]*$//; s/[[:space:]]*\.\.\.$//')
+    | sed -E 's/^.*"prompt"[[:space:]]*:[[:space:]]*"//; s/([^\\])".*$/\1/; s/[[:space:]]*(\.\.\.|…)$//')
   # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
   if [ -z "$QUOTED" ] || ! grep -qF -- "$QUOTED" $CRON_JOBS; then
     STALE_PROMPTS="${STALE_PROMPTS}${HIT}
