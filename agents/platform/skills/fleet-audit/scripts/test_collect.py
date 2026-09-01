@@ -800,9 +800,13 @@ class TestProbes(unittest.TestCase):
         hit = collect.check_probes_readiness(self.wl(), self.metrics_ctx([{"port": 9402}]))
         self.assertIn("(serving traffic)", hit["excerpt"])
 
-    def test_a_service_with_no_ports_at_all_is_not_metrics_only(self):
+    def test_a_service_with_no_ports_at_all_is_neither_scope(self):
+        # Not metrics-only -- nothing says these pods are scraped. Not serving
+        # either: a Service declaring no ports routes nothing through its own
+        # ClusterIP, so "every rollout sends production traffic to pods that
+        # are not yet serving" is a claim about traffic that does not exist.
         hit = collect.check_probes_readiness(self.wl(), self.metrics_ctx([]))
-        self.assertIn("(serving traffic)", hit["excerpt"])
+        self.assertIn("(no ports declared)", hit["excerpt"])
         self.assertIn("s-metrics[no ports]", hit["excerpt"])
 
     def test_liveness_missing_is_flagged_with_no_service_required(self):
@@ -864,6 +868,13 @@ class TestSingleReplica(unittest.TestCase):
         # webhook -- traffic, and the finding has to keep saying so.
         hit = collect.check_single_replica(self.wl(), self.svc_ctx([{"port": 443, "targetPort": 10250}]))
         self.assertIn("(serving traffic)", hit["excerpt"])
+
+    def test_a_service_with_no_ports_at_all_is_neither_scope(self):
+        # The readiness sibling's reason, and the same trap: 3.11's Impact line
+        # is a full outage for "this service", which a Service exposing no port
+        # cannot have.
+        hit = collect.check_single_replica(self.wl(), self.svc_ctx())
+        self.assertIn("(no ports declared)", hit["excerpt"])
 
     def test_multi_replica_is_never_flagged(self):
         self.assertIsNone(collect.check_single_replica(self.wl(replicas=2), self.svc_ctx()))

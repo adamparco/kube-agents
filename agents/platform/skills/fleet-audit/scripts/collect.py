@@ -792,6 +792,13 @@ def _containers_behind_a_service(workload: dict, services: list[dict]) -> list[d
 #: own.
 _METRICS_PORT_NAMES = frozenset({"metrics", "http-metrics", "https-metrics", "telemetry"})
 
+#: The three things "Service-backed" can mean, as the trailing `(scope)` of an
+#: exposure line. §3.9 and §3.11 of the SOP key their impact claims off these
+#: strings verbatim, so they are named rather than spelled inline.
+_SCOPE_SERVING = "serving traffic"
+_SCOPE_METRICS_ONLY = "metrics scrape only"
+_SCOPE_NO_PORTS = "no ports declared"
+
 
 def _metrics_only_ports(services: list[dict]) -> bool:
     """Every port every selecting Service exposes is a metrics scrape port.
@@ -809,6 +816,25 @@ def _metrics_only_ports(services: list[dict]) -> bool:
     """
     ports = [port for svc in services for port in (svc.get("spec") or {}).get("ports") or []]
     return bool(ports) and all(port.get("name") in _METRICS_PORT_NAMES for port in ports)
+
+
+def _exposure_scope(services: list[dict]) -> str:
+    """Which of the three things "Service-backed" means for this workload.
+
+    `_metrics_only_ports` answers one question and cannot answer this one: it
+    is false both for a Service carrying user requests and for a Service that
+    declares no ports at all, and those are not the same claim. A port-less
+    Service routes nothing through its own ClusterIP; if it is headless its DNS
+    records still hand out pod IPs, so a client that already knows a port can
+    reach the pods anyway. Neither of the other two scopes is true of it, so it
+    gets its own rather than being rounded to whichever is nearer -- rounding
+    it to `serving traffic` is what made a Service with no ports publish "every
+    rollout sends production traffic to pods that are not yet serving".
+    """
+    ports = [port for svc in services for port in (svc.get("spec") or {}).get("ports") or []]
+    if not ports:
+        return _SCOPE_NO_PORTS
+    return _SCOPE_METRICS_ONLY if _metrics_only_ports(services) else _SCOPE_SERVING
 
 
 def _exposure_line(services: list[dict]) -> str:
@@ -830,8 +856,7 @@ def _exposure_line(services: list[dict]) -> str:
         )
         for svc in services
     )
-    scope = "metrics scrape only" if _metrics_only_ports(services) else "serving traffic"
-    return f"selecting services: {exposure} ({scope})"
+    return f"selecting services: {exposure} ({_exposure_scope(services)})"
 
 
 def check_probes_readiness(workload: dict, context: dict) -> dict | None:
