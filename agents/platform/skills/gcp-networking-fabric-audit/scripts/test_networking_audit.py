@@ -489,7 +489,7 @@ class CollectProjectTest(unittest.TestCase):
             "backend-services list": run_of(0, "[]"),
         }
         entries = na.collect_project("proj-1", run=self.fake_run(responses))
-        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
         not_applicable = {na_entry["check"] for na_entry in s2["checks_not_applicable"]}
         self.assertIn("subnet-ip-exhaustion", not_applicable)
         self.assertEqual(s2["candidates"], [])
@@ -498,6 +498,66 @@ class CollectProjectTest(unittest.TestCase):
         self.assertNotIn(
             "subnet-ip-exhaustion",
             {na_entry["check"] for na_entry in s1["checks_not_applicable"]},
+        )
+
+    def test_a_name_shared_across_a_shared_vpc_stays_two_targets(self):
+        """`default` exists in the host project and in this one, and
+        `list-usable` returns both.
+
+        Naming both after the audited project gave two targets one name, and
+        `validate_scope` refuses a document whose target names collide -- so
+        `finish` exited 2 and the run published *nothing*, rather than the audit
+        losing the one duplicate. Nothing on a single-project fleet reaches it,
+        which is why it sat: all 42 subnets on the live fleet are owned by the
+        project being audited, and `auto` mode names every one of them
+        `default`.
+        """
+        both = (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/default", '
+            '"ipCidrRange": "10.0.0.0/20"}, '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/default", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+        # The insight is project-scoped, so it measures this project's
+        # `default` and never the host project's. It has to cover at least one
+        # subnet or the enumeration gate fails and no per-subnet target is
+        # emitted at all -- which is the state that hid this bug.
+        insight = (
+            '[{"content": {"ipUtilizationSummaryInfo": [{'
+            '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+            '"networkStats": [{'
+            '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+            '"subnetStats": [{'
+            '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/default", '
+            '"subnetRangeStats": ['
+            '{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}'
+            "]}]}]}]}}]"
+        )
+        responses = {
+            "subnets list-usable": run_of(0, both),
+            "recommender insights list": run_of(0, insight),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        names = [e["name"] for e in entries]
+        self.assertEqual(len(set(names)), len(names), f"target names collide: {names}")
+        subnets = [e for e in entries if e["name"].endswith("/us-east4/default")]
+        self.assertEqual(
+            sorted(e["name"] for e in subnets),
+            ["host-1/us-east4/default", "proj-1/us-east4/default"],
+        )
+        # `project` has to move with the name; the scope table resolves a
+        # target back to a project through it.
+        self.assertEqual(
+            {e["name"]: e["project"] for e in subnets},
+            {
+                "host-1/us-east4/default": "host-1",
+                "proj-1/us-east4/default": "proj-1",
+            },
         )
 
     def test_the_unmeasured_reason_is_marked_so_the_ledger_can_tell_it_apart(self):
@@ -519,7 +579,7 @@ class CollectProjectTest(unittest.TestCase):
             "backend-services list": run_of(0, "[]"),
         }
         entries = na.collect_project("proj-1", run=self.fake_run(responses))
-        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
         entry = next(
             d for d in s2["checks_not_applicable"] if d["check"] == "subnet-ip-exhaustion"
         )
@@ -578,7 +638,7 @@ class CollectProjectTest(unittest.TestCase):
             "backend-services list": run_of(0, "[]"),
         }
         entries = na.collect_project("proj-1", run=self.fake_run(responses))
-        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
         self.assertEqual(s2["limitations"], na.UNMEASURED_SUBNET_LIMITATION)
         self.assertIn("subnet-ip-exhaustion", s2["limitations"])
         # The measured subnet ran its check, so a limitation there would put a
@@ -925,7 +985,7 @@ class CollectProjectTest(unittest.TestCase):
         self.assertLess(len(command), 2000)
         # Every subnet in the run carries it, including the unmeasured one:
         # the same pair of reads is what established it as unmeasured.
-        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
         self.assertEqual(
             next(c for c in s2["commands"] if c["check"] == "subnet-ip-exhaustion")["command"],
             command,

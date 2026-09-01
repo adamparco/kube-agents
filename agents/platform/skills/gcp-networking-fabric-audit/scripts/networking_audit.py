@@ -940,6 +940,16 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
     for item in parsed:
         name = _last_segment(item.get("subnetwork", ""))
         region = _region_of_subnet_link(item.get("subnetwork", ""))
+        # Name the target after the project that owns the subnet, not the one
+        # being audited. `list-usable` reaches across a Shared VPC, so a host
+        # project's `us-east4/default` and this project's own `us-east4/default`
+        # both arrive here; labelling both with `project` gives two targets one
+        # name. That is not a cosmetic collision -- `validate_scope` refuses a
+        # document whose targets share a name, `finish` exits 2, and the run
+        # publishes nothing at all rather than losing the one duplicate. The
+        # three backfill helpers already discriminate on exactly this value;
+        # this is the fourth site that needed it and the only one without it.
+        owner = _project_of_subnet_link(item.get("subnetwork", "")) or project
         # A subnet the backfill did not reach has no utilization figure from
         # either surface. Running the check against it would return None --
         # "nothing wrong here" -- so declare it not-applicable instead, which
@@ -963,8 +973,8 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
             )
         hit = check_subnet_ip_exhaustion(item) if measured else None
         entry = {
-            "name": f"{project}/{region}/{name}",
-            "project": project,
+            "name": f"{owner}/{region}/{name}",
+            "project": owner,
             "location": region,
             "outcome": "collected",
             # Recorded on every subnet, measured or not. A `commands` entry
