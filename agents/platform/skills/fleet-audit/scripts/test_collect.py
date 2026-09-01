@@ -2452,6 +2452,22 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": value}]).get("severity"))
 
+    def test_a_placeholder_written_without_separators_is_left_at_major(self):
+        # Deliberate, and the direction to err in. Splitting on non-alphanumerics
+        # is what makes `hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN` readable, and
+        # the cost is that a run-together placeholder has no separators to split
+        # on, so `CHANGEME` reads as one opaque token and keeps `major`.
+        #
+        # The obvious repair -- letting a token match a *sequence* of placeholder
+        # words -- is what must not be done: `SECRET`+`KEY` tiles `secretkey`,
+        # which is a weak password rather than a placeholder, and downgrading a
+        # live credential is the error this check cannot afford. Over-reporting
+        # a placeholder is the one it can. `ai_security_audit_sop.md` says the
+        # same under check 3.5: never dropped, only downgraded.
+        for value in ("CHANGEME", "YOURTOKENHERE"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": value}]).get("severity"))
+
     def test_the_excerpt_reads_correctly_beside_a_severity_it_did_not_set(self):
         # `adopt_collector_evidence` forces this excerpt onto the finding but
         # never copies `severity`, so a model that kept `major` gets this
