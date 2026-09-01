@@ -1530,8 +1530,64 @@ def _authorized_networks_excerpt(describe: dict) -> str:
         part = f"{label}.enabled={_json_scalar(cfg.get('enabled'))}, cidrBlocks=[{','.join(blocks)}]"
         if cfg.get("gcpPublicCidrsAccessEnabled") is not None:
             part += f", gcpPublicCidrsAccessEnabled={_json_scalar(cfg.get('gcpPublicCidrsAccessEnabled'))}"
+            # Say so, because the field reads as an aggravating factor and is
+            # the opposite of one. It grants Google Cloud's own public
+            # addresses an exception to the allowlist, so it means something
+            # only while there is an allowlist to be excepted from; with
+            # `enabled` absent every address already reaches the endpoint and
+            # the grant adds nothing. Unannotated, it was the only difference
+            # between one cluster's excerpt and fifteen identical ones, which
+            # invites a reader to triage that cluster first over a field that
+            # makes it no worse than its neighbours.
+            if cfg.get("enabled") is not True:
+                part += " (inert: authorized networks not enabled)"
         parts.append(part)
     return "; ".join(parts)
+
+
+def _external_control_plane_paths(describe: dict) -> list[str]:
+    """Every way the control plane answers from outside the VPC, as read.
+
+    Two independent endpoints, and authorized networks gates only one of them.
+    The IP endpoint is the one this check was written for. The DNS endpoint is
+    a separate address (`gke-<hash>.<region>.gke.goog`) that GKE serves when
+    `dnsEndpointConfig.allowExternalTraffic` is set, and no IP allowlist
+    applies to it at all -- it is gated by IAM alone, so enabling authorized
+    networks does not close it and a reader who acts on this finding would be
+    left with the cluster still reachable.
+
+    `ipEndpointsConfig.enabled` is the master switch under which
+    `enablePublicEndpoint` sits. A cluster created with `--no-enable-ip-access`
+    serves no IP endpoint at all, and reading `enablePublicEndpoint` alone
+    calls it internet-reachable over an address it does not have. That
+    combination does not exist on this fleet, so this is a false positive the
+    check has not made yet rather than one it made.
+    """
+    endpoints = describe.get("controlPlaneEndpointsConfig") or {}
+    ip_cfg = endpoints.get("ipEndpointsConfig") or {}
+    private_cfg = describe.get("privateClusterConfig") or {}
+    paths = []
+    if ip_cfg.get("enabled") is False:
+        pass  # No IP endpoint at all; `enablePublicEndpoint` below it is moot.
+    elif ip_cfg.get("enablePublicEndpoint") is not None:
+        if ip_cfg.get("enablePublicEndpoint") is True:
+            paths.append(
+                "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint="
+                f"{_json_scalar(ip_cfg.get('enablePublicEndpoint'))}"
+            )
+    elif private_cfg.get("enablePrivateEndpoint") is not True:
+        # The legacy inversion, read only where GKE returns no current field.
+        paths.append(
+            "privateClusterConfig.enablePrivateEndpoint="
+            f"{_json_scalar(private_cfg.get('enablePrivateEndpoint'))}"
+        )
+    dns_cfg = endpoints.get("dnsEndpointConfig") or {}
+    if dns_cfg.get("allowExternalTraffic") is True:
+        paths.append(
+            "controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic=true "
+            "(DNS endpoint, not gated by authorized networks)"
+        )
+    return paths
 
 
 def check_public_control_plane(context: dict) -> list[dict]:
@@ -1548,28 +1604,21 @@ def check_public_control_plane(context: dict) -> list[dict]:
     `enablePrivateEndpoint: true`, was reported as reachable from the internet
     at `critical`. Prefer the current field wherever GKE returns it and fall
     back to the legacy one only when it does not.
+
+    Authorized networks answers for the IP endpoint and for nothing else, so it
+    suppresses that path rather than the whole finding. A cluster whose IP
+    endpoint is allowlisted and whose DNS endpoint takes external traffic is
+    still answering the internet, and returning nothing for it told the
+    operator the opposite -- the one shape where this check's silence was a
+    false negative rather than a pass.
     """
     describe = context.get("cluster_describe") or {}
-    private_cfg = describe.get("privateClusterConfig") or {}
-    public_endpoint_enabled = (
-        (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
-    ).get("enablePublicEndpoint")
-    if public_endpoint_enabled is None:
-        reachable = private_cfg.get("enablePrivateEndpoint") is not True
-        decided = (
-            "privateClusterConfig.enablePrivateEndpoint="
-            f"{_json_scalar(private_cfg.get('enablePrivateEndpoint'))}"
-        )
-    else:
-        reachable = public_endpoint_enabled is True
-        decided = (
-            "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint="
-            f"{_json_scalar(public_endpoint_enabled)}"
-        )
-    if not reachable:
-        return []
+    paths = _external_control_plane_paths(describe)
     if _has_restrictive_authorized_networks(describe):
+        paths = [p for p in paths if "dnsEndpointConfig" in p]
+    if not paths:
         return []
+    decided = "; ".join(paths)
     # Name the fields and the values, not the conclusion. `adopt_collector_evidence`
     # overwrites the model's excerpt with this string, so it is the only evidence
     # the finding will ever carry, and the constant sentence it used to be --

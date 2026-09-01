@@ -2245,6 +2245,124 @@ class TestPublicControlPlane(unittest.TestCase):
         for excerpt in (current[0]["excerpt"], legacy[0]["excerpt"]):
             self.assertIn("ipEndpointsConfig.authorizedNetworksConfig.enabled=", excerpt)
 
+    def test_an_external_dns_endpoint_survives_restrictive_authorized_networks(self):
+        """The one shape where silence here was a false negative.
+
+        Authorized networks gates the IP endpoint and nothing else. A cluster
+        that allowlists its IP endpoint and serves the DNS endpoint to external
+        traffic is still answering the internet, and the operator who enabled
+        authorized networks to close it has not.
+        """
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"displayName": "office", "cidrBlock": "203.0.113.0/24"}],
+                    },
+                    "controlPlaneEndpointsConfig": {
+                        "ipEndpointsConfig": {"enablePublicEndpoint": True},
+                        "dnsEndpointConfig": {"allowExternalTraffic": True},
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("dnsEndpointConfig.allowExternalTraffic=true", found[0]["excerpt"])
+        # The allowlisted IP path is closed, so claiming it is open would send
+        # the reader to fix a setting that is already right.
+        self.assertNotIn("enablePublicEndpoint", found[0]["excerpt"])
+
+    def test_a_dns_only_cluster_is_not_called_reachable_over_an_ip_it_lacks(self):
+        """`ipEndpointsConfig.enabled` is the switch `enablePublicEndpoint` sits under.
+
+        `--no-enable-ip-access` serves no IP endpoint at all, and GKE leaves
+        the now-moot `enablePublicEndpoint` behind it.
+        """
+        self.assertEqual(
+            collect.check_public_control_plane(
+                context_of(
+                    cluster_describe={
+                        "privateClusterConfig": {},
+                        "masterAuthorizedNetworksConfig": {},
+                        "controlPlaneEndpointsConfig": {
+                            "ipEndpointsConfig": {"enabled": False, "enablePublicEndpoint": True},
+                            "dnsEndpointConfig": {"allowExternalTraffic": False},
+                        },
+                    }
+                )
+            ),
+            [],
+        )
+
+    def test_a_dns_only_cluster_open_externally_is_flagged_for_that_path_alone(self):
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {},
+                    "controlPlaneEndpointsConfig": {
+                        "ipEndpointsConfig": {"enabled": False, "enablePublicEndpoint": True},
+                        "dnsEndpointConfig": {"allowExternalTraffic": True},
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("dnsEndpointConfig.allowExternalTraffic=true", found[0]["excerpt"])
+        self.assertNotIn("enablePublicEndpoint", found[0]["excerpt"])
+
+    def test_both_paths_open_names_both(self):
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {},
+                    "controlPlaneEndpointsConfig": {
+                        "ipEndpointsConfig": {"enablePublicEndpoint": True},
+                        "dnsEndpointConfig": {"allowExternalTraffic": True},
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("enablePublicEndpoint=true", found[0]["excerpt"])
+        self.assertIn("dnsEndpointConfig.allowExternalTraffic=true", found[0]["excerpt"])
+
+    def test_google_cloud_access_is_marked_inert_when_there_is_no_allowlist(self):
+        """It grants an exception to an allowlist that is not switched on.
+
+        Unannotated it was the only difference between one cluster's excerpt
+        and fifteen identical ones, reading as an aggravating factor on a
+        cluster no worse than its neighbours.
+        """
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {"gcpPublicCidrsAccessEnabled": True},
+                }
+            )
+        )
+        self.assertIn("gcpPublicCidrsAccessEnabled=true (inert:", found[0]["excerpt"])
+
+    def test_google_cloud_access_is_not_marked_inert_beside_a_live_allowlist(self):
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "gcpPublicCidrsAccessEnabled": True,
+                        "cidrBlocks": [{"displayName": "everywhere", "cidrBlock": "0.0.0.0/0"}],
+                    },
+                }
+            )
+        )
+        self.assertIn("gcpPublicCidrsAccessEnabled=true", found[0]["excerpt"])
+        self.assertNotIn("inert", found[0]["excerpt"])
+
     def test_the_excerpt_quotes_the_cidr_that_made_it_unrestricted(self):
         # A cluster caught by the allow-all branch is caught *because of* a
         # specific block. Leaving it out of the excerpt makes the one finding
