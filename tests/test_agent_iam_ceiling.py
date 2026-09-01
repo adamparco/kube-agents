@@ -45,6 +45,7 @@ TERRAFORM_DIR = REPO_ROOT / "terraform"
 FULL_INSTALL = TERRAFORM_DIR / "examples" / "full-install"
 TF_MAIN = FULL_INSTALL / "main.tf"
 TF_VARIABLES = FULL_INSTALL / "variables.tf"
+IAM_MODULE_MAIN = TERRAFORM_DIR / "modules" / "kube-agents-iam" / "main.tf"
 
 # The exact set the composition grants for `read-only`. Written out rather than
 # derived so that widening it is a visible diff here too.
@@ -73,6 +74,36 @@ FORBIDDEN_ROLES = {
     "roles/owner",
     "roles/editor",
     "roles/iam.serviceAccountTokenCreator",
+}
+
+# The exact permissions the module's one custom role carries. A custom role is
+# the hole in every check above it: FORBIDDEN_ROLES matches strings beginning
+# `roles/`, and a custom role's contents are bare permission ids, so a role
+# granting `container.clusters.update` passes the forbidden-role sweep without
+# being looked at. Written out for the same reason READ_ONLY_ROLES is -- so
+# widening it is a visible diff here.
+SUBNET_UTILIZATION_PERMISSIONS = [
+    "compute.subnetworks.use",
+    "recommender.networkAnalyzerIpAddressInsights.list",
+    "recommender.networkAnalyzerIpAddressInsights.get",
+]
+
+# Verbs that make a permission a write. Checked as the last dot-separated
+# segment of every permission in every custom role in the tree, so a second
+# custom role added later is covered without editing the pin above.
+FORBIDDEN_PERMISSION_VERBS = {
+    "create",
+    "delete",
+    "update",
+    "patch",
+    "setIamPolicy",
+    "setMetadata",
+    "impersonate",
+    "actAs",
+    "getCredentials",
+    "signBlob",
+    "signJwt",
+    "implicitDelegation",
 }
 
 # Values a human or a stale vars.sh might plausibly carry. Everything here that
@@ -484,6 +515,81 @@ class TerraformRoleBundlesTest(unittest.TestCase):
         )
         self.assertEqual(
             ACCEPTED_VALUES, re.findall(r'"([^"]*)"', condition.group(1))
+        )
+
+
+class TerraformCustomRolePermissionsTest(unittest.TestCase):
+    """What the module's own custom role is allowed to contain.
+
+    Every other check in this file reads role *names*. A custom role is defined
+    by its permissions, so none of them look inside one: inserting
+    `container.clusters.update` into `subnet_utilization_reader` grants the
+    agent cluster mutation project-wide and leaves the rest of the suite green.
+    """
+
+    def setUp(self):
+        self.module = IAM_MODULE_MAIN.read_text(encoding="utf-8")
+        self.lists = _terraform_list_locals(self.module)
+
+    def _custom_role_permissions(self) -> dict[str, list[str]]:
+        """Every `permissions = [...]` in the module, keyed by its resource name."""
+        found = {}
+        for match in re.finditer(
+            r'^resource\s+"google_project_iam_custom_role"\s+"([^"]+)"\s*\{',
+            self.module,
+            re.M,
+        ):
+            name = match.group(1)
+            depth, body = 0, ""
+            for ch in self.module[match.end() - 1 :]:
+                body += ch
+                depth += (ch == "{") - (ch == "}")
+                if depth == 0 and body.strip():
+                    break
+            perms = _terraform_list_locals(body).get("permissions")
+            self.assertIsNotNone(
+                perms, f"could not read the permissions of custom role {name}"
+            )
+            found[name] = perms
+        return found
+
+    def test_the_subnet_utilization_role_carries_exactly_three_permissions(self):
+        roles = self._custom_role_permissions()
+        self.assertIn(
+            "subnet_utilization_reader",
+            roles,
+            "the subnet-utilization custom role moved or was renamed",
+        )
+        self.assertEqual(
+            SUBNET_UTILIZATION_PERMISSIONS, roles["subnet_utilization_reader"]
+        )
+
+    def test_no_custom_role_in_the_module_carries_a_write(self):
+        roles = self._custom_role_permissions()
+        self.assertTrue(roles, "no custom role found; this test would pass vacuously")
+        for name, perms in roles.items():
+            for perm in perms:
+                with self.subTest(role=name, permission=perm):
+                    self.assertNotIn(
+                        perm.rsplit(".", 1)[-1],
+                        FORBIDDEN_PERMISSION_VERBS,
+                        f"custom role {name} grants {perm}, which authorizes the agent "
+                        "through IAM independently of its Kubernetes RBAC",
+                    )
+
+    def test_the_role_id_stays_overridable(self):
+        """A literal id cannot be changed while GCP holds a soft-deleted one.
+
+        `terraform destroy` soft-deletes the role and the name is reserved for
+        7-37 days, most of which it can be neither created nor updated in. The
+        variable is the only in-band way past that, so a refactor back to a
+        literal is a regression rather than a simplification.
+        """
+        self.assertRegex(
+            self.module,
+            r"role_id\s*=\s*var\.subnet_utilization_role_id",
+            "the custom role's id is no longer a variable; an operator "
+            "reinstalling inside GCP's soft-delete window has no way past it",
         )
 
 
