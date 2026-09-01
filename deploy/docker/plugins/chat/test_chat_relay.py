@@ -289,6 +289,28 @@ class TestStandaloneSend(unittest.TestCase):
             with self.subTest(report=report):
                 self.assertTrue(mod.is_silent_report(report))
 
+    def test_every_kind_of_whitespace_the_old_blank_test_caught_is_still_silence(self):
+        """This predicate replaced `not report.strip()` and must not narrow it.
+
+        `_MARKDOWN_DRESS` can only list ASCII whitespace, so undressing alone
+        called a report of one NBSP non-empty and relayed it -- and
+        `submit_cron_report` rejects a blank report with an HTTP 400 that lands
+        in `last_delivery_error`, the failure the guard exists to prevent. The
+        blast radius reaches past this plugin: `slack_relay_patch` imports this
+        function and dropped its own blank test in favour of it.
+        """
+        for report in ("\xa0", "　", "\x0b", "\x0c", "\x1c", " ", " ", "\xa0 \t　"):
+            with self.subTest(report=report):
+                self.assertTrue(report.strip() == "", "fixture is not whitespace")
+                self.assertTrue(mod.is_silent_report(report))
+
+    def test_the_marker_padded_with_non_ascii_whitespace_is_still_silence(self):
+        # The dress strip stops at the NBSP, leaving the asterisks in place, so
+        # the fallback compared "**[SILENT]**" against the marker and relayed it.
+        for report in ("\xa0**[SILENT]**\xa0", "　[SILENT]　", "\xa0`[SILENT]`\xa0"):
+            with self.subTest(report=report):
+                self.assertTrue(mod.is_silent_report(report))
+
     def test_silence_is_not_a_missing_key(self):
         """A quiet tick has nothing to authenticate, so an unset key is not its problem.
 

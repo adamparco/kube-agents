@@ -247,8 +247,18 @@ def is_silent_report(report: str) -> bool:
     So undress the report before testing it. On a real report this changes
     nothing: stripping punctuation off the two ends of a multi-line audit
     summary cannot turn it into the marker.
+
+    Bare ``strip()`` on both sides of the dress, because this predicate
+    replaced a plain ``not report.strip()`` and has to stay a superset of it.
+    ``_MARKDOWN_DRESS`` can only list ASCII whitespace, while ``str.strip()``
+    also takes NBSP, ``\\x0b``, ``\\x0c``, ``\\x1c``, ``\\u2028``, ``\\u2003``
+    and ``\\u3000`` — so stripping the dress alone called a report of one NBSP
+    non-empty and relayed it. `submit_cron_report` then rejects it as blank
+    with an HTTP 400 that lands in ``last_delivery_error``, which is the exact
+    failure this guard exists to prevent. The trailing strip catches the same
+    characters once the dress around them is gone.
     """
-    bare = report.strip(_MARKDOWN_DRESS)
+    bare = report.strip().strip(_MARKDOWN_DRESS).strip()
     if not bare:
         return True
     try:
