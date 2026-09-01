@@ -503,19 +503,75 @@ NODEPOOL_CEILING_FRACTION = 0.9
 # auto-scaling") and so was half wrong whichever arm published it.
 _IMPACT_ZONE_LOCKED = (
     "Node pool is locked to a single zone: a stockout in that zone halts "
-    "scale-up of this pool, and pods only this pool can host stay Pending. "
-    "The autoscaler backs off the failing node group on its own, so other "
-    "pools keep scaling -- the stall belongs to this pool, not the cluster."
+    "scale-up of this pool, and pods that can only run there -- pinned by a "
+    "nodeSelector, or by a PersistentVolume that is a zonal disk in that zone "
+    "-- stay Pending. The autoscaler backs off the failing node group on its "
+    "own and keeps scaling the others, so the stall belongs to this pool "
+    "rather than the cluster, until enough nodes cluster-wide go unready to "
+    "trip the autoscaler's 45% health check and stop every operation."
 )
-# Deliberately says nothing about zones or stockouts. The ceiling is the
-# pool's own configuration, and the excerpt's zone list usually shows the
-# operator already spans several -- a scale event reaching a configured limit
-# is the autoscaler working, not a capacity failure.
-_IMPACT_AT_CEILING = (
-    "The pool is at or above {fraction:.0%} of its effective node ceiling, so "
-    "the next scale-up stops there whatever capacity the zone has. The limit "
-    "is this pool's own configuration rather than anything about supply."
+# The ceiling arm's Impact is assembled rather than stored, because three of
+# its clauses are contingent and the previous single sentence asserted all
+# three unconditionally. See `_ceiling_impact`.
+_CEILING_AT_LIMIT = "The pool is at its effective node ceiling ({live}/{ceiling}), so the autoscaler adds no further node to it"
+_CEILING_NEAR_LIMIT = "The pool is at {percent:.0f}% of its effective node ceiling ({live}/{ceiling}), so at most {headroom} more {noun} can be added before scale-up stops there"
+# Cluster autoscaler skips a node group only on `currentTargetSize >=
+# MaxSize`, and target size is what it compares -- not the live Node count
+# this check can see. A pool at 27 live may already be targeting 30.
+_CEILING_TARGET_CAVEAT = (
+    " -- and fewer if the autoscaler's target already sits above the live count, "
+    "which is what it actually compares."
 )
+# Arm 2 does not require `not has_nap`, so on a NAP cluster every at-ceiling
+# pool lands here, single-zone ones included. NAP creates a new pool for
+# pending workloads, so "the next scale-up stops there" is false of the
+# cluster even where it is true of the pool.
+_CEILING_NAP_CLAUSE = (
+    " Node auto-provisioning is on, so the cluster can create a different pool "
+    "instead; what stops is this pool's growth, not the cluster's."
+)
+# "The limit is configuration rather than anything about supply" was the
+# earlier claim and it is only half true. The *value* is configuration --
+# nothing shrinks `maxSize` at runtime -- but reaching it is often a supply
+# artefact: when one zonal MIG is backed off the autoscaler pushes the whole
+# delta into the surviving zones, so "27/30" can be the footprint of a
+# stockout next door. Regional CPU quota can also bind below the field.
+_CEILING_SUPPLY_CLAUSE = (
+    " That ceiling is configuration, not capacity -- but the pool may have "
+    "reached it because scale-up was displaced here from a zone that could not "
+    "supply, or because regional quota binds below the configured limit."
+)
+
+
+def _ceiling_impact(ceiling: int, live: int, has_nap: bool) -> str:
+    """§3.9's ceiling Impact, with only the clauses that hold.
+
+    The sentence this replaces said "the next scale-up stops there whatever
+    capacity the zone has" at any fullness over 90%, and cluster autoscaler
+    skips a node group on exactly one condition: `currentTargetSize >=
+    nodeGroup.MaxSize()`. At the check's own worked example, `27 >= 30` is
+    false and the next scale-up adds three more nodes. A 90% threshold
+    guarantees 10% headroom, so the claim was true at exactly one point in the
+    band that fires it -- and a test asserted it at 27/30.
+    """
+    headroom = ceiling - live
+    if headroom <= 0:
+        return _CEILING_AT_LIMIT.format(live=live, ceiling=ceiling) + "." + (
+            _CEILING_NAP_CLAUSE if has_nap else ""
+        ) + _CEILING_SUPPLY_CLAUSE
+    near = _CEILING_NEAR_LIMIT.format(
+        percent=live / ceiling * 100,
+        live=live,
+        ceiling=ceiling,
+        headroom=headroom,
+        noun="node" if headroom == 1 else "nodes",
+    )
+    return (
+        near
+        + _CEILING_TARGET_CAVEAT
+        + (_CEILING_NAP_CLAUSE if has_nap else "")
+        + _CEILING_SUPPLY_CLAUSE
+    )
 
 
 def _pool_ceiling(autoscaling: dict, locations: list) -> tuple[int | None, str]:
@@ -529,14 +585,25 @@ def _pool_ceiling(autoscaling: dict, locations: list) -> tuple[int | None, str]:
     three times as full as it is. That matters more than it sounds: multi-zone
     is precisely what the zone-locked arm's remediation tells operators to
     build, so taking this check's advice was what armed its false positive.
+
+    Returns `(None, "")` for any input that does not pin both numbers. A pool
+    whose `autoscaling` is present but disabled has no ceiling to be near, and
+    a pool with no `locations` has an unknown zone span -- multiplying
+    `maxNodeCount` by an assumed 1 there would call a three-zone pool at 30%
+    full 90% full, which is the false positive this function exists to remove,
+    re-armed by a missing field.
     """
-    total_max = autoscaling.get("totalMaxNodeCount")
+    if not autoscaling.get("enabled"):
+        return None, ""
+    total_max = _gce_int(autoscaling.get("totalMaxNodeCount"))
     if total_max:
         return total_max, "totalMaxNodeCount"
-    per_zone = autoscaling.get("maxNodeCount")
+    per_zone = _gce_int(autoscaling.get("maxNodeCount"))
     if not per_zone:
         return None, ""
-    zones = max(len(locations), 1)
+    zones = len(locations)
+    if zones == 0:
+        return None, ""
     if zones == 1:
         return per_zone, "maxNodeCount"
     return per_zone * zones, f"maxNodeCount {per_zone}/zone x {zones} zones"
@@ -548,32 +615,44 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     `cloud.google.com/gke-nodepool` label) -- `initialNodeCount` is a
     creation-time field the GKE API never updates as the autoscaler scales
     the pool, so it cannot stand in for "how close to `maxNodeCount` is this
-    pool right now"."""
+    pool right now".
+
+    The two arms are not exclusive and the check must not pick one. A
+    single-zone pool at 2/2 returned only the zone-locked sentence, which
+    makes the stall contingent on a future stockout when scale-up is already
+    stopped for a reason that has nothing to do with supply. Both conditions
+    hold, so both are reported.
+    """
     locations = pool.get("locations") or []
     autoscaling = pool.get("autoscaling") or {}
-    if len(locations) <= 1 and autoscaling.get("enabled") and not has_nap:
-        return {
-            "object": f"NodePool/{pool.get('name', '')}",
-            "excerpt": f"single-zone ({locations}), autoscaling enabled, no NAP and no regional multi-zone configuration",
-            "impact": _IMPACT_ZONE_LOCKED,
-        }
+    zone_locked = len(locations) <= 1 and autoscaling.get("enabled") and not has_nap
     ceiling, basis = _pool_ceiling(autoscaling, locations)
-    if ceiling and current_node_count >= NODEPOOL_CEILING_FRACTION * ceiling:
+    at_ceiling = bool(ceiling) and current_node_count >= NODEPOOL_CEILING_FRACTION * ceiling
+    if not zone_locked and not at_ceiling:
+        return None
+    excerpts, impacts = [], []
+    if zone_locked:
+        excerpts.append(
+            f"single-zone ({locations}), autoscaling enabled, no NAP and no regional multi-zone configuration"
+        )
+        impacts.append(_IMPACT_ZONE_LOCKED)
+    if at_ceiling:
         # Name the arm and the zone span. This condition has nothing to do with
         # zones -- it fires on a regional pool spanning three of them -- but it
         # is published under a slug called `single-zone-nodepool`, and a bare
         # "9/10 live nodes" left the reader nothing to tell the two arms apart.
         # 3.9 keys its impact and its remediation off this prefix, so a run
         # stops proposing multi-zone node pools to an operator who has them.
-        return {
-            "object": f"NodePool/{pool.get('name', '')}",
-            "excerpt": (
-                f"at its autoscaling ceiling: {current_node_count}/{ceiling} live nodes "
-                f"({current_node_count / ceiling * 100:.0f}% of {basis}), zones {locations}"
-            ),
-            "impact": _IMPACT_AT_CEILING.format(fraction=NODEPOOL_CEILING_FRACTION),
-        }
-    return None
+        excerpts.append(
+            f"at its autoscaling ceiling: {current_node_count}/{ceiling} live nodes "
+            f"({current_node_count / ceiling * 100:.0f}% of {basis}), zones {locations}"
+        )
+        impacts.append(_ceiling_impact(ceiling, current_node_count, has_nap))
+    return {
+        "object": f"NodePool/{pool.get('name', '')}",
+        "excerpt": "; ".join(excerpts),
+        "impact": " ".join(impacts),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -881,10 +960,13 @@ IMPACT = {
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
     "quota-exhaustion-risk": "Workload resource requests across fleet exceed regional GCP quota limits; Cluster Autoscaler cannot provision additional nodes even if physical capacity exists.",
-    # Both arms of §3.9 set their own `impact` on the hit, because no one
-    # sentence is true of both; this entry is the fallback neither reaches,
-    # kept true of both rather than left as the blend that used to publish.
-    "single-zone-nodepool": "Node pool cannot scale when it needs to: it is either locked to a single zone or already at its own configured ceiling.",
+    # Both arms of §3.9 set their own `impact` on the hit -- and a pool
+    # matching both gets both sentences -- so this entry is the fallback
+    # nothing reaches. It says only what every hit has in common: "cannot
+    # scale when it needs to" was the previous wording and is false of a
+    # zone-locked pool at 1 of 2 nodes, which scales fine until the zone
+    # runs out.
+    "single-zone-nodepool": "Node pool's scale-up has a single point of failure: it is locked to one zone, at its own configured ceiling, or both.",
     "reservation-mismatch-risk": "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts.",
     "dangling-compute-class": "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state.",
     "spot-scarcity-risk": "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk.",
@@ -907,7 +989,7 @@ SEVERITY = {
 
 
 def _emit(slug: str, hit: dict) -> dict:
-    return {
+    emitted = {
         "check": slug,
         "namespace": hit.get("namespace", ""),
         "object": hit["object"],
@@ -919,6 +1001,12 @@ def _emit(slug: str, hit: dict) -> dict:
         "impact": hit.get("impact") or IMPACT[slug],
         "needs_triage": None,
     }
+    if hit.get("impact"):
+        # Which arm fired is an observation the model cannot infer from the
+        # excerpt reliably enough to bet a published sentence on it. See
+        # `adopt_arm_impact` in audit_report.py.
+        emitted["impact_authoritative"] = True
+    return emitted
 
 
 def crashed_entry(cluster: dict, exc: BaseException) -> dict:
