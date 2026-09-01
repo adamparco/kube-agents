@@ -1168,6 +1168,50 @@ class TestValidation(unittest.TestCase):
         self.assertIn("findings[0].evidence.command", str(exc.exception))
         self.assertIn("dropped, not softened", str(exc.exception))
 
+    def test_a_title_opening_with_the_check_slug_is_rejected(self):
+        """The shape a live run published, on a check whose sibling used prose.
+
+        `wildcard-rbac on ClusterRole/argocd-application-controller
+        (kube-agents-host)` restates the three fields the `Where:` line already
+        carries and leaves the heading saying nothing else.
+        """
+        doc = make_doc(
+            findings=[
+                make_finding(
+                    check="wildcard-rbac",
+                    title="wildcard-rbac on ClusterRole/argocd-application-controller (kube-agents-host)",
+                )
+            ]
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[0].title", str(exc.exception))
+        self.assertIn("wildcard-rbac", str(exc.exception))
+
+    def test_the_slug_check_is_case_insensitive(self):
+        doc = make_doc(findings=[make_finding(title="Netpol-Missing in payments")])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.validate_findings(doc, AUDIT)
+
+    def test_prose_spelling_the_same_words_is_not_the_slug(self):
+        """`privileged-container` is the slug; "Privileged container" is prose.
+
+        The comparison is against the hyphenated slug verbatim for exactly this
+        case -- normalising the separator would reject the title the SOP asks
+        for.
+        """
+        audit_report.validate_findings(
+            make_doc(
+                findings=[
+                    make_finding(
+                        check="privileged-container",
+                        title="Privileged container in Deployment/api",
+                    )
+                ]
+            ),
+            AUDIT,
+        )
+
     def test_two_findings_with_the_same_identity_are_rejected(self):
         """Same (check, cluster, namespace, object) is one finding, said twice.
 

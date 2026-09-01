@@ -2679,6 +2679,30 @@ def validate_findings(data: object, audit_id: str) -> dict:
             )
 
         _require_str(finding.get("title"), f"findings[{i}].title", allow_empty=False)
+        # The title says what is wrong, not which check found it. Every field a
+        # slug-prefixed title restates -- the check, the object, the cluster --
+        # is already rendered on the `**Where:**` line under the heading, so
+        # such a title leaves the heading saying nothing that is not said twice
+        # below it. The skill has asked for prose here since it was written and
+        # nothing enforced it, which is how one run published
+        # `wildcard-rbac on ClusterRole/argocd-application-controller
+        # (kube-agents-host)` beside a sibling finding from the same check that
+        # read `ClusterRole/argocd-server grants wildcard verbs/resources to a
+        # non-system subject` -- two shapes for one check in one document.
+        #
+        # Matched against the slug verbatim, hyphens and all, rather than any
+        # normalised form: `privileged-container` is the anti-pattern and
+        # "Privileged container in Deployment/api" is the title the SOP wants,
+        # and a normalising comparison cannot tell them apart.
+        if str(finding["title"]).strip().lower().startswith(f"{check}"):
+            raise ValidationError(
+                f"findings[{i}].title: opens with the check slug {check!r}. The "
+                "title says what is wrong, not which check found it — "
+                f"{finding.get('object')!r}, the cluster and the namespace are "
+                "already on the `Where:` line under the heading, so a title "
+                "built from them leaves no field saying what happened. Write "
+                "the consequence in prose"
+            )
         _require_str(
             finding.get("cluster"), f"findings[{i}].cluster", allow_empty=False
         )
