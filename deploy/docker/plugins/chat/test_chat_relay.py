@@ -598,6 +598,36 @@ class TestDeclaredSilent(unittest.TestCase):
             with self.subTest(job_id=job_id):
                 self.assertFalse(self.declared(job_id))
 
+    def test_a_traversal_cannot_reach_a_report_planted_outside_the_store(self):
+        """The one input the segment test alone lets through.
+
+        ``Path("..").name`` is ``".."``, not ``""`` -- pathlib keeps the
+        segment where ``os.path.basename`` drops it -- so ``job_id ==
+        Path(job_id).name`` holds for ``..``. The planted file below sits one
+        level above the store, inside the agent's own writable volume, and
+        would otherwise supply both the silence verdict and, through
+        ``recorded_summary``, the text posted in place of the report.
+
+        The job id reaches here from message text, so this is reachable
+        without any access to the store: it is the wrapper that names the
+        stream.
+        """
+        import datetime
+
+        parent = os.path.dirname(self.root.rstrip("/"))
+        planted = os.path.join(parent, "latest.json")
+        finished = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with open(planted, "w") as handle:
+            json.dump(
+                {"silent_ok": True, "summary": "ATTACKER TEXT", "finished_at": finished},
+                handle,
+            )
+        self.addCleanup(os.remove, planted)
+        self.assertFalse(self.declared(".."))
+        with patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root}):
+            with patch.object(mod, "_REPORTS_DIR", self.root):
+                self.assertEqual(mod.recorded_summary(".."), "")
+
     def test_an_unreadable_store_fails_open(self):
         """A bad read must not drop a report — it leaves the text test in charge."""
         os.makedirs(os.path.join(self.root, "compliance-audit"))

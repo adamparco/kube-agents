@@ -285,7 +285,14 @@ def _fresh_report(job_id: str) -> dict:
     # anything else -- `../scratch/x` from a runtime job, an absolute path,
     # `.` -- is steering this read rather than naming a stream, and the join
     # would follow it off the store.
-    if not job_id or job_id != Path(job_id).name:
+    #
+    # `..` needs saying separately, because it is a path segment: pathlib keeps
+    # it (`Path("..").name == ".."`, unlike `os.path.basename`), so the segment
+    # test alone admits the one input the test exists to stop. It is a real
+    # escape and not a theoretical one -- a `latest.json` one level above the
+    # store, which is inside the agent's own writable volume, would otherwise
+    # supply both the silence verdict and the text posted in its place.
+    if not job_id or job_id == ".." or job_id != Path(job_id).name:
         return {}
     # Re-read rather than trust the import-time constant: a cron child that
     # sets the variable after this module loads writes to one store and would
