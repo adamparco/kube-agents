@@ -6539,6 +6539,140 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(stored["current_ids"], seeded["current_ids"])
         self.assertEqual(stored["resolved_ids"], [])
 
+    def test_a_clean_run_that_refreshed_the_ledger_stores_the_body_it_wrote(self):
+        """The other half of the branch above, and the half `held_open` missed.
+
+        `refresh_coverage_ledger` runs on this same path and rewrites an open
+        coverage ledger's body in full from *this* run's document. Carrying the
+        previous one forward anyway stores a scope table the issue has already
+        replaced: `gcp-networking-fabric-audit` served 41 subnets as unmeasured
+        out of the report store on 2026-09-01, hours after the ledger it points
+        at had them measured. The reader skill answers from the store, so the
+        stale copy is the one a human is shown.
+        """
+        # A previous clean-over-gaps run: one cluster read, one unreachable.
+        self.seed_store(
+            make_doc(
+                findings=[],
+                clusters=[
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                    }
+                ],
+                skipped=[{"cluster": "stage-eu", "reason": "control plane unreachable"}],
+            )
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            # Coverage-shaped, so the refresh does not decline. This is the
+            # ledger that branch minted, and the only kind it will overwrite.
+            "--json title": json.dumps(
+                {"title": audit_report.coverage_issue_title(AUDIT, ["one gap"])}
+            ),
+        }
+        # This run reaches `stage-eu` and loses a third cluster instead, so the
+        # carried table and the written one cannot be confused for each other.
+        self.assertEqual(
+            self.run_finish(
+                make_doc(
+                    findings=[],
+                    skipped=[
+                        {"cluster": "prod-eu-west", "reason": "control plane unreachable"}
+                    ],
+                )
+            ),
+            0,
+        )
+
+        self.assertTrue(
+            self.harness.bodies_for("issue", "edit"),
+            "the coverage ledger's body was never rewritten, so this test is "
+            "measuring the carry-forward path instead",
+        )
+        stored = self.stored_envelope()
+        self.assertEqual(
+            [c["name"] for c in stored["document"]["scope"]["clusters"]],
+            ["prod-us-east", "stage-eu"],
+            "the store carried the previous run's scope table over a body this "
+            "run had already replaced",
+        )
+        self.assertEqual(
+            [s["cluster"] for s in stored["document"]["scope"]["skipped"]],
+            ["prod-eu-west"],
+        )
+        # The envelope still names the ledger it describes: the body is this
+        # run's, so there is nothing untrustworthy for the next run to detect.
+        self.assertEqual(stored["issue_number"], 42)
+
+    def test_a_findings_titled_ledger_is_still_carried_forward_untouched(self):
+        """The control: the refresh declines, so the carry-forward must stand.
+
+        `refresh_coverage_ledger` only overwrites a ledger whose title says it
+        minted it. A ledger minted from findings keeps whatever body the
+        findings run published, so this branch is still the comment-only one
+        and the previous document is still what the issue renders.
+        """
+        seeded = self.seed_store(make_doc())
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json title": json.dumps(
+                {"title": audit_report.issue_title(AUDIT, make_doc()["findings"])}
+            ),
+        }
+        gapped = make_doc(
+            findings=[],
+            clusters=[
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}
+            ],
+            skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(gapped), 0)
+
+        self.assertEqual(
+            self.harness.bodies_for("issue", "edit"),
+            [],
+            "a findings-minted ledger had its body overwritten by a run that "
+            "found nothing",
+        )
+        stored = self.stored_envelope()
+        self.assertEqual(stored["current_ids"], seeded["current_ids"])
+        self.assertEqual(
+            [f["id"] for f in stored["document"]["findings"]], seeded["current_ids"]
+        )
+
+    def test_a_refresh_that_could_not_publish_carries_the_document_forward(self):
+        """The refresh runs `check=False`, so a failure is a return value.
+
+        A `gh issue edit` that did not land leaves the ledger rendering the
+        previous run's body. Reading the *attempt* as the answer would store a
+        document the issue does not show, which is the same contradiction from
+        the other side.
+        """
+        seeded = self.seed_store(make_doc())
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json title": json.dumps(
+                {"title": audit_report.coverage_issue_title(AUDIT, ["one gap"])}
+            ),
+        }
+        self.harness.failures = {"issue edit": 1}
+        gapped = make_doc(
+            findings=[],
+            clusters=[
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}
+            ],
+            skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(gapped), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(stored["current_ids"], seeded["current_ids"])
+        self.assertEqual(
+            [f["id"] for f in stored["document"]["findings"]], seeded["current_ids"]
+        )
+
     def test_two_clean_runs_over_the_same_gap_still_hold_the_finding_back(self):
         """The carry-forward above covered `current_ids` and not `document`.
 

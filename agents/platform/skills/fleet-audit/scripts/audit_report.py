@@ -6161,8 +6161,14 @@ def refresh_coverage_ledger(
     gaps: list[str],
     data: dict,
     now: datetime,
-) -> None:
+) -> bool:
     """Keep an open coverage ledger's title and body honest across runs.
+
+    Returns whether the body now renders `data`. The caller needs that answer
+    and cannot derive it: the title guard below silently declines on a findings
+    ledger, and the edit itself runs `check=False`. Storing a report that says
+    the body is this run's when neither happened is the failure in
+    `write_report`'s `body_untouched`.
 
     The findings path rewrites both on every update. This one rewrote the title
     only, and only when the gap count moved, so a ledger opened the morning one
@@ -6183,7 +6189,7 @@ def refresh_coverage_ledger(
     """
     current = fetch_issue_title(repo, number)
     if current is None or not COVERAGE_TITLE_RE.search(current):
-        return
+        return False
 
     # No `current == wanted` early exit. The gap *count* holding steady across
     # runs says nothing about which clusters went unread or when — the two runs
@@ -6194,7 +6200,7 @@ def refresh_coverage_ledger(
     wanted = coverage_issue_title(audit_id, gaps)
     body_file = _write_temp(render_issue_body(data, generated_at=now, audit_id=audit_id).body)
     try:
-        gh(
+        res = gh(
             [
                 "issue",
                 "edit",
@@ -6210,7 +6216,14 @@ def refresh_coverage_ledger(
         )
     finally:
         _unlink(body_file)
+    if res.returncode != 0:
+        log(
+            f"Could not refresh coverage ledger #{number}; it still renders the "
+            f"previous run: {(res.stderr or '').strip()[:200]}"
+        )
+        return False
     log(f"Refreshed coverage ledger #{number}: {wanted}")
+    return True
 
 
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
@@ -7731,6 +7744,11 @@ def handle_finish(args: argparse.Namespace) -> None:
     # ledger exactly as before.
     held_open = bool(gaps) or bool(unverifiable)
 
+    # Set by the one branch below that rewrites an open ledger's body in full.
+    # Every other clean branch either closes the ledger, opens a new one, or
+    # only comments — see `body_untouched`.
+    body_rewritten = False
+
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
         # `unverifiable` stands in for the current ids this branch does not
@@ -7771,7 +7789,9 @@ def handle_finish(args: argparse.Namespace) -> None:
                 render_clean_comment(audit_id, data, now),
                 what="partial all-clear comment",
             )
-            refresh_coverage_ledger(repo, existing_issue, audit_id, gaps, data, now)
+            body_rewritten = refresh_coverage_ledger(
+                repo, existing_issue, audit_id, gaps, data, now
+            )
             log(
                 f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
                 f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
@@ -7896,20 +7916,31 @@ def handle_finish(args: argparse.Namespace) -> None:
         }
         payload["chat_summary"] = chat_summary(audit_id, payload, findings)
         # `current_ids` is a claim about what a *live ledger body* renders, so
-        # it may only be empty where a body this run wrote is empty. Two of the
-        # three clean paths qualify: the ledger was closed, or a fresh coverage
-        # ledger was opened with no findings in it. The third does not — zero
-        # findings over incomplete coverage leaves the ledger open and only
-        # comments on it, so the body still renders whatever the previous run
-        # put there. Recording `[]` against that still-open issue hands the
-        # next run a *trusted* memory of an empty ledger, and it announces
-        # every finding the body has been carrying all along as new.
+        # it may only be empty where a body this run wrote is empty. Three of
+        # the four clean paths qualify: the ledger was closed, a fresh coverage
+        # ledger was opened with no findings in it, or `refresh_coverage_ledger`
+        # rewrote an open coverage ledger's body from this run's document. The
+        # fourth does not — a ledger held open by an unevaluated target is only
+        # commented on, and so is one whose title says it was minted from
+        # findings, which the refresh declines to overwrite. There the body
+        # still renders whatever the previous run put there. Recording `[]`
+        # against that still-open issue hands the next run a *trusted* memory of
+        # an empty ledger, and it announces every finding the body has been
+        # carrying all along as new.
         #
         # Carry the previous set forward instead, and where the previous set
         # is itself unknowable, write no issue number at all: an envelope that
         # claims no ledger fails the next run's trust check by design, which
         # is the outcome an unreadable body should have.
-        body_untouched = bool(existing_issue) and held_open
+        #
+        # `held_open` alone was the test, and it is the wrong one: it says the
+        # ledger survived, not that its body went unwritten. Every clean-over-
+        # gaps run of `gcp-networking-fabric-audit` refreshed #122's body and
+        # then stored the document from the run before it, so the report store
+        # served a scope table the issue had already replaced — including,
+        # on 2026-09-01, the 41 unmeasured subnets the collector had by then
+        # learned to measure.
+        body_untouched = bool(existing_issue) and held_open and not body_rewritten
         # `document` carries forward for the same reason and on the same
         # condition. It is documented as the document the ledger rendered, and
         # an untouched body rendered the previous run's — so storing this run's
