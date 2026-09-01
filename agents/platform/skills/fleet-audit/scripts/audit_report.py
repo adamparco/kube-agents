@@ -3028,6 +3028,18 @@ def coverage_gaps(data: dict) -> list[str]:
     return [text for _, text in _coverage_gaps(data)]
 
 
+def waiver_gap(waiver: str) -> str:
+    """The coverage gap a waived collector manifest contributes.
+
+    A waiver is the one hold-open that is not derivable from the document, so
+    both the real run and `--dry-run` have to append it themselves. They have
+    to word it identically: the preview exists to show the comment the run
+    would publish, and one that phrased the hold-open differently would be
+    reporting on a run that does not exist.
+    """
+    return f"the collector manifest was waived — {waiver}"
+
+
 def coverage_gap_targets(data: dict) -> set[str] | None:
     """Which targets this run's gaps cover; `None` when one covers the stream.
 
@@ -7522,7 +7534,9 @@ def handle_start(args: argparse.Namespace) -> None:
     )
 
 
-def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
+def _handle_finish_dry_run(
+    audit_id: str, data: dict, now: datetime, waiver: str = ""
+) -> None:
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
@@ -7542,6 +7556,13 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
+    # `--no-collector-manifest` is accepted under `--dry-run` too -- it is in
+    # fact the only legal way to preview a run whose collector produced no
+    # manifest, since one of the two flags is always required. Appending its
+    # gap here is what stops that preview announcing a closure the real run
+    # then refuses.
+    if waiver:
+        gaps.append(waiver_gap(waiver))
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
 
@@ -7553,10 +7574,11 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
             )
         else:
             log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
-        # The preview reads no stored memory and takes no `--no-collector-
-        # manifest`, so a document-derived coverage gap is the only hold-open it
-        # can see; an unevaluable target and a waiver are both invisible here,
-        # and the preview may therefore promise a closure `finish` will not make.
+        # One hold-open remains invisible here: a previous finding on a target
+        # this run could not evaluate lives in stored memory, which the preview
+        # deliberately does not read. So the preview can still promise a closure
+        # `finish` will not make -- narrowly, and only on a stream that already
+        # has findings recorded against an unevaluated target.
         print(render_clean_comment(audit_id, data, now, closing=not gaps, gaps=gaps))
         return
 
@@ -7976,7 +7998,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     entry_mono = time.monotonic()
 
     if args.dry_run:
-        _handle_finish_dry_run(audit_id, data, now)
+        _handle_finish_dry_run(audit_id, data, now, waiver)
         return
 
     repo = resolve_repo()
@@ -8004,7 +8026,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     # it closing a ledger or retiring a remediation pull request on the
     # strength of an absence.
     if waiver:
-        gaps.append(f"the collector manifest was waived — {waiver}")
+        gaps.append(waiver_gap(waiver))
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
 

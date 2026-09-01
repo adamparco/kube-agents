@@ -3756,6 +3756,28 @@ class TestDryRun(BaseTestCase):
         )
         self.assertIn("is now clean", self.out)
 
+    def test_a_waived_dry_run_previews_the_hold_open_not_a_close(self):
+        """The preview has to show the comment the real run would publish.
+
+        `--no-collector-manifest` is accepted under `--dry-run`, and on a run
+        whose collector wrote no manifest it is the only legal way to preview
+        at all — one of the two flags is always required. The waiver is a
+        coverage gap the real `finish` appends by hand, so a preview that
+        computed gaps from the document alone announced "the ledger would be
+        closed" for a run that closes nothing.
+        """
+        self.patch_attr("run_cmd", Recorder())
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            argv_extra=("--dry-run", "--no-collector-manifest", "the collector crashed"),
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("the collector manifest was waived", self.err)
+        self.assertIn("the collector crashed", self.err)
+        self.assertIn("left OPEN, not closed", self.err)
+        self.assertNotIn("would be closed.", self.err)
+        self.assertNotIn("closing as completed", self.out)
+
     def test_dry_run_renders_every_pr_body_it_would_open(self):
         # The pull request is the artifact a person is asked to merge. Printing
         # the ledger alone left the reviewable half visible only in production.
