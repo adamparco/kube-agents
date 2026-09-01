@@ -40,7 +40,11 @@ resource "google_project_iam_custom_role" "subnet_utilization_reader" {
   project     = var.project_id
   role_id     = "kubeagentsSubnetUtilizationReader"
   title       = "Kube-Agents Subnet Utilization Reader"
-  description = "Grants only the three permissions the fleet audit's subnet-ip-exhaustion check needs: compute.subnetworks.use to see subnets at all, plus the list and get on the Network Analyzer insight that carries their utilization."
+  # This string is what the GCP console shows an operator reviewing the role, so it
+  # carries the same correction as the comment above rather than the read-framing the
+  # comment rejects. Changing it is an in-place update of the role on the next apply;
+  # it touches no permission and no binding.
+  description = "Grants only the three permissions the fleet audit's subnet-ip-exhaustion check needs: compute.subnetworks.use, which is a consumption permission and not a read, plus the list and get on the Network Analyzer insight that carries subnet utilization."
   permissions = [
     "compute.subnetworks.use",
     # `list-usable` turned out to answer only half the question: it reports
