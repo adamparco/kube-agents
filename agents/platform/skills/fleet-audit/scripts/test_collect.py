@@ -1818,6 +1818,37 @@ class TestHostNamespace(unittest.TestCase):
         hit = collect.check_host_namespace(self.wl(hostNetwork=True), context_of())
         self.assertEqual(hit["severity"], "major")
 
+    def test_each_flag_publishes_only_its_own_clause(self):
+        # The flag-when is an `or`, so a sentence naming all three namespaces
+        # is false on every hit that sets one of them.
+        for flag, clause, absent in (
+            ("hostPID", collect._IMPACT_HOST_PID, collect._IMPACT_HOST_NETWORK),
+            ("hostIPC", collect._IMPACT_HOST_IPC, collect._IMPACT_HOST_NETWORK),
+            ("hostNetwork", collect._IMPACT_HOST_NETWORK, collect._IMPACT_HOST_PID),
+        ):
+            with self.subTest(flag=flag):
+                hit = collect.check_host_namespace(self.wl(**{flag: True}), context_of())
+                self.assertEqual(hit["impact"], clause)
+                self.assertNotIn(absent, hit["impact"])
+
+    def test_several_flags_compose_in_spec_order(self):
+        hit = collect.check_host_namespace(self.wl(hostPID=True, hostIPC=True, hostNetwork=True), context_of())
+        self.assertEqual(
+            hit["impact"],
+            f"{collect._IMPACT_HOST_PID} {collect._IMPACT_HOST_IPC} {collect._IMPACT_HOST_NETWORK}",
+        )
+
+    def test_the_hostnetwork_clause_never_says_policy_is_merely_bypassed(self):
+        # "bypasses NetworkPolicy enforcement" reads as a policy that still
+        # applies and is weaker; nothing applies, so a reader must not be sent
+        # looking for a policy fix that cannot exist.
+        self.assertNotIn("bypass", collect._IMPACT_HOST_NETWORK.lower())
+        self.assertIn("out of NetworkPolicy", collect._IMPACT_HOST_NETWORK)
+
+    def test_the_downgraded_daemonset_still_carries_the_hostnetwork_clause(self):
+        hit = collect.check_host_namespace(self.ds(True, host_port=443), context_of())
+        self.assertEqual(hit["impact"], collect._IMPACT_HOST_NETWORK)
+
 
 class TestHostpathMount(unittest.TestCase):
     def wl(self, path, ro, mount_name="hostvol"):
@@ -2758,6 +2789,61 @@ class TestPublicControlPlane(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("enablePublicEndpoint=true", found[0]["excerpt"])
         self.assertIn("dnsEndpointConfig.allowExternalTraffic=true", found[0]["excerpt"])
+
+    def test_the_dns_only_arm_does_not_claim_an_unauthenticated_api_server(self):
+        """The IP endpoint is allowlisted, so the finding must not describe it as open.
+
+        Reaching the DNS endpoint costs an attacker a Google identity first;
+        saying "any address on the internet" of this cluster overstates the one
+        path that is left and points the reader at a control already correct.
+        """
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"cidrBlock": "203.0.113.0/24"}],
+                    },
+                    "controlPlaneEndpointsConfig": {
+                        "ipEndpointsConfig": {"enablePublicEndpoint": True},
+                        "dnsEndpointConfig": {"allowExternalTraffic": True},
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(found), 1)
+        impact = found[0]["impact"]
+        self.assertIn("container.clusters.connect", impact)
+        self.assertIn("Authorized networks do not gate it", impact)
+        # The IP-endpoint sentence would send the reader to widen or narrow a
+        # list that changes nothing about this path.
+        self.assertNotIn("directly exploitable", impact)
+
+    def test_an_open_ip_endpoint_keeps_the_unauthenticated_arm_even_beside_dns(self):
+        """DNS being open too does not soften the IP endpoint's own exposure."""
+        for label, endpoints in (
+            ("ip alone", {"ipEndpointsConfig": {"enablePublicEndpoint": True}}),
+            (
+                "ip and dns",
+                {
+                    "ipEndpointsConfig": {"enablePublicEndpoint": True},
+                    "dnsEndpointConfig": {"allowExternalTraffic": True},
+                },
+            ),
+        ):
+            with self.subTest(label):
+                found = collect.check_public_control_plane(
+                    context_of(
+                        cluster_describe={
+                            "privateClusterConfig": {},
+                            "masterAuthorizedNetworksConfig": {},
+                            "controlPlaneEndpointsConfig": endpoints,
+                        }
+                    )
+                )
+                self.assertEqual(len(found), 1)
+                self.assertIn("directly exploitable", found[0]["impact"])
 
     def test_google_cloud_access_is_marked_inert_when_there_is_no_allowlist(self):
         """It grants an exception to an allowlist that is not switched on.

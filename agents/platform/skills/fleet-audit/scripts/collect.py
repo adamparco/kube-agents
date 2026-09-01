@@ -1216,6 +1216,40 @@ def check_privileged_container(workload: dict, context: dict) -> dict | None:
     return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"privileged/SYS_ADMIN: {', '.join(bad)}"}
 
 
+# §2.2's flag-when is an **or** over three independent namespaces, so one
+# sentence covering all three is false on most of what the check catches: a
+# hostNetwork-only pod crosses no process boundary, and a hostPID/hostIPC-only
+# pod is still fully inside NetworkPolicy. Each flag contributes its own clause
+# and only the ones actually set are published.
+_IMPACT_HOST_PID = (
+    "hostPID puts every other pod's process table in this workload's /proc, so "
+    "the command lines and argv-borne configuration of every tenant on the node "
+    "are readable from here; where the container runs as root, which is the "
+    "default, /proc/<pid>/root also reaches into those containers' filesystems."
+)
+_IMPACT_HOST_IPC = (
+    "hostIPC shares the node's System V IPC and POSIX shared-memory segments, "
+    "so this workload can read and write memory that other tenants' processes "
+    "expect to be private to their own pod."
+)
+# Not "bypasses enforcement", which reads as a policy that is merely weaker.
+# Neither GKE Dataplane V2 nor Calico enforces NetworkPolicy on a host-networked
+# pod at all -- upstream leaves the behaviour undefined, and Calico's
+# `IsValidCalicoWorkloadEndpoint` rejects such pods outright, which is why they
+# vanish as rule peers as well as targets (projectcalico#1987, closed
+# not_planned).
+_IMPACT_HOST_NETWORK = (
+    "hostNetwork takes this pod out of NetworkPolicy rather than loosening it: "
+    "neither GKE Dataplane V2 nor Calico enforces policy on a host-networked "
+    "pod, and it disappears as a rule peer as well, so a podSelector elsewhere "
+    "written to admit it never matches. From another node its traffic arrives "
+    "as the node IP, which only an ipBlock over the node CIDR can describe; "
+    "from the same node it is allowed unconditionally, with no ipBlock "
+    "recourse. It also reaches every node-local listener bound to 127.0.0.1, "
+    "including ones whose owners took loopback for an isolation boundary."
+)
+
+
 def check_host_namespace(workload: dict, context: dict) -> dict | None:
     spec = workload["spec"]
     host_pid, host_ipc, host_net = bool(spec.get("hostPID")), bool(spec.get("hostIPC")), bool(spec.get("hostNetwork"))
@@ -1228,10 +1262,20 @@ def check_host_namespace(workload: dict, context: dict) -> dict | None:
         # only flag set and a hostPort is declared -- record it rather than
         # suppressing silently.
         severity = "minor"
+    clauses = [
+        clause
+        for flag, clause in (
+            (host_pid, _IMPACT_HOST_PID),
+            (host_ipc, _IMPACT_HOST_IPC),
+            (host_net, _IMPACT_HOST_NETWORK),
+        )
+        if flag
+    ]
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"hostNetwork={host_net} hostPID={host_pid} hostIPC={host_ipc}",
         "severity": severity,
+        "impact": " ".join(clauses),
     }
 
 
@@ -1946,6 +1990,28 @@ def _external_control_plane_paths(describe: dict) -> list[str]:
     return paths
 
 
+_IMPACT_PUBLIC_IP_ENDPOINT = (
+    "The cluster's API server accepts connections from any address on the "
+    "internet; credential compromise or an API-server CVE is directly "
+    "exploitable from outside the network."
+)
+# The two endpoints are not the same exposure, and saying so overstates the
+# one that is left. Reaching the DNS endpoint costs an attacker a Google
+# identity carrying `container.clusters.connect` before a single byte reaches
+# the API server, where the IP endpoint puts the server itself on the internet.
+# Still a finding: authorized networks is the control an operator reaches for
+# here and it does not apply, so the sentence has to say what does.
+_IMPACT_PUBLIC_DNS_ENDPOINT = (
+    "The IP endpoint is allowlisted, but the cluster also serves a DNS "
+    "endpoint that resolves and answers from any address on the internet. "
+    "Authorized networks do not gate it — IAM does, so reaching the API "
+    "server needs a Google identity holding container.clusters.connect, and "
+    "the exposure is that identity's blast radius rather than an unauthenticated "
+    "API server. Widening the authorized-network list, or narrowing it, changes "
+    "nothing about this path."
+)
+
+
 def check_public_control_plane(context: dict) -> list[dict]:
     """Whether the API server answers from the internet.
 
@@ -1974,6 +2040,7 @@ def check_public_control_plane(context: dict) -> list[dict]:
         paths = [p for p in paths if "dnsEndpointConfig" in p]
     if not paths:
         return []
+    dns_only = all("dnsEndpointConfig" in path for path in paths)
     decided = "; ".join(paths)
     # Name the fields and the values, not the conclusion. `adopt_collector_evidence`
     # overwrites the model's excerpt with this string, so it is the only evidence
@@ -1984,7 +2051,14 @@ def check_public_control_plane(context: dict) -> list[dict]:
     # through the current field with `gcpPublicCidrsAccessEnabled` set read the
     # same as one caught by the legacy inversion with the whole config absent.
     excerpt = f"{decided}; {_authorized_networks_excerpt(describe)}"
-    return [{"namespace": "", "object": _cluster_object(context), "excerpt": excerpt}]
+    return [
+        {
+            "namespace": "",
+            "object": _cluster_object(context),
+            "excerpt": excerpt,
+            "impact": _IMPACT_PUBLIC_DNS_ENDPOINT if dns_only else _IMPACT_PUBLIC_IP_ENDPOINT,
+        }
+    ]
 
 
 def _namespace_labels(context: dict, ns: str) -> dict:
@@ -2606,8 +2680,10 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         check_host_namespace,
         "major",  # overridden per hit: critical for hostPID/hostIPC
         None,
-        "Workload shares the node's process/IPC/network namespace, bypassing "
-        "pod isolation and NetworkPolicy enforcement.",
+        # Every hit composes its own from the flags actually set, so this is
+        # unreachable in practice; it stays as the arm that carries the check's
+        # own severity default rather than a fourth sentence nothing produces.
+        _IMPACT_HOST_NETWORK,
     ),
     CheckSpec(
         "hostpath-mount",
@@ -2687,9 +2763,9 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         check_public_control_plane,
         "critical",
         None,
-        "The cluster's API server accepts connections from any address on "
-        "the internet; credential compromise or an API-server CVE is "
-        "directly exploitable from outside the network.",
+        # Both arms set their own, so this is unreachable in practice; it stays
+        # as the IP-endpoint arm rather than a third sentence nothing produces.
+        _IMPACT_PUBLIC_IP_ENDPOINT,
     ),
     CheckSpec(
         "podsecurity-gaps",

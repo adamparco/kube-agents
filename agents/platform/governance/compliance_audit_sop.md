@@ -150,8 +150,15 @@ One finding per (check, object): three privileged containers in one Deployment a
 - **Flag when:** the pod spec sets `hostNetwork`, `hostPID`, or `hostIPC` to `true`.
 - **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `checks_not_applicable`); ingress/gateway data-plane DaemonSets that legitimately bind host ports — verify `hostNetwork` is the only flag set **and** a `hostPort` is declared, then record `minor` rather than suppressing silently.
 - **Severity:** `critical` when `hostPID` or `hostIPC` is set (direct visibility into other tenants' processes and memory); `major` when only `hostNetwork` is set — it bypasses NetworkPolicy enforcement and exposes node loopback, but does not cross the process boundary.
-- **Impact:** "Workload shares the node's process/IPC/network namespace, bypassing pod isolation and NetworkPolicy enforcement."
-- **Remediation:** `kind: manual`. Name the field to remove; for `hostNetwork`, note that a `NodePort` Service or a Gateway listener is the supported replacement for `hostPort`.
+- **Impact:** the flag-when is an **or** over three independent namespaces, so a sentence covering all three is false on most of what the check catches — a `hostNetwork`-only pod crosses no process boundary, and a `hostPID`/`hostIPC`-only pod is still fully inside NetworkPolicy. The collector composes the Impact from the flags actually set and marks it authoritative, so state it as given. What each flag contributes:
+
+  - **`hostPID`** — every other pod's process table appears in this workload's `/proc`, so the command lines and argv-borne configuration of every tenant on the node are readable from here; where the container runs as root, which is the default, `/proc/<pid>/root` also reaches into those containers' filesystems.
+  - **`hostIPC`** — the node's System V IPC and POSIX shared-memory segments are shared, so this workload can read and write memory other tenants' processes expect to be private to their own pod.
+  - **`hostNetwork`** — the pod is **out of** NetworkPolicy, not merely loosely covered by it. Neither GKE Dataplane V2 nor Calico enforces policy on a host-networked pod (upstream leaves the behaviour undefined; Calico's `IsValidCalicoWorkloadEndpoint` rejects such pods outright, which is why they disappear as rule **peers** as well as targets — projectcalico#1987, closed `not_planned`). From another node the traffic arrives as the node IP, describable only by an `ipBlock` over the node CIDR; from the same node it is allowed unconditionally, with no `ipBlock` recourse. It also reaches every node-local listener bound to `127.0.0.1`.
+
+  Never write "bypasses NetworkPolicy enforcement" for this: it reads as a policy that still applies and is merely weaker, and it sends a reader looking for a policy fix that does not exist.
+
+- **Remediation:** `kind: manual`. Name the field to remove; for `hostNetwork`, note that a `NodePort` Service or a Gateway listener is the supported replacement for `hostPort`. Do not propose a NetworkPolicy as a mitigation while `hostNetwork` is set — it will not apply.
 
 #### 2.3 hostPath volume mounts (`hostpath-mount`)
 
@@ -244,15 +251,21 @@ gcloud container node-pools list --cluster="$C" --location="$L" --project="$PROJ
 
 ```bash
 gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
-  --format='json(privateClusterConfig.enablePrivateEndpoint,masterAuthorizedNetworksConfig.enabled,masterAuthorizedNetworksConfig.cidrBlocks,controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint)'
+  --format='json(privateClusterConfig.enablePrivateEndpoint,masterAuthorizedNetworksConfig.enabled,masterAuthorizedNetworksConfig.cidrBlocks,controlPlaneEndpointsConfig.ipEndpointsConfig.enabled,controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)'
 ```
 
-- **Flag when:** the public endpoint is reachable (`privateClusterConfig.enablePrivateEndpoint` not `true`, or `controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint` is `true`) **and** either `masterAuthorizedNetworksConfig.enabled` is not `true` or its `cidrBlocks` contain a default route.
+- **Two endpoints, and authorized networks gates only one.** The IP endpoint is what this check was written for. The DNS endpoint is a separate address (`gke-<hash>.<region>.gke.goog`) that GKE answers on whenever `controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic` is `true`, and **no IP allowlist applies to it** — it is gated by IAM alone. So authorized networks suppresses the IP path and nothing else: a cluster whose IP endpoint is allowlisted and whose DNS endpoint takes external traffic is still answering the internet, and reporting it clean is a false negative rather than a pass. Select the field in the describe above or the check cannot see it.
+- **Flag when:** any of these paths is open — (a) `controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint` is `true`, or, only where GKE returns no `ipEndpointsConfig`, the legacy inversion `privateClusterConfig.enablePrivateEndpoint` is not `true`; or (b) `controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic` is `true`. Path (a) is suppressed when `masterAuthorizedNetworksConfig.enabled` is `true` and its `cidrBlocks` hold no default route; path (b) is never suppressed by it. `ipEndpointsConfig.enabled: false` means no IP endpoint at all, so `enablePublicEndpoint` beneath it is moot.
 - **A default route is any prefix of length zero, not the string `0.0.0.0/0`.** A dual-stack cluster writes `::/0`, and matching the v4 spelling alone reads that as an allowlist and drops the finding on a control plane open to every IPv6 address there is. The same test governs `enabled`: GKE returns a populated `masterAuthorizedNetworksConfig` carrying only `gcpPublicCidrsAccessEnabled` on clusters that never turned the feature on, so a cluster is restricted because `enabled` is `true`, never because the object is non-empty.
 - **Do NOT flag:** clusters with `enablePrivateEndpoint: true` — there is no public endpoint, so authorized networks are moot; a narrow but unfamiliar CIDR list. Judging whether a specific CIDR _should_ be allowed needs an external source of truth this audit does not have; only a literally unrestricted list is a finding. Nor `enabled: true` with no `cidrBlocks` at all: that is the strict end of the setting, shutting the endpoint to everything but Google's own access, and reading an empty list as "nothing allowlisted, therefore open" would report the most locked-down clusters in the fleet.
-- **Severity:** `critical` — the API server is exposed to the entire internet with only credentials in front of it.
-- **Impact:** "The cluster's API server accepts connections from any address on the internet; credential compromise or an API-server CVE is directly exploitable from outside the network."
-- **Remediation:** `kind: gcloud` — `gcloud container clusters update <C> --location=<L> --project=<PROJECT> --enable-master-authorized-networks --master-authorized-networks=<CIDR[,CIDR...]>`. The CIDR list must come from a human; say so in `remediation.note` and do not invent one.
+- **Severity:** `critical` — the API server answers the whole internet with only credentials in front of it.
+- **Impact:** the two paths are not the same exposure, so write the arm the finding is actually on. Naming the IP endpoint's exposure on a cluster whose IP endpoint is allowlisted overstates what is open and sends the reader to a control that is already correct.
+  - **The IP endpoint is open** (whether or not the DNS endpoint is too): "The cluster's API server accepts connections from any address on the internet; credential compromise or an API-server CVE is directly exploitable from outside the network."
+  - **Only the DNS endpoint is open**, the IP endpoint being absent or allowlisted: "The IP endpoint is allowlisted, but the cluster also serves a DNS endpoint that resolves and answers from any address on the internet. Authorized networks do not gate it — IAM does, so reaching the API server needs a Google identity holding `container.clusters.connect`, and the exposure is that identity's blast radius rather than an unauthenticated API server. Widening the authorized-network list, or narrowing it, changes nothing about this path."
+- **Remediation:** `kind: gcloud`, and which command depends on the same arm — the authorized-network flags do nothing to the DNS endpoint, and `--no-enable-dns-access` does nothing to the IP endpoint.
+  - IP endpoint open: `gcloud container clusters update <C> --location=<L> --project=<PROJECT> --enable-master-authorized-networks --master-authorized-networks=<CIDR[,CIDR...]>`. The CIDR list must come from a human; say so in `remediation.note` and do not invent one.
+  - DNS endpoint open: `gcloud container clusters update <C> --location=<L> --project=<PROJECT> --no-enable-dns-access`. Nothing here needs a human-supplied value, but the flag closes the endpoint for everyone, so `#`-comment above it that anyone reaching the cluster over `gke-<hash>.<region>.gke.goog` today loses access.
+  - Both open: both commands, one per line, in that order.
 
 #### 2.11 Pod Security `restricted` profile gaps (`podsecurity-gaps`)
 
@@ -315,7 +328,7 @@ Worked example, for a 2.6 finding on the `payments` namespace:
 }
 ```
 
-Three `rationale`/`risk` pairs in this SOP are check-specific and must not be written generically: 2.8 and 2.9 both recreate nodes, so say so in `risk`; 2.10's `risk` must state that an incomplete CIDR list locks every operator out of the API server, which is why the list comes from a human.
+Three `rationale`/`risk` pairs in this SOP are check-specific and must not be written generically: 2.8 and 2.9 both recreate nodes, so say so in `risk`; 2.10's `risk` follows the arm its remediation is on — an incomplete CIDR list locks every operator out of the API server, which is why the list comes from a human, and `--no-enable-dns-access` cuts off everyone who reaches the cluster over the DNS endpoint today.
 
 ### 5. Close the audit run
 
