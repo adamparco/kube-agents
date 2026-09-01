@@ -2772,6 +2772,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 			result = append(result, env)
 		}
 	}
+	// No dedup pass over `custom` here, deliberately. The reserved set above
+	// closes managed-vs-custom: every `managed` name is in it. Custom-vs-custom
+	// is closed a layer earlier -- `custom` is `spec.deployment.env` and
+	// nothing else, and DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so the API server refuses a CR that repeats a name
+	// before the operator ever sees it. Adding `lastWinsEnv` here would read as
+	// though that were in doubt.
 	return result
 }
 

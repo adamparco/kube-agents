@@ -3651,11 +3651,24 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	}
 }
 
+// allContainers is every container the API server validates env on, which is not
+// `Spec.Containers`. The credential proxy is a *native sidecar* — a normal container
+// with RestartPolicy: Always, which Kubernetes requires be declared in
+// `Spec.InitContainers` — so a test that walks only `Spec.Containers` cannot see it, and
+// its env is merged by `mergeCredentialProxyEnv` rather than by `mergeEnvVars`. Those two
+// functions dedup differently, so that is exactly the container a duplicate-env test most
+// needs to reach.
+func allContainers(spec corev1.PodSpec) []corev1.Container {
+	return append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+}
+
 // TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets is the general form of
 // the four-name count loop above, and the reason it is separate: that list has to be
 // maintained and this one cannot go stale. The plugin here declares an override for
 // *every* variable the operator sets in the baseline, so a twelfth operator-owned name
-// added after this is written is covered the day it is added.
+// added after this is written is covered the day it is added. It walks init containers
+// too — see allContainers — so the credential proxy, whose env is merged by a different
+// function from every other container's, is inside the property rather than beside it.
 //
 // The property is not "the operator wins" — the test above covers that for the names
 // where it matters. It is that no name appears twice at all. `Container.Env` carries
@@ -3670,7 +3683,7 @@ func TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets(t *testing.T
 
 	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true})
 	var pluginEnv []corev1.EnvVar
-	for _, container := range baseline.Spec.Containers {
+	for _, container := range allContainers(baseline.Spec) {
 		for _, e := range container.Env {
 			pluginEnv = append(pluginEnv, corev1.EnvVar{Name: e.Name, Value: "plugin-supplied"})
 		}
@@ -3689,7 +3702,7 @@ func TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets(t *testing.T
 	}
 
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
-	for _, container := range pod.Spec.Containers {
+	for _, container := range allContainers(pod.Spec) {
 		counts := map[string]int{}
 		for _, e := range container.Env {
 			counts[e.Name]++
