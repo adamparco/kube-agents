@@ -495,7 +495,7 @@ async def standalone_send(
     if summary and summary != report:
         logger.info(
             "chat relay: job_id=%s — relaying the recorded summary in place of "
-            "a %d-byte composed report",
+            "a %d-character composed report",
             job_id,
             len(report),
         )
