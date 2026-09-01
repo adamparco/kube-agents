@@ -1075,10 +1075,15 @@ def check_netpol_missing(context: dict) -> list[dict]:
             # and on kube-agents-host -- which has eleven, none of them in
             # cert-manager -- the one false line on an otherwise accurate
             # finding is what gets the audit switched off.
+            # A plain count, with no verdict attached to it. The tally includes
+            # policies in system namespaces and allow-all ones, so "and this
+            # namespace is the gap" would be reading more into the number than
+            # it carries; the reader needs to know the cluster is not
+            # uniformly unpoliced, which the count alone says.
             elsewhere = sum(len(v) for k, v in netpols_by_ns.items() if k != ns)
             excerpt = "no NetworkPolicy in this namespace"
             if elsewhere:
-                excerpt += f"; {elsewhere} elsewhere in the cluster, so this namespace is the gap"
+                excerpt += f"; {elsewhere} in other namespaces of this cluster"
             hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": excerpt, "severity": "major"})
             continue
         allow_all = [

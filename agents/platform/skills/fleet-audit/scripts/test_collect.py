@@ -1483,8 +1483,12 @@ class TestNetpolMissing(unittest.TestCase):
         self.assertEqual([h["namespace"] for h in hits], ["cert-manager"])
         self.assertEqual(
             hits[0]["excerpt"],
-            "no NetworkPolicy in this namespace; 1 elsewhere in the cluster, so this namespace is the gap",
+            "no NetworkPolicy in this namespace; 1 in other namespaces of this cluster",
         )
+        # The count carries no verdict: it tallies allow-all and
+        # system-namespace policies too, so it cannot support a claim that
+        # this namespace is the only gap.
+        self.assertNotIn("the gap", hits[0]["excerpt"])
 
     def test_a_cluster_with_no_policies_at_all_says_only_the_namespace_part(self):
         ctx = context_of(
