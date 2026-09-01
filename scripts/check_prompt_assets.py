@@ -756,10 +756,18 @@ def check_cron_delivery() -> list[Finding]:
             deliver = job.get("deliver") or "local"
             # The scheduler accepts a list and flattens it; so do we, rather
             # than reporting a shape it would have run happily.
-            # `;` as well as `,`, and case-folded below, because that is what
-            # the runtime splitter does (`sibling_delivery_targets` in
-            # `deploy/docker/plugins/chat/adapter.py`). A gate stricter than
-            # the parser it guards rejects values that would have worked.
+            #
+            # `,` and nothing else, case-folded below. The parser this guards
+            # is `cron/scheduler.py::_resolve_delivery_targets` -- the code that
+            # decides where a report actually goes -- and it splits on `,`
+            # alone. This once also split on `;`, on the authority of
+            # `sibling_delivery_targets`, which is not that parser: it decides
+            # only what the relay *subtracts* from its own fan-out. Following it
+            # made this gate looser than the delivering parser, so a roster
+            # carrying `deliver: "chat,slack;x"` passed `make prompt-check`
+            # while the scheduler resolved nothing from `slack;x` and posted
+            # nowhere -- the precise "reports ok and posts nowhere" outcome in
+            # this function's own docstring.
             #
             # Join *then* split, in that order, because that is the order the
             # runtime uses. Splitting only the string branch left a list entry
@@ -772,7 +780,7 @@ def check_cron_delivery() -> list[Finding]:
                 if isinstance(deliver, (list, tuple))
                 else str(deliver)
             )
-            parts = re.split(r"[,;]", joined)
+            parts = joined.split(",")
             for part in (str(p).strip() for p in parts):
                 # An empty part is `"chat,,slack"` -- a stray comma, which the
                 # scheduler ignores and which costs no delivery. An empty

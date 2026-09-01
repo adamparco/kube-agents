@@ -840,15 +840,29 @@ class CronDeliveryTests(unittest.TestCase):
                 self.assertEqual(len(self._findings({"id": "j", "deliver": deliver})), 1)
 
     def test_the_gate_is_no_stricter_than_the_parser_it_guards(self):
-        """`sibling_delivery_targets` lowercases and splits on `;` as well as `,`.
+        """`_resolve_delivery_targets` case-folds the platform and takes `:`.
 
-        Both shapes run; flagging them would block a pull request over a value
-        the runtime delivers fine.
+        Both shapes deliver; flagging them would block a pull request over a
+        value the runtime handles fine.
         """
-        for deliver in ("Slack:C123", "ALL", "chat;slack", "chat; slack"):
+        for deliver in ("Slack:C123", "ALL"):
             with self.subTest(deliver=deliver):
                 self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
-        self.assertEqual(len(self._findings({"id": "j", "deliver": "chat;gchat"})), 1)
+
+    def test_a_semicolon_is_not_a_separator_and_is_reported(self):
+        """The gate must mirror the parser that *delivers*, not the relay's.
+
+        `cron/scheduler.py::_resolve_delivery_targets` splits on `,` alone, so
+        `chat;slack` is one part it cannot resolve: it drops silently and the
+        job records `ok` having posted nowhere. Splitting on `;` here -- on the
+        authority of `sibling_delivery_targets`, which only decides what the
+        relay subtracts -- passed exactly that roster through
+        `make prompt-check`. Read out of the running pod on 2026-09-01.
+        """
+        for deliver in ("chat;slack", "chat; slack", "chat;gchat", ["chat;slack"]):
+            with self.subTest(deliver=deliver):
+                findings = self._findings({"id": "j", "deliver": deliver})
+                self.assertEqual(len(findings), 1, findings)
 
     def test_every_part_of_a_comma_separated_list_is_checked(self):
         """One good part must not vouch for a bad one.
@@ -869,18 +883,18 @@ class CronDeliveryTests(unittest.TestCase):
         self.assertEqual(self._findings({"id": "j", "deliver": ["all"]}), [])
         self.assertEqual(len(self._findings({"id": "j", "deliver": ["gchat"]})), 1)
 
-    def test_a_list_entry_that_carries_a_separator_is_split_like_the_relay(self):
-        """`sibling_delivery_targets` joins the list on `,` and *then* splits.
+    def test_a_list_entry_that_carries_a_separator_is_split_like_the_scheduler(self):
+        """`_normalize_deliver_value` joins the list on `,` and *then* splits.
 
         Checking each list entry whole instead reads `"google_chat,slack"` as
-        one unknown target and fails the roster over a value the relay resolves
-        into two working ones. `make prompt-check` gates every pull request
-        here, so the false positive is repository-wide, not roster-local.
+        one unknown target and fails the roster over a value the scheduler
+        resolves into two working ones. `make prompt-check` gates every pull
+        request here, so the false positive is repository-wide, not
+        roster-local.
         """
         self.assertEqual(
             self._findings({"id": "j", "deliver": ["chat", "google_chat,slack"]}), []
         )
-        self.assertEqual(self._findings({"id": "j", "deliver": ["chat;slack"]}), [])
         # Still finds the bad half, rather than passing the whole entry.
         findings = self._findings({"id": "j", "deliver": ["chat", "slack,gchat"]})
         self.assertEqual(len(findings), 1, findings)
