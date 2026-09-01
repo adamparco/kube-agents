@@ -170,18 +170,24 @@ fi
 # Any line quoting a finding-id-shaped character class must quote this exact
 # pattern. Anchored on `[a-z0-9._-]`, which is specific enough not to collide
 # with the unrelated slug rules elsewhere in the docs.
-WRONG_ID=$(search '\[a-z0-9\._-\]' | grep -vF "$ID_PATTERN" || true)
+ID_HITS=$(search '\[a-z0-9\._-\]')
+ID_SEARCH_OK=$?
+WRONG_ID=$(printf '%s' "$ID_HITS" | grep -vF "$ID_PATTERN" || true)
 if [ -n "$WRONG_ID" ]; then
   echo "::error::Documented finding-id pattern does not match FINDING_ID_RE in ${AUDIT_SCRIPT} (expected ${ID_PATTERN})."
   printf '%s\n\n' "$WRONG_ID" | sed 's/^/    /'
   FAILED=1
 fi
 
-# A guard that passes because every copy disappeared is not a passing guard.
-ID_COPIES=$(search '\[a-z0-9\._-\]' | grep -cF "$ID_PATTERN" || true)
-if [ "${ID_COPIES:-0}" -lt 1 ]; then
-  echo "::error::No document quotes the finding-id pattern any more; either restore it or drop this guard."
-  FAILED=1
+# A guard that passes because every copy disappeared is not a passing guard --
+# unless the search is what disappeared them, which is why the status is read.
+# `cap_guard` above carries the long form of this note.
+if [ "$ID_SEARCH_OK" -eq 0 ]; then
+  ID_COPIES=$(printf '%s' "$ID_HITS" | grep -cF "$ID_PATTERN" || true)
+  if [ "${ID_COPIES:-0}" -lt 1 ]; then
+    echo "::error::No document quotes the finding-id pattern any more; either restore it or drop this guard."
+    FAILED=1
+  fi
 fi
 
 # --- fleet-audit rendering caps -------------------------------------------
@@ -232,8 +238,9 @@ spellings() {
 # elsewhere on the same line can neither satisfy nor trip the check. Anything
 # the probe finds and the good pattern does not is a stale copy.
 cap_guard() {
-  local probe="$1" good="$2" why="$3" except="${4:-}" all hits copies
+  local probe="$1" good="$2" why="$3" except="${4:-}" all hits copies probe_ok
   all=$(search "$probe")
+  probe_ok=$?
   if [ -n "$all" ] && [ -n "$except" ]; then
     all=$(printf '%s\n' "$all" | grep -vE "$except" || true)
   fi
@@ -243,11 +250,19 @@ cap_guard() {
     printf '%s\n\n' "$hits" | sed 's/^/    /'
     FAILED=1
   fi
-  # A guard that passes because every copy disappeared is not a passing guard.
-  copies=$(printf '%s' "$all" | grep -cE "$good" || true)
-  if [ "${copies:-0}" -lt 1 ]; then
-    echo "::error::No document states this cap any more; restore it or drop the guard. ($why)"
-    FAILED=1
+  # A guard that passes because every copy disappeared is not a passing guard --
+  # unless the search itself is what disappeared them. A broken pattern or an
+  # unreadable file makes `search` return nothing for every probe, and each of
+  # the eleven guards below then announces that its cap is undocumented. Eleven
+  # confident wrong diagnoses bury the one line that names the real cause, which
+  # `search` has already recorded and the report at the end of this section
+  # prints. Say nothing here and let that line be the answer.
+  if [ "$probe_ok" -eq 0 ]; then
+    copies=$(printf '%s' "$all" | grep -cE "$good" || true)
+    if [ "${copies:-0}" -lt 1 ]; then
+      echo "::error::No document states this cap any more; restore it or drop the guard. ($why)"
+      FAILED=1
+    fi
   fi
 }
 
@@ -384,6 +399,19 @@ for JOBS_FILE in $CRON_JOBS; do
     exit 1
   fi
 done
+
+# --- Checks that could not run --------------------------------------------
+# Reported after the last `search` call so every broken pattern is named at
+# once, and reported at all because a check that did not run is not a check that
+# passed. Before the cron-prompt scan below rather than at the end of the file,
+# because that scan can `exit 1` outright -- an unreadable roster or a failed
+# awk -- and an early exit would take this report with it, leaving the run to
+# blame the roster for a failure a broken pattern up here had already caused.
+if [ -s "$GREP_FAILURES" ]; then
+  echo "::error::A terminology check could not run: grep rejected a pattern, or could not read a file."
+  sed 's/^/    /' "$GREP_FAILURES"
+  FAILED=1
+fi
 
 PROMPT_HITS=$(mktemp)
 ORPHAN_HITS=$(mktemp)
@@ -575,15 +603,6 @@ fi
 if [ -n "$SHORT_PROMPTS" ]; then
   echo "::error::Documented cron prompt is elided down to fewer than ${MIN_QUOTED_CHARS} characters, which verifies nothing. Quote more of it before the ellipsis, or paraphrase it in prose instead of rendering it as manifest JSON."
   printf '%s\n' "$SHORT_PROMPTS" | sed '/^$/d; s/^/    /'
-  FAILED=1
-fi
-
-# --- Checks that could not run --------------------------------------------
-# Reported last so every broken pattern is named at once, and reported at all
-# because a check that did not run is not a check that passed.
-if [ -s "$GREP_FAILURES" ]; then
-  echo "::error::A terminology check could not run: grep rejected a pattern, or could not read a file."
-  sed 's/^/    /' "$GREP_FAILURES"
   FAILED=1
 fi
 
