@@ -3671,11 +3671,24 @@ func allContainers(spec corev1.PodSpec) []corev1.Container {
 
 // TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets is the general form of
 // the four-name count loop above, and the reason it is separate: that list has to be
-// maintained and this one cannot go stale. The plugin here declares an override for
-// *every* variable the operator sets in the baseline, so a twelfth operator-owned name
-// added after this is written is covered the day it is added. It walks init containers
-// too — see allContainers — so the credential proxy, whose env is merged by a different
-// function from every other container's, is inside the property rather than beside it.
+// maintained and this one cannot go stale. Every variable the operator sets in the
+// baseline is overridden here, so a twelfth operator-owned name added after this is
+// written is covered the day it is added. It walks init containers too — see
+// allContainers — so the credential proxy, whose env is merged by a different function
+// from every other container's, is inside the property rather than beside it.
+//
+// Two inputs, because the two merges take different ones. A plugin's `spec.env` reaches
+// `mergeEnvVars` and never reaches the proxy: `buildCredentialProxyEnv` merges
+// `agent.Spec.Deployment.Env` and nothing else. Driving the plugin alone walked the
+// proxy's containers and called `mergeCredentialProxyEnv` zero times, so the
+// differing-dedup-function invariant the comment above names was the one thing the test
+// did not grade. `Spec.Deployment.Env` carries the same override set for that reason.
+//
+// The gap is real and the reserved list is what stands in it: `buildCredentialProxyEnv`
+// appends CREDENTIAL_PROXY_WORKSPACE_ROOT, EVENT_WATCHER_CLUSTER_NAME and
+// EVENT_WATCHER_ENABLED *after* the merge runs, and only a hand-maintained list keeps a
+// CR that names one of them from producing a duplicate — which is exactly the "list that
+// has to be maintained" this test exists to replace.
 //
 // The property is not "the operator wins" — the test above covers that for the names
 // where it matters. It is that no name appears twice at all. `Container.Env` carries
@@ -3707,6 +3720,28 @@ func TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets(t *testing.T
 			Env:      pluginEnv,
 		},
 	}
+	// Same names again through the one input the proxy's merge reads. Values
+	// differ from the plugin's so a container taking the wrong source is
+	// visible in a failure message rather than hidden behind matching strings.
+	//
+	// Deduplicated, unlike pluginEnv, because this list has to be a CR the API
+	// server would accept: DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so a repeated name is refused before the operator sees
+	// it. Feeding one anyway reports four duplicates on the proxy that no CR
+	// can produce — HERMES_HOME_MODE and HERMES_MANAGED_DIR are each set on
+	// both the gateway and the dashboard, so walking every container collects
+	// them twice — and a false failure here would be read as the reserved list
+	// being incomplete when it is not.
+	seen := map[string]struct{}{}
+	deploymentEnv := make([]corev1.EnvVar, 0, len(pluginEnv))
+	for _, e := range pluginEnv {
+		if _, dup := seen[e.Name]; dup {
+			continue
+		}
+		seen[e.Name] = struct{}{}
+		deploymentEnv = append(deploymentEnv, corev1.EnvVar{Name: e.Name, Value: "cr-supplied"})
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: deploymentEnv}
 
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
 	for _, container := range allContainers(pod.Spec) {

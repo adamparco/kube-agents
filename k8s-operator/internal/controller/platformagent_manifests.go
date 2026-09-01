@@ -2575,7 +2575,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
 		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
-		// 32 MiB, eight times the proxy's own default. Every command an agent
+		// 16 MiB, four times the proxy's own default. Every command an agent
 		// runs arrives here -- its `kubectl` is a shim that posts an argv
 		// vector to this sidecar -- so this cap, not the API server, is what
 		// bounds a cluster dump. On 2026-08-30 the fleet-audit workload dump
@@ -2594,16 +2594,20 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		//
 		// Which is what puts a ceiling on it, and the ceiling is this
 		// container's own 2Gi memory limit below rather than anything about
-		// the fleet. Count five live copies of a capped output per in-flight
-		// command -- the subprocess bytes, the slice, the decoded str, the
-		// JSON-escaped str, the encoded response -- against the five-way
-		// kanban fan-out resolveResources sizes the agent container for, plus
-		// the front-door session, each issuing one command. At 32 MiB that is
-		// ~960 MiB of burst on top of the ~250 MiB this sidecar holds steady,
-		// which the limit absorbs; at 64 MiB it does not, and an OOMKill here
-		// takes gcloud, kubectl, gh and git away from the whole Pod. Raising
-		// this means raising the limit with it, and the cap test asserts the
-		// pair so the two cannot drift apart silently.
+		// the fleet. Count five live copies of a capped output per stream --
+		// the subprocess bytes, the slice, the decoded str, the JSON-escaped
+		// str, the encoded response -- and two capped streams per command,
+		// because `_execute` truncates stdout and stderr in two independent
+		// calls, so the cap is a per-stream ceiling. Ten copies, then, against
+		// the five-way kanban fan-out resolveResources sizes the agent
+		// container for, plus the front-door session, each issuing one
+		// command. At 16 MiB that is ~960 MiB of burst on top of the ~250 MiB
+		// this sidecar holds steady, which the limit absorbs; at 32 MiB it
+		// does not, and an OOMKill here takes gcloud, kubectl, gh and git away
+		// from the whole Pod. Raising this means raising the limit with it,
+		// and the cap test asserts the pair so the two cannot drift apart
+		// silently -- it is the arithmetic above, so believe it over this
+		// paragraph if they ever disagree again.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "16777216"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
@@ -3065,13 +3069,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// than the cause. Appending after the merge leaves the operator's entry last, and
 	// lastWinsEnv below keeps the last of each name. Same mechanism, same reason, as
 	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
-	// reordering here is silent.
-	//
-	// Not the kubelet, which earlier comments here credited with the collapse: a
-	// PodSpec carrying two entries of one name never reaches a kubelet. `env` has
-	// patchMergeKey=name, and the API server rejects the server-side apply outright
-	// -- `duplicate entries for key [name="HERMES_HOME_MODE"]` -- so the gateway
-	// stops reconciling altogether rather than resolving to anyone's value.
+	// reordering here is silent. What happens without that collapse is not the kubelet
+	// picking a winner -- see the comment on lastWinsEnv below, which owns that.
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
