@@ -10,20 +10,24 @@ resource "google_service_account_iam_member" "workload_identity" {
   member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.namespace}/${var.ksa_name}]"
 }
 
-# `gcloud compute networks subnets list-usable` reports a subnet's
-# ipUtilization only for subnets the caller holds compute.subnetworks.use on,
-# and that field is the sole data source for the gcp-networking-fabric-audit
-# `subnet-ip-exhaustion` check. Without the permission the command does not
-# fail -- it exits 0 with an empty list, which the audit could not tell apart
-# from "this project has no subnets" until the collector learned to
-# corroborate against `subnets list`. On the deployed install that was 42
-# subnets reported as zero, every run.
+# `gcloud compute networks subnets list-usable` returns only the subnets the
+# caller holds compute.subnetworks.use on, and that enumeration is what scopes
+# the gcp-networking-fabric-audit `subnet-ip-exhaustion` check. Without the
+# permission the command does not fail -- it exits 0 with an empty list, which
+# the audit could not tell apart from "this project has no subnets" until the
+# collector learned to corroborate against `subnets list`. On the deployed
+# install that was 42 subnets reported as zero, every run.
+#
+# What the permission buys is the subnet list, not the measurement. gcloud's
+# UsableSubnetwork carries no ipUtilization field in v1, beta or alpha, so the
+# figure every verdict turns on comes from the Network Analyzer insight the two
+# recommender permissions below read. Take the three together: the first finds
+# the subnets, the other two say how full each one is.
 #
 # compute.subnetworks.use is a consumption permission, not a read: it is what
 # authorizes attaching a NIC, a node pool or a load balancer to a subnet, and
 # roles/compute.viewer does not carry it. So this is a deliberate exception to
-# the read-only project grant rather than an instance of it, taken because the
-# API offers no read-only route to the field.
+# the read-only project grant rather than an instance of it.
 #
 # The predefined home for it is roles/compute.networkUser, which carries some
 # two hundred permissions including networksecurity.sacAttachments.create and

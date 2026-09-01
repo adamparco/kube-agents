@@ -687,9 +687,9 @@ def _collect_subnet_targets(project: str, *, run: RunFn) -> list[dict]:
         elif listing:
             why = (
                 f"but `subnets list` sees {len(listing)} in this project. "
-                f"list-usable reports only subnets the caller holds "
-                f"compute.subnetworks.use on, and its ipUtilization is the sole "
-                f"field source for this check, so the check cannot run under the "
+                f"list-usable returns only subnets the caller holds "
+                f"compute.subnetworks.use on, and that enumeration is what "
+                f"scopes this check, so it has nothing to measure under the "
                 f"current identity. Grant compute.subnetworks.use to the audit "
                 f"service account or accept the gap."
             )
