@@ -1476,14 +1476,51 @@ AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE = re.compile(r"_(PATH|FILE|ID)$", re.IGNOR
 # fleet's own ai-inference demo -- is the same shape to a name-only rule as a
 # live Hugging Face token, so any fleet carrying example manifests turns this
 # check into noise at `major`.
-AI_CREDENTIAL_PLACEHOLDER_RE = re.compile(
-    r"EXAMPLE|PLACEHOLDER|CHANGE_?ME|YOUR_|DUMMY|FAKE|SAMPLE|REDACTED|NOT_?A_?REAL|TODO|XXXX",
+AI_CREDENTIAL_PLACEHOLDER_WORD_RE = re.compile(
+    r"EXAMPLE|PLACEHOLDER|CHANGE|DUMMY|FAKE|SAMPLE|REDACTED|NOT_?A_?REAL|TODO|FIXME"
+    r"|YOUR|HERE|TOKEN|KEY|SECRET|PASSWORD|PASS|CRED|API|VALUE|NONE|REAL|NOT|ME|X{4,}",
     re.IGNORECASE,
 )
 # `$(FOO)` is Kubernetes' own env expansion, `${FOO}` and `{{ FOO }}` a
 # templater's: the literal holds a reference to a value kept elsewhere, which
-# is the opposite of the thing this check is looking for.
-AI_CREDENTIAL_REFERENCE_RE = re.compile(r"\$\(|\$\{|\{\{")
+# is the opposite of the thing this check is looking for. Closing delimiter
+# required -- an unterminated `$(` expands to nothing, so treating it as a
+# reference would let it swallow the secret that follows it.
+AI_CREDENTIAL_REFERENCE_RE = re.compile(r"\$\([^)]*\)|\$\{[^}]*\}|\{\{.*?\}\}")
+_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+#: An opaque run this long is the secret itself. Below it, a fragment is
+#: decoration -- the `hf` in `hf_EXAMPLE_...`, the `sk` in `sk-...`.
+_OPAQUE_RUN = 4
+
+
+def _reads_as_inert(value: str) -> bool:
+    """Does the whole value read as a placeholder or an unexpanded reference?
+
+    Whole value, not any part of it: a substring test downgrades
+    ``sk-proj-Todo7x...`` because it contains "todo", and a DSN whose *host* is
+    ``db.example.com`` because of the host, while its password is live. So
+    strip the reference expressions, split what is left on punctuation, and
+    require every remaining run of ``_OPAQUE_RUN`` characters or more to be a
+    placeholder word. One high-entropy run is enough to fail the test, which is
+    the safe direction -- failing it keeps the finding at ``major``.
+
+    The cost is the other direction: ``Bearer ${TOKEN}`` and AWS's own
+    ``AKIAIOSFODNN7EXAMPLE`` do not read as inert here, because "bearer" is not
+    a placeholder word and the AWS key is a single unbroken run. Both stay at
+    ``major``, which is a wrong severity on a real finding rather than a
+    suppressed one.
+    """
+    residue = AI_CREDENTIAL_REFERENCE_RE.sub(" ", value)
+    referenced = residue != value
+    matched = False
+    for token in _WORD_SPLIT_RE.split(residue):
+        if not token:
+            continue
+        if AI_CREDENTIAL_PLACEHOLDER_WORD_RE.fullmatch(token):
+            matched = True
+        elif len(token) >= _OPAQUE_RUN:
+            return False
+    return matched or referenced
 
 
 def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict | None:
@@ -1498,7 +1535,7 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
                 and not AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE.search(name)
             ):
                 bad.append(f"{c.get('name', '')}:{name}")
-                if AI_CREDENTIAL_PLACEHOLDER_RE.search(value) or AI_CREDENTIAL_REFERENCE_RE.search(value):
+                if _reads_as_inert(value):
                     inert.append(f"{c.get('name', '')}:{name}")
     if not bad:
         return None
@@ -1509,7 +1546,12 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
     # placeholders beside it.
     if len(inert) == len(bad):
         hit["severity"] = "minor"
-        hit["excerpt"] += "; every value reads as a placeholder or an unexpanded reference, not a live secret"
+        # What was measured, not what it proves. `adopt_collector_evidence`
+        # forces this excerpt onto the finding but never copies `severity`, so
+        # the sentence has to still read correctly under a `major` the model
+        # kept -- and "not a live secret" beside `major` reads as the report
+        # contradicting itself.
+        hit["excerpt"] += "; every value matches this check's placeholder or unexpanded-reference patterns"
     return hit
 
 

@@ -2426,6 +2426,37 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
         hit = self.hit([{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}])
         self.assertNotIn("NOT_A_REAL_TOKEN", hit["excerpt"])
 
+    def test_a_live_token_that_merely_contains_a_placeholder_word_stays_major(self):
+        # A substring test downgrades every one of these: "todo" inside a
+        # random run, "sample" inside another, and -- worst -- a DSN whose
+        # *hostname* is example.com while its password is live. Suppressing a
+        # real credential is the expensive error, so the whole value has to
+        # read as inert, not some part of it.
+        for value in (
+            "sk-proj-Todo7xKqPnVrLmZbHdGw",
+            "hf_QsampleWnXaHrYuEjCiSoPfGb",
+            "postgres://svc:9fKq2LmZbHdGw@db.example.com:5432/models",
+            "AKIAIOSFODNN7EXAMPLE",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": value}]).get("severity"))
+
+    def test_a_live_token_carrying_reference_punctuation_stays_major(self):
+        # `${`, `$(` and `{{` anywhere in the value used to inert it, so any
+        # secret whose alphabet includes them was silently downgraded.
+        for value in ("sk-live-qMBpTvKzLdWnX${", "hf_2LmZbHdGw{{PnVrKq", "pw:$(9fKq2LmZbHdGwXa"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": value}]).get("severity"))
+
+    def test_the_excerpt_reads_correctly_beside_a_severity_it_did_not_set(self):
+        # `adopt_collector_evidence` forces this excerpt onto the finding but
+        # never copies `severity`, so a model that kept `major` gets this
+        # sentence under it. It has to describe what was measured rather than
+        # assert the conclusion, or the report contradicts itself.
+        hit = self.hit([{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}])
+        self.assertNotIn("not a live secret", hit["excerpt"])
+        self.assertIn("matches this check's placeholder or unexpanded-reference patterns", hit["excerpt"])
+
 
 class TestModelImageFloatingTag(unittest.TestCase):
     def hit(self, image):
