@@ -876,6 +876,24 @@ class CronDeliveryTests(unittest.TestCase):
         with mock.patch.object(cpa, "REPO", REPO):
             self.assertEqual(cpa.check_cron_delivery(), [])
 
+    def _audit_deliveries(self, rosters):
+        """Where each scheduled audit sends its report, keyed by job id.
+
+        By the skill it loads, not by a naming convention: three of the eight
+        streams end in neither `-audit` nor `-analysis`, so matching on the id
+        would have quietly graded five of them.
+        """
+        return {
+            # `or`, not a `get` default, for the reason `check_cron_delivery`
+            # gives: an explicit JSON `null` is the absent key to the runtime.
+            # A default that fires on absence alone left it as `None`, which
+            # holds no `local` and so passed the rule below.
+            job["id"]: job.get("deliver") or "local"
+            for _, roster in rosters
+            for job in roster
+            if "fleet-audit" in (job.get("skills") or [])
+        }
+
     def test_every_scheduled_audit_reaches_a_home_channel(self):
         """`local` passes the rule above and would silence the fleet audits.
 
@@ -886,21 +904,32 @@ class CronDeliveryTests(unittest.TestCase):
         """
         with mock.patch.object(cpa, "REPO", REPO):
             rosters = cpa.cron_rosters()
-        # By the skill it loads, not by a naming convention: three of the eight
-        # streams end in neither `-audit` nor `-analysis`, so matching on the id
-        # would have quietly graded five of them.
-        audits = {
-            job["id"]: job.get("deliver", "local")
-            for _, roster in rosters
-            for job in roster
-            if "fleet-audit" in (job.get("skills") or [])
-        }
+        audits = self._audit_deliveries(rosters)
         self.assertGreaterEqual(len(audits), 8, f"audit discovery has narrowed: {audits}")
         for audit, deliver in sorted(audits.items()):
             with self.subTest(audit=audit):
                 self.assertNotIn(
                     "local", str(deliver), f"{audit} runs and tells nobody"
                 )
+
+    def test_a_null_deliver_is_local_to_the_audit_rule_too(self):
+        """The one shape that cleared both gates at once.
+
+        `check_cron_delivery` reads a null `deliver` as the absent key the
+        runtime reads it as, so it reports nothing. This rule read the same
+        null as the string `None`, which holds no `local`, so it reported
+        nothing either -- an audit that runs, writes its report, and tells
+        nobody, with `make prompt-check` green over it.
+        """
+        roster = [
+            (
+                REPO / "agents/platform/cron/jobs.json",
+                [{"id": "compliance-audit", "skills": ["fleet-audit"], "deliver": None}],
+            )
+        ]
+        self.assertEqual(
+            self._audit_deliveries(roster), {"compliance-audit": "local"}
+        )
 
 
 class ProfileIsolationTests(unittest.TestCase):
