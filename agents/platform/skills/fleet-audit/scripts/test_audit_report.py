@@ -3351,6 +3351,46 @@ class TestFinishClean(HarnessTestCase):
         self.assertIn("closed as completed", comment)
         self.assertNotIn("checks changed", comment)
 
+    def test_a_moved_collector_routes_a_stale_close_to_remediate(self):
+        """And does not tell the reader to re-open the pull request by hand.
+
+        A hand-reopened pull request is closed again by the next run, silently:
+        it is open against a finding the document no longer carries, it already
+        carries the stale-closed label, and the comment is not re-posted because
+        this one already announced it. `/remediate` is the route that holds, and
+        the closing block below already offers it.
+        """
+        comment = audit_report.render_stale_close_comment(
+            AUDIT,
+            [{"id": "a", "title": "t"}],
+            NOW,
+            pr_number=7,
+            checks_changed=True,
+        )
+        self.assertIn("The collector's checks changed since the previous run", comment)
+        self.assertIn("/remediate", comment)
+        self.assertNotIn("re-open this pull request if the fix is still wanted", comment)
+
+    def test_an_unmoved_collector_leaves_the_stale_close_alone(self):
+        comment = audit_report.render_stale_close_comment(
+            AUDIT, [{"id": "a", "title": "t"}], NOW, pr_number=7
+        )
+        self.assertNotIn("checks changed", comment)
+
+    def test_a_caller_supplied_reason_suppresses_the_caveat(self):
+        """An orphaned branch is a different staleness, which a collector edit
+        does not explain — so the caveat would be a non-sequitur beside it."""
+        comment = audit_report.render_stale_close_comment(
+            AUDIT,
+            [{"id": "a", "title": "t"}],
+            NOW,
+            pr_number=7,
+            reason="Closing unmerged: the branch is gone.",
+            checks_changed=True,
+        )
+        self.assertIn("the branch is gone", comment)
+        self.assertNotIn("checks changed", comment)
+
 
 # --------------------------------------------------------------------------- #
 # start

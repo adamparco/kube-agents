@@ -5989,8 +5989,11 @@ def render_stale_close_comment(
         out += [
             "**The collector's checks changed since the previous run**, so the "
             "finding may have stopped being *looked for* rather than stopped "
-            "happening. The branch is kept; re-open this pull request if the "
-            "fix is still wanted.",
+            "happening. If the fix is still wanted, ask for it back with "
+            "`/remediate <finding-id>` — re-opening this pull request by hand "
+            "does not hold, because the next run finds it open against a "
+            "finding the document no longer carries and closes it again, "
+            "silently, having already announced itself here.",
             "",
         ]
     for finding in sort_findings(findings):
