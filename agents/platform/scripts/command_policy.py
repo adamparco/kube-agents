@@ -576,14 +576,27 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
 #: anything (`tests/test_agent_iam_ceiling.py` pins that ceiling). IAM is the
 #: backstop and the allowlist is defence in depth.
 #:
-#: These three have no backstop. They change local state inside the pod -- the
-#: active project, the active credentials, the installed toolchain -- and need
-#: no IAM permission to do it, so a short-circuit failure here is directly
+#: These three have no IAM backstop. They change local state inside the pod --
+#: the active project, the active credentials, the installed toolchain -- and
+#: need no IAM permission to do it, so a short-circuit failure here is directly
 #: exploitable and silently repoints or re-identifies every command that runs
-#: afterwards. Excluding them costs nothing anyone asked for: the SOP that
-#: motivated the escape wants flag syntax for `container clusters update`, and
-#: no skill in this repository runs `gcloud auth`, `gcloud config set`, or
-#: `gcloud components` at all.
+#: afterwards.
+#:
+#: `credentialProxyPolicyJSON` in the operator covers part of this, and only
+#: part: it names `auth (login|activate-service-account)` and
+#: `components (install|update|remove)` by pattern, and it names no `config`
+#: verb at all. Measured against the deployed proxy on 2026-09-01, three
+#: commands passed that document and were allowed by this module's escape --
+#: `gcloud auth revoke --help`, `gcloud config set project <other> --help`, and
+#: `gcloud config unset project --help`. The first logs the agent out of its own
+#: service account; the second repoints every gcloud call that follows. So the
+#: exclusion is load-bearing here, not defence in depth, and a reader should not
+#: infer from the two rules above that the proxy already has this covered.
+#:
+#: Excluding them costs nothing anyone asked for: the SOP that motivated the
+#: escape wants flag syntax for `container clusters update`, and no skill in
+#: this repository runs `gcloud auth`, `gcloud config set`, or `gcloud
+#: components` at all.
 _NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config"})
 
 

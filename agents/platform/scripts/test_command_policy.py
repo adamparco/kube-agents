@@ -753,10 +753,22 @@ class GcloudReadOnlyTest(unittest.TestCase):
         it is not: they rewrite the active project, the active credentials and
         the installed toolchain from inside the pod, with no IAM check to fail
         back to, and every command afterwards inherits the result.
+
+        The one marked below is the case this exclusion carries alone.
+        `credentialProxyPolicyJSON` in the operator names `auth
+        (login|activate-service-account)` and `components
+        (install|update|remove)` by pattern and no `config` verb at all. So the
+        two `auth login`/`activate-service-account` cases and the two
+        `components` ones are refused a layer earlier whatever this module says,
+        while `auth revoke` and every `config` case here reach `evaluate` and
+        were allowed by the escape -- measured against the deployed proxy on
+        2026-09-01.
         """
         for argv in (
             ["gcloud", "auth", "activate-service-account", "--help"],
             ["gcloud", "auth", "login", "--help"],
+            # Not in the proxy document's pattern; this module is the only gate.
+            ["gcloud", "auth", "revoke", "--help"],
             ["gcloud", "config", "set", "project", "elsewhere", "--help"],
             # Help ahead of the operands, not just trailing them.
             ["gcloud", "config", "set", "--help", "project", "elsewhere"],
