@@ -20,7 +20,9 @@ FAILED=0
 # Documentation this guard inspects. The guard itself is excluded, since it
 # necessarily contains the strings it forbids.
 FILE_LIST=$(mktemp)
-trap 'rm -f "$FILE_LIST"' EXIT
+GREP_ERR=$(mktemp)
+GREP_FAILURES=$(mktemp)
+trap 'rm -f "$FILE_LIST" "$GREP_ERR" "$GREP_FAILURES"' EXIT
 
 git ls-files '*.md' '*.mdx' \
   | grep -v '^docs/site/node_modules/' \
@@ -35,9 +37,26 @@ fi
 
 echo "Checking terminology across ${FILE_COUNT} documentation files..."
 
-# search <extended-regex> -> prints "path:line:text" matches, empty if none
+# search <extended-regex> -> prints "path:line:text" matches, empty if none.
+#
+# "No matches" and "grep would not run" are different answers and used to be
+# reported the same way. A pattern grep refuses to compile, or a file it cannot
+# read, is a check that did not happen; folded into an empty result by
+# `2>/dev/null || true` it becomes a check that passed, which is the one failure
+# mode a guard must not have. The exit status cannot tell them apart -- xargs
+# reports the same code whether grep found nothing or rejected the pattern -- so
+# the discriminator is stderr, recorded here and reported at the end so every
+# broken pattern is named rather than only the first.
 search() {
-  tr '\n' '\0' < "$FILE_LIST" | xargs -0 grep -nEI -H "$1" 2>/dev/null || true
+  local out
+  : > "$GREP_ERR"
+  out=$(tr '\n' '\0' < "$FILE_LIST" | xargs -0 grep -nEI -H "$1" 2>"$GREP_ERR")
+  if [ -s "$GREP_ERR" ]; then
+    printf 'pattern: %s\n' "$1" >> "$GREP_FAILURES"
+    sed 's/^/  /' "$GREP_ERR" >> "$GREP_FAILURES"
+    return 2
+  fi
+  printf '%s' "$out"
 }
 
 # forbid <extended-regex> <explanation>
@@ -194,6 +213,12 @@ spellings() {
   local value grouped word alt
   value=$(cap_value "$1")
   [ -n "$value" ] || return 1
+  # The result is interpolated into an extended regex below, so anything that is
+  # not a bare integer is a constant this function cannot spell -- and a stray
+  # `(` or `+` from, say, `MAX_X = int(1e5)` would make grep reject the whole
+  # pattern rather than say so. Refuse it here; the loop that calls this treats
+  # a refusal as fatal.
+  case "$value" in *[!0-9]*) return 1 ;; esac
   alt="$value"
   grouped=$(group_digits "$value")
   [ "$grouped" != "$value" ] && alt="${alt}|${grouped}"
@@ -230,7 +255,7 @@ for CONSTANT in MAX_EXCERPT_LINES MAX_EXCERPT_CHARS MAX_COMMAND_CHARS \
   MAX_BODY_CHARS BODY_BUDGET MAX_SCOPE_ROWS AUTO_PROMOTION_CAP MIN_NA_REASON_CHARS \
   MIN_CHECK_COMMAND_CHARS; do
   if ! spellings "$CONSTANT" > /dev/null; then
-    echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT}." >&2
+    echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT} as an integer." >&2
     exit 1
   fi
 done
@@ -361,8 +386,9 @@ for JOBS_FILE in $CRON_JOBS; do
 done
 
 PROMPT_HITS=$(mktemp)
-ROSTER_DOCS=$(mktemp)
-trap 'rm -f "$FILE_LIST" "$PROMPT_HITS" "$ROSTER_DOCS"' EXIT
+ORPHAN_HITS=$(mktemp)
+ROSTER_ID_FILE=$(mktemp)
+trap 'rm -f "$FILE_LIST" "$GREP_ERR" "$GREP_FAILURES" "$PROMPT_HITS" "$ORPHAN_HITS" "$ROSTER_ID_FILE"' EXIT
 
 # Which documents are claiming to quote the roster at all. The anchor below is
 # structural for the reason above, but `"prompt": "` is not structure unique to
@@ -373,43 +399,117 @@ trap 'rm -f "$FILE_LIST" "$PROMPT_HITS" "$ROSTER_DOCS"' EXIT
 # anchor turns any unrelated pull request that renders one of those into a red
 # CI run with an error message about cron prompts.
 #
-# So narrow the population, not the anchor. A document renders a roster *entry*
+# So narrow the population, not the anchor. A block renders a roster *entry*
 # when it renders a real job's `"id"`, which every one of the three quotations
 # in the tree today does, one line above its `"prompt"`. That keeps the
 # property the structural anchor was adopted for -- nothing here is drawn from
 # what a prompt says, so a rewording cannot make the guard stop looking -- while
-# a `prompt` key in a document that never names a job is left alone.
+# a `prompt` key in a block that never names a job is left alone.
 #
 # `jq` over both rosters rather than a hand-kept list: a new job is then covered
 # the day it is added, and a renamed one does not quietly narrow this to zero.
+# The exit status is checked and stderr is left alone: read through
+# `2>/dev/null` a parse error silently *narrowed* the id set -- to one roster's
+# ids, or to none -- and every document the missing ids covered dropped out of
+# the check without a word.
 # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
-ROSTER_IDS=$(jq -r '(.jobs // .)[].id' $CRON_JOBS 2>/dev/null | sort -u)
-if [ -z "$ROSTER_IDS" ]; then
+if ! jq -r '(.jobs // .)[].id' $CRON_JOBS | sort -u > "$ROSTER_ID_FILE"; then
+  echo "ERROR: could not read job ids from ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
+  exit 1
+fi
+if [ ! -s "$ROSTER_ID_FILE" ]; then
   echo "ERROR: no job ids read from ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
   exit 1
 fi
-ID_ALTERNATION=$(printf '%s\n' "$ROSTER_IDS" | paste -sd'|' -)
-search "\"id\"[[:space:]]*:[[:space:]]*\"(${ID_ALTERNATION})\"" \
-  | cut -d: -f1 | sort -u > "$ROSTER_DOCS"
 
-# Match the key wherever on the line it falls and however it is spaced. An
-# anchor that insisted on the key starting the line, followed by exactly one
-# space, saw only prettier's rendering of a multi-line object — a one-line
-# `{"id": …, "prompt": …}` entry, or a hand-spaced one, went unchecked, which
-# is the same silent skip the structural anchor was adopted to end. Prettier
-# normalises much of this back, but only inside a fence tagged `json`, and CI
-# does not run it over `.mdx` at all. What no line-based anchor can see is a
-# quotation whose value sits on the line after its key; those are unchecked.
-if [ -s "$ROSTER_DOCS" ]; then
-  tr '\n' '\0' < "$ROSTER_DOCS" \
-    | xargs -0 grep -nEI -H '"prompt"[[:space:]]*:[[:space:]]*"' 2>/dev/null \
-    > "$PROMPT_HITS" || true
+# The scan below decides three things at once, per fenced block rather than per
+# document, and the block is the point:
+#
+#   R  the block renders a roster id, so every `"prompt"` in it is graded.
+#   O  the block is shaped like a roster entry -- `schedule`, `skills`,
+#      `deliver` or `no_agent` sits beside its prompt -- but names no id this
+#      roster knows. That is reported, not skipped.
+#
+# Deciding by document, the way this used to, meant a page that named a job in
+# one section and rendered an unrelated `"prompt"` key in another failed CI with
+# an error about cron prompts, pointing at a block that was never claiming to
+# quote anything. A block is what a reader sees as one manifest, so the id and
+# the prompt it labels have to be in the same fence.
+#
+# `O` closes the other half of the same hole. Eliding the `"id"` line from a
+# rendered entry used to remove it from the check entirely -- no error, no
+# coverage -- so deleting one line was all it took to silence the guard on a
+# quotation. A block that still looks like a roster entry now has to name a job.
+#
+# The ids are compared whole, inside awk, and never become part of a pattern.
+# Interpolated into an alternation instead, a single `(`, `|` or `+` in a job id
+# made `grep -E` reject the pattern outright; the error went to /dev/null, the
+# status went to `|| true`, and the guard reported PASS having read nothing.
+#
+# Matching the key wherever on the line it falls and however it is spaced is
+# deliberate. An anchor that insisted on the key starting the line, followed by
+# exactly one space, saw only prettier's rendering of a multi-line object — a
+# one-line `{"id": …, "prompt": …}` entry, or a hand-spaced one, went unchecked,
+# which is the same silent skip the structural anchor was adopted to end.
+# Prettier normalises much of this back, but only inside a fence tagged `json`,
+# and CI does not run it over `.mdx` at all. What no line-based anchor can see
+# is a quotation whose value sits on the line after its key; those are unchecked.
+#
+# The awk program is single-quoted on purpose; `$0` below is awk's, not the
+# shell's, and the ids reach it through -v rather than through interpolation.
+# shellcheck disable=SC2016
+if ! SCAN=$(tr '\n' '\0' < "$FILE_LIST" | xargs -0 awk -v idfile="$ROSTER_ID_FILE" '
+  function flush(   i, kind) {
+    kind = hasid ? "R" : (cronish ? "O" : "")
+    if (kind != "")
+      for (i = 1; i <= n; i++)
+        printf "%s:%s:%s:%s\n", kind, pfile[i], pline[i], ptext[i]
+    n = 0; hasid = 0; cronish = 0
+  }
+  BEGIN { while ((getline id < idfile) > 0) if (id != "") ids["\"" id "\""] = 1 }
+  FNR == 1 { flush() }
+  /^[ \t]*(```|~~~)/ { flush(); next }
+  {
+    rest = $0
+    while (match(rest, /"id"[ \t]*:[ \t]*"[^"]*"/)) {
+      seg = substr(rest, RSTART, RLENGTH)
+      sub(/^"id"[ \t]*:[ \t]*/, "", seg)
+      if (seg in ids) hasid = 1
+      rest = substr(rest, RSTART + RLENGTH)
+    }
+    if ($0 ~ /"(schedule|skills|deliver|no_agent)"[ \t]*:/) cronish = 1
+    if ($0 ~ /"prompt"[ \t]*:[ \t]*"/) {
+      n++; pfile[n] = FILENAME; pline[n] = FNR; ptext[n] = $0
+    }
+  }
+  END { flush() }
+'); then
+  echo "ERROR: could not scan the documentation for cron prompts; the guard cannot run." >&2
+  exit 1
+fi
+printf '%s\n' "$SCAN" | sed -n 's/^R://p' > "$PROMPT_HITS"
+printf '%s\n' "$SCAN" | sed -n 's/^O://p' > "$ORPHAN_HITS"
+
+if [ -s "$ORPHAN_HITS" ]; then
+  echo "::error::A rendered cron roster entry names no job id from ${CRON_JOBS}, so its prompt cannot be checked. Restore the \"id\" line, or correct it if the job was renamed."
+  sed 's/^/    /' "$ORPHAN_HITS"
+  FAILED=1
 fi
 
 # No floor here, unlike the caps above: the site owes nobody a quotation of a
 # cron prompt, and zero copies is zero stale copies. That is safe only because
 # the anchor above is structural — see the note on why it used to not be.
+#
+# There is a floor on how much of a prompt a quotation has to show, though. The
+# ellipsis trim below checks as far as the elision and no further, so it can
+# leave almost nothing to check: `"prompt": "R…"` reduces to `R`, and a
+# one-character `grep -qF` matches every manifest that has ever existed. A
+# needle that short is not verification, so require enough of the prompt to
+# identify which one is being quoted. The shortest real quotation in the tree
+# today is `concepts/skills.md`'s opening sentence, at 51 characters.
+MIN_QUOTED_CHARS=24
 STALE_PROMPTS=""
+SHORT_PROMPTS=""
 while IFS= read -r HIT; do
   [ -n "$HIT" ] || continue
   # Strip the grep `path:line:` prefix and the JSON key, then cut at the first
@@ -444,8 +544,19 @@ while IFS= read -r HIT; do
     [ -n "$VALUE" ] || continue
     QUOTED=$(printf '%s\n' "$VALUE" \
       | sed -E 's/^"prompt"[[:space:]]*:[[:space:]]*"?//; s/"$//; s/[[:space:]]*(\.\.\.|…)$//')
+    if [ "${#QUOTED}" -lt "$MIN_QUOTED_CHARS" ]; then
+      SHORT_PROMPTS="${SHORT_PROMPTS}${HIT}
+"
+      break
+    fi
     # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
-    if [ -z "$QUOTED" ] || ! grep -qF -- "$QUOTED" $CRON_JOBS; then
+    grep -qF -- "$QUOTED" $CRON_JOBS
+    MATCH_STATUS=$?
+    if [ "$MATCH_STATUS" -ge 2 ]; then
+      echo "ERROR: grep could not read ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
+      exit 1
+    fi
+    if [ "$MATCH_STATUS" -ne 0 ]; then
       STALE_PROMPTS="${STALE_PROMPTS}${HIT}
 "
       break
@@ -458,6 +569,21 @@ done < "$PROMPT_HITS"
 if [ -n "$STALE_PROMPTS" ]; then
   echo "::error::Documented cron prompt is not a verbatim copy of any prompt in ${CRON_JOBS}."
   printf '%s\n' "$STALE_PROMPTS" | sed '/^$/d; s/^/    /'
+  FAILED=1
+fi
+
+if [ -n "$SHORT_PROMPTS" ]; then
+  echo "::error::Documented cron prompt is elided down to fewer than ${MIN_QUOTED_CHARS} characters, which verifies nothing. Quote more of it before the ellipsis, or paraphrase it in prose instead of rendering it as manifest JSON."
+  printf '%s\n' "$SHORT_PROMPTS" | sed '/^$/d; s/^/    /'
+  FAILED=1
+fi
+
+# --- Checks that could not run --------------------------------------------
+# Reported last so every broken pattern is named at once, and reported at all
+# because a check that did not run is not a check that passed.
+if [ -s "$GREP_FAILURES" ]; then
+  echo "::error::A terminology check could not run: grep rejected a pattern, or could not read a file."
+  sed 's/^/    /' "$GREP_FAILURES"
   FAILED=1
 fi
 
