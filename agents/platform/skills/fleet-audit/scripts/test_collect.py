@@ -1977,6 +1977,112 @@ class TestWildcardRbac(unittest.TestCase):
         )
         self.assertEqual(len(collect.check_wildcard_rbac(ctx)), 1)
 
+    def bound(self, rules, subjects, name="role-under-test"):
+        ctx = context_of(
+            roles=[cluster_role(name, rules)],
+            clusterrolebindings=[role_binding("ClusterRole", name, subjects)],
+        )
+        hits = collect.check_wildcard_rbac(ctx)
+        self.assertEqual(len(hits), 1, hits)
+        return hits[0]
+
+    def test_a_verb_wildcard_publishes_the_unbounded_sentence(self):
+        hit = self.bound(self.WILDCARD_RULE, [subject("ServiceAccount", "app", "default")])
+        self.assertEqual(hit["impact"], collect._IMPACT_RBAC_ANY_VERB)
+
+    def test_enumerated_verbs_do_not_publish_any_verb(self):
+        """The live defect. `ClusterRole/argocd-server` holds `delete`, `get`,
+        `patch` over every resource in every group, and the run published the
+        wildcard sentence over it -- collapsing the direct/indirect distinction
+        §2.5 spends a paragraph keeping. The verbs are parsed here, so the
+        branch is arithmetic rather than a reading-comprehension task.
+        """
+        hit = self.bound(
+            [{"verbs": ["delete", "get", "patch"], "resources": ["*"], "apiGroups": ["*"]}],
+            [subject("ServiceAccount", "argocd-server", "argocd")],
+        )
+        self.assertNotIn("any verb on any resource", hit["impact"])
+        self.assertIn("not a grant of every verb", hit["impact"])
+        for clause in ("read every Secret", "rewrite an existing privileged workload", "destroy any object"):
+            self.assertIn(clause, hit["impact"])
+        self.assertNotIn("create privileged pods directly", hit["impact"])
+        self.assertIn("real but indirect", hit["impact"])
+
+    def test_delete_alone_keeps_its_qualifier_and_a_verb_list_drops_it(self):
+        """§2.5 says `delete` *alone* is data loss rather than credential theft.
+        Alone is the whole clause: appended beside `get`, it denies the
+        credential theft the same sentence just described.
+        """
+        alone = self.bound(
+            [{"verbs": ["delete"], "resources": ["*"], "apiGroups": ["*"]}],
+            [subject("ServiceAccount", "reaper", "ops")],
+        )
+        self.assertIn("rather than credential theft", alone["impact"])
+        beside = self.bound(
+            [{"verbs": ["delete", "get"], "resources": ["*"], "apiGroups": ["*"]}],
+            [subject("ServiceAccount", "reaper", "ops")],
+        )
+        self.assertIn("read every Secret", beside["impact"])
+        self.assertNotIn("rather than credential theft", beside["impact"])
+
+    def test_a_direct_escalation_verb_names_itself(self):
+        for verb in collect._RBAC_DIRECT_VERBS:
+            with self.subTest(verb=verb):
+                hit = self.bound(
+                    [{"verbs": [verb, "get"], "resources": ["*"], "apiGroups": ["*"]}],
+                    [subject("ServiceAccount", "app", "default")],
+                )
+                self.assertIn(collect._IMPACT_RBAC_ANY_VERB, hit["impact"])
+                self.assertIn(f"`{verb}` is the verb that reaches it", hit["impact"])
+
+    def test_an_unrecognised_verb_list_understates_rather_than_overstates(self):
+        """No hit reaches this branch today: stage 1 admits a rule only for a
+        `*` verb or a member of `_ESCALATING_VERBS`, and every one of those is a
+        direct verb or a clause family. Asserted at the function because the two
+        lists are edited separately, and widening `_ESCALATING_VERBS` alone must
+        not promote a new verb to the wildcard sentence by default.
+        """
+        unmatched = set(collect._ESCALATING_VERBS)
+        for family, _ in collect._RBAC_VERB_CLAUSES:
+            unmatched -= set(family)
+        unmatched -= set(collect._RBAC_DIRECT_VERBS)
+        self.assertEqual(unmatched, set(), "a stage-1 verb now falls to the defensive branch")
+        impact = collect._wildcard_rbac_impact({"proxy"})
+        self.assertNotIn("any verb on any resource", impact)
+        self.assertIn("Read the verbs in the excerpt", impact)
+
+    def test_the_excerpt_names_the_bound_principal(self):
+        """The subject goes in the excerpt, not the recommendation, because
+        `adopt_collector_evidence` restores the excerpt over whatever a run
+        publishes. Live, the model invented one: `ClusterRole/argocd-server`'s
+        finding told the operator to enumerate `argocd-application-controller`
+        -- the other finding's subject, holding `verbs: ["*"]` on `["*"]`, so
+        the mandated diff passes whatever the replacement says.
+        """
+        hit = self.bound(self.WILDCARD_RULE, [subject("ServiceAccount", "argocd-server", "argocd")])
+        self.assertIn("; bound to system:serviceaccount:argocd:argocd-server", hit["excerpt"])
+        # Still the matched rules verbatim in front, which §2.5 requires.
+        self.assertTrue(hit["excerpt"].startswith(json.dumps(self.WILDCARD_RULE)))
+
+    def test_a_user_and_a_group_are_spelled_by_name(self):
+        hit = self.bound(
+            self.WILDCARD_RULE,
+            [subject("User", "dev@acme.com"), subject("Group", "platform-admins@acme.com")],
+        )
+        self.assertIn("; bound to dev@acme.com, platform-admins@acme.com", hit["excerpt"])
+
+    def test_the_same_principal_bound_twice_is_listed_once(self):
+        sa = subject("ServiceAccount", "app", "default")
+        ctx = context_of(
+            roles=[cluster_role("god-mode", self.WILDCARD_RULE)],
+            clusterrolebindings=[
+                role_binding("ClusterRole", "god-mode", [sa]),
+                role_binding("ClusterRole", "god-mode", [sa]),
+            ],
+        )
+        hits = collect.check_wildcard_rbac(ctx)
+        self.assertEqual(hits[0]["excerpt"].count("system:serviceaccount:default:app"), 1)
+
 
 class TestNetpolMissing(unittest.TestCase):
     def test_zero_policies_with_workloads_is_major(self):
@@ -2154,6 +2260,44 @@ class TestNetpolMissing(unittest.TestCase):
         self.assertEqual(hits[0]["severity"], "major")
         self.assertEqual(hits[0]["object"], "Namespace/kubeagents-system")
         self.assertIn("1 of 2 pods", hits[0]["excerpt"])
+
+    def test_the_partial_arm_carries_its_own_impact_and_the_other_two_do_not(self):
+        """§2.6 forbids arm 1's sentence on arm 3 by name -- "the other m - n
+        pods are policed, and saying otherwise tells an operator their working
+        policies do nothing" -- and the live run published it anyway, on a
+        finding whose own title had taken the correct branch. So the collector
+        writes arm 3's sentence and `adopt_arm_impact` restores it.
+
+        Arms 1 and 2 deliberately stay on the table default: they share one true
+        sentence, and leaving it unflagged is what lets a run name the actual
+        namespace the way 39 of this install's 106 findings do.
+        """
+        partial = context_of(
+            namespaces=[namespace("kubeagents-system")],
+            networkpolicies=[netpol("litellm", ns="kubeagents-system", pod_selector={"matchLabels": {"app": "litellm"}}, policy_types=["Ingress"])],
+            pods=[
+                netpol_pod("litellm-7bcc-9rjvl", ns="kubeagents-system", labels={"app": "litellm"}),
+                netpol_pod("manager-764d-46gl4", ns="kubeagents-system", labels={"app": "operator"}),
+            ],
+            pod_namespaces={"kubeagents-system"},
+        )
+        hit = collect.check_netpol_missing(partial)[0]
+        self.assertEqual(hit["impact"], collect._IMPACT_NETPOL_PARTIAL)
+        self.assertNotIn("Every pod in this namespace", hit["impact"])
+
+        zero = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        self.assertNotIn("impact", collect.check_netpol_missing(zero)[0])
+
+        allow_all = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("open", ns="payments", pod_selector={}, ingress=[{}])],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        self.assertNotIn("impact", collect.check_netpol_missing(allow_all)[0])
 
     def test_the_excerpt_names_the_workload_and_the_object_stays_the_namespace(self):
         """A pod name carries a ReplicaSet hash and a random suffix. The ledger

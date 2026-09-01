@@ -1267,6 +1267,98 @@ _ESCALATING_VERBS = frozenset(
     {"create", "update", "patch", "delete", "deletecollection", "impersonate", "escalate", "bind"}
 )
 
+# The three verbs RBAC escalation prevention keys on. A subject holding one of
+# them reaches the ceiling directly; every other enumerated verb reaches it the
+# long way, and §2.5 forbids describing the two the same way.
+_RBAC_DIRECT_VERBS = ("bind", "escalate", "impersonate")
+_IMPACT_RBAC_ANY_VERB = (
+    "Subject can perform any verb on any resource in this scope, including "
+    "reading Secrets and creating privileged pods -- an unbounded escalation path."
+)
+# §2.5 branch 3, one clause per verb family actually present and no others.
+# Ordered by what an owner acts on first, not alphabetically.
+_RBAC_VERB_CLAUSES = (
+    (("get", "list"), "read every Secret in every namespace"),
+    (("create",), "create privileged pods directly"),
+    (
+        ("patch", "update"),
+        "rewrite an existing privileged workload into one it controls and take the node that runs it",
+    ),
+    (("delete", "deletecollection"), "destroy any object in the cluster"),
+)
+# §2.5 says `delete` *alone* is "data loss and denial of service rather than
+# credential theft". Alone is load-bearing: appended to a list that also grants
+# `get`, it would deny the credential theft the sentence just described.
+_RBAC_DELETE_ONLY_TAIL = " That is data loss and denial of service rather than credential theft."
+_IMPACT_RBAC_INDIRECT_TAIL = (
+    " RBAC escalation prevention refuses a subject holding none of `bind`, "
+    "`escalate` or `impersonate` a binding granting more than it already has, "
+    "so the route to cluster-admin here is real but indirect."
+)
+
+
+def _wildcard_rbac_impact(verbs: set[str]) -> str:
+    """§2.5's Impact, chosen by the verbs the matched rules actually grant.
+
+    The model was asked to do this from the excerpt and did it for one finding
+    out of two: `ClusterRole/argocd-server` holds `delete`, `get`, `patch` on
+    every resource in every group and published the wildcard sentence, which
+    collapses exactly the direct/indirect distinction the branch exists to
+    keep. The verbs are already parsed here, so the branch is arithmetic rather
+    than a reading comprehension task.
+    """
+    if "*" in verbs:
+        return _IMPACT_RBAC_ANY_VERB
+    direct = [v for v in _RBAC_DIRECT_VERBS if v in verbs]
+    if direct:
+        # Same ceiling as the wildcard, so the sentence holds -- but say which
+        # verb reaches it: that one verb is the whole finding, and an owner
+        # trimming the list needs to know it cannot stay.
+        return f"{_IMPACT_RBAC_ANY_VERB} `{direct[0]}` is the verb that reaches it."
+    clauses = [text for family, text in _RBAC_VERB_CLAUSES if verbs.intersection(family)]
+    if not clauses:
+        # A verb list matching none of the shapes above. No hit reaches here
+        # today -- stage 1 admits a rule only for a `*` verb or a member of
+        # `_ESCALATING_VERBS`, and every one of those is a direct verb or a
+        # clause family. It stays because the two lists are edited separately:
+        # widening `_ESCALATING_VERBS` alone must not silently promote a new
+        # verb to the wildcard sentence. §2.5 picks this direction on purpose --
+        # understating an escalation costs a reader one follow-up, overstating
+        # one costs the audit its standing.
+        return (
+            "The rule's scope is every resource in every API group. Read the verbs in the "
+            "excerpt for what that grants; it is not a grant of every verb."
+            + _IMPACT_RBAC_INDIRECT_TAIL
+        )
+    if len(clauses) > 1:
+        listed = f"{', '.join(clauses[:-1])}, and {clauses[-1]}"
+        tail = ""
+    else:
+        listed = clauses[0]
+        tail = _RBAC_DELETE_ONLY_TAIL if verbs & set(_RBAC_VERB_CLAUSES[-1][0]) else ""
+    return (
+        f"The verbs are enumerated rather than wildcarded, so this is not a grant of every "
+        f"verb. With what it does grant, the subject can {listed}."
+        + tail
+        + _IMPACT_RBAC_INDIRECT_TAIL
+    )
+
+
+def _binding_principal(subject: dict) -> str:
+    """How a subject is spelled to `kubectl auth can-i --as`.
+
+    The remediation §2.5 mandates is `kubectl auth can-i --list --as=<subject>`,
+    and until this was carried on the hit the model had to invent the subject:
+    `ClusterRole/argocd-server`'s finding told the operator to enumerate
+    `argocd-application-controller` instead -- the *other* finding's subject,
+    holding `verbs: ["*"]` on `["*"]`, a strict superset. Diffing a proposed
+    replacement against a superset passes whatever the replacement says.
+    """
+    kind, name = subject.get("kind"), str(subject.get("name") or "")
+    if kind == "ServiceAccount":
+        return f"system:serviceaccount:{subject.get('namespace', '')}:{name}"
+    return name
+
 
 def check_wildcard_rbac(context: dict) -> list[dict]:
     """The universal suppressions on line 126 of the SOP say "every check in
@@ -1291,14 +1383,20 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
     names this exact failure -- "flagging these is the fastest way to get this
     audit switched off".
     """
-    bound_non_system = set()
+    # Keyed the same as before, but keeping the subjects rather than throwing
+    # them away: the remediation names a principal, and the only place that
+    # principal exists is the binding.
+    bound_non_system: dict[tuple, list[str]] = {}
     for kind_key in ("clusterrolebindings", "rolebindings"):
         for binding in context.get(kind_key) or []:
             role_ref = binding.get("roleRef") or {}
             for subject in binding.get("subjects") or []:
                 flagged, _ = _is_non_system_subject(subject)
                 if flagged:
-                    bound_non_system.add((role_ref.get("kind"), role_ref.get("name")))
+                    key = (role_ref.get("kind"), role_ref.get("name"))
+                    principal = _binding_principal(subject)
+                    if principal not in bound_non_system.setdefault(key, []):
+                        bound_non_system[key].append(principal)
 
     hits = []
     for role in (context.get("roles") or []):
@@ -1355,12 +1453,21 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
         if key not in bound_non_system:
             continue
         ns = meta.get("namespace", "")
+        verbs = {
+            str(v).lower() for rule in wildcard_rules for v in (rule.get("verbs") or [])
+        }
+        # The subjects go in the excerpt rather than the recommendation because
+        # `adopt_collector_evidence` restores the excerpt over whatever the run
+        # published: a principal written anywhere else is a principal the model
+        # is free to replace with a plausible-looking wrong one.
+        principals = ", ".join(bound_non_system[key])
         hits.append(
             {
                 "namespace": ns,
                 "object": f"{role['kind']}/{meta.get('name')}",
-                "excerpt": json.dumps(wildcard_rules),
+                "excerpt": f"{json.dumps(wildcard_rules)}; bound to {principals}",
                 "severity": "critical" if role.get("kind") == "ClusterRole" else "major",
+                "impact": _wildcard_rbac_impact(verbs),
             }
         )
     return hits
@@ -1409,6 +1516,21 @@ def _ccnp_coverage(policies: list[dict]) -> tuple[bool, set[str]]:
                 if labels.get(key):
                     covered.add(labels[key])
     return covers_all, covered
+
+
+# §2.6's partial-coverage arm. The table's sentence -- "every pod in this
+# namespace accepts traffic from every pod in the cluster" -- is true of the
+# other two arms and flatly false of this one, where the policies that exist
+# are working and cover everything except the pods named in the excerpt. The
+# SOP forbids that sentence here by name, and the run published it anyway over
+# `kubeagents-system`, whose four policies police five of six pods; the title
+# took the right branch while the Impact told the operator their policies do
+# nothing. Written on the hit so `adopt_arm_impact` can hold it.
+_IMPACT_NETPOL_PARTIAL = (
+    "The named workloads accept traffic from every pod in the cluster, while "
+    "the rest of the namespace is policed -- so the gap is invisible in a "
+    "policy review that only asks whether this namespace has NetworkPolicies."
+)
 
 
 def check_netpol_missing(context: dict) -> list[dict]:
@@ -1514,6 +1636,7 @@ def check_netpol_missing(context: dict) -> list[dict]:
                         f"{'policy' if len(policies) == 1 else 'policies'} in this namespace cover the rest"
                     ),
                     "severity": "major",
+                    "impact": _IMPACT_NETPOL_PARTIAL,
                 }
             )
     return hits
@@ -2470,8 +2593,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         check_default_sa_automount,
         "major",
         None,
-        "Workload mounts an API-server credential it does not use, handing "
-        "an attacker an authenticated foothold for free.",
+        # Not "a credential it does not use": the check reads the SA reference
+        # and the automount flag, and neither says whether the workload calls
+        # the API server. A finding that asserts an unobservable is one an owner
+        # can refute from memory, and refuting a true finding on a false clause
+        # is how a whole audit stops being read.
+        "Workload mounts an API-server credential by default rather than by "
+        "request, handing an attacker who lands in the container an "
+        "authenticated foothold for free.",
     ),
     CheckSpec(
         "workload-identity-off",
