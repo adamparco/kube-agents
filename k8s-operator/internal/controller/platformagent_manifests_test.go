@@ -3556,8 +3556,8 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	}
 
 	// AGENT_SHARED_STATE_SETUP is operator-owned for the same reason and by the same
-	// means — appended after the plugin merge, so the kubelet's last-wins resolution
-	// lands on the operator's value. A plugin that could set it to `skip` would switch
+	// means — appended after the plugin merge, so lastWinsEnv's collapse lands on the
+	// operator's value. A plugin that could set it to `skip` would switch
 	// off the entrypoint's shared-state setup for the whole agent, and the resulting
 	// unpopulated $HERMES_HOME surfaces nowhere near the plugin that caused it.
 	if env["AGENT_SHARED_STATE_SETUP"] != "owner" {
@@ -3601,6 +3601,60 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			t.Errorf("expected %s exactly once, got %d occurrences; a repeated env name is "+
 				"rejected by server-side apply, so this stalls the gateway rather than "+
 				"letting the operator's value win", name, counts[name])
+		}
+	}
+}
+
+// TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets is the general form of
+// the four-name count loop above, and the reason it is separate: that list has to be
+// maintained and this one cannot go stale. The plugin here declares an override for
+// *every* variable the operator sets in the baseline, so a twelfth operator-owned name
+// added after this is written is covered the day it is added.
+//
+// The property is not "the operator wins" — the test above covers that for the names
+// where it matters. It is that no name appears twice at all. `Container.Env` carries
+// patchMergeKey=name and the controller applies server-side, so the API server refuses
+// a duplicate outright and the gateway stops reconciling; the pod keeps running the
+// spec it already had, which is why the failure reads as "my change did nothing"
+// rather than as an error.
+func TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "dup-agent", Namespace: "test-ns"},
+	}
+
+	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true})
+	var pluginEnv []corev1.EnvVar
+	for _, container := range baseline.Spec.Containers {
+		for _, e := range container.Env {
+			pluginEnv = append(pluginEnv, corev1.EnvVar{Name: e.Name, Value: "plugin-supplied"})
+		}
+	}
+	if len(pluginEnv) == 0 {
+		t.Fatalf("expected the baseline pod spec to set at least one env var")
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "dupenv"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "dup-agent",
+			Image:    "gcr.io/env:v1",
+			Env:      pluginEnv,
+		},
+	}
+
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
+	for _, container := range pod.Spec.Containers {
+		counts := map[string]int{}
+		for _, e := range container.Env {
+			counts[e.Name]++
+		}
+		for name, n := range counts {
+			if n != 1 {
+				t.Errorf("container %s: env %s appears %d times; server-side apply rejects "+
+					"a duplicate env name outright (\"duplicate entries for key\"), so the "+
+					"gateway would stop reconciling rather than resolve to a value",
+					container.Name, name, n)
+			}
 		}
 	}
 }

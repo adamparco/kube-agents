@@ -3027,10 +3027,16 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
 	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
 	// plugins mounted but never enabled — would look like the plugin was broken rather
-	// than the cause. Appending after the merge leaves the operator's entry last, and the
-	// kubelet collapses duplicate env names last-wins. Same mechanism, same reason, as
+	// than the cause. Appending after the merge leaves the operator's entry last, and
+	// lastWinsEnv below keeps the last of each name. Same mechanism, same reason, as
 	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
 	// reordering here is silent.
+	//
+	// Not the kubelet, which earlier comments here credited with the collapse: a
+	// PodSpec carrying two entries of one name never reaches a kubelet. `env` has
+	// patchMergeKey=name, and the API server rejects the server-side apply outright
+	// -- `duplicate entries for key [name="HERMES_HOME_MODE"]` -- so the gateway
+	// stops reconciling altogether rather than resolving to anyone's value.
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
