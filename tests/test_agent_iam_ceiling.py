@@ -88,19 +88,31 @@ SUBNET_UTILIZATION_PERMISSIONS = [
     "recommender.networkAnalyzerIpAddressInsights.get",
 ]
 
-# Verbs that make a permission a write. Checked as the last dot-separated
-# segment of every permission in every custom role in the tree, so a second
-# custom role added later is covered without editing the pin above.
+# Verbs that make a permission a write, or hand over someone else's identity.
+# Checked as the last dot-separated segment of every permission in every custom
+# role in the tree, so a second custom role added later is covered without
+# editing the pin above.
+#
+# The impersonation half is not optional garnish: FORBIDDEN_ROLES already names
+# `roles/iam.serviceAccountTokenCreator`, and a custom role holding that role's
+# permissions grants the same thing under a name this file has never heard of.
+# All five of its permissions are listed for that reason.
 FORBIDDEN_PERMISSION_VERBS = {
     "create",
     "delete",
     "update",
     "patch",
+    "start",
+    "stop",
+    "reset",
     "setIamPolicy",
     "setMetadata",
+    "setLabels",
     "impersonate",
     "actAs",
+    "getAccessToken",
     "getCredentials",
+    "getOpenIdToken",
     "signBlob",
     "signJwt",
     "implicitDelegation",
@@ -519,12 +531,18 @@ class TerraformRoleBundlesTest(unittest.TestCase):
 
 
 class TerraformCustomRolePermissionsTest(unittest.TestCase):
-    """What the module's own custom role is allowed to contain.
+    """What a custom role anywhere in the terraform tree is allowed to contain.
 
     Every other check in this file reads role *names*. A custom role is defined
     by its permissions, so none of them look inside one: inserting
     `container.clusters.update` into `subnet_utilization_reader` grants the
     agent cluster mutation project-wide and leaves the rest of the suite green.
+
+    Scanned across every `.tf` under `terraform/` rather than just the one
+    module that has a custom role today. Scoping it to that file left the same
+    hole one directory over -- a `google_project_iam_custom_role` added to
+    `examples/full-install/main.tf` with `iam.serviceAccounts.setIamPolicy` in
+    it passed the whole suite.
     """
 
     def setUp(self):
@@ -532,39 +550,36 @@ class TerraformCustomRolePermissionsTest(unittest.TestCase):
         self.lists = _terraform_list_locals(self.module)
 
     def _custom_role_permissions(self) -> dict[str, list[str]]:
-        """Every `permissions = [...]` in the module, keyed by its resource name."""
+        """Every custom role's `permissions = [...]`, keyed `<path>:<resource>`."""
         found = {}
-        for match in re.finditer(
-            r'^resource\s+"google_project_iam_custom_role"\s+"([^"]+)"\s*\{',
-            self.module,
-            re.M,
-        ):
-            name = match.group(1)
-            depth, body = 0, ""
-            for ch in self.module[match.end() - 1 :]:
-                body += ch
-                depth += (ch == "{") - (ch == "}")
-                if depth == 0 and body.strip():
-                    break
-            perms = _terraform_list_locals(body).get("permissions")
-            self.assertIsNotNone(
-                perms, f"could not read the permissions of custom role {name}"
-            )
-            found[name] = perms
+        for path in sorted(TERRAFORM_DIR.rglob("*.tf")):
+            source = path.read_text(encoding="utf-8")
+            for match in re.finditer(
+                r'^resource\s+"google_project_iam_custom_role"\s+"([^"]+)"\s*\{',
+                source,
+                re.M,
+            ):
+                key = f"{path.relative_to(REPO_ROOT)}:{match.group(1)}"
+                depth, body = 0, ""
+                for ch in source[match.end() - 1 :]:
+                    body += ch
+                    depth += (ch == "{") - (ch == "}")
+                    if depth == 0 and body.strip():
+                        break
+                perms = _terraform_list_locals(body).get("permissions")
+                self.assertIsNotNone(
+                    perms, f"could not read the permissions of custom role {key}"
+                )
+                found[key] = perms
         return found
 
     def test_the_subnet_utilization_role_carries_exactly_three_permissions(self):
         roles = self._custom_role_permissions()
-        self.assertIn(
-            "subnet_utilization_reader",
-            roles,
-            "the subnet-utilization custom role moved or was renamed",
-        )
-        self.assertEqual(
-            SUBNET_UTILIZATION_PERMISSIONS, roles["subnet_utilization_reader"]
-        )
+        key = "terraform/modules/kube-agents-iam/main.tf:subnet_utilization_reader"
+        self.assertIn(key, roles, "the subnet-utilization custom role moved or was renamed")
+        self.assertEqual(SUBNET_UTILIZATION_PERMISSIONS, roles[key])
 
-    def test_no_custom_role_in_the_module_carries_a_write(self):
+    def test_no_custom_role_in_the_tree_carries_a_write(self):
         roles = self._custom_role_permissions()
         self.assertTrue(roles, "no custom role found; this test would pass vacuously")
         for name, perms in roles.items():
