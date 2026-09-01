@@ -730,7 +730,7 @@ class TestDumpStateGate(unittest.TestCase):
         self.assertFalse(gate_ok)
 
     def test_a_truncated_dump_fails_the_gate(self):
-        # What a 4 MiB proxy truncation looks like: valid JSON up to a point,
+        # What a proxy truncation looks like: valid JSON up to a point,
         # then cut off mid-object.
         _, _, gate_ok = self.run_dump('{"items": [{"kind": "Depl')
         self.assertFalse(gate_ok)
