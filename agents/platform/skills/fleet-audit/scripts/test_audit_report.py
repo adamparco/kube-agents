@@ -8334,6 +8334,60 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertNotIn(stale, body)
         self.assertNotIn("the model's own guess", body)
 
+    def test_the_dry_run_previews_the_collectors_arm_sentence(self):
+        """The preview is read to check exactly the line it used to get wrong.
+
+        `adopt_arm_impact` runs below the `--dry-run` return in `handle_finish`,
+        after `carry_unchanged_findings`, for a reason its docstring gives. That
+        left the preview showing the model's guess at which arm of a multi-arm
+        check fired while the real run published the collector's — so a reviewer
+        approving the preview approved a sentence that was never going to ship.
+        The dry run reads no stored memory and carries nothing forward, so
+        adopting on that path re-orders nothing.
+        """
+        corrected = (
+            "Node pool is locked to a single zone: a stockout in that zone "
+            "halts scale-up of this pool. Other pools keep scaling."
+        )
+        guess = "the model's own guess at which arm fired"
+        manifest = {
+            "clusters": [
+                {
+                    "name": name,
+                    "outcome": "collected",
+                    "commands": [
+                        {"check": c, "command": f"ran {c}", "rc": 0}
+                        for c in audit_report.audit_checks(AUDIT)
+                    ],
+                    "candidates": (
+                        [
+                            {
+                                "check": "netpol-missing",
+                                "cluster": "prod-us-east",
+                                "namespace": "payments",
+                                "object": "Namespace/no-network-policy",
+                                "severity": "major",
+                                "excerpt": "zero NetworkPolicies",
+                                "impact": corrected,
+                                "impact_authoritative": True,
+                                "needs_triage": None,
+                            }
+                        ]
+                        if name == "prod-us-east"
+                        else []
+                    ),
+                }
+                for name in ("prod-us-east", "stage-eu")
+            ]
+        }
+        rc = self.run_finish(
+            make_doc(findings=[make_finding(impact=guess)]),
+            ["--dry-run", "--manifest-file", self.manifest_file(manifest)],
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(corrected, self.out)
+        self.assertNotIn(guess, self.out)
+
     def test_a_failing_manifest_rejects_before_any_publish(self):
         manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "commands": []}]}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])

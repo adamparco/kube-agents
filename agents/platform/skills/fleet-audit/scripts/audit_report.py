@@ -8001,6 +8001,17 @@ def handle_finish(args: argparse.Namespace) -> None:
     entry_mono = time.monotonic()
 
     if args.dry_run:
+        # The real run adopts the collector's arm sentence too, but not until
+        # after `carry_unchanged_findings`, which is below this branch and for
+        # a reason the adopt's own docstring gives. The preview reaches neither,
+        # so doing it here is not a re-ordering: the dry run reads no stored
+        # memory and carries nothing forward, which leaves this the only place
+        # the preview can see the sentence the real run will publish. Without
+        # it the preview shows the model's guess at which arm of a multi-arm
+        # check fired — the one line these checks get wrong most often, and the
+        # line a reviewer reads the preview to check.
+        for fid in adopt_arm_impact(data["findings"], manifest):
+            log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
         _handle_finish_dry_run(audit_id, data, now, waiver)
         return
 
