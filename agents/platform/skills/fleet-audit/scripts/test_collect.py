@@ -4057,7 +4057,13 @@ class TestChecksRevision(unittest.TestCase):
                 module = self.module(name)
                 # `collect.py` serves three streams, so it alone is told which.
                 args = ("obtainability-audit", "acme") if name == "collect" else ("acme",)
-                manifest = module.collect_fleet(*args, run=run)
+                # `fleet_waste` alone builds a Cloud Monitoring session, and a
+                # `None` one sends it to `google.auth.default()` -- which in the
+                # agent image, where google-auth is installed, means real ADC
+                # resolution and a metadata-server probe. The fleet is empty, so
+                # nothing ever calls this; it just has to not be None.
+                extra = {"session": object()} if name == "fleet_waste" else {}
+                manifest = module.collect_fleet(*args, run=run, **extra)
                 self.assertEqual(manifest["checks_revision"], module.CHECKS_REVISION)
                 self.assertEqual(manifest["version"], module.MANIFEST_VERSION)
 
