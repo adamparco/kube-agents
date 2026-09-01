@@ -315,6 +315,47 @@ def output_digest(text: str) -> str:
 WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 OPT_OUT_KEY = "kubeagents.x-k8s.io/reliability-audit"
 
+# The owners S3 is entitled to defer to. Kind and API group both have to
+# match: `Job` in `batch` is the built-in whose children S5 drops, while a
+# `Job` some operator defines in its own group is a CRD wearing the name.
+BUILTIN_OWNER_GROUPS = frozenset({"", "apps", "batch"})
+BUILTIN_OWNER_KINDS = frozenset(WORKLOAD_KINDS) | {
+    "ReplicaSet",
+    "ReplicationController",
+    "Job",
+    "CronJob",
+}
+
+
+def _defers_to_owner(meta: dict) -> bool:
+    """True when S3's promise — audit the owning controller instead — is one
+    this audit can keep.
+
+    S3 skips an owned workload on the grounds that its replica count, PDB, and
+    probes belong to its controller rather than to a human. That holds for a
+    built-in controller: the audit reads Deployments, StatefulSets, and
+    DaemonSets directly, a ReplicaSet's own owner is one of those, and S5 puts
+    Jobs and CronJobs out of scope outright. It does not hold for a CRD the
+    audit never dumps. There the deferral has nowhere to defer to — the
+    workload is dropped and the owner is never looked at either — so a real gap
+    goes unreported forever instead of being reported against a better object.
+
+    Across the sixteen clusters of this fleet, S3 as an unconditional
+    `ownerReferences` test suppressed exactly one workload:
+    `kubeagents-system/platform-agent-gateway`, owned by a `PlatformAgent`.
+    That is the harness's own gateway, in the one namespace S1 deliberately
+    keeps in scope so that the harness audits itself. The rule was costing
+    nothing but its single counterexample, and the counterexample was the
+    object the surrounding prose most wanted covered.
+    """
+    for ref in meta.get("ownerReferences") or []:
+        api_version = str(ref.get("apiVersion", ""))
+        # `apps/v1` → `apps`; `v1` and an absent apiVersion → the core group.
+        group = api_version.rsplit("/", 1)[0] if "/" in api_version else ""
+        if str(ref.get("kind", "")) in BUILTIN_OWNER_KINDS and group in BUILTIN_OWNER_GROUPS:
+            return True
+    return False
+
 
 def normalize_workloads(dump: dict) -> list[dict]:
     """Every workload template surviving S1–S5, as `{kind, ns, name, spec}`.
@@ -335,7 +376,7 @@ def normalize_workloads(dump: dict) -> list[dict]:
         annotations = meta.get("annotations") or {}
         if "addonmanager.kubernetes.io/mode" in labels:  # S2
             continue
-        if meta.get("ownerReferences"):  # S3
+        if _defers_to_owner(meta):  # S3
             continue
         if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
             continue
@@ -404,10 +445,15 @@ def services_by_namespace(dump: dict) -> dict[str, list[dict]]:
 
 
 def hpas_by_namespace(dump: dict) -> dict[str, list[dict]]:
-    """Excludes KEDA-owned HPAs (`ownerReferences` present) — the same S3
-    reasoning `normalize_workloads` applies to workloads: a KEDA
-    `ScaledObject` owns the real configuration, and this audit does not read
-    CRDs."""
+    """Excludes any owned HPA (`ownerReferences` present), KEDA's included.
+
+    This is not `_defers_to_owner`, and deliberately so. A workload owned by a
+    CRD still has its own PDB and probe gaps to answer for, which is why S3 no
+    longer drops it. An HPA owned by a `ScaledObject` is different in kind: the
+    `min`/`max` this audit would read are a copy the operator writes from the
+    CRD, so 3.6 would be grading a projection of a configuration it cannot see.
+    The SOP calls that exclusion out under 3.6 for exactly that reason.
+    """
     return {
         ns: [hpa for hpa in hpas if not (hpa.get("metadata") or {}).get("ownerReferences")]
         for ns, hpas in _by_namespace(dump, "HorizontalPodAutoscaler").items()

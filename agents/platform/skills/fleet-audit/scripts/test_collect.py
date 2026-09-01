@@ -74,6 +74,38 @@ class TestNormalizeWorkloads(unittest.TestCase):
         d["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "x"}]
         self.assertEqual(collect.normalize_workloads(dump_of(d)), [])
 
+    def test_a_workload_owned_by_a_job_is_excluded(self):
+        d = deployment("batch-child")
+        d["metadata"]["ownerReferences"] = [{"apiVersion": "batch/v1", "kind": "Job", "name": "x"}]
+        self.assertEqual(collect.normalize_workloads(dump_of(d)), [])
+
+    def test_a_workload_owned_by_a_crd_is_still_audited(self):
+        """S3 defers to the owning controller. A CRD is not a controller this
+        audit ever reads, so deferring to it drops the finding instead of
+        moving it — which is how the harness's own gateway went permanently
+        unaudited in the one namespace S1 keeps in scope on purpose."""
+        d = deployment("platform-agent-gateway", ns="kubeagents-system")
+        d["metadata"]["ownerReferences"] = [
+            {"apiVersion": "kubeagents.x-k8s.io/v1alpha1", "kind": "PlatformAgent", "name": "platform-agent"}
+        ]
+        out = collect.normalize_workloads(dump_of(d))
+        self.assertEqual([w["name"] for w in out], ["platform-agent-gateway"])
+
+    def test_a_crd_that_borrows_a_builtin_kind_name_does_not_suppress(self):
+        """`Job` in someone else's API group is a custom resource wearing the
+        name, and nothing about it is reachable from this dump."""
+        d = deployment("look-alike")
+        d["metadata"]["ownerReferences"] = [{"apiVersion": "acme.example.com/v1", "kind": "Job", "name": "x"}]
+        self.assertEqual([w["name"] for w in collect.normalize_workloads(dump_of(d))], ["look-alike"])
+
+    def test_one_builtin_owner_is_enough_to_suppress(self):
+        d = deployment("two-owners")
+        d["metadata"]["ownerReferences"] = [
+            {"apiVersion": "acme.example.com/v1", "kind": "Widget", "name": "w"},
+            {"apiVersion": "apps/v1", "kind": "Deployment", "name": "d"},
+        ]
+        self.assertEqual(collect.normalize_workloads(dump_of(d)), [])
+
     def test_the_opt_out_label_is_excluded(self):
         d = deployment("exempted")
         d["metadata"]["labels"]["kubeagents.x-k8s.io/reliability-audit"] = "exempt"
