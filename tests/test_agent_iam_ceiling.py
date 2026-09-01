@@ -88,34 +88,45 @@ SUBNET_UTILIZATION_PERMISSIONS = [
     "recommender.networkAnalyzerIpAddressInsights.get",
 ]
 
-# Verbs that make a permission a write, or hand over someone else's identity.
-# Checked as the last dot-separated segment of every permission in every custom
-# role in the tree, so a second custom role added later is covered without
-# editing the pin above.
+# Verbs that make a permission a read. Checked as the last dot-separated
+# segment of every permission in every custom role in the tree, so a second
+# custom role added later is covered without editing the pin above.
+#
+# An allowlist, because the denylist this replaced could only refuse the writes
+# somebody had thought of. It named `setIamPolicy`, `setMetadata` and
+# `setLabels` and so admitted `container.clusters.setMasterAuth`,
+# `compute.instances.setServiceAccount`, `compute.instances.attachDisk`,
+# `compute.networks.addPeering`, and the RBAC-escalation pair
+# `clusterRoles.bind` / `.escalate` -- a ceiling test that green-lit rewriting
+# the cluster's admin credentials. GCP's write verbs are an open set and its
+# read verbs are not, so the refusal has to be the default.
 #
 # The impersonation half is not optional garnish: FORBIDDEN_ROLES already names
 # `roles/iam.serviceAccountTokenCreator`, and a custom role holding that role's
 # permissions grants the same thing under a name this file has never heard of.
-# All five of its permissions are listed for that reason.
-FORBIDDEN_PERMISSION_VERBS = {
-    "create",
-    "delete",
-    "update",
-    "patch",
-    "start",
-    "stop",
-    "reset",
-    "setIamPolicy",
-    "setMetadata",
-    "setLabels",
-    "impersonate",
-    "actAs",
-    "getAccessToken",
-    "getCredentials",
-    "getOpenIdToken",
-    "signBlob",
-    "signJwt",
-    "implicitDelegation",
+# None of `actAs`, `getAccessToken`, `getCredentials`, `getOpenIdToken`,
+# `signBlob`, `signJwt` or `implicitDelegation` is a read, so all seven are
+# refused here without being named -- note that `getAccessToken` is its own
+# verb and not the bare `get` below.
+READ_PERMISSION_VERBS = {
+    "get",
+    "list",
+    "aggregatedList",
+    "getIamPolicy",
+    "queryTestablePermissions",
+    "search",
+    "watch",
+    "check",
+}
+
+# The one non-read this repository grants on purpose, spelled out in full
+# rather than as a verb: `use` authorizes attaching a NIC, a node pool or a
+# load balancer to a subnet, so exempting the verb would exempt it on every
+# resource type. `terraform/modules/kube-agents-iam/main.tf` and the site's
+# `reference/security-and-iam.md` both argue for this one grant; adding a
+# second entry here is the moment to make the same argument in public.
+ALLOWED_NON_READ_PERMISSIONS = {
+    "compute.subnetworks.use",
 }
 
 # Values a human or a stale vars.sh might plausibly carry. Everything here that
@@ -585,12 +596,55 @@ class TerraformCustomRolePermissionsTest(unittest.TestCase):
         for name, perms in roles.items():
             for perm in perms:
                 with self.subTest(role=name, permission=perm):
-                    self.assertNotIn(
+                    if perm in ALLOWED_NON_READ_PERMISSIONS:
+                        continue
+                    self.assertIn(
                         perm.rsplit(".", 1)[-1],
-                        FORBIDDEN_PERMISSION_VERBS,
-                        f"custom role {name} grants {perm}, which authorizes the agent "
-                        "through IAM independently of its Kubernetes RBAC",
+                        READ_PERMISSION_VERBS,
+                        f"custom role {name} grants {perm}, which is not a read and is "
+                        "not in ALLOWED_NON_READ_PERMISSIONS -- it would authorize the "
+                        "agent through IAM independently of its Kubernetes RBAC. Add it "
+                        "there with the argument for it, or drop the permission.",
                     )
+
+    def test_the_verbs_a_denylist_would_have_missed_are_refused(self):
+        """The regression this allowlist exists for, held down by name.
+
+        Each of these passed the denylist that shipped before it. They are not
+        hypothetical shapes: `setMasterAuth` rewrites a cluster's admin
+        credentials, `setServiceAccount` re-identifies a VM, and
+        `clusterRoles.escalate` is the permission that removes the RBAC ceiling
+        the rest of this file rests on.
+        """
+        for perm in (
+            "container.clusters.setMasterAuth",
+            "compute.instances.setServiceAccount",
+            "compute.instances.attachDisk",
+            "compute.networks.addPeering",
+            "container.pods.exec",
+            "container.clusterRoles.bind",
+            "container.clusterRoles.escalate",
+            "storage.objects.setRetention",
+        ):
+            with self.subTest(permission=perm):
+                self.assertNotIn(perm, ALLOWED_NON_READ_PERMISSIONS)
+                self.assertNotIn(perm.rsplit(".", 1)[-1], READ_PERMISSION_VERBS)
+
+    def test_every_permission_the_module_grants_today_is_accounted_for(self):
+        """The allowlist must not be so tight that the shipped role fails it.
+
+        A guard that refuses the thing the repository actually installs gets
+        widened in a hurry, and widening under time pressure is how a denylist
+        got here. Pinning the current three keeps that pressure visible in a
+        diff instead.
+        """
+        for perm in SUBNET_UTILIZATION_PERMISSIONS:
+            with self.subTest(permission=perm):
+                self.assertTrue(
+                    perm in ALLOWED_NON_READ_PERMISSIONS
+                    or perm.rsplit(".", 1)[-1] in READ_PERMISSION_VERBS,
+                    f"{perm} is granted by the module but refused by this test",
+                )
 
 
 class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
