@@ -6408,6 +6408,91 @@ class TestReportStore(HarnessTestCase):
         blocks = self.relink_drops_a_finding()
         self.assertEqual(self.stored_envelope()["current_ids"], blocks[0])
 
+    def squeeze_one_finding_out_of_the_body(self, doc):
+        """Charge the body budget so `doc`'s lower-severity finding will not fit.
+
+        Probed against the real renderer rather than computed: the body carries
+        a header, a coverage table and a hidden block whose sizes are none of
+        this test's business, and a hard-coded budget would drift into
+        vacuously-true the first time any of them changed.
+        """
+        audit_report.validate_findings(doc, AUDIT)
+        plain = dict(
+            generated_at=NOW,
+            audit_id=AUDIT,
+            states={str(f["id"]): "open" for f in doc["findings"]},
+        )
+
+        def fitted(budget):
+            with patch.object(audit_report, "BODY_BUDGET", budget):
+                return len(audit_report.render_issue_body(doc, **plain).rendered_ids)
+
+        self.assertEqual(fitted(audit_report.BODY_BUDGET), 2)
+        low, high = 0, audit_report.BODY_BUDGET
+        while low < high:
+            middle = (low + high) // 2
+            if fitted(middle) == 2:
+                high = middle
+            else:
+                low = middle + 1
+        # One below the tightest budget that seats both. The critical is
+        # rendered first, so what is left is the one-finding body this test
+        # needs -- asserted, because a budget that seated *neither* would make
+        # the resolution assertion below pass for the wrong reason.
+        self.patch_attr("BODY_BUDGET", low - 1)
+        self.assertEqual(fitted(low - 1), 1, "the squeeze left no findings at all")
+
+    def test_a_finding_cut_for_space_is_not_reported_as_resolved(self):
+        """Truncation is not remediation.
+
+        A finding the previous run published and this run still detects has not
+        been fixed just because this run's body had no room to reprint it.
+        Announcing it resolved retracts a live finding in writing -- and on a
+        security check, tells a reader an exposure is gone while it is still
+        there.
+
+        `compute_delta` already refuses this, and its own tests cover the
+        refusal. What none of them can see is the call site: resolution is
+        judged against the *detected* set only because `finish` passes
+        `current_ids` as the third argument, and passing `rendered.rendered_ids`
+        instead -- the set two lines above it, and the right answer for the
+        `new` half -- puts the retraction straight back with the whole suite
+        green. This is the test that fails when it does.
+        """
+        doc = make_doc(
+            findings=[
+                make_finding(),
+                make_finding(
+                    fid="wide-rbac",
+                    severity="minor",
+                    title="Wildcard RBAC verb",
+                    check="wildcard-rbac",
+                ),
+            ]
+        )
+        # Seeded before the squeeze: the previous run published both, which is
+        # what makes the dropped one a candidate for a false resolution rather
+        # than a finding the ledger never knew.
+        seeded = self.seed_store(doc)
+        self.assertEqual(len(seeded["current_ids"]), 2)
+        self.squeeze_one_finding_out_of_the_body(doc)
+
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_finish(doc), 0)
+
+        stored = self.stored_envelope()
+        self.assertEqual(
+            len(stored["current_ids"]),
+            1,
+            "the fixture no longer truncates, so this test cannot tell the "
+            "detected set from the rendered one",
+        )
+        self.assertEqual(stored["resolved_ids"], [])
+        # And the run still knows about it: the store keeps the whole detected
+        # set in `document`, which is where tomorrow's `all_previous_ids` comes
+        # from. A body that dropped a finding must not drop the memory of it.
+        self.assertEqual(len(stored["document"]["findings"]), 2)
+
     def test_a_clean_run_that_closed_its_ledger_stores_no_rendered_ids(self):
         """A clean run publishes no findings section, so there is nothing for
         the next run to measure `new` against — and the next run, finding no
