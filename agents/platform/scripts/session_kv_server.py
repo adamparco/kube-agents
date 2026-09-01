@@ -1669,17 +1669,30 @@ def relay_cron_report(
     # did.
     all_targets = enabled_platforms() or [active_platform]
     handled = {str(name).strip().lower() for name in also_delivered_to if str(name).strip()}
-    targets = [p for p in all_targets if p not in handled] or all_targets
+    remaining = [p for p in all_targets if p not in handled]
+    targets = remaining or all_targets
     if len(targets) < len(all_targets):
         logger.info(
             f"Relay for {profile}/{job_id}: skipping "
             f"{', '.join(sorted(set(all_targets) - set(targets)))} — the job's own deliver "
             f"value posts the raw report there"
         )
-    elif handled:
+    elif not remaining:
         logger.info(
             f"Relay for {profile}/{job_id}: the job's deliver value claims every platform "
             f"({', '.join(sorted(handled))}); relaying anyway rather than risk sending nothing"
+        )
+    elif handled:
+        # `remaining == all_targets` with a non-empty `handled` is the third
+        # case, and it read as the second: the subtraction removed nothing, so
+        # the branch above logged "claims every platform (telegram)" about a
+        # value that claimed one platform this install does not run. Which is
+        # the interesting one -- a deliver value naming a platform that is not
+        # enabled here posts nowhere, and the log said the opposite.
+        logger.info(
+            f"Relay for {profile}/{job_id}: the job's deliver value names "
+            f"{', '.join(sorted(handled))}, none of which this install has enabled "
+            f"({', '.join(sorted(all_targets))}); relaying to all of them"
         )
 
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")

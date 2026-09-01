@@ -2596,6 +2596,37 @@ class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
         _, sender, _ = self._post(["telegram", "discord"])
         self.assertEqual(self._sent_to(sender), ["slack", "google_chat"])
 
+    def test_an_unenabled_platform_is_logged_as_that_and_not_as_full_coverage(self):
+        """Two different things leave the fan-out at its full width, and the log
+        collapsed them into the more reassuring one.
+
+        `handled` covering every enabled platform is the floor holding; `handled`
+        naming only platforms this install does not run is a deliver value that
+        posts nowhere. Both leave `targets == all_targets`, so the second was
+        reported as "claims every platform (telegram)" -- a sentence that names
+        the symptom of the interesting case and asserts the boring one.
+        """
+        with self.assertLogs("session_kv_server", level="INFO") as captured:
+            self._post(["telegram"])
+        line = next(m for m in captured.output if "deliver value" in m)
+        self.assertIn("none of which this install has enabled", line)
+        self.assertIn("telegram", line)
+        self.assertNotIn("claims every platform", line)
+
+    def test_covering_every_platform_still_logs_that_it_is_the_floor_holding(self):
+        with self.assertLogs("session_kv_server", level="INFO") as captured:
+            self._post(["slack", "google_chat"])
+        line = next(m for m in captured.output if "deliver value" in m)
+        self.assertIn("claims every platform", line)
+
+    def test_a_partial_sibling_set_logs_the_skip_and_neither_other_line(self):
+        with self.assertLogs("session_kv_server", level="INFO") as captured:
+            self._post(["google_chat"])
+        joined = "\n".join(captured.output)
+        self.assertIn("skipping google_chat", joined)
+        self.assertNotIn("claims every platform", joined)
+        self.assertNotIn("none of which this install has enabled", joined)
+
     def test_names_are_matched_the_way_the_registry_spells_them(self):
         _, sender, _ = self._post(["  Google_Chat  "])
         self.assertEqual(self._sent_to(sender), ["slack"])
