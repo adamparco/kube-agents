@@ -480,6 +480,32 @@ class TestStandaloneSend(unittest.TestCase):
         self.assertIn("was posted", error)
         self.assertIn("do not re-run", error.lower())
 
+    def test_a_runaway_detail_is_bounded_before_it_becomes_the_error(self):
+        """The error string is stored as `last_delivery_error`, once per run.
+
+        `_http_error_detail` bounds its own contribution at 200 characters for
+        that reason; `relay_detail` comes from the same route and lands in the
+        same field, so it takes the same bound. Left unbounded, a route that
+        echoes a stack trace or the report itself writes the whole thing into
+        the job record.
+        """
+        detail = "google_chat rejected the send: " + "x" * 5000
+        body = json.dumps(
+            {"status": "delivered", "relay": "degraded", "relay_detail": detail}
+        ).encode()
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        error = result["error"]
+        self.assertIn("google_chat rejected the send:", error)
+        self.assertNotIn("x" * 201, error)
+        # And the two things the string has always had to say survive the cut.
+        self.assertIn("was posted", error)
+        self.assertIn("do not re-run", error.lower())
+
     def test_a_degraded_relay_with_no_detail_keeps_the_sentence_it_had(self):
         """A route too old to send `relay_detail` had only the one cause.
 

@@ -399,10 +399,14 @@ def _relay_verdict(response) -> Tuple[str, str]:
     turn and a channel the send never reached, and only the route knows which
     happened and to which platform. A route too old to send it leaves ``""``,
     and the caller falls back to the sentence it used to print unconditionally.
+
+    Bounded at the same 200 characters as :func:`_http_error_detail`, and for
+    the same reason: this ends up inside the ``error`` string the scheduler
+    stores as ``last_delivery_error``, once per job run.
     """
     try:
         body = json.loads(response.read().decode("utf-8", "replace")) or {}
-        return str(body.get("relay") or ""), str(body.get("relay_detail") or "")
+        return str(body.get("relay") or ""), str(body.get("relay_detail") or "").strip()[:200]
     except Exception:
         return "", ""
 
