@@ -524,12 +524,18 @@ _REQUEST_RESOURCES = ("cpu", "memory")
 # §3.1's Impact, for the two arms where the sentence in `OBTAINABILITY_CHECKS`
 # is false. That sentence ends "its pods are the first evicted under node
 # pressure", which is a claim about QoS class, and only a BestEffort pod is
-# first. §3.1 flags a container missing `cpu` *or* `memory`, so most of what it
-# catches is not BestEffort at all: `kube-proxy` and `antrea-controller` ship on
-# every cluster in this fleet with a CPU request and no memory request. They are
-# Burstable, they are evicted after every BestEffort pod on the node, and an
-# owner told they are first goes looking for a pressure event that reached them
-# before it reached anything else.
+# first. §3.1 flags a container missing `cpu` *or* `memory`, so what it catches
+# need not be BestEffort at all, and an owner told their pod goes first goes
+# looking for a pressure event that reached it before it reached anything else.
+#
+# Note that the ubiquitous cpu-request-only workloads -- `kube-proxy`,
+# `antrea-controller` -- are *not* what these arms are for, however often they
+# get cited as the motivating case. They live in `kube-system`, S1 drops the
+# namespace before `check_no_requests` ever runs, and no finding for either can
+# exist. The arms serve user-namespace workloads in the same shape. All 7
+# findings on this fleet are BestEffort, so neither arm has a live instance
+# here; both were graded against the API server's own `status.qosClass`
+# instead, over all 79 workloads on the host cluster.
 #
 # The sentence is two independent halves: what the missing requests cost, and
 # what the pod's QoS class means. They vary separately -- a pod whose every

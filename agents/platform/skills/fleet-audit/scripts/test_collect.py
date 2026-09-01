@@ -231,8 +231,10 @@ class TestNoRequests(unittest.TestCase):
         self.assertNotIn("impact", self.check(self.wl(resources={})))
 
     def test_a_burstable_pod_is_not_called_first_evicted(self):
-        # The live shape: `kube-proxy` and `antrea-controller` run on every
-        # cluster in the fleet with a CPU request and no memory request.
+        # A cpu request and no memory request. Ubiquitous as a shape --
+        # `kube-proxy` and `antrea-controller` both ship it -- but never as a
+        # finding from those two, whose namespace S1 drops; this arm is for a
+        # user-namespace workload in the same shape.
         hit = self.check(self.wl(resources={"requests": {"cpu": "100m"}}))
         self.assertIn("Burstable, not BestEffort", hit["impact"])
         self.assertIn("memory goes unreserved", hit["impact"])
