@@ -35,6 +35,7 @@ _STANDARD_ROLES = [
 ]
 
 _ADMIN_ROLES = [
+    "roles/iam.roleAdmin",
     "roles/iam.serviceAccountAdmin",
     "roles/resourcemanager.projectIamAdmin",
     "roles/pubsub.admin",
@@ -134,6 +135,62 @@ class SetupGcpGithubWifTest(unittest.TestCase):
                 admin_block,
                 f"Base role '{role}' unexpectedly found in admin ROLES+= array of {_WIF_SCRIPT}",
             )
+
+
+class CustomRoleNeedsRoleAdminTest(unittest.TestCase):
+    """A Terraform module that *defines* a custom role needs `iam.roles.create`.
+
+    `roles/resourcemanager.projectIamAdmin` -- what every installer principal
+    used to get, on the reasoning that the IAM module "binds and unbinds
+    project IAM policies" -- carries no `iam.roles.*` permission whatsoever.
+    That was true for as long as the module only bound predefined roles. The
+    moment one `google_project_iam_custom_role` appeared, apply and destroy
+    both started failing PERMISSION_DENIED for every principal short of Owner,
+    and nothing in the tree said so: the grant lists and the module that
+    outgrew them are four directories apart.
+
+    So this asserts the join rather than the two ends of it. Adding a custom
+    role to any module fails here until the grant follows, which is the
+    direction the mistake actually travels -- nobody removes `roleAdmin`; they
+    add a resource that needs it.
+    """
+
+    #: Grant sites, and the literal each one writes a role as. Both are
+    #: installer principals that run `terraform apply` on the composition.
+    _GRANT_SITES = (
+        (_REPO_ROOT / "k8s-operator" / "scripts" / "dev" / "setup-gcp-github-wif.sh", '"roles/iam.roleAdmin"'),
+        (_REPO_ROOT / "scripts" / "provision_ci_pool_project.sh", "roles/iam.roleAdmin"),
+        (_REPO_ROOT / "scripts" / "verify_ci_pool_project.py", '"roles/iam.roleAdmin"'),
+    )
+
+    def _modules_defining_a_custom_role(self) -> list[pathlib.Path]:
+        return sorted(
+            path
+            for path in (_REPO_ROOT / "terraform").rglob("*.tf")
+            if "google_project_iam_custom_role" in path.read_text()
+        )
+
+    def test_a_module_defines_a_custom_role(self):
+        """Guards the test below: with no custom role anywhere, it proves nothing."""
+        self.assertTrue(
+            self._modules_defining_a_custom_role(),
+            "No terraform/**/*.tf declares google_project_iam_custom_role, so the grant "
+            "assertion below would pass vacuously. Delete both tests, or fix the glob.",
+        )
+
+    def test_every_installer_principal_can_create_it(self):
+        defining = self._modules_defining_a_custom_role()
+        for path, literal in self._GRANT_SITES:
+            with self.subTest(grant_site=path.relative_to(_REPO_ROOT).as_posix()):
+                self.assertIn(
+                    literal,
+                    path.read_text(),
+                    f"{path.relative_to(_REPO_ROOT)} grants no roles/iam.roleAdmin, but "
+                    f"{', '.join(p.relative_to(_REPO_ROOT).as_posix() for p in defining)} "
+                    f"declares a google_project_iam_custom_role. projectIamAdmin cannot "
+                    f"create one -- it holds no iam.roles.* permission -- so terraform "
+                    f"apply fails PERMISSION_DENIED for this principal.",
+                )
 
 
 if __name__ == "__main__":

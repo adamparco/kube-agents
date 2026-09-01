@@ -160,6 +160,13 @@ PROW_RUNNER_ROLES = {
     "roles/cloudbuild.builds.viewer",
     "roles/container.admin",
     "roles/container.developer",
+    # Derived rather than measured, unlike the rest of this set: the
+    # kube-agents-iam module defines a custom role, and projectIamAdmin below
+    # carries no iam.roles.* permission, so a project without this fails
+    # terraform apply. A project provisioned before the role was added holds
+    # everything else and still cannot run an install -- reporting that is the
+    # point, so it is listed here rather than left to the script alone.
+    "roles/iam.roleAdmin",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
