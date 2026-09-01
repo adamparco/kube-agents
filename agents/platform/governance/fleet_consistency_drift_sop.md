@@ -79,14 +79,21 @@ For each cohort `C` (size ≥ 3) and each facet `F`:
 5. **Confidence to severity.** Start at the facet's base severity and walk down the ladder `critical > major > minor`: `r < 0.90` → one step; `r < 0.80` → one further step (cumulative); `k >= 3` → one step (three-plus divergent clusters is an undeclared cohort, not an outlier); the outlier's or the baseline's cohort membership rests on an **inferred** environment → one step. If the result falls below `minor`, **drop the finding.** A base-`major` facet at `r = 0.71` therefore disappears while a base-`critical` facet at `r = 0.71` survives as `minor`. That is intended: a weak majority only earns an admin's attention when the stake is high.
 6. **Split-cluster guard.** If one cluster is an outlier on **6 or more** facets it is not drifting, it is a different kind of cluster. Suppress its individual facet findings and emit one `major` finding with `check: uncohorted` against that cluster, naming them, so the admin fixes the cohort labelling instead of twelve symptoms.
 7. **Identity is derived — do not write an `id`.** The harness builds it from `check`, `cluster`, `namespace` and `object`, and ignores any `id` in the file. Set `check` to the slug backticked in the facet's §4 heading — a section covering several facets backticks one slug per facet, in the order its **Read** bullet lists them — and `object` to `Cluster/<name>`. The split-cluster finding in step 6 uses `check: uncohorted`; it is the one slug here that is not a facet, and no cluster is ever asked to run it. Never let counts, ratios, dates, or severities into any of the four: the delta depends on the same drift keeping the same identity between runs, and drift that changes identity is announced as fixed.
-8. **Every finding shows its work.** `evidence.excerpt` opens with these four labelled lines — the harness clips excerpts at 40 lines / 2000 characters, so they go first and the raw JSON fragment follows. Without them the audit reads as an oracle and gets ignored:
+8. **Every finding shows its work.** `evidence.excerpt` opens with these labelled lines — the harness clips excerpts at 40 lines / 2000 characters, so they go first and the raw JSON fragment follows. Without them the audit reads as an oracle and gets ignored:
 
 ```
 baseline: <field path>=<t*> in <m>/<n> clusters of cohort <mode>/<env>
 peers: <up to 6 cluster names>, +<N> more
 observed: <token>  (<raw JSON fragment or "key absent">)
+missing: <baseline tokens this cluster does not carry>
 consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "none">)
 ```
+
+`missing:` appears only on the set-valued facets — `logging-components`,
+`monitoring-components`, `label-keys`, `image-type` — because only there is the
+finding a set difference. It is that difference, taken by the same predicate
+that decided to flag, so a title or recommendation naming anything else is
+wrong about its own evidence.
 
 ### 4. Facet comparison
 
@@ -153,7 +160,7 @@ Every facet reads only GKE control-plane and node-pool metadata through `gcloud 
 #### 4.6 Logging and monitoring component sets (`logging-components`, `monitoring-components`, `managed-prometheus`)
 
 - **Read:** three facets. `.loggingConfig.componentConfig.enableComponents[]` and `.monitoringConfig.componentConfig.enableComponents[]` are list-valued: deduplicate, sort ascending lexicographically, join with `,` — that canonical ordering is what makes them comparable, and an absent config, an absent `enableComponents`, and an empty list all become `NONE`. `.monitoringConfig.managedPrometheusConfig.enabled` → `ON`/`OFF`.
-- **Do NOT flag:** a cluster whose set is a strict **superset** of the baseline — collecting more telemetry than peers is not drift. Flag subsets and disjoint sets, and name the missing components. The same holds for `managed-prometheus`, which is the one facet here that is not set-valued: only `OFF` against an `ON` majority is a finding, never `ON` against an `OFF` one.
+- **Do NOT flag:** a cluster whose set is a strict **superset** of the baseline — collecting more telemetry than peers is not drift. Flag subsets and disjoint sets, and name the missing components — **every** one on the candidate's `missing:` line, which the collector computed from the same set difference that decided the finding. Do not re-derive that list from `baseline:` and `observed:`, and do not shorten it: a cluster observed `NONE` is missing the whole baseline, and a title naming one component of two reads as though the other still worked. The same holds for `managed-prometheus`, which is the one facet here that is not set-valued: only `OFF` against an `ON` majority is a finding, never `ON` against an `OFF` one.
 - **Severity:** base `major` when the outlier is missing `SYSTEM_COMPONENTS`, otherwise base `minor`.
 - **Impact:** the outlier is invisible to fleet dashboards and alerts built on the peers' component set.
 - **Remediation:** `gcloud` — `gcloud container clusters update … --logging=<t* comma list> --monitoring=<t* comma list>`.

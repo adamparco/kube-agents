@@ -422,10 +422,34 @@ def _flag_less_only(observed: str, baseline: str) -> bool:
     return rank.get(observed, 0) < rank.get(baseline, 0)
 
 
+def _tokens(value: str) -> set[str]:
+    return set(value.split(",")) if value != "NONE" else set()
+
+
 def _flag_not_superset(observed: str, baseline: str) -> bool:
-    base_set = set(baseline.split(",")) if baseline != "NONE" else set()
-    obs_set = set(observed.split(",")) if observed != "NONE" else set()
-    return not obs_set.issuperset(base_set)
+    return not _tokens(observed).issuperset(_tokens(baseline))
+
+
+def _missing_tokens(observed: str, baseline: str) -> list[str]:
+    """The baseline tokens the outlier does not carry.
+
+    `_flag_not_superset` computes this difference to decide and throws it away,
+    leaving the model to re-derive it from `observed` and `baseline` in order to
+    write a title. It got that derivation wrong on the live fleet:
+    `drift-peer-std-4` observed `NONE` against a `SYSTEM_COMPONENTS,WORKLOADS`
+    baseline and published as "logging component set missing WORKLOADS relative
+    to its cohort" -- one of the two missing components, reading as though system
+    logging still worked. The cluster carried `loggingService: none` and logged
+    nothing at all. Two lines below, the same finding's excerpt said
+    `observed: NONE` and its impact line said "no logging component config at
+    all", so the title contradicted its own evidence, and the title is the line a
+    reader sees first and the one the ledger's finding table shows.
+
+    Meaningful only for the `_flag_not_superset` facets, whose tokens are
+    comma-joined sets; the call site passes `None` for the rest rather than
+    emitting a line whose set framing does not apply to an `ON`/`OFF` facet.
+    """
+    return sorted(_tokens(baseline) - _tokens(observed))
 
 
 def _logging_severity(observed: str) -> str:
@@ -504,14 +528,16 @@ def apply_severity_ladder(base: str, r: float, k: int, inferred: bool) -> tuple[
     return SEVERITY_LEVELS[idx], applied
 
 
-def build_excerpt(field_path: str, t_star: str, m: int, n: int, cohort_label: str, peer_names: list[str], observed: str, sev: str, base_sev: str, downgrades: list[str], r: float) -> str:
+def build_excerpt(field_path: str, t_star: str, m: int, n: int, cohort_label: str, peer_names: list[str], observed: str, sev: str, base_sev: str, downgrades: list[str], r: float, missing: list[str] | None = None) -> str:
     peers = peer_names[:6]
     more = f", +{len(peer_names) - 6} more" if len(peer_names) > 6 else ""
     downgrade_text = ", ".join(downgrades) if downgrades else "none"
+    missing_line = f"missing: {', '.join(missing)}\n" if missing else ""
     return (
         f"baseline: {field_path}={t_star} in {m}/{n} clusters of cohort {cohort_label}\n"
         f"peers: {', '.join(peers)}{more}\n"
         f"observed: {observed}\n"
+        f"{missing_line}"
         f"consensus: {r:.2f} -> severity {sev} (base {base_sev}, {downgrade_text})"
     )
 
@@ -815,7 +841,11 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                 sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)
                 if sev is None:
                     continue
-                excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, peer_names, observed, sev, base_sev, downgrades, r)
+                # Only the set-valued facets have a "missing" to name, and
+                # `_flag_not_superset` is exactly the predicate that says so:
+                # it is the gate that already took this difference.
+                missing = _missing_tokens(observed, t_star) if facet.should_flag is _flag_not_superset else None
+                excerpt = build_excerpt(facet.field_path, t_star, m, n, cohort_label, peer_names, observed, sev, base_sev, downgrades, r, missing)
                 candidates[ckey(c)].append(_emit(facet.slug, name, excerpt, sev))
                 outlier_facet_count[ckey(c)] += 1
 

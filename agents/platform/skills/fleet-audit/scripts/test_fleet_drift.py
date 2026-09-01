@@ -775,6 +775,53 @@ class InferredEnvironmentTest(unittest.TestCase):
         self.assertIn("inferred environment", found[0]["excerpt"])
 
 
+class MissingTokensTest(unittest.TestCase):
+    """§3.8's `missing:` line, so a title does not have to re-derive the set
+    difference the gate already took.
+
+    Live case, `drift-peer-std-4` on 2026-09-01: logging off entirely against a
+    `SYSTEM_COMPONENTS,WORKLOADS` cohort, published as "logging component set
+    missing WORKLOADS relative to its cohort" -- one of the two, reading as
+    though system logging still worked.
+    """
+
+    @staticmethod
+    def _cohort(outlier_logging):
+        fleet = [cluster(f"peer{i}", labels={"team": "x"}) for i in range(9)]
+        fleet.append(cluster("odd", labels={"team": "x"}, **{"loggingConfig.componentConfig": outlier_logging}))
+        return fleet
+
+    def _logging_finding(self, outlier_logging):
+        _, candidates = fd.compute_drift(self._cohort(outlier_logging), now=NOW)
+        found = [c for c in candidates[K("odd")] if c["check"] == "logging-components"]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_a_cluster_with_no_logging_at_all_is_missing_the_whole_baseline(self):
+        found = self._logging_finding({})
+        self.assertIn("observed: NONE", found["excerpt"])
+        self.assertIn("missing: SYSTEM_COMPONENTS, WORKLOADS", found["excerpt"])
+        # Missing SYSTEM_COMPONENTS is the `major` leg of `_logging_severity`,
+        # and r = 9/10 = 0.90 clears the `r < 0.90` step, so nothing downgrades.
+        self.assertEqual(found["severity"], "major")
+
+    def test_a_partial_set_names_only_what_it_actually_lacks(self):
+        found = self._logging_finding({"enableComponents": ["SYSTEM_COMPONENTS"]})
+        self.assertIn("missing: WORKLOADS", found["excerpt"])
+        self.assertNotIn("SYSTEM_COMPONENTS,", found["excerpt"].split("missing: ")[1])
+        self.assertEqual(found["severity"], "minor")
+
+    def test_a_facet_that_is_not_set_valued_gets_no_missing_line(self):
+        fleet = [cluster(f"peer{i}", labels={"team": "x"}) for i in range(9)]
+        fleet.append(cluster("odd", labels={"team": "x"}, **{"shieldedNodes.enabled": False}))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        found = [c for c in candidates[K("odd")] if c["check"] == "shielded-nodes"]
+        self.assertEqual(len(found), 1)
+        # `ON`/`OFF` is not a set, so "missing: ON" would assert a shape the
+        # facet does not have.
+        self.assertNotIn("missing:", found[0]["excerpt"])
+
+
 class PoolShapeTest(unittest.TestCase):
     """§4.8: do not flag single-pool clusters against multi-pool peers."""
 
