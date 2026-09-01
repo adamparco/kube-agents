@@ -439,19 +439,25 @@ platformAgent:
       #
       # Autopilot ships the RuntimeClass natively (GKE 1.27.4-gke.800 and
       # later). A Standard cluster needs the sandbox node pool that the
-      # gke-cluster module's enable_gvisor_node_pool creates; without it the
-      # operator refuses to write the agent Deployment and reports
-      # RuntimeClassNotFound on the PlatformAgent. Set "" to omit the field and
-      # run on the standard container runtime.
+      # gke-cluster module's enable_gvisor_node_pool creates. Note that on GKE
+      # the RuntimeClass object itself is a cluster addon and is present either
+      # way -- what a Standard cluster without the pool lacks is a node
+      # carrying sandbox.gke.io/runtime=gvisor, which is the thing the operator
+      # checks. Set "" to omit the field and run on the standard container
+      # runtime.
       #
       # The Terraform composition always passes this explicitly (from
       # agent_runtime_class, which install.sh derives from --gvisor), so this
       # default is what a direct `helm install` gets -- and what a `helm
       # upgrade` of a release that never set the key adopts, since Helm merges
-      # the new chart's defaults. That upgrade path fails quietly where the
-      # RuntimeClass is missing: the operator stops before reconciling the
-      # workload, so the previous unsandboxed Deployment keeps running while
-      # .status says Degraded. See the chart README's Usage section.
+      # the new chart's defaults. On that upgrade path the operator stops
+      # before reconciling the workload rather than replacing a running agent
+      # with a Pod that cannot be scheduled: the previous unsandboxed
+      # Deployment keeps running and .status says Degraded, with reason
+      # RuntimeClassNotFound where the object is absent and
+      # RuntimeClassUnschedulable where it exists but no node matches it. On a
+      # first install there is nothing to protect, so the workload is written
+      # and its Pod waits Pending. See the chart README's Usage section.
       runtimeClassName: "gvisor"
     # Extra environment for the agent container, applied after the operator's own
     # values so it overrides them. Telemetry is the case this exists for, though
