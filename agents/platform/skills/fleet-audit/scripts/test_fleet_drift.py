@@ -822,6 +822,41 @@ class MissingTokensTest(unittest.TestCase):
         self.assertNotIn("missing:", found[0]["excerpt"])
 
 
+class PeerListTest(unittest.TestCase):
+    """`peers:` names the clusters holding the baseline, not every cluster that
+    voted.
+
+    Live case, `drift-peer-std-4` on 2026-09-01: the excerpt said the baseline
+    held "in 9/10 clusters", then listed 10 names -- one of them
+    `drift-peer-std-4` itself, whose `observed:` line directly underneath said
+    it did not hold the baseline. Sorting put the outlier first as often as not,
+    so the first name a reader saw in the comparison set was the cluster being
+    compared.
+    """
+
+    @staticmethod
+    def _peers_line(excerpt):
+        return next(line for line in excerpt.splitlines() if line.startswith("peers:"))
+
+    def _logging_excerpt(self):
+        fleet = [cluster(f"peer{i}", labels={"team": "x"}) for i in range(9)]
+        fleet.append(cluster("odd", labels={"team": "x"}, **{"loggingConfig.componentConfig": {}}))
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        found = [c for c in candidates[K("odd")] if c["check"] == "logging-components"]
+        self.assertEqual(len(found), 1)
+        return found[0]["excerpt"]
+
+    def test_the_outlier_is_not_listed_among_the_peers_it_differs_from(self):
+        excerpt = self._logging_excerpt()
+        self.assertIn("in 9/10 clusters", excerpt)
+        self.assertNotIn("odd", self._peers_line(excerpt))
+
+    def test_the_peer_count_agrees_with_the_baseline_count_above_it(self):
+        # 9 hold the baseline, 6 are printed, so the overflow is 3. Counting all
+        # 10 voters printed "+4 more" beside a line claiming 9.
+        self.assertIn("+3 more", self._peers_line(self._logging_excerpt()))
+
+
 class PoolShapeTest(unittest.TestCase):
     """§4.8: do not flag single-pool clusters against multi-pool peers."""
 

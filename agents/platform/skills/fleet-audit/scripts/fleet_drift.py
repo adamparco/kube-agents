@@ -818,7 +818,15 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                 continue
             baseline_clusters = [c for c in voters if tokens[ckey(c)] == t_star]
             baseline_inferred = env_matters and any(env_of[ckey(c)][1] == "inferred" for c in baseline_clusters)
-            peer_names = sorted(c.get("name", "") for c in voters)
+            # The clusters that hold the baseline, not every cluster that voted.
+            # `peers:` sits one line under "in {m}/{n} clusters" and one line
+            # over the outlier's own `observed:`, so listing all `n` names
+            # contradicted both of its neighbours: it printed 10 names beside a
+            # claim that 9 clusters agree, and among them the very cluster the
+            # finding is about. A reader checking the comparison against
+            # `drift-peer-std-4 emits no logging components` found
+            # `drift-peer-std-4` in the list of clusters that do.
+            peer_names = sorted(c.get("name", "") for c in baseline_clusters)
             # §3.2 defines `k` as `n - m`, the count of voting members not on
             # the baseline token -- how split the cohort is. `len(outliers)` is
             # a different number wherever `should_flag` is narrower than "differs
