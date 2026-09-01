@@ -1,6 +1,11 @@
 import unittest
 
-from command_policy import evaluate, GCLOUD_READ_COMMANDS, _gcloud_words_and_flag
+from command_policy import (
+    evaluate,
+    GCLOUD_READ_COMMANDS,
+    _gcloud_asks_for_help,
+    _gcloud_words_and_flag,
+)
 
 
 def _gcloud_words(argv):
@@ -737,11 +742,33 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertEqual("gcp.read-only", decision.rule_id)
 
     def test_help_after_an_unknown_flag_is_still_unreadable(self):
-        """An unknown flag's arity is unknown, so nothing after it is trusted."""
+        """An unknown flag's arity is unknown, so nothing after it is trusted.
+
+        `_gcloud_words_and_flag` refuses first, so this grades the earlier gate
+        and never enters the help walker -- which is the right answer for
+        `evaluate` and no evidence at all about the walker. The next test grades
+        that separately.
+        """
         decision = evaluate(["gcloud", "--unknown-flag", "container", "clusters",
                              "delete", "--help"])
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.unreadable-command", decision.rule_id)
+
+    def test_the_help_walker_stops_at_an_unknown_flag_on_its_own(self):
+        """The walker's own fail-closed branch, reached directly.
+
+        Unreachable through `evaluate` today because the words parse runs first,
+        so nothing pins it there. It is the guarantee the walker's docstring
+        makes to any future second caller -- an unknown flag could take a value
+        and hide the `--help` that follows it, or hide one that is not there --
+        and an unpinned guarantee is one a refactor deletes without a failure.
+        """
+        self.assertFalse(_gcloud_asks_for_help(
+            ["gcloud", "--unknown-flag", "container", "clusters", "delete", "--help"]))
+        # The same argv without the unknown flag, to show the False above is the
+        # flag's doing and not a walk that finds no help anywhere.
+        self.assertTrue(_gcloud_asks_for_help(
+            ["gcloud", "container", "clusters", "delete", "--help"]))
 
     def test_help_buys_nothing_on_a_surface_that_mutates_local_state(self):
         """`auth`, `config` and `components` are outside the escape.
@@ -797,9 +824,67 @@ class GcloudReadOnlyTest(unittest.TestCase):
             # No surface word at all -- the one unambiguous documentation request.
             ["gcloud", "--help"],
             ["gcloud", "-h"],
+            # A track word and nothing after it is the same thing: a topic
+            # listing, naming no surface to exclude.
+            ["gcloud", "beta", "--help"],
         ):
             with self.subTest(argv=argv):
                 self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_a_release_track_does_not_walk_past_the_exclusion(self):
+        """`gcloud beta auth revoke` is `auth`, not `beta`.
+
+        The exclusion read the first word, and a track word stands where the
+        surface should be, so one prefix defeated it. Measured against the
+        deployed proxy on 2026-09-01: `gcloud auth revoke --help` was refused
+        and `gcloud beta auth revoke --help` was allowed. Two of the spellings
+        below -- `beta auth revoke` and every `config` verb -- are the cases the
+        exclusion's own comment says `credentialProxyPolicyJSON` does not name,
+        so the prefix walked around this module exactly where it was the only
+        gate.
+        """
+        for argv in (
+            ["gcloud", "beta", "auth", "revoke", "--help"],
+            ["gcloud", "alpha", "auth", "revoke", "--help"],
+            ["gcloud", "beta", "auth", "login", "--help"],
+            ["gcloud", "beta", "config", "set", "project", "elsewhere", "--help"],
+            ["gcloud", "alpha", "config", "unset", "project", "-h"],
+            ["gcloud", "beta", "components", "update", "--help"],
+            # A global flag ahead of the track, so the walk has to skip both.
+            ["gcloud", "--project", "p", "beta", "config", "set", "project", "x", "--help"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_a_release_track_still_gets_the_escape_on_every_other_surface(self):
+        """Looking past the track must not cost the escape its purpose.
+
+        The SOP that motivated the escape reads remediation flag syntax off
+        `container clusters update`, and it is `gcloud beta container clusters
+        update --help` as often as the GA spelling.
+        """
+        for argv in (
+            ["gcloud", "beta", "container", "clusters", "update", "my-cluster", "--help"],
+            ["gcloud", "alpha", "container", "clusters", "delete", "c", "-h"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_init_buys_nothing_from_help_either(self):
+        """`gcloud init` is `auth` and `config` in one word.
+
+        It runs an auth flow and rewrites the active configuration, which is the
+        criterion the other four are on the list for. Unlike them it was never
+        measured escaping -- gcloud short-circuited every `--help` tested -- so
+        this pins the exclusion rather than a fix to an observed hole.
+        """
+        for argv in (["gcloud", "init", "--help"], ["gcloud", "beta", "init", "-h"]):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual("gcp.read-only", decision.rule_id)
 
     def test_help_does_not_smuggle_a_file_write_or_an_identity_change(self):
         for argv, rule in (

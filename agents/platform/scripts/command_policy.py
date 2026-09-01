@@ -576,11 +576,13 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
 #: anything (`tests/test_agent_iam_ceiling.py` pins that ceiling). IAM is the
 #: backstop and the allowlist is defence in depth.
 #:
-#: These three have no IAM backstop. They change local state inside the pod --
-#: the active project, the active credentials, the installed toolchain -- and
-#: need no IAM permission to do it, so a short-circuit failure here is directly
+#: These have no IAM backstop. They change local state inside the pod -- the
+#: active project, the active credentials, the installed toolchain -- and need
+#: no IAM permission to do it, so a short-circuit failure here is directly
 #: exploitable and silently repoints or re-identifies every command that runs
-#: afterwards.
+#: afterwards. `init` is here for the same reason and not because anything
+#: measured it: it runs an auth flow and rewrites the active configuration,
+#: which is `auth` and `config` in one word.
 #:
 #: `credentialProxyPolicyJSON` in the operator covers part of this, and only
 #: part: it names `auth (login|activate-service-account)` and
@@ -593,11 +595,39 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
 #: exclusion is load-bearing here, not defence in depth, and a reader should not
 #: infer from the two rules above that the proxy already has this covered.
 #:
-#: Excluding them costs nothing anyone asked for: the SOP that motivated the
-#: escape wants flag syntax for `container clusters update`, and no skill in
-#: this repository runs `gcloud auth`, `gcloud config set`, or `gcloud
-#: components` at all.
-_NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config"})
+#: Excluding them costs nothing anyone asked for. The SOP that motivated the
+#: escape wants flag syntax for `container clusters update`. One skill does run
+#: one of these surfaces -- `gke-app-onboarding`'s SKILL.md runs `gcloud auth
+#: configure-docker <region>-docker.pkg.dev --quiet` -- but that is a bare
+#: invocation, not a `--help` read: the allowlist refused it before this escape
+#: existed and refuses it now, so the exclusion takes nothing away from it.
+_NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config", "init"})
+
+#: gcloud's release-track words, which precede the surface rather than being one.
+#:
+#: `gcloud beta auth revoke` is `auth revoke` on the beta track, so a surface
+#: test that reads the first word alone reads `beta` and matches nothing. That
+#: was the hole: measured on 2026-09-01, `gcloud auth revoke --help` was refused
+#: and `gcloud beta auth revoke --help` was allowed, and the same one-word
+#: prefix walked past the exclusion for `config set`, `config unset` and
+#: `components update`. Two of those -- `beta auth revoke` and every `config`
+#: verb -- are exactly the cases the block above says the proxy document does
+#: not cover, so the prefix defeated the exclusion precisely where it was the
+#: only gate.
+_GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+
+
+def _gcloud_surface(words: list[str]) -> str | None:
+    """The surface a gcloud argv addresses, looking past any release track.
+
+    Returns None when the argv names no surface at all -- bare `gcloud`, or a
+    track word with nothing after it. Both are topic listings, so a caller
+    testing membership in a deny set gets the same answer it gave before.
+    """
+    for word in words:
+        if word not in _GCLOUD_RELEASE_TRACKS:
+            return word
+    return None
 
 
 def _gcloud_asks_for_help(argv: list[str]) -> bool:
@@ -1059,10 +1089,11 @@ def evaluate(argv: list[str]) -> Decision:
 
         # After the words parse, so an unknown flag is still refused, and after
         # the three guards above, so --help cannot smuggle a file write or an
-        # identity change past them. `words[:1]` rather than `words[0]`: bare
-        # `gcloud --help` parses to no words at all and is the one form of this
-        # that is unambiguously a documentation request.
-        if _gcloud_asks_for_help(argv) and not set(words[:1]) & _NO_HELP_ESCAPE_SURFACES:
+        # identity change past them. `_gcloud_surface` rather than `words[0]`:
+        # bare `gcloud --help` parses to no words at all and is the one form of
+        # this that is unambiguously a documentation request, and a release
+        # track otherwise stands where the surface should be.
+        if _gcloud_asks_for_help(argv) and _gcloud_surface(words) not in _NO_HELP_ESCAPE_SURFACES:
             return _ALLOWED
 
         if not _gcloud_is_read_only(words):
