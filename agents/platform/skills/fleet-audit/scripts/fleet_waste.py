@@ -945,11 +945,26 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         billable = name in lb_ns or pvc_gib_by_ns.get(name, 0) > 0 or name in quota_ns
         if not billable:
             continue
-        severity = "major" if name in lb_ns or pvc_gib_by_ns.get(name, 0) >= 100 else "minor"
+        # Floor the capacity for the same reason `_whole_days` floors an age:
+        # this number sits next to a threshold. A namespace holding one
+        # 102000Mi PVC is 99.6 GiB, which `:.0f` printed as "100 GiB" while the
+        # severity gate -- reading the raw value -- graded it `minor`, so the
+        # excerpt asserted the threshold in the same sentence the severity
+        # denied it. Gate on the floored number too: `floor(x) >= 100` and
+        # `x >= 100` are the same test, and reading one value twice is what
+        # makes the two impossible to disagree again.
+        gib = pvc_gib_by_ns.get(name, 0)
+        whole_gib = int(gib)
+        # "<1" rather than "0" when there really is a claim: flooring a 500Mi
+        # PVC to "0 GiB of PVCs" would deny the storage that made the namespace
+        # billable three lines up. A namespace billable only through a
+        # LoadBalancer or a ResourceQuota holds no PVCs and still prints "0".
+        gib_text = str(whole_gib) if whole_gib or not gib else "<1"
+        severity = "major" if name in lb_ns or whole_gib >= 100 else "minor"
         hits.append(
             {
                 "object": f"Namespace/{name}",
-                "excerpt": f"no Running/Pending pods for {_whole_days(age)}d; holds {'a LoadBalancer Service, ' if name in lb_ns else ''}{pvc_gib_by_ns.get(name, 0):.0f} GiB of PVCs",
+                "excerpt": f"no Running/Pending pods for {_whole_days(age)}d; holds {'a LoadBalancer Service, ' if name in lb_ns else ''}{gib_text} GiB of PVCs",
                 "severity": severity,
             }
         )

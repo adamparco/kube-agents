@@ -302,6 +302,13 @@ class OrphanPvTest(unittest.TestCase):
         pv = self.pv("Released", **{"status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z", "spec.capacity": {"storage": "500Gi"}})
         self.assertEqual(fw.check_orphan_pv(self.context([pv]), now=NOW)[0]["severity"], "major")
 
+    def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
+        # 30d 14h. The gate is 30, so this is the shape that matters: rounding
+        # to nearest printed "31d" and handed the model a number a day past a
+        # threshold it is entitled to quote back in a title.
+        pv = self.pv("Available", **{"metadata.creationTimestamp": "2026-07-01T10:00:00Z"})
+        self.assertIn("AGE=30d", fw.check_orphan_pv(self.context([pv]), now=NOW)[0]["excerpt"])
+
 
 class UnconsumedPvcTest(unittest.TestCase):
     def pvc(self, name="data", ns="default", phase="Bound", created="2026-01-01T00:00:00Z", capacity="10Gi"):
@@ -332,6 +339,11 @@ class UnconsumedPvcTest(unittest.TestCase):
     def test_does_not_flag_unbound(self):
         context = {"pods": [], "pvcs": [self.pvc(phase="Pending")], "statefulsets": []}
         self.assertEqual(fw.check_unconsumed_pvc(context, now=NOW), [])
+
+    def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
+        # 14d 14h, against a 14-day gate. See the matching case in OrphanPvTest.
+        context = {"pods": [], "pvcs": [self.pvc(created="2026-07-17T10:00:00Z")], "statefulsets": []}
+        self.assertIn("AGE=14d", fw.check_unconsumed_pvc(context, now=NOW)[0]["excerpt"])
 
 
 class IdleNodepoolTest(unittest.TestCase):
@@ -699,6 +711,35 @@ class IdleNamespaceTest(unittest.TestCase):
         ns_doc["metadata"]["annotations"]["configsync.gke.io/sync-name"] = "x"
         context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [ns_doc]}
         self.assertEqual(fw.check_idle_namespace(context, now=NOW), [])
+
+    def test_a_part_day_over_the_gate_reports_the_gate_not_the_day_after(self):
+        # 30d 14h, against a 30-day gate. See the matching case in OrphanPvTest.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "10Gi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo", created="2026-07-01T10:00:00Z")]}
+        self.assertIn("for 30d;", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+
+    def test_capacity_just_under_the_severity_gate_is_not_printed_as_the_gate(self):
+        # 102000Mi is 99.6 GiB. Rounding to nearest printed "100 GiB" while the
+        # gate read the raw value and graded `minor`, so one finding said the
+        # threshold was met and denied it in the same breath.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "102000Mi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        hit = fw.check_idle_namespace(context, now=NOW)[0]
+        self.assertIn("99 GiB of PVCs", hit["excerpt"])
+        self.assertEqual(hit["severity"], "minor")
+
+    def test_a_sub_gibibyte_claim_is_not_floored_away_to_zero(self):
+        # Flooring must not print "0 GiB of PVCs" about the very PVC that made
+        # the namespace billable; only a namespace billable through something
+        # other than storage gets a literal 0.
+        pvc = obj("PersistentVolumeClaim", "d", ns="demo", **{"status.capacity": {"storage": "500Mi"}})
+        context = {"pods": [], "pvcs": [pvc], "services": [], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertIn("<1 GiB of PVCs", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
+
+    def test_a_namespace_billable_only_by_a_loadbalancer_holds_zero(self):
+        svc = obj("Service", "lb", ns="demo", **{"spec.type": "LoadBalancer"})
+        context = {"pods": [], "pvcs": [], "services": [svc], "resourcequotas": [], "namespaces": [self.ns("demo")]}
+        self.assertIn("a LoadBalancer Service, 0 GiB of PVCs", fw.check_idle_namespace(context, now=NOW)[0]["excerpt"])
 
 
 class OverrequestTest(unittest.TestCase):
