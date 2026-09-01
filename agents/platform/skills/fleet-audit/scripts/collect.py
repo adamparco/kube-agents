@@ -519,25 +519,80 @@ def _effective_containers(workload: dict) -> list[dict]:
     return containers
 
 
+_REQUEST_RESOURCES = ("cpu", "memory")
+
+# §3.1's Impact, for the two arms where the sentence in `OBTAINABILITY_CHECKS`
+# is false. That sentence ends "its pods are the first evicted under node
+# pressure", which is a claim about QoS class, and only a BestEffort pod is
+# first. §3.1 flags a container missing `cpu` *or* `memory`, so most of what it
+# catches is not BestEffort at all: `kube-proxy` and `antrea-controller` ship on
+# every cluster in this fleet with a CPU request and no memory request. They are
+# Burstable, they are evicted after every BestEffort pod on the node, and an
+# owner told they are first goes looking for a pressure event that reached them
+# before it reached anything else.
+#
+# Keyed off what the check already computed rather than off the check firing at
+# all -- a fourth shape reaching here falls to the Burstable branch, which
+# claims the least.
+_IMPACT_LIMIT_BACKED = (
+    "Every missing request is backed by a limit on the same container, so "
+    "Kubernetes defaults the request to that limit at admission: the scheduler "
+    "reserves this workload at its ceiling rather than at its steady-state "
+    "size, and the pod is Guaranteed — the last thing evicted, not the first. "
+    "The cost is bin-packing headroom held against a peak that may never "
+    "arrive, and a reservation nobody wrote down and can review."
+)
+_IMPACT_BURSTABLE = (
+    "The scheduler and cluster autoscaler size this cluster without {resources} "
+    "for this workload, so a node can be packed past its real demand and this "
+    "pod's share of the cost cannot be attributed. It is Burstable, not "
+    "BestEffort — other containers here do declare a request — so the kubelet "
+    "evicts it after every BestEffort pod on the node, ranking it by how far "
+    "usage exceeds a request of zero."
+)
+
+
 def check_no_requests(workload: dict, context: dict) -> dict | None:
     limitranges = context["limitranges"]
     missing_by_container = {}
+    # Whether the pod is BestEffort, and whether a limit already covers every
+    # request the check is about to report missing. Both decide the Impact, and
+    # both are properties of the pod rather than of one container.
+    declares_something = False
+    unbacked_missing: set[str] = set()
     for container in _effective_containers(workload):
-        requests = ((container.get("resources") or {}).get("requests")) or {}
+        resources = container.get("resources") or {}
+        requests, limits = resources.get("requests") or {}, resources.get("limits") or {}
+        if requests or limits:
+            declares_something = True
         missing = [
             resource
-            for resource in ("cpu", "memory")
+            for resource in _REQUEST_RESOURCES
             if resource not in requests
             and not _has_default(limitranges, workload["ns"], "defaultRequest", resource)
         ]
+        # A limit with no request is not an unreserved resource: Kubernetes
+        # copies the limit into the request before the scheduler sees the pod.
+        # It stays a finding -- §3.1 wants the request declared, not inferred
+        # from a ceiling -- but it is the opposite failure from an unreserved
+        # one, so it must not draw the unreserved sentence.
+        unbacked_missing |= {resource for resource in missing if resource not in limits}
         if missing:
             missing_by_container[container.get("name", "")] = missing
     if not missing_by_container:
         return None
-    return {
+    hit = {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": "; ".join(f"{c}: missing {','.join(m)}" for c, m in missing_by_container.items()),
     }
+    if not declares_something:
+        return hit  # BestEffort: the check's own Impact is the true one.
+    if not unbacked_missing:
+        hit["impact"] = _IMPACT_LIMIT_BACKED
+    else:
+        resources = " or ".join(sorted(unbacked_missing))
+        hit["impact"] = _IMPACT_BURSTABLE.format(resources=resources)
+    return hit
 
 
 def check_no_memory_limit(workload: dict, context: dict) -> dict | None:
@@ -2122,7 +2177,7 @@ class CheckSpec(NamedTuple):
     run: Callable
     severity: str  # A hit's own "severity" key overrides this (§3.4, §3.6, §3.7's two-condition checks).
     autopilot_severity: str | None  # None: severity is mode-independent
-    impact: str
+    impact: str  # A hit's own "impact" key overrides this (§3.1's non-BestEffort arms).
 
 
 OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -2665,7 +2720,10 @@ def collect_cluster(
 
     def emit(spec: CheckSpec, hit: dict, default_namespace: str) -> dict:
         severity = hit.get("severity") or spec.severity
-        impact = spec.impact
+        # Same override `severity` already has, for the same reason: a check
+        # whose arms differ in what they prove cannot state one consequence for
+        # all of them, and the arm is only known where the hit is built.
+        impact = hit.get("impact") or spec.impact
         if severity == spec.severity and cluster.get("autopilot") and spec.autopilot_severity:
             severity = spec.autopilot_severity
             impact = f"{impact} (Autopilot: severity downgraded — the platform injects requests at admission.)"

@@ -219,6 +219,53 @@ class TestNoRequests(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertIn("proxy", hit["excerpt"])
 
+    # -- Impact, per arm. §3.1 flags a container missing cpu *or* memory, so
+    # the check's own "first evicted under node pressure" describes only the
+    # BestEffort arm. The other two carry their own sentence.
+
+    def test_a_besteffort_pod_keeps_the_checks_own_impact(self):
+        # Nothing declared anywhere: the pod really is BestEffort and really is
+        # evicted first, so the hit must NOT override the Impact.
+        self.assertNotIn("impact", self.check(self.wl(resources={})))
+
+    def test_a_burstable_pod_is_not_called_first_evicted(self):
+        # The live shape: `kube-proxy` and `antrea-controller` run on every
+        # cluster in the fleet with a CPU request and no memory request.
+        hit = self.check(self.wl(resources={"requests": {"cpu": "100m"}}))
+        self.assertIn("Burstable, not BestEffort", hit["impact"])
+        self.assertIn("after every BestEffort pod", hit["impact"])
+        self.assertIn("without memory ", hit["impact"])
+        self.assertNotIn("first evicted", hit["impact"])
+
+    def test_a_limit_with_no_request_is_reserved_at_its_ceiling(self):
+        # Kubernetes copies the limit into the request at admission, so this pod
+        # is Guaranteed -- the last thing evicted. Still flagged, because §3.1
+        # wants the request declared, but for the opposite reason.
+        hit = self.check(self.wl(resources={"limits": {"cpu": "1", "memory": "1Gi"}}))
+        self.assertIn("defaults the request to that limit", hit["impact"])
+        self.assertIn("last thing evicted", hit["impact"])
+        self.assertNotIn("costs nothing", hit["impact"])
+
+    def test_a_limit_covering_only_one_resource_leaves_the_other_unreserved(self):
+        # A memory limit backs the memory request; CPU is backed by nothing, so
+        # the sentence must name CPU and only CPU as unreserved.
+        hit = self.check(self.wl(resources={"limits": {"memory": "1Gi"}}))
+        self.assertIn("without cpu ", hit["impact"])
+        self.assertNotIn("memory", hit["impact"].split("Burstable")[0])
+
+    def test_the_unreserved_resources_are_named_in_sorted_order(self):
+        # Both missing but a sibling container declares one, so the pod is
+        # Burstable rather than BestEffort while nothing backs either resource.
+        hit = self.check(
+            self.wl(
+                resources={},
+                init_containers=[
+                    {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}
+                ],
+            )
+        )
+        self.assertIn("without cpu or memory ", hit["impact"])
+
     def test_a_plain_init_container_is_never_flagged(self):
         hit = self.check(
             self.wl(
