@@ -1566,9 +1566,19 @@ class ChecksRevisionTest(unittest.TestCase):
         self.assertEqual(na.CHECKS_REVISION, expected)
 
     def test_the_manifest_carries_it(self):
-        # Inert unless it reaches the manifest `audit_report.py` reads.
-        source = Path(na.__file__).resolve().read_text(encoding="utf-8")
-        self.assertIn('"checks_revision": CHECKS_REVISION,', source)
+        """Driven, not grepped.
+
+        The constant is inert unless it reaches the manifest `audit_report.py`
+        reads, and asserting the assignment is present in the source passes
+        just as well when the key lands in a branch nothing takes. `run`
+        answers `[]`, so the collector lists an empty fleet and returns its
+        manifest without reaching a project.
+        """
+        manifest = na.collect_fleet(
+            "acme", run=lambda argv, **kwargs: na.Run(argv, 0, "[]", "", 0.01)
+        )
+        self.assertEqual(manifest["checks_revision"], na.CHECKS_REVISION)
+        self.assertEqual(manifest["version"], na.MANIFEST_VERSION)
 
 
 if __name__ == "__main__":

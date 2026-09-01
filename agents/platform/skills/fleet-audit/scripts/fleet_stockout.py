@@ -81,7 +81,14 @@ MANIFEST_VERSION = 1
 # A digest of this file, published in the manifest. `audit_report.py` compares
 # it against the previous run's to tell a finding that stopped reproducing from
 # a check that stopped looking; see `render_delta_comment`.
-CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+# Long enough that two collector sources will not collide, short enough to
+# read in a log line. It has to agree across every collector: the comparison
+# is between one run's revision and the last one's, so a file that truncated
+# differently would report a moved collector on the run that changed it.
+REVISION_DIGEST_CHARS = 12
+CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
+    :REVISION_DIGEST_CHARS
+]
 
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 DEFAULT_TIMEOUT_S = 60

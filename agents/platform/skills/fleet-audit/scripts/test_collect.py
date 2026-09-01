@@ -4039,13 +4039,27 @@ class TestChecksRevision(unittest.TestCase):
         self.assertEqual(len(revisions), len(self.MODULES))
 
     def test_the_manifest_carries_it(self):
-        # The constant is inert unless it reaches the manifest `audit_report.py`
-        # reads; asserted on the source because building five fleet-wide
-        # manifests here would test the collectors' plumbing, not this key.
+        """Driven, not grepped.
+
+        The constant is inert unless it reaches the manifest `audit_report.py`
+        reads. Asserting the assignment is present in the source passes just as
+        well when the key lands in a branch nothing takes, and fails on a
+        reformat that changes nothing — so each collector is actually run.
+        Every `run` answers `[]`, so each lists an empty fleet and returns its
+        manifest without reaching a cluster.
+        """
+
+        def run(argv, **kwargs):
+            return Run(argv, 0, "[]", "", 0.01)
+
         for name in self.MODULES:
             with self.subTest(module=name):
-                source = (Path(__file__).resolve().parent / f"{name}.py").read_text()
-                self.assertIn('"checks_revision": CHECKS_REVISION,', source)
+                module = self.module(name)
+                # `collect.py` serves three streams, so it alone is told which.
+                args = ("obtainability-audit", "acme") if name == "collect" else ("acme",)
+                manifest = module.collect_fleet(*args, run=run)
+                self.assertEqual(manifest["checks_revision"], module.CHECKS_REVISION)
+                self.assertEqual(manifest["version"], module.MANIFEST_VERSION)
 
 
 if __name__ == "__main__":
