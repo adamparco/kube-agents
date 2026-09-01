@@ -990,6 +990,42 @@ class TestSiblingDeliveryTargets(unittest.TestCase):
         os.environ["CHAT_HOME_CHANNEL"] = "cron-reports"
         self.assertEqual(mod.sibling_delivery_targets("audit"), ["google_chat", "slack"])
 
+    def test_an_explicit_chat_id_target_is_still_that_platform(self):
+        """``platform:chat_id[:thread]`` is a form the scheduler resolves.
+
+        ``_resolve_single_delivery_target`` splits on the first ``:`` and looks
+        the prefix up, so the report goes to Slack. Reading the part whole left
+        ``slack:D0BKGRBM6RH`` matching no platform and no ``*_HOME_CHANNEL``,
+        this returned nothing, and the relay posted a second composed copy into
+        the channel the scheduler had just delivered to. Confirmed against the
+        live scheduler in the pod on 2026-09-01.
+        """
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        for deliver, expected in (
+            ("chat,slack:D0BKGRBM6RH", ["slack"]),
+            ("chat,google_chat:spaces/AAA:spaces/AAA/threads/T", ["google_chat"]),
+            ("chat,SLACK:D0BKGRBM6RH", ["slack"]),
+        ):
+            with self.subTest(deliver=deliver):
+                self._roster(deliver)
+                self.assertEqual(mod.sibling_delivery_targets("audit"), expected)
+
+    def test_a_semicolon_is_not_a_separator_the_scheduler_honours(self):
+        """Over-reporting is the one direction this must never err in.
+
+        ``cron/scheduler.py::_resolve_delivery_targets`` splits on ``,`` alone,
+        so ``slack;x`` is one part it cannot resolve and it delivers nowhere.
+        Splitting on ``;`` here named ``slack`` as handled anyway, the relay
+        subtracted it, and the report reached no channel at all while the run
+        recorded ``ok`` -- the exact silent drop this function's docstring says
+        to fail away from. On ``,`` alone the token matches no platform, the
+        relay posts, and the channel gets one copy.
+        """
+        self._roster("chat,slack;x")
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
+
     def test_a_platform_named_without_a_home_channel_is_not_a_sibling(self):
         """It resolves to nothing, so the scheduler sends it nowhere."""
         self._roster("chat,slack")

@@ -205,7 +205,25 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
     # empty answer for `deliver: "chat"` -- so every sibling channel quietly got
     # the duplicate copy this function exists to subtract.
     text = ",".join(str(entry) for entry in raw) if isinstance(raw, (list, tuple)) else str(raw)
-    tokens = {t.strip().lower() for t in text.replace(";", ",").split(",") if t.strip()}
+    # Split the way the scheduler does and no other way. It is
+    # `cron/scheduler.py::_resolve_delivery_targets`, and it splits on `,`
+    # alone. Accepting `;` as well made this the looser of the two parsers,
+    # which is the direction the docstring above says never to err in:
+    # `deliver: "chat,slack;x"` gave the scheduler one part it cannot resolve,
+    # so it delivered nowhere, while this named `slack` as handled and the
+    # relay subtracted it. Nothing was posted anywhere and the run recorded
+    # `ok`. On `,` alone, `slack;x` matches no platform, so the relay posts and
+    # the channel gets one copy.
+    #
+    # `platform:chat_id[:thread]` is a target the scheduler resolves --
+    # `_resolve_single_delivery_target` splits on the first `:` and looks the
+    # platform up -- so the prefix is the token here too. Reading the part
+    # whole left `slack:D0BKGRBM6RH` matching no platform and no
+    # `<NAME>_HOME_CHANNEL`, so the relay posted a second copy of the report
+    # into the channel the scheduler had just delivered it to.
+    tokens = {
+        part.split(":", 1)[0].strip().lower() for part in text.split(",") if part.strip()
+    }
     if not tokens or tokens <= {PLATFORM_NAME}:
         return []
 
