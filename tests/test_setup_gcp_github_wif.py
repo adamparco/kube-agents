@@ -163,19 +163,39 @@ class CustomRoleNeedsRoleAdminTest(unittest.TestCase):
         (_REPO_ROOT / "scripts" / "verify_ci_pool_project.py", '"roles/iam.roleAdmin"'),
     )
 
+    #: Any scope, not just the project-scoped resource that exists today.
+    #: `roles/iam.roleAdmin` is what carries `iam.roles.create`, and an
+    #: org-scoped `google_organization_iam_custom_role` needs it just as much
+    #: -- more, since it has to be held at the organization. Naming the one
+    #: literal meant a module that moved its role up a scope silently stopped
+    #: being covered here.
+    _CUSTOM_ROLE_RESOURCE = re.compile(r"google_\w*_iam_custom_role")
+
     def _modules_defining_a_custom_role(self) -> list[pathlib.Path]:
         return sorted(
             path
             for path in (_REPO_ROOT / "terraform").rglob("*.tf")
-            if "google_project_iam_custom_role" in path.read_text()
+            if self._CUSTOM_ROLE_RESOURCE.search(path.read_text())
         )
 
     def test_a_module_defines_a_custom_role(self):
-        """Guards the test below: with no custom role anywhere, it proves nothing."""
+        """Guards the glob, not the assertion below.
+
+        The test below asserts the grant unconditionally -- `defining` only
+        feeds its failure message -- so it does not pass vacuously when this
+        returns nothing. What it does instead is fail with a sentence that has
+        a hole where the module name goes. And an empty result here has one
+        likely cause, since the tree has carried a custom role since the
+        subnet-utilization one landed: this glob or that regex stopped matching
+        what Terraform now writes. Say so where a maintainer will read it,
+        rather than letting the join go unwatched with the suite green.
+        """
         self.assertTrue(
             self._modules_defining_a_custom_role(),
-            "No terraform/**/*.tf declares google_project_iam_custom_role, so the grant "
-            "assertion below would pass vacuously. Delete both tests, or fix the glob.",
+            "No terraform/**/*.tf declares a custom-role resource at any scope. The tree has "
+            "carried one since the subnet-utilization role landed, so this is most likely a "
+            "stale glob or regex rather than a real removal -- fix it, or delete both tests "
+            "if the last custom role really is gone.",
         )
 
     def test_every_installer_principal_can_create_it(self):
@@ -187,7 +207,7 @@ class CustomRoleNeedsRoleAdminTest(unittest.TestCase):
                     path.read_text(),
                     f"{path.relative_to(_REPO_ROOT)} grants no roles/iam.roleAdmin, but "
                     f"{', '.join(p.relative_to(_REPO_ROOT).as_posix() for p in defining)} "
-                    f"declares a google_project_iam_custom_role. projectIamAdmin cannot "
+                    f"declares an IAM custom role. projectIamAdmin cannot "
                     f"create one -- it holds no iam.roles.* permission -- so terraform "
                     f"apply fails PERMISSION_DENIED for this principal.",
                 )

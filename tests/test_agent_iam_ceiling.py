@@ -554,6 +554,16 @@ class TerraformCustomRolePermissionsTest(unittest.TestCase):
     hole one directory over -- a `google_project_iam_custom_role` added to
     `examples/full-install/main.tf` with `iam.serviceAccounts.setIamPolicy` in
     it passed the whole suite.
+
+    Matched by resource-type *shape* rather than by naming the project-scoped
+    one, for the same reason. GCP creates custom roles at project or
+    organization scope, and the provider spells the second
+    `google_organization_iam_custom_role`; a role defined there is bound above
+    the project and reaches it by inheritance, so it is the wider grant, not a
+    lesser one. Pinning the literal `google_project_iam_custom_role` let an
+    org-scoped role carrying `resourcemanager.projects.setIamPolicy` and
+    `iam.serviceAccounts.actAs` pass this whole file. `google_\\w*_iam_custom_role`
+    covers both and whatever scope the provider adds next.
     """
 
     def setUp(self):
@@ -561,16 +571,21 @@ class TerraformCustomRolePermissionsTest(unittest.TestCase):
         self.lists = _terraform_list_locals(self.module)
 
     def _custom_role_permissions(self) -> dict[str, list[str]]:
-        """Every custom role's `permissions = [...]`, keyed `<path>:<resource>`."""
+        """Every custom role's `permissions = [...]`, keyed `<path>:<address>`.
+
+        The address carries the resource type as well as the name so that two
+        roles sharing a name at different scopes are two entries rather than
+        one overwriting the other.
+        """
         found = {}
         for path in sorted(TERRAFORM_DIR.rglob("*.tf")):
             source = path.read_text(encoding="utf-8")
             for match in re.finditer(
-                r'^resource\s+"google_project_iam_custom_role"\s+"([^"]+)"\s*\{',
+                r'^resource\s+"(google_\w*_iam_custom_role)"\s+"([^"]+)"\s*\{',
                 source,
                 re.M,
             ):
-                key = f"{path.relative_to(REPO_ROOT)}:{match.group(1)}"
+                key = f"{path.relative_to(REPO_ROOT)}:{match.group(1)}.{match.group(2)}"
                 depth, body = 0, ""
                 for ch in source[match.end() - 1 :]:
                     body += ch
@@ -586,7 +601,10 @@ class TerraformCustomRolePermissionsTest(unittest.TestCase):
 
     def test_the_subnet_utilization_role_carries_exactly_three_permissions(self):
         roles = self._custom_role_permissions()
-        key = "terraform/modules/kube-agents-iam/main.tf:subnet_utilization_reader"
+        key = (
+            "terraform/modules/kube-agents-iam/main.tf:"
+            "google_project_iam_custom_role.subnet_utilization_reader"
+        )
         self.assertIn(key, roles, "the subnet-utilization custom role moved or was renamed")
         self.assertEqual(SUBNET_UTILIZATION_PERMISSIONS, roles[key])
 
