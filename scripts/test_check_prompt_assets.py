@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import re
 import unittest
 from pathlib import Path
@@ -711,6 +712,58 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(on_disk - discovered, set(), "rosters the checker never reads")
         self.assertEqual(discovered - on_disk, set(), "rosters the checker invented")
         self.assertGreater(jobs, 0, "rosters found but every one of them is empty")
+
+    def _roster_repo(self, directory, document):
+        root = Path(directory)
+        home = root / "agents" / "platform" / "cron"
+        home.mkdir(parents=True)
+        (home / "jobs.json").write_text(json.dumps(document), encoding="utf-8")
+        return root
+
+    def test_a_roster_with_no_jobs_list_names_the_file(self):
+        """The glob's own consequence: a file this script has never seen.
+
+        Discovery exists so a roster that moves is still checked, which means
+        the first thing the loader does is index into a file nobody vetted.
+        `["jobs"]` on one without that key raised a bare `KeyError: 'jobs'`,
+        naming the line of this script that died and not the file that is
+        wrong -- and every rule downstream reads rosters, so it takes the whole
+        run with it.
+        """
+        for document in ({"job": []}, [], {"jobs": {}}, {"jobs": None}):
+            with self.subTest(document=document), TemporaryDirectory() as directory:
+                root = self._roster_repo(directory, document)
+                with mock.patch.object(cpa, "REPO", root):
+                    with self.assertRaises(SystemExit) as caught:
+                        cpa.cron_rosters()
+                self.assertIn("agents/platform/cron/jobs.json", str(caught.exception))
+                self.assertIn("jobs", str(caught.exception))
+
+    def test_a_job_with_no_id_names_the_file_and_the_index(self):
+        """Every message the cron rules print interpolates `job['id']`.
+
+        A job missing it therefore turned a finding into a traceback from
+        whichever rule reached it first, which is neither the finding nor a
+        clue about where to look.
+        """
+        for jobs in ([{"deliver": "chat"}], [{"id": "  "}], ["chat"]):
+            with self.subTest(jobs=jobs), TemporaryDirectory() as directory:
+                root = self._roster_repo(directory, {"jobs": jobs})
+                with mock.patch.object(cpa, "REPO", root):
+                    with self.assertRaises(SystemExit) as caught:
+                        cpa.cron_rosters()
+                message = str(caught.exception)
+                self.assertIn("agents/platform/cron/jobs.json", message)
+                self.assertIn("index 0", message)
+
+    def test_a_well_formed_roster_still_loads(self):
+        """The guards must not refuse the shape the repository actually ships."""
+        with TemporaryDirectory() as directory:
+            root = self._roster_repo(directory, {"jobs": [{"id": "audit"}]})
+            with mock.patch.object(cpa, "REPO", root):
+                self.assertEqual(
+                    [jobs for _, jobs in cpa.cron_rosters()], [[{"id": "audit"}]]
+                )
 
     def test_it_is_actually_looking_at_something(self):
         """A checker whose scope silently empties reports a clean repository.

@@ -520,12 +520,34 @@ def cron_rosters() -> list[tuple[Path, list[dict]]]:
     both cron rules become no-ops while the run still prints OK. Globbing means
     a roster that moves within agents/ is still checked, and the count in the
     success line means one that moves out of it is visible in the log.
+
+    Shape errors are raised here with the file named. `["jobs"]` on a roster
+    that has no such key, and `["id"]` on a job that has no such key, both
+    raised a bare `KeyError: 'jobs'` from inside a glob -- a traceback that
+    tells a contributor which line of this script died and not which of their
+    files is wrong. Globbing makes that worse, not better: the point of finding
+    rosters rather than listing them is that a file this script has never seen
+    can turn up, and the first thing it does with one is index into it.
     """
     rosters = []
     for path in sorted(REPO.glob("agents/*/cron/jobs.json")) + sorted(
         REPO.glob("agents/*/defaults/cron/jobs.json")
     ):
-        rosters.append((path, json.loads(path.read_text(encoding="utf-8"))["jobs"]))
+        rel = path.relative_to(REPO)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if not isinstance(jobs, list):
+            raise SystemExit(
+                f"{rel}: cron roster has no top-level 'jobs' list -- "
+                "every rule that reads a roster is skipping this file"
+            )
+        for index, job in enumerate(jobs):
+            if not isinstance(job, dict) or not str(job.get("id") or "").strip():
+                raise SystemExit(
+                    f"{rel}: job at index {index} has no 'id' -- the scheduler "
+                    "keys every job by it, and so does every message below"
+                )
+        rosters.append((path, jobs))
     return rosters
 
 
