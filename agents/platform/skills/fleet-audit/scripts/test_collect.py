@@ -490,6 +490,43 @@ class TestNoMemoryLimit(unittest.TestCase):
         hit = collect.check_no_memory_limit(self.wl(resources={}), context_of(limitranges=limitranges))
         self.assertIsNotNone(hit)
 
+    def test_no_memory_request_draws_the_first_casualty_arm(self):
+        # The kubelet ranks on usage-above-request, so a request of zero puts
+        # the leaker in the first group -- the opposite of the sentence that
+        # says the node absorbs the leak.
+        hit = collect.check_no_memory_limit(self.wl(resources={"requests": {"cpu": "1"}}), context_of())
+        self.assertEqual(hit["impact"], collect._IMPACT_NO_LIMIT_UNREQUESTED)
+
+    def test_a_memory_request_draws_the_neighbours_first_arm(self):
+        hit = collect.check_no_memory_limit(self.wl(resources={"requests": {"memory": "256Mi"}}), context_of())
+        self.assertEqual(hit["impact"], collect._IMPACT_NO_LIMIT_REQUESTED)
+
+    def test_a_zero_memory_request_is_no_request(self):
+        # `requests.memory: 0` is what the eviction ranking subtracts, so it
+        # reads as zero rather than as a declared reservation.
+        hit = collect.check_no_memory_limit(self.wl(resources={"requests": {"memory": "0"}}), context_of())
+        self.assertEqual(hit["impact"], collect._IMPACT_NO_LIMIT_UNREQUESTED)
+
+    def test_a_limitrange_defaultRequest_makes_the_request_real(self):
+        # Injected before the scheduler sees the pod, so the ranking reads it
+        # even though the manifest is silent.
+        limitranges = {"default": [{"spec": {"limits": [{"defaultRequest": {"memory": "256Mi"}}]}}]}
+        hit = collect.check_no_memory_limit(self.wl(resources={}), context_of(limitranges=limitranges))
+        self.assertEqual(hit["impact"], collect._IMPACT_NO_LIMIT_REQUESTED)
+
+    def test_a_workload_matching_both_arms_reports_both_against_their_containers(self):
+        d = deployment("api")
+        d["spec"]["template"]["spec"]["containers"] = [
+            {"name": "app", "resources": {}},
+            {"name": "sidecar", "resources": {"requests": {"memory": "64Mi"}}},
+        ]
+        hit = collect.check_no_memory_limit(collect.normalize_workloads(dump_of(d))[0], context_of())
+        self.assertEqual(hit["excerpt"], "containers missing a memory limit: app, sidecar")
+        self.assertEqual(
+            hit["impact"],
+            f"app: {collect._IMPACT_NO_LIMIT_UNREQUESTED} sidecar: {collect._IMPACT_NO_LIMIT_REQUESTED}",
+        )
+
 
 class TestSelectorMatches(unittest.TestCase):
     def test_matchLabels_all_must_match(self):
@@ -1337,22 +1374,23 @@ class TestCollectCluster(unittest.TestCase):
     def test_only_a_check_whose_hit_wrote_its_own_impact_is_authoritative(self):
         """The flag `adopt_arm_impact` keys off, at the point it is set.
 
-        `no-requests` picks one of several QoS sentences per hit, so which one
-        fired is an observation the model cannot reliably infer from the
-        excerpt. `no-memory-limit` means one thing, its `impact` is the spec
-        constant, and the model's object-specific rewrite of a constant is
-        usually the better sentence -- so it must stay unflagged.
+        `no-requests` picks one of several QoS sentences per hit, and
+        `no-memory-limit` one of two eviction sentences, so which one fired is
+        an observation the model cannot reliably infer from the excerpt.
+        `no-pdb` means one thing, its `impact` is the spec constant, and the
+        model's object-specific rewrite of a constant is usually the better
+        sentence -- so it must stay unflagged.
         """
         result, _ = self.collect([deployment("api")])
         by_slug = {c["check"]: c for c in result["candidates"]}
-        self.assertIs(by_slug["no-requests"]["impact_authoritative"], True)
-        for slug in ("no-memory-limit", "no-pdb"):
+        for slug in ("no-requests", "no-memory-limit"):
             with self.subTest(check=slug):
-                self.assertNotIn("impact_authoritative", by_slug[slug])
-                self.assertEqual(
-                    by_slug[slug]["impact"],
-                    next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == slug).impact,
-                )
+                self.assertIs(by_slug[slug]["impact_authoritative"], True)
+        self.assertNotIn("impact_authoritative", by_slug["no-pdb"])
+        self.assertEqual(
+            by_slug["no-pdb"]["impact"],
+            next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact,
+        )
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])

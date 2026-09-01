@@ -716,17 +716,74 @@ def check_no_requests(workload: dict, context: dict) -> dict | None:
     return hit
 
 
+# §3.2 has two arms and they point in opposite directions, because the kubelet
+# ranks a memory-pressure eviction on whether usage exceeds the memory *request*
+# -- never on the QoS class. An uncapped container that also declares no request
+# exceeds zero on its first byte and sits in the first bucket from the start; an
+# uncapped container with a request is in the last bucket until the leak passes
+# that request. Only the second one shields itself at the neighbours' expense,
+# and it is the first that every live finding is.
+#
+# kubernetes.io contradicts itself here -- `pod-qos.md` still says Burstable pods
+# "are evicted only after all BestEffort Pods are evicted", which upstream issue
+# #129759 has open against the code -- so both arms name the sort keys rather
+# than asserting an order a reader can find an official page against.
+_IMPACT_NO_LIMIT_UNREQUESTED = (
+    "Nothing caps memory here and no memory request is declared either, so a "
+    "leak makes this workload the node's first casualty rather than its "
+    "neighbours'. The kubelet ranks memory-pressure eviction by whether usage "
+    "exceeds the memory request, then by Pod Priority, then by how far usage "
+    "sits above that request — never by QoS class — so a request of zero puts "
+    "this pod in the first group from its first byte, and at equal priority the "
+    "leak ranks it ahead of the BestEffort pods beside it. The kernel's OOM "
+    "killer is a separate mechanism that can fire before the kubelet reacts, "
+    "and it scores these containers at the top of its range too."
+)
+_IMPACT_NO_LIMIT_REQUESTED = (
+    "Nothing caps memory here, so a leak grows until the node is under "
+    "pressure, and up to the declared request the kubelet does evict "
+    "co-located workloads first. Past that request this pod joins the group "
+    "evicted first, ranked by how far its usage exceeds it. The kernel's OOM "
+    "killer scores a container down in proportion to its memory request, so "
+    "the larger the request the more of the node a leak here can take before "
+    "the kernel picks it over a neighbour."
+)
+
+
 def check_no_memory_limit(workload: dict, context: dict) -> dict | None:
-    missing = [
-        container.get("name", "")
-        for container in workload["template"].get("containers") or []
-        if "memory" not in ((container.get("resources") or {}).get("limits") or {})
-    ]
-    if not missing or _has_default(context["limitranges"], workload["ns"], "default", "memory"):
+    limitranges = context["limitranges"]
+    missing, unrequested, requested = [], [], []
+    for container in workload["template"].get("containers") or []:
+        resources = container.get("resources") or {}
+        if "memory" in (resources.get("limits") or {}):
+            continue
+        name = container.get("name", "")
+        missing.append(name)
+        # Key presence decides whether the limit is missing, matching §3.1's
+        # reading of the manifest; the request is read with `_declared`
+        # instead, because the arm turns on the quantity the eviction ranking
+        # subtracts and `requests.memory: 0` is a request of zero. A LimitRange
+        # `defaultRequest` counts: it is injected before the scheduler sees the
+        # pod, so the ranking reads it even though the manifest is silent.
+        if _declared(resources, "requests", "memory") or _has_default(
+            limitranges, workload["ns"], "defaultRequest", "memory"
+        ):
+            requested.append(name)
+        else:
+            unrequested.append(name)
+    if not missing or _has_default(limitranges, workload["ns"], "default", "memory"):
         return None
+    if unrequested and requested:
+        impact = (
+            f"{', '.join(unrequested)}: {_IMPACT_NO_LIMIT_UNREQUESTED} "
+            f"{', '.join(requested)}: {_IMPACT_NO_LIMIT_REQUESTED}"
+        )
+    else:
+        impact = _IMPACT_NO_LIMIT_UNREQUESTED if unrequested else _IMPACT_NO_LIMIT_REQUESTED
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"containers missing a memory limit: {', '.join(missing)}",
+        "impact": impact,
     }
 
 
@@ -2442,8 +2499,11 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         check_no_memory_limit,
         "major",
         None,
-        "A memory leak here is absorbed by the node, not by this pod — the "
-        "kubelet evicts co-located workloads first.",
+        # Both arms of §3.2 set their own, so this is unreachable in practice.
+        # It stays as the arm that describes a container with no memory request
+        # -- the shape the fleet is actually made of -- rather than a third
+        # sentence nothing produces.
+        _IMPACT_NO_LIMIT_UNREQUESTED,
     ),
     CheckSpec(
         "no-pdb",
