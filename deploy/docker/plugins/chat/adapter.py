@@ -250,7 +250,7 @@ def is_silent_report(report: str) -> bool:
 
     Bare ``strip()`` on both sides of the dress, because this predicate
     replaced a plain ``not report.strip()`` and has to stay a superset of it.
-    ``_MARKDOWN_DRESS`` can only list ASCII whitespace, while ``str.strip()``
+    ``_MARKDOWN_DRESS`` can only list ASCII characters, while ``str.strip()``
     also takes NBSP, ``\\x0b``, ``\\x0c``, ``\\x1c``, ``\\u2028``, ``\\u2003``
     and ``\\u3000`` — so stripping the dress alone called a report of one NBSP
     non-empty and relayed it. `submit_cron_report` then rejects it as blank
