@@ -1001,10 +1001,23 @@ def evaluate(argv: list[str]) -> Decision:
             return Decision(
                 allowed=False,
                 rule_id="gcp.unreadable-command",
+                # Unlike the kubectl walker, this one is strict past the command
+                # path as well, so the flag named here is usually
+                # command-specific rather than global -- `--enable-autoupgrade`
+                # and `--maintenance-window-start` reach this branch. Saying
+                # "global flag" sent readers looking for a gcloud release note
+                # that does not exist, and an agent repeating the advice into a
+                # report tells a customer something untrue. Both examples are
+                # flags on `container clusters update`, which this gate refuses
+                # as a write regardless, so the retry below is what resolves the
+                # ambiguity: if the command still fails without the flag, the
+                # flag was never the reason.
                 message=(
                     "gcloud used a flag whose arity is unknown to this module, so the "
-                    "command path cannot be read. Report a new gcloud global flag to "
-                    "your infrastructure team."
+                    "command path cannot be read. Re-run without the flag: if the "
+                    "command is refused anyway it is not a read this gate allows, and "
+                    "if it succeeds, ask your infrastructure team to teach this module "
+                    "the flag's arity."
                 ),
                 offending_flag=unknown_flag,
             )

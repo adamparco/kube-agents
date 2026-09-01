@@ -648,6 +648,27 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.unreadable-command", decision.rule_id)
 
+    def test_the_unreadable_refusal_does_not_call_the_flag_global(self):
+        """The flag that reaches this branch is usually command-specific.
+
+        This walker, unlike the kubectl one, stays strict past the command
+        path, so ordinary flags on a write verb land here. Calling them global
+        sent readers after a gcloud release note that does not exist, and an
+        agent quoting the advice into a report tells a customer something
+        untrue.
+        """
+        for argv in (
+            ["gcloud", "container", "clusters", "update", "c", "--enable-autoupgrade"],
+            ["gcloud", "container", "clusters", "update", "c", "--maintenance-window", "09:00"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.unreadable-command", decision.rule_id)
+                self.assertNotIn("global", decision.message)
+                # The advice has to be something the reader can act on alone.
+                self.assertIn("without the flag", decision.message)
+
     def test_multiple_flags_before_command(self):
         # Multiple flags should be correctly skipped.
         argv = ["gcloud", "--project", "proj1", "--region", "us-central1",
