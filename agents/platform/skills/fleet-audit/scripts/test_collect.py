@@ -832,11 +832,38 @@ class TestSingleReplica(unittest.TestCase):
             d["spec"]["strategy"] = {"type": strategy}
         return collect.normalize_workloads(dump_of(d))[0]
 
-    def svc_ctx(self):
-        return context_of(services={"default": [service("s", selector={"app": "api"})]})
+    def svc_ctx(self, ports=None):
+        return context_of(
+            services={"default": [service("s", selector={"app": "api"}, **({"ports": ports} if ports else {}))]}
+        )
 
     def test_a_single_replica_service_backed_deployment_is_flagged(self):
         self.assertIsNotNone(collect.check_single_replica(self.wl(), self.svc_ctx()))
+
+    def test_a_metrics_only_service_is_named_as_such(self):
+        """The same claim readiness makes, so the same qualifier.
+
+        Live case, 2026-09-01: this check published `cert-manager` and
+        `cert-manager-cainjector` as "single replica, Service-backed" -- 3.8's
+        Impact line is that a rollout drops user traffic -- in the same report
+        where the readiness check had already said the only Service in front of
+        each is `http-metrics/9402`. Giving one check the exposure line and not
+        the other is how the report contradicted itself.
+        """
+        hit = collect.check_single_replica(self.wl(), self.svc_ctx([{"name": "http-metrics", "port": 9402}]))
+        self.assertIsNotNone(hit)
+        self.assertIn("s[http-metrics]", hit["excerpt"])
+        self.assertIn("(metrics scrape only)", hit["excerpt"])
+
+    def test_a_serving_port_makes_the_traffic_claim_true(self):
+        hit = collect.check_single_replica(self.wl(), self.svc_ctx([{"name": "http", "port": 80}]))
+        self.assertIn("(serving traffic)", hit["excerpt"])
+
+    def test_an_unnamed_port_is_not_assumed_to_be_metrics(self):
+        # `kube-agents-webhook-service` is an unnamed 443 to an admission
+        # webhook -- traffic, and the finding has to keep saying so.
+        hit = collect.check_single_replica(self.wl(), self.svc_ctx([{"port": 443, "targetPort": 10250}]))
+        self.assertIn("(serving traffic)", hit["excerpt"])
 
     def test_multi_replica_is_never_flagged(self):
         self.assertIsNone(collect.check_single_replica(self.wl(replicas=2), self.svc_ctx()))

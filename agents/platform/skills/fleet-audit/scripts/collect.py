@@ -499,10 +499,6 @@ def _selecting_services(workload: dict, context: dict) -> list[dict]:
     return matched
 
 
-def selected_by_a_service(workload: dict, context: dict) -> bool:
-    return bool(_selecting_services(workload, context))
-
-
 def _has_default(limitranges: dict, ns: str, field: str, resource: str) -> bool:
     """`field` is `"default"` (a limit) or `"defaultRequest"` (a request)."""
     for lr in limitranges.get(ns, []):
@@ -815,6 +811,29 @@ def _metrics_only_ports(services: list[dict]) -> bool:
     return bool(ports) and all(port.get("name") in _METRICS_PORT_NAMES for port in ports)
 
 
+def _exposure_line(services: list[dict]) -> str:
+    """`selecting services: name[port,port] (scope)` — what "Service-backed" means here.
+
+    Both checks that gate on a selecting Service publish an Impact line about
+    production traffic, and neither can tell whether there is any. On
+    2026-09-01 the live fleet had `cert-manager` and `cert-manager-cainjector`
+    each selected by one Service whose only port is `http-metrics/9402`, and
+    `argocd-notifications-controller` by one whose only port is `metrics/9001`;
+    nothing distinguishes them from `argocd-redis` (`tcp-redis/6379`) or
+    `kube-agents-controller-manager` (an unnamed 443 to a webhook) except the
+    ports, so name the ports and say which case it is.
+    """
+    exposure = "; ".join(
+        "{}[{}]".format(
+            (svc.get("metadata") or {}).get("name", "?"),
+            ",".join(str(port.get("name") or port.get("port")) for port in (svc.get("spec") or {}).get("ports") or []) or "no ports",
+        )
+        for svc in services
+    )
+    scope = "metrics scrape only" if _metrics_only_ports(services) else "serving traffic"
+    return f"selecting services: {exposure} ({scope})"
+
+
 def check_probes_readiness(workload: dict, context: dict) -> dict | None:
     services = _selecting_services(workload, context)
     if not services:
@@ -826,27 +845,11 @@ def check_probes_readiness(workload: dict, context: dict) -> dict | None:
     ]
     if not missing:
         return None
-    # Name what the Services actually expose. The check's Impact line is a
-    # fixed sentence about production traffic, and on 2026-09-01 three of the
-    # six findings this check published on the live fleet carried it against a
-    # workload no user request reaches: `cert-manager` and
-    # `cert-manager-cainjector` are each selected by one Service whose only
-    # port is `http-metrics/9402`, and `argocd-notifications-controller` by one
-    # whose only port is `metrics/9001`. The model cannot tell those apart from
-    # `argocd-redis` (`tcp-redis/6379`) without being told, so tell it.
-    exposure = "; ".join(
-        "{}[{}]".format(
-            (svc.get("metadata") or {}).get("name", "?"),
-            ",".join(str(port.get("name") or port.get("port")) for port in (svc.get("spec") or {}).get("ports") or []) or "no ports",
-        )
-        for svc in services
-    )
-    scope = "metrics scrape only" if _metrics_only_ports(services) else "serving traffic"
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": (
             f"Service-backed, containers missing a readiness probe: {', '.join(missing)}\n"
-            f"selecting services: {exposure} ({scope})"
+            f"{_exposure_line(services)}"
         ),
     }
 
@@ -872,9 +875,19 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
         return None
     if (workload["spec"].get("strategy") or {}).get("type") == "Recreate":
         return None
-    if not selected_by_a_service(workload, context):
+    services = _selecting_services(workload, context)
+    if not services:
         return None
-    return {"object": f"Deployment/{workload['name']}", "excerpt": "single replica, Service-backed"}
+    # Same claim, same qualifier as `check_probes_readiness`. Giving one check
+    # the exposure line and not the other left the 2026-09-01 run publishing
+    # `cert-manager` and `cert-manager-cainjector` as "single replica,
+    # Service-backed" -- a rollout-drops-user-traffic claim -- one section
+    # below the readiness finding on those same two Deployments that had just
+    # said the only Service in front of them is a scrape endpoint.
+    return {
+        "object": f"Deployment/{workload['name']}",
+        "excerpt": f"single replica, Service-backed\n{_exposure_line(services)}",
+    }
 
 
 # --------------------------------------------------------------------------- #
