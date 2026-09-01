@@ -83,7 +83,7 @@ For each cohort `C` (size ≥ 3) and each facet `F`:
 
 ```
 baseline: <field path>=<t*> in <m>/<n> clusters of cohort <mode>/<env>
-peers: <up to 6 cluster names>, +<N> more
+peers: <up to 6 of the m clusters holding t*>, +<N> more
 observed: <token>  (<raw JSON fragment or "key absent">)
 missing: <baseline tokens this cluster does not carry>
 consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "none">)
