@@ -1906,15 +1906,26 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
         the module makes as a `google_project_iam_custom_role` resource is
         invisible to them — which is how it came to be missing from the
         expected set while every provisioned project held it, and every
-        verification reported "holds 1 role(s) beyond the read-only set"."""
+        verification reported "holds 1 role(s) beyond the read-only set".
+
+        Asserted as a join between the two sides rather than against the one
+        role that exists today. Pinning the count instead fails on a second
+        custom role even when it is wired up correctly on both sides, which
+        turns the guard into a reason not to add one; the join fails only when
+        the two sides disagree, which is the drift that produced the bug.
+        """
         tf = (checker._ROOT / "terraform" / "modules" / "kube-agents-iam" / "main.tf").read_text()
         role_ids = set(re.findall(r'^\s*role_id\s*=\s*"([^"]+)"', tf, re.M))
-        self.assertEqual(role_ids, {checker.PLATFORM_GSA_CUSTOM_ROLE_ID})
+        # Vacuity guard: with no custom role in the module the join below holds
+        # trivially, and this test would go green on the state it exists to catch.
+        self.assertTrue(role_ids, "the module defines no google_project_iam_custom_role")
         self.assertIn("google_project_iam_member", tf)
         expected = checker.platform_gsa_roles("kube-agents-evals-3")
+        prefix = "projects/kube-agents-evals-3/roles/"
         self.assertEqual(
-            expected - checker.PLATFORM_GSA_ROLES,
-            {f"projects/kube-agents-evals-3/roles/{checker.PLATFORM_GSA_CUSTOM_ROLE_ID}"},
+            {role.removeprefix(prefix) for role in expected - checker.PLATFORM_GSA_ROLES},
+            role_ids,
+            "every custom role the module defines must be in platform_gsa_roles, and vice versa",
         )
 
 
