@@ -4013,7 +4013,7 @@ class TestRenderBudget(BaseTestCase):
         self.assertLess(len(rendered), 4000)
         self.assertIn("truncated", rendered.lower())
 
-    def test_selection_is_a_prefix_of_the_sorted_order(self):
+    def test_the_cut_still_eats_the_least_severe_end(self):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
@@ -4025,6 +4025,73 @@ class TestRenderBudget(BaseTestCase):
     def test_at_least_one_finding_always_renders(self):
         rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
+
+    def _cost(self, finding):
+        """What `select_rendered_findings` charges this finding against the budget."""
+        rendered = "\n".join(audit_report.render_finding(finding))
+        return len(rendered) + 2 + len(str(finding.get("id", ""))) + 3
+
+    def _clustered(self, clusters, per_cluster, severity="minor"):
+        """`per_cluster` findings on each named cluster, all one severity."""
+        out = []
+        for cluster in clusters:
+            for index in range(per_cluster):
+                out.append(
+                    make_finding(
+                        fid=f"{cluster}-{index}",
+                        severity=severity,
+                        cluster=cluster,
+                        namespace=f"ns-{index}",
+                        obj=f"Deployment/app-{index}",
+                    )
+                )
+        return out
+
+    def test_truncation_never_erases_a_whole_cluster(self):
+        """A cluster late in the alphabet used to lose every row it had.
+
+        Selection cut a prefix of an order whose within-severity key starts
+        with the cluster name, so which clusters survived the cut was decided
+        by spelling. On a live `security-patch-orchestrator` run that dropped
+        both of `kube-agents-host`'s findings -- the one cluster in that fleet
+        running real workloads -- while fourteen empty test fixtures each kept
+        a row, because `k` sorts after `d`.
+        """
+        clusters = ["drift-a", "drift-b", "drift-c", "kube-agents-host"]
+        findings = self._clustered(clusters, 2)
+
+        # Exactly six of the eight fit, so two must go. Summed rather than
+        # multiplied: cost includes the id, and these ids are not equal length.
+        order = audit_report._fair_share_order(audit_report.sort_findings(findings))
+        budget = sum(self._cost(f) for f in order[:6])
+        rendered, omitted = audit_report.select_rendered_findings(findings, budget)
+
+        self.assertEqual(len(rendered), 6)
+        self.assertEqual(len(omitted), 2)
+        self.assertEqual(
+            sorted({f["cluster"] for f in rendered}),
+            clusters,
+            "every cluster keeps at least one row",
+        )
+
+    def test_the_rendered_set_is_still_in_display_order(self):
+        # The cluster cycle decides membership, not presentation: a body whose
+        # findings interleaved by cluster would be unreadable, and two runs over
+        # an unchanged fleet must still render byte-identically.
+        findings = self._clustered(["drift-a", "drift-b"], 3)
+        rendered, _ = audit_report.select_rendered_findings(findings, 10**6)
+        self.assertEqual(rendered, audit_report.sort_findings(findings))
+
+    def test_a_cycle_never_promotes_a_minor_over_a_critical(self):
+        # The cycle runs inside a severity band. Cycling across the whole list
+        # would buy each cluster a row by spending a critical's slot on a minor.
+        findings = self._clustered(["z-cluster"], 2, severity="critical") + self._clustered(
+            ["a-cluster"], 2, severity="minor"
+        )
+        rendered, _ = audit_report.select_rendered_findings(findings, 1)
+        self.assertEqual(len(rendered), 1)
+        self.assertEqual(rendered[0]["severity"], "critical")
+        self.assertEqual(rendered[0]["cluster"], "z-cluster")
 
 
 # --------------------------------------------------------------------------- #

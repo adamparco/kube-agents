@@ -4864,6 +4864,51 @@ def sort_findings(findings: list[dict]) -> list[dict]:
     )
 
 
+def _fair_share_order(ordered: list[dict]) -> list[dict]:
+    """`ordered` re-sequenced so every cluster's first finding in a severity
+    band precedes any cluster's second.
+
+    Selection cuts a prefix and the within-severity sort key starts with the
+    cluster name, so on a fleet whose findings do not all fit, whether a cluster
+    appears in the ledger at all was decided by where its name fell in the
+    alphabet. A live `security-patch-orchestrator` run cut four of twenty-nine
+    `minor` findings; two of the four were both of `kube-agents-host`'s, the one
+    cluster in that fleet carrying real workloads, and it lost every row it had
+    because `k` sorts after `d`. The other fourteen clusters are empty
+    single-node test fixtures and each kept its row.
+
+    Cycling the clusters spends the same budget on about the same number of
+    findings and buys each target its first row before any target gets a second,
+    so truncation can no longer make a whole cluster vanish while another shows
+    twice. It is not a severity judgement — this audit has no per-cluster
+    criticality input and inventing one here would be worse than the alphabet.
+    It only stops the cut from being decided by a property with no bearing on
+    what matters.
+
+    Bands are kept apart: cycling across the whole list would promote a minor
+    finding over a critical, which is the other thing this cut must never do. A
+    severity outside `SEVERITIES` keeps its own band at the end rather than
+    being dropped.
+    """
+    severities = list(SEVERITIES) + sorted(
+        {str(f.get("severity", "")) for f in ordered} - set(SEVERITIES)
+    )
+    out: list[dict] = []
+    for severity in severities:
+        by_cluster: dict[str, list[dict]] = {}
+        for finding in ordered:
+            if str(finding.get("severity", "")) != severity:
+                continue
+            by_cluster.setdefault(str(finding.get("cluster", "")), []).append(finding)
+        # `ordered` is sorted and dicts keep insertion order, so the cycle visits
+        # clusters in the same sequence every run.
+        while any(by_cluster.values()):
+            for queue in by_cluster.values():
+                if queue:
+                    out.append(queue.pop(0))
+    return out
+
+
 def select_rendered_findings(
     findings: list[dict],
     budget: int,
@@ -4873,24 +4918,28 @@ def select_rendered_findings(
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
-    Selection walks the severity-first order and stops at the first finding that
-    does not fit, so the rendered set is always a prefix and truncation only ever
-    eats the least-severe end. That is a statement about the *cut*, not about the
-    findings: when one severity overflows the budget on its own the end of the
-    list is that same severity, and criticals are dropped like anything else. A
-    live `stockout-prevention` run rendered 18 of 49 criticals. Callers that
-    describe the omitted set must read its severities rather than assume. At
-    least one finding always renders — a body with a single oversized finding is
-    still more useful than a body with none.
+    Selection walks the severity bands in order and stops at the first finding
+    that does not fit, so truncation only ever eats the least-severe end. That
+    is a statement about the *cut*, not about the findings: when one severity
+    overflows the budget on its own the end of the list is that same severity,
+    and criticals are dropped like anything else. A live `stockout-prevention`
+    run rendered 18 of 49 criticals. Callers that describe the omitted set must
+    read its severities rather than assume. At least one finding always renders
+    — a body with a single oversized finding is still more useful than none.
+
+    Within a band the walk is `_fair_share_order`'s cluster cycle rather than
+    the display order, so a cluster late in the alphabet cannot lose every row
+    it has. Both returned lists are sorted back into display order; the cycle
+    decides membership, never presentation.
 
     Each finding is charged for its own rendered text *and* for the slot its id
     occupies in the hidden delta block, because that block is itself unbounded:
     1,250 ids render over 80,000 characters of marker alone.
     """
-    ordered = sort_findings(findings)
+    candidates = _fair_share_order(sort_findings(findings))
     used = 0
     fitted = 0
-    for finding in ordered:
+    for finding in candidates:
         fid = str(finding.get("id", ""))
         # Charged against the *rendered* text, state line included: the state
         # and PR link are per-finding, so estimating without them would
@@ -4906,7 +4955,7 @@ def select_rendered_findings(
             break
         used += cost
         fitted += 1
-    return ordered[:fitted], ordered[fitted:]
+    return sort_findings(candidates[:fitted]), sort_findings(candidates[fitted:])
 
 
 def _render_header(audit_id: str) -> list[str]:
