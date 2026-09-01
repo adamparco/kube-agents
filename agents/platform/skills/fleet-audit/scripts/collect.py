@@ -1572,25 +1572,44 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         # wrong. With no address yet the load balancer is still provisioning and
         # the annotations are all there is -- the behaviour before this check
         # looked at status at all.
+        # Both fields, not `ip or hostname`: an ingress entry may carry each,
+        # and short-circuiting on `ip` would throw away a hostname that
+        # `_is_private_address` treats as public. That is the one direction
+        # that loses a finding.
         assigned = [
             addr
-            for addr in (
-                (ing.get("ip") or ing.get("hostname") or "")
-                for ing in ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
-            )
+            for ing in ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+            for addr in (ing.get("ip") or "", ing.get("hostname") or "")
             if addr
         ]
         public = [addr for addr in assigned if not _is_private_address(addr)]
+        # Dropped rather than downgraded, unlike the placeholder branch in
+        # `check_model_credential_plaintext_env`. That one guesses at intent
+        # from a value's shape and can be wrong about a live secret; this one
+        # reads routability off the assigned address, and an RFC 1918 address
+        # is not reachable from the internet whatever else is true. A hostname
+        # never lands here -- `_is_private_address` calls it public -- so the
+        # branch needs every entry to be an unambiguously private literal.
         if assigned and not public:
             continue
         hits.append(
             {
                 "namespace": ns,
                 "object": f"Service/{meta.get('name', '')}",
-                # Naming the address makes the finding checkable: a reviewer can
-                # reach the endpoint, or fail to, without re-deriving it.
+                # The count, never the address. `ai_security_audit_sop.md`
+                # (Red Lines, and again under check 3.5) forbids publishing
+                # the address of a reachable model endpoint, and these
+                # findings are filed as issues on a public repository --
+                # writing one here would hand a reader the target. It is not
+                # advisory either: `adopt_collector_evidence` overwrites the
+                # model's excerpt with this string, so an SOP-compliant
+                # excerpt would be replaced by whatever is written here.
                 "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace"
-                + (f"; reachable at {', '.join(public)}" if public else ""),
+                + (
+                    f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, none of them private"
+                    if public
+                    else ""
+                ),
             }
         )
     return hits

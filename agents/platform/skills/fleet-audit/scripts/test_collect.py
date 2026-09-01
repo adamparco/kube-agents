@@ -2507,20 +2507,40 @@ class TestInferenceEndpointPublic(unittest.TestCase):
         svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["10.150.0.78"])
         self.assertEqual(self.result(svc, [w]), [])
 
-    def test_a_routable_address_is_flagged_and_named_in_the_excerpt(self):
+    def test_a_routable_address_is_flagged_without_publishing_the_address(self):
+        # `ai_security_audit_sop.md` Red Lines: the address of a reachable
+        # model endpoint never reaches `title`, `object`, `evidence.excerpt`
+        # or `recommendation`. These findings are filed as issues on a public
+        # repository, and `adopt_collector_evidence` forces this excerpt over
+        # whatever the model wrote, so the rule has to hold here or nowhere.
         w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
         svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["136.70.153.197"])
         hits = self.result(svc, [w])
         self.assertEqual(len(hits), 1)
-        self.assertIn("136.70.153.197", hits[0]["excerpt"])
+        self.assertNotIn("136.70.153.197", hits[0]["excerpt"])
+        self.assertNotIn("136.70.153.197", hits[0]["object"])
+        self.assertIn("1 assigned address, none of them private", hits[0]["excerpt"])
 
     def test_one_public_address_among_private_ones_still_counts(self):
         w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
         svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["10.0.0.5", "136.70.153.197"])
         hits = self.result(svc, [w])
         self.assertEqual(len(hits), 1)
-        self.assertIn("136.70.153.197", hits[0]["excerpt"])
+        self.assertNotIn("136.70.153.197", hits[0]["excerpt"])
         self.assertNotIn("10.0.0.5", hits[0]["excerpt"])
+        self.assertIn("1 assigned address, none of them private", hits[0]["excerpt"])
+
+    def test_an_ingress_entry_carrying_both_ip_and_hostname_keeps_the_hostname(self):
+        # `ip or hostname` short-circuits and would throw the hostname away.
+        # The private IP would then be the only address considered, the
+        # all-private branch would fire, and a reachable endpoint would go
+        # unreported -- the one direction that loses a finding.
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        svc["status"] = {"loadBalancer": {"ingress": [{"ip": "10.0.0.5", "hostname": "vllm.example.com"}]}}
+        hits = self.result(svc, [w])
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("vllm.example.com", hits[0]["excerpt"])
 
     def test_a_pending_load_balancer_still_falls_back_to_annotations(self):
         # No address assigned yet, so status says nothing and the annotation
