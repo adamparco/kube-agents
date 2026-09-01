@@ -1229,6 +1229,12 @@ def namespace(name, labels=None):
     return {"kind": "Namespace", "metadata": {"name": name, "labels": labels or {}}}
 
 
+def netpol_pod(name, ns="default", labels=None, phase="Running"):
+    """A `context["pods"]` entry -- the pod-label view §2.6 needs to ask which
+    pods a namespace's policies actually select."""
+    return {"ns": ns, "name": name, "labels": labels or {}, "phase": phase}
+
+
 def ccnp(name, selector=None, ingress=None):
     """A Dataplane V2 ClusterNetworkPolicy. Defaults to the shape that
     suppresses §2.6 everywhere: every endpoint, ingress-isolating."""
@@ -1699,6 +1705,143 @@ class TestNetpolMissing(unittest.TestCase):
             pod_namespaces=set(),
         )
         self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_a_pod_no_policy_selects_is_flagged_even_where_policies_exist(self):
+        """NetworkPolicy is additive and pod-scoped, so "this namespace has a
+        policy" and "this pod has a policy" are different facts and only the
+        second decides exposure. Deciding coverage per namespace let a pod
+        selected by nothing sit behind a namespace that graded clean --
+        `kubeagents-system` on the reference fleet, whose four policies name
+        four workloads and leave the operator's manager pod reachable.
+        """
+        ctx = context_of(
+            namespaces=[namespace("kubeagents-system")],
+            networkpolicies=[netpol("litellm", ns="kubeagents-system", pod_selector={"matchLabels": {"app": "litellm"}}, policy_types=["Ingress"])],
+            pods=[
+                netpol_pod("litellm-7bcc-9rjvl", ns="kubeagents-system", labels={"app": "litellm"}),
+                netpol_pod("kube-agents-controller-manager-764d-46gl4", ns="kubeagents-system", labels={"app.kubernetes.io/name": "kube-agents-operator"}),
+            ],
+            pod_namespaces={"kubeagents-system"},
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertEqual(hits[0]["object"], "Namespace/kubeagents-system")
+        self.assertIn("1 of 2 pods", hits[0]["excerpt"])
+
+    def test_the_excerpt_names_the_workload_and_the_object_stays_the_namespace(self):
+        """A pod name carries a ReplicaSet hash and a random suffix. The ledger
+        keys on the object, so a pod-scoped finding would resolve and re-raise
+        on every rollout; the volatile name belongs in the excerpt, and even
+        there the conventional label is the better identifier."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("api", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Ingress"])],
+            pods=[netpol_pod("web-6f8d9c4b5-xk2mn", ns="payments", labels={"app.kubernetes.io/name": "web"})],
+            pod_namespaces={"payments"},
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(hits[0]["object"], "Namespace/payments")
+        self.assertIn("web", hits[0]["excerpt"])
+        self.assertNotIn("6f8d9c4b5", hits[0]["excerpt"])
+
+    def test_a_namespace_whose_every_pod_is_selected_is_left_alone(self):
+        """argocd on the reference fleet: seven pods, seven policies, each
+        naming its own workload. The check has to stay silent there or it
+        becomes the false-positive flood instead of the missing finding."""
+        ctx = context_of(
+            namespaces=[namespace("argocd")],
+            networkpolicies=[
+                netpol("server", ns="argocd", pod_selector={"matchLabels": {"app.kubernetes.io/name": "argocd-server"}}, policy_types=["Ingress"]),
+                netpol("redis", ns="argocd", pod_selector={"matchLabels": {"app.kubernetes.io/name": "argocd-redis"}}, policy_types=["Ingress"]),
+            ],
+            pods=[
+                netpol_pod("argocd-server-687f-z89zg", ns="argocd", labels={"app.kubernetes.io/name": "argocd-server"}),
+                netpol_pod("argocd-redis-79db-g8xhl", ns="argocd", labels={"app.kubernetes.io/name": "argocd-redis"}),
+            ],
+            pod_namespaces={"argocd"},
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_an_egress_only_policy_is_not_ingress_coverage(self):
+        """§2.6 asks who can reach these pods. A policy whose `policyTypes` is
+        Egress alone leaves its own pods exactly as reachable as they were."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("egress", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Egress"])],
+            pods=[netpol_pod("api-1", ns="payments", labels={"app": "api"})],
+            pod_namespaces={"payments"},
+        )
+        self.assertEqual(len(collect.check_netpol_missing(ctx)), 1)
+
+    def test_an_absent_policy_types_still_counts_as_ingress_coverage(self):
+        """Kubernetes derives `policyTypes` from the rule blocks present, and
+        a spec with neither derives to `["Ingress"]` -- a deny-all, the
+        strongest coverage there is. Absent must not read as egress-only."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("deny", ns="payments", pod_selector={"matchLabels": {"app": "api"}})],
+            pods=[netpol_pod("api-1", ns="payments", labels={"app": "api"})],
+            pod_namespaces={"payments"},
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_a_finished_job_pod_is_neither_a_gap_nor_a_denominator(self):
+        """`kubeagents-system` carries three Failed CronJob pods. A pod that is
+        not running cannot be reached, so it is not exposure -- and its name is
+        the churniest of all, one per schedule tick."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("api", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Ingress"])],
+            pods=[
+                netpol_pod("api-1", ns="payments", labels={"app": "api"}),
+                netpol_pod("batch-29803800-892cg", ns="payments", labels={"job-name": "batch"}, phase="Failed"),
+                netpol_pod("batch-29803860-ct6br", ns="payments", labels={"job-name": "batch"}, phase="Succeeded"),
+            ],
+            pod_namespaces={"payments"},
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_an_allow_all_alongside_a_real_policy_does_cover_every_pod(self):
+        """The two branches have to compose. `podSelector: {}` selects every
+        pod in the namespace, so a namespace holding one is never a coverage
+        gap -- it is the `minor` allow-all finding, and only when that is all
+        it holds."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[
+                netpol("allow-all", ns="payments", ingress=[{}]),
+                netpol("api", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Ingress"]),
+            ],
+            pods=[netpol_pod("web-1", ns="payments", labels={"app": "web"})],
+            pod_namespaces={"payments"},
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_a_cluster_network_policy_suppresses_a_partial_gap_too(self):
+        """The Do-NOT-flag case does not stop applying because the namespace
+        also has a namespaced policy of its own."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("api", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Ingress"])],
+            pods=[netpol_pod("web-1", ns="payments", labels={"app": "web"})],
+            pod_namespaces={"payments"},
+            cluster_network_policies=[ccnp("fleet-wide")],
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_an_unlabelled_pod_is_uncovered_and_named_by_its_pod_name(self):
+        """Nothing but `podSelector: {}` can select a pod with no labels, so it
+        is genuinely uncovered, and there is no workload label to name it by."""
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("api", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Ingress"])],
+            pods=[netpol_pod("bare", ns="payments", labels={})],
+            pod_namespaces={"payments"},
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("bare", hits[0]["excerpt"])
 
 
 class TestDefaultSaAutomount(unittest.TestCase):

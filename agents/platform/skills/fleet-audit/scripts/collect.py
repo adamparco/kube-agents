@@ -1186,7 +1186,78 @@ def check_netpol_missing(context: dict) -> list[dict]:
                         "severity": "minor",
                     }
                 )
+            continue
+        # A namespace holding policies is not therefore a covered namespace.
+        # NetworkPolicy is additive and pod-scoped: a pod no policy selects has
+        # no policy applied to it and stays reachable from anywhere, exactly as
+        # if the namespace had none. The branch above answers "does this
+        # namespace have a policy"; only the pod labels answer "does this pod
+        # have one", and the second is the question the exposure turns on.
+        # On the reference fleet that is `kubeagents-system`, whose four
+        # policies name four workloads by label and leave the operator's own
+        # manager pod -- 8081 and a 10250 webhook -- selected by none.
+        if ccnp_all or ns in ccnp_covered:
+            continue
+        uncovered = _pods_no_policy_selects(context.get("pods") or [], ns, policies)
+        if uncovered:
+            # Namespace-scoped, not pod-scoped: a pod name carries a
+            # ReplicaSet hash and a random suffix, so keying the ledger on one
+            # would resolve and re-raise this finding on every rollout. The
+            # workload names go in the excerpt, where churn costs nothing.
+            live = sum(1 for p in context.get("pods") or [] if p.get("ns") == ns and _is_live_pod(p))
+            names = sorted({_pod_workload_name(p) for p in uncovered})
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"Namespace/{ns}",
+                    "excerpt": (
+                        f"{len(uncovered)} of {live} pods here are selected by no NetworkPolicy that "
+                        f"enforces Ingress: {', '.join(names)}; {len(policies)} "
+                        f"{'policy' if len(policies) == 1 else 'policies'} in this namespace cover the rest"
+                    ),
+                    "severity": "major",
+                }
+            )
     return hits
+
+
+def _is_live_pod(pod: dict) -> bool:
+    """A finished Job pod is not an exposure and its name is pure churn."""
+    return str(pod.get("phase") or "") not in ("Succeeded", "Failed")
+
+
+def _pod_workload_name(pod: dict) -> str:
+    """The pod's own name is a ReplicaSet hash away from stable, so prefer
+    whichever conventional label names the workload behind it."""
+    labels = pod.get("labels") or {}
+    for key in ("app.kubernetes.io/name", "app", "k8s-app"):
+        if labels.get(key):
+            return str(labels[key])
+    return str(pod.get("name") or "")
+
+
+def _enforces_ingress(policy: dict) -> bool:
+    """`policyTypes` is optional. Kubernetes derives it from which rule blocks
+    are present, and an empty spec derives to `["Ingress"]` -- a deny-all. So
+    absent means ingress is enforced unless the policy is egress-only.
+    """
+    spec = policy.get("spec") or {}
+    declared = spec.get("policyTypes")
+    if declared:
+        return "Ingress" in declared
+    return not (spec.get("egress") and "ingress" not in spec)
+
+
+def _pods_no_policy_selects(pods: list[dict], ns: str, policies: list[dict]) -> list[dict]:
+    ingress_policies = [p for p in policies if _enforces_ingress(p)]
+    out = []
+    for pod in pods:
+        if pod.get("ns") != ns or not _is_live_pod(pod):
+            continue
+        labels = pod.get("labels") or {}
+        if not any(selector_matches((p.get("spec") or {}).get("podSelector") or {}, labels) for p in ingress_policies):
+            out.append(pod)
+    return out
 
 
 def check_default_sa_automount(context: dict) -> list[dict]:
@@ -2249,6 +2320,19 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
     }
+    # The same pods again, with the labels kept. "Does this namespace hold a
+    # NetworkPolicy" and "is this pod selected by one" are different questions,
+    # and only the labels can answer the second.
+    context["pods"] = [
+        {
+            "ns": (i.get("metadata") or {}).get("namespace", ""),
+            "name": (i.get("metadata") or {}).get("name", ""),
+            "labels": (i.get("metadata") or {}).get("labels") or {},
+            "phase": (i.get("status") or {}).get("phase", ""),
+        }
+        for i in parsed.get("items", []) or []
+        if i.get("kind") == "Pod"
+    ]
     workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
