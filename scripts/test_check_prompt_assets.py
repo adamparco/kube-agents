@@ -795,6 +795,18 @@ class CronDeliveryTests(unittest.TestCase):
             with self.subTest(deliver=deliver):
                 self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
 
+    def test_a_null_deliver_is_the_absent_key_the_runtime_reads_it_as(self):
+        """`raw = job.get("deliver") or ""` -- null and absent are one shape.
+
+        A `get` default fires on absence only, so an explicit `null` reached
+        the splitter as the string `None` and was reported as a job delivering
+        to `'None'`. That failed `make prompt-check` over a roster the
+        scheduler runs exactly as it runs one with no `deliver` key at all.
+        """
+        for job in ({"id": "j"}, {"id": "j", "deliver": None}):
+            with self.subTest(job=job):
+                self.assertEqual(self._findings(job), [])
+
     def test_an_explicit_target_names_its_own_destination(self):
         """`platform:chat_id` carries an install-specific id. Nothing to check."""
         self.assertEqual(

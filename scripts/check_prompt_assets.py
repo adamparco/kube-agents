@@ -748,7 +748,12 @@ def check_cron_delivery() -> list[Finding]:
     for path, jobs in cron_rosters():
         rel = path.relative_to(REPO)
         for job in jobs:
-            deliver = job.get("deliver", "local")
+            # `or`, not a `get` default: the runtime splitter reads
+            # `job.get("deliver") or ""`, so an explicit JSON `null` is the
+            # same to it as an absent key. Defaulting on absence alone
+            # reported `"deliver": null` as a job delivering to `'None'` and
+            # failed the roster over a shape the scheduler handles.
+            deliver = job.get("deliver") or "local"
             # The scheduler accepts a list and flattens it; so do we, rather
             # than reporting a shape it would have run happily.
             # `;` as well as `,`, and case-folded below, because that is what
