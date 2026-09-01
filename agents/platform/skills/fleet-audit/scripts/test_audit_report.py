@@ -3351,14 +3351,17 @@ class TestFinishClean(HarnessTestCase):
         self.assertIn("closed as completed", comment)
         self.assertNotIn("checks changed", comment)
 
-    def test_a_moved_collector_routes_a_stale_close_to_remediate(self):
-        """And does not tell the reader to re-open the pull request by hand.
+    def test_a_moved_collector_tells_the_reader_to_re_open_and_merge(self):
+        """Re-open *and merge* is the only route that holds, so say both halves.
 
-        A hand-reopened pull request is closed again by the next run, silently:
-        it is open against a finding the document no longer carries, it already
-        carries the stale-closed label, and the comment is not re-posted because
-        this one already announced it. `/remediate` is the route that holds, and
-        the closing block below already offers it.
+        `close_stale_remediation_prs` skips any pull request that is not OPEN,
+        so a merge is permanent. A re-open that is still open when the next run
+        reaches it is closed again, and without a comment, because `announced`
+        is already true from the marker this very comment carries.
+
+        `/remediate` is not the route: it validates its target against the
+        current document, and the ids listed here are by construction absent
+        from it, so every one of them is refused.
         """
         comment = audit_report.render_stale_close_comment(
             AUDIT,
@@ -3368,8 +3371,14 @@ class TestFinishClean(HarnessTestCase):
             checks_changed=True,
         )
         self.assertIn("The collector's checks changed since the previous run", comment)
-        self.assertIn("/remediate", comment)
-        self.assertNotIn("re-open this pull request if the fix is still wanted", comment)
+        self.assertIn("re-open this pull request", comment)
+        self.assertIn("merge it before the next run", comment)
+        self.assertIn("closed a second time", comment)
+        # The caveat may warn *against* `/remediate`, but it must not route to
+        # it. A bare `assertNotIn` would fail on the warning, so pin the shape
+        # the old text used to offer.
+        self.assertNotIn("ask for it back with", comment)
+        self.assertNotIn("`/remediate <finding-id>` —", comment)
 
     def test_an_unmoved_collector_leaves_the_stale_close_alone(self):
         comment = audit_report.render_stale_close_comment(
