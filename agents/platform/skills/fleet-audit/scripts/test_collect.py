@@ -1735,6 +1735,60 @@ class TestPublicControlPlane(unittest.TestCase):
         )
         self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
 
+    def test_the_v6_default_route_is_allow_all_too(self):
+        # A dual-stack cluster can write `::/0` where only `0.0.0.0/0` was ever
+        # recognised. Matching the v4 string alone reads that as an allowlist,
+        # drops the finding, and loses a `critical` on a control plane open to
+        # every IPv6 address on the internet.
+        for block in ("::/0", "0.0.0.0/0"):
+            with self.subTest(block=block):
+                ctx = context_of(
+                    cluster_describe={
+                        "privateClusterConfig": {},
+                        "masterAuthorizedNetworksConfig": {
+                            "enabled": True,
+                            "cidrBlocks": [
+                                {"displayName": "office", "cidrBlock": "203.0.113.0/24"},
+                                {"displayName": "everywhere", "cidrBlock": block},
+                            ],
+                        },
+                    }
+                )
+                self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
+
+    def test_enabled_with_no_cidr_blocks_stays_restrictive(self):
+        # Authorized networks on with an empty list is the strict end of the
+        # setting -- nothing outside Google's own access reaches the endpoint.
+        # Treating "no blocks" as "nothing was allowlisted, so it is open"
+        # would invert it and report the most locked-down clusters.
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {},
+                "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": []},
+            }
+        )
+        self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+    def test_a_config_present_but_not_enabled_does_not_count_as_restrictive(self):
+        # What `kube-agents-host` actually returns: a non-empty
+        # `masterAuthorizedNetworksConfig` carrying only
+        # `gcpPublicCidrsAccessEnabled`, with `enabled` absent. Testing the
+        # object for emptiness rather than for `enabled` would call that
+        # cluster restricted and lose the finding.
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {},
+                "masterAuthorizedNetworksConfig": {"gcpPublicCidrsAccessEnabled": True},
+                "controlPlaneEndpointsConfig": {
+                    "ipEndpointsConfig": {
+                        "enablePublicEndpoint": True,
+                        "authorizedNetworksConfig": {"gcpPublicCidrsAccessEnabled": True},
+                    }
+                },
+            }
+        )
+        self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
+
     def test_a_private_endpoint_is_never_flagged(self):
         ctx = context_of(cluster_describe={"privateClusterConfig": {"enablePrivateEndpoint": True}})
         self.assertEqual(collect.check_public_control_plane(ctx), [])

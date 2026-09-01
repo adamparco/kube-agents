@@ -1179,6 +1179,20 @@ def check_legacy_metadata(context: dict) -> list[dict]:
     return hits
 
 
+def _is_default_route(cidr: str) -> bool:
+    """Whether this CIDR admits every address of its family.
+
+    A prefix length of zero rather than a string match, so `::/0` is caught
+    beside `0.0.0.0/0`. An allowlist is only worth the name if something is
+    outside it, and a dual-stack cluster can write the v6 default route into a
+    field where only the v4 one was ever recognised.
+    """
+    try:
+        return ipaddress.ip_network(cidr.strip(), strict=False).prefixlen == 0
+    except ValueError:
+        return False
+
+
 def _has_restrictive_authorized_networks(describe: dict) -> bool:
     """Whether some authorized-networks surface narrows control-plane access.
 
@@ -1188,6 +1202,10 @@ def _has_restrictive_authorized_networks(describe: dict) -> bool:
     restricted through the other wide open. `cidrBlocks` holds CidrBlock objects
     (`{displayName, cidrBlock}`), never bare strings, so the allow-all entry is
     matched on the field rather than by membership in the list.
+
+    Enabled with no blocks at all stays restrictive: that shuts the public
+    endpoint to everything but Google's own access, which is the strict end of
+    this setting rather than the open one.
     """
     ip_cfg = (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
     for cfg in (describe.get("masterAuthorizedNetworksConfig"), ip_cfg.get("authorizedNetworksConfig")):
@@ -1195,7 +1213,7 @@ def _has_restrictive_authorized_networks(describe: dict) -> bool:
         if cfg.get("enabled") is not True:
             continue
         blocks = [b.get("cidrBlock") if isinstance(b, dict) else b for b in (cfg.get("cidrBlocks") or [])]
-        if "0.0.0.0/0" not in [str(b or "").strip() for b in blocks]:
+        if not any(_is_default_route(str(b or "")) for b in blocks):
             return True
     return False
 
@@ -1603,13 +1621,20 @@ def _restricting_source_ranges(spec: dict) -> list[str]:
     unparseable entry means the allowlist cannot be read at all, and an empty
     list was never a restriction. Erring towards "unrestricted" keeps the
     severity where it was.
+
+    The unparseable case is why this does not simply call `_is_default_route`
+    for everything: there, a CIDR that will not parse is "not the allow-all
+    entry" and keeps the control-plane finding, which is that caller's safe
+    direction. Here it is "cannot vouch for this allowlist", and the safe
+    direction is the opposite one.
     """
     ranges = [r.strip() for r in (spec.get("loadBalancerSourceRanges") or []) if isinstance(r, str) and r.strip()]
     for r in ranges:
         try:
-            if ipaddress.ip_network(r, strict=False).prefixlen == 0:
-                return []
+            ipaddress.ip_network(r, strict=False)
         except ValueError:
+            return []
+        if _is_default_route(r):
             return []
     return ranges
 
