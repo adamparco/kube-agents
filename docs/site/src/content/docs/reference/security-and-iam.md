@@ -61,7 +61,11 @@ The install grants the agent GSA one of two permission sets. Both entry points c
 
 ### Roles per set
 
-The default **read-only** set binds viewer roles only:
+The default **read-only** set is read-only in the sense that it grants no writes to your
+resources. Two of its roles are still capabilities rather than reads — `iam.serviceAccountUser`
+carries `iam.serviceAccounts.actAs` and `mcp.toolUser` carries `mcp.tools.call` — so an install
+that needs "no cloud-side capability" as an enforced property has three grants to weigh, not the
+one the custom role below describes.
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
 - `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
@@ -73,19 +77,19 @@ The default **read-only** set binds viewer roles only:
 Alongside them the composition defines one project-level custom role,
 `kubeagentsSubnetUtilizationReader`, and binds it to the same service account. It carries three
 permissions and exists because no predefined role carries them without carrying much more:
-`compute.subnetworks.use` to see subnets at all, and
-`recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the Network Analyzer insight that
-reports their IP utilization — the only place that measurement is published, and otherwise reachable
-only through `roles/recommender.viewer`, which grants viewer on every recommender in the project.
+`compute.subnetworks.use`, and `recommender.networkAnalyzerIpAddressInsights.list`/`.get` for the
+Network Analyzer insight that reports subnet IP utilization — the only place that measurement is
+published, and otherwise reachable only through `roles/recommender.viewer`, which grants viewer on
+every recommender in the project.
 
-`compute.subnetworks.use` is the one permission in the default set that is not a read.
-`roles/compute.viewer` does not carry it: it is the permission that authorizes attaching a NIC, a
-node pool or a load balancer to a subnet, and the API offers no read-only route to the utilization
-field. The custom role is narrower than the predefined alternative — `roles/compute.networkUser`
-runs to some two hundred permissions and includes real writes — but it is an exception to the
-read-only posture rather than an instance of it, and an install that needs "no cloud-side
-capability" as an enforced property should read it as such.
-The fleet audit's subnet-ip-exhaustion check is its sole consumer. It is defined in
+`compute.subnetworks.use` is not a read. `roles/compute.viewer` does not carry it: it is the
+permission that authorizes attaching a NIC, a node pool or a load balancer to a subnet, and the API
+offers no read-only route to the utilization field. The custom role is narrower than the predefined
+alternative — `roles/compute.networkUser` runs to some two hundred permissions and includes real
+writes — but it is an exception to the read-only posture rather than an instance of it, and an
+install that needs "no cloud-side capability" as an enforced property should read it as such.
+
+The fleet audit's subnet-ip-exhaustion check is the custom role's sole consumer. It is defined in
 [`terraform/modules/kube-agents-iam`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam)
 and, like the bundle above, is skipped entirely when `project_roles` is empty.
 
@@ -241,7 +245,11 @@ The agent never has direct write access to running infrastructure — see [Decla
   - **Config subtree allowlisting.** Only the top-level keys `approvals`, `platforms`, and `platform_toolsets` are merged from `spec.config`; every other key is dropped and logged. This keeps a plugin out of `agent` (including `agent.disabled_toolsets`), `leader_election`, `logging`, and `plugins`. It does **not** make the merge safe in general — see the two caveats below.
   - **Caveat: allowlisted subtrees still carry security weight.** `approvals` governs approval gating and `platform_toolsets` gates which toolsets a platform surface exposes. A plugin may set values under both. Allowlisting bounds _where_ a plugin can write, not _how much authority_ it can grant itself.
   - **Caveat: list merges are additive.** When a plugin supplies a list under an allowlisted key, its entries are unioned into the operator's list rather than replacing it. A plugin can therefore add a toolset to `platform_toolsets` but cannot remove one the operator configured.
-  - **`spec.env` overrides operator-set variables.** Plugin-supplied environment variables take precedence over variables of the same name set by the operator, and secret references resolve against any Secret in the agent's namespace. Four names are exceptions: the operator appends `CREDENTIAL_PROXY_URL`, `AGENT_SHARED_STATE_SETUP`, `PATH`, and `PYTHONPATH` _after_ the merge, so a plugin's copy of any of them loses. The first keeps a plugin from redirecting the credential proxy; the second keeps it from switching off the container-startup setup that populates `$HERMES_HOME` (see [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)), which would surface as plugins mounted but never enabled, far from the plugin that caused it. Secrets referenced this way land in the agent container's environment: this is a supported way to supply a plugin its own API token, not a preservation of the credential-proxy boundary, which only covers the credentials the proxy itself brokers. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+  - **`spec.env` overrides operator-set variables.** Plugin-supplied environment variables take precedence over variables of the same name set by the operator, and secret references resolve against any Secret in the agent's namespace. Eleven names are exceptions, all appended _after_ the merge so a plugin's copy of any of them loses: `HERMES_MANAGED_DIR`, `HERMES_HOME_MODE`, `CREDENTIAL_PROXY_URL`, `CREDENTIAL_PROXY_TOKEN_FILE`, `PATH`, `PYTHONPATH`, `HINDSIGHT_API_URL`, `MEMORY_PROVIDER`, `AGENT_SHARED_STATE_SETUP`, `API_SERVER_MODEL_NAME`, and `HERMES_GATEWAY_PROFILE` (the last four of those are conditional on the feature that sets them being on, and a name the operator never sets is not reserved). `CREDENTIAL_PROXY_URL` keeps a plugin from redirecting the credential proxy; `AGENT_SHARED_STATE_SETUP` keeps it from switching off the container-startup setup that populates `$HERMES_HOME` (see [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)), which would surface as plugins mounted but never enabled, far from the plugin that caused it; `HERMES_MANAGED_DIR` is the switch for the whole pin layer.
+
+    "Loses" is what the operator now guarantees, rather than what happened before. The duplicate used to be left in the PodSpec for the kubelet to resolve, and a PodSpec carrying two entries of one name never reaches a kubelet: `env` has `patchMergeKey=name`, so the API server rejects the server-side apply outright and the gateway stops reconciling at all. The operator collapses the duplicates itself, keeping the last of each name.
+
+    Secrets referenced this way land in the agent container's environment: this is a supported way to supply a plugin its own API token, not a preservation of the credential-proxy boundary, which only covers the credentials the proxy itself brokers. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 
 ## Secrets Encryption & Local State Security
 
