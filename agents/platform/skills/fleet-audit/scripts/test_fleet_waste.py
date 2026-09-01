@@ -1103,6 +1103,26 @@ class AgeInExcerptTest(unittest.TestCase):
         ago)" would assert the thing went idle today."""
         self.assertEqual(fw._ago(None), "")
 
+    def test_a_part_day_rounds_down_so_a_title_cannot_claim_the_threshold(self):
+        """The second half of the same bug, one release later.
+
+        Dating the excerpt stopped the model doing its own arithmetic, but
+        `{age:.0f}` rounds to nearest, so the same `argocd-webhook-ip` -- 29.69
+        days old when the 2026-09-01 cost run read it -- was published as "(30d
+        ago)" and the model titled the finding "unused for 30+ days". A claim
+        about a threshold, derived from a rounded number, and false. Anything
+        under a whole day has to round down, or the collector hands the model
+        the licence to state the threshold.
+        """
+        self.assertEqual(fw._ago(29.69), " (29d ago)")
+        self.assertEqual(fw._ago(29.999), " (29d ago)")
+        self.assertEqual(fw._ago(30.0), " (30d ago)")
+
+    def test_an_age_that_predates_the_read_prints_zero_not_a_negative(self):
+        """A clock that moved backwards between creation and read gives a
+        negative age. "(-1d ago)" would say the object is from the future."""
+        self.assertEqual(fw._ago(-0.5), " (0d ago)")
+
 
 class CollectProjectComputeTest(unittest.TestCase):
     """The five project-scope reads, and what happens when one of them fails.

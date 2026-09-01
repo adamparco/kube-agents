@@ -438,6 +438,25 @@ def _age_days(timestamp: str, *, now: datetime) -> float | None:
     return (now - ts).total_seconds() / 86400.0
 
 
+def _whole_days(age: float) -> int:
+    """Elapsed days, floored -- never the next day up.
+
+    `f"{age:.0f}"` rounds to nearest, which reads as a harmless half-day of
+    imprecision until the number lands next to a threshold. It did: the same
+    `argocd-webhook-ip` the docstring below is about was 29.69 days old on
+    2026-09-01, printed as "(30d ago)", and the model titled the finding
+    "unused for 30+ days" -- a claim about a threshold, derived from a rounded
+    number, and false. Rounding down cannot produce that: a model given "29d
+    ago" has nothing to round up from.
+
+    Floored rather than truncated toward zero only matters for a negative age,
+    which means the clock moved backwards between the object's creation and the
+    read. Clamp that to 0 rather than print "-1d", which would assert the thing
+    is from the future.
+    """
+    return int(age) if age > 0 else 0
+
+
 def _ago(age: float | None) -> str:
     """The elapsed-days parenthetical an excerpt puts after a timestamp.
 
@@ -456,7 +475,7 @@ def _ago(age: float | None) -> str:
     guessing: a missing timestamp is why `_age_days` returns None, and "(0d
     ago)" would assert something about it.
     """
-    return "" if age is None else f" ({age:.0f}d ago)"
+    return "" if age is None else f" ({_whole_days(age)}d ago)"
 
 
 # --------------------------------------------------------------------------- #
@@ -516,7 +535,7 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
             hits.append(
                 {
                     "object": f"PersistentVolume/{name}",
-                    "excerpt": f"phase=Available, unclaimed, AGE={age:.0f}d, storageClass={spec.get('storageClassName')}",
+                    "excerpt": f"phase=Available, unclaimed, AGE={_whole_days(age)}d, storageClass={spec.get('storageClassName')}",
                     "severity": "major" if _is_large_or_ssd(spec) else "minor",
                 }
             )
@@ -582,7 +601,7 @@ def check_unconsumed_pvc(context: dict, *, now: datetime) -> list[dict]:
             {
                 "namespace": ns,
                 "object": f"PersistentVolumeClaim/{name}",
-                "excerpt": f"Bound, {capacity}, {sc}, unreferenced by any pod, AGE={age:.0f}d",
+                "excerpt": f"Bound, {capacity}, {sc}, unreferenced by any pod, AGE={_whole_days(age)}d",
                 "severity": "major" if gib >= 100 or "ssd" in sc else "minor",
             }
         )
@@ -930,7 +949,7 @@ def check_idle_namespace(context: dict, *, now: datetime) -> list[dict]:
         hits.append(
             {
                 "object": f"Namespace/{name}",
-                "excerpt": f"no Running/Pending pods for {age:.0f}d; holds {'a LoadBalancer Service, ' if name in lb_ns else ''}{pvc_gib_by_ns.get(name, 0):.0f} GiB of PVCs",
+                "excerpt": f"no Running/Pending pods for {_whole_days(age)}d; holds {'a LoadBalancer Service, ' if name in lb_ns else ''}{pvc_gib_by_ns.get(name, 0):.0f} GiB of PVCs",
                 "severity": severity,
             }
         )
