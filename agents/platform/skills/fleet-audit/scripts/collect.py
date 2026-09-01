@@ -487,15 +487,20 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
     }
 
 
-def selected_by_a_service(workload: dict, context: dict) -> bool:
+def _selecting_services(workload: dict, context: dict) -> list[dict]:
+    matched = []
     for svc in context["services"].get(workload["ns"], []):
         spec = svc.get("spec") or {}
         selector = spec.get("selector")
         if spec.get("type") == "ExternalName" or not selector:
             continue
         if selector_matches({"matchLabels": selector}, workload["pod_labels"]):
-            return True
-    return False
+            matched.append(svc)
+    return matched
+
+
+def selected_by_a_service(workload: dict, context: dict) -> bool:
+    return bool(_selecting_services(workload, context))
 
 
 def _has_default(limitranges: dict, ns: str, field: str, resource: str) -> bool:
@@ -751,12 +756,46 @@ def check_no_spread(workload: dict, context: dict) -> dict | None:
 _SELF_HEALTH_SIDECARS = {"istio-proxy", "cloud-sql-proxy", "gke-metadata-server"}
 
 
+def _containers_behind_a_service(workload: dict, services: list[dict]) -> list[dict]:
+    """The containers a Service actually routes traffic to.
+
+    A container with no readiness probe counts as ready the moment it starts,
+    so a probe-less log shipper cannot hold traffic off a pod. Only the
+    container serving the Service's `targetPort` can, which makes it the only
+    one whose missing probe is the risk this check names.
+
+    Resolving that container means reading the native sidecars too --
+    `initContainers` with `restartPolicy: Always` serve ports like any other
+    container. The gateway's own Service targets 8643, which belongs to the
+    `envoy-credential-proxy` sidecar and nothing under `containers`; a check
+    that reads only `containers` reported the one container holding the
+    Service port as having no probe when it has one.
+
+    Declaring `ports` is optional -- kubelet routes to a port a container never
+    named -- so when nothing in the pod declares a matching one there is no
+    routing to infer, and every container stays in the path as before.
+    """
+    targets = set()
+    for svc in services:
+        for port in (svc.get("spec") or {}).get("ports") or []:
+            targets.add(port.get("targetPort", port.get("port")))
+    targets.discard(None)
+    containers = _effective_containers(workload)
+    behind = [
+        c
+        for c in containers
+        if any(p.get("containerPort") in targets or p.get("name") in targets for p in c.get("ports") or [])
+    ]
+    return behind or containers
+
+
 def check_probes_readiness(workload: dict, context: dict) -> dict | None:
-    if not selected_by_a_service(workload, context):
+    services = _selecting_services(workload, context)
+    if not services:
         return None
     missing = [
         c.get("name", "")
-        for c in workload["template"].get("containers") or []
+        for c in _containers_behind_a_service(workload, services)
         if c.get("name") not in _SELF_HEALTH_SIDECARS and not c.get("readinessProbe")
     ]
     if not missing:

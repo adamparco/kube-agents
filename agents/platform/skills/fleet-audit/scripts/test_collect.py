@@ -328,10 +328,12 @@ def hpa(name, ns="default", min_replicas=1, max_replicas=5, target=None, owned=F
     return doc
 
 
-def service(name, ns="default", selector=None, svc_type="ClusterIP"):
+def service(name, ns="default", selector=None, svc_type="ClusterIP", ports=None):
     spec = {"type": svc_type}
     if selector is not None:
         spec["selector"] = selector
+    if ports is not None:
+        spec["ports"] = ports
     return {"kind": "Service", "metadata": {"namespace": ns, "name": name}, "spec": spec}
 
 
@@ -663,6 +665,90 @@ class TestProbes(unittest.TestCase):
         workload = collect.normalize_workloads(dump_of(d))[0]
         hit = collect.check_probes_readiness(workload, self.svc_ctx())
         self.assertNotIn("istio-proxy", hit["excerpt"] if hit else "")
+
+    def gateway_shaped(self, sidecar_readiness=True):
+        """The live `platform-agent-gateway` shape, which this check got wrong.
+
+        Three containers behind one Service: the app on 8642 with a probe, a
+        probe-less log shipper serving nothing, and a native sidecar holding
+        8643 -- the port the Service actually targets.
+        """
+        d = deployment("api")
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        d["spec"]["template"]["spec"]["containers"] = [
+            {
+                "name": "platform-agent",
+                "ports": [{"containerPort": 8642, "name": "api"}],
+                "readinessProbe": {"exec": {"command": ["true"]}},
+            },
+            {"name": "fluent-bit"},
+        ]
+        sidecar = {
+            "name": "envoy-credential-proxy",
+            "restartPolicy": "Always",
+            "ports": [{"containerPort": 8765, "name": "cred-proxy"}, {"containerPort": 8643, "name": "proxy-api"}],
+        }
+        if sidecar_readiness:
+            sidecar["readinessProbe"] = {"exec": {"command": ["true"]}}
+        d["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "sandbox-credential-cleanup"},
+            sidecar,
+        ]
+        ctx = context_of(
+            services={
+                "default": [service("s", selector={"app": "api"}, ports=[{"port": 8642, "targetPort": 8643}])]
+            }
+        )
+        return collect.normalize_workloads(dump_of(d))[0], ctx
+
+    def test_a_probe_on_the_native_sidecar_holding_the_service_port_counts(self):
+        """The container serving `targetPort` may be an `initContainer`.
+
+        `initContainers` with `restartPolicy: Always` are native sidecars: they
+        run for the pod's whole life and serve ports like anything else. This
+        check read `containers` only, so on the gateway it saw 8643 served by
+        nobody, judged the probe-less `fluent-bit` to be the workload's answer
+        for readiness, and reported a Service-backed workload with no readiness
+        probe -- while both the app container and the container actually behind
+        the Service port had one. A false positive stated as fact about a live
+        deployment, which is the kind that costs a reader the most to disprove.
+        """
+        workload, ctx = self.gateway_shaped()
+        self.assertIsNone(collect.check_probes_readiness(workload, ctx))
+
+    def test_the_container_behind_the_service_port_is_still_required_to_probe(self):
+        """The narrowing must not amount to switching the check off.
+
+        Same three containers, same Service; the only change is that the
+        sidecar holding 8643 has no readiness probe. Traffic now reaches a
+        container with no readiness signal, which is exactly what this check is
+        for -- and the app container's probe two lines up must not excuse it.
+        """
+        workload, ctx = self.gateway_shaped(sidecar_readiness=False)
+        hit = collect.check_probes_readiness(workload, ctx)
+        self.assertIsNotNone(hit)
+        self.assertIn("envoy-credential-proxy", hit["excerpt"])
+        # And only that one: naming `fluent-bit` here is what sent a reader
+        # looking at the wrong container in the first place.
+        self.assertNotIn("fluent-bit", hit["excerpt"])
+
+    def test_a_pod_that_declares_no_ports_keeps_every_container_in_the_path(self):
+        """Declaring `ports` is optional, so absence is not evidence.
+
+        kubelet routes to a `targetPort` no container ever named. With nothing
+        to match on there is no routing to infer, and narrowing to the empty
+        set would silently retire the check for every workload that omits the
+        field -- a far bigger hole than the false positive being fixed.
+        """
+        d = deployment("api")
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        ctx = context_of(
+            services={"default": [service("s", selector={"app": "api"}, ports=[{"port": 80, "targetPort": 8080}])]}
+        )
+        workload = collect.normalize_workloads(dump_of(d))[0]
+        hit = collect.check_probes_readiness(workload, ctx)
+        self.assertIsNotNone(hit)
+        self.assertIn("app", hit["excerpt"])
 
     def test_liveness_missing_is_flagged_with_no_service_required(self):
         self.assertIsNotNone(collect.check_probes_liveness(self.wl(), context_of()))
