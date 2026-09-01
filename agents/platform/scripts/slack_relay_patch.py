@@ -667,7 +667,7 @@ def install() -> None:
                 # which was defensible only while the branch required literally
                 # blank text.
                 LOGGER.info(
-                    "slack relay: dropped a %d-byte message as a silent tick",
+                    "slack relay: dropped a %d-character message as a silent tick",
                     len(str(message or "")),
                 )
                 return blank

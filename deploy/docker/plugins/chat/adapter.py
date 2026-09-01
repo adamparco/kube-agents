@@ -102,6 +102,16 @@ RELAY_TIMEOUT_SECONDS = 360.0
 #: tested for silence — see :func:`is_silent_report`.
 _MARKDOWN_DRESS = "`*_~ \t\r\n"
 
+#: The token a cron run emits to say it has nothing to report.
+#:
+#: Restated rather than imported from ``cron.scheduler``, which lives in the
+#: pinned base image and is absent from this checkout — importing it would make
+#: this module unimportable under its own tests and take the whole silence
+#: predicate with it. Restating a constant is only safe if something notices
+#: when the two diverge, so ``verify_chat_relay.py`` imports the upstream one at
+#: image-build time and fails the build if it is not this string.
+SILENT_MARKER = "[SILENT]"
+
 #: ``_deliver_result``'s wrapper. Matched, not assumed — see
 #: :func:`parse_cron_wrapper`.
 _WRAPPER_RE = re.compile(
@@ -191,7 +201,13 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
 
     jobs = store.get("jobs") if isinstance(store, dict) else store
     raw: object = ""
-    for job in jobs if isinstance(jobs, list) else []:
+    # An empty `job_id` is every delivery that carries no cron wrapper -- the
+    # `cron.wrap_response: false` case this module still relays -- and matching
+    # it against `job.get("id") or ""` made it equal to the first job in the
+    # store with a missing or empty id. A hand-edited `jobs.json` is all that
+    # takes, and the delivery then subtracts platforms on a different job's
+    # `deliver`. There is no job to look up here, so look none up.
+    for job in jobs if isinstance(jobs, list) and job_id else []:
         if isinstance(job, dict) and str(job.get("id") or "") == job_id:
             raw = job.get("deliver") or ""
             break
@@ -248,23 +264,37 @@ def sibling_delivery_targets(job_id: str) -> list[str]:
 def is_silent_report(report: str) -> bool:
     """Should this report be swallowed rather than relayed?
 
-    True for an empty report, and for one whose entire content is the silence
-    marker however the model dressed it. The scheduler's own matcher is already
-    generous — ``[SILENT]`` bare, lowercased, or on its own line among prose all
-    suppress delivery — and where it applies, ``standalone_send`` is never
-    reached at all. What it does not accept is the marker wearing markdown:
-    ``` `[SILENT]` ``` and ``**[SILENT]**`` both test False and are delivered.
-
-    Which is the form to expect. These reports are written by agents that write
-    markdown by default, and every audit SOP now tells the run to copy
+    True for an empty report, and for one whose *entire* content is the silence
+    marker however the model dressed it. ``` `[SILENT]` ``` and ``**[SILENT]**``
+    are the forms to expect: these reports are written by agents that write
+    markdown by default, and every audit SOP tells the run to copy
     ``chat_summary`` — a field whose value *is* ``[SILENT]`` on a quiet run —
     verbatim into its final response. Emphasise it once and the run that meant
     to say nothing posts the word "[SILENT]" to the home channel instead, which
-    is the one outcome the silent path exists to prevent.
+    is the one outcome the silent path exists to prevent. So undress the report
+    before testing it. On a real report this changes nothing: stripping
+    punctuation off the two ends of a multi-line audit summary cannot turn it
+    into the marker.
 
-    So undress the report before testing it. On a real report this changes
-    nothing: stripping punctuation off the two ends of a multi-line audit
-    summary cannot turn it into the marker.
+    **Entire** is load-bearing, and it is why this does not call the scheduler's
+    ``_is_cron_silence_response``. That matcher accepts the marker on its own
+    line among prose, which is right for the thing it grades — a model's final
+    response to a cron prompt, where the marker anywhere means the model chose
+    silence and the prose is its reasoning. It is wrong for what reaches here.
+    ``standalone_send`` is the sender for every out-of-process ``hermes send``,
+    not only cron: ``session_kv_server._post_initial_alert`` posts RCA and
+    incident alerts through it, and ``_send_to_chat`` posts the composed cron
+    report itself. An alert that quotes the marker while explaining why a run
+    published nothing — which is exactly what an alert about a silent run says —
+    matched, and was dropped with ``{"success": True, "skipped": "empty_text"}``
+    and no ``message_id``, so the caller could not tell it had lost the page.
+
+    Delegating bought nothing against that cost. Where the scheduler's matcher
+    applies it suppresses delivery before either sender runs, so its extra
+    leniency is redundant here; the only calls it changed were the ones it had
+    never graded. Everything the marker legitimately arrives as when it is the
+    whole message — bare, lowercased, dressed, padded — the two lines below
+    already catch.
 
     Bare ``strip()`` on both sides of the dress, because this predicate
     replaced a plain ``not report.strip()`` and has to stay a superset of it.
@@ -277,25 +307,7 @@ def is_silent_report(report: str) -> bool:
     characters once the dress around them is gone.
     """
     bare = report.strip().strip(_MARKDOWN_DRESS).strip()
-    if not bare:
-        return True
-    try:
-        from cron.scheduler import _is_cron_silence_response
-
-        return bool(_is_cron_silence_response(bare))
-    except Exception:
-        # Two cases, one answer. The import fails outside the Hermes tree — the
-        # unit tests, and any caller that imports this module on its own. The
-        # call fails if that private matcher ever raises on an input, which is
-        # no longer a hypothetical worth leaving uncovered: this predicate now
-        # gates every out-of-process Slack send, not just cron reports, so it
-        # runs over arbitrary interactive text rather than a scheduler's own
-        # output. Guarding only the import left the call able to take the whole
-        # send down over a silence test.
-        #
-        # Fall back to the marker itself rather than failing open, because
-        # failing open here means posting the marker.
-        return bare.strip().upper() == "[SILENT]"
+    return not bare or bare.upper() == SILENT_MARKER
 
 
 #: Where ``audit_report.py finish`` records each stream's last run. Same

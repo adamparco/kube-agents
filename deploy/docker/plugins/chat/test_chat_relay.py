@@ -304,31 +304,60 @@ class TestStandaloneSend(unittest.TestCase):
                 self.assertTrue(report.strip() == "", "fixture is not whitespace")
                 self.assertTrue(mod.is_silent_report(report))
 
-    def test_an_upstream_matcher_that_raises_costs_the_test_not_the_send(self):
-        """The `try` guarded the import and left the call outside it.
+    def test_the_upstream_matcher_is_not_consulted_at_all(self):
+        """Every case must answer the same in the pod as it does here.
 
-        This predicate is no longer cron-only: `slack_relay_patch` routes every
-        out-of-process Slack send through it, so it runs over arbitrary
-        interactive text rather than a scheduler's own output. A raise inside
-        the private upstream matcher therefore propagated out of a silence test
-        and failed the whole send. Degrade to the marker comparison instead --
-        the same answer the import failure already gives.
+        The predicate used to delegate to `cron.scheduler`, which is absent from
+        this checkout, so every silence test took the `except` fallback and the
+        branch that actually ships was ungraded. Two of the tests above --
+        including the one asserting a report that mentions the marker is
+        relayed -- passed for that reason alone.
+
+        Planting a matcher that answers the opposite of the truth pins that the
+        deployed branch and the tested branch are now the same code. If the
+        delegation comes back, this fails on both lines at once.
         """
         import sys
         import types
 
+        calls = []
+
+        def inverted(text):
+            calls.append(text)
+            return "SILENT" not in text.upper()
+
         fake = types.ModuleType("cron.scheduler")
-
-        def explode(_text):
-            raise RuntimeError("upstream matcher blew up")
-
-        fake._is_cron_silence_response = explode
+        fake._is_cron_silence_response = inverted
         pkg = types.ModuleType("cron")
         pkg.scheduler = fake
         with patch.dict(sys.modules, {"cron": pkg, "cron.scheduler": fake}):
-            # Reached the matcher and survived it, answering from the marker.
-            self.assertTrue(mod.is_silent_report("[SILENT]"))
+            self.assertTrue(mod.is_silent_report("**[SILENT]**"))
             self.assertFalse(mod.is_silent_report("3 critical findings"))
+        self.assertEqual([], calls, "the upstream matcher was consulted")
+
+    def test_an_alert_that_quotes_the_marker_in_prose_is_relayed(self):
+        """The reason the delegation had to go.
+
+        `standalone_send` is the sender for every out-of-process `hermes send`,
+        not only for cron: `session_kv_server._post_initial_alert` pages through
+        it and `_send_to_chat` posts the composed cron report through it.
+        Upstream's matcher accepts the marker on its own line among prose, which
+        is correct for a model's response to a cron prompt and wrong for these
+        -- an alert about a run that published nothing quotes the marker while
+        saying so, and got `{"success": True, "skipped": "empty_text"}` with no
+        `message_id`, so the caller could not tell the page had been dropped.
+        """
+        alert = (
+            "Incident: audit-runner CrashLoopBackOff in prod-eu.\n"
+            "The run never emitted its summary; the last thing hermes recorded was\n"
+            "[SILENT]\n"
+            "which is why nothing was posted at 06:00. Investigating."
+        )
+        self.assertFalse(mod.is_silent_report(alert))
+        # The marker leading and trailing the prose, not only embedded in it:
+        # both are shapes the undress could have eaten from the ends.
+        self.assertFalse(mod.is_silent_report("[SILENT]\nwas recorded at 06:00."))
+        self.assertFalse(mod.is_silent_report("The 06:00 run recorded\n[SILENT]"))
 
     def test_the_marker_padded_with_non_ascii_whitespace_is_still_silence(self):
         # The dress strip stops at the NBSP, leaving the asterisks in place, so
@@ -954,6 +983,29 @@ class TestSiblingDeliveryTargets(unittest.TestCase):
         os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
         os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
         self.assertEqual(mod.sibling_delivery_targets("audit"), ["slack"])
+
+    def test_no_job_id_adopts_no_jobs_deliver(self):
+        """An empty id is "no wrapper", not "the job whose id is blank".
+
+        Every delivery under ``cron.wrap_response: false`` arrives without a
+        wrapper and yields ``job_id == ""``, and the lookup compared that
+        against ``job.get("id") or ""`` -- so it matched the first hand-edited
+        entry with a missing id and subtracted platforms on the strength of a
+        different job's ``deliver``. Here that would suppress both legs of a
+        delivery the store says nothing about.
+        """
+        path = os.path.join(self.home, "cron", "jobs.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"jobs": [{"name": "hand edited, no id", "deliver": "all"},
+                          {"id": "audit", "deliver": "chat"}]},
+                handle,
+            )
+        os.environ["SLACK_HOME_CHANNEL"] = "D0BKGRBM6RH"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        self.assertEqual(mod.sibling_delivery_targets(""), [])
+        # The real job still resolves, so this narrowed nothing that works.
+        self.assertEqual(mod.sibling_delivery_targets("audit"), [])
 
     def test_a_json_list_is_read_the_same_as_the_comma_form(self):
         """The test above calls a comma string "an explicit list"; this is one.
