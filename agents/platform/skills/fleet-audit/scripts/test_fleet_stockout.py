@@ -533,8 +533,9 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=1))
 
     def test_flags_near_max_node_count(self):
+        # 2 zones x maxNodeCount 10 = 20 real ceiling, so 90% is 18 nodes.
         pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
-        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9)
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=18)
         self.assertIsNotNone(hit)
         self.assertIn("90%", hit["excerpt"])
 
@@ -545,10 +546,97 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         told to enable multi-zone node pools it already had, so the excerpt has
         to carry both the arm and the span for 3.9 to key off."""
         pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
-        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9)
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=18)
         self.assertTrue(hit["excerpt"].startswith("at its autoscaling ceiling:"), hit["excerpt"])
         self.assertIn("us-central1-b", hit["excerpt"])
         self.assertNotIn("single-zone", hit["excerpt"])
+
+    # ----------------------------------------------------------------- #
+    # `maxNodeCount` is per location, and the live count is a pool total
+    # ----------------------------------------------------------------- #
+
+    def test_a_multi_zone_pool_is_not_full_at_the_per_zone_number(self):
+        """The regression. `maxNodeCount` is the GKE API's *per-location*
+        limit, so a three-zone pool declaring 10 stops at 30 nodes. Comparing
+        a pool total against the per-zone field called this pool 90% full at
+        9 of its 30 nodes -- and multi-zone is what the zone-locked arm's own
+        remediation tells operators to build, so following this check's advice
+        was what armed its false positive."""
+        pool = {
+            "name": "p1",
+            "locations": ["us-central1-a", "us-central1-b", "us-central1-c"],
+            "autoscaling": {"enabled": True, "maxNodeCount": 10},
+        }
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9))
+        # ...and it does fire once the pool really is near 30.
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=27)
+        self.assertIn("27/30 live nodes", hit["excerpt"])
+        self.assertIn("maxNodeCount 10/zone x 3 zones", hit["excerpt"])
+
+    def test_total_max_node_count_is_already_pool_wide(self):
+        # The mutually-exclusive pool-wide form. Multiplying it by the zone
+        # count would be the same bug in the other direction.
+        pool = {
+            "name": "p1",
+            "locations": ["us-central1-a", "us-central1-b"],
+            "autoscaling": {"enabled": True, "totalMaxNodeCount": 10},
+        }
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9)
+        self.assertIn("9/10 live nodes", hit["excerpt"])
+        self.assertIn("totalMaxNodeCount", hit["excerpt"])
+        self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=4))
+
+    def test_a_single_zone_pool_reads_max_node_count_unchanged(self):
+        # Where the two spellings coincide, and the only shape this fleet has.
+        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=9)
+        self.assertIn("9/10 live nodes", hit["excerpt"])
+        self.assertIn("90% of maxNodeCount)", hit["excerpt"])
+
+    # ----------------------------------------------------------------- #
+    # Each arm carries its own Impact
+    # ----------------------------------------------------------------- #
+
+    def test_the_zone_locked_impact_does_not_halt_the_whole_cluster(self):
+        """`IMPACT["single-zone-nodepool"]` used to be one blended sentence --
+        "locked to a single zone or near its scaling ceiling: any zonal
+        stockout or scale event halts cluster auto-scaling" -- so it was half
+        false whichever arm published it. The zone-locked half also overstated
+        its blast radius: GKE's autoscaler treats each pool-zone pair as its
+        own node group and backs off only the one that failed."""
+        pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        hit = fs.check_single_zone_nodepool(pool, has_nap=False, current_node_count=1)
+        self.assertIn("halts scale-up of this pool", hit["impact"])
+        self.assertIn("other pools keep scaling", hit["impact"])
+        self.assertNotIn("halts cluster auto-scaling", hit["impact"])
+        self.assertNotIn("all cluster auto-scaling", hit["impact"])
+        # And it must not carry the other arm's condition.
+        self.assertNotIn("scaling ceiling", hit["impact"])
+
+    def test_the_ceiling_impact_claims_nothing_about_zones_or_stockouts(self):
+        # This arm fires on regional pools spanning three zones. Every
+        # zonal-stockout sentence is false of it, and a scale event reaching a
+        # configured limit is the autoscaler working, not a capacity failure.
+        pool = {
+            "name": "p1",
+            "locations": ["us-central1-a", "us-central1-b", "us-central1-c"],
+            "autoscaling": {"enabled": True, "maxNodeCount": 10},
+        }
+        hit = fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=27)
+        self.assertIn("90% of its effective node ceiling", hit["impact"])
+        self.assertIn("this pool's own configuration", hit["impact"])
+        self.assertNotIn("stockout", hit["impact"])
+        self.assertNotIn("locked to a single zone", hit["impact"])
+
+    def test_emit_prefers_the_arm_impact_and_falls_back_otherwise(self):
+        # The plumbing the two arms rely on, and the default every
+        # single-meaning check still gets.
+        armed = fs._emit("single-zone-nodepool", {"object": "NodePool/p1", "excerpt": "x", "impact": "arm sentence"})
+        self.assertEqual(armed["impact"], "arm sentence")
+        default = fs._emit("single-zone-nodepool", {"object": "NodePool/p1", "excerpt": "x"})
+        self.assertEqual(default["impact"], fs.IMPACT["single-zone-nodepool"])
+        # The unreachable fallback must at least be true of both arms.
+        self.assertNotIn("any zonal stockout or scale event", default["impact"])
 
     def test_the_zone_locked_arm_still_starts_with_single_zone(self):
         # The other half of the discriminator 3.9 reads.
@@ -1007,8 +1095,10 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("single-zone-nodepool", slugs)
 
     def test_near_max_node_count_flagged_from_live_nodes(self):
+        # 18 of the pool's real 20-node ceiling: `maxNodeCount` is per
+        # location and this pool spans two, while the live count sums both.
         pool = {"name": "p1", "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
-        live_nodes = [node(f"n{i}", "p1") for i in range(9)]
+        live_nodes = [node(f"n{i}", "p1") for i in range(18)]
         entry = self.run_with(dump_items=live_nodes, pools=[pool])
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("single-zone-nodepool", slugs)
