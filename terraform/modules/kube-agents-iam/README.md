@@ -22,7 +22,16 @@ rather than a read, so the grant is not read-only in substance — see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md) for why the
 narrower custom role is still the better of the two options. And `role_id` is a constant, not
 derived from `service_account_id`, so two instantiations of this module in one project collide on
-it; that is the same constraint the GSA's own default name already imposes.
+it. That is a harder constraint than the one the GSA name imposes, not the same one:
+`service_account_id` is a variable, so a second instantiation can be given a different name, and
+the custom role has no such escape.
+
+`terraform destroy` — which `uninstall.sh` reaches — soft-deletes that role, and GCP then holds
+the name for between 7 and 37 days. Reinstalling inside the first 7 is fine, because the provider
+finds the soft-deleted role and undeletes it. Past that the role can be neither created nor
+changed until the window closes, and `terraform apply` fails. Wait it out, or run
+`gcloud iam roles undelete kubeagentsSubnetUtilizationReader --project <project>`. `main.tf`
+carries the rest, including why turning the id into a variable is not the fix it looks like.
 
 There is no admin preset to mirror: the `gke-admin` bundle was removed (see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),
