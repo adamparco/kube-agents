@@ -819,6 +819,29 @@ class UnattachedDiskTest(unittest.TestCase):
     def test_does_not_flag_recently_created(self):
         self.assertEqual(fw.check_unattached_disk([self.disk(created="2026-07-30T00:00:00Z")], set(), now=NOW), [])
 
+    def test_a_disk_detached_yesterday_is_churn_however_old_it_is(self):
+        """The 30 days are justified as outliving a maintenance cycle, and a
+        maintenance cycle detaches disks — it does not create them. Reading the
+        age off `creationTimestamp` flagged a year-old boot disk that PD-CSI
+        released this morning, which is the churn the threshold excludes."""
+        disk = self.disk(created="2025-01-01T00:00:00Z")
+        disk["lastDetachTimestamp"] = "2026-08-27T00:00:00Z"
+        self.assertEqual(fw.check_unattached_disk([disk], set(), now=NOW), [])
+
+    def test_the_excerpt_dates_the_detach_not_the_creation(self):
+        disk = self.disk(created="2025-01-01T00:00:00Z")
+        disk["lastDetachTimestamp"] = "2026-05-30T00:00:00Z"
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn("unattached since 2026-05-30T00:00:00Z", hits[0]["excerpt"])
+        self.assertNotIn("2025-01-01", hits[0]["excerpt"])
+
+    def test_a_disk_never_attached_says_so_rather_than_implying_a_detach(self):
+        """No `lastDetachTimestamp` means GCE never attached it, so creation is
+        genuinely when it went idle — but "unattached since" would assert a
+        detach that never happened."""
+        hits = fw.check_unattached_disk([self.disk()], set(), now=NOW)
+        self.assertIn("never attached, created 2026-01-01T00:00:00Z", hits[0]["excerpt"])
+
     def test_does_not_flag_a_disk_matching_a_live_pv_handle(self):
         self.assertEqual(fw.check_unattached_disk([self.disk(name="pv-handle-1")], {"pv-handle-1"}, now=NOW), [])
 

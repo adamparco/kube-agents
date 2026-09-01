@@ -1272,12 +1272,37 @@ LB_ANNOTATION_KEYS = ("kubernetes.io/ingress.global-static-ip-name", "networking
 NON_WASTE_ADDRESS_PURPOSES = {"GCE_ENDPOINT", "VPC_PEERING", "PRIVATE_SERVICE_CONNECT", "NAT_AUTO", "SHARED_LOADBALANCER_VIP", "IPSEC_INTERCONNECT"}
 
 
+def _idle_since(disk: dict) -> tuple[str, str]:
+    """When the disk stopped being used, and how the excerpt should say it.
+
+    `creationTimestamp` is the wrong clock here for any disk that was ever
+    attached. The SOP justifies the 30-day threshold as outliving "node
+    upgrades, pod rescheduling, and maintenance windows" — churn, in other
+    words — and none of those touch creation time. A boot disk created a year
+    ago and detached this morning clears a creation-age filter with eleven
+    months to spare, and it is exactly the churn the threshold exists to
+    exclude. Reading it as waste would also make the excerpt's "unattached
+    since" a false statement by eleven months.
+
+    GCE stamps `lastDetachTimestamp` on every detach and omits it for a disk
+    that has never been attached — the one case where creation really is the
+    moment it went idle, and the excerpt says so rather than implying a detach
+    that never happened.
+    """
+    detached = disk.get("lastDetachTimestamp")
+    if detached:
+        return str(detached), f"unattached since {detached}"
+    created = disk.get("creationTimestamp", "")
+    return str(created), f"never attached, created {created}"
+
+
 def check_unattached_disk(disks: list[dict], live_pv_handles: set[str], *, now: datetime) -> list[dict]:
     hits = []
     for disk in disks:
         if disk.get("users"):
             continue
-        age = _age_days(disk.get("creationTimestamp", ""), now=now)
+        idle_since, idle_phrase = _idle_since(disk)
+        age = _age_days(idle_since, now=now)
         if age is None or age < 30:
             continue
         if disk.get("name", "") in live_pv_handles:
@@ -1288,7 +1313,7 @@ def check_unattached_disk(disks: list[dict], live_pv_handles: set[str], *, now: 
         hits.append(
             {
                 "object": f"Disk/{disk.get('name', '')}",
-                "excerpt": f"unattached since {disk.get('creationTimestamp')}, {size_gb:.0f} GB, {disk.get('type')} ({_scope_flag(disk)})",
+                "excerpt": f"{idle_phrase}, {size_gb:.0f} GB, {disk.get('type')} ({_scope_flag(disk)})",
                 "severity": "major" if size_gb >= 500 or "ssd" in disk_type or "extreme" in disk_type else "minor",
             }
         )
