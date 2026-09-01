@@ -1041,6 +1041,69 @@ class OrphanLbTest(unittest.TestCase):
         self.assertIn("--global", glob[0]["excerpt"])
 
 
+class AgeInExcerptTest(unittest.TestCase):
+    """Every check that gates on age says the age it gated on.
+
+    A check computes an age, decides with it, and then quoted the raw ISO
+    timestamp. The model reading the manifest still has to say how long the
+    thing has been idle -- that is the finding -- so it did the date arithmetic
+    itself and got it wrong: `argocd-webhook-ip`, reserved 2026-08-02 and read
+    2026-09-01, was published as "unused for 28 days". `adopt_collector_evidence`
+    replaces the model's evidence with the collector's and leaves the title
+    alone, so the wrong number outlives the correct evidence beside it.
+
+    Each timestamp below is 2026-01-01 against a NOW of 2026-08-01: 212 days.
+    """
+
+    AGO = "(212d ago)"
+
+    def test_orphan_pv_dates_the_phase_transition(self):
+        pv = obj("PersistentVolume", "pv-1", **{"spec.persistentVolumeReclaimPolicy": "Retain", "status.phase": "Released", "spec.capacity": {"storage": "10Gi"}, "status.lastPhaseTransitionTime": "2026-01-01T00:00:00Z"})
+        hits = fw.check_orphan_pv({"pvs": [pv], "pvcs": [], "statefulsets": []}, now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_terminal_pods_dates_the_oldest_pod(self):
+        pods = [obj("Pod", "p", ns="default", **{"status.phase": "Succeeded", "metadata.creationTimestamp": "2026-01-01T00:00:00Z"})]
+        hits = fw.check_terminal_pods({"pods": pods, "jobs": [], "cronjobs": []}, now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_a_ttl_less_job_dates_its_completion(self):
+        job = obj("Job", "batch", ns="default", **{"status.succeeded": 1, "status.completionTime": "2026-01-01T00:00:00Z"})
+        hits = fw.check_terminal_pods({"pods": [], "jobs": [job], "cronjobs": []}, now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_an_unattached_disk_dates_the_detach(self):
+        disk = {"name": "d1", "sizeGb": "200", "type": "pd-standard", "creationTimestamp": "2020-01-01T00:00:00Z", "lastDetachTimestamp": "2026-01-01T00:00:00Z", "zone": "us-central1-a", "users": []}
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn(f"unattached since 2026-01-01T00:00:00Z {self.AGO}", hits[0]["excerpt"])
+
+    def test_an_idle_address_dates_its_reservation(self):
+        addr = {"name": "a1", "address": "1.2.3.4", "addressType": "EXTERNAL", "status": "RESERVED", "purpose": "", "creationTimestamp": "2026-01-01T00:00:00Z", "region": "us-central1"}
+        hits = fw.check_idle_address([addr], set(), project="p", now=NOW)
+        self.assertIn(f"since 2026-01-01T00:00:00Z {self.AGO}", hits[0]["excerpt"])
+
+    def test_an_orphan_forwarding_rule_dates_its_creation(self):
+        rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        hits = fw.check_orphan_lb([rule], [], [], set(), now=NOW)
+        self.assertIn(self.AGO, hits[0]["excerpt"])
+
+    def test_the_age_belongs_to_the_address_it_is_printed_beside(self):
+        """`idle` was a list of addresses and the age a loop variable left over
+        from the filter pass, so reading it in the emit loop would have stamped
+        every address with the last one's age. Two addresses of different ages,
+        emitted separately, is the only shape that catches it."""
+        old = {"name": "old", "address": "1.1.1.1", "addressType": "EXTERNAL", "status": "RESERVED", "creationTimestamp": "2026-01-01T00:00:00Z", "region": "us-central1"}
+        new = {"name": "new", "address": "2.2.2.2", "addressType": "EXTERNAL", "status": "RESERVED", "creationTimestamp": "2026-07-01T00:00:00Z", "region": "us-central1"}
+        by_name = {h["object"]: h["excerpt"] for h in fw.check_idle_address([old, new], set(), project="p", now=NOW)}
+        self.assertIn("(212d ago)", by_name["Address/old"])
+        self.assertIn("(31d ago)", by_name["Address/new"])
+
+    def test_an_unreadable_timestamp_prints_no_age_rather_than_zero(self):
+        """`_age_days` returns None for a timestamp it cannot parse, and "(0d
+        ago)" would assert the thing went idle today."""
+        self.assertEqual(fw._ago(None), "")
+
+
 class CollectProjectComputeTest(unittest.TestCase):
     """The five project-scope reads, and what happens when one of them fails.
 

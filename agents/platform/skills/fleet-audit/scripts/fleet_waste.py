@@ -438,6 +438,27 @@ def _age_days(timestamp: str, *, now: datetime) -> float | None:
     return (now - ts).total_seconds() / 86400.0
 
 
+def _ago(age: float | None) -> str:
+    """The elapsed-days parenthetical an excerpt puts after a timestamp.
+
+    Every check here that gates on age computes one, decides with it, and then
+    quoted the raw ISO timestamp and threw the number away. The model reading
+    the manifest still has to say how long the thing has been idle -- that is
+    the finding -- so it re-derived the age by doing date arithmetic on the
+    string, and got it wrong: an address reserved on 2026-08-02, read on
+    2026-09-01, was published as "unused for 28 days". Nothing downstream
+    catches that, because `adopt_collector_evidence` replaces the model's
+    evidence with the collector's and leaves the title alone, so the wrong
+    number is the one a reader sees next to correct evidence.
+
+    Returning the number the gate already used costs nothing and removes the
+    arithmetic from the model's job. Empty when the age is unknown rather than
+    guessing: a missing timestamp is why `_age_days` returns None, and "(0d
+    ago)" would assert something about it.
+    """
+    return "" if age is None else f" ({age:.0f}d ago)"
+
+
 # --------------------------------------------------------------------------- #
 # 3.2 orphan-pv
 # --------------------------------------------------------------------------- #
@@ -484,7 +505,7 @@ def check_orphan_pv(context: dict, *, now: datetime) -> list[dict]:
             hits.append(
                 {
                     "object": f"PersistentVolume/{name}",
-                    "excerpt": f"phase={phase} since {transition or meta.get('creationTimestamp')}{fallback_note}, capacity={spec.get('capacity', {}).get('storage')}",
+                    "excerpt": f"phase={phase} since {transition or meta.get('creationTimestamp')}{_ago(age)}{fallback_note}, capacity={spec.get('capacity', {}).get('storage')}",
                     "severity": "major" if _is_large_or_ssd(spec) else "minor",
                 }
             )
@@ -837,10 +858,11 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
     total = sum(len(v) for v in by_ns.values())
     for ns, pods in by_ns.items():
         oldest = min((p.get("metadata", {}).get("creationTimestamp", "") for p in pods), default="")
+        oldest_age = _age_days(oldest, now=now)
         old_enough = any((_age_days(p.get("metadata", {}).get("creationTimestamp", ""), now=now) or 0) >= 7 for p in pods)
         if len(pods) >= 50 or old_enough:
             severity = "major" if len(pods) > 500 or total > 2000 else "minor"
-            hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": f"{len(pods)} terminal pods, oldest from {oldest}", "severity": severity})
+            hits.append({"namespace": ns, "object": f"Namespace/{ns}", "excerpt": f"{len(pods)} terminal pods, oldest from {oldest}{_ago(oldest_age)}", "severity": severity})
 
     for job in context["jobs"]:
         meta, spec, status = job.get("metadata", {}), job.get("spec", {}), job.get("status", {})
@@ -857,7 +879,7 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
         age = _age_days(done, now=now)
         if age is None or age < 7:
             continue
-        hits.append({"namespace": ns, "object": f"Job/{meta.get('name', '')}", "excerpt": f"finished {done}, no ttlSecondsAfterFinished", "severity": "minor"})
+        hits.append({"namespace": ns, "object": f"Job/{meta.get('name', '')}", "excerpt": f"finished {done}{_ago(age)}, no ttlSecondsAfterFinished", "severity": "minor"})
 
     for cj in context["cronjobs"]:
         meta, spec = cj.get("metadata", {}), cj.get("spec", {})
@@ -1313,7 +1335,7 @@ def check_unattached_disk(disks: list[dict], live_pv_handles: set[str], *, now: 
         hits.append(
             {
                 "object": f"Disk/{disk.get('name', '')}",
-                "excerpt": f"{idle_phrase}, {size_gb:.0f} GB, {disk.get('type')} ({_scope_flag(disk)})",
+                "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk.get('type')} ({_scope_flag(disk)})",
                 "severity": "major" if size_gb >= 500 or "ssd" in disk_type or "extreme" in disk_type else "minor",
             }
         )
@@ -1372,7 +1394,7 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
         age = _age_days(addr.get("creationTimestamp", ""), now=now)
         if age is None or age < 14:
             continue
-        idle.append(addr)
+        idle.append((addr, age))
     if len(idle) >= 10:
         # §3.5's roll-up is per *project*, and §5 requires a roll-up to be named
         # after the scope it covers rather than after one of its members. It was
@@ -1382,10 +1404,10 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
         # and an identity that moves the moment that address is released, which
         # re-announces the same leak as a new finding. The scope is the project.
         by_location: dict[str, list[str]] = {}
-        for addr in idle:
+        for addr, _ in idle:
             by_location.setdefault(_location_of(addr), []).append(addr.get("name", ""))
         breakdown = ", ".join(f"{loc} ({len(names)})" for loc, names in sorted(by_location.items()))
-        names = sorted(n for n in (a.get("name", "") for a in idle) if n)
+        names = sorted(n for n in (a.get("name", "") for a, _ in idle) if n)
         shown = ", ".join(names[:ROLLUP_EXCERPT_MEMBERS])
         if len(names) > ROLLUP_EXCERPT_MEMBERS:
             shown += f", and {len(names) - ROLLUP_EXCERPT_MEMBERS} more"
@@ -1396,8 +1418,8 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
                 "severity": "major",
             }
         ]
-    for addr in idle:
-        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')} ({_scope_flag(addr)})", "severity": "minor"})
+    for addr, age in idle:
+        hits.append({"object": f"Address/{addr.get('name', '')}", "excerpt": f"RESERVED and unattached since {addr.get('creationTimestamp')}{_ago(age)} ({_scope_flag(addr)})", "severity": "minor"})
     return hits
 
 
@@ -1424,7 +1446,7 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
         age = _age_days(rule.get("creationTimestamp", ""), now=now)
         if age is None or age < 7:
             continue
-        hits.append({"object": f"ForwardingRule/{rule.get('name', '')}", "excerpt": f"targets deleted Service {m.group(1)} ({_scope_flag(rule)})", "severity": "major"})
+        hits.append({"object": f"ForwardingRule/{rule.get('name', '')}", "excerpt": f"targets deleted Service {m.group(1)}, created {rule.get('creationTimestamp')}{_ago(age)} ({_scope_flag(rule)})", "severity": "major"})
     for pool in target_pools:
         if not pool.get("instances"):
             hits.append({"object": f"TargetPool/{pool.get('name', '')}", "excerpt": f"zero instances ({_scope_flag(pool)})", "severity": "major"})
