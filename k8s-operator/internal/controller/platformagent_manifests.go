@@ -2576,6 +2576,19 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// survives, and that copy is then JSON-escaped and encoded for the
 		// response -- so raising it costs on the order of three times the
 		// increase per in-flight request rather than nothing.
+		//
+		// Which is what puts a ceiling on it, and the ceiling is this
+		// container's own 2Gi memory limit below rather than anything about
+		// the fleet. Count five live copies of a capped output per in-flight
+		// command -- the subprocess bytes, the slice, the decoded str, the
+		// JSON-escaped str, the encoded response -- against the five-way
+		// kanban fan-out resolveResources sizes the agent container for, plus
+		// the front-door session, each issuing one command. At 32 MiB that is
+		// ~960 MiB of burst on top of the ~250 MiB this sidecar holds steady,
+		// which the limit absorbs; at 64 MiB it does not, and an OOMKill here
+		// takes gcloud, kubectl, gh and git away from the whole Pod. Raising
+		// this means raising the limit with it, and the cap test asserts the
+		// pair so the two cannot drift apart silently.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "33554432"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},

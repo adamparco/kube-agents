@@ -1285,6 +1285,32 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if capBytes <= largestObservedDump {
 		t.Errorf("proxy output cap %d does not clear the largest observed dump %d", capBytes, largestObservedDump)
 	}
+
+	// The other half of the argument, which the floor above cannot make: a cap
+	// this side of the fleet's needs is still wrong if the container cannot
+	// hold it. Five live copies of a capped output exist per in-flight command
+	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
+	// response -- and the commands in flight are one per kanban worker plus
+	// the front-door session. Nothing bounds that concurrency inside the
+	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
+	// memory limit alongside the ~250Mi this sidecar holds steady, or an
+	// OOMKill takes gcloud, kubectl, gh and git away from the whole Pod.
+	//
+	// Five workers rather than defaultKanbanMaxInProgress, because that
+	// default is overridable and resolveResources sizes the agent container
+	// for the five-way fan-out it has actually observed. The sidecar is sized
+	// for the same install.
+	const copiesPerCommand = 5
+	const steadyStateBytes = 250 << 20
+	const observedFanOut = 5
+	inFlight := int64(observedFanOut + 1)
+	burst := int64(capBytes) * copiesPerCommand * inFlight
+	limits := buildCredentialProxySidecar(agent, "/opt/hermes").Resources.Limits
+	limit := limits.Memory().Value()
+	if burst+steadyStateBytes > limit {
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the sidecar's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+			capBytes, burst, inFlight, limit, int64(steadyStateBytes))
+	}
 }
 
 // TestBuildPodTemplateSpecIsolatesTheSidecarUser covers the two Pod-level halves
