@@ -361,8 +361,37 @@ for JOBS_FILE in $CRON_JOBS; do
 done
 
 PROMPT_HITS=$(mktemp)
-trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
+ROSTER_DOCS=$(mktemp)
+trap 'rm -f "$FILE_LIST" "$PROMPT_HITS" "$ROSTER_DOCS"' EXIT
+
+# Which documents are claiming to quote the roster at all. The anchor below is
+# structural for the reason above, but `"prompt": "` is not structure unique to
+# a cron manifest -- it is the shape of a LiteLLM request body, a Vertex
+# payload, and a bench fixture, none of which this guard has an opinion about
+# and all of which live in `examples/`, `bench/` and the reference pages that
+# document them. Applied to all 280 markdown files in the repository, the
+# anchor turns any unrelated pull request that renders one of those into a red
+# CI run with an error message about cron prompts.
 #
+# So narrow the population, not the anchor. A document renders a roster *entry*
+# when it renders a real job's `"id"`, which every one of the three quotations
+# in the tree today does, one line above its `"prompt"`. That keeps the
+# property the structural anchor was adopted for -- nothing here is drawn from
+# what a prompt says, so a rewording cannot make the guard stop looking -- while
+# a `prompt` key in a document that never names a job is left alone.
+#
+# `jq` over both rosters rather than a hand-kept list: a new job is then covered
+# the day it is added, and a renamed one does not quietly narrow this to zero.
+# shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+ROSTER_IDS=$(jq -r '(.jobs // .)[].id' $CRON_JOBS 2>/dev/null | sort -u)
+if [ -z "$ROSTER_IDS" ]; then
+  echo "ERROR: no job ids read from ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
+  exit 1
+fi
+ID_ALTERNATION=$(printf '%s\n' "$ROSTER_IDS" | paste -sd'|' -)
+search "\"id\"[[:space:]]*:[[:space:]]*\"(${ID_ALTERNATION})\"" \
+  | cut -d: -f1 | sort -u > "$ROSTER_DOCS"
+
 # Match the key wherever on the line it falls and however it is spaced. An
 # anchor that insisted on the key starting the line, followed by exactly one
 # space, saw only prettier's rendering of a multi-line object — a one-line
@@ -371,7 +400,11 @@ trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
 # normalises much of this back, but only inside a fence tagged `json`, and CI
 # does not run it over `.mdx` at all. What no line-based anchor can see is a
 # quotation whose value sits on the line after its key; those are unchecked.
-search '"prompt"[[:space:]]*:[[:space:]]*"' > "$PROMPT_HITS"
+if [ -s "$ROSTER_DOCS" ]; then
+  tr '\n' '\0' < "$ROSTER_DOCS" \
+    | xargs -0 grep -nEI -H '"prompt"[[:space:]]*:[[:space:]]*"' 2>/dev/null \
+    > "$PROMPT_HITS" || true
+fi
 
 # No floor here, unlike the caps above: the site owes nobody a quotation of a
 # cron prompt, and zero copies is zero stale copies. That is safe only because
@@ -390,13 +423,36 @@ while IFS= read -r HIT; do
   # far as the ellipsis and no further. Abbreviating is allowed; misquoting the
   # part you did show is not. Both spellings count: house style is `…`, and
   # accepting only `...` failed the quotations that follow it.
-  QUOTED=$(printf '%s\n' "$HIT" \
-    | sed -E 's/^.*"prompt"[[:space:]]*:[[:space:]]*"//; s/([^\\])".*$/\1/; s/[[:space:]]*(\.\.\.|…)$//')
-  # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
-  if [ -z "$QUOTED" ] || ! grep -qF -- "$QUOTED" $CRON_JOBS; then
-    STALE_PROMPTS="${STALE_PROMPTS}${HIT}
-"
+  # Every `"prompt": "…"` on the line, not just the last one. The single `sed`
+  # this replaced led with `^.*"prompt"`, and `.*` is greedy: on a line carrying
+  # two of them it stripped past the first and graded only the second, so a
+  # fabricated first value passed green. The value's own character class has no
+  # such preference — `[^"\\]|\\.` stops at the first unescaped quote by
+  # construction rather than by a following substitution — and `grep -o` emits
+  # one match per occurrence, so both get graded.
+  VALUES=$(printf '%s\n' "$HIT" \
+    | grep -oE '"prompt"[[:space:]]*:[[:space:]]*"([^"\\]|\\.)*"')
+  # A value with no closing quote on its line matches nothing above. Fall back
+  # to the old read — the rest of the line — rather than skipping the hit,
+  # because a hit the loop declines to grade is the silent pass this whole
+  # guard exists to stop, and an unterminated value is exactly the shape a
+  # half-pasted quotation takes.
+  if [ -z "$VALUES" ]; then
+    VALUES=$(printf '%s\n' "$HIT" | sed -E 's/^.*"prompt"[[:space:]]*:[[:space:]]*/"prompt": /')
   fi
+  while IFS= read -r VALUE; do
+    [ -n "$VALUE" ] || continue
+    QUOTED=$(printf '%s\n' "$VALUE" \
+      | sed -E 's/^"prompt"[[:space:]]*:[[:space:]]*"?//; s/"$//; s/[[:space:]]*(\.\.\.|…)$//')
+    # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+    if [ -z "$QUOTED" ] || ! grep -qF -- "$QUOTED" $CRON_JOBS; then
+      STALE_PROMPTS="${STALE_PROMPTS}${HIT}
+"
+      break
+    fi
+  done <<VALUES_EOF
+$VALUES
+VALUES_EOF
 done < "$PROMPT_HITS"
 
 if [ -n "$STALE_PROMPTS" ]; then
