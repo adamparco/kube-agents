@@ -2607,6 +2607,63 @@ class TestInferenceEndpointPublic(unittest.TestCase):
         svc["status"] = {"loadBalancer": {"ingress": [{"hostname": "a1b2.elb.amazonaws.com"}]}}
         self.assertEqual(len(self.result(svc, [w])), 1)
 
+    def restricted(self, ranges, ingress=("136.70.153.197",)):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=list(ingress))
+        svc["spec"]["loadBalancerSourceRanges"] = ranges
+        hits = self.result(svc, [w])
+        self.assertEqual(len(hits), 1)
+        return hits[0]
+
+    def test_a_source_range_allowlist_downgrades_rather_than_drops(self):
+        # The check's `impact` says anyone who finds the address can use the
+        # endpoint. GKE programs `loadBalancerSourceRanges` into the firewall
+        # in front of the forwarding rule, so under an allowlist that is not
+        # true and `critical` overstates it. Still a finding, though -- an
+        # allowlist bounds who reaches the endpoint, it does not make it
+        # unreachable, so this downgrades where the private-address branch
+        # drops outright.
+        hit = self.restricted(["203.0.113.0/24"])
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("admits 1 CIDR, not the whole internet", hit["excerpt"])
+
+    def test_the_allowed_ranges_are_counted_never_printed(self):
+        # Which networks are trusted is the other half of the target, and
+        # these findings are filed as issues on a public repository.
+        hit = self.restricted(["203.0.113.0/24", "198.51.100.7/32"])
+        self.assertNotIn("203.0.113", hit["excerpt"])
+        self.assertNotIn("198.51.100", hit["excerpt"])
+        self.assertIn("admits 2 CIDRs", hit["excerpt"])
+
+    def test_a_default_route_is_not_a_restriction(self):
+        # `0.0.0.0/0` is the whole internet written as an allowlist. Reading
+        # the field's presence rather than its contents would downgrade every
+        # one of these to `major`.
+        for ranges in (["0.0.0.0/0"], ["::/0"], ["203.0.113.0/24", "0.0.0.0/0"]):
+            with self.subTest(ranges=ranges):
+                hit = self.restricted(ranges)
+                self.assertIsNone(hit.get("severity"))
+                self.assertNotIn("admits", hit["excerpt"])
+
+    def test_an_unreadable_range_leaves_the_severity_alone(self):
+        # An allowlist the collector cannot parse is one it cannot vouch for,
+        # and guessing in the other direction downgrades a live exposure.
+        for ranges in (["not-a-cidr"], ["203.0.113.0/24", "10.0.0.0/8/8"]):
+            with self.subTest(ranges=ranges):
+                self.assertIsNone(self.restricted(ranges).get("severity"))
+
+    def test_blank_entries_do_not_defeat_the_allowlist(self):
+        # A blank string is not a CIDR and widens nothing, so the ranges
+        # beside it still restrict. Counting it would also misreport the total.
+        hit = self.restricted(["203.0.113.0/24", "", "  "])
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("admits 1 CIDR,", hit["excerpt"])
+
+    def test_an_absent_field_leaves_the_severity_alone(self):
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["136.70.153.197"])
+        self.assertIsNone(self.result(svc, [w])[0].get("severity"))
+
 
 class TestAiSecurityCollectCluster(unittest.TestCase):
     """One end-to-end pass over ai-security-audit's real collection plan --

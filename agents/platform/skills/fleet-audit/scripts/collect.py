@@ -1593,6 +1593,27 @@ def _is_private_address(value: str) -> bool:
         return False
 
 
+def _restricting_source_ranges(spec: dict) -> list[str]:
+    """The Service's source-range allowlist, or ``[]`` if it restricts nothing.
+
+    GKE programs ``loadBalancerSourceRanges`` into the firewall rule in front of
+    the forwarding rule, so it is enforcement rather than intent. Three ways a
+    populated field still restricts nothing, all of which return ``[]``: a
+    default route (``0.0.0.0/0``, ``::/0``) admits the whole internet, an
+    unparseable entry means the allowlist cannot be read at all, and an empty
+    list was never a restriction. Erring towards "unrestricted" keeps the
+    severity where it was.
+    """
+    ranges = [r.strip() for r in (spec.get("loadBalancerSourceRanges") or []) if isinstance(r, str) and r.strip()]
+    for r in ranges:
+        try:
+            if ipaddress.ip_network(r, strict=False).prefixlen == 0:
+                return []
+        except ValueError:
+            return []
+    return ranges
+
+
 def check_inference_endpoint_public(context: dict) -> list[dict]:
     hits = []
     for svc in context.get("services") or []:
@@ -1641,26 +1662,40 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         # branch needs every entry to be an unambiguously private literal.
         if assigned and not public:
             continue
-        hits.append(
-            {
-                "namespace": ns,
-                "object": f"Service/{meta.get('name', '')}",
-                # The count, never the address. `ai_security_audit_sop.md`
-                # (Red Lines, and again under check 3.5) forbids publishing
-                # the address of a reachable model endpoint, and these
-                # findings are filed as issues on a public repository --
-                # writing one here would hand a reader the target. It is not
-                # advisory either: `adopt_collector_evidence` overwrites the
-                # model's excerpt with this string, so an SOP-compliant
-                # excerpt would be replaced by whatever is written here.
-                "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace"
-                + (
-                    f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, none of them private"
-                    if public
-                    else ""
-                ),
-            }
-        )
+        hit = {
+            "namespace": ns,
+            "object": f"Service/{meta.get('name', '')}",
+            # The count, never the address. `ai_security_audit_sop.md`
+            # (Red Lines, and again under check 3.5) forbids publishing
+            # the address of a reachable model endpoint, and these
+            # findings are filed as issues on a public repository --
+            # writing one here would hand a reader the target. It is not
+            # advisory either: `adopt_collector_evidence` overwrites the
+            # model's excerpt with this string, so an SOP-compliant
+            # excerpt would be replaced by whatever is written here.
+            "excerpt": "type=LoadBalancer, no internal-LB annotation, selects an AI workload in this namespace"
+            + (
+                f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, none of them private"
+                if public
+                else ""
+            ),
+        }
+        # Downgraded rather than dropped, the opposite of the private-address
+        # branch above. A private address settles reachability outright; an
+        # allowlist only bounds who reaches it, and a `/8` of public space
+        # bounds very little. So the endpoint stays a finding and the severity
+        # stops claiming what `impact` says of an unrestricted one -- that
+        # anyone who finds the address can use it.
+        #
+        # Counts again, not the ranges themselves: which networks are trusted
+        # is the other half of the target, and this goes in a public issue.
+        ranges = _restricting_source_ranges(spec)
+        if ranges:
+            hit["severity"] = "major"
+            hit["excerpt"] += (
+                f"; loadBalancerSourceRanges admits {len(ranges)} CIDR{'s' if len(ranges) > 1 else ''}, not the whole internet"
+            )
+        hits.append(hit)
     return hits
 
 
