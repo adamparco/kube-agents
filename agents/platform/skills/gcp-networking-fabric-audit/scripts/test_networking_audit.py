@@ -188,7 +188,7 @@ class MtuMismatchTest(unittest.TestCase):
             {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
             {"name": "vpc-b", "mtu": 1500, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
         ]
-        hits = na.check_mtu_mismatch(networks)
+        hits = na.check_mtu_mismatch(networks, "p")
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["object"], "NetworkPeering/vpc-a--vpc-b")
 
@@ -197,7 +197,7 @@ class MtuMismatchTest(unittest.TestCase):
             {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
             {"name": "vpc-b", "mtu": 1500, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
         ]
-        hits = na.check_mtu_mismatch(networks)
+        hits = na.check_mtu_mismatch(networks, "p")
         self.assertEqual(len(hits), 1)
 
     def test_does_not_flag_matching_mtu(self):
@@ -205,18 +205,18 @@ class MtuMismatchTest(unittest.TestCase):
             {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
             {"name": "vpc-b", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
         ]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_does_not_flag_inactive_peering(self):
         networks = [
             {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "INACTIVE"}]},
             {"name": "vpc-b", "mtu": 1500, "peerings": []},
         ]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_peer_outside_this_project_is_not_a_crash(self):
         networks = [{"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/other-project-vpc", "state": "ACTIVE"}]}]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_an_absent_mtu_key_is_the_default_and_still_mismatches(self):
         """The shape `networks list` actually returns, and the only one that fires.
@@ -229,7 +229,7 @@ class MtuMismatchTest(unittest.TestCase):
             {"name": "vpc-default", "peerings": [{"network": ".../networks/vpc-jumbo", "state": "ACTIVE"}]},
             {"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/vpc-default", "state": "ACTIVE"}]},
         ]
-        hits = na.check_mtu_mismatch(networks)
+        hits = na.check_mtu_mismatch(networks, "p")
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["object"], "NetworkPeering/vpc-default--vpc-jumbo")
         self.assertIn("vpc-default mtu=1460", hits[0]["excerpt"])
@@ -240,14 +240,14 @@ class MtuMismatchTest(unittest.TestCase):
             {"name": "vpc-a", "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
             {"name": "vpc-b", "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
         ]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_a_silent_network_matches_one_that_spells_the_default_out(self):
         networks = [
             {"name": "vpc-a", "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
             {"name": "vpc-b", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
         ]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_an_unlisted_peer_is_not_defaulted_into_a_mismatch(self):
         """Absent from the listing is unknown; absent `mtu` on a listed network is 1460.
@@ -256,7 +256,7 @@ class MtuMismatchTest(unittest.TestCase):
         peered out to another project.
         """
         networks = [{"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/elsewhere", "state": "ACTIVE"}]}]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_a_peer_in_another_project_does_not_resolve_to_the_local_namesake(self):
         """`default` is the most common network name in GCP, so a bare-name
@@ -283,7 +283,7 @@ class MtuMismatchTest(unittest.TestCase):
                 ],
             },
         ]
-        self.assertEqual(na.check_mtu_mismatch(networks), [])
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
     def test_a_peer_in_this_project_still_resolves_through_its_self_link(self):
         """The other half of the pair: same URL shape, same project, so the
@@ -308,11 +308,83 @@ class MtuMismatchTest(unittest.TestCase):
                 "peerings": [],
             },
         ]
-        hits = na.check_mtu_mismatch(networks)
+        hits = na.check_mtu_mismatch(networks, "p")
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
         self.assertIn("default mtu=1460", hits[0]["excerpt"])
         self.assertIn("vpc-jumbo mtu=8896", hits[0]["excerpt"])
+
+    def test_a_peering_given_as_a_partial_url_resolves(self):
+        """`NetworkPeering.network` is documented as a full *or* partial URL.
+
+        A partial one carries no `projects/` segment, so keying it as a bare
+        name left it unable to join a `selfLink`-keyed listing: a real
+        1460-vs-8896 mismatch read clean, with nothing logged. Relative means
+        the audited project, so it is qualified with it.
+        """
+        networks = [
+            {
+                "name": "default",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                "peerings": [
+                    {"network": "global/networks/vpc-jumbo", "state": "ACTIVE"}
+                ],
+            },
+            {
+                "name": "vpc-jumbo",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [],
+            },
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
+
+    def test_a_listing_entry_without_a_self_link_still_joins_a_full_url(self):
+        """The check must not depend on `networks list` emitting `selfLink`.
+
+        If it stops, every entry keys on its bare name, a fully-qualified
+        `peerings[].network` matches none of them, and the check reports clean
+        for the whole project without erroring -- the silent blind spot this
+        file refuses to accept for the PSC filter. Qualifying a `selfLink`-less
+        entry with the audited project is what keeps the join working.
+        """
+        networks = [
+            {
+                "name": "default",
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+            {"name": "vpc-jumbo", "mtu": 8896, "peerings": []},
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
+
+    def test_qualifying_a_relative_peer_does_not_reach_another_project(self):
+        """The control for both tests above: qualification uses the audited
+        project, so a `selfLink`-less listing does not become a namespace a
+        cross-project peering can accidentally land in.
+        """
+        networks = [
+            {
+                "name": "vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/other-proj/global/networks/default",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+            {"name": "default", "peerings": []},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
 
 
 class CloudArmorTest(unittest.TestCase):

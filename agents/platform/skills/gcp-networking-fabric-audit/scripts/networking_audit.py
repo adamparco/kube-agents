@@ -475,8 +475,8 @@ def check_psc_routing(forwarding_rules: list[dict]) -> list[dict]:
     return hits
 
 
-def _network_key(url_or_name: str) -> str:
-    """A network URL reduced to `projects/<project>/global/networks/<name>`.
+def _network_key(url_or_name: str, project: str) -> str:
+    """A network reference reduced to `projects/<project>/global/networks/<name>`.
 
     The project has to stay in the key. `networks list` returns one project's
     networks, but a `peerings[].network` URL can point at another project's
@@ -487,12 +487,27 @@ def _network_key(url_or_name: str) -> str:
     1460 the mis-resolved pair becomes a `major` finding naming a peering that
     does not exist.
 
-    A string with no `projects/` segment — a bare name — is returned as itself,
-    which is what makes a peer outside the listing miss rather than collide.
+    A reference carrying no `projects/` segment is *relative*, which in this
+    API means the project being audited — a `peerings[].network` given as a
+    partial URL, or a listing entry that arrived without a `selfLink`. Both are
+    qualified with `project` rather than left as bare names, because a bare
+    name matching anything is how the cross-project collision above gets back
+    in, and a bare name matching nothing turns a real mismatch into a silent
+    clean read.
+
+    A peer in another project still misses, deliberately: its MTU is genuinely
+    unread rather than defaulted. One shape misses that arguably should not — a
+    peering URL naming the project by number where `selfLink` names it by ID —
+    and that costs a missed finding, never a false one.
     """
     text = (url_or_name or "").rstrip("/")
     index = text.find(NETWORK_URL_PROJECT_MARKER)
-    return (text[index:] if index != -1 else _last_segment(text)).lower()
+    if index != -1:
+        return text[index:].lower()
+    return (
+        f"{NETWORK_URL_PROJECT_MARKER}{project}/global/networks/"
+        f"{_last_segment(text)}"
+    ).lower()
 
 
 def _network_mtu(network: dict | None) -> int | None:
@@ -508,12 +523,17 @@ def _network_mtu(network: dict | None) -> int | None:
     return DEFAULT_NETWORK_MTU if mtu is None else mtu
 
 
-def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
+def check_mtu_mismatch(networks: list[dict], project: str) -> list[dict]:
     """One finding per unordered pair of ACTIVE-peered networks whose `mtu`
     values differ, named by both networks sorted so the pair reads the same
-    regardless of which side's listing surfaced the peering."""
+    regardless of which side's listing surfaced the peering.
+
+    `networks` is one project's listing, and `project` is whose — needed to
+    qualify a reference that arrived relative, on either side of the join.
+    """
     by_key = {
-        _network_key(n.get("selfLink") or n.get("name", "")): n for n in networks or []
+        _network_key(n.get("selfLink") or n.get("name", ""), project): n
+        for n in networks or []
     }
     seen_pairs = set()
     hits = []
@@ -522,7 +542,7 @@ def check_mtu_mismatch(networks: list[dict]) -> list[dict]:
         for peering in net.get("peerings") or []:
             if peering.get("state") != "ACTIVE":
                 continue
-            peer = by_key.get(_network_key(peering.get("network", "")))
+            peer = by_key.get(_network_key(peering.get("network", ""), project))
             peer_mtu = _network_mtu(peer)
             # A peer outside this listing -- another project's VPC -- is the one
             # shape still skipped: its MTU is genuinely unread, not defaulted.
@@ -1132,7 +1152,7 @@ def _collect_project_target(project: str, *, run: RunFn) -> dict:
             ["gcloud", "compute", "networks", "list", "--project", project, "--format", "json"],
             "mtu-packet-fragmentation",
         )
-        candidates += [_emit("mtu-packet-fragmentation", hit) for hit in check_mtu_mismatch(networks)]
+        candidates += [_emit("mtu-packet-fragmentation", hit) for hit in check_mtu_mismatch(networks, project)]
 
         policies = gated(
             ["gcloud", "compute", "security-policies", "list", "--project", project, "--format", "json"],
