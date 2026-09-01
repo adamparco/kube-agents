@@ -1205,7 +1205,13 @@ REPORT_HISTORY = 14
 
 
 def reports_dir_for(audit_id: str) -> Path:
-    return Path(REPORTS_DIR) / audit_id
+    # Re-read at call time, with the import-time value as the fallback, which
+    # is what the three readers do (`report_status.py`, `report_query.py`, and
+    # `_fresh_report` in the chat adapter). This is the write side, so a skew
+    # here is the expensive direction: a phase that sets the variable after
+    # this module loads would put the report somewhere no reader looks, with
+    # no error on either side.
+    return Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR) / audit_id
 
 
 # --------------------------------------------------------------------------- #
