@@ -1436,6 +1436,64 @@ class TestWildcardRbac(unittest.TestCase):
         hits = collect.check_wildcard_rbac(ctx)
         self.assertEqual(hits[0]["severity"], "major")
 
+    def test_enumerated_verbs_over_a_wildcard_scope_are_still_an_escalation(self):
+        """Spelling the verbs out is not a boundary, and the miss was live.
+
+        `ClusterRole/argocd-server` on the reference fleet holds
+        `apiGroups: ["*"], resources: ["*"], verbs: ["delete","get","patch"]`,
+        bound to `ServiceAccount/argocd/argocd-server`, and graded clean because
+        the predicate required a `*` in `verbs`. `get` on every resource in
+        every group is every Secret in every namespace; `patch` on every
+        resource rewrites a Deployment into a privileged pod.
+        """
+        ctx = context_of(
+            roles=[cluster_role("argocd-server", [
+                {"verbs": ["delete", "get", "patch"], "resources": ["*"], "apiGroups": ["*"]}
+            ])],
+            clusterrolebindings=[role_binding(
+                "ClusterRole", "argocd-server",
+                [subject("ServiceAccount", "argocd-server", "argocd")],
+            )],
+        )
+        hits = collect.check_wildcard_rbac(ctx)
+        self.assertEqual(len(hits), 1, hits)
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_a_read_only_wildcard_scope_is_left_alone(self):
+        """The control, and the reason the new branch names its verbs.
+
+        `apiGroups: ["*"], resources: ["*"], verbs: ["get","list","watch"]` is
+        the ordinary cluster-monitoring shape -- a scraper, a backup agent --
+        and grading every one of those critical is the false-positive flood this
+        audit has already paid for once. Reading every Secret in the fleet is a
+        real concern; it needs a check that can tell a scraper from an
+        escalation, and this is not that check.
+        """
+        ctx = context_of(
+            roles=[cluster_role("scraper", [
+                {"verbs": ["get", "list", "watch"], "resources": ["*"], "apiGroups": ["*"]}
+            ])],
+            clusterrolebindings=[role_binding(
+                "ClusterRole", "scraper",
+                [subject("ServiceAccount", "prometheus", "monitoring")],
+            )],
+        )
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
+    def test_enumerated_verbs_under_one_vendor_group_stay_suppressed(self):
+        # The new branch requires `apiGroups == ["*"]`, so the operator-owns-its
+        # -own-CRDs pattern keeps the exception it already had.
+        ctx = context_of(
+            roles=[cluster_role("cnrm-admin", [
+                {"verbs": ["create", "patch"], "resources": ["*"], "apiGroups": ["cnrm.cloud.google.com"]}
+            ])],
+            clusterrolebindings=[role_binding(
+                "ClusterRole", "cnrm-admin",
+                [subject("ServiceAccount", "cnrm", "cnrm-system")],
+            )],
+        )
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
     def test_an_unbound_wildcard_role_is_never_flagged(self):
         ctx = context_of(roles=[cluster_role("god-mode", self.WILDCARD_RULE)])
         self.assertEqual(collect.check_wildcard_rbac(ctx), [])

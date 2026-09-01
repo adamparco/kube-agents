@@ -953,6 +953,22 @@ def check_cluster_admin_binding(context: dict) -> list[dict]:
 
 _WILDCARD_BOOTSTRAP_LABEL = "kubernetes.io/bootstrapping"
 
+# Verbs that make a wildcard *scope* an escalation rather than a broad read.
+# Used only by the second stage-1 branch below, the one that fires without a
+# `*` in `verbs`; a rule that already carries the verb wildcard is caught
+# whatever it lists.
+#
+# Deliberately excludes get/list/watch. A ClusterRole of `apiGroups: ["*"],
+# resources: ["*"], verbs: ["get","list","watch"]` is the ordinary
+# cluster-monitoring shape -- Prometheus, a backup agent, the `view` role's
+# cousins -- and reporting every one of those as critical is the
+# false-positive flood this audit already learned to avoid once. Reading every
+# Secret in the fleet is a real concern and it is not this check's; it needs a
+# rule that can tell a scraper from an escalation, which this one cannot.
+_ESCALATING_VERBS = frozenset(
+    {"create", "update", "patch", "delete", "deletecollection", "impersonate", "escalate", "bind"}
+)
+
 
 def check_wildcard_rbac(context: dict) -> list[dict]:
     """The universal suppressions on line 126 of the SOP say "every check in
@@ -998,11 +1014,28 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
         wildcard_rules = [
             rule
             for rule in role.get("rules") or []
-            if "*" in (rule.get("verbs") or [])
-            and (
-                (rule.get("apiGroups") or []) == [""]
-                or "*" in (rule.get("resources") or [])
-                or "*" in (rule.get("apiGroups") or [])
+            if (
+                "*" in (rule.get("verbs") or [])
+                and (
+                    (rule.get("apiGroups") or []) == [""]
+                    or "*" in (rule.get("resources") or [])
+                    or "*" in (rule.get("apiGroups") or [])
+                )
+            )
+            # Second branch: the scope is every resource in every apiGroup and
+            # the verbs are written out instead of wildcarded. Requiring a `*`
+            # in `verbs` missed those, and the miss is not academic -- on the
+            # reference fleet `ClusterRole/argocd-server` holds
+            # `apiGroups: ["*"], resources: ["*"], verbs: ["delete","get",
+            # "patch"]`, bound to `ServiceAccount/argocd/argocd-server`, and
+            # graded clean. `get` on every resource in every group is every
+            # Secret in every namespace; `patch` on every resource is enough to
+            # rewrite a Deployment into a privileged pod. Enumerating three
+            # verbs rather than typing `*` is a spelling, not a boundary.
+            or (
+                (rule.get("apiGroups") or []) == ["*"]
+                and "*" in (rule.get("resources") or [])
+                and _ESCALATING_VERBS & {str(v).lower() for v in (rule.get("verbs") or [])}
             )
         ]
         # Vendor-apiGroup exception: a wildcard confined to one non-core
@@ -1989,9 +2022,10 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         check_wildcard_rbac,
         "critical",  # overridden per hit: major for a namespaced Role
         None,
-        "Subject can perform any verb on any resource in this scope, "
-        "including reading Secrets and creating privileged pods — an "
-        "unbounded escalation path.",
+        "Subject holds write access to every resource in this scope — enough "
+        "to read Secrets in any namespace it covers and rewrite a workload "
+        "into a privileged pod. Wildcarding the verbs and enumerating them "
+        "reach the same ceiling.",
     ),
     CheckSpec(
         "netpol-missing",
