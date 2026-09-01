@@ -2016,6 +2016,13 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
     print("\n" + "-" * 80)
     if not all_passed:
         print(f"PRE-FLIGHT CHECK FAILED. Do NOT register {project_id} in Boskos until the above are resolved.")
+        # An already-registered project can start failing here without anyone
+        # touching it: this script gains an expectation, and every project
+        # provisioned before that gains a gap. The operator reading this is
+        # then holding a list of missing grants and no procedure, so name the
+        # page that carries the repair commands rather than leaving them to
+        # reconstruct it from the check names.
+        print("  Repair commands: docs/site/src/content/docs/deploy/ci-pool-projects.md")
         status = EXIT_FAILED
     elif unverified:
         print(
