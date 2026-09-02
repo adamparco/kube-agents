@@ -6346,7 +6346,10 @@ class TestRunLockAntiWedge(BaseTestCase):
         claim costs the stream two hours for a minute of outage, and the status
         surface shows a run that never began as running and then as DIED.
         """
-        self.patch_attr("resolve_repo", lambda: 1 / 0)
+        # `*a, **k` so the injected fault is the ZeroDivisionError this names and
+        # not a TypeError from the arity: `start` calls `resolve_repo(audit_id=…)`.
+        # Both exit 1, so the test passed either way while testing the wrong thing.
+        self.patch_attr("resolve_repo", lambda *a, **k: 1 / 0)
         self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 1)
         self.assertFalse(self.started.exists())
         # The point of giving it back: the retry is not refused. Exit 3 here
