@@ -287,6 +287,19 @@ because there is no shared mutable state in the collectors beyond the filesystem
   interleaved bytes. It is the right primitive here precisely because the losing writer's content
   is not wanted — a whole envelope, superseded by a whole envelope.
 
+**Keyed by stream means keyed by stream, not by repository.** Every SOP's §0 tells an unattended
+run to iterate `managed_repos` in sequence, so on a multi-repo install one stream publishes one
+envelope per repository into one directory. Two consequences are deliberate rather than
+oversights. The envelope carries `repo`, and `read_report_memory` requires it to match, so the
+second repository's run treats the first's envelope as unknowable and makes no delta claim instead
+of joining two repositories' findings — issue numbers are per-repository, so `acme/a#38` and
+`acme/b#38` compare equal and the `issue_number` guard alone would let that join through. And the
+chat path's silence verdict abstains when more than one repository published inside its window
+(`_spans_several_repos`), because `latest.json` is the last repository's verdict and reading it as
+the run's would let a clean staging repository suppress a production repository's criticals. The
+richer answer — one aggregated verdict per turn — needs a run-group concept neither the store nor
+the scheduler has; abstaining costs the recorded summary and keeps the findings.
+
 **One run per stream at a time is enforced, by a real lock.** The store's paths —
 `latest.json`, `started.json`, `findings_<audit>.json` — are keyed by _stream_, not by run, so a
 second concurrent run of the same audit would overwrite the first's in-flight state. Within a run

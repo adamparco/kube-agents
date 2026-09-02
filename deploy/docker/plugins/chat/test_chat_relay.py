@@ -726,17 +726,40 @@ class TestDeclaredSilent(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.root, True)
 
-    def write(self, stream: str, *, silent: bool, age_s: float = 20.0) -> None:
+    def write(
+        self,
+        stream: str,
+        *,
+        silent: bool,
+        age_s: float = 20.0,
+        repo: str | None = None,
+        ring: bool = False,
+    ) -> None:
+        """Publish one envelope, the way `write_report` does.
+
+        `ring` also drops it into `runs/`, which is where `finish` puts every
+        envelope and where `_spans_several_repos` looks for the repositories
+        that published before this one.
+        """
         import datetime
 
         finished = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
             seconds=age_s
         )
+        envelope = {
+            "silent_ok": silent,
+            "finished_at": finished.isoformat(),
+            "repo": repo,
+        }
         os.makedirs(os.path.join(self.root, stream), exist_ok=True)
         with open(os.path.join(self.root, stream, "latest.json"), "w") as handle:
-            json.dump(
-                {"silent_ok": silent, "finished_at": finished.isoformat()}, handle
-            )
+            json.dump(envelope, handle)
+        if ring:
+            runs = os.path.join(self.root, stream, "runs")
+            os.makedirs(runs, exist_ok=True)
+            stamp = finished.strftime("%Y%m%dT%H%M%S.%fZ")
+            with open(os.path.join(runs, f"{stamp}.json"), "w") as handle:
+                json.dump(envelope, handle)
 
     def declared(self, job_id: str) -> bool:
         with patch.dict(os.environ, {"FLEET_AUDIT_REPORTS_DIR": self.root}):
@@ -767,6 +790,43 @@ class TestDeclaredSilent(unittest.TestCase):
         with open(os.path.join(self.root, "compliance-audit", "started.json"), "w") as h:
             json.dump({"nonce": "n", "t0": "2026-09-01T06:25:00+00:00"}, h)
         self.assertFalse(self.declared("compliance-audit"))
+
+    def test_a_clean_second_repo_cannot_silence_the_first_repo_s_findings(self):
+        """The multi-repo cron loop every audit SOP's §0 prescribes.
+
+        Production is audited first and finds four criticals; staging is
+        audited second and is clean. Both write into the one directory the
+        store keys by stream, so `latest.json` is staging's -- and reading it
+        as the run's verdict suppresses the whole delivery, criticals included,
+        with `last_status=ok` and nothing logged.
+        """
+        self.write("compliance-audit", silent=False, repo="acme/prod", ring=True, age_s=90)
+        self.write("compliance-audit", silent=True, repo="acme/staging", ring=True)
+        self.assertFalse(self.declared("compliance-audit"))
+
+    def test_one_repo_publishing_twice_still_gets_a_verdict(self):
+        """Abstaining is for a genuinely multi-repo window, not any busy one."""
+        self.write("compliance-audit", silent=False, repo="acme/prod", ring=True, age_s=90)
+        self.write("compliance-audit", silent=True, repo="acme/prod", ring=True)
+        self.assertTrue(self.declared("compliance-audit"))
+
+    def test_a_ring_entry_outside_the_window_is_a_different_run(self):
+        """Yesterday's other repository says nothing about this delivery."""
+        self.write(
+            "compliance-audit",
+            silent=False,
+            repo="acme/prod",
+            ring=True,
+            age_s=mod._SILENCE_WINDOW_SECONDS + 600,
+        )
+        self.write("compliance-audit", silent=True, repo="acme/staging", ring=True)
+        self.assertTrue(self.declared("compliance-audit"))
+
+    def test_envelopes_written_before_the_repo_key_look_single_repo(self):
+        """`repo: None` is unknown, not a distinct repository."""
+        self.write("compliance-audit", silent=False, ring=True, age_s=90)
+        self.write("compliance-audit", silent=True, ring=True)
+        self.assertTrue(self.declared("compliance-audit"))
 
     def test_a_stale_report_decides_nothing(self):
         """It belongs to an earlier run, so it must not silence this delivery."""

@@ -321,6 +321,59 @@ _REPORTS_DIR = os.getenv("FLEET_AUDIT_REPORTS_DIR", "") or "/opt/data/fleet-audi
 #: 237s at worst, so this is roughly four times the observed ceiling.
 _SILENCE_WINDOW_SECONDS = 900
 
+#: How far back into the history ring ``_spans_several_repos`` looks. The ring
+#: itself is bounded at 14 entries by ``audit_report.REPORT_HISTORY``, so this
+#: reads all of it; it is named rather than inlined so the two ceilings are
+#: visibly the same number and a change to one is a question about the other.
+_SILENCE_WINDOW_RUNS = 14
+
+
+def _spans_several_repos(runs: Path, latest: dict) -> bool:
+    """Did more than one repository publish into this stream since the delivery began?
+
+    The store is keyed by stream, and every audit SOP's §0 tells an unattended
+    run to iterate ``managed_repos`` in sequence — one ``start``/``finish`` pair
+    per repository, all writing here. The chat delivery, though, happens once
+    for the whole turn, so ``latest.json`` is the *last* repository's verdict
+    being asked to speak for all of them.
+
+    That is the direction that loses findings. Audit the production repository
+    first and find four criticals, then a clean staging repository second, and
+    ``declared_silent`` reads staging's ``silent_ok: true`` and suppresses the
+    entire reply. The four criticals are never posted, the run records ``ok``,
+    and nothing is logged. ``recorded_summary`` fails the same way one notch
+    down, replacing the model's multi-repo text with staging's one-liner.
+
+    Aggregating the repositories into one verdict would be the richer answer,
+    but a run group is a concept neither the store nor the scheduler has — so
+    abstain instead. ``{}`` is "no opinion", the state both callers already
+    handle by keeping the model's own text, which on a multi-repo run is the
+    text that covers every repository. Single-repo installs, which is every
+    install that has not registered a second ``managed_repos`` entry, see one
+    repository in the window and are unaffected.
+
+    Envelopes written before ``repo`` existed carry ``None``, which is unknown
+    rather than a distinct repository; a store holding only those looks
+    single-repo, exactly as it did before this function.
+    """
+    seen = {latest.get("repo")}
+    try:
+        recent = sorted(runs.glob("*.json"))[-_SILENCE_WINDOW_RUNS:]
+    except OSError:
+        return False
+    for entry in recent:
+        try:
+            envelope = json.loads(entry.read_text("utf-8"))
+            finished = datetime.datetime.fromisoformat(envelope["finished_at"])
+        except Exception:
+            continue
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc) - finished).total_seconds()
+        if 0 <= age <= _SILENCE_WINDOW_SECONDS:
+            seen.add(envelope.get("repo"))
+    return len({r for r in seen if r}) > 1
+
 
 def _fresh_report(job_id: str) -> dict:
     """This audit stream's last run, if it is recent enough to be this delivery's.
@@ -374,6 +427,8 @@ def _fresh_report(job_id: str) -> dict:
         if (Path(root) / job_id / "started.json").exists():
             return {}
         report = json.loads((Path(root) / job_id / "latest.json").read_text("utf-8"))
+        if _spans_several_repos(Path(root) / job_id / "runs", report):
+            return {}
         finished = datetime.datetime.fromisoformat(report["finished_at"])
         # `finish` writes an aware stamp today. A naive one would otherwise
         # raise inside the blanket handler below and take the whole feature

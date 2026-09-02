@@ -1772,6 +1772,7 @@ def report_envelope(
     resolved_ids: list[str],
     rendered_ids: list[str],
     checks_revision: str | None = None,
+    repo: str | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -1802,9 +1803,22 @@ def report_envelope(
     that stopped looking. Absent — a waived manifest, or a store entry written
     before collectors published it — means unknown, which the readers treat as
     "assume nothing changed" rather than as a change.
+
+    `repo` says which repository this run audited, and the store is keyed by
+    stream alone, so on a multi-repo install two runs of one stream land in one
+    directory. Every SOP's §0 tells an unattended run to iterate `managed_repos`
+    in sequence, so that is the ordinary case there rather than an exotic one.
+    Without this key the two envelopes are indistinguishable, and the
+    `issue_number` guard in `read_report_memory` cannot separate them: issue
+    numbers are per-repository, so `acme/a#38` and `acme/b#38` compare equal and
+    the next morning's delta joins one repository's findings against the
+    other's. Absent means unknown — an envelope written before this key existed
+    — and is accepted rather than treated as a mismatch, so an install upgrading
+    into this code keeps its memory instead of losing a delta to the upgrade.
     """
     return {
         "audit_id": audit_id,
+        "repo": repo,
         "finished_at": now.isoformat(),
         "status": payload.get("status"),
         "issue_number": issue_number,
@@ -1909,16 +1923,23 @@ def write_report(audit_id: str, envelope: dict, now: datetime) -> None:
         log(f"WARNING: report store prune for {audit_id} failed: {exc}")
 
 
-def read_report_memory(audit_id: str, issue_number: int | None) -> dict | None:
+def read_report_memory(
+    audit_id: str, issue_number: int | None, repo: str | None = None
+) -> dict | None:
     """The previous run's envelope, or None when it cannot be trusted.
 
-    Trust is two equalities, both required. The envelope's `issue_number` must
+    Trust is three equalities, all required. The envelope's `issue_number` must
     match the ledger `find_existing_issue` just returned — a store written for
     a different issue is a memory of a different conversation, and joining
     against it would call every id on one side new and every id on the other
-    resolved. And its `id_scheme` must match the code's, for the same reason
+    resolved. Its `id_scheme` must match the code's, for the same reason
     at the level of individual ids: the same finding is spelled differently
-    across a scheme bump.
+    across a scheme bump. And its `repo` must match, because the store is keyed
+    by stream and every SOP's §0 sends an unattended run around `managed_repos`
+    in sequence — so on a multi-repo install this directory holds one
+    repository's envelope and is read by the next repository's run. Issue
+    numbers are per-repository, so that pair can compare equal and the
+    `issue_number` guard alone would let the join through.
 
     None is *unknowable*, not empty, and the caller must keep them apart —
     treating an absent store as an empty one would announce every live finding
@@ -1955,6 +1976,17 @@ def read_report_memory(audit_id: str, issue_number: int | None) -> dict | None:
             f"Stored report for {audit_id} carries finding-identity scheme "
             f"{envelope.get('id_scheme')} and this run uses {ID_SCHEME}; this "
             "run makes no delta claim rather than reporting a rename as a fix."
+        )
+        return None
+    # `is not None` on both sides deliberately: an envelope predating this key
+    # is unknown, not foreign, and rejecting it would cost every upgrading
+    # install one delta for nothing.
+    stored_repo = envelope.get("repo")
+    if repo is not None and stored_repo is not None and stored_repo != repo:
+        log(
+            f"Stored report for {audit_id} was written for {stored_repo}, not "
+            f"{repo}; this run makes no delta claim rather than joining two "
+            "repositories' findings."
         )
         return None
     # Well-formed JSON is not a well-formed envelope. `current_ids` is iterated
@@ -8313,7 +8345,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     # read as "the previous run found nothing". No open ledger is the one case
     # that genuinely is empty — the run is first, and everything present is
     # new.
-    memory = read_report_memory(audit_id, existing_issue)
+    memory = read_report_memory(audit_id, existing_issue, repo)
     delta_known = existing_issue is None or memory is not None
     previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
     previous_titles = report_finding_titles(memory)
@@ -8635,6 +8667,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 resolved_ids=clean_resolved_ids,
                 rendered_ids=previous_ids if body_untouched else [],
                 checks_revision=checks_revision,
+                repo=repo,
             ),
             now,
         )
@@ -8978,6 +9011,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             resolved_ids=[] if not delta_known else resolved_ids,
             rendered_ids=published_ids,
             checks_revision=checks_revision,
+            repo=repo,
         ),
         now,
     )

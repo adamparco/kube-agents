@@ -6571,6 +6571,34 @@ class TestReportStore(HarnessTestCase):
             "issue create": f"https://github.com/acme/fleet/issues/{issue}\n",
         }
 
+    def test_the_envelope_names_the_repository_the_run_audited(self):
+        self.open_ledger()
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.stored_envelope()["repo"], "acme/fleet")
+
+    def test_a_memory_written_for_another_repository_is_not_joined(self):
+        """The multi-repo loop in every SOP's §0, one morning on.
+
+        The store is keyed by stream, so `acme/staging`'s envelope is what
+        `acme/prod`'s next run finds. Issue numbers are per-repository, so the
+        two can carry the same one and the `issue_number` guard passes — which
+        would join one repository's findings against the other's and report the
+        difference as fixes and regressions.
+        """
+        self.seed_store(make_doc(), issue_number=38, repo="acme/staging")
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 38, "acme/prod"))
+
+    def test_a_memory_written_for_the_same_repository_is_joined(self):
+        self.seed_store(make_doc(), issue_number=38, repo="acme/prod")
+        memory = audit_report.read_report_memory(AUDIT, 38, "acme/prod")
+        self.assertIsNotNone(memory)
+        self.assertEqual(memory["repo"], "acme/prod")
+
+    def test_an_envelope_predating_the_repo_key_is_still_trusted(self):
+        """Unknown, not foreign: an upgrading install keeps its delta."""
+        self.seed_store(make_doc(), issue_number=38, repo=None)
+        self.assertIsNotNone(audit_report.read_report_memory(AUDIT, 38, "acme/prod"))
+
     def test_the_store_path_does_not_move_with_hermes_home(self):
         """Writer and reader disagree if it does, and nothing says so.
 
@@ -6676,6 +6704,11 @@ class TestReportStore(HarnessTestCase):
                 "prs_closed",
                 "prs_opened",
                 "publish_s",
+                # Which repository this run audited. The store is keyed by
+                # stream and every SOP's §0 sends an unattended run around
+                # `managed_repos` in sequence, so without this key two
+                # repositories' envelopes are indistinguishable here.
+                "repo",
                 "resolved_ids",
                 "silent_ok",
                 "status",
