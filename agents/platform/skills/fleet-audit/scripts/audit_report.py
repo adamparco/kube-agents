@@ -336,6 +336,60 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 
 PROTECTED_BRANCHES = {"main", "master", "production"}
 
+# gcloud's accepted values for the enum flags a cluster remediation names, keyed
+# by flag. A model writing a `kind: gcloud` note reads the value off the API and
+# pastes it through, and the API's spelling is routinely not gcloud's: the
+# 2026-09-01 `fleet-consistency-drift` run read `.releaseChannel.channel=RAPID`
+# and shipped `--release-channel=REGULAR`, which dies on paste with *Invalid
+# choice: 'REGULAR'. Did you mean 'regular'?*. One bad flag discredits a true
+# finding, because a reader who pastes it concludes the finding is wrong rather
+# than the command.
+#
+# There is no rule to apply instead of a table. gcloud spells the first thirteen
+# of these lowercase and the six below them upper, so a blanket `.lower()` breaks
+# `--logging-variant=MAX_THROUGHPUT` and a blanket `.upper()` breaks all of the
+# first group. Each list here is gcloud's own, harvested by feeding the flag a
+# bogus value and reading back the "Valid choices are [...]" it prints; re-run
+# that probe rather than editing a list by hand. Flags taking a component *list*
+# rather than a single choice (`--logging`, `--monitoring`) are deliberately
+# absent: their values are not drawn from a fixed set and normalising them by
+# case would be guessing.
+GCLOUD_ENUM_FLAG_CHOICES: dict[str, tuple[str, ...]] = {
+    "--release-channel": ("extended", "rapid", "regular", "stable"),
+    "--binauthz-evaluation-mode": ("disabled", "project-singleton-policy-enforce"),
+    "--security-posture": ("disabled", "enterprise", "standard"),
+    "--workload-vulnerability-scanning": ("disabled", "enterprise", "standard"),
+    "--stack-type": ("ipv4", "ipv4-ipv6"),
+    "--in-transit-encryption": ("inter-node-transparent", "none"),
+    "--cluster-dns": ("clouddns", "default", "kubedns"),
+    "--cluster-dns-scope": ("cluster", "vpc"),
+    "--gateway-api": ("disabled", "standard"),
+    "--tier": ("enterprise", "standard"),
+    "--autoprovisioning-cgroup-mode": ("default", "v1", "v2"),
+    "--autopilot-general-profile": ("no-performance", "none"),
+    "--private-ipv6-google-access-type": (
+        "bidirectional",
+        "disabled",
+        "outbound-only",
+    ),
+    "--logging-variant": ("DEFAULT", "MAX_THROUGHPUT"),
+    "--dataplane-v2-observability-mode": (
+        "DISABLED",
+        "EXTERNAL_LB",
+        "INTERNAL_VPC_LB",
+    ),
+    "--control-plane-egress": ("NONE", "VIA_CONTROL_PLANE"),
+    "--node-creation-mode": ("CONTROL_PLANE", "KUBELET"),
+    "--membership-type": ("LIGHTWEIGHT",),
+    "--anonymous-authentication-config": ("ENABLED", "LIMITED"),
+}
+
+# `--flag=value` and `--flag value` are both valid gcloud, and the drift stream
+# emits both in the same report, so the rewrite has to see each.
+_GCLOUD_ENUM_FLAG_RE = re.compile(
+    r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>[A-Za-z0-9_-]+)"
+)
+
 # Both directories must live on the PVC. `gh` and `git` are not binaries in the
 # agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
 # sidecar that runs the real tool in *its* filesystem. Only /opt/data is shared
@@ -2884,6 +2938,13 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
+        if kind == "gcloud":
+            # Write the corrected spelling back, for the same reason the
+            # manifest path above is normalised here: this string is what gets
+            # published, and every reader downstream sees whatever it says.
+            remediation["note"] = normalise_gcloud_enum_values(
+                str(remediation["note"])
+            )
 
     return data
 
@@ -2891,6 +2952,31 @@ def validate_findings(data: object, audit_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Pure helpers — derivation
 # --------------------------------------------------------------------------- #
+
+
+def normalise_gcloud_enum_values(note: str) -> str:
+    """Rewrite enum flag values in a `kind: gcloud` note to the case gcloud takes.
+
+    Only a value that matches one of that flag's choices case-insensitively is
+    rewritten, and only to that choice. A flag absent from
+    `GCLOUD_ENUM_FLAG_CHOICES`, or a value that is not one of its choices under
+    any casing, is left exactly as written: the note is a command a human will
+    paste, and silently changing a value this function does not recognise turns
+    "the command fails and you look at it" into "the command runs and does
+    something else". Publishing a wrong-cased flag is a bad command; publishing
+    a rewritten one nobody checked is a bad change.
+    """
+    def rewrite(match: re.Match[str]) -> str:
+        choices = GCLOUD_ENUM_FLAG_CHOICES.get(match.group("flag"))
+        if not choices:
+            return match.group(0)
+        value = match.group("value")
+        for choice in choices:
+            if value != choice and value.lower() == choice.lower():
+                return f"{match.group('flag')}{match.group('sep')}{choice}"
+        return match.group(0)
+
+    return _GCLOUD_ENUM_FLAG_RE.sub(rewrite, note)
 
 
 def severity_counts(findings: list[dict]) -> dict[str, int]:

@@ -10270,6 +10270,107 @@ class TestBlockQuoteScanning(unittest.TestCase):
         self.assertEqual(self.strip(None), "")
 
 
+class TestGcloudEnumCasing(unittest.TestCase):
+    """A `kind: gcloud` note is a command a human pastes, so it has to parse.
+
+    The model reads the value off the API and passes it through, and the API's
+    spelling is often not gcloud's. Every expectation here is gcloud's own
+    output, harvested by feeding the flag a bogus value and reading back the
+    "Valid choices are [...]" it prints.
+    """
+
+    def normalise(self, note):
+        return audit_report.normalise_gcloud_enum_values(note)
+
+    def test_the_live_defect_is_corrected(self):
+        # 2026-09-01 fleet-consistency-drift read `.releaseChannel.channel=RAPID`
+        # and shipped `--release-channel=REGULAR`, which gcloud rejects with
+        # *Invalid choice: 'REGULAR'. Did you mean 'regular'?*.
+        self.assertEqual(
+            self.normalise(
+                "gcloud container clusters update drift-peer-std-9 "
+                "--location us-east4-c --release-channel=REGULAR"
+            ),
+            "gcloud container clusters update drift-peer-std-9 "
+            "--location us-east4-c --release-channel=regular",
+        )
+
+    def test_the_space_separated_form_is_corrected_too(self):
+        self.assertEqual(
+            self.normalise("gcloud x --release-channel RAPID"),
+            "gcloud x --release-channel rapid",
+        )
+
+    def test_an_uppercase_choice_flag_is_not_lowercased(self):
+        # The reason this is a table and not a `.lower()`: gcloud spells
+        # --release-channel's choices lower and --logging-variant's upper.
+        self.assertEqual(
+            self.normalise("gcloud x --logging-variant=MAX_THROUGHPUT"),
+            "gcloud x --logging-variant=MAX_THROUGHPUT",
+        )
+
+    def test_an_uppercase_choice_flag_is_corrected_when_written_lower(self):
+        self.assertEqual(
+            self.normalise("gcloud x --logging-variant=max_throughput"),
+            "gcloud x --logging-variant=MAX_THROUGHPUT",
+        )
+
+    def test_a_component_list_flag_is_left_alone(self):
+        # --logging takes a list drawn from no fixed set, so it is absent from
+        # the table on purpose. `SYSTEM,WORKLOAD` is already the correct fix for
+        # an enableComponents of SYSTEM_COMPONENTS,WORKLOADS.
+        self.assertEqual(
+            self.normalise("gcloud x --logging=SYSTEM,WORKLOAD"),
+            "gcloud x --logging=SYSTEM,WORKLOAD",
+        )
+
+    def test_an_unrecognised_value_is_left_alone_not_guessed_at(self):
+        # A command that fails is inspected; a command quietly rewritten to
+        # something else runs and does the wrong thing.
+        self.assertEqual(
+            self.normalise("gcloud x --release-channel=TURBO"),
+            "gcloud x --release-channel=TURBO",
+        )
+
+    def test_a_flag_outside_the_table_is_left_alone(self):
+        self.assertEqual(
+            self.normalise("gcloud x --location US-EAST4-C"),
+            "gcloud x --location US-EAST4-C",
+        )
+
+    def test_several_flags_in_one_note(self):
+        self.assertEqual(
+            self.normalise("gcloud x --release-channel=STABLE --tier=ENTERPRISE"),
+            "gcloud x --release-channel=stable --tier=enterprise",
+        )
+
+    def test_validation_writes_the_correction_back_into_the_document(self):
+        # The published note is whatever survives validation, so a normaliser
+        # nothing calls fixes nothing.
+        finding = make_finding(
+            fid="a",
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=REGULAR",
+            },
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["remediation"]["note"],
+            "gcloud container clusters update c --release-channel=regular",
+        )
+
+    def test_a_manual_note_is_not_rewritten(self):
+        # `kind: manual` notes are prose, where "REGULAR" may be the API value
+        # under discussion rather than a flag to paste.
+        note = "The channel is REGULAR on nine of ten peers; --release-channel=REGULAR"
+        finding = make_finding(
+            fid="a", remediation={"kind": "manual", "note": note}
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(finding["remediation"]["note"], note)
+
+
 class TestPathContainment(unittest.TestCase):
     def test_a_normalised_path_is_returned_not_just_accepted(self):
         # Grouping, the branch digest, the `git add` pathspec and the existence
