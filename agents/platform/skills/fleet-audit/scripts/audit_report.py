@@ -3759,6 +3759,57 @@ def adopt_arm_impact(findings: list[dict], manifest: dict | None) -> list[str]:
     return adopted
 
 
+def collector_flagged_ids(manifest: dict | None) -> set[str]:
+    """Every finding id the collector still emits a candidate for.
+
+    `compute_delta` reads a finding's absence from this run's document as
+    proof it was fixed, because for most of the document that is the only
+    evidence there is. It is not the only evidence for a check a collector
+    owns: the collector re-derives its candidates from the live API every
+    run, deterministically, and a candidate it still emits is the condition
+    still holding. Where the two disagree, the collector is the one that
+    looked.
+
+    They did disagree. `security-patch-orchestrator` published 31 findings
+    for eleven runs, then 29 for four — `no-maintenance-window` on
+    `drift-peer-std-1` and `spot-capacity-test` vanished from the document
+    while both clusters' `checks_run` went on attesting the check had run,
+    the manifest went on recording them at `rc == 0`, and neither cluster had
+    acquired a maintenance window (both still have an empty
+    `maintenancePolicy` today). The delta read the absence as a fix and
+    announced both resolved, which closes their ledger rows and any
+    remediation pull request open against them. Four runs later they came
+    back as though nothing had happened. No `coverage_gaps`, no `partial`, no
+    limitation: on this install the only trace was the count.
+
+    `cross_check_manifest` is the guard for the same failure one level up —
+    a whole cluster dropped from `scope.clusters` — and stops there because a
+    candidate is a candidate: the model is *supposed* to be able to reject one
+    as a false positive, so a missing finding cannot be a rejection the way a
+    missing cluster can. That is why this returns a set to subtract from
+    `resolved_ids` rather than raising. A dropped candidate stops being
+    announced as fixed; it does not stop the run.
+
+    Cluster name comes from the enclosing entry, not the candidate, for the
+    reason `adopt_collector_evidence` gives at length: four of the five
+    collectors build the name into `object` and never write a `cluster` key,
+    so an id derived from the candidate alone matches nothing.
+    """
+    if not manifest:
+        return set()
+    flagged: set[str] = set()
+    for entry in manifest.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            flagged.add(derive_finding_id(keyed))
+    return flagged
+
+
 class ContainmentError(ValidationError):
     """A remediation path that passed the string check still escapes the repo."""
 
@@ -8635,6 +8686,18 @@ def handle_finish(args: argparse.Namespace) -> None:
     # never offered it as new — and it reappears in the delta the moment its
     # target is covered again and it is still gone.
     resolved_ids = [fid for fid in resolved_ids if fid not in unverifiable]
+    # And held back again for the collector, on the same principle one source
+    # further out: a candidate the collector still emits is the condition still
+    # holding, whatever this run's document did or did not say about it.
+    still_flagged = collector_flagged_ids(manifest)
+    contradicted = [fid for fid in resolved_ids if fid in still_flagged]
+    if contradicted:
+        resolved_ids = [fid for fid in resolved_ids if fid not in still_flagged]
+        log(
+            f"WARNING: {len(contradicted)} finding(s) absent from this run's document "
+            "are NOT being announced as resolved: the collector still emits a "
+            f"candidate for each. {', '.join(contradicted)}"
+        )
     # What the published body's hidden block ends up carrying, and so what the
     # store records as this run's memory. The relink edit below can change it.
     published_ids = rendered.rendered_ids

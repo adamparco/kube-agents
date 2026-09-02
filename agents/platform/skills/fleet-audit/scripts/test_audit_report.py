@@ -8028,6 +8028,95 @@ class TestCrossCheckManifest(unittest.TestCase):
         # which runs against this exact manifest shape.
 
 
+class TestCollectorFlaggedIds(unittest.TestCase):
+    """A candidate the collector still emits is the condition still holding.
+
+    `compute_delta` reads a finding's absence from this run's document as proof
+    it was fixed. Live, `security-patch-orchestrator` published 31 findings for
+    eleven runs, then 29 for four: `no-maintenance-window` on `drift-peer-std-1`
+    and `spot-capacity-test` dropped out of the document while both clusters'
+    `checks_run` went on attesting the check had run and neither cluster had
+    acquired a window. The delta announced both resolved — closing their ledger
+    rows — and four runs later they came back. Nothing in the run disclosed it;
+    the only trace was the count.
+    """
+
+    def entry(self, name, candidates):
+        return {"name": name, "outcome": "collected", "commands": [], "candidates": candidates}
+
+    def test_a_still_emitted_candidate_yields_its_finding_id(self):
+        manifest = {
+            "clusters": [
+                self.entry(
+                    "drift-peer-std-1",
+                    [
+                        {
+                            "check": "no-maintenance-window",
+                            "namespace": "",
+                            "object": "Cluster/drift-peer-std-1",
+                            "severity": "major",
+                        }
+                    ],
+                )
+            ]
+        }
+        flagged = audit_report.collector_flagged_ids(manifest)
+        expected = audit_report.derive_finding_id(
+            {
+                "check": "no-maintenance-window",
+                "cluster": "drift-peer-std-1",
+                "namespace": "",
+                "object": "Cluster/drift-peer-std-1",
+            }
+        )
+        self.assertEqual(flagged, {expected})
+
+    def test_the_cluster_name_comes_from_the_enclosing_entry(self):
+        """Same join `adopt_collector_evidence` makes, for the same reason.
+
+        Four of the five collectors build the cluster name into `object` and
+        never write a `cluster` key, so an id derived from the candidate alone
+        matches nothing and the guard would silently hold nothing back.
+        """
+        candidate = {
+            "check": "no-maintenance-window",
+            "namespace": "",
+            "object": "Cluster/spot-capacity-test",
+            "severity": "major",
+        }
+        self.assertNotIn("cluster", candidate)
+        flagged = audit_report.collector_flagged_ids(
+            {"clusters": [self.entry("spot-capacity-test", [candidate])]}
+        )
+        finding = make_finding(
+            check="no-maintenance-window",
+            cluster="spot-capacity-test",
+            namespace="",
+            obj="Cluster/spot-capacity-test",
+        )
+        self.assertEqual(flagged, {audit_report.derive_finding_id(finding)})
+
+    def test_no_manifest_flags_nothing(self):
+        """The `--no-collector-manifest` waiver path keeps working.
+
+        A waived run has no collector to contradict the document, so the delta
+        is left exactly as `compute_delta` computed it.
+        """
+        for manifest in (None, {}, {"clusters": []}, {"clusters": None}):
+            with self.subTest(manifest=manifest):
+                self.assertEqual(audit_report.collector_flagged_ids(manifest), set())
+
+    def test_malformed_entries_are_skipped_rather_than_raising(self):
+        manifest = {
+            "clusters": [
+                "not-a-dict",
+                {"name": "c1", "candidates": None},
+                {"name": "c2", "candidates": ["not-a-dict"]},
+            ]
+        }
+        self.assertEqual(audit_report.collector_flagged_ids(manifest), set())
+
+
 class TestAdoptCollectorEvidence(unittest.TestCase):
     """`evidence` is observed, so the collector authors it — see
     `audit_report.adopt_collector_evidence`.
