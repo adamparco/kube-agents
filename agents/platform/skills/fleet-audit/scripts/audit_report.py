@@ -3235,8 +3235,30 @@ def carry_unverifiable_into_document(
         return document
     findings = list((document or {}).get("findings") or [])
     have = {str(f.get("id", "")) for f in findings if isinstance(f, dict)}
-    findings.extend(f for f in keep if str(f.get("id", "")) not in have)
+    findings.extend(
+        # Copied, then re-cased, for the reason `carry_unchanged_findings` is:
+        # these came out of a stored document rather than out of this run's
+        # `validate_findings`, so a `gcloud` note written before the normaliser
+        # existed would be stored again unaltered. The copy is so re-casing does
+        # not reach back into `memory`, which other reads here treat as the
+        # previous run's record and not as something this run edits.
+        _recased_carry(f)
+        for f in keep
+        if str(f.get("id", "")) not in have
+    )
     return {**(document or {}), "findings": findings}
+
+
+def _recased_carry(finding: dict) -> dict:
+    """`finding` copied, with any `gcloud` remediation note spelled as gcloud takes it."""
+    remediation = finding.get("remediation")
+    if not isinstance(remediation, dict) or remediation.get("kind") != "gcloud":
+        return finding
+    out = copy.deepcopy(finding)
+    out["remediation"]["note"] = normalise_gcloud_enum_values(
+        str(out["remediation"].get("note", ""))
+    )
+    return out
 
 
 def _limitation_restates_na(limitation: str, na: set, roster: tuple, reasons: object = ()) -> bool:

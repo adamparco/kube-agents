@@ -3136,6 +3136,48 @@ class TestCarryUnchangedFindings(unittest.TestCase):
         self.assertEqual(ids, [])
 
 
+class TestCarryUnverifiableIntoDocument(unittest.TestCase):
+    """A held-back finding is stored again from memory, so it is stored re-cased.
+
+    Same bypass as `carry_unchanged_findings`: the entry comes out of the
+    previous run's stored document, never out of this run's `validate_findings`.
+    `fleet-consistency-drift` held a `kube-agents-host` gap for six consecutive
+    runs, so the hold is long-lived rather than a one-run blip.
+    """
+
+    def held(self, note, kind="gcloud"):
+        return {
+            "id": "release-channel.h._.cluster-h",
+            "remediation": {"kind": kind, "note": note},
+        }
+
+    def carry(self, held):
+        memory = {"document": {"findings": [held]}}
+        out = audit_report.carry_unverifiable_into_document(
+            {"findings": []}, memory, {"release-channel.h._.cluster-h"}
+        )
+        return out["findings"][0]
+
+    def test_a_held_gcloud_note_is_recased(self):
+        held = self.held("gcloud container clusters update h --release-channel=REGULAR")
+        self.assertEqual(
+            self.carry(held)["remediation"]["note"],
+            "gcloud container clusters update h --release-channel=regular",
+        )
+
+    def test_recasing_does_not_edit_the_stored_memory_it_read(self):
+        original = "gcloud container clusters update h --release-channel=REGULAR"
+        held = self.held(original)
+        self.carry(held)
+        self.assertEqual(held["remediation"]["note"], original)
+
+    def test_a_held_manual_note_is_left_alone(self):
+        held = self.held("The channel is REGULAR here.", kind="manual")
+        self.assertEqual(
+            self.carry(held)["remediation"]["note"], "The channel is REGULAR here."
+        )
+
+
 class TestPublishedBodies(HarnessTestCase):
     """What reaches GitHub, read back off the `--body-file` the harness wrote.
 
