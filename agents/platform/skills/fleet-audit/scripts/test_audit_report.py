@@ -13242,14 +13242,46 @@ class TestRepoResolution(BaseTestCase):
                 audit_report.resolve_repo(repo="acme/unregistered")
             self.assertIn("not in the managed repositories list", str(caught.exception))
 
-    def test_explicit_repo_raises_when_get_managed_github_repos_fails(self):
+    def test_explicit_repo_is_honoured_when_the_managed_list_is_unreadable(self):
+        # #504 asserted the opposite, from the multi-repo install it was written
+        # for, where the ConfigMap always exists. A single-repo install has no
+        # `managed_repos` ConfigMap at all, so the read fails every time and
+        # `--repo` aborted on the one configuration that is the default.
+        #
+        # Honouring it is also the consistent answer: `resolve_repo()` with no
+        # flag already swallows this same exception and proceeds, so the strict
+        # treatment was landing on the more deliberate of the two inputs. The
+        # check is advisory either way -- what actually scopes a write is the
+        # repo-scoped token the minter issues, not this list.
+        for failure in (
+            RuntimeError("kubectl failed: Forbidden"),
+            RuntimeError("Failed to read ConfigMap: NotFound"),
+            RuntimeError("Timed out after 30s reading ConfigMap"),
+        ):
+            with self.subTest(failure=str(failure)):
+                with patch(
+                    "gitops_workspace.get_managed_github_repos", side_effect=failure
+                ):
+                    self.assertEqual(
+                        audit_report.resolve_repo(repo="acme/first"), "acme/first"
+                    )
+
+    def test_explicit_repo_is_still_checked_when_the_list_reads(self):
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first"]):
+            with self.assertRaises(ValueError):
+                audit_report.resolve_repo(repo="acme/unregistered")
+
+    def test_a_malformed_explicit_repo_is_rejected_before_the_list_is_read(self):
+        # The format check must stay ahead of the read, or the permissive
+        # `except` above would let `--repo 'not a repo'` through on any install
+        # whose ConfigMap is missing.
         with patch(
             "gitops_workspace.get_managed_github_repos",
-            side_effect=RuntimeError("kubectl failed: Forbidden"),
+            side_effect=RuntimeError("NotFound"),
         ):
-            with self.assertRaises(RuntimeError) as caught:
-                audit_report.resolve_repo(repo="acme/first")
-            self.assertIn("kubectl failed: Forbidden", str(caught.exception))
+            with self.assertRaises(ValueError) as caught:
+                audit_report.resolve_repo(repo="not a repo")
+            self.assertIn("Invalid repository format", str(caught.exception))
 
     def _leased(self, repo):
         """Patch the lease record `audit_id` would read, whatever the root."""

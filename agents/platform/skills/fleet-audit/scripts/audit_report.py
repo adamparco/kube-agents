@@ -6507,7 +6507,21 @@ def resolve_repo(
         r = str(repo).strip()
         if not BARE_REPO_RE.match(r):
             raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
-        managed = gitops_workspace.get_managed_github_repos()
+        # An unreadable list and an empty one are the same fact -- there is no
+        # list to check `r` against -- so they get the same answer. Raising
+        # instead made `--repo` unusable on exactly the installs that need it
+        # most: a single-repo install has no `managed_repos` ConfigMap at all,
+        # so the read fails, and the flag aborted rather than being honoured.
+        # The ambiguity error this flag exists to escape (gitops_workspace's
+        # "please specify the target repository explicitly") could not be
+        # escaped during the API-server blip that raised it, either.
+        #
+        # The check stays strict whenever the list *is* readable, which is the
+        # multi-repo case it was written for.
+        try:
+            managed = gitops_workspace.get_managed_github_repos()
+        except Exception:
+            managed = []
         if managed and r not in managed:
             raise ValueError(
                 f"Repository {r!r} is not in the managed repositories list: {managed}"
