@@ -3195,6 +3195,55 @@ def waiver_gap(waiver: str) -> str:
     return f"the collector manifest was waived — {waiver}"
 
 
+def coverage_changed(gaps: list[str], memory: dict | None) -> bool:
+    """Whether this run's coverage differs from what the last one reported.
+
+    The silence verdicts used `gaps` itself, so a stream with a *permanent*
+    gap could never be silent — it announced the same unchanged shortfall
+    every morning until someone fixed the fleet. The fleet-consistency drift
+    audit ran fourteen consecutive times at 0 new, 0 resolved, and a
+    byte-identical summary: `kube-agents-host` carries no `environment` label,
+    so it has no cohort to compare against and skips all nineteen checks.
+    Every one of those runs spoke.
+
+    That rule was written on 2026-08-04 (§7.4 of the ledger design), and §7.5
+    justified it on the ground that a scheduled run "reaches humans through
+    the Tier 1 ledger and nowhere else" — the verdict "currently gates a
+    delivery leg that has no destination", so making it loud cost nothing.
+    #731 gave that leg a destination on 2026-08-19, and neither design was
+    reconciled to the other.
+
+    What §7.4 protects is still protected, because the gap is announced on the
+    run that acquires it and on every run that changes it. Only the repeat
+    goes quiet, and the standing shortfall stays legible in the ledger body,
+    in `coverage_gaps` on the stored envelope, and in the run log's
+    `COVERAGE GAP:` lines.
+
+    Three cases, in the order they are decided:
+
+    - No gaps: nothing to say about coverage, so this never forces speech.
+      That includes a gap that *cleared* since the last run, which is silent
+      today for the same reason and is left as it was — announcing good news
+      about coverage would be new behaviour, not a fix to a repeat.
+    - Gaps, and no previous envelope: `memory` is None both for a first run
+      and for a store this run may not trust, and neither can be compared
+      against. Speak; an unknowable yardstick must not buy silence.
+    - Gaps on both sides: compare them. The waiver gap is already inside
+      `gaps` by the time this is called, so a waived run does not compare
+      equal to an unwaived one carrying the same collector shortfall.
+
+    The comparison is over sets, so a collector that reorders its reasons
+    between runs does not read as a change.
+    """
+    if not gaps:
+        return False
+    if memory is None:
+        return True
+    return {str(g) for g in gaps} != {
+        str(g) for g in (memory.get("coverage_gaps") or [])
+    }
+
+
 def coverage_gap_targets(data: dict) -> set[str] | None:
     """Which targets this run's gaps cover; `None` when one covers the stream.
 
@@ -8379,6 +8428,11 @@ def handle_finish(args: argparse.Namespace) -> None:
     delta_known = existing_issue is None or memory is not None
     previous_ids = [str(i) for i in (memory.get("current_ids") or [])] if memory else []
     previous_titles = report_finding_titles(memory)
+    # Whether coverage *moved*, which is what the silence verdicts on both
+    # branches below ask about — a standing gap is not news on its fourteenth
+    # morning. Computed here rather than at either verdict so the two cannot
+    # drift apart, and after `memory` because it is the yardstick.
+    coverage_moved = coverage_changed(gaps, memory)
     # Whether the collector's own source moved between the two runs this delta
     # spans. A finding vanishes for two reasons — the fleet was fixed, or the
     # arm that found it was deleted — and the harness has no way to tell them
@@ -8630,7 +8684,9 @@ def handle_finish(args: argparse.Namespace) -> None:
             # there. A clean run is the *usual* silent one, but not
             # unconditionally: `resolved > 0` is the fleet getting
             # better and is the best news this audit ever delivers, and
-            # a gap means it could not look rather than found nothing.
+            # a gap that *moved* means it could not look rather than found
+            # nothing. A gap that did not move said so on the run that
+            # acquired it; see `coverage_changed`.
             #
             # `delta_known` is the same guard one step further out. An
             # untrusted memory reaches here as an empty `previous_ids`, so
@@ -8639,7 +8695,8 @@ def handle_finish(args: argparse.Namespace) -> None:
             # swallowing its own good news because it could not count it. It
             # still claims no number; it just does not claim there was
             # nothing to say.
-            "silent_ok": not (clean_resolved or gaps or prs_closed) and delta_known,
+            "silent_ok": not (clean_resolved or coverage_moved or prs_closed)
+            and delta_known,
             "partial": bool(gaps),
             "coverage_gaps": gaps,
             "inspect_s": inspect_s,
@@ -8993,10 +9050,17 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # run off-schedule is waiting for an answer, and gets one
                 # regardless of what this says — see the dispatch rule in the
                 # Platform Agent's AGENTS.md.
+                #
+                # Coverage enters as `coverage_moved`, not as `gaps`. A gap
+                # that has not changed since the last run is not news, and
+                # using the raw list made a stream with a permanent gap
+                # incapable of silence — which is what the drift audit did for
+                # fourteen consecutive runs. `coverage_changed` carries the
+                # rest of that history.
                 "silent_ok": not (
                     reported_new
                     or reported_resolved
-                    or gaps
+                    or coverage_moved
                     or prs_opened
                     or prs_closed
                 ),

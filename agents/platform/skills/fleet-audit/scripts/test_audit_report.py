@@ -11258,6 +11258,79 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertNotIn("⚠", out)
 
 
+class TestCoverageChanged(unittest.TestCase):
+    """Whether coverage *moved*, which is what the silence verdicts ask.
+
+    The verdicts used the raw gap list, so a stream whose gap it could not
+    close was incapable of silence. The fleet-consistency drift audit ran
+    fourteen times at 0 new, 0 resolved and a byte-identical summary, and sent
+    every one of them.
+    """
+
+    GAP = "prod-autopilot: partially audited — 3 checks did not run"
+    OTHER = "prod-autopilot: partially audited — 7 checks did not run"
+
+    def test_no_gaps_never_forces_speech(self):
+        self.assertFalse(audit_report.coverage_changed([], {"coverage_gaps": []}))
+
+    def test_no_gaps_and_no_memory_still_never_forces_speech(self):
+        """The ordinary first clean run, which has always been silent."""
+        self.assertFalse(audit_report.coverage_changed([], None))
+
+    def test_a_gap_with_no_previous_envelope_speaks(self):
+        """None is unknowable, not empty, and must not be read as agreement."""
+        self.assertTrue(audit_report.coverage_changed([self.GAP], None))
+
+    def test_a_gap_the_previous_run_did_not_have_speaks(self):
+        self.assertTrue(
+            audit_report.coverage_changed([self.GAP], {"coverage_gaps": []})
+        )
+
+    def test_an_envelope_with_no_gaps_key_reads_as_no_gaps(self):
+        """An envelope written before the key existed, upgraded into."""
+        self.assertTrue(audit_report.coverage_changed([self.GAP], {}))
+
+    def test_the_same_gap_twice_is_silent(self):
+        self.assertFalse(
+            audit_report.coverage_changed([self.GAP], {"coverage_gaps": [self.GAP]})
+        )
+
+    def test_a_widened_gap_set_speaks(self):
+        self.assertTrue(
+            audit_report.coverage_changed(
+                [self.GAP, self.OTHER], {"coverage_gaps": [self.GAP]}
+            )
+        )
+
+    def test_a_narrowed_gap_set_speaks(self):
+        """Still incomplete, but less so — the operator's picture changed."""
+        self.assertTrue(
+            audit_report.coverage_changed(
+                [self.GAP], {"coverage_gaps": [self.GAP, self.OTHER]}
+            )
+        )
+
+    def test_reordering_the_same_reasons_is_not_a_change(self):
+        """`_coverage_gaps` builds its list by iterating the document's scope,
+        so a collector that emits its targets in a different order would
+        otherwise read as a change every time it did."""
+        self.assertFalse(
+            audit_report.coverage_changed(
+                [self.GAP, self.OTHER], {"coverage_gaps": [self.OTHER, self.GAP]}
+            )
+        )
+
+    def test_a_waived_run_does_not_compare_equal_to_an_unwaived_one(self):
+        """`finish` appends the waiver gap before calling this, so the waiver
+        is inside the set being compared. Were it appended afterwards, a run
+        that stopped collecting entirely would compare equal to yesterday's
+        ordinary shortfall and go quiet about it."""
+        waived = [self.GAP, audit_report.waiver_gap("collector image missing")]
+        self.assertTrue(
+            audit_report.coverage_changed(waived, {"coverage_gaps": [self.GAP]})
+        )
+
+
 class TestScopeCountsTargetsByKind(unittest.TestCase):
     """"Audited N cluster(s)" was `len(scope.clusters)`, which is not a count of
     clusters.
@@ -13609,10 +13682,14 @@ class TestSilentVerdict(HarnessTestCase):
         out = self.finish_json(doc)
         self.assertTrue(out["silent_ok"])
 
-    def test_a_partial_run_is_never_silent(self):
-        """The exact shape that went silent on 2026-08-03."""
-        doc = make_doc(
-            findings=[],
+    def partial_doc(self, findings=()):
+        """A document with one cluster that ran 1 of its 11 applicable checks.
+
+        The only fixture here that produces a coverage gap, so every test
+        below about coverage builds on it.
+        """
+        return make_doc(
+            findings=list(findings),
             clusters=[
                 {
                     "name": "prod-autopilot",
@@ -13622,7 +13699,77 @@ class TestSilentVerdict(HarnessTestCase):
                 }
             ],
         )
-        out = self.finish_json(doc)
+
+    def test_a_partial_run_is_never_silent(self):
+        """The exact shape that went silent on 2026-08-03.
+
+        `seed_store` records no coverage gaps, so this is the gap's *first*
+        morning and it is announced. The three tests below cover the later
+        mornings, which is where the rule changed.
+        """
+        out = self.finish_json(self.partial_doc())
+        self.assertTrue(out["partial"])
+        self.assertFalse(out["silent_ok"])
+
+    def test_an_unchanged_coverage_gap_is_not_news_a_second_time(self):
+        """The drift audit's fourteen identical morning pings.
+
+        `kube-agents-host` carries no `environment` label, so it has no cohort
+        and skips all nineteen checks — a gap no run of that stream can close
+        and every run therefore re-announced. The gap is still true, still in
+        the ledger body and still on the stored envelope; it has just stopped
+        being a reason to speak.
+
+        The previous gap is taken from the same document rather than written
+        out here on purpose. What this pins is "the same shortfall two
+        mornings running", and a hardcoded string would fail on a reword of
+        the gap text, which is not a change in behaviour.
+        """
+        doc = self.partial_doc()
+        self.seed_store(doc, coverage_gaps=audit_report.coverage_gaps(doc))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(doc)
+        out = self.stdout_json()
+        self.assertTrue(out["partial"])
+        self.assertTrue(out["silent_ok"])
+        self.assertEqual(out["chat_summary"], "[SILENT]")
+
+    def test_an_unchanged_gap_is_silent_on_the_findings_branch_too(self):
+        """The live shape: status UPDATED, 0 new, 0 resolved, one standing gap.
+
+        The clean branch above and this one compute the verdict separately, so
+        fixing one and not the other would have left the stream that actually
+        complained — drift, which carries two findings — talking every day.
+        """
+        doc = self.partial_doc(findings=[make_finding(fid="a")])
+        self.seed_store(doc, coverage_gaps=audit_report.coverage_gaps(doc))
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(doc)
+        out = self.stdout_json()
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertTrue(out["partial"])
+        self.assertTrue(out["silent_ok"])
+
+    def test_a_coverage_gap_that_widened_speaks(self):
+        """Losing sight of more of the fleet is a change, and changes speak."""
+        doc = self.partial_doc()
+        self.seed_store(doc, coverage_gaps=["prod-autopilot: one earlier reason"])
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.run_finish(doc)
+        out = self.stdout_json()
+        self.assertFalse(out["silent_ok"])
+
+    def test_a_coverage_gap_with_nothing_to_compare_against_speaks(self):
+        """No store, no yardstick — and an unknowable one must not buy silence.
+
+        The issue list is empty so `delta_known` stays true and this isolates
+        the coverage term: without the empty list the clean branch's
+        `and delta_known` would force speech on its own and the assertion
+        would pass while proving nothing.
+        """
+        self.harness.replies = {"issue list": json.dumps([])}
+        self.run_finish(self.partial_doc())
+        out = self.stdout_json()
         self.assertTrue(out["partial"])
         self.assertFalse(out["silent_ok"])
 
@@ -13635,20 +13782,46 @@ class TestSilentVerdict(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
 
     def test_the_verdict_agrees_with_the_fields_beside_it(self):
-        """Whatever else changes, `silent_ok` stays a function of the JSON."""
-        for findings in ([], [make_finding(fid="a")]):
-            with self.subTest(findings=len(findings)):
-                out = self.finish_json(make_doc(findings=findings))
-                self.assertEqual(
-                    out["silent_ok"],
-                    not (
-                        out["new"]
-                        or out["resolved"]
-                        or out["partial"]
-                        or out["prs_opened"]
-                        or out["prs_closed"]
-                    ),
+        """Whatever else changes, `silent_ok` stays a function of the JSON.
+
+        `partial` is the one term that is not read straight off the payload.
+        It says a gap exists; the verdict asks whether the gap *moved*, and
+        the payload cannot answer that on its own — the previous run's gaps
+        live in the store. So the subtests below say what they seeded, and the
+        unchanged-gap row is the one that would have failed the old form of
+        this assertion.
+        """
+        cases = [
+            ("clean", make_doc(findings=[]), [], True),
+            ("findings", make_doc(findings=[make_finding(fid="a")]), [], True),
+            ("gap unchanged", self.partial_doc(), None, False),
+            ("gap first seen", self.partial_doc(), [], True),
+        ]
+        for name, doc, seeded, coverage_agrees in cases:
+            with self.subTest(case=name):
+                gaps = audit_report.coverage_gaps(doc)
+                self.seed_store(
+                    doc, coverage_gaps=gaps if seeded is None else seeded
                 )
+                self.harness.replies = {"issue list": self.issue_list()}
+                self.run_finish(doc)
+                out = self.stdout_json()
+                payload_only = not (
+                    out["new"]
+                    or out["resolved"]
+                    or out["partial"]
+                    or out["prs_opened"]
+                    or out["prs_closed"]
+                )
+                if coverage_agrees:
+                    self.assertEqual(out["silent_ok"], payload_only)
+                else:
+                    # A standing gap: `partial` is true and the run is silent
+                    # anyway. Asserted rather than skipped, so that collapsing
+                    # the verdict back onto `partial` fails here.
+                    self.assertTrue(out["partial"])
+                    self.assertTrue(out["silent_ok"])
+                    self.assertFalse(payload_only)
 
 
 class TestChatSummary(HarnessTestCase):

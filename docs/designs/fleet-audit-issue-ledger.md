@@ -58,12 +58,15 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   stream.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no coverage gap, and no remediation PR opened or closed. If any of those fails
+  `resolved == 0`, coverage unchanged since the last run, and no remediation PR opened or closed.
+  If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
-  could not read the whole fleet is never silent even when both counters are zero, because "I found
-  nothing" and "I could not look" are different statements and only one of them is reassuring
-  (§7.4). `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports regardless.
+  has just discovered it cannot read the whole fleet is never silent even when both counters are
+  zero, because "I found nothing" and "I could not look" are different statements and only one of
+  them is reassuring (§7.4). A gap it has already reported and cannot close is not that discovery
+  a second time. `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports
+  regardless.
 
 ### Tier 2 — remediation pull requests
 
@@ -789,9 +792,12 @@ still reads as the whole stream, which is the widest answer and the safe one.
 - Zero findings does not close the ledger — this one stays stream-wide, on any gap at all. `status` is still `CLEAN` — the audit found nothing, and
   saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
   gaps, so the stream self-heals the day the unreadable clusters come back.
-- The run is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5) on any gap, also
-  stream-wide. "I found nothing" and "I could not look" must not arrive in chat as the same
-  silence.
+- The run is never `[SILENT]` on a gap that **moved**: `finish` returns `silent_ok: false` (§7.5)
+  when this run's `coverage_gaps` differ from the stored envelope's, or when there is no stored
+  envelope to compare against, also stream-wide. "I found nothing" and "I could not look" must not
+  arrive in chat as the same silence — so the gap speaks on the run that acquires it and on every
+  run that widens or narrows it. It does not speak again unchanged: that made a stream with a gap
+  it cannot close incapable of silence, which §7.5 records.
 
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
 published normally, and new fixes are still proposed for them. A partial audit is a partial audit,
@@ -821,7 +827,8 @@ URL. An earlier run of the same job, the same morning, had got the same rule rig
 applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
-moved nothing an operator needs to hear about — nothing new, nothing resolved, no coverage gap, no
+moved nothing an operator needs to hear about — nothing new, nothing resolved, no change in
+coverage since the last run, no
 remediation PR opened or closed — and it is computed from the numbers `finish` is about to _report_,
 not the ones it privately knows. A partial run reports `resolved: 0`; a report store this run cannot
 trust makes the delta unknowable and reports `new: 0` and `resolved: 0`. `silent_ok` follows what
@@ -851,6 +858,25 @@ the Tier 1 ledger and nowhere else. `silent_ok` still earns its keep on the disp
 person is demonstrably waiting; on the scheduled path it currently gates a delivery leg that has no
 destination. If a scheduled chat ping is ever wanted it belongs on the Chat Agent, which owns
 ingress, and it should carry a pointer — title, counts, ledger URL — not the report.
+
+**That last paragraph stopped being true on 2026-08-19**, and the rule above was re-priced on
+2026-09-02 because of it. #731 gave the scheduled path the destination this section says it lacks,
+delivering exactly the pointer described — title, counts, ledger URL. The "never `[SILENT]` on a
+gap" rule was written on 2026-08-04 on the explicit ground that making it loud gated nothing, and
+nobody revisited it when the leg acquired a destination fifteen days later. The
+fleet-consistency drift audit then sent fourteen consecutive messages at 0 new, 0 resolved, and a
+byte-identical summary: `kube-agents-host` carries no `environment` label, so it has no cohort,
+skips all nineteen checks, and produces the same gap every morning.
+
+So the verdict now asks whether coverage _moved_ rather than whether a gap exists
+(`coverage_changed` in `audit_report.py`). The three cases it decides — no gaps, gaps with no
+readable previous envelope, gaps on both sides — are in that function's docstring. Everything §7.4
+was protecting still holds: the gap is announced when it appears and whenever it changes, and the
+standing shortfall stays in the ledger body, on the stored envelope, and in the run log.
+
+One inconsistency this resolves rather than introduces: the same run already declined to post a
+GitHub delta comment at 0 new / 0 resolved. Unchanged-means-quiet was being applied to the ledger
+and not to chat.
 
 ## 8. Labels
 

@@ -262,10 +262,12 @@ did read. Over a partial run the harness:
 Two gaps are wider than one cluster and hold everything back: a waived collector manifest, and a
 gap that belongs to no target at all — a whole kind of object nobody enumerated.
 
-A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it, and counts the gaps
-in the `chat_summary` line it hands you to send. The gaps themselves are named in the ledger, which
-is what the link is for; name them in your answer too when a person asked for the run. See
-[The clean run](#the-clean-run) for the full rule.
+A run whose coverage **changed** is never `[SILENT]` — `finish` returns `silent_ok: false` for it,
+and counts the gaps in the `chat_summary` line it hands you to send. A gap that has not moved since
+the last run is not news a second time, so a stream with a standing gap it cannot close still goes
+quiet; the gap stays in the ledger and in `coverage_gaps` either way. The gaps themselves are named
+in the ledger, which is what the link is for; name them in your answer too when a person asked for
+the run. See [The clean run](#the-clean-run) for the full rule.
 
 ## The findings document
 
@@ -758,8 +760,9 @@ unanswered in the thread, comments the date and the clusters covered, closes the
 completed**, and closes every remediation pull request still open for the stream. The answers come
 first, deliberately: a reply posted after the close would land on an issue nobody is watching.
 
-**Zero findings plus a coverage gap is not a clean run, and it is not silent even on a stream with
-no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
+**Zero findings plus a coverage gap is not a clean run, and the run that acquires the gap is not
+silent even on a stream with no ledger.** With gaps, the harness opens one — titled
+`coverage incomplete (n gaps, 0 findings)`
 rather than the all-clear phrasing — so the run leaves a durable artifact saying what it could not
 see. Without this, a stream that inspected nothing produced no issue, no comment, and nothing to
 notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
@@ -773,7 +776,16 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no coverage gap, and no remediation pull request opened or closed.
+> new, nothing resolved, no change in coverage since the last run, and no remediation pull request
+> opened or closed.
+
+Coverage counts as _movement_, not as a state. A gap speaks on the run that acquires it and on any
+run that widens or narrows it; an unchanged gap does not speak again. Using the gap list itself
+made a stream with a gap it could not close incapable of silence — the fleet-consistency drift
+audit sent fourteen consecutive messages at 0 new, 0 resolved, and a byte-identical summary,
+because one cluster had no `environment` label and so had no cohort to compare against. The
+shortfall is still in the ledger body, in `coverage_gaps`, and in the run log; it has just stopped
+being a reason to send.
 
 Two rules follow, and they are the whole rule:
 
