@@ -13,8 +13,13 @@
 ### 0. Open the audit run
 
 ```bash
-python3 ./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit stockout-prevention [--repo "<owner>/<repo>"]
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/stockout-prevention/org__repo", "findings_path":"/opt/data/scratch/findings_stockout-prevention.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
 
@@ -265,7 +270,8 @@ Write the schema exactly as the helper validates it to the `findings_path` retur
 ```bash
 python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit stockout-prevention \
   --findings-file /opt/data/scratch/findings_stockout-prevention.json \
-  --manifest-file /opt/data/scratch/manifest_stockout-prevention.json
+  --manifest-file /opt/data/scratch/manifest_stockout-prevention.json \
+  [--repo "<owner>/<repo>"]
 ```
 
 `--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §3's collector never produced one — it crashed, or the fleet was unreachable, and every check on every cluster came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether.

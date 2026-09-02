@@ -12,7 +12,14 @@
 
 ### 0. Open the audit run
 
-Run `python3 ./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis`. It prints one JSON line:
+Run `python3 ./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis [--repo "<owner>/<repo>"]`.
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
+
+It prints one JSON line:
 
 ```json
 {
@@ -246,7 +253,7 @@ Worked example, for a 3.7 finding on an idle batch pool — a `gcloud` remediati
 
 ### 6. Close the audit run
 
-Run `python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost-analysis --findings-file <findings_path> --manifest-file /opt/data/scratch/manifest_fleet-wide-cost-analysis.json`. `--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §2's collector never produced one — every check on every target came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` target the document leaves out of `scope.clusters` altogether. Exit 0 means published; exit 2 means the validator rejected the document and nothing was published — fix the document and re-run, never delete the finding that tripped it; exit 1 is fatal. The helper prints one JSON line, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled run replies), and two telemetry durations (`inspect_s`, `publish_s`).
+Run `python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost-analysis --findings-file <findings_path> --manifest-file /opt/data/scratch/manifest_fleet-wide-cost-analysis.json [--repo "<owner>/<repo>"]`. `--manifest-file` is required and `finish` refuses to publish without it, because nothing else checks the document against what the collector actually ran. On a run where §2's collector never produced one — every check on every target came from the manual fallback — pass `--no-collector-manifest '<why>'` instead; it publishes but reports the reason as a coverage gap, so the run is partial. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`, and rejects a `"collected"` target the document leaves out of `scope.clusters` altogether. Exit 0 means published; exit 2 means the validator rejected the document and nothing was published — fix the document and re-run, never delete the finding that tripped it; exit 1 is fatal. The helper prints one JSON line, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled run replies), and two telemetry durations (`inspect_s`, `publish_s`).
 
 `partial` and `coverage_gaps` describe how much of the fleet the run can actually speak for: `partial` is `true` if any cluster is in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` states each gap in a sentence. This matters most on a cost audit, where the conclusion is usually drawn from an absence — an idle disk that stops appearing has not necessarily been released, it may sit in a project nobody could list this week. So over a partial run the helper holds back the findings that sat on the cluster the gap names — out of `resolved`, remediation PR left open — while still announcing a saving realised on a cluster it did read and retiring that PR as stale, and keeps the ledger open even with an empty findings array: `status` is still `CLEAN`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Coverage is the only thing the flag tracks, so `partial` is `true` if and only if `coverage_gaps` is non-empty: the §5 body budget dropping findings from the description does not set it, because the audit still saw them and says as much in the body.
 

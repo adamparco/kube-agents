@@ -450,33 +450,37 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     return f": {detail.strip()[:200]}"
 
 
-def _relay_verdict(response) -> Tuple[str, str]:
-    """The route's ``relay`` and ``relay_detail`` off a 2xx body, ``("", "")`` if absent.
+def _relay_receipt(response) -> dict:
+    """The route's 2xx body, or ``{}`` if it could not be read.
+
+    Three fields are read off it, and each says something a bare 200 does not:
+    ``relay`` (``degraded`` when the report is in a channel but the delivery did
+    not go as intended), ``relay_detail`` (which of the degradations it was, in
+    words) and ``undelivered`` (the enabled chat platforms this report did not
+    reach while another one did).
 
     Best effort, like :func:`_http_error_detail`: the body is read once and a
     delivery that worked is never turned into an exception by failing to parse
-    the receipt for it. ``""`` therefore means "no verdict", not "composed" —
-    the caller treats only an explicit ``degraded`` as degraded.
+    the receipt for it. ``{}`` therefore means "the route did not say", not
+    "nothing to report" — the caller acts only on explicit values.
 
-    The detail comes back beside the verdict rather than being re-derived,
-    because it cannot be re-derived here: `degraded` covers a failed Chat Agent
-    turn and a channel the send never reached, and only the route knows which
-    happened and to which platform. A route too old to send it leaves ``""``,
-    and the caller falls back to the sentence it used to print unconditionally.
-
-    Bounded at the same 200 characters as :func:`_http_error_detail`, and for
-    the same reason: this ends up inside the ``error`` string the scheduler
-    stores as ``last_delivery_error``, once per job run.
+    The whole body comes back rather than one field off it because the caller
+    reads three, and a tuple carrying some of them is one the two ends have to
+    keep in step. ``relay_detail`` in particular cannot be re-derived here:
+    ``degraded`` covers a failed Chat Agent turn and a channel the send never
+    reached, and only the route knows which happened and to which platform. A
+    route too old to send it leaves the field absent, and the caller falls back
+    to the sentence it used to print unconditionally.
     """
     try:
-        body = json.loads(response.read().decode("utf-8", "replace")) or {}
-        return str(body.get("relay") or ""), str(body.get("relay_detail") or "").strip()[:200]
+        body = json.loads(response.read().decode("utf-8", "replace"))
     except Exception:
-        return "", ""
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
-def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], str, str]:
-    """POST *payload* as JSON. ``(None, verdict, detail)`` on success, else ``(why, "", "")``.
+def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], dict]:
+    """POST *payload* as JSON. ``(None, receipt)`` on success, else ``(why, {})``.
 
     Blocking, and called through :func:`asyncio.to_thread`. ``urllib`` rather
     than ``httpx`` keeps this module stdlib-only, so its tests run wherever the
@@ -498,15 +502,15 @@ def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], str, st
         with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT_SECONDS) as response:
             status = getattr(response, "status", None) or response.getcode()
             if status >= 300:
-                return f"chat relay answered HTTP {status}", "", ""
-            return (None, *_relay_verdict(response))
+                return f"chat relay answered HTTP {status}", {}
+            return None, _relay_receipt(response)
     except urllib.error.HTTPError as exc:
         # The route names the failing leg in `detail` ("composed but not
         # delivered to google_chat"), which is the difference between a
         # last_delivery_error someone can act on and a bare status code.
-        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}", "", ""
+        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}", {}
     except Exception as exc:  # URLError, socket timeout, malformed URL
-        return f"chat relay unreachable: {type(exc).__name__}: {exc}", "", ""
+        return f"chat relay unreachable: {type(exc).__name__}: {exc}", {}
 
 
 async def standalone_send(
@@ -525,8 +529,9 @@ async def standalone_send(
     for.
 
     ``chat_id``, ``thread_id``, ``media_files`` and ``force_document`` are
-    accepted for signature parity and ignored: the relay route has exactly one
-    destination, and the Chat Agent decides where its own message goes.
+    accepted for signature parity and ignored: this sender names no destination
+    at all. The route resolves them itself — one per enabled chat platform — and
+    the Chat Agent decides what its own message says.
 
     The error strings become ``last_delivery_error``, so they name the condition
     and never the key.
@@ -604,34 +609,60 @@ async def standalone_send(
         # same platforms itself -- lands twice in each of them.
         "also_delivered_to": sibling_delivery_targets(job_id),
     }
-    error, verdict, detail = await asyncio.to_thread(_post, relay_url(), payload, api_key)
+    error, receipt = await asyncio.to_thread(_post, relay_url(), payload, api_key)
     if error:
         return {"error": error}
 
-    if verdict == "degraded":
-        # The route answered 200 and the report is in the channel, so this is
-        # not a lost delivery — but something about it degraded. `error` is the
-        # only field of this dict the scheduler reads, and `last_delivery_error`
-        # is the only place a run record can carry the fact, so the verdict goes
-        # there rather than into a log line nobody greps. The string says
-        # plainly that the report did arrive, because `cronjob list` showing a
-        # delivery error is otherwise read as "nothing was sent" and invites a
-        # re-run that would post the same finding twice.
+    # Two ways a 200 is still worth recording, and a run can hit both at once,
+    # so they accumulate rather than returning early. In each case the report IS
+    # in a channel: `error` is the only field of this dict the scheduler reads
+    # and `last_delivery_error` is the only place a run record can carry the
+    # fact, so the verdict goes there rather than into a log line nobody greps —
+    # and each string says plainly that the report arrived, because `cronjob
+    # list` showing a delivery error is otherwise read as "nothing was sent" and
+    # invites a re-run that would post the same finding twice.
+    #
+    # Not doing this is what the relay was built to stop, one layer out: a front
+    # door that has been down all week would otherwise produce run records
+    # byte-identical to healthy ones.
+    notes = []
+
+    if receipt.get("relay") == "degraded":
+        # Which degradation comes from the route, because the ones it reports
+        # want opposite responses and this end cannot tell them apart: a failed
+        # Chat Agent turn leaves raw text in every channel, a send that never
+        # landed leaves one channel with nothing. The fallback is the sentence
+        # that used to be printed for both, which is correct only for the
+        # failed-turn case — so it is what a route too old to send a detail
+        # gets, and nothing else.
         #
-        # Not doing this is what the relay was built to stop, one layer out: a
-        # front door that has been down all week would otherwise produce run
-        # records byte-identical to healthy ones.
-        #
-        # Which degradation comes from the route, because the two it reports
-        # want opposite responses and this end cannot tell them apart. The
-        # fallback is the sentence that used to be printed for both, which is
-        # correct only for the failed-turn case — so it is what a route too old
-        # to send a detail gets, and nothing else.
-        message = "chat relay degraded: the report was posted but " + (
-            detail
-            or "the Chat Agent turn failed, so the channel has the raw text "
-            "marked [unrelayed] rather than a composed message"
-        ) + ". Delivered — do not re-run to resend."
+        # Bounded at the same 200 characters as :func:`_http_error_detail`, and
+        # for the same reason: this ends up inside the `error` string the
+        # scheduler stores as `last_delivery_error`, once per job run. Left
+        # unbounded, a route that echoes a stack trace or the report itself
+        # writes the whole thing into the job record.
+        detail = str(receipt.get("relay_detail") or "").strip()[:200]
+        notes.append(
+            "chat relay degraded: the report was posted but "
+            + (
+                detail
+                or "the Chat Agent turn failed, so the channel has the raw text "
+                "marked [unrelayed] rather than a composed message"
+            )
+            + "."
+        )
+
+    # A fan-out that reached one platform and missed another — the audience that
+    # heard nothing is exactly the silence #1094 is about. Separate from
+    # `relay_detail` above rather than folded into it: a route can report a
+    # clean `relay: "ok"` and still have missed a platform, and that case has no
+    # detail string to carry it.
+    undelivered = str(receipt.get("undelivered") or "").strip()
+    if undelivered:
+        notes.append(f"chat relay partial: the report did not reach {undelivered}.")
+
+    if notes:
+        message = " ".join(notes) + " Delivered — do not re-run to resend."
         logger.warning("chat relay: %s (job_id=%s)", message, job_id or "?")
         return {"error": message}
 
@@ -687,8 +718,8 @@ def register(ctx) -> None:
         standalone_sender_fn=standalone_send,
         # No chunking. The Chat Agent is composing a message from this text, not
         # posting it; the length bound that matters is CRON_REPORT_MAX_CHARS on
-        # the relay route, which rejects rather than silently splitting a report
-        # into pieces that each start a separate turn.
+        # the relay route, which truncates to a single marked report rather than
+        # splitting it into pieces that each start a separate turn.
         max_message_length=0,
         emoji="🗣️",
         # Never offer /update from a channel that has no inbound side.

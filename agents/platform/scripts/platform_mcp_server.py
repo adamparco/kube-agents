@@ -822,25 +822,51 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     except Exception as exc:
         return f"ERROR: Failed to hand the report to the chat relay: {exc}"
 
-    # The route answers 200 for both a composed delivery and a degraded one, and
-    # says which in `relay`. Reading it here is the difference between the agent
-    # knowing its report went out raw and it believing the Chat Agent framed it.
-    # `relay_detail` says which degradation — a failed Chat Agent turn and a
+    # The route answers 200 for a composed delivery, a degraded one, and a
+    # fan-out that reached some platforms and not others, and says which in
+    # `relay` and `undelivered`. Reading both here is the difference between the
+    # agent knowing what actually happened to its report and it believing the
+    # Chat Agent framed it for everyone. The relay adapter — the other caller of
+    # this route — reads the same two fields; a sibling that reads only one
+    # reports a half-delivered report as a clean one.
+    #
+    # `relay_detail` then says which degradation — a failed Chat Agent turn and a
     # channel the send never reached are both `degraded` and want opposite
     # descriptions. Older routes do not send it; the sentence they used to get is
     # the fallback, which is right for them because they only had the one cause.
+    session = payload.get("session_id", "?")
+    labels, caveats = [], []
     if payload.get("relay") == "degraded":
-        detail = str(payload.get("relay_detail") or "").strip() or (
-            "the Chat Agent turn failed, so the user sees your raw text marked "
-            "[unrelayed] rather than a composed message"
+        labels.append("degraded")
+        caveats.append(
+            str(payload.get("relay_detail") or "").strip()
+            or (
+                "the Chat Agent turn failed, so the user sees your raw text marked "
+                "[unrelayed] rather than a composed message"
+            )
         )
+    undelivered = str(payload.get("undelivered") or "").strip()
+    if undelivered:
+        labels.append("partial")
+        caveats.append(
+            f"it did not reach {undelivered}, so that audience has not seen it"
+        )
+    if str(payload.get("truncated") or "").strip():
+        labels.append("truncated")
+        caveats.append(
+            "it was over the chat character limit, so only the beginning of it "
+            "was posted and the rest is only in the saved output — write a "
+            "shorter report next time rather than resending this one"
+        )
+    if caveats:
         return (
-            f"SUCCESS (degraded): the report was posted to chat (session "
-            f"{payload.get('session_id', '?')}) but {detail}. It is "
-            "delivered — do not send it again — and there is nothing for you to retry."
+            f"SUCCESS ({', '.join(labels)}): the report was posted to chat "
+            f"(session {session}), but "
+            + "; and ".join(caveats)
+            + ". It is delivered — do not send it again — and there is nothing for you to retry."
         )
     return (
-        f"SUCCESS: Report accepted for delivery to chat (session {payload.get('session_id', '?')}). "
+        f"SUCCESS: Report accepted for delivery to chat (session {session}). "
         "The Chat Agent posts it; do not also call send_notification for this report."
     )
 
