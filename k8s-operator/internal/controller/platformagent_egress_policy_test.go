@@ -1121,6 +1121,29 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 				a.Spec.Security.SplitCredentialBrokerPod = nil
 			},
 		},
+		{
+			// Step 10's refusal, which returns above the two egress ones and so
+			// used to withhold the gateway policy. It matters because the
+			// refusal grew a second trigger, RuntimeClassUnschedulable, that
+			// fires only when a Ready replica already exists — so unlike
+			// RuntimeClassNotFound on a first install, it parks a long-lived
+			// serving install in a 30-second requeue loop that never reconciles
+			// a policy again.
+			//
+			// Not guarded: the egress policy stays withheld here on purpose.
+			// Step 10c's layout check has not run at this point, so rendering it
+			// on an Allowlist install with a sidecar broker would deny the
+			// broker the metadata server it exists to reach.
+			name:   "RuntimeClassNotFound",
+			reason: "RuntimeClassNotFound",
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("gvisor"),
+					},
+				}
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()

@@ -384,7 +384,12 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   scheduled. Pod-scoped, so it covers the agent, both injected sidecars, anything in
   `initContainers`/`sidecars`, and the OCI image volumes `AgentPlugin`s mount.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
-- `runtimeClassName` — pod runtime class (e.g. `gvisor`).
+- `runtimeClassName` — pod runtime class (e.g. `gvisor`). The operator checks two things and
+  parks `phase: Degraded` on either: the RuntimeClass object existing at all
+  (`RuntimeClassNotFound`), and — only once a Ready replica exists — some node carrying the
+  labels in its `scheduling.nodeSelector` (`RuntimeClassUnschedulable`). The second is deferred
+  until there is a replica to lose so that a first install still writes the workload, leaving a
+  Pending Pod for a cluster autoscaler to react to.
 - `env` — additional container environment variables.
 - `initContainers` / `sidecars` — standard init and sidecar containers.
 - `extraVolumes` / `extraVolumeMounts` — custom volumes and mounts for the main container.
@@ -498,11 +503,11 @@ The operator writes observed state to the `status` subresource:
 
 Three condition types appear in `conditions`, and only the first is always present:
 
-| Type           | Written                                      | Meaning                                                                                                                                                                                                                                                                       |
-| -------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on — including the four spec refusals that park `phase: Degraded` (`RuntimeClassNotFound`, `SplitBrokerStrandsEventWatcher`, `EgressPolicyRequiresSplitBroker`, `EgressAllowlistRefused`). |
-| `Degraded`     | Only while degraded                          | Something in the spec cannot be honoured — today, `Reason: InvalidGitRepoURL`. The refusals above ride the `Ready` condition instead of this one.                                                                                                                             |
-| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                  |
+| Type           | Written                                      | Meaning                                                                                                                                                                                                                                                                                                    |
+| -------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on — including the five spec refusals that park `phase: Degraded` (`RuntimeClassNotFound`, `RuntimeClassUnschedulable`, `SplitBrokerStrandsEventWatcher`, `EgressPolicyRequiresSplitBroker`, `EgressAllowlistRefused`). |
+| `Degraded`     | Only while degraded                          | Something in the spec cannot be honoured — today, `Reason: InvalidGitRepoURL`. The refusals above ride the `Ready` condition instead of this one.                                                                                                                                                          |
+| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                                               |
 
 `EventWatcher` is absent on a healthy install rather than `True`, deliberately: the operator can say
 it asked for a watcher, but nothing here checks that one is alive, and a permanently-`True`

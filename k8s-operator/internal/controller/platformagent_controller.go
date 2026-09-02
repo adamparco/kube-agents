@@ -272,6 +272,30 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if rcReason != "" {
 		log.Info(rcMsg)
+		// The guardrail note at step 10e applies here too, and it did not used
+		// to. When this refusal had only RuntimeClassNotFound it withheld the
+		// gateway policy from an install whose RuntimeClass object is absent —
+		// on GKE, a first install where nothing is running yet, so withholding
+		// everything is harmless. RuntimeClassUnschedulable inverts that
+		// precondition: it fires only when workloadHasReadyReplica is true, so
+		// it is a long-lived healthy install that starts requeueing every 30
+		// seconds forever the moment a node-pool replacement drops the sandbox
+		// labels. Without this the agent keeps serving while its policies are
+		// never reconciled again, and an operator triaging with `kubectl delete
+		// netpol --all` never gets them back — leaving nothing selecting the
+		// agent Pod, so NetworkPolicy default-allows and the pod has
+		// unrestricted egress including the metadata server, behind a Degraded
+		// status naming only the RuntimeClass.
+		//
+		// Gateway policy only, deliberately: the egress policy is withheld by
+		// refusalStillRendersTheGuardrail for every reason but
+		// EgressAllowlistRefused, and that is right here. Step 10c's layout
+		// check has not run yet at this point, so on an Allowlist install with
+		// a sidecar broker the egress policy would govern the broker too and
+		// take away the credentials it exists to mint.
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, rcReason); err != nil {
+			return ctrl.Result{}, err
+		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, rcReason, rcMsg); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -358,10 +382,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// This closes the hazard at the two egress refusals only — this one
-		// and step 10c's. The two refusals above them — step 10's
-		// RuntimeClassNotFound and step 10b's SplitBrokerStrandsEventWatcher —
-		// return without reconciling the gateway policy and still have it.
+		// Step 10's RuntimeClass refusal now reconciles the gateway policy for
+		// the same reason, so the remaining gap is step 10b's
+		// SplitBrokerStrandsEventWatcher, which returns without reconciling it.
 		// Issue #964 tracks that; do not read the rule stated here as one the
 		// whole function keeps yet.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
