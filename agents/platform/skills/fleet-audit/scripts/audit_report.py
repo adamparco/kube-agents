@@ -2065,6 +2065,21 @@ def carry_unchanged_findings(
                 finding[field] = copy.deepcopy(before[field])
                 stabilised = True
         if stabilised:
+            # A carried remediation was authored by an earlier run and reaches
+            # the published body without passing `validate_findings`, so it can
+            # hold a spelling the validator would have corrected — and because
+            # the carry condition is "evidence did not move", it holds it for
+            # as long as the finding stands. `--release-channel=REGULAR` was
+            # written on 2026-09-01 and came back verbatim on the run *after*
+            # the validator learned to fix it, which is how a normaliser that
+            # works can still publish nothing but wrong commands. Re-normalise
+            # here so the invariant is about the published note rather than
+            # about which run authored it.
+            remediation = finding.get("remediation")
+            if isinstance(remediation, dict) and remediation.get("kind") == "gcloud":
+                remediation["note"] = normalise_gcloud_enum_values(
+                    str(remediation.get("note", ""))
+                )
             carried.append(fid)
     return carried
 

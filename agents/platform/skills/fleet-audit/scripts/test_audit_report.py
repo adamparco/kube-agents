@@ -3021,6 +3021,41 @@ class TestCarryUnchangedFindings(unittest.TestCase):
         self.assertEqual(out["impact"], "A zonal stockout halts autoscaling for this pool.")
         self.assertEqual(out["recommendation"], {"action": "Add us-east4-b and us-east4-c."})
 
+    def test_a_carried_gcloud_note_is_recased_on_the_way_through(self):
+        # The carried remediation never sees `validate_findings`, so a note
+        # authored before the normaliser existed would otherwise be republished
+        # verbatim for as long as its evidence holds still. Observed live: the
+        # 2026-09-01 drift run wrote `--release-channel=REGULAR`, and the run
+        # after the validator was fixed published the same broken command.
+        stale = self.before(
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=REGULAR",
+            }
+        )
+        now = self.before(
+            title="a rewrite, so the carry engages",
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=regular",
+            },
+        )
+        _, out = self.carry(stale, now)
+        self.assertEqual(
+            out["remediation"]["note"],
+            "gcloud container clusters update c --release-channel=regular",
+        )
+
+    def test_a_carried_manual_note_is_left_alone(self):
+        stale = self.before(
+            remediation={"kind": "manual", "note": "The channel is REGULAR on nine peers."}
+        )
+        now = self.before(title="a rewrite, so the carry engages")
+        _, out = self.carry(stale, now)
+        self.assertEqual(
+            out["remediation"]["note"], "The channel is REGULAR on nine peers."
+        )
+
     def test_a_remediation_that_drops_a_zone_does_not_survive(self):
         # The live pair. One run proposed [us-east4-b, us-east4-c] for a pool
         # whose only nodes are in us-east4-a; the next proposed all three.
