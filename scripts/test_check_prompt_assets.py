@@ -313,6 +313,52 @@ class SyntheticProfileTests(unittest.TestCase):
         )
         self.assertEqual([], self.fixture.rules())
 
+    def test_a_cron_path_with_an_argument_after_it_is_still_checked(self):
+        """The old pattern demanded the closing quote right after the extension.
+
+        So `'collect.py <stream>'` matched nothing and the reference went
+        unchecked: three of the eight collector invocations in the platform
+        roster name a stream after the script, and renaming `collect.py` left
+        `make prompt-check` at exit 0.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": '
+            "\"Run 'skills/thing/scripts/collect.py compliance-audit'.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_a_cron_path_behind_an_interpreter_is_still_checked(self):
+        """Same gap from the other side: a prefix before the path, not after.
+
+        The cost roster spells its collector
+        `'/opt/hermes/.venv/bin/python3 skills/.../fleet_waste.py'`, which the
+        old pattern also skipped.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "cost", "prompt": '
+            "\"Run '/opt/hermes/.venv/bin/python3 skills/thing/scripts/waste.py'.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_an_absolute_interpreter_is_not_itself_an_asset(self):
+        """The interpreter ships in the image, not in the profile.
+
+        Reporting `/opt/hermes/.venv/bin/python3` as missing would be a false
+        finding on every roster that spells its collector out in full, so the
+        path pattern requires the first segment to be a name rather than the
+        empty string a leading `/` produces.
+        """
+        self.fixture.write("agents/platform/skills/thing/scripts/waste.py", "x = 1\n")
+        self.fixture.skill("thing")
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "cost", "prompt": '
+            "\"Run '/opt/hermes/.venv/bin/python3 skills/thing/scripts/waste.py'.\"}]}",
+        )
+        self.assertEqual([], self.fixture.rules())
+
     def test_a_roster_that_moves_within_agents_is_still_found(self):
         """Two hardcoded paths behind is_file() made both cron rules no-ops.
 

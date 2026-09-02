@@ -197,9 +197,31 @@ SKILL_IN_PROSE = re.compile(r"`?\b([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`?\s+skill\b")
 # unchecked, and that spelling is the one the asset-path rule reports as always
 # wrong at runtime -- so the SOP was protected against it and the cron prompt
 # that sends a worker to the SOP was not.
-CRON_PROMPT_REF = re.compile(
-    r"['\"`]([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.(?:md|json|py|sh))['\"`]"
+#
+# Two stages rather than one pattern, because the path is not always the whole
+# quoted span. Demanding the closing quote right after the extension skipped
+# every reference with an argument after it or an interpreter before it: three
+# prompts name `skills/fleet-audit/scripts/collect.py <stream>` and one names
+# `/opt/hermes/.venv/bin/python3 skills/fleet-audit/scripts/fleet_waste.py`, so
+# four of the eight collector references went unchecked and renaming
+# `collect.py` left `make prompt-check` at exit 0.
+CRON_PROMPT_SPAN = re.compile(r"['\"`]([^'\"`\n]+)['\"`]")
+# Whitespace or the span edge on both sides, so a token is a path only when it
+# stands alone. That also drops the absolute interpreter above rather than
+# reporting `/opt/hermes/...` as an asset missing from the profile: a leading
+# `/` fails the first segment, and there is no whitespace inside it to restart
+# the match on a suffix.
+CRON_PROMPT_PATH = re.compile(
+    r"(?:\A|(?<=\s))([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.(?:md|json|py|sh))(?=\Z|\s)"
 )
+
+
+def cron_prompt_refs(prompt: str) -> set[str]:
+    """Every repository-relative asset path a cron prompt quotes."""
+    refs: set[str] = set()
+    for span in CRON_PROMPT_SPAN.findall(prompt):
+        refs.update(CRON_PROMPT_PATH.findall(span))
+    return refs
 
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 FRONTMATTER_NAME = re.compile(r"^name:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
@@ -699,16 +721,17 @@ def check_skill_manifests(skills: dict[str, dict[str, Path]]) -> list[Finding]:
 def check_cron_assets() -> list[Finding]:
     """Every SOP a cron prompt sends its worker to has to be there.
 
-    The geography of those SOPs -- how long they are, which lines hold the
-    checks -- is verified by the fleet-audit suite, which can re-derive it. This
-    only asks the cheaper question that suite does not ask of every roster: does
-    the file exist at all.
+    Whether a prompt still names the collector its SOP prescribes is verified
+    by `test_cron_prompts_name_the_real_collector_invocation` in the fleet-audit
+    suite, which re-derives the invocation from the SOP itself. This only asks
+    the cheaper question that test does not ask of every roster: does the file
+    exist at all.
     """
     findings = []
     for path, jobs in cron_rosters():
         rel = path.relative_to(REPO)
         for job in jobs:
-            for ref in set(CRON_PROMPT_REF.findall(job.get("prompt", ""))):
+            for ref in cron_prompt_refs(job.get("prompt", "")):
                 # The same profile-home model the asset-path rule uses. Resolving
                 # against the whole of agents/<profile>/ instead was how this rule
                 # came to accept `docs/glossary.md` from the platform roster --
