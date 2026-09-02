@@ -3046,6 +3046,22 @@ class TestCarryUnchangedFindings(unittest.TestCase):
             "gcloud container clusters update c --release-channel=regular",
         )
 
+    def test_a_carried_recommendation_action_is_recased_too(self):
+        # `recommendation` is always in the carried set, and it is the field the
+        # issue body renders first. Observed live on run 20260902T015558Z: the
+        # note carried and re-cased correctly while the Recommendation line
+        # above it still read `--release-channel=REGULAR`.
+        stale = self.before(
+            recommendation={"action": "Run `gcloud x --release-channel=REGULAR`."}
+        )
+        now = self.before(
+            recommendation={"action": "Run `gcloud x --release-channel=regular`."}
+        )
+        _, out = self.carry(stale, now)
+        self.assertEqual(
+            out["recommendation"]["action"], "Run `gcloud x --release-channel=regular`."
+        )
+
     def test_a_carried_manual_note_is_left_alone(self):
         stale = self.before(
             remediation={"kind": "manual", "note": "The channel is REGULAR on nine peers."}
@@ -10437,15 +10453,49 @@ class TestGcloudEnumCasing(unittest.TestCase):
             "gcloud container clusters update c --release-channel=regular",
         )
 
-    def test_a_manual_note_is_not_rewritten(self):
-        # `kind: manual` notes are prose, where "REGULAR" may be the API value
-        # under discussion rather than a flag to paste.
-        note = "The channel is REGULAR on nine of ten peers; --release-channel=REGULAR"
+    def test_prose_naming_the_api_value_is_not_touched(self):
+        # The rewrite fires on a flag and its value, so a sentence discussing
+        # the API's own spelling survives intact. This is what makes it safe to
+        # run over `recommendation.action`, which is prose with a command in it.
+        prose = "Nine of ten peers run REGULAR while this one is on RAPID."
+        self.assertEqual(self.normalise(prose), prose)
+
+    def test_a_manual_note_that_still_names_a_flag_is_corrected(self):
+        # `kind` says who applies the fix, not whether the text is pasteable.
+        # A manual note spelling out a command is a command a reader will run.
         finding = make_finding(
-            fid="a", remediation={"kind": "manual", "note": note}
+            fid="a",
+            remediation={
+                "kind": "manual",
+                "note": "Ask the owner to run: gcloud x --release-channel=REGULAR",
+            },
         )
         audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
-        self.assertEqual(finding["remediation"]["note"], note)
+        self.assertEqual(
+            finding["remediation"]["note"],
+            "Ask the owner to run: gcloud x --release-channel=regular",
+        )
+
+    def test_the_recommendation_action_is_corrected_too(self):
+        # The field the issue body renders above the fix block. Correcting the
+        # note alone published the broken command and the working one together.
+        finding = make_finding(
+            fid="a",
+            recommendation={
+                "action": "Run `gcloud x --release-channel=REGULAR` to align.",
+                "rationale": "r",
+                "risk": "k",
+            },
+            remediation={"kind": "gcloud", "note": "gcloud x --release-channel=REGULAR"},
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["recommendation"]["action"],
+            "Run `gcloud x --release-channel=regular` to align.",
+        )
+        self.assertEqual(
+            finding["remediation"]["note"], "gcloud x --release-channel=regular"
+        )
 
 
 class TestPathContainment(unittest.TestCase):

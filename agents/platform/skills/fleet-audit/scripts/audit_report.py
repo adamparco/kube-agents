@@ -2075,11 +2075,7 @@ def carry_unchanged_findings(
             # works can still publish nothing but wrong commands. Re-normalise
             # here so the invariant is about the published note rather than
             # about which run authored it.
-            remediation = finding.get("remediation")
-            if isinstance(remediation, dict) and remediation.get("kind") == "gcloud":
-                remediation["note"] = normalise_gcloud_enum_values(
-                    str(remediation.get("note", ""))
-                )
+            normalise_finding_commands(finding)
             carried.append(fid)
     return carried
 
@@ -2953,13 +2949,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
-        if kind == "gcloud":
-            # Write the corrected spelling back, for the same reason the
-            # manifest path above is normalised here: this string is what gets
-            # published, and every reader downstream sees whatever it says.
-            remediation["note"] = normalise_gcloud_enum_values(
-                str(remediation["note"])
-            )
+        # Write the corrected spelling back, for the same reason the manifest
+        # path above is normalised here: these strings are what get published,
+        # and every reader downstream sees whatever they say.
+        normalise_finding_commands(finding)
 
     return data
 
@@ -2992,6 +2985,35 @@ def normalise_gcloud_enum_values(note: str) -> str:
         return match.group(0)
 
     return _GCLOUD_ENUM_FLAG_RE.sub(rewrite, note)
+
+
+def normalise_finding_commands(finding: dict) -> None:
+    """Spell every gcloud enum value `finding` publishes the way gcloud takes it.
+
+    Two fields carry a command a reader pastes, and both have to be corrected
+    or neither is worth correcting. `remediation.note` is what `/remediate`
+    reads; `recommendation.action` is what the issue body renders *first*, and
+    the model writes the same command into both. Fixing the note alone
+    published `--release-channel=REGULAR` on the Recommendation line with
+    `--release-channel=regular` in the fix block seven lines below it, which
+    tells a reader the audit cannot spell its own command.
+
+    Passing prose through is safe: the rewrite only fires on a value directly
+    following a flag in the table, so "cohort peers run Regular" and "enrolled
+    in the Rapid channel" are untouched. `evidence` is deliberately excluded —
+    it records the command a collector actually ran, and correcting that would
+    misreport what happened rather than fix anything.
+    """
+    recommendation = finding.get("recommendation")
+    if isinstance(recommendation, dict) and isinstance(
+        recommendation.get("action"), str
+    ):
+        recommendation["action"] = normalise_gcloud_enum_values(
+            recommendation["action"]
+        )
+    remediation = finding.get("remediation")
+    if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
+        remediation["note"] = normalise_gcloud_enum_values(remediation["note"])
 
 
 def severity_counts(findings: list[dict]) -> dict[str, int]:
@@ -3250,14 +3272,9 @@ def carry_unverifiable_into_document(
 
 
 def _recased_carry(finding: dict) -> dict:
-    """`finding` copied, with any `gcloud` remediation note spelled as gcloud takes it."""
-    remediation = finding.get("remediation")
-    if not isinstance(remediation, dict) or remediation.get("kind") != "gcloud":
-        return finding
+    """`finding` copied, with every gcloud enum value spelled as gcloud takes it."""
     out = copy.deepcopy(finding)
-    out["remediation"]["note"] = normalise_gcloud_enum_values(
-        str(out["remediation"].get("note", ""))
-    )
+    normalise_finding_commands(out)
     return out
 
 
