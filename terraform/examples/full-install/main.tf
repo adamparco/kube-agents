@@ -22,8 +22,10 @@ locals {
     # the install still works -- it just cannot measure subnet exhaustion.
     "recommender.googleapis.com",
   ]
-  chat_apis = var.enable_google_chat ? [
+  pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
     "pubsub.googleapis.com",
+  ] : []
+  chat_apis = var.enable_google_chat ? [
     "chat.googleapis.com",
     "gsuiteaddons.googleapis.com",
   ] : []
@@ -33,7 +35,7 @@ locals {
   # Not var.location: a model is only callable from a location that serves it,
   # and the cluster's is often not one — on a zonal cluster it is not even a
   # valid Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
-  # k8s-operator/scripts/installer_common.sh.
+  # scripts/installer/installer_common.sh.
   vertex_location = var.vertex_location != "" ? var.vertex_location : "global"
   litellm_ksa     = "kubeagents-litellm"
 
@@ -46,7 +48,7 @@ locals {
   github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
   github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
 
-  required_apis = toset(concat(local.base_apis, local.chat_apis))
+  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis))
 
   # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
   # paths hand the agent the same authority. Kubernetes RBAC is read-only
@@ -132,7 +134,8 @@ locals {
   # Empty means the upstream registries.
   third_party_registry = trimsuffix(
     var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
-  "/")
+    "/"
+  )
 
   # Mirrored image overrides for helm_release.cert_manager below. Destination
   # names follow images.json (<prefix>/<name>:<tag>) — the contract
@@ -318,6 +321,72 @@ module "github_minter" {
   kms_key_name     = var.github_minter_kms_key
 
   depends_on = [google_project_service.required]
+}
+
+# Stockout Investigator Pub/Sub Infrastructure (Topic, Subscription, Logging Sink, IAM).
+# Declaratively provisioned by the composition when enable_stockout_investigator = true.
+# Matches the resource names and filter configuration created imperatively by
+# agentplugins/gke-stockout-investigator/install.sh.
+resource "google_pubsub_topic" "stockout_alerts" {
+  #checkov:skip=CKV_GCP_83:Stockout alert topic uses default Google-managed encryption keys
+  count   = var.enable_stockout_investigator ? 1 : 0
+  project = var.project_id
+  name    = var.stockout_pubsub_topic
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_pubsub_subscription" "stockout_alerts" {
+  count   = var.enable_stockout_investigator ? 1 : 0
+  project = var.project_id
+  name    = var.stockout_pubsub_subscription
+  topic   = google_pubsub_topic.stockout_alerts[0].id
+
+  ack_deadline_seconds       = 60
+  message_retention_duration = "604800s"
+
+  expiration_policy {
+    ttl = ""
+  }
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+}
+
+resource "google_logging_project_sink" "stockout_alerts" {
+  count       = var.enable_stockout_investigator ? 1 : 0
+  project     = var.project_id
+  name        = var.stockout_pubsub_sink
+  destination = "pubsub.googleapis.com/${google_pubsub_topic.stockout_alerts[0].id}"
+  filter      = "(log_id(\"test-stockout\") OR log_id(\"container.googleapis.com/cluster-autoscaler-visibility\")) AND (resource.labels.cluster_name=\"${module.gke_cluster.cluster_name}\" OR jsonPayload.resource.labels.cluster_name=\"${module.gke_cluster.cluster_name}\") AND (jsonPayload.messageId:(\"scale.up.error.out.of.resources\" OR \"scale.up.error.quota.exceeded\" OR \"scale.up.error.ip.space.exhausted\" OR \"scale.up.no.scale.up\") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:(\"scale.up.error.out.of.resources\" OR \"scale.up.error.quota.exceeded\" OR \"scale.up.error.ip.space.exhausted\" OR \"scale.up.no.scale.up\"))"
+
+  unique_writer_identity = true
+}
+
+resource "google_pubsub_topic_iam_member" "stockout_sink_writer" {
+  count   = var.enable_stockout_investigator ? 1 : 0
+  project = var.project_id
+  topic   = google_pubsub_topic.stockout_alerts[0].name
+  role    = "roles/pubsub.publisher"
+  member  = google_logging_project_sink.stockout_alerts[0].writer_identity
+}
+
+resource "google_pubsub_subscription_iam_member" "stockout_agent_subscriber" {
+  count        = var.enable_stockout_investigator ? 1 : 0
+  project      = var.project_id
+  subscription = google_pubsub_subscription.stockout_alerts[0].name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${module.kube_agents_iam.service_account_email}"
+}
+
+resource "google_pubsub_subscription_iam_member" "stockout_agent_viewer" {
+  count        = var.enable_stockout_investigator ? 1 : 0
+  project      = var.project_id
+  subscription = google_pubsub_subscription.stockout_alerts[0].name
+  role         = "roles/pubsub.viewer"
+  member       = "serviceAccount:${module.kube_agents_iam.service_account_email}"
 }
 
 # cert-manager, the certificate source for the operator's admission webhooks.
@@ -535,6 +604,34 @@ resource "helm_release" "kube_agents" {
         key     = var.github_minter_kms_key
       }
     }
+    plugins = {
+      pubsubPlatform = merge(
+        {
+          enabled = var.enable_pubsub_platform || var.enable_stockout_investigator
+        },
+        var.image_tag != "" ? {
+          image = {
+            tag = var.image_tag
+          }
+        } : {}
+      )
+      stockoutInvestigator = merge(
+        {
+          enabled     = var.enable_stockout_investigator
+          clusterName = module.gke_cluster.cluster_name
+          pubsub = {
+            topic        = var.stockout_pubsub_topic
+            subscription = var.stockout_pubsub_subscription
+            sink         = var.stockout_pubsub_sink
+          }
+        },
+        var.image_tag != "" ? {
+          image = {
+            tag = var.image_tag
+          }
+        } : {}
+      )
+    }
     }),
     # Second document rather than a merge() into the first: Helm deep-merges
     # successive values documents, so a caller can reach a single leaf
@@ -554,6 +651,12 @@ resource "helm_release" "kube_agents" {
     google_project_service.vertex_ai,
     google_project_iam_member.litellm_vertex_user,
     helm_release.cert_manager,
+    google_pubsub_topic.stockout_alerts,
+    google_pubsub_subscription.stockout_alerts,
+    google_logging_project_sink.stockout_alerts,
+    google_pubsub_topic_iam_member.stockout_sink_writer,
+    google_pubsub_subscription_iam_member.stockout_agent_subscriber,
+    google_pubsub_subscription_iam_member.stockout_agent_viewer,
   ]
 
   lifecycle {

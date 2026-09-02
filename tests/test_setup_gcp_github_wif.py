@@ -1,4 +1,4 @@
-"""Tests for k8s-operator/scripts/dev/setup-gcp-github-wif.sh.
+"""Tests for scripts/dev/setup-gcp-github-wif.sh.
 
 Asserts that required GCP APIs and IAM roles (for both standard CI and extended
 --admin E2E pipelines) remain consistent and complete.
@@ -12,7 +12,7 @@ import unittest
 from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_WIF_SCRIPT = _REPO_ROOT / "k8s-operator" / "scripts" / "dev" / "setup-gcp-github-wif.sh"
+_WIF_SCRIPT = _REPO_ROOT / "scripts" / "dev" / "setup-gcp-github-wif.sh"
 
 
 _EXPECTED_APIS = [
@@ -158,7 +158,7 @@ class CustomRoleNeedsRoleAdminTest(unittest.TestCase):
     #: Grant sites, and the literal each one writes a role as. Both are
     #: installer principals that run `terraform apply` on the composition.
     _GRANT_SITES = (
-        (_REPO_ROOT / "k8s-operator" / "scripts" / "dev" / "setup-gcp-github-wif.sh", '"roles/iam.roleAdmin"'),
+        (_REPO_ROOT / "scripts" / "dev" / "setup-gcp-github-wif.sh", '"roles/iam.roleAdmin"'),
         (_REPO_ROOT / "scripts" / "provision_ci_pool_project.sh", "roles/iam.roleAdmin"),
         (_REPO_ROOT / "scripts" / "verify_ci_pool_project.py", '"roles/iam.roleAdmin"'),
     )
