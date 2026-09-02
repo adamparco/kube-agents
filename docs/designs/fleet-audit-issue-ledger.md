@@ -235,10 +235,12 @@ could not read the cluster has no standing to assert it.
 
 The comment does **not** print the command that no longer reproduces, or its output, and an earlier
 draft of this section promising both was wrong about what is knowable at that moment. A resolved
-finding is by definition absent from the current document, so its evidence is not in hand; the only
-place it survives is the previous ledger body, and recovering it would mean parsing rendered
-Markdown back into fields. The renderer emits the command only on the rare path where a caller
-supplies the finding — and says nothing rather than print an empty code fence.
+finding is by definition absent from the current document, so its evidence is not in this run's
+hand. Since §4.8 the previous run's whole `document` is on the PVC, so the old field _is_
+recoverable — but it is the command as it read on the run before, against a fleet that has since
+changed, and printing it beside "no longer reproduces" invites a reader to paste a stale command
+and treat whatever it returns as the audit's claim. The renderer emits the command only on the rare
+path where a caller supplies the finding — and says nothing rather than print an empty code fence.
 
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
 
@@ -572,11 +574,16 @@ headroom for the trailing marker and for anything a later section appends.
   unbounded.
 - **Both halves of the delta are measured against what the previous run _knew_**, which is wider
   than what its body had room to show: its stored `current_ids` union every finding in its stored
-  `document`. `new` is _rendered minus that union_; `resolved` is _that union minus **every**
-  current finding, rendered or not_. A finding cut for space still reproduces, so calling it
-  resolved puts a fix that never happened in writing, on the one finding nobody can see to
-  contradict it — and a finding that loses one budget contest and wins the next is not new either,
-  which the rendered-minus-rendered rule this replaces could not express. On 2026-08-30
+  `document`. Both halves are also measured against **every** current finding, rendered or not:
+  `new` is _that wide current set minus the union_, and `resolved` is _the union minus that same
+  wide current set_. A finding cut for space still reproduces, so calling it resolved puts a fix
+  that never happened in writing, on the one finding nobody can see to contradict it — and a
+  finding that loses one budget contest and wins the next is not new either, which the
+  rendered-minus-rendered rule this replaces could not express. The two halves have to agree on
+  which current set they judge against, or the ledger contradicts itself: an earlier revision
+  measured `new` against the rendered set alone, and on 2026-09-02 a planted workload produced
+  three obtainability findings with room in the body for two, so the ledger said "2 new" and then
+  "3 resolved" — announcing a fix for something it had never reported broken. On 2026-08-30
   stockout-prevention published "18 new, 15 resolved" for a run that had in truth found nothing new
   and seen 49 findings fixed: the previous body had rendered 15 of its 67 findings, so the 18 that
   survived into the next run all read as new and 34 real fixes went unannounced. The union is taken

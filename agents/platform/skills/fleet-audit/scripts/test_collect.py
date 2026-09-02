@@ -1615,6 +1615,36 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
         doc = {"audit": "ai-security-audit", "scope": {"clusters": [{"name": "c1", "checks_run": checks_run}]}}
         audit_report.cross_check_manifest(doc, manifest)  # must not raise
 
+    def test_every_slug_the_collector_declares_exists_in_the_sop_roster(self):
+        """The third edge of the SOP/roster/collector triangle.
+
+        `test_check_rosters_match_the_sops` over in `test_audit_report.py`
+        binds the SOP headings to `AUDITS`; nothing bound the collector to
+        either, so a slug renamed in `CHECK_TABLES` alone stayed green here and
+        only surfaced as a coverage denominator that never reached 100%. The
+        containment is one-way on purpose: the roster is allowed to hold checks
+        the collector does not implement -- those are the ones the model still
+        evaluates by hand -- but a slug the collector emits and the roster does
+        not know is a check no run can ever be credited with.
+        """
+        for audit_id, specs in sorted(collect.CHECK_TABLES.items()):
+            with self.subTest(audit=audit_id):
+                self.assertIn(
+                    audit_id,
+                    audit_report.AUDITS,
+                    f"collect.CHECK_TABLES has an audit {audit_id!r} that "
+                    f"audit_report.AUDITS does not define",
+                )
+                roster = set(audit_report.AUDITS[audit_id].checks)
+                unknown = sorted({spec.slug for spec in specs} - roster)
+                self.assertEqual(
+                    [],
+                    unknown,
+                    f"collect.CHECK_TABLES[{audit_id!r}] emits {unknown}, which "
+                    f"{audit_report.audit_sop(audit_id)} does not define as a "
+                    f"check",
+                )
+
 
 # --------------------------------------------------------------------------- #
 # compliance-audit

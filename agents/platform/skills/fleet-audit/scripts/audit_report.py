@@ -2799,7 +2799,22 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # normalised form: `privileged-container` is the anti-pattern and
         # "Privileged container in Deployment/api" is the title the SOP wants,
         # and a normalising comparison cannot tell them apart.
-        if str(finding["title"]).strip().lower().startswith(f"{check}"):
+        #
+        # Only a hyphenated slug is matched, and only on a word boundary.
+        # Eighty-two of the eighty-four slugs carry a hyphen, which no prose
+        # title spells -- "Netpol-Missing in payments" can only be the slug.
+        # The two that do not, `overrequest` and the derived `uncohorted`, are
+        # ordinary English words, and a bare `startswith` rejected
+        # "Overrequested CPU on Deployment/payments-api" and "Uncohorted
+        # cluster drifts on six facets": the prose titles their own SOPs ask
+        # for. That is not a cosmetic refusal. `finish` raises here, after
+        # collection, inspection and publication have all already run, so a
+        # well-formed title throws the entire run away -- while the cost of
+        # letting a bare `overrequest on Deployment/api` through is one heading
+        # that reads badly. The asymmetry decides it: enforce where the
+        # evidence is unambiguous, and leave the two words alone.
+        title_text = str(finding["title"]).strip().lower()
+        if "-" in check and re.match(rf"{re.escape(check)}(?![a-z0-9])", title_text):
             raise ValidationError(
                 f"findings[{i}].title: opens with the check slug {check!r}. The "
                 "title says what is wrong, not which check found it — "
@@ -7805,8 +7820,21 @@ def handle_start(args: argparse.Namespace) -> None:
     # this would be destroying is the caller's own.
     resumed = own_run_claim(audit_id)
     if resumed is None:
-        take_run_lock(audit_id, t0, steal=bool(getattr(args, "steal_lock", False)))
+        # Prune BEFORE the acquire, never after. A steal token outlives the
+        # steal on purpose (see `acquire_run_lock`), so a process that links
+        # `.steal-<n>` and then dies before its `os.replace` leaves the token
+        # behind with the dead claim still in `started.json`. Every later
+        # acquire then finds the claim dead, tries to take the steal right,
+        # gets FileExistsError from the orphan, and exhausts its attempts into
+        # RunInProgress -- including one passed `--steal-lock`, which routes
+        # through the same link and so cannot clear the thing it exists to
+        # clear. Ordered after `take_run_lock`, the only cleanup that resolves
+        # the wedge sat on the one path that never runs during it, and the
+        # stream stayed dead for the full two-hour ceiling. Pruning first is
+        # unconditional-safe for the reason the token is age-pruned at all: a
+        # stolen nonce is gone from `started.json` for good.
         prune_steal_tokens(audit_id, now=t0.timestamp())
+        take_run_lock(audit_id, t0, steal=bool(getattr(args, "steal_lock", False)))
     else:
         log(
             f"RESUMING {audit_id}: this run already holds the stream "

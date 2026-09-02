@@ -56,10 +56,15 @@ Source: [`agents/platform/skills/fleet-audit/`](https://github.com/gke-labs/kube
 The agent's only output is a validated `findings.json` — one entry per deviation, each carrying the literal read-only command that proves it and a `recommendation` (action, rationale, risk). `audit_report.py` does the rest:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
-# … the agent inspects the fleet read-only and writes findings.json …
-./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <path>
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
+# … a collector reads the fleet, and the agent writes findings.json from its manifest …
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> \
+  --findings-file <path> --manifest-file <manifest>
 ```
+
+`--manifest-file` is not optional. `finish` refuses to publish without it (or an explicit
+`--no-collector-manifest <why>`), because the manifest is what every cross-check between the
+model's claims and the fleet's actual state is run against.
 
 What it publishes has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff.
 
@@ -96,7 +101,7 @@ The last two states are the same event seen from opposite sides: a fix PR that i
 Three properties follow from the script owning the artefacts rather than the model:
 
 - **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open an unlisted stream. The agent never calls `gh issue create` itself.
-- **A computable delta.** Each run keeps the finding ids it published on the agent's own volume, and the next run diffs against that store. The issue body carries the same ids in a hidden `<!-- audit-findings: [...] -->` block, with a second hidden line stamping which identity scheme minted them — the published, machine-readable copy of the run rather than the harness's own memory. Stability is not asked of the model: the id is derived in code from `(check, cluster, namespace, object)` and any `id` in the findings file is discarded, so the same problem keeps the same id without anyone remembering to make it so. The store is trusted only when it was written for the ledger this run found and under the identity scheme the code still uses; one that is missing or fails either test makes the previous run unknowable, so the run publishes its findings with no delta claim at all rather than announcing every live finding as new. That costs one run's delta annotation, and the same run's own store write restores it.
+- **A computable delta.** Each run keeps the finding ids it published on the agent's own volume, and the next run diffs against that store. The issue body carries the same ids in a hidden `<!-- audit-findings: [...] -->` block, with a second hidden line stamping which identity scheme minted them — the published, machine-readable copy of the run rather than the harness's own memory. Stability is not asked of the model: the id is derived in code from `(check, cluster, namespace, object)` and any `id` in the findings file is discarded, so the same problem keeps the same id without anyone remembering to make it so. The store is trusted only on three equalities — it was written for the ledger this run found, under the identity scheme the code still uses, and for the same repository, since an unattended run walks `managed_repos` in sequence and issue numbers are per-repository, so the first two can match across two different repos' findings. A store that is missing or fails any of the three makes the previous run unknowable, so the run publishes its findings with no delta claim at all rather than announcing every live finding as new. That costs one run's delta annotation, and the same run's own store write restores it.
 - **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
 
 The `agent:audit` label is also what keeps the two issue-writing watchdogs apart: the `github-issue-resolver` poll query excludes it, so it never tries to "resolve" an audit ledger.

@@ -11,7 +11,7 @@ The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kub
 
 ## The eight audit SOPs
 
-Eight SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
+Eight SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped. Where the evidence comes from a command the model runs itself, the check states that command exactly. Where a collector script gathers it instead — `ai_security_audit_sop.md`, `compliance_audit_sop.md` and `fleet_consistency_drift_sop.md`, thirty-one checks between them — the check states no command, because the collector records the one it actually ran and `finish` restores that over anything the model writes in its place.
 
 ### `compliance_audit_sop.md`
 

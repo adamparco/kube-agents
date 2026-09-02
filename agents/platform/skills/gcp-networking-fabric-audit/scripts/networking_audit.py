@@ -40,12 +40,17 @@ exhausted is this":
   cannot see. Those `_collect_subnet_targets` turns into a not-applicable
   declaration plus a `limitations` string rather than a pass.
 - `cloud-nat-exhaustion` combines three real GCP surfaces: `routers list` for
-  each NAT gateway's `natIpAllocateOption` and (when dynamic port allocation
-  is on) `maxPortsPerVm`; `routers get-status` for
-  `result.natStatus[].autoAllocatedNatIps` (empty under `AUTO_ONLY` means
-  Google could not allocate an external IP at all); `routers
-  get-nat-mapping-info` for each VM's `interfaceNatMappings[].numTotalNatPorts`
-  against that ceiling.
+  each NAT gateway's `natIpAllocateOption` and `maxPortsPerVm`; `routers
+  get-status` for `result.natStatus[].autoAllocatedNatIps` (empty under
+  `AUTO_ONLY` means Google could not allocate an external IP at all); `routers
+  get-nat-mapping-info --nat-name` for each VM's
+  `interfaceNatMappings[].numTotalNatPorts` against that ceiling. The port half
+  runs only where dynamic port allocation is on — a static gateway hands every
+  VM exactly `minPortsPerVm`, so its ratio is the constant 1.0 and measuring it
+  reports exhaustion for every VM behind every stock gateway. `--nat-name`
+  scopes the read for the same reason: unfiltered, it returns every VM on the
+  router, and comparing that against each gateway's own ceiling in turn
+  attributes one gateway's VMs to another's limit.
 - `psc-routing-deadlock` reads `forwarding-rules list`, unfiltered, and keeps
   the Private Service Connect ones in Python. Each item's `target` names the
   service attachment it points at, and `pscConnectionStatus` carries the
@@ -166,9 +171,10 @@ PARTIAL_SUBNET_LIMITATION = (
     "{names}."
 )
 
-# Cloud NAT's documented per-VM port defaults, applied when `routers list`
-# omits the field — which it does for any NAT that never overrode it.
-DEFAULT_MIN_PORTS_PER_VM = 64
+# Cloud NAT's documented per-VM dynamic port ceiling, applied when `routers
+# list` omits the field — which it does for any NAT that never overrode it.
+# There is deliberately no static counterpart: `check_router_nat` does not
+# measure a static gateway, whose allocation equals its own reservation.
 DEFAULT_MAX_PORTS_PER_VM = 65536
 
 # A VPC's MTU when nobody set one, applied for the same reason as the NAT
@@ -408,12 +414,19 @@ def _nat_status_entry(status: dict | None, nat_name: str) -> dict | None:
     return None
 
 
-def check_router_nat(router: dict, status: dict | None, mapping: list | None) -> dict | None:
+def check_router_nat(router: dict, status: dict | None, mappings: dict | None) -> dict | None:
     """`router` is one item from `routers list`; `status` is
-    `get-status`'s response for it; `mapping` is
-    `get-nat-mapping-info`'s response for it. One finding per router,
-    aggregating every NAT gateway on it that is either lacking an
+    `get-status`'s response for it; `mappings` maps a NAT gateway's name to
+    `get-nat-mapping-info --nat-name`'s response for that gateway. One finding
+    per router, aggregating every NAT gateway on it that is either lacking an
     auto-allocated external IP or has a VM near its port ceiling.
+
+    Keyed by gateway, not one list per router, because `get-nat-mapping-info`
+    without `--nat-name` returns every VM behind *any* gateway on the router.
+    Read once per router and compared against each gateway's ceiling in turn,
+    that cross-attributes: a VM drawing 4096 ports from a dynamic gateway is
+    measured a second time against a static gateway's 64 and reported at
+    6400%. The mapping has to be fetched per gateway to mean anything.
 
     The object names the region as well as the router: a router name is
     unique inside a region, not inside a project, so `Router/<name>` collides
@@ -433,19 +446,24 @@ def check_router_nat(router: dict, status: dict | None, mapping: list | None) ->
             if entry is not None and not entry.get("autoAllocatedNatIps"):
                 problems.append(f"{nat_name}: AUTO_ONLY with no auto-allocated external IP")
                 continue
-        # Fall back to GCP's documented defaults rather than skipping. `routers
-        # list` omits `minPortsPerVm`/`maxPortsPerVm` whenever the NAT was left
-        # on them, so `ceiling = None` silently dropped §2.2's port half for
-        # exactly the gateways running the stock 64 ports per VM -- the
-        # configuration most likely to exhaust, and the one this check never
-        # once evaluated.
-        if nat.get("enableDynamicPortAllocation"):
-            ceiling = nat.get("maxPortsPerVm") or DEFAULT_MAX_PORTS_PER_VM
-        else:
-            ceiling = nat.get("minPortsPerVm") or DEFAULT_MIN_PORTS_PER_VM
-        if mapping is None:
+        # The port ratio only means something under dynamic port allocation.
+        # With DPA off, Cloud NAT reserves each VM exactly `minPortsPerVm`
+        # ports, so `numTotalNatPorts` *is* the ceiling and `total / ceiling`
+        # is the constant 1.0 -- every VM behind every stock gateway clears
+        # the 80% bar, and the check reported `critical` port exhaustion for
+        # each of them daily on a fleet with no exhaustion anywhere. Under DPA
+        # the allocation floats between min and max, which is the only
+        # configuration where approaching the ceiling is a fact about load.
+        # Falling short of ports under static allocation is real, but it shows
+        # up as a VM with no mapping at all rather than as a ratio, and
+        # nothing read here can see it.
+        if not nat.get("enableDynamicPortAllocation"):
             continue
-        for vm in mapping:
+        # Fall back to GCP's documented default rather than skipping. `routers
+        # list` omits `maxPortsPerVm` whenever the NAT was left on it, so
+        # `ceiling = None` silently dropped §2.2's port half.
+        ceiling = nat.get("maxPortsPerVm") or DEFAULT_MAX_PORTS_PER_VM
+        for vm in (mappings or {}).get(nat_name) or []:
             for iface in vm.get("interfaceNatMappings") or []:
                 total = iface.get("numTotalNatPorts")
                 if isinstance(total, (int, float)) and total / ceiling >= 0.8:
@@ -1127,14 +1145,26 @@ def _collect_project_target(project: str, *, run: RunFn) -> dict:
                 ["gcloud", "compute", "routers", "get-status", router_name, "--region", region, "--project", project, "--format", "json"],
                 "cloud-nat-exhaustion",
             )
-            mapping = gated(
-                [
-                    "gcloud", "compute", "routers", "get-nat-mapping-info", router_name,
-                    "--region", region, "--project", project, "--format", "json",
-                ],
-                "cloud-nat-exhaustion",
-            )
-            hit = check_router_nat(router, status, mapping)
+            # One read per dynamic gateway rather than one per router: an
+            # unfiltered `get-nat-mapping-info` returns every VM behind every
+            # gateway on the router, and `check_router_nat` says what comparing
+            # that against each gateway's own ceiling in turn produces. Static
+            # gateways are not read at all -- the check no longer evaluates
+            # them, so the call would buy an answer that is thrown away.
+            mappings = {}
+            for nat in router["nats"]:
+                if not nat.get("enableDynamicPortAllocation"):
+                    continue
+                nat_name = nat.get("name", "")
+                mappings[nat_name] = gated(
+                    [
+                        "gcloud", "compute", "routers", "get-nat-mapping-info", router_name,
+                        "--nat-name", nat_name,
+                        "--region", region, "--project", project, "--format", "json",
+                    ],
+                    "cloud-nat-exhaustion",
+                )
+            hit = check_router_nat(router, status, mappings)
             if hit:
                 candidates.append(_emit("cloud-nat-exhaustion", hit))
 

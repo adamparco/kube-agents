@@ -92,7 +92,7 @@ class RouterNatTest(unittest.TestCase):
 
     def test_flags_missing_auto_allocated_ip(self):
         status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": []}]}}
-        hit = na.check_router_nat(self.router(), status, [])
+        hit = na.check_router_nat(self.router(), status, {})
         self.assertEqual(hit["object"], "Router/us-central1/nat-router")
         self.assertIn("no auto-allocated external IP", hit["excerpt"])
 
@@ -102,46 +102,61 @@ class RouterNatTest(unittest.TestCase):
         status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": []}]}}
         east = self.router(region="https://www.googleapis.com/compute/v1/projects/p/regions/us-east4")
         objects = {
-            na.check_router_nat(self.router(), status, [])["object"],
-            na.check_router_nat(east, status, [])["object"],
+            na.check_router_nat(self.router(), status, {})["object"],
+            na.check_router_nat(east, status, {})["object"],
         }
         self.assertEqual(objects, {"Router/us-central1/nat-router", "Router/us-east4/nat-router"})
 
     def test_does_not_flag_healthy_auto_allocation(self):
         status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["34.1.2.3"]}]}}
-        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 512}]}]
-        hit = na.check_router_nat(self.router(), status, mapping)
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 512}]}]}
+        hit = na.check_router_nat(self.router(), status, mappings)
         self.assertIsNone(hit)
 
     def test_flags_port_ceiling_at_80_percent(self):
         status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["34.1.2.3"]}]}}
-        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 3277}]}]  # 80.0% of 4096
-        hit = na.check_router_nat(self.router(), status, mapping)
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 3277}]}]}  # 80.0% of 4096
+        hit = na.check_router_nat(self.router(), status, mappings)
         self.assertIn("vm-1", hit["excerpt"])
         self.assertIn("3277/4096", hit["excerpt"])
 
-    def test_fixed_allocation_uses_min_ports_per_vm_as_ceiling(self):
+    def test_static_allocation_is_never_measured_against_its_own_reservation(self):
+        """With dynamic port allocation off, Cloud NAT hands every VM exactly
+        `minPortsPerVm` ports, so `numTotalNatPorts` is the ceiling and the
+        ratio is the constant 1.0. Measuring it flagged `critical` port
+        exhaustion for every VM behind every stock gateway, every day."""
         router = self.router(nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "minPortsPerVm": 64, "natIps": ["34.1.2.3"]}])
-        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 64}]}]
-        hit = na.check_router_nat(router, None, mapping)
-        self.assertIn("64/64", hit["excerpt"])
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 64}]}]}
+        self.assertIsNone(na.check_router_nat(router, None, mappings))
 
-    def test_a_nat_on_the_default_port_ceiling_is_still_measured(self):
-        """`routers list` omits `minPortsPerVm` for a NAT that never overrode
-        it, and the old `if not ceiling: continue` then passed over exactly the
-        gateways running GCP's stock 64 ports per VM."""
-        router = self.router(nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "natIps": ["34.1.2.3"]}])
-        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 56}]}]  # 87.5% of 64
-        hit = na.check_router_nat(router, None, mapping)
-        self.assertIn("56/64", hit["excerpt"])
+        # Same gateway on GCP's stock ceiling, which `routers list` omits.
+        stock = self.router(nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "natIps": ["34.1.2.3"]}])
+        self.assertIsNone(na.check_router_nat(stock, None, mappings))
 
     def test_a_dynamic_nat_on_the_default_ceiling_uses_the_dynamic_default(self):
         router = self.router(
             nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "natIps": ["34.1.2.3"]}]
         )
-        mapping = [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 60000}]}]  # 91.6% of 65536
-        hit = na.check_router_nat(router, None, mapping)
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 60000}]}]}  # 91.6% of 65536
+        hit = na.check_router_nat(router, None, mappings)
         self.assertIn("60000/65536", hit["excerpt"])
+
+    def test_two_gateways_on_one_router_do_not_cross_attribute(self):
+        """A router's mapping used to be read once, unfiltered, and compared
+        against each gateway's ceiling in turn -- so `wide`'s VM at 4096 ports
+        was measured a second time against `narrow`'s 1024 and reported at
+        400%. Each gateway is keyed to its own `--nat-name` read."""
+        router = self.router(
+            nats=[
+                {"name": "wide", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "maxPortsPerVm": 8192, "natIps": ["34.1.2.3"]},
+                {"name": "narrow", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "maxPortsPerVm": 1024, "natIps": ["34.1.2.4"]},
+            ]
+        )
+        mappings = {
+            "wide": [{"instanceName": "busy-vm", "interfaceNatMappings": [{"numTotalNatPorts": 4096}]}],  # 50% of 8192
+            "narrow": [{"instanceName": "quiet-vm", "interfaceNatMappings": [{"numTotalNatPorts": 64}]}],  # 6% of 1024
+        }
+        self.assertIsNone(na.check_router_nat(router, None, mappings))
 
     def test_no_mapping_data_is_not_a_crash(self):
         hit = na.check_router_nat(self.router(), {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["1.2.3.4"]}]}}, None)
@@ -500,10 +515,13 @@ class CollectProjectTest(unittest.TestCase):
         responses = {
             "subnets list-usable": run_of(0, "[]"),
             "subnets list": run_of(0, "[]"),
+            # Dynamic port allocation on: the mapping read only happens for a
+            # gateway whose ratio can move, so a static NAT here would make
+            # this a two-read check and the third fragment unreachable.
             "routers list": run_of(
                 0,
                 '[{"name": "r-east", "region": "https://x/projects/proj-1/regions/us-east4", '
-                '"nats": [{"name": "nat-gw", "minPortsPerVm": 64}]}]',
+                '"nats": [{"name": "nat-gw", "enableDynamicPortAllocation": true, "maxPortsPerVm": 4096}]}]',
             ),
             "routers get-status": run_of(0, '{"result": {"natStatus": []}}'),
             "routers get-nat-mapping-info": run_of(0, "[]"),

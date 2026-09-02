@@ -22,7 +22,7 @@ Follow the authoritative SOP at `governance/gcp_networking_fabric_sop.md` to exe
 Run the collector before evaluating any check by hand — see the SOP's §2 for the manifest-reading rules:
 
 ```bash
-./skills/gcp-networking-fabric-audit/scripts/networking_audit.py > /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
+python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py > /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
 ```
 
 ## 2. Hand Findings to Fleet Audit

@@ -352,8 +352,9 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 - **A home channel set with `/sethome` stays on the profile it was set on.** The operator renders no
   `home_channel` of its own, so on an install that did not populate the CR's Google Chat or Slack
   `homeChannel` the value lives only in the config file the gateway last wrote. Flipping the flag
-  changes which file that is, and nothing carries it across. The Platform Agent's own `deliver: all`
-  watchdogs then tick in-process, where the delivery target is read from the environment alone —
+  changes which file that is, and nothing carries it across. The Platform Agent's own watchdogs —
+  every one of them `deliver: chat` in `agents/platform/cron/jobs.json` — then tick in-process,
+  where that keyword resolves the home channel from the environment alone —
   so every scheduled report posts nowhere while chat replies stay healthy and the install looks
   fine. Either populate `homeChannel` on the CR before flipping, or re-run `/sethome` after.
 - **`chat_message_audit` stops recording.** It is a hook rather than a plugin, and hooks are only

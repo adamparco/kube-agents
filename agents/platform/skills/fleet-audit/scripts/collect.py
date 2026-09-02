@@ -2305,7 +2305,13 @@ def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict 
         if urls:
             reasons.append("plaintext URL " + ", ".join(_ai_safe_url(u) for u in urls[:3]))
         if models and not has_revision_flag:
-            reasons.append(f"{', '.join(models[:3])} with no --revision")
+            # Redacted for the same reason the URL clause above is: a `--model`
+            # value is very often a URL, and this one reaches the same public
+            # issue. Leaving a token here would have made the redaction on the
+            # line above decorative -- the identical string arrives through
+            # both clauses whenever a container passes its model as a URL.
+            safe_models = [_ai_safe_url(m) for m in models[:3]]
+            reasons.append(f"{', '.join(safe_models)} with no --revision")
         if reasons:
             bad.append(f"{c.get('name', '')}: {'; '.join(reasons)}")
             if _container_trusts_remote_code(c):

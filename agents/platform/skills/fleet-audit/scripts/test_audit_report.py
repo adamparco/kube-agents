@@ -1314,6 +1314,44 @@ class TestValidation(unittest.TestCase):
             AUDIT,
         )
 
+    def test_a_slug_that_is_an_english_word_stem_does_not_reject_prose(self):
+        """`overrequest` and `uncohorted` are slugs and also word stems.
+
+        A bare `startswith` refused "Overrequested CPU on …" and "Uncohorted
+        cluster …" -- the prose titles their SOPs ask for -- and `finish`
+        raises here, after collection, inspection and publication have all
+        already run. The run is lost over a well-formed title.
+        """
+        for audit, check, title in (
+            ("fleet-wide-cost-analysis", "overrequest", "Overrequested CPU on Deployment/payments-api"),
+            ("fleet-consistency-drift", "uncohorted", "Uncohorted cluster drifts on six facets"),
+        ):
+            with self.subTest(check=check):
+                audit_report.validate_findings(
+                    make_doc(findings=[make_finding(check=check, title=title)], audit=audit),
+                    audit,
+                )
+
+    def test_only_two_slugs_in_the_whole_roster_are_exempt(self):
+        """The exemption is for words, not a hole anyone can widen.
+
+        If a new single-token slug is added, this fails and whoever added it
+        decides deliberately whether the title guard can still see it.
+        """
+        every = set()
+        for audit in audit_report.AUDITS:
+            every |= set(audit_report.audit_checks(audit))
+        self.assertEqual({"overrequest"}, {s for s in every if "-" not in s})
+
+    def test_a_hyphenated_slug_is_still_rejected_on_the_boundary(self):
+        """82 of 84 slugs carry a hyphen and stay fully enforced."""
+        doc = make_doc(
+            findings=[make_finding(check="netpol-missing", title="netpol-missing in payments")]
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[0].title", str(exc.exception))
+
     def test_two_findings_with_the_same_identity_are_rejected(self):
         """Same (check, cluster, namespace, object) is one finding, said twice.
 
@@ -6387,6 +6425,49 @@ class TestRunLockAntiWedge(BaseTestCase):
 
         self.started.write_text("also { truncated", encoding="utf-8")
         self.assertTrue(self.acquired_nonce())
+
+    def test_an_orphaned_steal_token_does_not_wedge_the_stream_forever(self):
+        """A steal that died between its token and its `os.replace`.
+
+        The token outlives the steal on purpose, so a process that links
+        `.steal-<n>` and then dies leaves it behind with the dead claim still
+        in `started.json`. Every later acquire reads that claim, finds it dead,
+        asks for the same token and gets FileExistsError -- `--steal-lock`
+        included, since the override routes through the identical link and so
+        cannot clear the one thing it exists to clear. `prune_steal_tokens` is
+        the only cleanup that resolves it, and ordered after `take_run_lock` it
+        sat on the single path a wedged stream never reaches: the stream stayed
+        dead *past* the ceiling rather than for it.
+        """
+        stale = time.time() - audit_report.RUN_LOCK_CEILING_S * 2
+        self.plant(
+            self.live_claim(
+                epoch=stale,
+                t0=datetime.fromtimestamp(stale, timezone.utc).isoformat(),
+                nonce="orphaned",
+            )
+        )
+        token = self.store / ".steal-orphaned"
+        token.touch()
+        os.utime(token, (stale, stale))
+
+        # The orphan defeats the ordinary acquire and the documented override.
+        for steal in (False, True):
+            with self.subTest(steal_lock=steal):
+                with self.assertRaises(audit_report.RunInProgress):
+                    audit_report.acquire_run_lock(
+                        AUDIT, datetime.now(timezone.utc), steal=steal
+                    )
+
+        # `start` prunes before it acquires, so the stream comes back. Exit 1 is
+        # the injected fault downstream of the lock; exit 3 would be the refusal.
+        self.patch_attr("resolve_repo", lambda *a, **k: 1 / 0)
+        self.assertEqual(audit_report.main(["start", "--audit", AUDIT]), 1)
+        self.assertFalse(self.started.exists())
+        # A token is present again, and that is right: the steal this run made
+        # wrote a fresh one for the same dead nonce. Its mtime is what proves
+        # the orphan is gone rather than merely still blocking.
+        self.assertGreater(token.stat().st_mtime, stale)
 
     def test_two_racers_on_one_corrupt_claim_still_yield_one_stealer(self):
         """The other half of the rule above, and the one it must not break.
@@ -14079,13 +14160,24 @@ class TestDispatchAndHandover(unittest.TestCase):
         `sys.path.append("/opt/defaults/scripts")`, which is exactly how
         `audit_report.py` acquired its two, would refuse every command the
         skill teaches. The escape is not worth depending on.
+
+        Scoped to every skill that ships a `scripts/` directory, not to the
+        fleet-audit pair. Pinned to those two, this test watched the wrong
+        files: `gcp_networking_fabric_sop.md` and its SKILL.md shipped the
+        by-path spelling for `networking_audit.py` and neither the regex nor
+        the document list could see it, in the same branch that spelled the
+        `audit_report.py` calls in that very SOP with `python3`.
         """
-        pattern = re.compile(
-            r"(?m)^\s*\./skills/fleet-audit(-reports)?/scripts/\w+\.py |Run `\./skills/"
-        )
+        pattern = re.compile(r"(?m)^\s*\./skills/[\w-]+/scripts/[\w.-]+\.py |Run `\./skills/")
         docs = [f"governance/{audit_report.audit_sop(a)}" for a in audit_report.AUDITS]
-        docs.append("skills/fleet-audit/SKILL.md")
-        docs.append("skills/fleet-audit-reports/SKILL.md")
+        skills_dir = Path(__file__).resolve().parents[4] / "platform" / "skills"
+        docs.extend(
+            sorted(
+                f"skills/{path.parent.name}/SKILL.md"
+                for path in skills_dir.glob("*/SKILL.md")
+                if (path.parent / "scripts").is_dir()
+            )
+        )
         for doc in docs:
             with self.subTest(doc=doc):
                 self.assertEqual([], pattern.findall(self.read(doc)))

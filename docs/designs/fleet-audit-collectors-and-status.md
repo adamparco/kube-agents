@@ -187,10 +187,16 @@ SOP's exception class. The driver owns fleet enumeration, per-cluster credential
 per-cluster kubeconfig files, dump-once with the `jq -e` fail-closed gate, filter execution,
 cross-cluster parallelism (§4.3), and manifest emission.
 
-The check tables must key off the same roster the harness validates against.
-`test_check_rosters_match_the_sops` already re-derives `AUDITS` from the SOP `####` headings;
-the collector imports the roster from the same module (or a shared one), so a check cannot exist
-in collector code without an SOP heading, and CI keeps SOP, roster, and collector in one triangle.
+The check tables must key off the same roster the harness validates against. CI closes that
+triangle in two tests rather than by sharing a symbol: `test_check_rosters_match_the_sops`
+re-derives `AUDITS` from the SOP `####` headings, and
+`test_every_slug_the_collector_declares_exists_in_the_sop_roster` requires every slug in the
+collector's `CHECK_TABLES` to be one the roster defines. The collector deliberately does not
+import the roster — it runs inside the agent image where `audit_report.py` is a sibling script
+rather than a package, and a runtime import would trade a test failure for a boot failure. The
+containment is one-way: the roster may hold checks no collector implements, because those are the
+ones the model still evaluates by hand, but a slug only the collector knows is a check no run can
+be credited with.
 
 Precedent, not invention: `gcp-networking-fabric-audit` already ships `networking_audit.py`
 (132 lines, one of its five checks, emitting harness-schema findings); all five open stream PRs
@@ -254,12 +260,15 @@ case; the collector applies it to every dump on every stream, ending today's une
 compliance has no gate at all.
 
 **Fan-out width, and what happens past it.** Every collector runs the whole fleet at once up to
-a ceiling and queues the remainder; the pool is sized
-`max(1, min(len(clusters), MAX_WORKERS))`, so a four-cluster fleet gets four threads rather than
-eight idle ones, and a fifty-cluster fleet runs eight at a time until it is done. The
-`ThreadPoolExecutor` queue _is_ the bucketing — a worker picks up the next cluster the moment it
-frees, which beats fixed batches, where the whole bucket waits on its slowest member. Nothing
-hand-rolls batches.
+a ceiling and queues the remainder: `ThreadPoolExecutor(max_workers=MAX_WORKERS)`, so a
+fifty-cluster fleet runs eight at a time until it is done. A four-cluster fleet gets four threads,
+not eight idle ones, and no arithmetic is needed to get that — `ThreadPoolExecutor` spawns a
+worker only when a task is submitted and no existing one is free, so the ceiling is a cap rather
+than an allocation. (`fleet_waste.py` clamps it to `max(1, min(len(clusters), max_workers))`
+anyway; that is redundant, not load-bearing, and the other four collectors are right to pass the
+ceiling through.) The pool's queue _is_ the bucketing — a worker picks up the next cluster the
+moment it frees, which beats fixed batches, where the whole bucket waits on its slowest member.
+Nothing hand-rolls batches.
 
 `MAX_WORKERS` is 8 on all six streams. The cost stream was to have been the exception at 64,
 on the reasoning that its threads spent nearly all their wall-clock asleep between the three
@@ -616,9 +625,12 @@ says something.
 ### 4.6 `make fleet-audit-view`
 
 A repo script (`scripts/fleet_audit_status_view.py`) plus a thin Makefile target, mirroring
-`selfimprove`'s view: `--file`/stdin offline mode, `--json` passthrough, imports the harness's
-own pure helpers for derived columns and degrades to `?` when unavailable, scrubs terminal
-control characters from all model-influenced strings at one boundary.
+`selfimprove`'s view: `--file`/stdin offline mode, `--json` passthrough, and terminal control
+characters scrubbed from every model-influenced string at one boundary, `scrub()`. It imports
+nothing from the harness. The table, colour and hyperlink primitives come from a checked-in
+sibling, `scripts/terminal_table.py`, and the derived columns come from the projection the pod
+computes — see the next paragraph — so there is no second implementation to drift and no
+"degrades when the import fails" path to test.
 
 **The read is a projection, not a directory walk.** The store lives on the pod's PVC, so the
 view runs one `kubectl exec` against the agent pod, piping in

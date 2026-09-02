@@ -521,7 +521,7 @@ every one of them is visible to a job author:
   restores the Google Chat channel too. The relay leg now subtracts instead:
   `adapter.sibling_delivery_targets` resolves the job's `deliver` in the cron
   child, where alone `all` is known to have expanded, and sends the set as
-  `also_delivered_to`; `relay_specialist_report` skips those platforms, so a
+  `also_delivered_to`; `relay_cron_report` skips those platforms, so a
   channel gets the composed report or the raw one and never both. The
   subtraction is deliberately one-sided — where it would empty the list it fans
   out to every platform anyway, because `also_delivered_to` says what the

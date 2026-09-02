@@ -40,7 +40,7 @@ gcloud compute networks subnets list --format=json
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-./skills/gcp-networking-fabric-audit/scripts/networking_audit.py > /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
+python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py > /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
 ```
 
 This stream's targets are GCP compute resources, not GKE clusters, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for the field contracts it assumes of each `gcloud` command's JSON. It sweeps every project named by `MONITORED_PROJECT_IDS`/`GCP_PROJECT_ID` on its own; pass `--project <id>` only to scope a run to one project. Read the manifest before doing anything else:
@@ -68,12 +68,14 @@ This stream's targets are GCP compute resources, not GKE clusters, so its collec
 
 #### 2.2 Cloud NAT gateway port allocation saturation (`cloud-nat-exhaustion`)
 
-- **Command:** `gcloud compute routers get-nat-mapping-info $ROUTER --region=$REGION --project=$PROJECT --format=json`, corroborated by `routers list` (each NAT's `natIpAllocateOption`/`maxPortsPerVm`) and `routers get-status` (`result.natStatus[].autoAllocatedNatIps`).
-- **Flag when:** a NAT gateway is `AUTO_ONLY` with no auto-allocated external IP at all, or any VM's `interfaceNatMappings[].numTotalNatPorts` is `>= 80%` of that NAT's port ceiling (`maxPortsPerVm` when dynamic port allocation is on, `minPortsPerVm` otherwise). **A NAT that never overrode the field has no field:** `routers list` omits it, and the ceiling is then GCP's default — 65536 with dynamic allocation on, 64 without. Use the default rather than passing over the gateway, which reads as clearing it and skips exactly the NATs still on the stock 64 ports per VM.
-- **Do NOT flag:** a `MANUAL` NAT IP allocation that still has addresses assigned; a VM under 80% of its port ceiling.
+- **Command:** `gcloud compute routers get-nat-mapping-info $ROUTER --nat-name=$NAT --region=$REGION --project=$PROJECT --format=json`, corroborated by `routers list` (each NAT's `natIpAllocateOption`/`maxPortsPerVm`) and `routers get-status` (`result.natStatus[].autoAllocatedNatIps`).
+- **`--nat-name` is not optional.** Unfiltered, `get-nat-mapping-info` returns every VM behind every gateway on the router. Compared against each gateway's own ceiling in turn, that measures one gateway's VMs against another's limit: a VM drawing 4096 ports from a dynamic gateway reads as 6400% of a static gateway's 64. Read once per gateway.
+- **Flag when:** a NAT gateway is `AUTO_ONLY` with no auto-allocated external IP at all, or — **only where `enableDynamicPortAllocation` is on** — any VM's `interfaceNatMappings[].numTotalNatPorts` is `>= 80%` of that NAT's `maxPortsPerVm`. **A NAT that never overrode the field has no field:** `routers list` omits `maxPortsPerVm`, and the ceiling is then GCP's default of 65536. Use the default rather than passing over the gateway, which reads as clearing it.
+- **Never measure a static gateway's ports.** With dynamic port allocation off, Cloud NAT reserves each VM exactly `minPortsPerVm`, so `numTotalNatPorts` _is_ the ceiling, the ratio is the constant 1.0, and every VM behind every stock gateway clears the 80% bar. Flagging on it reports `critical` port exhaustion fleet-wide, daily, on an install with no exhaustion anywhere. A static gateway that has genuinely run out shows up as a VM with no mapping at all — indistinguishable here from a VM that is simply idle, so report nothing rather than inventing a ratio.
+- **Do NOT flag:** a `MANUAL` NAT IP allocation that still has addresses assigned; a VM under 80% of its port ceiling; any VM behind a gateway with dynamic port allocation off.
 - **Severity:** `critical`.
 - **Impact:** "VMs that exhaust their NAT port allocation see new outbound connections silently fail, which for a GKE node means pods lose egress with no error at the workload layer."
-- **Remediation:** `kind: manifest`. Increase `minPortsPerVm` (or `maxPortsPerVm` under dynamic allocation) or add additional NAT IP addresses to the Cloud Router specification in Terraform.
+- **Remediation:** `kind: manifest`. Raise `maxPortsPerVm`, or add NAT IP addresses to the Cloud Router specification in Terraform. A port finding only ever names a dynamic-allocation gateway, so `minPortsPerVm` is never the ceiling that was breached.
 
 #### 2.3 Private Service Connect endpoint routing deadlock (`psc-routing-deadlock`)
 
