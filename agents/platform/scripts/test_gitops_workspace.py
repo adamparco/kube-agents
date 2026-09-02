@@ -765,6 +765,28 @@ class TestResolveRepo(WorkspaceTestCase):
                 gitops_workspace.get_managed_github_repos()
             self.assertIn("kubectl binary not found", str(caught.exception))
 
+    def test_get_managed_github_repos_bounds_the_kubectl_read(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return CompletedProcess(args=cmd, returncode=0, stdout="{}", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            gitops_workspace.get_managed_github_repos()
+        self.assertEqual(
+            captured.get("timeout"), gitops_workspace.CONFIGMAP_READ_TIMEOUT_SECONDS
+        )
+
+    def test_get_managed_github_repos_raises_on_kubectl_timeout(self):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["kubectl"], 30),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("Timed out", str(caught.exception))
+
     def test_get_managed_github_repos_raises_on_invalid_json(self):
         fake_cm = CompletedProcess(
             args=["kubectl"],
