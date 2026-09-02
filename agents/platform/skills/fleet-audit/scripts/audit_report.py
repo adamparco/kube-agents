@@ -6451,7 +6451,24 @@ def resolve_repo(
     repo: str | None = None,
     workspace: str | Path | None = None,
 ) -> str:
-    """Resolve the GitOps repository as `owner/name`, checking explicit repo, workspace, lease record, then ConfigMap."""
+    """Resolve the GitOps repository as `owner/name`: explicit repo, workspace, ConfigMap, then lease record.
+
+    The ConfigMap outranks the lease, which is what `start --help`, `SKILL.md`
+    and `docs/designs/fleet-audit-issue-ledger.md` all already say and what the
+    code used to contradict. Reading the lease first cost two things. An
+    operator who repointed a single-repo `managed_repos` from `acme/old` to
+    `acme/new` kept writing issues to `acme/old` on every stream that had run
+    once, because the lease is refreshed each run and never ages out. And on a
+    multi-repo install the ambiguity error this is documented to raise — "please
+    specify the target repository explicitly" — was pre-empted by whichever repo
+    happened to be leased last, so the nightly run audited it silently.
+
+    So the lease answers only where the ConfigMap says nothing at all. Where the
+    ConfigMap is ambiguous the lease is deliberately not consulted: it is keyed
+    by `audit_id`, one stream holds one lease however many repositories that
+    stream iterates over, so it cannot disambiguate and would only launder a
+    guess into an answer.
+    """
     import gitops_workspace
 
     if repo and str(repo).strip():
@@ -6473,7 +6490,12 @@ def resolve_repo(
         except Exception:
             pass
 
-    if audit_id:
+    try:
+        managed = gitops_workspace.get_managed_github_repos()
+    except Exception:
+        managed = []
+
+    if audit_id and not managed:
         try:
             holder = gitops_workspace.lease_dir(
                 GITOPS_WORKSPACE or gitops_workspace.default_root(), audit_id

@@ -13212,6 +13212,47 @@ class TestRepoResolution(BaseTestCase):
                 audit_report.resolve_repo(repo="acme/first")
             self.assertIn("kubectl failed: Forbidden", str(caught.exception))
 
+    def _leased(self, repo):
+        """Patch the lease record `audit_id` would read, whatever the root."""
+        return (
+            patch("gitops_workspace.lease_dir", lambda root, audit_id: Path(root)),
+            patch("gitops_workspace.read_lease", lambda holder: {"repo": repo}),
+        )
+
+    def test_the_configmap_outranks_a_stale_lease(self):
+        # The lease is refreshed on every run and never ages out, so an operator
+        # who repointed `managed_repos` from acme/old to acme/new would go on
+        # writing issues to acme/old forever on any stream that had run once.
+        lease_dir, read_lease = self._leased("acme/old")
+        with patch(
+            "gitops_workspace.get_managed_github_repos", return_value=["acme/new"]
+        ), lease_dir, read_lease:
+            self.assertEqual(
+                audit_report.resolve_repo(audit_id="compliance-audit"), "acme/new"
+            )
+
+    def test_an_ambiguous_configmap_still_raises_with_a_lease_present(self):
+        # The lease is keyed by audit_id, and one stream holds one lease however
+        # many repositories it iterates over, so it cannot disambiguate. Letting
+        # it answer here would launder a guess into the documented error.
+        lease_dir, read_lease = self._leased("acme/second")
+        with patch(
+            "gitops_workspace.get_managed_github_repos",
+            return_value=["acme/first", "acme/second"],
+        ), lease_dir, read_lease:
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.resolve_repo(audit_id="compliance-audit")
+            self.assertIn("Multiple repositories configured", str(caught.exception))
+
+    def test_the_lease_answers_when_the_configmap_says_nothing(self):
+        lease_dir, read_lease = self._leased("acme/leased")
+        with patch(
+            "gitops_workspace.get_managed_github_repos", return_value=[]
+        ), lease_dir, read_lease:
+            self.assertEqual(
+                audit_report.resolve_repo(audit_id="compliance-audit"), "acme/leased"
+            )
+
 
 class TestCredentialOrdering(HarnessTestCase):
     def setUp(self):
