@@ -960,15 +960,32 @@ class TestDeltaBlock(unittest.TestCase):
         self.assertEqual(resolved, ["a"])
 
     def test_a_truncated_finding_is_not_announced_as_new_every_run(self):
-        # The block records what the body *rendered*, so `new` has to be
-        # measured against the same set. Against the full finding list, every
-        # finding the budget dropped reads as new every morning, forever.
+        # No `all_previous_ids`, so the only record of the last run is what its
+        # body *rendered* and `new` has to be measured against that same set.
+        # Against the full finding list, every finding the budget dropped reads
+        # as new every morning, forever. With a stored previous document to
+        # measure against the yardstick widens -- see the two tests below.
         new, _ = audit_report.compute_delta(
             previous_ids=["a", "b"],
             rendered_ids=["a", "b"],
             all_current_ids=["a", "b", "truncated"],
         )
         self.assertEqual(new, [])
+
+    def test_a_finding_the_budget_hid_and_then_rendered_is_not_new(self):
+        # `b` did not fit last run and does this run. The stored document
+        # remembers it, so surfacing is not novelty -- announcing it would
+        # report a finding new on a run where nothing about it changed but the
+        # body's spare room. Live on 2026-09-02: an obtainability run surfaced
+        # three findings the previous body had dropped and announced none.
+        new, resolved = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a", "b"],
+            all_current_ids=["a", "b"],
+            all_previous_ids=["a", "b"],
+        )
+        self.assertEqual(new, [])
+        self.assertEqual(resolved, [])
 
     def test_a_truncated_finding_is_not_announced_as_resolved(self):
         # It still reproduces; it just did not fit. Calling it resolved claims
