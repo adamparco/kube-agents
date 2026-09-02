@@ -54,11 +54,11 @@ nothing:
   is COPYed to ``/opt/platform-template/skills``, so the profile home holds
   ``skills/``, never ``agents/``.
 
-What this does *not* check is the SOP *geography* in the cron prompts -- the
-line counts and section ranges. That is already covered, and better, by
-``test_cron_prompts_cite_the_real_sop_geography`` in
+What this does *not* check is that a cron prompt names its stream's real
+collector invocation. That is already covered, and better, by
+``test_cron_prompts_name_the_real_collector_invocation`` in
 ``agents/platform/skills/fleet-audit/scripts/test_audit_report.py``, which
-re-derives the numbers from the SOP headings.
+re-derives the invocation from the SOP's own "Run the collector" instruction.
 
 Findings print to stderr as ``path:line: [rule] message``, and under GitHub
 Actions each one is also emitted as an ``::error`` annotation so it lands on the
