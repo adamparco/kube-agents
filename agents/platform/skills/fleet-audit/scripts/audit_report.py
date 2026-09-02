@@ -4069,15 +4069,31 @@ def compute_delta(
     this function exists to prevent, let back in through the wider set.
 
     `all_current_ids` is every finding in this document, rendered or not, and
-    resolution is judged against it alone. A finding cut for space still
+    both halves are judged against it. A finding cut for space still
     reproduces; calling it resolved claims a fix that never happened, in
     writing, on a finding nobody can see. It defaults to `rendered_ids` for
     callers where nothing was truncated.
+
+    Novelty is judged against the same wide set, and the two halves have to
+    agree on it or the ledger contradicts itself. Judging `new` on the rendered
+    set alone loses a finding that arrives already over the budget: it is not
+    announced on the run it appears, and by the next run the document it landed
+    in has joined `known`, so it is never announced at all — yet `resolved`
+    measures against the document and duly reports it fixed when it goes. On
+    2026-09-02 a planted workload produced three obtainability findings, the
+    body had room for two, and the ledger said "2 new" and then "3 resolved",
+    telling a reader something was fixed that it had never said was broken.
+    Widening this half does not let the 2026-08-30 flapping back in: that was
+    a `known` too narrow to remember a truncated finding, and `known` is the
+    union above whichever set this half measures. It widens only when there is
+    a stored previous document to widen against, for the same reason the union
+    exists — without one, `known` is just the last body's rendered ids, and
+    every finding the budget dropped would read as new every morning.
     """
     known = set(previous_ids) | set(all_previous_ids or ())
-    rendered = set(rendered_ids)
     current = set(rendered_ids if all_current_ids is None else all_current_ids)
-    return sorted(rendered - known), sorted(known - current)
+    appeared = current if all_previous_ids else set(rendered_ids)
+    return sorted(appeared - known), sorted(known - current)
 
 
 # --------------------------------------------------------------------------- #

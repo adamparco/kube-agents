@@ -1023,6 +1023,54 @@ class TestDeltaBlock(unittest.TestCase):
         )
         self.assertEqual(resolved, ["gone"])
 
+    def test_a_finding_that_arrives_over_the_budget_is_still_announced_new(self):
+        # `c` is new to the fleet and did not fit the body. Judged on the
+        # rendered set it is never announced at all -- not this run, and not
+        # the next, because by then the document it landed in is part of
+        # `known`. Live on 2026-09-02: a planted workload produced three
+        # obtainability findings, two fitted, and the ledger said "2 new" and
+        # then "3 resolved" -- crediting a fix for something it never reported.
+        new, _ = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a", "b"],
+            all_current_ids=["a", "b", "c"],
+            all_previous_ids=["a"],
+        )
+        self.assertEqual(new, ["b", "c"])
+
+    def test_the_two_halves_agree_on_a_finding_that_never_rendered(self):
+        # The pair the live run got wrong: `c` arrives over the budget and then
+        # goes away. Whatever novelty this function claims for it on the way in,
+        # it must claim the mirror of on the way out.
+        new, _ = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a"],
+            all_current_ids=["a", "c"],
+            all_previous_ids=["a"],
+        )
+        _, resolved = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a"],
+            all_current_ids=["a"],
+            all_previous_ids=["a", "c"],
+        )
+        self.assertEqual(new, ["c"])
+        self.assertEqual(resolved, ["c"])
+
+    def test_an_unreadable_previous_document_keeps_the_rendered_yardstick(self):
+        # The pair of the case above. Novelty widens to the full document only
+        # when there is a stored previous document to measure against; without
+        # one `known` is just the last body's rendered ids, and widening would
+        # announce every truncated finding new every morning.
+        for wider in ([], None):
+            new, _ = audit_report.compute_delta(
+                previous_ids=["a", "b"],
+                rendered_ids=["a", "b"],
+                all_current_ids=["a", "b", "truncated"],
+                all_previous_ids=wider,
+            )
+            self.assertEqual(new, [])
+
     def test_an_unreadable_previous_document_does_not_announce_everything_new(self):
         # A missing or malformed stored document yields no wider set. Measured
         # against that alone every live finding reads as new, so the union with
