@@ -13216,13 +13216,16 @@ class TestRepoResolution(BaseTestCase):
 
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: "acme/from-remote"
+        # `*a, **k` for the reason given on the same stub in
+        # `test_gitops_workspace.py`: the workspace branch calls this as
+        # `(cwd=...)` behind a bare `except Exception: pass`.
+        module.get_current_git_repo = lambda *a, **k: "acme/from-remote"
         with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(audit_report.resolve_repo(), "acme/from-remote")
 
     def test_all_sources_failing_names_sources(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: None
+        module.get_current_git_repo = lambda *a, **k: None
         with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 audit_report.resolve_repo()
