@@ -416,12 +416,52 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual(entry["candidates"], [])
         self.assertNotIn("limitations", entry)
 
-    def test_zero_instances_is_a_reading_not_a_gap(self):
-        """Absence that provably means zero is a result. A project with no VM
-        still records the enumeration against §2.1 and declares nothing."""
-        entry = cf.collect_project("proj-1", run=self.fake_run(self.clean(**{"instances list": run_of(0, "[]")})))
-        self.assertIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
-        self.assertNotIn(cf.STARTUP_SLUG, [c["check"] for c in entry["checks_not_applicable"]])
+    def test_zero_instances_is_declared_because_it_does_not_prove_zero(self):
+        """An empty `instances list` is not a fleet of zero VMs.
+
+        This test previously asserted the opposite — that absence provably
+        means zero, so §2.1 could record the enumeration and declare nothing.
+        GKE Autopilot node VMs are the counterexample: they are absent from the
+        Compute API for the audit identity by design, returning 404 rather than
+        403, so a project whose nodes are all Autopilot enumerates empty while
+        running plenty of VMs. Recording the slug as run against that is a
+        clean bill of health for a fleet nobody looked at.
+
+        Declared plain rather than `UNEVALUATED:`, because the exclusion is a
+        genuine narrowing of the universe: Google manages those nodes, so their
+        startup scripts are not the operator's to set or fix. A marker would
+        union the project into `blocked` and pin every GCE finding on it open
+        forever, and this project is the stream's only target.
+        """
+        entry = cf.collect_project(
+            "proj-1", run=self.fake_run(self.clean(**{"instances list": run_of(0, "[]")}))
+        )
+        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+        self.assertIn(cf.STARTUP_SLUG, declared)
+        self.assertNotIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
+        self.assertFalse(declared[cf.STARTUP_SLUG].startswith(cf.UNEVALUATED_MARKER))
+        self.assertIn("Autopilot", declared[cf.STARTUP_SLUG])
+        self.assertNotIn("limitations", entry)
+
+    def test_instances_that_exist_but_none_running_is_declared_too(self):
+        """A stopped fleet serves no serial console, so §2.1 had nothing to read.
+
+        Distinct from the empty case above and from the all-refused case below:
+        the instances were enumerated and their state positively establishes
+        that the check cannot apply, so it is plain rather than `UNEVALUATED:`
+        and the reason cites the count it saw.
+        """
+        stopped = json.dumps(
+            [{"name": "vm-1", "zone": "https://x/zones/us-central1-a", "status": "TERMINATED"}]
+        )
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{"instances list": run_of(0, stopped)})),
+        )
+        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+        self.assertIn(cf.STARTUP_SLUG, declared)
+        self.assertFalse(declared[cf.STARTUP_SLUG].startswith(cf.UNEVALUATED_MARKER))
+        self.assertIn("1 instance(s)", declared[cf.STARTUP_SLUG])
         self.assertNotIn("limitations", entry)
 
     # --- the three checks nobody implemented -------------------------------- #

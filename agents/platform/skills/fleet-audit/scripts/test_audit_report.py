@@ -11315,6 +11315,47 @@ class TestScopedCoverage(unittest.TestCase):
             [],
         )
 
+    def test_a_gce_run_that_enumerated_no_project_reports_all_four_stranded(self):
+        """Every gce check is project-scoped, so a run with no project entry ran none.
+
+        The collector names `project/<id>` and nothing else, so a document
+        holding some other kind of target got there by the model rewriting the
+        scope rather than copying it. Before the partition was declared the
+        denominator was the whole roster for every target, and such a run
+        charged its stray target with all four checks — reported as a per-target
+        shortfall, but never as the thing that actually happened, which is that
+        no project was audited at all.
+        """
+        gaps = audit_report._unenumerated_kind_gaps(
+            "gce-compute-fleet-audit", [{"name": "prod-us-east"}]
+        )
+        self.assertEqual(len(gaps), 1, gaps)
+        self.assertIn("no project targets were audited", gaps[0])
+        for slug in audit_report.AUDITS["gce-compute-fleet-audit"].checks:
+            self.assertIn(slug, gaps[0])
+
+    def test_a_gce_project_entry_is_rated_against_the_whole_roster(self):
+        """The partition must not narrow what a `project/<id>` entry owes.
+
+        All four checks sit under the one kind, so the live shape — one project
+        target running all four — has to keep reading as complete. A partition
+        that quietly dropped a slug here would turn the coverage claim this
+        stream exists to make into a smaller one nobody asked for.
+        """
+        spec = audit_report.AUDITS["gce-compute-fleet-audit"]
+        self.assertEqual(
+            audit_report.audit_target_checks(
+                "gce-compute-fleet-audit", "project/adamparco-kage"
+            ),
+            spec.checks,
+        )
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(
+                "gce-compute-fleet-audit", [{"name": "project/adamparco-kage"}]
+            ),
+            [],
+        )
+
     def test_the_scope_table_rates_a_project_row_against_its_own_checks(self):
         """The rendered `Checks` column had the same scope-blind denominator."""
         out = "\n".join(

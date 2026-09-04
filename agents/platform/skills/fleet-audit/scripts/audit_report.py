@@ -324,6 +324,22 @@ AUDITS: dict[str, AuditSpec] = {
             "sole-tenant-headroom",
             "orphaned-snapshots",
         ),
+        # Every check reads Compute Engine objects that belong to a project, so
+        # the collector names one `project/<id>` entry per project and nothing
+        # else. Declaring the partition is what makes a run that enumerated
+        # some other kind of target — and so ran none of these four anywhere —
+        # report a gap instead of passing silently.
+        scopes=(
+            (
+                "project",
+                (
+                    "gce-startup-script-status",
+                    "mig-convergence-stalled",
+                    "sole-tenant-headroom",
+                    "orphaned-snapshots",
+                ),
+            ),
+        ),
     ),
 }
 

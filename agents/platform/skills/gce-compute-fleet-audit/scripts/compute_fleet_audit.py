@@ -203,10 +203,51 @@ UNEVALUATED_MARKER = "UNEVALUATED: "
 # (target, check) pair. A project that simply runs no MIGs is not a project this
 # run cannot vouch for, and marking it so would pin the whole stream's ledger
 # open over an absence the read positively established.
+#
+# GKE Autopilot node VMs are the reason an empty enumeration has to be declared
+# rather than passed over. The Compute API does not show them to the audit
+# identity — by design, not a grant this install is missing: as the platform
+# GSA a `gk3-*` instance, its MIG and its boot disk all return 404 rather than
+# 403, while the same read as project Owner returns them, and no deny policy,
+# IAM condition or org policy is involved. See
+# https://docs.cloud.google.com/kubernetes-engine/docs/concepts/autopilot-architecture
+# ("Visibility"). Google manages those nodes, so §2.1's startup scripts and
+# §2.2's convergence are not the operator's to set or to fix and a finding on
+# one would carry a recommendation nobody can act on — a real narrowing of the
+# universe, not a missed read. What makes it dangerous is that a project whose
+# only nodes are Autopilot enumerates *empty*, which is indistinguishable from
+# an idle project unless the reason says so.
+AUTOPILOT_INVISIBLE_NOTE = (
+    "GKE Autopilot node VMs do not appear in the Compute Engine API to this "
+    "identity by design rather than for want of a grant, so a project whose "
+    "nodes are all Autopilot enumerates empty here; Google manages those nodes "
+    "and the condition is not the operator's to act on."
+)
 NO_MIGS_REASON = (
-    "This project runs no Managed Instance Groups: `compute instance-groups "
-    "managed list` returned an empty array, so §2.2's convergence condition "
-    "has nothing to hold against. Structural, not a missed read."
+    "This project runs no Managed Instance Groups visible to the audit "
+    "identity: `compute instance-groups managed list` returned an empty array, "
+    "so §2.2's convergence condition has nothing to hold against. Structural, "
+    "not a missed read. " + AUTOPILOT_INVISIBLE_NOTE
+)
+# §2.1's counterpart to the two below. Without it an Autopilot-only project ran
+# the enumeration, found nothing to read a console from, and recorded the slug
+# as run and clean across a fleet it never saw — the false all-clear this whole
+# stream is being converted to remove, arriving one layer up from the checks.
+NO_INSTANCES_REASON = (
+    "This project runs no Compute Engine instances visible to the audit "
+    "identity: `compute instances list` returned an empty array, so §2.1's "
+    "serial console markers have no instance to match against. Structural, not "
+    "a missed read. " + AUTOPILOT_INVISIBLE_NOTE
+)
+# Instances exist and were enumerated, but none is RUNNING. A stopped instance
+# serves no serial console output, so there is nothing §2.1 could have read —
+# structural in the same way, and still not an `UNEVALUATED:` case, because the
+# state that rules the check out is one the read positively established.
+NO_RUNNING_INSTANCES_REASON = (
+    "No Compute Engine instance on this project is RUNNING: `compute instances "
+    "list` returned {total} instance(s) and none in RUNNING state, and an "
+    "instance that is not running serves no serial console output for §2.1 to "
+    "read. Structural, not a missed read."
 )
 NO_NODE_GROUPS_REASON = (
     "This project reserves no sole-tenant node groups: `compute sole-tenancy "
@@ -858,7 +899,20 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
             else:
                 reads.setdefault(STARTUP_SLUG, []).append((" ".join(argv), result))
 
-        if targets and len(unread) == len(targets):
+        if not instances:
+            not_applicable.append(
+                {"check": STARTUP_SLUG, "reason": NO_INSTANCES_REASON}
+            )
+        elif not targets:
+            not_applicable.append(
+                {
+                    "check": STARTUP_SLUG,
+                    "reason": NO_RUNNING_INSTANCES_REASON.format(
+                        total=len(instances)
+                    ),
+                }
+            )
+        elif len(unread) == len(targets):
             # Nothing was examined. The enumeration ran, so the slug has a
             # `commands` entry pending — dropped at emit time, because a
             # recorded command corroborates exactly the `checks_run` claim
