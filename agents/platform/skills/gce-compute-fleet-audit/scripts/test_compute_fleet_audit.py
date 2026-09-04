@@ -1292,15 +1292,36 @@ class SoleTenantHeadroomTest(unittest.TestCase):
     def test_an_autoscaling_group_is_excluded_and_still_counts_as_measured(self):
         """§2.4's Do-NOT-flag limb. Excluded is not the same as unread — the
         group was measured, so it must not drag the check into `UNEVALUATED:`."""
-        group = dict(self.GROUP, autoscalingPolicy={"mode": "ON"})
-        hit, measured = cf.check_sole_tenant_headroom(group, [node(cpus=8, used_cpus=8)])
-        self.assertIsNone(hit)
-        self.assertTrue(measured)
+        for mode in ("ON", "ONLY_SCALE_OUT"):
+            group = dict(self.GROUP, autoscalingPolicy={"mode": mode})
+            hit, measured = cf.check_sole_tenant_headroom(group, [node(cpus=8, used_cpus=8)])
+            self.assertIsNone(hit, mode)
+            self.assertTrue(measured, mode)
 
-    def test_a_group_with_autoscaling_off_is_still_evaluated(self):
-        group = dict(self.GROUP, autoscalingPolicy={"mode": "OFF"})
-        hit, _ = cf.check_sole_tenant_headroom(group, [node(cpus=8, used_cpus=8)])
+    def test_the_two_non_autoscaling_modes_are_still_evaluated(self):
+        """`mode` has four values in the Compute v1 discovery document, and
+        excluding on "anything but OFF" would drop a MODE_UNSPECIFIED group out
+        of the check while still reporting it measured — headroom never read,
+        published as headroom found adequate."""
+        for mode in ("OFF", "MODE_UNSPECIFIED"):
+            group = dict(self.GROUP, autoscalingPolicy={"mode": mode})
+            hit, measured = cf.check_sole_tenant_headroom(group, [node(cpus=8, used_cpus=8)])
+            self.assertIsNotNone(hit, mode)
+            self.assertTrue(measured, mode)
+
+    def test_every_discovery_document_mode_is_accounted_for(self):
+        """The enum is small and stable, so pin it: a fifth value appearing
+        upstream should fail here rather than be silently treated as fixed."""
+        self.assertEqual(
+            sorted(cf.AUTOSCALING_MODES), ["ON", "ONLY_SCALE_OUT"]
+        )
+
+    def test_an_absent_autoscaling_policy_is_evaluated(self):
+        hit, measured = cf.check_sole_tenant_headroom(
+            self.GROUP, [node(cpus=8, used_cpus=8)]
+        )
         self.assertIsNotNone(hit)
+        self.assertTrue(measured)
 
     def test_nodes_without_resource_figures_report_unmeasured(self):
         """The genuine `UNEVALUATED:` case, and the only one this check

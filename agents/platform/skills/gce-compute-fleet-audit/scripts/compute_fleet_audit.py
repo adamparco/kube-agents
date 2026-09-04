@@ -77,13 +77,14 @@ Field contracts assumed of `gcloud ... --format=json` output:
   changed contract must read as "no churn observed" rather than cost the
   project its whole MIG check.
 - `compute sole-tenancy node-groups list-nodes` items carry `totalResources`
-  and `consumedResources`, each `{guestCpus, memoryMb, localSsdGb}`. This is
-  the one shape here not verified against live output — the reference install
-  reserves no sole-tenant node groups, so the read returns `[]` and the check
-  declares a structural non-applicability instead. `check_sole_tenant_headroom`
-  is therefore written to skip any node missing either object and to report
-  `measured=False` when none of them yields figures, which is the `UNEVALUATED:`
-  case the marker actually exists for.
+  and `consumedResources`, each an `InstanceConsumptionInfo`
+  (`{guestCpus, memoryMb, localSsdGb, minNodeCpus}`). This is the one shape here
+  taken from the Compute v1 discovery document rather than from live output —
+  the reference install reserves no sole-tenant node groups, so the read returns
+  `[]` and the check declares a structural non-applicability instead.
+  `check_sole_tenant_headroom` is therefore written to skip any node missing
+  either object and to report `measured=False` when none of them yields figures,
+  which is the `UNEVALUATED:` case the marker actually exists for.
 
 What this collector deliberately does not do, because it would change what
 gets flagged: it applies neither §2.1's GKE-node exclusion, nor §2.2's
@@ -170,6 +171,12 @@ ORPHAN_AGE_DAYS = 90
 
 # §2.4's threshold, as a percentage of the node group's aggregate capacity.
 SOLE_TENANT_UTILISATION_PCT = 90
+
+# The two `NodeGroup.autoscalingPolicy.mode` values that actually add nodes, out
+# of the four the Compute v1 discovery document defines. The other two --
+# MODE_UNSPECIFIED and OFF -- leave the group a fixed reservation, which is
+# exactly what §2.4 measures.
+AUTOSCALING_MODES = ("ON", "ONLY_SCALE_OUT")
 
 SEVERITY = {
     STARTUP_SLUG: "critical",
@@ -704,9 +711,15 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
     # §2.4's Do-NOT-flag limb: a node group that grows itself is not short of
     # headroom, it is between sizes. Applied here rather than handed back as
     # triage because the mode is a field on the group, not a judgment.
+    #
+    # Named positively rather than as "anything but OFF". The Compute v1
+    # discovery document gives `mode` four values — MODE_UNSPECIFIED, OFF, ON,
+    # ONLY_SCALE_OUT — and only the last two actually add nodes. Excluding on
+    # "not OFF" would drop a MODE_UNSPECIFIED group out of the check silently,
+    # reporting headroom it never measured as headroom it found adequate.
     policy = group.get("autoscalingPolicy")
     mode = str((policy or {}).get("mode", "")).strip().upper()
-    if isinstance(policy, dict) and mode not in ("", "OFF"):
+    if mode in AUTOSCALING_MODES:
         return None, True
 
     cpu_pct = 100.0 * consumed_cpus / total_cpus
