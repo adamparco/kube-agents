@@ -24,10 +24,23 @@ def run_of(rc: int, stdout: str = "", stderr: str = "") -> cf.Run:
     return cf.Run(["gcloud"], rc, stdout, stderr, 0.01)
 
 
-def one_running_instance(name: str = "vm-1", zone: str = "us-central1-a") -> str:
+# The metadata block that makes an instance one §2.1 has anything to say about.
+# Without a startup script `google_metadata_script_runner` never runs, so the
+# exit status the check greps for cannot appear and the instance is not a
+# target — see `NO_STARTUP_SCRIPT_REASON`.
+STARTUP_META = '"metadata": {"items": [{"key": "startup-script", "value": "#!/bin/sh"}]}'
+# What `project-info describe` returns on a project that sets no fleet-wide
+# startup script. The common case, and the one the reference install is in.
+NO_PROJECT_STARTUP_SCRIPT = '{"commonInstanceMetadata": {"items": []}}'
+
+
+def one_running_instance(
+    name: str = "vm-1", zone: str = "us-central1-a", *, startup_script: bool = True
+) -> str:
+    meta = f", {STARTUP_META}" if startup_script else ""
     return (
         f'[{{"name": "{name}", "status": "RUNNING", '
-        f'"zone": "https://x/projects/proj-1/zones/{zone}"}}]'
+        f'"zone": "https://x/projects/proj-1/zones/{zone}"{meta}}}]'
     )
 
 
@@ -274,6 +287,7 @@ class CollectProjectTest(unittest.TestCase):
         # needle is a prefix of the longer command.
         responses = {
             "instances list": run_of(0, one_running_instance()),
+            "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
             "get-serial-port-output": run_of(0, "boot ok\n"),
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
@@ -463,6 +477,142 @@ class CollectProjectTest(unittest.TestCase):
         self.assertFalse(declared[cf.STARTUP_SLUG].startswith(cf.UNEVALUATED_MARKER))
         self.assertIn("1 instance(s)", declared[cf.STARTUP_SLUG])
         self.assertNotIn("limitations", entry)
+
+    def test_running_instances_that_run_no_startup_script_are_declared(self):
+        """The false clean this branch exists to remove, measured live.
+
+        On the reference install §2.1 read 14 RUNNING consoles — 2.4 MB of text
+        — and reported the check run and clean. Not one of those instances
+        carried `startup-script` or `startup-script-url`, and the project set
+        neither, so `google_metadata_script_runner` never ran and the sentence
+        the check greps for could not occur in any console. Nothing was wrong
+        and nothing could have been found; the pass was vacuous.
+
+        Plain rather than `UNEVALUATED:` for the reason the empty enumeration
+        is: the absence is a fact the read positively established, not a
+        surface nobody reached.
+        """
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(
+                self.clean(
+                    **{
+                        "instances list": run_of(
+                            0, one_running_instance(startup_script=False)
+                        )
+                    }
+                )
+            ),
+        )
+        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+        self.assertIn(cf.STARTUP_SLUG, declared)
+        self.assertFalse(declared[cf.STARTUP_SLUG].startswith(cf.UNEVALUATED_MARKER))
+        self.assertIn("1 RUNNING instance(s)", declared[cf.STARTUP_SLUG])
+        self.assertNotIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
+        self.assertNotIn("limitations", entry)
+
+    def test_no_console_is_read_for_an_instance_that_runs_no_script(self):
+        """The declaration has to stop the reads, not just relabel them.
+
+        Each console read is a `gcloud` round trip against a multi-hundred-KB
+        body, and on the reference install they were the bulk of the collect.
+        """
+        seen = []
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            seen.append(joined)
+            if "instances list" in joined:
+                return run_of(0, one_running_instance(startup_script=False))
+            if "project-info describe" in joined:
+                return run_of(0, NO_PROJECT_STARTUP_SCRIPT)
+            return run_of(0, "[]")
+
+        cf.collect_project("proj-1", run=run)
+        self.assertFalse(
+            [c for c in seen if "get-serial-port-output" in c],
+            "read a console that cannot carry the marker",
+        )
+
+    def test_a_project_wide_startup_script_keeps_every_instance_a_target(self):
+        """Common metadata runs on every instance in the project, so the
+        per-instance keys say nothing on their own. Filtering without this read
+        would declare §2.1 inapplicable over a fleet that does run scripts —
+        the same false clean, arrived at from the other side."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(
+                self.clean(
+                    **{
+                        "instances list": run_of(
+                            0, one_running_instance(startup_script=False)
+                        ),
+                        "project-info describe": run_of(
+                            0,
+                            '{"commonInstanceMetadata": {"items": '
+                            '[{"key": "startup-script", "value": "#!/bin/sh"}]}}',
+                        ),
+                        "get-serial-port-output": run_of(
+                            0, "startup-script exit status 1\n"
+                        ),
+                    }
+                )
+            ),
+        )
+        self.assertNotIn(
+            cf.STARTUP_SLUG, [d["check"] for d in entry["checks_not_applicable"]]
+        )
+        self.assertEqual(
+            [c["object"] for c in entry["candidates"]],
+            ["ComputeInstance/us-central1-a/vm-1"],
+        )
+
+    def test_an_unreadable_project_info_keeps_every_instance_a_target(self):
+        """Fail toward doing the work. A refused or malformed `project-info`
+        read leaves the fleet-wide question open, and guessing "no script"
+        there would skip §2.1 across a whole project on the strength of a read
+        that did not happen. Reading a console nobody needed costs seconds; the
+        other error is the false clean."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(
+                self.clean(
+                    **{
+                        "instances list": run_of(
+                            0, one_running_instance(startup_script=False)
+                        ),
+                        "project-info describe": run_of(1, "", "PERMISSION_DENIED"),
+                        "get-serial-port-output": run_of(
+                            0, "startup-script exit status 1\n"
+                        ),
+                    }
+                )
+            ),
+        )
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertNotIn(
+            cf.STARTUP_SLUG, [d["check"] for d in entry["checks_not_applicable"]]
+        )
+        self.assertEqual(len(entry["candidates"]), 1)
+        # No `limitations` either: the fallback reads more, not less, so it
+        # inflates no coverage claim -- and a limitation on this stream's only
+        # target would hold every GCE finding open forever.
+        self.assertNotIn("limitations", entry)
+
+    def test_a_project_info_failure_does_not_fail_the_project_closed(self):
+        """`gated` raises `GateFailure` on a bad read and the whole target is
+        recorded unreadable. This read is deliberately outside that gate: it
+        refines which instances to look at, and losing it costs precision, not
+        correctness."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(
+                self.clean(
+                    **{"project-info describe": run_of(1, "", "PERMISSION_DENIED")}
+                )
+            ),
+        )
+        self.assertEqual(entry["outcome"], "collected")
 
     # --- the three checks nobody implemented -------------------------------- #
 
@@ -805,6 +955,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         # dispositions the roster cross-check has to accept.
         responses = {
             "instances list": run_of(0, one_running_instance()),
+            "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
             "get-serial-port-output": run_of(0, "startup-script exit status 1\n"),
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
@@ -1098,6 +1249,7 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
         stubs.setdefault("instance-groups managed list", run_of(0, "[]"))
         stubs.setdefault("node-groups list-nodes", run_of(0, "[]"))
         stubs.setdefault("node-groups list", run_of(0, "[]"))
+        stubs.setdefault("project-info describe", run_of(0, NO_PROJECT_STARTUP_SCRIPT))
 
         def run(argv, **kwargs):
             joined = " ".join(argv)
@@ -1117,9 +1269,9 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
         """
         two_zones = (
             '[{"name": "web-1", "status": "RUNNING", '
-            '"zone": "https://x/projects/p1/zones/us-central1-a"},'
+            f'"zone": "https://x/projects/p1/zones/us-central1-a", {STARTUP_META}}},'
             '{"name": "web-1", "status": "RUNNING", '
-            '"zone": "https://x/projects/p1/zones/us-central1-b"}]'
+            f'"zone": "https://x/projects/p1/zones/us-central1-b", {STARTUP_META}}}]'
         )
         entry = cf.collect_project(
             "p1",
@@ -1396,6 +1548,7 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
     def run_with(self, **overrides):
         base = {
             "instances list": run_of(0, one_running_instance()),
+            "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
             "get-serial-port-output": run_of(0, "boot ok\n"),
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),

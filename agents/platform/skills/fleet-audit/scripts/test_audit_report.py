@@ -13783,6 +13783,87 @@ class TestNotApplicableChecks(unittest.TestCase):
         body = render_body(make_doc(), generated_at=NOW)
         self.assertNotIn("Not applicable", body)
 
+    def test_a_full_length_reason_survives_to_the_reader(self):
+        """The cell is the only place a reason is ever published, and at the
+        default 120-character cell limit every collector-authored one was cut
+        mid-sentence — before the clause saying the absence is structural, which
+        is the entire load-bearing part. Eight of the seventeen reasons the
+        collectors author exceed the default, across three streams."""
+        reason = (
+            "No Compute Engine instance on this project runs a startup script, so "
+            "the metadata script runner never executes and the exit status this "
+            "check greps for cannot appear in any console. Structural, not a "
+            "missed read: a GKE node pool bootstraps from user-data and kube-env "
+            "rather than from a startup script, so a project whose only instances "
+            "are GKE nodes reaches this branch legitimately."
+        )
+        self.assertGreater(len(reason), audit_report.MAX_CELL_CHARS)
+        self.assertLessEqual(len(reason), audit_report.MAX_REASON_CHARS)
+        body = render_body(self.doc([na("privileged-container", reason)]), generated_at=NOW)
+        self.assertIn(reason, body)
+
+    def test_a_reason_past_the_column_limit_is_still_bounded(self):
+        """`validate_na_reason` sets a floor and no ceiling, and on most streams
+        the reason is model-authored. Raising the limit is not removing it."""
+        body = render_body(
+            self.doc([na("privileged-container", "x" * 4000)]), generated_at=NOW
+        )
+        self.assertNotIn("x" * (audit_report.MAX_REASON_CHARS + 1), body)
+        self.assertIn("…", body)
+
+    def test_one_reason_shared_by_the_fleet_renders_once(self):
+        """The commands table collapses on (check, command) for this reason and
+        a reason is boilerplate by construction — every Autopilot cluster gives
+        the same words. Uncollapsed, a full-length reason repeated across a
+        fleet costs the whole evidence section, which yields as a unit."""
+        roster = list(audit_report.audit_checks(AUDIT))
+        reason = "Autopilot: Google manages the node pools, so there are none here."
+        clusters = [
+            {
+                "name": f"prod-{i}",
+                "location": "us-central1",
+                "project": "acme-prod",
+                "checks_run": [
+                    ran(c, f"prod-{i}") for c in roster if c != "privileged-container"
+                ],
+                "checks_not_applicable": [na("privileged-container", reason)],
+            }
+            for i in range(4)
+        ]
+        body = render_body(make_doc(clusters=clusters), generated_at=NOW)
+        self.assertEqual(body.count(reason), 1)
+        # The count stays per (target, check): four clusters each lost the check.
+        self.assertIn("Not applicable (4)", body)
+        self.assertIn("all 4 targets", body)
+
+    def test_two_clusters_excused_for_different_reasons_keep_both_rows(self):
+        """Collapsing is on the reason, not the check. Two clusters that cannot
+        run the same check for genuinely different reasons are two claims, and
+        merging them would attribute one cluster's excuse to the other."""
+        roster = list(audit_report.audit_checks(AUDIT))
+        reasons = {
+            "prod-autopilot": "Autopilot: Google manages the node pools here.",
+            "prod-standard": "This cluster runs a single node pool with no taints.",
+        }
+        clusters = [
+            {
+                "name": name,
+                "location": "us-central1",
+                "project": "acme-prod",
+                "checks_run": [
+                    ran(c, name) for c in roster if c != "privileged-container"
+                ],
+                "checks_not_applicable": [na("privileged-container", reason)],
+            }
+            for name, reason in reasons.items()
+        ]
+        body = render_body(make_doc(clusters=clusters), generated_at=NOW)
+        for name, reason in reasons.items():
+            self.assertIn(reason, body)
+            self.assertIn(f"`{name}`", body)
+        self.assertIn("Not applicable (2)", body)
+        self.assertNotIn("all 2 targets", body)
+
 
 class TestSilentVerdict(HarnessTestCase):
     """`silent_ok` is computed, not re-derived by the model.

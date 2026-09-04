@@ -626,6 +626,18 @@ MAX_TITLE_CHARS = 300
 MAX_TEXT_CHARS = 1500
 MAX_NOTE_CHARS = 2000
 MAX_CELL_CHARS = 120
+# The not-applicable table's reason column, on the same reasoning as
+# MAX_COMMAND_CHARS: a cell nobody can act on is not worth the space it saves.
+# A reason is the only claim in the document that shrinks the coverage
+# denominator, and the cell is the one place it is ever published — so a reason
+# clipped mid-sentence asks the reader to accept an excuse they cannot read. The
+# collector-authored reasons run 108-558 characters (8 of 17 exceed the default,
+# across three streams) because they carry the argument, not just the verdict:
+# which surface was read, why the absence is structural, and what a reader
+# should look at to falsify it. Every one of them lost that argument to the
+# clip. Bounded rather than unbounded because the reason is model-authorable on
+# most streams and validate_na_reason sets only a floor.
+MAX_REASON_CHARS = 700
 # `cluster`, `namespace` and `object` are Kubernetes identifiers, and the API
 # bounds every one of them: a namespace is a 63-character DNS label, a resource
 # name a 253-character DNS subdomain, a GKE cluster name 40. 320 clears
@@ -5829,7 +5841,14 @@ def _render_check_evidence(
     # Keyed by (check, command) and ordered by first appearance, so a run where
     # every command is distinct produces the table it produced before.
     grouped: dict[tuple[str, str], list[str]] = {}
-    na_rows: list[tuple[str, str, str]] = []
+    # Collapsed on (check, reason) for the reason the commands are collapsed on
+    # (check, command), and it bites harder here: a reason is boilerplate by
+    # construction. Every Autopilot cluster in a fleet declares the same check
+    # inapplicable in the same words, so the uncollapsed table was that
+    # paragraph repeated once per cluster. Collapsing is also what makes
+    # MAX_REASON_CHARS affordable — a full-length reason repeated forty times
+    # would cost the whole section, which yields as a unit.
+    na_grouped: dict[tuple[str, str], list[str]] = {}
     for cluster in clusters:
         name = str(cluster.get("name", "")).strip() or "(unnamed)"
         for entry in cluster.get("checks_run") or []:
@@ -5845,9 +5864,13 @@ def _render_check_evidence(
             check = str(entry.get("check", "")).strip()
             reason = str(entry.get("reason", "")).strip()
             if check and reason:
-                na_rows.append((name, check, reason))
+                na_grouped.setdefault((check, reason), []).append(name)
     ran = sum(len(targets) for targets in grouped.values())
-    if not grouped and not na_rows:
+    # Counted before the rows are collapsed, both here and in the yield notice
+    # below: what a reader is owed is how many (target, check) pairs left the
+    # denominator, not how many distinct excuses covered them.
+    declared = sum(len(targets) for targets in na_grouped.values())
+    if not grouped and not na_grouped:
         return []
 
     out = [
@@ -5881,23 +5904,30 @@ def _render_check_evidence(
             f"| {_evidence_targets(targets, per_check[check])} | `{_cell(check)}` "
             f"| `{_cell(command, limit=MAX_COMMAND_CHARS)}` |"
         )
-    if na_rows:
+    if na_grouped:
         # Published for the same reason the commands are. A check declared
         # inapplicable leaves the coverage denominator, so this is the one claim
         # in the document that can make a partial run look complete — it belongs
         # where a reader can weigh the excuse against the cluster.
+        na_per_check: dict[str, int] = {}
+        for (check, _), targets in na_grouped.items():
+            na_per_check[check] = na_per_check.get(check, 0) + len(targets)
         out += [
             "",
-            f"**Not applicable ({len(na_rows)})** — checks excluded from the "
+            f"**Not applicable ({declared})** — checks excluded from the "
             "coverage count above, and why. These did not run because there was "
             "nothing to run them against; a check that could have run and did "
-            "not is a gap, and is reported as one.",
+            "not is a gap, and is reported as one. One row per distinct reason, "
+            "with the targets that gave it.",
             "",
-            "| Cluster | Check | Why it cannot apply |",
-            "| ------- | ----- | ------------------- |",
+            "| Target | Check | Why it cannot apply |",
+            "| ------ | ----- | ------------------- |",
         ]
-        for name, check, reason in na_rows:
-            out.append(f"| `{_cell(name)}` | `{_cell(check)}` | {_cell(reason)} |")
+        for (check, reason), targets in na_grouped.items():
+            out.append(
+                f"| {_evidence_targets(targets, na_per_check[check])} "
+                f"| `{_cell(check)}` | {_cell(reason, limit=MAX_REASON_CHARS)} |"
+            )
     out.append("")
     out.append("</details>")
     if len("\n".join(out)) <= budget:
@@ -5909,7 +5939,7 @@ def _render_check_evidence(
     # runs whose findings crowded it out, which are the runs where a fabricated
     # check would matter most. Silence there leaves a document that looks
     # complete. Name the omission and say where the commands survive.
-    excluded = f" and the {len(na_rows)} exclusion(s)" if na_rows else ""
+    excluded = f" and the {declared} exclusion(s)" if na_grouped else ""
     notice = [
         "",
         f"_The {len(grouped)} command(s) behind this run's checks{excluded} do not "

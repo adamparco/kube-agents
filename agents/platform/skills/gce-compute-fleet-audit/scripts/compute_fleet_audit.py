@@ -18,9 +18,11 @@ saw it and the model's retyped excerpts shipped in place of the observed ones.
 
 All four of the SOP's checks are implemented here:
 
-- `gce-startup-script-status` enumerates with `compute instances list` and
-  measures with `compute instances get-serial-port-output` per RUNNING
-  instance, matching §2.1's two literal markers in the console text.
+- `gce-startup-script-status` enumerates with `compute instances list`, keeps
+  the RUNNING instances that actually run a startup script — its own metadata
+  or the project's common metadata, read with `compute project-info describe` —
+  and measures each with `compute instances get-serial-port-output`, matching
+  §2.1's two literal markers in the console text.
 - `mig-convergence-stalled` reads `compute instance-groups managed list` and
   holds §2.2's two limbs against each group's `currentActions` counters.
 - `sole-tenant-headroom` reads `compute sole-tenancy node-groups list`, then
@@ -55,9 +57,11 @@ records the surface it would need.
 
 Field contracts assumed of `gcloud ... --format=json` output:
 
-- `compute instances list` items carry `name`, `status` and a `zone`
-  selfLink whose last segment is the zone. Only `RUNNING` instances have
-  serial console output to read.
+- `compute instances list` items carry `name`, `status`, a `zone` selfLink
+  whose last segment is the zone, and `metadata.items[].key`. Only `RUNNING`
+  instances have serial console output to read.
+- `compute project-info describe` carries the project's common metadata under
+  `commonInstanceMetadata.items[].key`, the same shape one item deeper.
 - `compute instances get-serial-port-output` returns **text, not JSON**, so it
   runs outside `run_and_gate`. A failure on one instance does not fail the
   project closed — a single stopped-mid-run or IAM-refused VM would otherwise
@@ -248,6 +252,28 @@ NO_RUNNING_INSTANCES_REASON = (
     "list` returned {total} instance(s) and none in RUNNING state, and an "
     "instance that is not running serves no serial console output for §2.1 to "
     "read. Structural, not a missed read."
+)
+# The metadata keys `google_metadata_script_runner` reads. It runs a startup
+# script only when one of these is set on the instance or in the project's
+# common metadata, and only then does it log the `startup-script exit status N`
+# line §2.1 matches on. Neither set anywhere means the sentence cannot appear.
+STARTUP_SCRIPT_KEYS = ("startup-script", "startup-script-url")
+# The third structural case for §2.1, and the one that hides best: the
+# instances are there, they are RUNNING, their consoles read fine — and not one
+# of them runs a startup script, so the marker the check greps for cannot occur
+# in any of them. Measured live on the reference install: 14 RUNNING instances,
+# 2.4 MB of console text, zero occurrences of `startup-script exit status` in
+# any form, positive or negative, and zero instances carrying either metadata
+# key. Without this branch that reads as a clean pass over the whole fleet.
+NO_STARTUP_SCRIPT_REASON = (
+    "No Compute Engine instance on this project runs a startup script: none of "
+    "the {total} RUNNING instance(s) carries `startup-script` or "
+    "`startup-script-url` in its metadata and the project's common metadata "
+    "sets neither, so `google_metadata_script_runner` never runs and the exit "
+    "status §2.1 matches on cannot appear in any console. Structural, not a "
+    "missed read. A GKE node pool is the ordinary way to reach this branch: "
+    "its nodes bootstrap from `user-data` and `kube-env`, not from a startup "
+    "script, so a project whose only instances are GKE nodes runs none."
 )
 NO_NODE_GROUPS_REASON = (
     "This project reserves no sole-tenant node groups: `compute sole-tenancy "
@@ -517,11 +543,46 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     return None
 
 
-def running_instances(instances: list) -> list[tuple[str, str]]:
+def _metadata_keys(payload: dict, field: str) -> set[str]:
+    """The metadata keys set on one `compute` payload.
+
+    `instances list` items carry them under `metadata`, `project-info describe`
+    under `commonInstanceMetadata`; both use the same `{"items": [{"key": ...}]}`
+    shape, so `field` is the only difference.
+    """
+    items = ((payload or {}).get(field) or {}).get("items") or []
+    return {
+        item.get("key", "") for item in items if isinstance(item, dict)
+    }
+
+
+def project_sets_startup_script(project_info: object) -> bool:
+    """Does the project's common metadata set a startup script?
+
+    A common-metadata startup script runs on every instance in the project, so
+    one here makes the per-instance question moot.
+    """
+    if not isinstance(project_info, dict):
+        return False
+    return bool(
+        _metadata_keys(project_info, "commonInstanceMetadata")
+        & set(STARTUP_SCRIPT_KEYS)
+    )
+
+
+def running_instances(
+    instances: list, *, require_startup_script: bool = False
+) -> list[tuple[str, str]]:
     """The `(name, zone)` pairs §2.1 has console output to read.
 
     A non-RUNNING instance has no live serial console, and an item missing
     either field cannot be addressed by a `get-serial-port-output` call.
+
+    `require_startup_script` additionally drops an instance whose own metadata
+    sets neither key in `STARTUP_SCRIPT_KEYS`. No script ran on it, so its
+    console cannot carry an exit status for one, and reading it is a guaranteed
+    miss recorded as a pass. The caller leaves this False when the project's
+    common metadata sets a script, because that one runs everywhere.
     """
     out = []
     for inst in instances or []:
@@ -530,6 +591,10 @@ def running_instances(instances: list) -> list[tuple[str, str]]:
         name = inst.get("name", "")
         zone = _last_segment(inst.get("zone", ""))
         if inst.get("status", "") != RUNNING_STATUS or not name or not zone:
+            continue
+        if require_startup_script and not (
+            _metadata_keys(inst, "metadata") & set(STARTUP_SCRIPT_KEYS)
+        ):
             continue
         out.append((name, zone))
     return out
@@ -871,7 +936,35 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
             ["gcloud", "compute", "instances", "list", "--project", project, "--format=json"],
             STARTUP_SLUG,
         )
-        targets = running_instances(instances)
+        running = running_instances(instances)
+        # A startup script is set either on the instance or, project-wide, in
+        # the common metadata — and a project-wide one runs on every instance,
+        # so the per-instance filter below is only sound once this read says
+        # there is none. A read that fails leaves `project_wide` True and every
+        # RUNNING instance a target, which is what this collector did before
+        # the filter existed: reading a console nobody needed costs seconds,
+        # while guessing the other way would declare §2.1 inapplicable over a
+        # fleet that does run scripts. No `limitations` entry for the failure —
+        # the fallback inflates no coverage claim, and a limitation on this
+        # stream's only target would hold every GCE finding open.
+        info_argv = [
+            "gcloud", "compute", "project-info", "describe",
+            "--project", project, "--format=json",
+        ]
+        info_parsed, info_result = run_and_gate(info_argv, run=run)
+        reads.setdefault(STARTUP_SLUG, []).append(
+            (" ".join(info_argv), info_result)
+        )
+        project_wide = (
+            True
+            if not isinstance(info_parsed, dict)
+            else project_sets_startup_script(info_parsed)
+        )
+        targets = (
+            running
+            if project_wide
+            else running_instances(instances, require_startup_script=True)
+        )
         unread: list[str] = []
         for instance_name, zone in targets:
             argv = _serial_argv(instance_name, zone, project)
@@ -903,12 +996,21 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
             not_applicable.append(
                 {"check": STARTUP_SLUG, "reason": NO_INSTANCES_REASON}
             )
-        elif not targets:
+        elif not running:
             not_applicable.append(
                 {
                     "check": STARTUP_SLUG,
                     "reason": NO_RUNNING_INSTANCES_REASON.format(
                         total=len(instances)
+                    ),
+                }
+            )
+        elif not targets:
+            not_applicable.append(
+                {
+                    "check": STARTUP_SLUG,
+                    "reason": NO_STARTUP_SCRIPT_REASON.format(
+                        total=len(running)
                     ),
                 }
             )

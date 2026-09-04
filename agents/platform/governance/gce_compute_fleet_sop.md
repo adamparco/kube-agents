@@ -57,6 +57,8 @@ This stream's targets are GCP projects, not GKE clusters, so its collector is it
 - **Do NOT flag**: GKE node pool instances managed directly by GKE control plane or instances cleanly completing boot without errors.
 - **Remediation**: Correct boot metadata or deployment configuration in instance template or Terraform definition.
 
+The collector reads only the consoles of instances that run a startup script at all — its own metadata sets `startup-script` or `startup-script-url`, or the project's common metadata does and therefore every instance's does. Where no instance qualifies it declares the check in `checks_not_applicable` rather than reporting it clean. Both markers above are printed by `google_metadata_script_runner`, which does not run when no script is set, so a console with no script behind it cannot carry either one however badly the instance booted; reading fourteen of them and finding nothing is a pass that was never capable of failing. The reference install is exactly that shape — its only instances are GKE nodes, which bootstrap from `user-data` and `kube-env`. A `compute project-info describe` that fails leaves every RUNNING instance a target, because skipping the check across a whole project on the strength of a read that did not happen is the worse error.
+
 #### 2.2 Managed Instance Group convergence stalled (`mig-convergence-stalled`)
 
 - **Severity**: `major`
