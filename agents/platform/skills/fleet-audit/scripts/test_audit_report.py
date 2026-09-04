@@ -14079,6 +14079,45 @@ class TestDispatchAndHandover(unittest.TestCase):
             self.skipTest(f"{relative} not present")
         return path.read_text(encoding="utf-8")
 
+    def test_the_skill_roster_table_lists_every_audit_and_counts_them(self):
+        """`skills/fleet-audit/SKILL.md`'s roster table is what a worker reads
+        to find out whether its own audit id is allowed to own a ledger, and
+        nothing bound it to `AUDITS`. When `gce-compute-fleet-audit` was added
+        the table kept its eight rows and its sentence kept saying "these eight
+        audit ids", so the ninth stream's own worker read that its id was
+        rejected "before a single git or gh command runs" -- which is false,
+        and is the kind of false a run acts on. The nearby "a test fails if the
+        two drift apart" referred to the AUDITS/jobs.json title equality test,
+        not to this table.
+
+        Both halves are checked: a row per audit id, and the spelled-out count
+        in the sentence above it. The count is the half that reads as
+        authoritative and the half a row-only check would leave stale.
+        """
+        text = self.read("skills/fleet-audit/SKILL.md")
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                self.assertIn(
+                    f"`{audit_id}`",
+                    text,
+                    f"{audit_id} is in AUDITS but has no row in the SKILL.md "
+                    "roster table, so its worker reads that its own id is "
+                    "rejected.",
+                )
+        words = {
+            1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+            7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven",
+            12: "twelve",
+        }
+        expected = words.get(len(audit_report.AUDITS))
+        self.assertIsNotNone(expected, "extend `words` past twelve")
+        self.assertIn(
+            f"Only these {expected} audit ids may own a ledger",
+            text,
+            f"AUDITS holds {len(audit_report.AUDITS)} streams; SKILL.md's "
+            f"sentence does not say '{expected}'.",
+        )
+
     def bullet(self, marker):
         """The whole of the AGENTS.md bullet whose first line holds `marker`.
 

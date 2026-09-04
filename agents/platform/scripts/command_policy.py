@@ -302,6 +302,38 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "disks", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
+        # The daily `gce-compute-fleet-audit` cron runs
+        # skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py, and
+        # neither read it opens with was in this set. `instances list` is the
+        # first call the collector makes against a project, and it early-returns
+        # the whole target when that read comes back empty -- so the gate, not
+        # the fleet, decided the answer, and both of the stream's checks
+        # (startup-script-failures and orphaned-snapshots) reported nothing
+        # gathered from a project whose disks and snapshots were readable all
+        # along. `get-serial-port-output` is the evidence read behind
+        # startup-script-failures: it is how the collector distinguishes an
+        # instance whose startup script exited non-zero from one that is
+        # healthy, and without it that check has no data source at all. Both
+        # are pure reads. The writes one word away -- `instances create`,
+        # `delete`, `reset`, `add-metadata` -- stay refused, including the
+        # `instances reset` the stream emits as a *proposed* remediation, and
+        # the tests assert it.
+        ("compute", "instances", "get-serial-port-output"),
+        ("compute", "instances", "list"),
+        # The other two reads that same collector opens, added when §2.2 and
+        # §2.4 stopped being prose and became code. `instance-groups managed
+        # list` backs `mig-convergence-stalled` -- it is the only read that
+        # carries a group's `currentActions` counters, which are the whole
+        # condition. The sole-tenancy pair backs `sole-tenant-headroom`: the
+        # `list` establishes whether the project reserves any node groups at
+        # all, and `list-nodes` is the only surface carrying the per-node
+        # `totalResources`/`consumedResources` the utilisation ratio needs.
+        # Reads, all three; the resizes and deletes one word away
+        # (`instance-groups managed resize`, `delete`, `rolling-action
+        # restart`, `sole-tenancy node-groups add-nodes`) stay refused.
+        ("compute", "instance-groups", "managed", "list"),
+        ("compute", "sole-tenancy", "node-groups", "list"),
+        ("compute", "sole-tenancy", "node-groups", "list-nodes"),
         # The daily `gcp-networking-fabric-audit` cron executes
         # governance/gcp_networking_fabric_sop.md exactly, and of the reads
         # that SOP issues only forwarding-rules list was in this set --
@@ -430,6 +462,13 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--regions",
         # `recommender insights list` requires it. --location is already above.
         "--insight-type",
+        # `compute instances get-serial-port-output --port=1`, as the GCE
+        # fleet SOP writes it. Port 1 is the console the startup-script
+        # messages land on, so the flag is the check rather than a detail --
+        # and unlisted it refused the command as gcp.unreadable-command
+        # before the allowlist entry was consulted at all, which is the same
+        # trap --zones and --machine-type above were added for.
+        "--port",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud

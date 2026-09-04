@@ -320,8 +320,7 @@ AUDITS: dict[str, AuditSpec] = {
         "gce_compute_fleet_sop.md",
         (
             "gce-startup-script-status",
-            "mig-autoscaler-flapping",
-            "ops-agent-guest-health",
+            "mig-convergence-stalled",
             "sole-tenant-headroom",
             "orphaned-snapshots",
         ),

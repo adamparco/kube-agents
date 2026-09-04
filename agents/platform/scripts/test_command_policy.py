@@ -624,7 +624,13 @@ class GcloudReadOnlyTest(unittest.TestCase):
         self.assertTrue(evaluate(argv).allowed)
 
     def test_an_unlisted_group_alone_is_refused(self):
-        decision = evaluate(["gcloud", "compute", "instances", "list"])
+        # A pure read is still refused until someone lists it -- this is an
+        # allowlist, not a "reads are fine" rule. `compute images list` stands
+        # in for that: a real, harmless gcloud read that nothing here needs.
+        # It used to be `compute instances list`, which stopped making the
+        # point when the gce-compute-fleet-audit collector turned out to need
+        # that read and it was listed.
+        decision = evaluate(["gcloud", "compute", "images", "list"])
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
 
@@ -1318,6 +1324,47 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertFalse(
                     evaluate(["gcloud", "compute", "routers", verb, "r"]).allowed,
+                    verb,
+                )
+
+    def test_the_gce_compute_fleet_audit_reads_are_allowed(self):
+        # compute_fleet_audit.py opens every project target with
+        # `instances list` and early-returns the target when it comes back
+        # empty. Unlisted, the gate answered before the fleet did: the
+        # collector recorded a skipped target reading "permission denied or
+        # API unavailable" against a project whose disks and snapshots were
+        # readable all along, and both of the stream's checks reported
+        # nothing gathered. Probed against a live install, `instances list`
+        # was refused under gcp.read-only while `disks list` beside it
+        # returned JSON -- the command tuple was the whole difference.
+        # get-serial-port-output is startup-script-failures' only evidence
+        # read: the check looks for "startup-script exit status 1" in the
+        # console output and has no other source for it.
+        for argv, desc in (
+            (["gcloud", "compute", "instances", "list", "--project", "p",
+              "--format=json"],
+             "collector's project inventory, space-separated --project"),
+            (["gcloud", "compute", "instances", "list", "--project=p",
+              "--format=json"],
+             "same read, --project=p"),
+            (["gcloud", "compute", "instances", "get-serial-port-output",
+              "vm-1", "--zone=us-east4-a", "--project=p"],
+             "startup-script-failures evidence read"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_instances_mutations_are_not_swept_in_with_the_fleet_audit_reads(self):
+        # `instances reset` matters most here: the stream emits it as the
+        # proposed remediation text for a failed startup script, so the one
+        # verb the collector names in its own output must stay refused.
+        for verb in ("create", "delete", "reset", "stop", "start",
+                     "add-metadata", "set-machine-type"):
+            with self.subTest(verb=verb):
+                self.assertFalse(
+                    evaluate(["gcloud", "compute", "instances", verb,
+                              "vm-1", "--zone=us-east4-a"]).allowed,
                     verb,
                 )
 

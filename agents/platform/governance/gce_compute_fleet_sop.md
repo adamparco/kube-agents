@@ -1,6 +1,6 @@
 # SOP: GCE Compute Engine and MIG Fleet Audit (Daily Governance)
 
-**Purpose:** Sweep all managed GCE Compute Engine instances and Managed Instance Groups (MIGs) across target GCP projects for failed startup scripts, flapping autoscaler recommendations, failing Ops Agent health metrics, sole-tenant headroom exhaustion, and orphaned storage snapshots. The question this audit answers for a platform admin is: _which standalone VMs or MIG instances have failed startup scripts, where are MIG autoscalers stuck in flapping resize loops, and which storage snapshots belong to deleted disks?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
+**Purpose:** Sweep all managed GCE Compute Engine instances and Managed Instance Groups (MIGs) across target GCP projects for failed startup scripts, MIGs that cannot converge on their target size, sole-tenant headroom exhaustion, and orphaned storage snapshots. The question this audit answers for a platform admin is: _which standalone VMs or MIG instances have failed startup scripts, which MIGs are stuck in a resize loop or unable to create instances at all, and which storage snapshots belong to deleted disks?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying Terraform or manifest fixes for the findings that get promoted.
 
 **Cron:** id `gce-compute-fleet-audit`, schedule `45 7 * * *` (daily 07:45 UTC).
 
@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit gce-compute-fleet-audit
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit gce-compute-fleet-audit
 ```
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gce-compute-fleet-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gce-compute-fleet-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
@@ -26,11 +26,27 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 gcloud projects list --format=json
 ```
 
-- Target every Google Cloud project accessible to the Platform Agent identity. Record each project as `{name: "project-" + project_id, location: "global", project: project_id, checks_run: [...]}` into `scope.clusters`.
+- Target every Google Cloud project accessible to the Platform Agent identity. Record each project as `{name: "project/" + project_id, location: "global", project: project_id, checks_run: [...]}` into `scope.clusters`. The `project/` prefix is what makes the scope line say "project"; a hyphen there is read as a bare cluster name.
 - **`checks_run` is mandatory on every scope entry:** Each entry is an object `{"check": "<slug>", "command": "<literal command>"}` naming the exact inspection command executed on that project target.
 - A project or target you cannot reach goes in `scope.skipped` with a reason string. If a target is partially readable, record the refusal in its `limitations` string. Declare structurally inapplicable checks in `checks_not_applicable`.
 
 ### 2. Diagnostic checks roster
+
+**Run the collector before evaluating any check below by hand.**
+
+```bash
+python3 ./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
+```
+
+This stream's targets are GCP projects, not GKE clusters, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for the field contracts it assumes of each `gcloud` command's JSON. Pass `--project-id <id>` only to scope a run to one project; left alone it resolves its own targets in four tiers, in this order: `MONITORED_PROJECT_IDS`, then every project `gcloud projects list` returns, then `GCP_PROJECT_ID`/`GKE_PROJECT_ID`/`PROJECT_ID`, then `gcloud config get-value project`. The second tier is the one to know about: on an install that does not set `MONITORED_PROJECT_IDS`, an identity that can list the organisation sweeps every project it can see rather than the one it is configured for. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` is one project target, named `project/<project_id>`, carrying one `outcome`. `"collected"` means every check the collector implements already ran; do not re-run it by hand. `"gate-failed"` means one of that target's `gcloud` reads failed; put it in `scope.skipped` with its `error` as the reason.
+- For a `"collected"` target, copy its `commands` list into that target's `checks_run` — minus any entry whose `check` that same target also lists in `checks_not_applicable`. A `commands` entry records that a command ran, not that the check reached a verdict on that target, so one read is routinely recorded against slugs it could not answer for; `finish` rejects a `checks_run` naming a slug the collector declared inapplicable there. Copy that target's `checks_not_applicable` and its `limitations` string verbatim too.
+- **The roster is four checks and the collector implements all four**, so there is nothing below for you to hand-run. §2.3 is a numbered slot rather than a check: `ops-agent-guest-health` is not on the roster and `finish` rejects any mention of it. Where a target does carry a `checks_not_applicable` entry, the list you publish is the collector's, unchanged: copy it, and where a target has none, publish none.
+- **A `checks_not_applicable` reason opening with `UNEVALUATED: ` means something different from one that does not**, and neither is yours to rewrite. Without the marker the check could not apply — the project reserves no sole-tenant node groups, so §2.4 has no reservation to measure. With it, the check applied, the collector read the surface, and no figure came back; that target's other findings cannot be called resolved off this run. Copying the reason verbatim is what keeps the two apart downstream.
+- Every entry in a `"collected"` target's `candidates` is a verified finding: `check`, `object`, `severity`, `impact` and `excerpt` are already computed, and `finish` overwrites your `evidence` with the collector's. What is still yours to write is the `title` and the `recommendation`, and for a `kind: manifest` remediation the Terraform or manifest file itself (§3).
+- **A candidate carrying `needs_triage` is the one place your judgment still decides whether it ships.** The collector applies the mechanical condition and not the check's _Do NOT flag_ clause, so it names the exclusion it could not apply: `gke-managed-node` on §2.1 means confirm the instance is not a GKE node pool member before publishing, `retention-hold` on §2.5 means confirm the snapshot is not under a legal hold or compliance schedule. Drop the candidate where the exclusion holds. `needs_triage` is not a findings-schema field — do not copy it into the document.
+- Pass `--manifest-file <path>` to `finish` (§5) so it cross-checks your `checks_run` against what the collector actually ran.
 
 #### 2.1 Instance startup script failures in serial port output (`gce-startup-script-status`)
 
@@ -40,29 +56,31 @@ gcloud projects list --format=json
 - **Do NOT flag**: GKE node pool instances managed directly by GKE control plane or instances cleanly completing boot without errors.
 - **Remediation**: Correct boot metadata or deployment configuration in instance template or Terraform definition.
 
-#### 2.2 Managed Instance Group autoscaler flapping and resizing loops (`mig-autoscaler-flapping`)
+#### 2.2 Managed Instance Group convergence stalled (`mig-convergence-stalled`)
 
 - **Severity**: `major`
-- **Command**: `gcloud compute instance-groups managed describe $MIG --region=$REGION --format=json`
-- **Condition**: MIG autoscaler repeatedly scales instances up and down within 15 minutes due to contradictory target metric thresholds.
-- **Do NOT flag**: GKE cluster autoscaler managed node pools (`k8s-` or `gke-` prefix) undergoing standard pod-driven scale events.
-- **Remediation**: Adjust autoscaling cool-down period and utilization targets in MIG specification.
+- **Command**: `gcloud compute instance-groups managed list --project=$PROJECT --format=json`
+- **Condition**: A group's `currentActions` shows either `creating` and `deleting` both non-zero — it is adding and removing instances at the same moment, which is a resize loop and not a scale event — or `creatingWithoutRetries` non-zero, meaning creation failed and the group will not try again, so it sits below target until someone intervenes.
+- **Do NOT flag**: GKE node pool groups (`gke-` or `gk3-` prefix) undergoing standard pod-driven scale events. The collector cannot tell a pod-driven churn from a pathological one, so it hands these back carrying `needs_triage: gke-managed-mig`. Also do not flag `status.isStable: false` on its own — instability is the normal state of any group mid-scale, and on a fleet of Autopilot node pools that is every group the moment a workload arrives.
+- **Remediation**: Adjust the autoscaling cool-down period and utilization targets in the MIG specification; for the no-retry limb, the cause is usually a zonal stockout for the machine type or an instance template that no longer resolves.
 
-#### 2.3 Compute Engine Ops Agent guest telemetry and health check failures (`ops-agent-guest-health`)
+This slug replaced `mig-autoscaler-flapping`, whose condition was a rate — repeated resizes inside fifteen minutes. No `gcloud` read carries a MIG's resize history to count one, so the rate was never measurable; these two limbs are the part of that intent a single point-in-time read can establish, and the slug now says what it measures.
 
-- **Severity**: `major`
-- **Command**: `gcloud compute instances describe $VM --zone=$ZONE --format=json`
-- **Condition**: Standalone production VM instance lacks active Google Cloud Ops Agent telemetry reporting or guest health check failures are present.
-- **Do NOT flag**: GKE node instances, short-lived ephemeral batch VMs, or non-production test instances explicitly labeled for dev/test.
-- **Remediation**: Install or restart Google Cloud Ops Agent service on target VM instance.
+#### 2.3 Compute Engine Ops Agent guest telemetry (not audited by this stream)
+
+There is no `ops-agent-guest-health` slug on this stream's roster, and `finish` rejects a `checks_run` or a `finding.check` naming one. Do not hand-run this check and do not publish a `checks_not_applicable` entry for it either.
+
+It is recorded here because the gap is deliberate rather than forgotten. Whether a guest's Ops Agent is reporting lives in Cloud Monitoring or in OS Config inventory, and neither surface is reachable: `gcloud monitoring` exposes no metric read the credential proxy's allowlist could carry, and `osconfig.googleapis.com` is not enabled on the reference install. Carrying the slug as a permanent `UNEVALUATED:` declaration was worse than dropping it — that marker unions the target into `blocked`, where resolution is judged per _target_ rather than per check, so one unimplementable check kept every finding on the other three from ever being announced resolved and their remediation pull requests from ever closing. If the surface becomes reachable, this section is where the check goes back.
 
 #### 2.4 Sole-tenant node group reservation headroom exhaustion (`sole-tenant-headroom`)
 
 - **Severity**: `minor`
-- **Command**: `gcloud compute sole-tenancy node-groups list --format=json`
-- **Condition**: Sole-tenant node group utilization exceeds 90% allocated vCPU/memory capacity without failover host headroom.
-- **Do NOT flag**: Node groups with active autoscaling enabled or planned maintenance windows.
-- **Remediation**: Add capacity or expand sole-tenant node group reservation.
+- **Command**: `gcloud compute sole-tenancy node-groups list --project=$PROJECT --format=json`, then `gcloud compute sole-tenancy node-groups list-nodes $GROUP --zone=$ZONE --project=$PROJECT --format=json` per group.
+- **Condition**: Consumed vCPU or memory reaches 90% of the group's aggregate capacity **and** less than one node's worth of vCPU is still free. Both halves are required: a group at 90% across ten nodes still has a whole node spare and survives losing one, which is what "without failover host headroom" means.
+- **Do NOT flag**: Node groups with autoscaling enabled — the collector applies this one itself, because `autoscalingPolicy.mode` is a field on the group rather than a judgment about it. Planned maintenance windows are not readable, so candidates come back carrying `needs_triage: maintenance-window`.
+- **Remediation**: Add capacity or expand the sole-tenant node group reservation.
+
+A project reserving no sole-tenant node groups gets a plain `checks_not_applicable` entry with no `UNEVALUATED:` marker: the enumeration ran and came back empty, which is a structural absence the read positively established, not a measurement that failed. The marker is reserved for the case where the groups exist, `list-nodes` ran, and not one node carried the `totalResources`/`consumedResources` figures the ratio needs.
 
 #### 2.5 Orphaned Persistent Disk snapshots from deleted source disks (`orphaned-snapshots`)
 
@@ -93,7 +111,7 @@ Every finding must conform to the full findings schema:
   "scope": {
     "clusters": [
       {
-        "name": "project-proj-1",
+        "name": "project/proj-1",
         "location": "global",
         "project": "proj-1",
         "checks_run": [
@@ -111,9 +129,9 @@ Every finding must conform to the full findings schema:
       "check": "gce-startup-script-status",
       "severity": "critical",
       "title": "Startup script failure on standalone instance vm-1",
-      "cluster": "project-proj-1",
+      "cluster": "project/proj-1",
       "namespace": "",
-      "object": "ComputeInstance/vm-1",
+      "object": "ComputeInstance/us-central1-a/vm-1",
       "impact": "Instance vm-1 failed initialization and is unable to serve production traffic.",
       "evidence": {
         "command": "gcloud compute instances get-serial-port-output vm-1 --zone=us-central1-a --port=1 --project=proj-1",
@@ -137,7 +155,9 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit gce-compute-fleet-audit   --findings-file /opt/data/scratch/findings_gce-compute-fleet-audit.json
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit gce-compute-fleet-audit \
+  --findings-file /opt/data/scratch/findings_gce-compute-fleet-audit.json \
+  --manifest-file /opt/data/scratch/manifest_gce-compute-fleet-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
@@ -154,6 +174,6 @@ Every finding must conform to the full findings schema:
 - **Read-only audit.** Never terminate Compute Engine instances, delete Persistent Disks, or modify live firewall rules.
 - **No hand-written issues or PRs.** `audit_report.py` owns the entire git/GitHub write path.
 - **Never print raw credentials.** Secret tokens, certificates, private keys, or credentials in serial port output must never reach an excerpt.
-- **No unstable finding identity.** Name the durable resource identifier (`ComputeInstance/<name>`, `ManagedInstanceGroup/<name>`), never an ephemeral instance ID.
+- **No unstable finding identity.** Name the durable resource identifier (`ComputeInstance/<zone>/<name>`, `ManagedInstanceGroup/<region>/<name>`), never an ephemeral instance ID. The zone or region is part of the identity, not decoration: a GCE instance name is unique per zone, so two `web-1`s in one project collapse to one finding id without it and `finish` refuses the whole document over the collision.
 - **Never emit a manifest that directly deletes a VM or disk.** Deletion remediations are `kind: manual` or `kind: gcloud` only.
 - **Never export internal VM secrets or private keys in issue bodies.**

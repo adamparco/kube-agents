@@ -26,7 +26,7 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these eight audit ids may own a ledger. Any other id is rejected before a single git or gh
+Only these nine audit ids may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
@@ -41,6 +41,7 @@ watchdog — **not** a prettified form of the audit id:
 | `ai-security-audit`           | `[audit] AI Workload Security Audit — 7 findings (2 critical)`                 |
 | `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 | `gcp-networking-fabric-audit` | `[audit] GCP Networking Fabric & VPC IPAM Audit — 7 findings (2 critical)`     |
+| `gce-compute-fleet-audit`     | `[audit] GCE Compute Engine and MIG Fleet Audit — 7 findings (2 critical)`     |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -108,7 +109,7 @@ token in it as a script it must scan too. Two of those tokens — `/opt/defaults
 `/opt/data/scripts` — are real directories, the guard fails closed on a reference it cannot read as
 a script, and the command is refused with a message about restarting the gateway that has nothing
 to do with what was asked. Naming an interpreter makes the file an argument rather than the
-executable, so nothing reads it. Every invocation in this file and in all eight SOPs is spelled
+executable, so nothing reads it. Every invocation in this file and in all nine SOPs is spelled
 that way; do not shorten one back.
 
 This resolves the target repository (using `--repo` if specified, falling back to the single configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints a repo-scoped GitHub token, clones or refreshes the

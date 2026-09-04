@@ -3,6 +3,7 @@
 
 import datetime
 import hashlib
+import json
 import os
 import sys
 import unittest
@@ -28,6 +29,40 @@ def one_running_instance(name: str = "vm-1", zone: str = "us-central1-a") -> str
         f'[{{"name": "{name}", "status": "RUNNING", '
         f'"zone": "https://x/projects/proj-1/zones/{zone}"}}]'
     )
+
+
+def mig(name: str = "mig-1", zone: str = "us-central1-a", **actions) -> dict:
+    """One `instance-groups managed list` item, converged unless told otherwise.
+
+    All thirteen `currentActions` counters are present and zero, the way the
+    API publishes them, so a test that wants churn names only the counter it
+    is raising.
+    """
+    counters = {
+        key: 0
+        for key in (
+            "abandoning", "creating", "creatingWithoutRetries", "deleting",
+            "none", "recreating", "refreshing", "restarting", "resuming",
+            "starting", "stopping", "suspending", "verifying",
+        )
+    }
+    counters.update(actions)
+    return {
+        "name": name,
+        "size": 2,
+        "targetSize": 2,
+        "zone": f"https://x/projects/proj-1/zones/{zone}",
+        "status": {"isStable": not any(counters.values()), "versionTarget": {"isReached": True}},
+        "currentActions": counters,
+    }
+
+
+def node(cpus: int = 8, used_cpus: int = 0, mem: int = 32768, used_mem: int = 0) -> dict:
+    """One `sole-tenancy node-groups list-nodes` item."""
+    return {
+        "totalResources": {"guestCpus": cpus, "memoryMb": mem},
+        "consumedResources": {"guestCpus": used_cpus, "memoryMb": used_mem},
+    }
 
 
 class RunAndGateTest(unittest.TestCase):
@@ -234,9 +269,15 @@ class CollectProjectTest(unittest.TestCase):
         return run
 
     def clean(self, **overrides) -> dict:
+        # `node-groups list-nodes` is stubbed before `node-groups list` because
+        # `fake_run` matches on substring in insertion order and the shorter
+        # needle is a prefix of the longer command.
         responses = {
             "instances list": run_of(0, one_running_instance()),
             "get-serial-port-output": run_of(0, "boot ok\n"),
+            "instance-groups managed list": run_of(0, json.dumps([mig()])),
+            "node-groups list-nodes": run_of(0, "[]"),
+            "node-groups list": run_of(0, "[]"),
             "disks list": run_of(0, "[]"),
             "snapshots list": run_of(0, "[]"),
         }
@@ -385,17 +426,64 @@ class CollectProjectTest(unittest.TestCase):
 
     # --- the three checks nobody implemented -------------------------------- #
 
-    def test_the_three_unimplemented_checks_are_declared_unevaluated(self):
-        """Silence would be read as a clean result. The declaration is what
-        stops `finish` accepting a `checks_run` claim on a check no code
-        performs, and what stops a previous finding on one being announced
-        resolved because this run said nothing about it.
+    def test_an_empty_enumeration_is_structural_not_unevaluated(self):
+        """The distinction the whole coverage model turns on.
+
+        A project reserving no sole-tenant node groups gets a plain
+        `checks_not_applicable` entry. Marking it `UNEVALUATED:` instead would
+        union the target into `blocked`, where `unverifiable_findings` judges
+        resolution per *target* rather than per check — so one absent object
+        class would stop findings on the other three checks from ever being
+        announced resolved and their remediation pull requests from closing.
         """
         entry = cf.collect_project("proj-1", run=self.fake_run(self.clean()))
         declared = {e["check"]: e["reason"] for e in entry["checks_not_applicable"]}
-        for slug in ("mig-autoscaler-flapping", "ops-agent-guest-health", "sole-tenant-headroom"):
-            self.assertIn(slug, declared)
-            self.assertTrue(declared[slug].startswith(cf.UNEVALUATED_MARKER), slug)
+        self.assertIn(cf.SOLE_TENANT_SLUG, declared)
+        self.assertFalse(
+            declared[cf.SOLE_TENANT_SLUG].startswith(cf.UNEVALUATED_MARKER),
+            "an enumeration that ran and came back empty is a result, not a gap",
+        )
+
+    def test_a_clean_project_carries_no_unevaluated_marker_at_all(self):
+        """The regression that motivated implementing §2.2 and §2.4.
+
+        The roster used to be five checks with three of them declared
+        `UNEVALUATED:` on every target forever. Because that marker leaves the
+        coverage denominator, a two-of-five run published `coverage_gaps: []`
+        and `partial: false` and closed the ledger claiming coverage it did not
+        have — while simultaneously pinning every target in `blocked`. Asserted
+        through `audit_report`'s own readers rather than by string matching, so
+        the test tracks the semantics and not this collector's phrasing.
+        """
+        import audit_report
+
+        entry = cf.collect_project("proj-1", run=self.fake_run(self.clean()))
+        cluster = {
+            "name": entry["name"],
+            "checks_run": [
+                {"check": c["check"], "command": c["command"]} for c in entry["commands"]
+            ],
+            "checks_not_applicable": entry["checks_not_applicable"],
+        }
+        self.assertEqual(audit_report.checks_unevaluated(cluster), [])
+
+        doc = {"audit": cf.AUDIT_ID, "scope": {"clusters": [cluster]}, "findings": []}
+        self.assertEqual(audit_report.unevaluated_targets(doc), set())
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_every_roster_slug_is_either_run_or_declared(self):
+        """No slug may go unmentioned, and the roster is the list to check
+        against — hard-coding the four names here would keep passing after
+        someone adds a fifth to `AuditSpec` and implements nothing."""
+        import audit_report
+
+        entry = cf.collect_project("proj-1", run=self.fake_run(self.clean()))
+        accounted = {c["check"] for c in entry["commands"]} | {
+            d["check"] for d in entry["checks_not_applicable"]
+        }
+        roster = set(audit_report.AUDITS[cf.AUDIT_ID].checks)
+        self.assertEqual(roster - accounted, set())
+        self.assertEqual(accounted - roster, set())
 
     def test_no_command_is_recorded_for_a_check_declared_inapplicable(self):
         """Rule 6.5 exists because one broad read recorded against every slug
@@ -406,13 +494,18 @@ class CollectProjectTest(unittest.TestCase):
         recorded = {c["check"] for c in entry["commands"]}
         self.assertEqual(declared & recorded, set())
 
-    def test_no_candidate_is_emitted_for_an_unimplemented_check(self):
+    def test_every_candidate_cites_a_roster_slug(self):
+        """`finding.check` is validated against the roster plus the derived
+        slugs, so a candidate citing anything else costs the whole document."""
+        import audit_report
+
         entry = cf.collect_project(
             "proj-1",
             run=self.fake_run(self.clean(**{"get-serial-port-output": run_of(0, "startup-script exit status 1\n")})),
         )
         emitted = {c["check"] for c in entry["candidates"]}
-        self.assertEqual(emitted - {cf.STARTUP_SLUG, cf.SNAPSHOT_SLUG}, set())
+        self.assertTrue(emitted)
+        self.assertEqual(emitted - audit_report.audit_finding_checks(cf.AUDIT_ID), set())
 
     # --- gcloud failure handling -------------------------------------------- #
 
@@ -666,9 +759,16 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
     AUDIT = "gce-compute-fleet-audit"
 
     def fleet(self, **overrides) -> dict:
+        # One converged MIG and no sole-tenant node groups: the shape of the
+        # reference install, where §2.2 runs and finds nothing and §2.4 declares
+        # a structural non-applicability. Between them the target exercises both
+        # dispositions the roster cross-check has to accept.
         responses = {
             "instances list": run_of(0, one_running_instance()),
             "get-serial-port-output": run_of(0, "startup-script exit status 1\n"),
+            "instance-groups managed list": run_of(0, json.dumps([mig()])),
+            "node-groups list-nodes": run_of(0, "[]"),
+            "node-groups list": run_of(0, "[]"),
             "disks list": run_of(0, "[]"),
             "snapshots list": run_of(0, "[]"),
         }
@@ -775,22 +875,34 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         audit_report.adopt_collector_evidence(data["findings"], manifest)
         self.assertEqual(data["findings"][0]["evidence"]["excerpt"], "startup-script exit status 1")
 
-    def test_claiming_an_unimplemented_check_is_rejected(self):
+    def test_claiming_a_check_declared_inapplicable_is_rejected(self):
         """Rule 6.5. The collector declared the slug inapplicable, so a
-        document asserting it ran is refused however the command is spelled."""
+        document asserting it ran is refused however the command is spelled.
+
+        Aimed at `sole-tenant-headroom` deliberately. The slug has to be one
+        that is *on the roster* and declared not-applicable by this fixture,
+        which is what Rule 6.5 is about; a slug that left the roster is
+        refused a step earlier as simply unknown, and pointing this test at one
+        would have it pass without the rule under test ever running.
+        """
         import audit_report
 
         manifest = self.fleet()
+        declared = {
+            d["check"] for d in manifest["clusters"][0]["checks_not_applicable"]
+        }
+        self.assertIn("sole-tenant-headroom", declared)
+
         data = self._document(manifest)
         data["scope"]["clusters"][0]["checks_run"].append(
             {
-                "check": "mig-autoscaler-flapping",
-                "command": "gcloud compute instance-groups managed list --project proj-1 --format=json",
+                "check": "sole-tenant-headroom",
+                "command": "gcloud compute sole-tenancy node-groups list --project proj-1 --format=json",
             }
         )
         with self.assertRaises(audit_report.ValidationError) as caught:
             audit_report.cross_check_manifest(data, manifest)
-        self.assertIn("mig-autoscaler-flapping", str(caught.exception))
+        self.assertIn("sole-tenant-headroom", str(caught.exception))
 
     def test_a_gate_failed_target_left_out_of_the_document_is_rejected(self):
         """Rule 6.2. A project the collector could not read has to be
@@ -937,9 +1049,19 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
     not by the shape of the fix."""
 
     def fake_run(self, responses: dict) -> cf.RunFn:
+        # The §2.2 and §2.4 reads are appended *after* whatever the caller
+        # stubbed, so a caller that names one still wins the first-match scan.
+        # None of the defects below is about a MIG or a node group, and every
+        # test in this class would otherwise have to stub two reads it does not
+        # care about.
+        stubs = dict(responses)
+        stubs.setdefault("instance-groups managed list", run_of(0, "[]"))
+        stubs.setdefault("node-groups list-nodes", run_of(0, "[]"))
+        stubs.setdefault("node-groups list", run_of(0, "[]"))
+
         def run(argv, **kwargs):
             joined = " ".join(argv)
-            for needle, result in responses.items():
+            for needle, result in stubs.items():
                 if needle in joined:
                     return result
             raise AssertionError(f"unstubbed command: {joined}")
@@ -1055,6 +1177,256 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
         self.assertLessEqual(len(command), cf.MAX_COMMAND_CHARS)
         self.assertIn("more read(s)", command, "fixture must overflow the budget")
         self.assertIn("vm-059", command, "the read behind the published excerpt was clipped away")
+
+
+class MigConvergenceTest(unittest.TestCase):
+    """§2.2. Two limbs, and several shapes that deliberately are not limbs."""
+
+    def test_a_converged_group_is_not_a_finding(self):
+        self.assertIsNone(cf.check_mig_convergence(mig()))
+
+    def test_creating_and_deleting_at_once_is_the_resize_loop(self):
+        hit = cf.check_mig_convergence(mig(creating=2, deleting=1))
+        self.assertEqual(hit["object"], "ManagedInstanceGroup/us-central1-a/mig-1")
+        self.assertIn("creating=2", hit["excerpt"])
+        self.assertIn("deleting=1", hit["excerpt"])
+
+    def test_creating_without_retries_is_the_stuck_group(self):
+        hit = cf.check_mig_convergence(mig(creatingWithoutRetries=3))
+        self.assertIn("creatingWithoutRetries=3", hit["excerpt"])
+        self.assertIn("will not retry", hit["impact"])
+
+    def test_a_group_only_scaling_up_is_not_a_finding(self):
+        """The false positive the check is shaped to avoid. A healthy
+        autoscaler under load creates instances and is `isStable: false` the
+        whole time; flagging that reports every group on the fleet."""
+        self.assertIsNone(cf.check_mig_convergence(mig(creating=4)))
+
+    def test_a_group_only_scaling_down_is_not_a_finding(self):
+        self.assertIsNone(cf.check_mig_convergence(mig(deleting=4)))
+
+    def test_a_rolling_update_is_not_a_finding(self):
+        """`recreating` is how a MIG rolls a new template through. It is not a
+        resize at all, and neither limb reads it."""
+        self.assertIsNone(cf.check_mig_convergence(mig(recreating=5)))
+
+    def test_the_gke_exclusion_is_handed_back_to_the_model(self):
+        for name in ("gke-prod-default-pool-1234-grp", "gk3-auto-pool-1-abcd-grp"):
+            hit = cf.check_mig_convergence(mig(name=name, creating=1, deleting=1))
+            self.assertEqual(hit["needs_triage"], cf.TRIAGE_GKE_MIG, name)
+
+    def test_a_non_gke_group_carries_no_triage(self):
+        hit = cf.check_mig_convergence(mig(name="batch-workers", creating=1, deleting=1))
+        self.assertIsNone(hit["needs_triage"])
+
+    def test_a_regional_group_is_scoped_by_region(self):
+        """A MIG list mixes zonal and regional groups, and only one of the two
+        keys is present on any given item."""
+        regional = mig(name="rmig")
+        del regional["zone"]
+        regional["region"] = "https://x/projects/proj-1/regions/us-central1"
+        regional["currentActions"].update(creating=1, deleting=1)
+        hit = cf.check_mig_convergence(regional)
+        self.assertEqual(hit["object"], "ManagedInstanceGroup/us-central1/rmig")
+
+    def test_two_same_named_groups_in_different_zones_stay_distinct(self):
+        """The collision `check_startup_script` is zone-qualified for: a MIG
+        name is unique per scope, and two candidates deriving one finding id
+        make `validate_findings` refuse the whole document."""
+        a = cf.check_mig_convergence(mig(zone="us-central1-a", creating=1, deleting=1))
+        b = cf.check_mig_convergence(mig(zone="us-central1-b", creating=1, deleting=1))
+        self.assertNotEqual(a["object"], b["object"])
+
+    def test_a_missing_actions_object_is_not_a_crash(self):
+        broken = mig()
+        del broken["currentActions"]
+        self.assertIsNone(cf.check_mig_convergence(broken))
+
+    def test_a_non_integer_counter_reads_as_zero(self):
+        """A changed contract must read as "no churn observed" rather than cost
+        the project its whole MIG check."""
+        weird = mig()
+        weird["currentActions"]["creating"] = "two"
+        weird["currentActions"]["deleting"] = 1
+        self.assertIsNone(cf.check_mig_convergence(weird))
+
+    def test_an_unnamed_group_is_skipped(self):
+        self.assertIsNone(cf.check_mig_convergence(mig(name="")))
+
+
+class SoleTenantHeadroomTest(unittest.TestCase):
+    """§2.4. The `measured` half of the return value is the point: it keeps
+    "read it, it is fine" apart from "never read it"."""
+
+    GROUP = {"name": "ng-1", "zone": "https://x/projects/proj-1/zones/us-central1-a"}
+
+    def test_an_idle_group_is_clean_and_measured(self):
+        hit, measured = cf.check_sole_tenant_headroom(self.GROUP, [node(), node()])
+        self.assertIsNone(hit)
+        self.assertTrue(measured)
+
+    def test_a_full_single_node_group_is_flagged(self):
+        hit, measured = cf.check_sole_tenant_headroom(
+            self.GROUP, [node(cpus=8, used_cpus=8, mem=32768, used_mem=30000)]
+        )
+        self.assertTrue(measured)
+        self.assertEqual(hit["object"], "NodeGroup/us-central1-a/ng-1")
+        self.assertEqual(hit["needs_triage"], cf.TRIAGE_MAINTENANCE)
+        self.assertIn("100%", hit["excerpt"])
+
+    def test_ninety_percent_with_a_whole_node_spare_is_not_flagged(self):
+        """The "without failover host headroom" half of §2.4's conjunction. Ten
+        nodes at 90% still survive losing one, so utilisation alone is not the
+        condition."""
+        nodes = [node(cpus=10, used_cpus=9) for _ in range(10)]
+        hit, measured = cf.check_sole_tenant_headroom(self.GROUP, nodes)
+        self.assertTrue(measured)
+        self.assertIsNone(hit)
+
+    def test_memory_pressure_alone_can_flag(self):
+        hit, _ = cf.check_sole_tenant_headroom(
+            self.GROUP, [node(cpus=8, used_cpus=8, mem=1000, used_mem=950)]
+        )
+        self.assertIsNotNone(hit)
+
+    def test_an_autoscaling_group_is_excluded_and_still_counts_as_measured(self):
+        """§2.4's Do-NOT-flag limb. Excluded is not the same as unread — the
+        group was measured, so it must not drag the check into `UNEVALUATED:`."""
+        group = dict(self.GROUP, autoscalingPolicy={"mode": "ON"})
+        hit, measured = cf.check_sole_tenant_headroom(group, [node(cpus=8, used_cpus=8)])
+        self.assertIsNone(hit)
+        self.assertTrue(measured)
+
+    def test_a_group_with_autoscaling_off_is_still_evaluated(self):
+        group = dict(self.GROUP, autoscalingPolicy={"mode": "OFF"})
+        hit, _ = cf.check_sole_tenant_headroom(group, [node(cpus=8, used_cpus=8)])
+        self.assertIsNotNone(hit)
+
+    def test_nodes_without_resource_figures_report_unmeasured(self):
+        """The genuine `UNEVALUATED:` case, and the only one this check
+        produces. Returning `(None, True)` here would publish a clean verdict
+        off a read that yielded nothing."""
+        hit, measured = cf.check_sole_tenant_headroom(self.GROUP, [{"status": "READY"}])
+        self.assertIsNone(hit)
+        self.assertFalse(measured)
+
+    def test_an_empty_node_list_reports_unmeasured(self):
+        self.assertEqual(cf.check_sole_tenant_headroom(self.GROUP, []), (None, False))
+
+    def test_a_zero_capacity_node_does_not_skew_the_ratio(self):
+        """Counting a node that reports no capacity would shrink the
+        denominator and manufacture a utilisation figure from a bad record."""
+        nodes = [node(cpus=0, used_cpus=0), node(cpus=10, used_cpus=1)]
+        hit, measured = cf.check_sole_tenant_headroom(self.GROUP, nodes)
+        self.assertTrue(measured)
+        self.assertIsNone(hit)
+
+    def test_a_malformed_node_is_skipped_not_fatal(self):
+        nodes = [None, "junk", node(cpus=8, used_cpus=8)]
+        hit, measured = cf.check_sole_tenant_headroom(self.GROUP, nodes)
+        self.assertTrue(measured)
+        self.assertIsNotNone(hit)
+
+
+class NewChecksInCollectProjectTest(unittest.TestCase):
+    """The two checks wired through `collect_project`, where the manifest
+    dispositions are actually decided."""
+
+    def run_with(self, **overrides):
+        base = {
+            "instances list": run_of(0, one_running_instance()),
+            "get-serial-port-output": run_of(0, "boot ok\n"),
+            "instance-groups managed list": run_of(0, json.dumps([mig()])),
+            "node-groups list-nodes": run_of(0, "[]"),
+            "node-groups list": run_of(0, "[]"),
+            "disks list": run_of(0, "[]"),
+            "snapshots list": run_of(0, "[]"),
+        }
+        base.update(overrides)
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            for needle, result in base.items():
+                if needle in joined:
+                    return result
+            raise AssertionError(f"unstubbed command: {joined}")
+
+        return cf.collect_project("proj-1", run=run)
+
+    def test_a_project_with_no_migs_declares_a_structural_na(self):
+        entry = self.run_with(**{"instance-groups managed list": run_of(0, "[]")})
+        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+        self.assertIn(cf.MIG_SLUG, declared)
+        self.assertFalse(declared[cf.MIG_SLUG].startswith(cf.UNEVALUATED_MARKER))
+
+    def test_a_project_with_migs_records_a_command_not_a_declaration(self):
+        entry = self.run_with()
+        self.assertIn(cf.MIG_SLUG, {c["check"] for c in entry["commands"]})
+        self.assertNotIn(cf.MIG_SLUG, {d["check"] for d in entry["checks_not_applicable"]})
+
+    def test_a_churning_mig_becomes_a_candidate(self):
+        entry = self.run_with(
+            **{
+                "instance-groups managed list": run_of(
+                    0, json.dumps([mig(creating=1, deleting=1)])
+                )
+            }
+        )
+        hits = [c for c in entry["candidates"] if c["check"] == cf.MIG_SLUG]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_node_groups_that_exist_but_cannot_be_measured_are_unevaluated(self):
+        entry = self.run_with(
+            **{
+                "node-groups list": run_of(
+                    0, json.dumps([{"name": "ng-1", "zone": "https://x/zones/z1"}])
+                ),
+                "node-groups list-nodes": run_of(0, json.dumps([{"status": "READY"}])),
+            }
+        )
+        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+        self.assertIn(cf.SOLE_TENANT_SLUG, declared)
+        self.assertTrue(declared[cf.SOLE_TENANT_SLUG].startswith(cf.UNEVALUATED_MARKER))
+        self.assertIn("1 node group(s)", declared[cf.SOLE_TENANT_SLUG])
+
+    def test_a_measured_node_group_is_not_declared_at_all(self):
+        entry = self.run_with(
+            **{
+                "node-groups list": run_of(
+                    0, json.dumps([{"name": "ng-1", "zone": "https://x/zones/z1"}])
+                ),
+                "node-groups list-nodes": run_of(0, json.dumps([node(cpus=8, used_cpus=1)])),
+            }
+        )
+        self.assertNotIn(
+            cf.SOLE_TENANT_SLUG, {d["check"] for d in entry["checks_not_applicable"]}
+        )
+        self.assertIn(cf.SOLE_TENANT_SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_one_unreadable_node_group_does_not_cost_the_project(self):
+        """A `list-nodes` that fails is not a project-level gate failure, the
+        way one unreadable serial console is not: the snapshot check still has
+        to run."""
+        entry = self.run_with(
+            **{
+                "node-groups list": run_of(
+                    0, json.dumps([{"name": "ng-1", "zone": "https://x/zones/z1"}])
+                ),
+                "node-groups list-nodes": run_of(1, "", "PERMISSION_DENIED"),
+            }
+        )
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIn(cf.SNAPSHOT_SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_mig_list_gate_fails_the_target(self):
+        """Unlike `list-nodes`, the group enumeration is gated: reading zero
+        groups off a failed call would report a project with no MIGs."""
+        entry = self.run_with(
+            **{"instance-groups managed list": run_of(1, "", "PERMISSION_DENIED")}
+        )
+        self.assertEqual(entry["outcome"], "gate-failed")
+        self.assertIn(cf.MIG_SLUG, entry["error"])
 
 
 if __name__ == "__main__":

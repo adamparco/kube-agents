@@ -102,7 +102,7 @@
       "prompt": "Run the daily GCP networking fabric and VPC IPAM audit. Run the collector (`skills/gcp-networking-fabric-audit/scripts/networking_audit.py`) first, redirecting its stdout to /opt/data/scratch/manifest_gcp-networking-fabric-audit.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/gcp_networking_fabric_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found and for the manual fallback on any cluster it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "chat"
+      "deliver": "all"
     },
     {
       "id": "gce-compute-fleet-audit",
@@ -112,10 +112,10 @@
         "expr": "45 7 * * *",
         "display": "45 7 * * *"
       },
-      "prompt": "Run the daily GCE Compute Engine and MIG fleet audit. Read the SOP at 'governance/gce_compute_fleet_sop.md' in your profile home — all 159 lines of it, before you run anything. Its five checks are section 2, lines 33-74, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily GCE Compute Engine and MIG fleet audit. Run the collector (`skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py`) first, redirecting its stdout to /opt/data/scratch/manifest_gce-compute-fleet-audit.json, and read that manifest before doing anything else — it is the tested, procedural implementation of every check in the SOP at 'governance/gce_compute_fleet_sop.md' in your profile home. Read that SOP for the Flag-when/Do-NOT-flag semantics you need to triage what the collector found, for what a `checks_not_applicable` reason means with and without the `UNEVALUATED: ` marker, and for the manual fallback on any project it could not cover. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
-      "deliver": "all"
+      "deliver": "chat"
     },
     {
       "id": "github-repo-watcher",
