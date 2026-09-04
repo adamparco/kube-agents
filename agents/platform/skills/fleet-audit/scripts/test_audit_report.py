@@ -870,6 +870,55 @@ class TestRenderBody(unittest.TestCase):
         )
         self.assertIn("_cluster-scoped_", body)
 
+    def test_a_project_target_is_not_called_cluster_scoped(self):
+        """Issue #113 published `project/adamparco-kage` / _cluster-scoped_.
+
+        A reserved external IP is not cluster-scoped; the project-scoped streams
+        name no cluster at all, so the hardcoded label was wrong on every
+        finding they can publish.
+        """
+        body = render_body(
+            make_doc(
+                findings=[
+                    make_finding(
+                        cluster="project/adamparco-kage",
+                        namespace="",
+                        obj="Address/argocd-webhook-ip",
+                    )
+                ]
+            ),
+            generated_at=NOW,
+        )
+        self.assertIn("_project-scoped_", body)
+        self.assertNotIn("_cluster-scoped_", body)
+
+    def test_a_subnet_target_is_not_called_cluster_scoped(self):
+        body = render_body(
+            make_doc(
+                findings=[
+                    make_finding(
+                        cluster="adamparco-kage/us-east4/default",
+                        namespace="",
+                        obj="Subnet/default",
+                    )
+                ]
+            ),
+            generated_at=NOW,
+        )
+        self.assertIn("_subnet-scoped_", body)
+        self.assertNotIn("_cluster-scoped_", body)
+
+    def test_a_namespaced_finding_still_names_its_namespace(self):
+        """The scope label is the else-branch; it must not displace a namespace."""
+        body = render_body(
+            make_doc(
+                findings=[make_finding(namespace="payments", obj="Deployment/api")]
+            ),
+            generated_at=NOW,
+        )
+        self.assertIn("`payments`", body)
+        self.assertNotIn("-scoped_", body)
+
     def test_body_is_deterministic_regardless_of_input_order(self):
         first = render_body(
             make_doc(findings=THREE_SEVERITIES), generated_at=NOW

@@ -5314,11 +5314,22 @@ def render_finding(
     # and publish nothing at all — the noisiest possible failure for the least
     # important reason.
     title = clip_text(finding.get("title", ""), MAX_TITLE_CHARS)
-    cluster = _ident(str(finding.get("cluster", "")))
+    target = str(finding.get("cluster", ""))
+    cluster = _ident(target)
     namespace = _ident(str(finding.get("namespace", "")))
     obj = _ident(str(finding.get("object", "")))
     where = f"`{cluster}`"
-    where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
+    # Named after what the target actually is. This used to be a hardcoded
+    # "cluster-scoped", which is a false statement on every project-scoped
+    # stream: issue #113 published a reserved external IP as
+    # `project/adamparco-kage` / _cluster-scoped_, and gce-compute-fleet-audit
+    # names no cluster at all, so every finding it can ever publish would have
+    # carried it. `target_kind` already draws this distinction for the scope
+    # table's header, and is read off the raw name rather than the `_ident`
+    # form because `_ident` clips, and a clip could take the `/` with it.
+    where += (
+        f" / `{namespace}`" if namespace else f" / _{target_kind(target)}-scoped_"
+    )
 
     # The anchor is a line of its own *above* the heading rather than markup
     # appended to it, so the `finding:` comment stays the last thing on the
