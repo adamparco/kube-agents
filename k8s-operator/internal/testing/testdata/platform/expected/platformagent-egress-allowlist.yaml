@@ -329,6 +329,10 @@ data:
         enabled: false
         extra:
           rich_blocks: true
+      teams:
+        enabled: false
+        extra:
+          adaptive_cards: true
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
     HERMES_HOME_MODE=2770
@@ -1258,6 +1262,8 @@ spec:
         - ipBlock:
             cidr: 169.254.20.10/32
         - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
             cidr: 10.96.0.10/32
     - ports:
         - port: 8765
@@ -1416,6 +1422,8 @@ spec:
               k8s-app: node-local-dns
         - ipBlock:
             cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
     - ports:

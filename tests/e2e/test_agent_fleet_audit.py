@@ -480,13 +480,13 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.REPORTS_DIR = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
-        audit_report.refresh_credentials = lambda repo=None: None
-        # `*a, **k`: `handle_finish` calls this as `resolve_repo(audit_id=…, repo=…)`.
-        # A zero-arg stub raised TypeError there, `main()`'s blanket handler turned
-        # that into exit 1, and all seven audit cases failed on the stub rather than
-        # on the product — with the release-candidate pipeline as the only thing
-        # running them.
-        audit_report.resolve_repo = lambda *a, **k: "test-org-kube-agent/agents-repo"
+        audit_report.refresh_credentials = lambda *args, **kwargs: None
+        # `*args, **kwargs`: `handle_finish` calls this as
+        # `resolve_repo(audit_id=…, repo=…)`. A zero-arg stub raised TypeError there,
+        # `main()`'s blanket handler turned that into exit 1, and all seven audit
+        # cases failed on the stub rather than on the product — with the
+        # release-candidate pipeline as the only thing running them.
+        audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
 
         valid_check = audit_report.AUDITS[audit_id].checks[0] if audit_id in audit_report.AUDITS and audit_report.AUDITS[audit_id].checks else "single-zone-nodepool"

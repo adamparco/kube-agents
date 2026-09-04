@@ -285,10 +285,11 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "get-value"),
         ("config", "list"),
         # `beta` is a word like any other here, so a beta path has to be
-        # listed on its own -- the GA entry above it grants nothing. These two
+        # listed on its own -- the GA entry above it grants nothing. These
         # are the stockout SOP's capacity forecast; the data has no GA
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
+        ("beta", "compute", "advice", "capacity"),
         ("beta", "compute", "advice", "capacity-history"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
@@ -421,6 +422,9 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # capacity-history was ever reached -- and every stockout run recorded
         # spot-scarcity-risk as "did not run" against all four clusters.
         "--machine-type", "--provisioning-model",
+        # The sibling `beta compute advice capacity` shapes its request with
+        # these two on top of the plural spellings above.
+        "--target-distribution-shape", "--instance-selection",
         # `compute routers list` takes --regions (plural). Same trap as
         # --zones above: the singular was listed and the plural was not.
         "--regions",
