@@ -98,7 +98,8 @@ A project reserving no sole-tenant node groups gets a plain `checks_not_applicab
 For promoted findings requiring `kind: manifest` remediation, write the updated Terraform or manifest file to `remediation.path` resolved within the `workspace` GitOps repository:
 
 - Discover the target configuration from existing repository paths (e.g., `terraform/modules/compute/vm.tf`).
-- Never invent phantom paths or write manifests to directories outside the reconciled GitOps hierarchy.
+- **The Declaration Rule in the fleet-audit skill decides where the file goes** — for an object the repo already declares and for one it does not yet. Follow it rather than a rule of your own. Every target this audit reports on is project-scoped, so the sibling that proves a directory is reconciled is another declaration governing that same project: a Config Connector `Compute*` resource, or the Terraform file that already describes the instances, MIGs, or node groups you are fixing. Find no sibling for the project and the finding is `kind: manual`.
+- Never write to a directory outside the reconciled GitOps hierarchy. Creating an object the repo does not yet declare is permitted and is what makes a finding resolvable by a pull request; inventing the _directory_ to put it in is not, because the repository is reconciled over a fixed set of paths and a file outside them is applied by nothing.
 
 ### 4. Emit findings.json
 

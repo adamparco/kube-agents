@@ -177,6 +177,36 @@ If a remediation is a declarative file, write that file **under the `workspace` 
 reported** and name its repo-relative path in the finding. The harness puts it on a branch of its
 own.
 
+**The Declaration Rule — where that file goes.** A remediation that changes an object the repo
+already declares goes to that declaration: locate it (`grep -rl "name: <object>" --include='*.yaml'
+.`), name that file's repo-relative path, and rewrite it as the object's complete desired manifest.
+Open the hits before trusting them — `grep` is kind-blind and unanchored, so it also matches
+`app.kubernetes.io/name:` label lines and objects whose names merely share a prefix, and a hit is
+not a declaration until you have opened it and confirmed it declares the object you observed, on the
+cluster you observed it on. Hits landing in more than one directory, or none tied to the target
+cluster, and the finding is `kind: manual`.
+
+A remediation that **creates an object the repo does not yet declare is a `manifest` too** — the
+whole point of a GitOps repo is that new objects arrive through it, and an audit that can only
+describe the file it would have written leaves the finding unresolvable. Two things must hold
+first. The object must be genuinely absent, from the cluster as well as from the repo: one that is
+live but whose declaration you merely failed to find is the case above, and a second file claiming
+it is a duplicate resource id that both Config Sync and Argo reject. And the directory you write
+into must already be reconciled onto the target, which you establish from a **sibling** — another
+object declared here that belongs to the same target you are fixing. What counts as a sibling
+follows the target's scope: for a cluster-scoped finding, another object applied to that cluster;
+for a project- or subnet-scoped one, another declaration governing that same project, whether it is
+a Config Connector resource or a Terraform file. Write the new file beside the sibling, named after
+the object, following the sibling's conventions rather than your own: same file-per-object
+granularity, same labels and namespace fields. Never a new top-level directory and never a parent
+that is not already in the clone, because the repository is reconciled by a tool that applies a
+fixed set of paths, and a file outside them is applied by nothing — which makes the pull request a
+no-op that reads as a fix.
+
+No sibling means the target is not wired to this repo. Then the finding is `kind: manual`, the
+manifest you would have written goes in `recommendation.action`, and `recommendation.rationale` says
+which of the two you established and how you established it.
+
 **Do not leave unrelated uncommitted work in that tree during an audit.** Opening a remediation pull
 request requires switching branches, and the harness forces the switch. It snapshots and restores
 every path you declared, and returns you to the branch you started on — but a file it was never told

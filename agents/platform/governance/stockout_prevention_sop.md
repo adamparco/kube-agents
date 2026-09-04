@@ -233,7 +233,7 @@ The `project/<project-id>` entry is covered on the same terms. `gcloud compute r
 - **Severity:** `critical`.
 - **Impact:** "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion."
 - **Remediation:**
-  - `scale.up.error.out.of.resources`: If a `ComputeClass` manifest exists in the GitOps repo for the affected workload, `kind: manifest` (add secondary fallback machine families and multi-zone support). If no `ComputeClass` manifest exists in the GitOps clone (such as default Autopilot workloads), `kind: manual` (adopting a custom ComputeClass requires a workload-owner decision on which workloads adopt it and which families are acceptable; provide the recommended ComputeClass YAML definition with fallback priorities in `recommendation.action` verified against the §4 feasibility gate).
+  - `scale.up.error.out.of.resources`: `kind: manifest`. Where a `ComputeClass` manifest for the affected workload already exists in the GitOps repo, add secondary fallback machine families and multi-zone support to it. Where none exists — a default Autopilot workload, say — write a **new** ComputeClass declaration under §4's Declaration Rule and point the affected workload at it, so the class is under declarative control like every other object in the repo rather than a snippet a human retypes. Verify the families against the §4 feasibility gate, and name in `recommendation.risk` which workloads the new class will move and what it does to their placement. The single case that stays `kind: manual` is a cluster §4's sync precondition rules out, where no file this audit writes would ever be applied.
   - `scale.up.error.quota.exceeded`: `kind: manual` (request a regional/family GCP compute quota increase via Google Cloud Console or `gcloud compute project-info describe`).
   - `scale.up.error.ip.space.exhausted`: `kind: manual` (expand the VPC pod subnet secondary CIDR range).
 
@@ -250,10 +250,7 @@ The `project/<project-id>` entry is covered on the same terms. `gcloud compute r
 ### 4. Generate remediation artifacts
 
 - Locate the existing declaration in the GitOps clone (`grep -rl "name: <object>" --include='*.yaml' <workspace>`).
-- **The Declaration Rule**:
-  - A remediation that changes an object that already exists must go to that object's **existing declaration in the GitOps repo**: locate it (`grep -rl "name: <object>" --include='*.yaml' .`), give that file's repo-relative path as `remediation.path`, and rewrite it as the object's complete desired manifest.
-  - If the workload or ComputeClass has no declaration in the clone, the finding is `kind: manual`. Put the manifest you would have written in `recommendation.action`.
-  - Never invent a new path for an object that is not declared in the repository.
+- **The skill's Declaration Rule decides where the file goes**, for an object the repo already declares and for one it does not yet. Read it there; this audit adds only what follows. Unlike most streams, this one has a real create case — a default Autopilot workload hitting `scale.up.error.out.of.resources` needs a ComputeClass that does not exist anywhere yet — so the new-object branch is the one you will reach most often, and it is a `manifest`, not a `manual`. The sibling that proves the directory is reconciled is another Kubernetes object declared here and running on the same cluster; a new ComputeClass goes beside it, named after the class. Say in `recommendation.rationale` which branch you took and how you established it.
 - **Remediation Feasibility Gate**: Before proposing a new machine family or Spot tier, verify that:
   1. The target GCP zone actually offers the machine type (`gcloud compute machine-types list --zones=<zone>`).
   2. For On-Demand proposals, the project quota for that family (`N4_CPUS`, `C4_CPUS`, GPU types) is greater than 0 (`gcloud compute regions describe <region> --project=<project>`).
