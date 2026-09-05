@@ -8560,6 +8560,37 @@ def _handle_finish_dry_run(
         )
 
 
+class OpenedPRs(NamedTuple):
+    """What `_open_promoted_prs` published, in the two shapes callers need.
+
+    `urls` is the envelope's `prs_opened`, unchanged. `records` is the same
+    pull requests shaped like `list_remediation_prs` rows so they can be
+    folded into a listing too fresh to contain them — see `_with_just_opened`,
+    which is the whole reason this is not just a list of strings.
+
+    Only the fields the post-promotion consumers actually read are populated:
+    `headRefName` (the join key), `number`, `state`, `mergedAt`/`closedAt`
+    (what `derive_finding_state` reads) and `url`. `labels` and `body` are
+    left off rather than guessed — nothing downstream of the promotion step
+    reads them, and an invented value would be indistinguishable from one
+    GitHub reported.
+    """
+
+    urls: list[str]
+    records: list[dict]
+
+
+def _pr_number_from_url(url: str) -> int:
+    """The trailing `/pull/<n>` of a pull request URL, or 0.
+
+    Only used to order two records on one branch, which `_select_pr_by_head`
+    does by highest number. A URL that does not end in a number sorts first,
+    which is the right way round: a real listing row beats a synthesised one.
+    """
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
 def _open_promoted_prs(
     repo: str,
     audit_id: str,
@@ -8570,7 +8601,7 @@ def _open_promoted_prs(
     root: Path,
     issue_number: int | None,
     generated_at: datetime,
-) -> list[str]:
+) -> OpenedPRs:
     """Open (or refresh) one pull request per group holding a promoted finding.
 
     Groups are computed over the *whole* finding set, not just the promoted
@@ -8588,7 +8619,7 @@ def _open_promoted_prs(
     `gh` error, and lose the groups that came after the broken one.
     """
     if not promote:
-        return []
+        return OpenedPRs([], [])
 
     promoted = set(promote)
     groups = [
@@ -8597,11 +8628,12 @@ def _open_promoted_prs(
         if any(str(f.get("id", "")) in promoted for f in group)
     ]
     if not groups:
-        return []
+        return OpenedPRs([], [])
 
     started_on = current_branch()
     snapshot = snapshot_paths(root, manifest_paths(findings))
     opened: list[str] = []
+    records: list[dict] = []
     try:
         for group in groups:
             fid = str(sort_findings(group)[0].get("id", ""))
@@ -8621,6 +8653,20 @@ def _open_promoted_prs(
                 continue
             if url:
                 opened.append(url)
+                # Stated rather than looked up: this pull request was created
+                # seconds ago by the call above, so "on this branch, open,
+                # neither merged nor closed" is what just happened, not a
+                # guess about what GitHub will say.
+                records.append(
+                    {
+                        "number": _pr_number_from_url(url),
+                        "headRefName": group_branch_for(audit_id, group),
+                        "state": "OPEN",
+                        "mergedAt": None,
+                        "closedAt": None,
+                        "url": url,
+                    }
+                )
     finally:
         if started_on and started_on != "HEAD":
             git(["checkout", "--force", started_on], check=False)
@@ -8636,7 +8682,45 @@ def _open_promoted_prs(
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(blob)
-    return opened
+    return OpenedPRs(opened, records)
+
+
+def _with_just_opened(listing: list[dict], records: list[dict]) -> list[dict]:
+    """`listing`, plus any pull request this run opened that it is missing.
+
+    `list_remediation_prs` filters on two labels, which sends `gh` through
+    GitHub's *search* index rather than a direct read — and that index is
+    eventually consistent. A pull request created seconds earlier is routinely
+    absent from it, even though the labels are already on the pull request and
+    a later query returns it.
+
+    That is not hypothetical. On 2026-09-05 a `/remediate` on the
+    `stockout-prevention` ledger opened pull request 126 at 20:00:27 and
+    labelled it at 20:00:28; the re-listing a second later came back without
+    it, so the finding reconciled to no pull request at all. Two things went
+    wrong downstream and neither looked like a bug from the outside: the
+    ledger re-render left the finding reading `open` with nothing linking the
+    fix, and the acknowledgement told the operator "no pull request was
+    opened; the harness could not publish it this run" — four seconds after
+    publishing it. The run's own summary line said "1 PR opened" at the same
+    time, which is the only reason the contradiction was visible at all.
+
+    Re-listing is still what the ledger needs, because it is the only thing
+    that reports on pull requests *other* runs opened. This just stops the
+    freshly opened ones depending on it. Records already present under the
+    same branch are dropped, so GitHub's version always wins over the
+    synthesised one.
+    """
+    known = {str(pr.get("headRefName", "")) for pr in listing or []}
+    missing = [r for r in records if str(r.get("headRefName", "")) not in known]
+    if missing:
+        log(
+            f"{len(missing)} pull request(s) opened this run were absent from "
+            "the re-listing (GitHub's search index lags creation); folding "
+            "them in so the ledger links them and the acknowledgement names "
+            "them: " + ", ".join(str(r.get("url", "")) for r in missing)
+        )
+    return list(listing or []) + missing
 
 
 def _remediation_outcomes(
@@ -8843,7 +8927,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         root=root,
         issue_number=issue_number,
         generated_at=now,
-    )
+    ).urls
     payload = {
         "status": "REMEDIATED",
         "prs_opened": opened,
@@ -9486,7 +9570,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             checks_changed=checks_changed,
         )
 
-    prs_opened = _open_promoted_prs(
+    promotion = _open_promoted_prs(
         repo,
         audit_id,
         findings,
@@ -9496,11 +9580,14 @@ def handle_finish(args: argparse.Namespace) -> None:
         issue_number=number,
         generated_at=now,
     )
+    prs_opened = promotion.urls
 
     if prs_opened:
         # The ledger was written before those pull requests existed, so it does
         # not yet link them, and neither would the acknowledgement below.
-        refreshed = list_remediation_prs(repo, audit_id)
+        refreshed = _with_just_opened(
+            list_remediation_prs(repo, audit_id), promotion.records
+        )
         pr_by_finding, pr_urls = reconcile_remediation_prs(
             audit_id, findings, refreshed
         )

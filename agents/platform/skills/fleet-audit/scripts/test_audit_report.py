@@ -9948,6 +9948,65 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.run_finish(make_doc())
         self.assertTrue(self.harness.gh_calls("issue", "edit", "7"))
 
+    def test_that_rewrite_actually_links_the_pull_request(self):
+        # The re-listing that feeds the rewrite is `gh pr list` filtered on two
+        # labels, which GitHub answers from its *search* index -- and that
+        # index lags creation by seconds, so it routinely comes back without
+        # the pull request this run just opened. The harness reproduces that
+        # by default: `pr list` replies empty here.
+        #
+        # Asserting only that an edit happened (the test above) left the bug
+        # invisible for as long as it existed. On 2026-09-05 the live ledger
+        # was rewritten exactly as intended and still showed the finding as
+        # `open` with nothing linking pull request 126, because the finding
+        # had reconciled to no pull request at all.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.run_finish(make_doc())
+        bodies = self.harness.bodies_for("issue", "edit", "7")
+        self.assertTrue(bodies)
+        self.assertIn("https://github.com/acme/fleet/pull/8", bodies[-1])
+
+    def test_the_acknowledgement_names_the_pull_request_it_just_opened(self):
+        # The operator-visible half of the same stale-listing bug. On
+        # 2026-09-05 a `/remediate` on the live `stockout-prevention` ledger
+        # was answered "no pull request was opened; the harness could not
+        # publish it this run" four seconds *after* it published pull request
+        # 126 -- while the run's own summary line said "1 PR opened".
+        fid = "netpol-missing.prod-us-east.payments.namespace-no-network-policy"
+        self.harness.replies["issue list"] = self.issue_list()
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {fid}", login="maintainer")]}
+        )
+        self.harness.replies["collaborators/maintainer/permission"] = "admin\n"
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.run_finish(make_doc())
+        acks = [
+            body
+            for body in self.harness.bodies_for("issue", "comment")
+            if "was processed" in body
+        ]
+        self.assertTrue(acks, "the accepted /remediate was never acknowledged")
+        self.assertIn("https://github.com/acme/fleet/pull/8", acks[-1])
+        self.assertNotIn("no pull request was opened", acks[-1])
+
+    def test_the_stale_listing_does_not_override_what_github_reports(self):
+        # The fold-in is a backstop for what the listing is missing, never a
+        # correction to what it holds: a pull request the listing reports as
+        # MERGED must not be re-described as OPEN by the record this run
+        # synthesised for the same branch.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        branch = audit_report.group_branch_for(
+            AUDIT, [make_finding(fid="a")]
+        )
+        merged = dict(pr(8, branch), state="MERGED", mergedAt="2026-09-05T00:00:00Z")
+        self.harness.replies["pr list"] = json.dumps([merged])
+        self.run_finish(make_doc())
+        folded = audit_report._with_just_opened(
+            [merged],
+            [{"number": 8, "headRefName": branch, "state": "OPEN", "url": "u"}],
+        )
+        self.assertEqual(folded, [merged])
+
     def test_a_gcloud_critical_is_never_auto_promoted(self):
         doc = make_doc(
             findings=[
