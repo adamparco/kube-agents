@@ -342,12 +342,8 @@ the run. See [The clean run](#the-clean-run) for the full rule.
         ],
         "checks_not_applicable": [
           {
-            "check": "legacy-metadata",
-            "reason": "GKE Autopilot: no user-managed node pools to carry a metadata setting."
-          },
-          {
             "check": "hostpath-mount",
-            "reason": "GKE Autopilot: hostPath volumes are rejected by the admission webhook."
+            "reason": "GKE Autopilot: admission rejects write-mode hostPath for in-scope workloads and allows read access under /var/log alone, and this cluster carries no WorkloadAllowlist that would exempt one."
           }
         ],
         "limitations": "RBAC denied `list clusterrolebindings`; check 2.4 did not run."
@@ -412,8 +408,12 @@ field, and publishes nothing:
   - **`check`** — the same slugs `checks_run` uses. An unknown slug, a duplicate, or a slug that
     also appears in this cluster's `checks_run` is rejected: a check either ran or could not.
   - **`reason`** — why the check _cannot_ apply here, naming the property of the cluster that rules
-    it out ("GKE Autopilot: no user-managed node pools to carry a metadata setting"). Anything
-    under sixteen characters is rejected, which is enough to stop "N/A" and "n/a — autopilot".
+    it out ("GKE Autopilot: admission rejects hostPID/hostIPC/hostNetwork for in-scope workloads,
+    and this cluster carries no WorkloadAllowlist that would exempt one"). Anything under sixteen
+    characters is rejected, which is enough to stop "N/A" and "n/a — autopilot". Name a property
+    the cluster actually has: a reason that says the object _cannot exist_ is a claim a reviewer
+    can disprove by finding one, and Autopilot's node-facing rules bind in-scope workloads rather
+    than the cluster.
 
   These checks leave the coverage denominator instead of counting as missing, so a cluster that ran
   everything that _can_ apply to it is fully covered. That is the difference between a fleet whose

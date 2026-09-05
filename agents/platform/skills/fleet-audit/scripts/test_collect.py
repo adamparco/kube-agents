@@ -3296,7 +3296,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         "message=Autopilot node pools cannot be accessed or modified."
     )
 
-    def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None):
+    def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None):
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
         self.issued = []
@@ -3317,6 +3317,12 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
                 if kinds == "ccnp" and ccnp_run is not None:
                     return ccnp_run
+                if kinds.startswith("workloadallowlists"):
+                    if allowlist_items is None:
+                        # What a cluster without the CRDs answers, which is
+                        # every Standard cluster and the default here.
+                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "workloadallowlists"', 0.05)
+                    return Run(argv, 0, json.dumps(dump_of(*allowlist_items)), "", 0.05)
             if argv[:3] == ["gcloud", "container", "clusters"]:
                 return Run(argv, 0, json.dumps(describe), "", 0.1)
             if argv[:3] == ["gcloud", "container", "node-pools"]:
@@ -3400,13 +3406,63 @@ class TestComplianceCollectCluster(unittest.TestCase):
         not_applicable_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(
             not_applicable_slugs,
-            {"privileged-container", "host-namespace", "hostpath-mount", "legacy-metadata"},
+            {"privileged-container", "host-namespace", "hostpath-mount"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
             self.assertIn("Autopilot", entry["reason"])
+
+    def test_no_reason_claims_the_object_cannot_exist_on_the_cluster(self):
+        """The reasons used to read "privileged containers are rejected at
+        admission and cannot exist here", and privileged containers, host
+        namespaces and hostPath mounts all run on this fleet's Autopilot
+        clusters -- as Google's own kube-system add-ons, which the universal
+        suppressions drop. A reason a reviewer can disprove by pointing at a
+        running pod is worse than no reason: it is published verbatim in the
+        ledger under _Not applicable_ as a statement about the cluster."""
+        result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        for entry in result["checks_not_applicable"]:
+            self.assertNotIn("cannot exist", entry["reason"])
+            # Scoped to the workloads the audit can see, and to the admission
+            # policy holding -- both halves, on every reason.
+            self.assertIn("in-scope workloads", entry["reason"])
+            self.assertIn("WorkloadAllowlist", entry["reason"])
+
+    def test_an_installed_workload_allowlist_withdraws_every_declaration(self):
+        """Each reason ends by saying the cluster carries no WorkloadAllowlist,
+        because Autopilot's admission rule is a policy one lifts
+        (`autogke-disallow-privilege`, `autogke-no-write-mode-hostpath`). One
+        existing falsifies all three at once, whether or not any check fired,
+        so the collector reads for them rather than asserting their absence."""
+        result = self.run_with(
+            cluster={**self.CLUSTER, "autopilot": True},
+            allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
+        )
+        self.assertNotIn("checks_not_applicable", result)
+        # And they report as what they are: checks that ran and found nothing.
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertLessEqual(
+            {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
+        )
+        self.assertEqual(len(command_slugs), 11)
+
+    def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
+        """The read is best-effort for the reason the `ccnp` one is: the CRDs
+        come from Autopilot itself, so "the server doesn't have a resource
+        type" is the answer and not a missing input. Failing the cluster
+        closed on it would cost eleven checks to learn there are no
+        exemptions."""
+        result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=None)
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual(len(result["checks_not_applicable"]), 3)
+
+    def test_a_standard_cluster_never_reads_for_allowlists(self):
+        """The CRDs only exist on Autopilot and the table only applies there,
+        so the read has nothing to inform on a Standard cluster."""
+        self.run_with()
+        self.assertEqual([a for a in self.issued if a[:2] == ["kubectl", "get"] and a[2].startswith("workloadallowlists")], [])
 
     def test_standard_cluster_carries_no_checks_not_applicable_key(self):
         result = self.run_with()
@@ -3426,9 +3482,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("privileged-container", found)
         self.assertNotIn("privileged-container", not_applicable)
         self.assertIn("privileged-container", {c["check"] for c in result["commands"]})
-        # The other three still are: they found nothing, so nothing falsifies
+        # The other two still are: they found nothing, so nothing falsifies
         # the claim that they cannot apply here.
-        self.assertEqual(not_applicable, {"host-namespace", "hostpath-mount", "legacy-metadata"})
+        self.assertEqual(not_applicable, {"host-namespace", "hostpath-mount"})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
         """The live regression: `node-pools list` 400s on Autopilot, and it was
@@ -3475,16 +3531,75 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Eleven checks minus the four Autopilot rules out is seven, each with a
-        command behind it, and `legacy-metadata` dispositioned rather than
-        silently absent -- absent is what §6 reads as a coverage gap."""
+        Eleven checks minus the three Autopilot rules out is eight, each with a
+        command behind it, and the three dispositioned rather than silently
+        absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 7)
-        self.assertIn("legacy-metadata", na_slugs)
-        self.assertNotIn("legacy-metadata", command_slugs)
+        self.assertEqual(len(command_slugs), 8)
+        self.assertEqual(len(na_slugs), 3)
+        self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
+
+    def test_legacy_metadata_runs_on_autopilot_off_the_describe(self):
+        """It used to be declared inapplicable for "no user-managed node pools
+        to carry a metadata setting" -- false on a cluster with five pools that
+        each carry `config.workloadMetadataConfig`. What Autopilot refuses is
+        `node-pools list` (HTTP 400), not the pools existing, and `clusters
+        describe` returns the same field. So the check runs, and reports the
+        honest result: every Google-managed pool is on GKE_METADATA."""
+        result = self.run_with(
+            cluster={**self.CLUSTER, "autopilot": True},
+            describe={
+                "nodePools": [
+                    {"name": "default-pool", "config": {"workloadMetadataConfig": {"mode": "GKE_METADATA"}}},
+                    {"name": "pool-1", "config": {"workloadMetadataConfig": {"mode": "GKE_METADATA"}}},
+                ]
+            },
+        )
+        na_slugs = {e["check"] for e in result["checks_not_applicable"]}
+        self.assertNotIn("legacy-metadata", na_slugs)
+        command = next(c for c in result["commands"] if c["check"] == "legacy-metadata")
+        self.assertIn("clusters describe", command["command"])
+        self.assertNotIn("legacy-metadata", {c["check"] for c in result["candidates"]})
+
+    def test_a_non_compliant_autopilot_pool_is_now_reachable(self):
+        """The guard the hardcoded `node_pools = []` disarmed. With the pools
+        coming from the describe, a pool off GKE_METADATA produces a candidate
+        instead of being unreportable by construction on every run forever."""
+        result = self.run_with(
+            cluster={**self.CLUSTER, "autopilot": True},
+            describe={
+                "nodePools": [
+                    {"name": "pool-1", "config": {"workloadMetadataConfig": {"mode": "GCE_METADATA"}}},
+                ]
+            },
+        )
+        candidate = next(c for c in result["candidates"] if c["check"] == "legacy-metadata")
+        self.assertEqual(candidate["object"], "NodePool/pool-1")
+        self.assertIn("GCE_METADATA", candidate["excerpt"])
+
+    def test_the_describe_projection_asks_for_the_node_pool_fields(self):
+        """`check_legacy_metadata` reads two fields off each pool. If the
+        projection stops requesting them the check silently passes every pool
+        on every Autopilot cluster, which is the failure this replaced."""
+        self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        describe = next(a for a in self.issued if a[:4] == ["gcloud", "container", "clusters", "describe"])
+        fmt = describe[describe.index("--format") + 1]
+        self.assertIn("nodePools[].name", fmt)
+        self.assertIn("nodePools[].config.workloadMetadataConfig", fmt)
+
+    def test_every_not_applicable_slug_has_a_detection_fed_real_input(self):
+        """The invariant the `legacy-metadata` entry broke. The guard's whole
+        safety property is that each detection runs anyway and withholds the
+        declaration if it fires; a slug whose input is hardcoded empty can
+        never fire, so the guard silently covers everything but it."""
+        na_slugs = {slug for slug, _ in collect._COMPLIANCE_AUTOPILOT_NOT_APPLICABLE}
+        workload_kinds = {
+            spec.slug for spec in collect.COMPLIANCE_CHECKS if spec.kind == "workload"
+        }
+        self.assertLessEqual(na_slugs, workload_kinds)
 
 
 # --------------------------------------------------------------------------- #

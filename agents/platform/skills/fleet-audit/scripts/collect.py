@@ -3004,18 +3004,41 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "public-control-plane": ("describe",),
 }
 
-# §1's four node-facing checks Autopilot's admission controller rules out
-# structurally, with the SOP's own canonical reasons verbatim. On an
-# Autopilot cluster these must never appear in the manifest's `commands` --
-# an agent that copies `commands` verbatim into `checks_run` (§2's
+# §1's three node-facing checks Autopilot's admission controller rules out
+# for in-scope workloads, with the SOP's own canonical reasons verbatim. On
+# an Autopilot cluster these must never appear in the manifest's `commands`
+# -- an agent that copies `commands` verbatim into `checks_run` (§2's
 # instruction for every other check) and *also* follows §1's instruction to
-# record these four in `checks_not_applicable` would name the same slug in
-# both lists, which the validator rejects.
+# record these in `checks_not_applicable` would name the same slug in both
+# lists, which the validator rejects.
+#
+# Each reason is scoped two ways on purpose, because the earlier wording
+# ("privileged containers are rejected at admission and cannot exist here")
+# was false on both counts. Privileged containers, host namespaces and
+# hostPath mounts all run on this fleet's Autopilot clusters today -- they
+# are Google's own system add-ons in kube-system, which S1 and S3 suppress,
+# so "in-scope workloads" rather than a claim about the cluster. And
+# admission rejecting them is a policy a WorkloadAllowlist can lift
+# (`autogke-disallow-privilege`, `autogke-no-write-mode-hostpath`, GKE >=
+# 1.32.0-gke.1000000), so the trailing clause is a fact the collector reads
+# for -- see `autopilot_allowlists` -- rather than one it assumes.
 _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
-    ("privileged-container", "GKE Autopilot: privileged containers are rejected at admission and cannot exist here."),
-    ("host-namespace", "GKE Autopilot: hostPID/hostIPC/hostNetwork are rejected at admission and cannot exist here."),
-    ("hostpath-mount", "GKE Autopilot: hostPath volumes are rejected at admission and cannot exist here."),
-    ("legacy-metadata", "GKE Autopilot: no user-managed node pools to carry a metadata setting."),
+    (
+        "privileged-container",
+        "GKE Autopilot: admission rejects privileged: true and the SYS_ADMIN capability for "
+        "in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one.",
+    ),
+    (
+        "host-namespace",
+        "GKE Autopilot: admission rejects hostPID/hostIPC/hostNetwork for in-scope workloads, "
+        "and this cluster carries no WorkloadAllowlist that would exempt one.",
+    ),
+    (
+        "hostpath-mount",
+        "GKE Autopilot: admission rejects write-mode hostPath for in-scope workloads and allows "
+        "read access under /var/log alone, and this cluster carries no WorkloadAllowlist "
+        "that would exempt one.",
+    ),
 )
 
 
@@ -3107,35 +3130,46 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     describe_argv = [
         "gcloud", "container", "clusters", "describe", name, "--location", location, "--project", project,
         "--format", "json(workloadIdentityConfig,privateClusterConfig,masterAuthorizedNetworksConfig,"
-        "controlPlaneEndpointsConfig)",
+        "controlPlaneEndpointsConfig,nodePools[].name,nodePools[].config.workloadMetadataConfig)",
     ]
     parsed, result = gated(describe_argv)
     if parsed is None:
         raise GateFailure(f"cluster describe gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
     context["cluster_describe"] = parsed
     describe_command = shlex.join(describe_argv)
+    describe_record = _record(describe_command, result)
     for slug in ("workload-identity-off", "public-control-plane"):
-        commands[slug] = _record(describe_command, result)
+        commands[slug] = describe_record
 
     # Not attempted on Autopilot, where the API refuses it outright:
     # `node-pools list` answers HTTP 400 "Autopilot node pools cannot be
     # accessed or modified". Gating on that read anyway threw the whole
-    # cluster away for the single check it backs -- and that check is
-    # `legacy-metadata`, which `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE` above
-    # already declares inapplicable on Autopilot for the reason the API
-    # itself gives. The table was simply unreachable: the gate raises here,
-    # `collect_cluster` returns `gate-failed`, and the not-applicable block
-    # that would have said so never runs. Three of this fleet's four clusters
-    # are Autopilot, so every daily `compliance-audit` collected one cluster
-    # and gate-failed the rest -- eleven checks per cluster that had already
-    # succeeded, discarded on the twelfth, which could not have run.
+    # cluster away for the single check it backs. The table was simply
+    # unreachable: the gate raises here, `collect_cluster` returns
+    # `gate-failed`, and the not-applicable block that would have said so
+    # never runs. Three of this fleet's four clusters were Autopilot, so every
+    # daily `compliance-audit` collected one cluster and gate-failed the rest
+    # -- eleven checks per cluster that had already succeeded, discarded on
+    # the twelfth.
     #
-    # `context["node_pools"]` stays defined so `legacy-metadata` evaluates to
-    # no hits rather than raising, and `commands` gets no entry: the slug is
-    # in `not_applicable_slugs` by the time `collect_cluster` builds the
-    # manifest, which skips it there.
+    # The refusal is one API surface being closed, not the node pools being
+    # absent, and the fix for the gate failure used to be to declare
+    # `legacy-metadata` inapplicable -- publishing "no user-managed node
+    # pools to carry a metadata setting" for a cluster that has five pools,
+    # each carrying `config.metadata` and `config.workloadMetadataConfig`,
+    # readable through the `clusters describe` above. That cost real coverage:
+    # every Autopilot pool reports the compliant `GKE_METADATA`, so the check
+    # does not fail to apply, it runs and passes, and saying otherwise
+    # published an enforced control as unverified. Worse, the "run the
+    # detection anyway and withhold the declaration if it fires" guard in
+    # `collect_cluster` was structurally dead for this one slug: with
+    # `node_pools` hardcoded empty, `check_legacy_metadata` returned no hits
+    # by construction on every Autopilot cluster forever, so nothing could
+    # ever falsify the reason. Take the pools from the describe projection
+    # instead, and record that describe as the command behind the check.
     if cluster.get("autopilot"):
-        context["node_pools"] = []
+        context["node_pools"] = context["cluster_describe"].get("nodePools") or []
+        commands["legacy-metadata"] = describe_record
     else:
         node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
         parsed, result = gated(node_pools_argv)
@@ -3143,6 +3177,36 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
             raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
         context["node_pools"] = parsed if isinstance(parsed, list) else []
         commands["legacy-metadata"] = _record(shlex.join(node_pools_argv), result)
+
+    # Whether the three admission premises `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE`
+    # rests on are still intact on this cluster. They hold only while nothing
+    # lifts them, and Google documents two things that do: a customer-authored
+    # `WorkloadAllowlist` naming `autogke-disallow-privilege` or
+    # `autogke-no-write-mode-hostpath` (GKE >= 1.32.0-gke.1000000), and a
+    # partner allowlist synchronised in (>= 1.32.2-gke.1652000). With one
+    # installed, a privileged or hostPath workload is admissible and the three
+    # checks are checks that ran and found nothing, not checks the cluster's
+    # shape rules out -- so read for it rather than assert its absence in a
+    # reason string an operator is meant to trust.
+    #
+    # Non-gated, for the reason the `ccnp` read above is: the four CRDs come
+    # from Autopilot itself, so a cluster without them answers "the server
+    # doesn't have a resource type", which is the answer (no allowlists) and
+    # not a missing input. The residual risk is an RBAC denial reading as
+    # absence; it is the same trade the `ccnp` read makes, and it fails to the
+    # behaviour that predates this read rather than past it.
+    if cluster.get("autopilot"):
+        allowlist_argv = [
+            "kubectl", "get",
+            "workloadallowlists.auto.gke.io,allowlistsynchronizers.auto.gke.io,"
+            "allowlistedworkloads.auto.gke.io,allowlistedv2workloads.auto.gke.io",
+            "-o", "json",
+        ]
+        allowlist_parsed, _ = run_and_gate(allowlist_argv, kubeconfig, run=run)
+        context["autopilot_allowlists"] = [
+            f"{i.get('kind') or '?'}/{(i.get('metadata') or {}).get('name', '')}"
+            for i in (allowlist_parsed or {}).get("items", []) or []
+        ]
 
     return CollectedContext(context, context["workloads"], commands)
 
@@ -3254,16 +3318,39 @@ def collect_cluster(
     if audit_id == "compliance-audit" and cluster.get("autopilot"):
         applicable = {spec.slug for spec in checks}
         # A check that found something plainly applied. Each reason below
-        # asserts the object cannot exist on Autopilot, so a candidate is that
-        # premise being wrong on this cluster -- a preview channel, a
-        # workload predating the conversion, an exemption Google granted --
-        # and the manifest must not say both. Declaring it inapplicable while
-        # carrying its candidate is the incoherence the `commands` filter
-        # already avoids, and it resolves the wrong way: the finding is real
-        # and the claim about the cluster's shape is not.
+        # asserts admission rejects the shape for in-scope workloads, so a
+        # candidate is that premise being wrong on this cluster -- a preview
+        # channel, a workload predating the conversion, an exemption Google
+        # granted -- and the manifest must not say both. Declaring it
+        # inapplicable while carrying its candidate is the incoherence the
+        # `commands` filter already avoids, and it resolves the wrong way: the
+        # finding is real and the claim about the cluster's shape is not.
+        #
+        # Every slug in the table is backed by a detection fed the real
+        # workload dump, so this guard has something to guard for each of
+        # them. It did not always: `legacy-metadata` was in the table while
+        # `_collect_compliance` handed `check_legacy_metadata` a hardcoded
+        # empty `node_pools`, so it returned no hits by construction and could
+        # never falsify its own reason. Keep that property -- a slug added
+        # here whose detection cannot see real input silently disarms this.
         found = {c["check"] for c in candidates}
+        # The second way each premise fails. Every reason ends by saying this
+        # cluster carries no WorkloadAllowlist, and an allowlist is exactly
+        # what lifts the admission rule the rest of the sentence rests on --
+        # so one existing makes all three declarations false at once, whether
+        # or not any check fired. `_collect_compliance` reads for them; the
+        # three then report as checks that ran, which they did.
+        allowlists = collected.context.get("autopilot_allowlists") or []
+        if allowlists:
+            print(
+                f"[collect] {project}/{name}: {len(allowlists)} Autopilot workload "
+                f"allowlist object(s) present ({', '.join(sorted(allowlists)[:3])}); "
+                f"admission can be exempted here, so §1's node-facing checks are "
+                f"reported as checks that ran rather than declared inapplicable",
+                file=sys.stderr,
+            )
         for slug, reason in _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE:
-            if slug not in applicable:
+            if slug not in applicable or allowlists:
                 continue
             if slug in found:
                 print(
