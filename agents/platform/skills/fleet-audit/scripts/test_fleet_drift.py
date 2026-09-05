@@ -167,9 +167,18 @@ class ClusterEligibilityTest(unittest.TestCase):
     def test_running_and_old_is_eligible(self):
         self.assertIsNone(fd.cluster_eligibility(cluster("c1"), now=NOW))
 
-    def test_reconciling_is_ineligible(self):
-        reason = fd.cluster_eligibility(cluster("c1", status="RECONCILING"), now=NOW)
-        self.assertIn("RECONCILING", reason)
+    def test_reconciling_still_votes(self):
+        """A reconcile is work in progress on a cluster that is otherwise up,
+        and this module compares the configuration `clusters list` returns
+        rather than reading inside the cluster. Excluding it dropped a cluster
+        out of every cohort for the duration of any routine change -- and a
+        cohort is a majority vote, so a missing member can flip the majority it
+        was meant to define."""
+        self.assertIsNone(fd.cluster_eligibility(cluster("c1", status="RECONCILING"), now=NOW))
+
+    def test_provisioning_is_ineligible(self):
+        reason = fd.cluster_eligibility(cluster("c1", status="PROVISIONING"), now=NOW)
+        self.assertIn("PROVISIONING", reason)
 
     def test_brand_new_is_ineligible(self):
         reason = fd.cluster_eligibility(cluster("c1", created="2026-07-31T23:00:00Z"), now=NOW)
@@ -631,10 +640,16 @@ class ComputeDriftTest(unittest.TestCase):
 
     def test_ineligible_cluster_gets_no_facets_compared(self):
         clusters = self.cohort(n=3)
-        clusters.append(cluster("reconciling", status="RECONCILING", labels={"environment": "prod"}))
+        clusters.append(cluster("provisioning", status="PROVISIONING", labels={"environment": "prod"}))
         checks_run, candidates = fd.compute_drift(clusters, now=NOW)
-        self.assertEqual(checks_run[K("reconciling")], [])
-        self.assertEqual(candidates[K("reconciling")], [])
+        self.assertEqual(checks_run[K("provisioning")], [])
+        self.assertEqual(candidates[K("provisioning")], [])
+
+    def test_a_reconciling_cluster_is_still_compared(self):
+        clusters = self.cohort(n=3)
+        clusters.append(cluster("reconciling", status="RECONCILING", labels={"environment": "prod"}))
+        checks_run, _ = fd.compute_drift(clusters, now=NOW)
+        self.assertIn("release-channel", checks_run[K("reconciling")])
 
     def test_split_cluster_guard_replaces_many_findings_with_one(self):
         # n=20 keeps r=0.95 for every facet -- comfortably clear of the

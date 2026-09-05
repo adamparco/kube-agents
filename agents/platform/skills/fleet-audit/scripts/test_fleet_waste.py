@@ -2446,6 +2446,41 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertIn("DEGRADED", by_name["sick"]["error"])
         self.assertEqual(by_name["c1"]["outcome"], "collected")
 
+    def test_a_reconciling_cluster_is_audited_rather_than_skipped(self):
+        """GKE sets RECONCILING while work proceeds on a cluster whose API
+        server is up, and any config change puts one there for minutes. Skipped
+        as unreachable, a routine edit dropped the cluster from the whole audit
+        -- which on this fleet meant losing the only cluster with more than one
+        node pool, the only place `idle-nodepool` can run."""
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(
+                    0,
+                    json.dumps(
+                        [
+                            {"name": "busy", "location": "us-east4", "status": "RECONCILING", "autopilot": {"enabled": False}},
+                            {"name": "gone", "location": "us-west1", "status": "PROVISIONING"},
+                        ]
+                    ),
+                )
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
+
+        by_name = {c["name"]: c for c in manifest["clusters"]}
+        self.assertEqual(by_name["busy"]["outcome"], "collected")
+        self.assertEqual(by_name["gone"]["outcome"], "unreachable")
+        self.assertIn("PROVISIONING", by_name["gone"]["error"])
+
     def fleet_with(self, clusters, orphan_rule=True):
         rule = {
             "name": "fr1",

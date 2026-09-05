@@ -192,6 +192,15 @@ def fetch_credentials(project: str, cluster: str, location: str, *, run: RunFn) 
     return kc, result
 
 
+# See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
+# unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
+# API server stays up, it is transient and ordinary, and excluding it dropped
+# clusters from audits for the duration of any routine config change. Each
+# collector is a standalone script with no shared import, so the constant is
+# duplicated rather than imported.
+AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+
+
 def not_running_entry(c: dict, project: str) -> dict:
     """A manifest target for a cluster whose state rules out auditing it.
 
@@ -211,7 +220,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
         "outcome": "unreachable",
-        "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
+        "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
     }
 
 
@@ -236,9 +245,9 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
         }
         for c in clusters
-        if c.get("status") == "RUNNING"
+        if c.get("status") in AUDITABLE_STATUSES
     ]
-    return running, [not_running_entry(c, project) for c in clusters if c.get("status") != "RUNNING"]
+    return running, [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
 
 
 def region_of(location: str) -> str:

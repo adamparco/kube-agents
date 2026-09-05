@@ -173,6 +173,24 @@ class EnumerateClustersTest(unittest.TestCase):
         self.assertEqual(not_running[0]["location"], "us-east4")
         self.assertIn("DEGRADED", not_running[0]["error"])
 
+    def test_a_reconciling_cluster_is_enumerated(self):
+        """A reconcile is work in progress on a cluster whose API server stays
+        up, and any config change causes one. Skipping it dropped the cluster
+        from the audit for the duration -- see `AUDITABLE_STATUSES`."""
+        clusters_json = json.dumps(
+            [
+                {"name": "busy", "location": "us-east4", "status": "RECONCILING"},
+                {"name": "new", "location": "us-west1", "status": "PROVISIONING"},
+            ]
+        )
+
+        def run(argv, **kwargs):
+            return run_of(0, clusters_json)
+
+        clusters, not_running = fs.enumerate_clusters("acme", run=run)
+        self.assertEqual([c["name"] for c in clusters], ["busy"])
+        self.assertEqual([c["name"] for c in not_running], ["new"])
+
 
 class RegionOfTest(unittest.TestCase):
     def test_zonal_location(self):

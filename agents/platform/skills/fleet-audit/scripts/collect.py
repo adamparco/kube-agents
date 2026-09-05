@@ -154,12 +154,21 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         return Run(argv, 124, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
 
 
+# See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
+# unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
+# API server stays up, it is transient and ordinary, and excluding it dropped
+# clusters from audits for the duration of any routine config change. Each
+# collector is a standalone script with no shared import, so the constant is
+# duplicated rather than imported.
+AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+
+
 def not_running_entry(c: dict, project: str) -> dict:
     """A manifest target for a cluster whose state rules out auditing it.
 
-    Every collector here filters `clusters list` down to `RUNNING`, which is
-    right — a PROVISIONING cluster has no API server to read and a STOPPING one
-    is on its way out. Dropping the rest on the floor is what is wrong. The
+    Every collector here filters `clusters list` down to `AUDITABLE_STATUSES`,
+    which is right — a PROVISIONING cluster has no API server to read and a
+    STOPPING one is on its way out. Dropping the rest on the floor is what is wrong. The
     manifest is the run's only account of the fleet it saw, so a cluster that
     never reaches it is indistinguishable from a cluster that does not exist,
     and the document is free to publish a fleet-wide all-clear over a fleet
@@ -179,13 +188,13 @@ def not_running_entry(c: dict, project: str) -> dict:
         "location": c.get("location") or c.get("zone") or "",
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": "unreachable",
-        "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
+        "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
     }
 
 
 def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[dict], list[dict]]:
-    """Every `RUNNING` cluster in `project`, as `{name, location, project,
-    autopilot}`, plus a manifest target for each cluster that is not RUNNING.
+    """Every auditable cluster in `project`, as `{name, location, project,
+    autopilot}`, plus a manifest target for each cluster that is not.
     Raises on a `gcloud` failure — an audit that could not enumerate the fleet
     has nothing to report against, the same rule `handle_start`'s callers
     already follow for a bare `gcloud` failure.
@@ -205,9 +214,9 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
             "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         }
         for c in clusters
-        if c.get("status") == "RUNNING"
+        if c.get("status") in AUDITABLE_STATUSES
     ]
-    return running, [not_running_entry(c, project) for c in clusters if c.get("status") != "RUNNING"]
+    return running, [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
 
 
 def kubeconfig_path(project: str, cluster: str, location: str) -> Path:

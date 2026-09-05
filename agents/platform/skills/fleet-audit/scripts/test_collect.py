@@ -1347,6 +1347,24 @@ class TestCollectCluster(unittest.TestCase):
             False,
         )
 
+    def test_a_reconciling_cluster_is_enumerated_rather_than_recorded(self):
+        """`RECONCILING` means work is in progress on a cluster whose API
+        server stays up, and any config change causes one -- so skipping it
+        dropped the cluster from the audit for the duration of a routine edit.
+        `PROVISIONING` has no API server yet and stays recorded."""
+        listing = json.dumps(
+            [
+                {"name": "busy", "location": "us-east4", "status": "RECONCILING"},
+                {"name": "new", "location": "us-west1", "status": "PROVISIONING"},
+            ]
+        )
+        clusters, not_running = collect.enumerate_clusters(
+            "acme", run=lambda argv, **kw: collect.Run(argv, 0, listing, "", 0.0)
+        )
+        self.assertEqual([c["name"] for c in clusters], ["busy"])
+        self.assertEqual([c["name"] for c in not_running], ["new"])
+        self.assertIn("PROVISIONING", not_running[0]["error"])
+
     def test_autopilot_downgrades_no_requests_but_not_no_memory_limit(self):
         cluster = {**self.CLUSTER, "autopilot": True}
         calls = []

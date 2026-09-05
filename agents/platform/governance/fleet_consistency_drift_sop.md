@@ -60,7 +60,7 @@ Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consisten
 
    `scope.skipped` holds one case and one only: `describe` failed or was denied — quote the error in the reason. A cluster you read but did not compare stays in `scope.clusters` and says so in its `limitations`:
 
-   - `status` is not `RUNNING` (`PROVISIONING`, `RECONCILING`, `STOPPING`, `ERROR`, `DEGRADED`) — a cluster mid-change is not drifting. `"status RECONCILING: excluded from every cohort, no facet compared."`
+   - `status` is neither `RUNNING` nor `RECONCILING` (`PROVISIONING`, `STOPPING`, `ERROR`, `DEGRADED`) — there is no settled configuration to compare. `"status PROVISIONING: excluded from every cohort, no facet compared."` `RECONCILING` still votes: this section compares configuration rather than reading inside the cluster, and the config a reconcile is converging _towards_ is exactly what `clusters list` returns. Excluding it dropped any cluster mid-change out of every cohort, which is worse than comparing it — a cohort is a majority vote, so a missing member can flip the majority it was meant to define.
    - `createTime` is under 24 hours old — a brand-new cluster has not settled. `"created <createTime>: under 24h, excluded from every cohort."`
    - Its cohort is below the §2 floor — see §2.4 for the wording.
 

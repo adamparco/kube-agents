@@ -187,7 +187,15 @@ def cluster_eligibility(c: dict, *, now: datetime) -> str | None:
     `limitations` sentence, or None when the cluster is a normal voting
     candidate."""
     status = c.get("status", "")
-    if status != "RUNNING":
+    # `RECONCILING` votes. GKE sets it while work proceeds on a cluster that is
+    # otherwise up, and this module compares configuration rather than reading
+    # inside the cluster -- the config a reconcile is converging *towards* is
+    # exactly what `clusters list` returns, so it is the right thing to compare.
+    # Excluding it meant any routine change silently dropped that cluster out
+    # of every cohort, which is worse than comparing it: a cohort is a majority
+    # vote, and a missing member can flip the majority it was meant to define.
+    # See `fleet_waste.AUDITABLE_STATUSES`, which makes the same call.
+    if status not in ("RUNNING", "RECONCILING"):
         return f"status {status}: excluded from every cohort, no facet compared."
     # `.get("createTime", "")` returns `None` for a key that is present and null,
     # and `None.replace` is an `AttributeError` that `except ValueError` does not

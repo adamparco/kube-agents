@@ -267,13 +267,37 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> list[str]:
     return projects
 
 
+# `RECONCILING` is not a cluster you cannot read. GKE sets it while work is in
+# progress on an otherwise-operational cluster -- a control-plane upgrade, a
+# node-pool resize, a setting change -- and the API server stays up throughout.
+# It is also transient and ordinary: any config change puts a cluster there for
+# minutes, so an audit that happened to fire during one dropped that cluster
+# with no check evaluated against it. On the sixteen-cluster fleet that cost
+# the only cluster with more than one node pool, and so the only one where
+# `idle-nodepool` and `scaledown-blocked` can run at all, because a
+# `gcpPublicCidrsAccessEnabled` edit had left it reconciling.
+#
+# The cost of reading one is that node state may be mid-transition. That is
+# worth accepting rather than noting as a `limitations` string: a limitation
+# makes the run `partial`, a partial run closes no ledger, and on a fleet this
+# size with GitOps driving it something is reconciling often enough to pin the
+# stream partial for good. The checks that could see a half-finished node pool
+# already exclude `SchedulingDisabled` nodes and pools under seven days old,
+# and a finding that was only ever transient disappears from next week's run.
+#
+# `PROVISIONING` has no API server yet and `STOPPING` is on its way out; both
+# stay recorded rather than audited. A read that fails anyway still lands on
+# the existing per-cluster `unreachable`/`gate-failed` path.
+AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+
+
 def not_running_entry(c: dict, project: str) -> dict:
     """A manifest target for a cluster whose state rules out auditing it.
 
-    Filtering `clusters list` down to RUNNING is right -- a PROVISIONING
-    cluster has no API server to read. Dropping the rest without a trace is
-    not: the manifest is the run's only account of the fleet it saw, so a
-    cluster absent from it reads exactly like a cluster that does not exist,
+    Filtering `clusters list` down to `AUDITABLE_STATUSES` is right -- a
+    PROVISIONING cluster has no API server to read. Dropping the rest without a
+    trace is not: the manifest is the run's only account of the fleet it saw, so
+    a cluster absent from it reads exactly like a cluster that does not exist,
     and the document can publish a fleet-wide all-clear over a fleet quietly
     missing it. DEGRADED is the case that makes this bite. Recorded as a
     non-`collected` target, the loss is something the document has to place in
@@ -285,7 +309,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "location": c.get("location") or c.get("zone") or "",
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": "unreachable",
-        "error": f"cluster status is {c.get('status') or 'unknown'}, not RUNNING; no check was evaluated against it",
+        "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
     }
 
 
@@ -299,9 +323,9 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     running = [
         {"name": c["name"], "location": c.get("location"), "project": project, "autopilot": bool((c.get("autopilot") or {}).get("enabled"))}
         for c in clusters
-        if c.get("status") == "RUNNING"
+        if c.get("status") in AUDITABLE_STATUSES
     ]
-    return running, [not_running_entry(c, project) for c in clusters if c.get("status") != "RUNNING"]
+    return running, [not_running_entry(c, project) for c in clusters if c.get("status") not in AUDITABLE_STATUSES]
 
 
 # --------------------------------------------------------------------------- #
