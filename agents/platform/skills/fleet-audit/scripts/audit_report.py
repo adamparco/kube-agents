@@ -361,6 +361,13 @@ SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 
+# A manifest finding may stage more than one file when the fix is only correct
+# as a single commit -- a new object plus the edit that references it. The cap
+# is a blast-radius bound, not a design target: a finding that wants to rewrite
+# a dozen files is a finding that has stopped describing one problem, and the
+# reviewer of its pull request is the person who pays for that.
+MAX_REMEDIATION_PATHS = 8
+
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
 # distinguishes a rationale from a restated action.
@@ -2169,11 +2176,37 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     return titles
 
 
+def remediation_paths(remediation: object) -> list[str]:
+    """Every repo path a remediation stages, in declaration order.
+
+    `path` accepts a single string or a list of them, because some fixes are
+    only correct as one commit across two files. Enabling GKE upgrade
+    notifications is the case that forced it: the cluster's `notificationConfig`
+    names a Pub/Sub topic, and GKE rejects the update if that topic does not
+    exist yet. Split across two pull requests, whichever merges first is the one
+    that breaks -- the cluster edit reconciles against a missing topic, and the
+    audit records a merge over a fleet that did not change. One finding, both
+    files, one merge.
+
+    Order is preserved rather than sorted: it is what the model wrote, and the
+    ledger renders it in that order so a reader sees the new object before the
+    edit that depends on it. Callers that need a canonical set (grouping, the
+    `git add` pathspec) sort it themselves.
+    """
+    if not isinstance(remediation, dict):
+        return []
+    raw = remediation.get("path")
+    if raw is None or raw == "":
+        return []
+    values = raw if isinstance(raw, list) else [raw]
+    return [str(p) for p in values if str(p).strip()]
+
+
 def _remediation_is_file_backed(remediation: object) -> bool:
     if not isinstance(remediation, dict):
         return False
     return remediation.get("kind") == "manifest" or bool(
-        str(remediation.get("path") or "").strip()
+        remediation_paths(remediation)
     )
 
 
@@ -3119,21 +3152,43 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 f"{', '.join(REMEDIATION_KINDS)}, got {kind!r}"
             )
         path = remediation.get("path", "")
+        where = f"findings[{i}].remediation.path"
+        if isinstance(path, list):
+            # A list is only ever a manifest's; rejecting it here keeps the
+            # `elif path` branch below reading a plain value.
+            for j, entry in enumerate(path):
+                _require_str(entry, f"{where}[{j}]", allow_empty=False)
         if kind == "manifest":
-            _require_str(
-                path, f"findings[{i}].remediation.path", allow_empty=False
-            )
-            assert isinstance(path, str)
-            # Write the normalised spelling back. Grouping, the branch digest
-            # and the `git add` pathspec all key on this string; if `a/b.yaml`
+            declared = remediation_paths(remediation)
+            if not declared:
+                raise ValidationError(f"{where}: required, must be a non-empty path")
+            if len(declared) > MAX_REMEDIATION_PATHS:
+                raise ValidationError(
+                    f"{where}: at most {MAX_REMEDIATION_PATHS} files per finding, "
+                    f"got {len(declared)}"
+                )
+            # Write the normalised spellings back. Grouping, the branch digest
+            # and the `git add` pathspec all key on these strings; if `a/b.yaml`
             # and `./a/b.yaml` survive as two spellings they become two groups,
             # two pull requests against one file, and a conflict on the second.
-            remediation["path"] = _require_repo_relative(
-                path, f"findings[{i}].remediation.path"
+            normalised = [
+                _require_repo_relative(entry, where) for entry in declared
+            ]
+            duplicates = {p for p in normalised if normalised.count(p) > 1}
+            if duplicates:
+                raise ValidationError(
+                    f"{where}: names the same file twice "
+                    f"({', '.join(sorted(repr(p) for p in duplicates))}); a "
+                    "finding writes each file once, as its complete desired state"
+                )
+            # Keep the author's shape: a lone path stays a string, so every
+            # existing consumer and every stored envelope reads back unchanged.
+            remediation["path"] = (
+                normalised if isinstance(path, list) else normalised[0]
             )
         elif path:
             raise ValidationError(
-                f"findings[{i}].remediation.path: only permitted when kind == "
+                f"{where}: only permitted when kind == "
                 f"'manifest' (kind is {kind!r}); {kind!r} remediations stage no files"
             )
         _require_str(
@@ -3245,9 +3300,7 @@ def manifest_paths(findings: list[dict]) -> list[str]:
     for finding in findings:
         remediation = finding.get("remediation") or {}
         if remediation.get("kind") == "manifest":
-            path = remediation.get("path")
-            if path:
-                paths.add(str(path))
+            paths.update(remediation_paths(remediation))
     return sorted(paths)
 
 
@@ -4344,8 +4397,7 @@ def _finding_paths(finding: dict) -> set[str]:
     remediation = finding.get("remediation") or {}
     if remediation.get("kind") != "manifest":
         return set()
-    path = str(remediation.get("path", "") or "")
-    return {path} if path else set()
+    return set(remediation_paths(remediation))
 
 
 def remediation_groups(findings: list[dict]) -> list[list[dict]]:
@@ -5563,18 +5615,25 @@ def render_finding(
     kind = remediation.get("kind")
     lines.append("")
     if kind == "manifest":
-        path = str(remediation.get("path", ""))
+        paths = remediation_paths(remediation)
         note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
         suffix = f" — {note}" if note else ""
+
         # Plain code when the repository is unknown: a reader can still paste the
         # path, whereas a link that 404s costs them the round trip to find that
         # out. Callers that publish a real ledger all have the slug in hand.
-        target = (
-            REMEDIATION_BLOB_URL.format(repo=repo, path=path)
-            if repo and path
-            else ""
-        )
-        rendered_path = f"[`{path}`]({target})" if target else f"`{path}`"
+        def _render(path: str) -> str:
+            target = (
+                REMEDIATION_BLOB_URL.format(repo=repo, path=path)
+                if repo and path
+                else ""
+            )
+            return f"[`{path}`]({target})" if target else f"`{path}`"
+
+        # Comma-joined on one line rather than a nested list: the multi-file case
+        # is two or three files, and a sub-list for them buries the note that
+        # says why they travel together.
+        rendered_path = ", ".join(_render(p) for p in paths) if paths else "``"
         lines.append(f"- **Remediation (manifest):** {rendered_path}{suffix}")
     elif kind == "gcloud":
         lines.append("- **Remediation (gcloud):**")
@@ -8132,24 +8191,29 @@ def remediation_file_problem(finding: dict, root: Path) -> str | None:
     remediation = finding.get("remediation") or {}
     if remediation.get("kind") != "manifest":
         return None
-    path = str(remediation.get("path", ""))
-    try:
-        resolved = resolve_inside_repo(
-            root, path, f"{finding.get('id', '?')}.remediation.path"
-        )
-    except ValidationError as exc:
-        log(f"SECURITY: refusing remediation path {path!r}: {exc}")
+    # Every declared file has to be there. A multi-file fix is one commit
+    # precisely because its files depend on each other, so staging the subset
+    # that got written is worse than staging none of it -- that is the split
+    # merge the whole feature exists to avoid.
+    for path in remediation_paths(remediation):
+        try:
+            resolved = resolve_inside_repo(
+                root, path, f"{finding.get('id', '?')}.remediation.path"
+            )
+        except ValidationError as exc:
+            log(f"SECURITY: refusing remediation path {path!r}: {exc}")
+            return (
+                f"named `{path}` as the fix, but that path does not resolve to a "
+                "real file inside the repository, so nothing was read from it and "
+                "no pull request can be opened"
+            )
+        if resolved.is_file():
+            continue
         return (
-            f"named `{path}` as the fix, but that path does not resolve to a "
-            "real file inside the repository, so nothing was read from it and "
-            "no pull request can be opened"
+            f"named `{path}` as the fix but did not write it, so no pull "
+            "request can be opened for this finding"
         )
-    if resolved.is_file():
-        return None
-    return (
-        f"named `{path}` as the fix but did not write it, so no pull "
-        "request can be opened for this finding"
-    )
+    return None
 
 
 def kcc_declarations(root: Path) -> dict[tuple[str, str], tuple[str, set[str]]]:

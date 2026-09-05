@@ -479,6 +479,18 @@ field, and publishes nothing:
 - `remediation.kind` is `manifest`, `gcloud`, or `manual`. `path` is required for `manifest`
   (repo-relative, no `..`, no absolute paths, no glob metacharacters) and forbidden for the other
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
+- **`path` may be a list when the fix is only correct as one commit.** A string is the normal case
+  and stays the normal case. Reach for a list of up to eight paths when the files depend on each
+  other so completely that merging one without the other breaks the fleet — a new object plus the
+  edit that references it. Enabling GKE upgrade notifications is the shape: the cluster's
+  `notificationConfig` names a Pub/Sub topic, and GKE rejects the update while that topic does not
+  exist, so a two-pull-request split has a first merge that always fails. Write the new object
+  first in the list and the edits that depend on it after; the ledger renders them in that order.
+  All of them are staged together, all of them must be on disk when `finish` runs — one missing
+  and the whole finding degrades to `manual` rather than opening a half pull request — and two
+  findings sharing any one path still share a pull request, which is what collapses a
+  fleet-wide wiring change into one review. Do **not** use a list to bundle unrelated fixes: two
+  files that would each merge fine alone are two findings.
 - **A `gcloud` note is a command that runs, not the finding restated in flag form.** A flag takes
   the value `gcloud` accepts, which is routinely not the one the API reported, and pasting the
   observed value straight through is how that goes wrong. Enum fields are the trap, because

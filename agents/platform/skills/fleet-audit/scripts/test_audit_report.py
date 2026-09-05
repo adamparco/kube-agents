@@ -5220,10 +5220,11 @@ class TestRemediationGroups(BaseTestCase):
         self.assertEqual(self.ids(groups), [["a", "b"], ["c"]])
 
     def test_grouping_is_transitive(self):
-        # Today's schema is one path per finding, which makes groups plain
-        # equivalence classes and never exercises the union step. The union-find
-        # is written to be transitive anyway, so drive it through the path
-        # accessor: a—b share x, b—c share y, so all three are one PR.
+        # `TestMultiFileRemediation` drives the union step through the real
+        # schema now that a finding may declare several paths. This one keeps
+        # driving it through the accessor, so the transitive chain stays covered
+        # even for a shape no SOP currently emits: a—b share x, b—c share y, so
+        # all three are one PR though a and c have no file in common.
         paths = {"a": {"x.yaml"}, "b": {"x.yaml", "y.yaml"}, "c": {"y.yaml"}}
         findings = [manifest_finding(fid, f"{fid}.yaml") for fid in ("a", "b", "c")]
         with patch.object(
@@ -5307,6 +5308,171 @@ ALL_STATES = (
 def stale_closed_pr(**extra):
     """A pull request the *harness* closed, not a person."""
     return {"state": "CLOSED", "labels": [{"name": audit_report.STALE_CLOSED_LABEL}], **extra}
+
+
+class TestMultiFileRemediation(BaseTestCase):
+    """A `manifest` finding may name several files, staged as one commit.
+
+    The case that forced it: `no-notifications` wants a Pub/Sub topic that does
+    not exist yet *and* the `notificationConfig` on each cluster that publishes
+    to it. GKE rejects the cluster update while the topic is missing, so the two
+    files only work as one merge. Before this, `path` held one string and all
+    sixteen findings fell back to `kind: manual` -- a permanently unresolvable
+    42% of that ledger.
+    """
+
+    TOPIC = "gcp/pubsub-gke-upgrade-notifications.yaml"
+    CLUSTER = "gcp/adam-new-cluster.yaml"
+
+    def multi(self, fid="a", paths=None):
+        # `is None`, not falsy: an empty list is a case under test.
+        if paths is None:
+            paths = [self.TOPIC, self.CLUSTER]
+        return manifest_finding(fid, list(paths))
+
+    # -- the accessor ----------------------------------------------------- #
+
+    def test_a_string_path_still_reads_as_one_path(self):
+        self.assertEqual(
+            audit_report.remediation_paths({"kind": "manifest", "path": "a.yaml"}),
+            ["a.yaml"],
+        )
+
+    def test_a_list_reads_as_every_path_in_order(self):
+        self.assertEqual(
+            audit_report.remediation_paths(
+                {"kind": "manifest", "path": [self.TOPIC, self.CLUSTER]}
+            ),
+            [self.TOPIC, self.CLUSTER],
+        )
+
+    def test_absent_and_empty_read_as_no_paths(self):
+        for remediation in ({}, {"path": ""}, {"path": []}, {"path": ["", "  "]}):
+            with self.subTest(remediation=remediation):
+                self.assertEqual(audit_report.remediation_paths(remediation), [])
+
+    # -- validation ------------------------------------------------------- #
+
+    def test_a_two_file_manifest_validates(self):
+        doc = make_doc(findings=[self.multi()])
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_every_element_is_normalised_not_just_the_first(self):
+        doc = make_doc(findings=[self.multi(paths=["./a.yaml", "gcp/./b.yaml"])])
+        audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(
+            doc["findings"][0]["remediation"]["path"], ["a.yaml", "gcp/b.yaml"]
+        )
+
+    def test_one_bad_element_rejects_the_whole_finding(self):
+        # The escape is in the second slot on purpose: a validator that checked
+        # only `path[0]` would stage `../../etc/passwd` and pass.
+        doc = make_doc(findings=[self.multi(paths=["a.yaml", "../../etc/passwd"])])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[0].remediation.path", str(exc.exception))
+
+    def test_the_same_file_twice_is_rejected(self):
+        doc = make_doc(findings=[self.multi(paths=["a.yaml", "./a.yaml"])])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("same file twice", str(exc.exception))
+
+    def test_an_empty_list_is_rejected_like_an_empty_string(self):
+        doc = make_doc(findings=[self.multi(paths=[])])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[0].remediation.path", str(exc.exception))
+
+    def test_more_paths_than_the_cap_are_rejected(self):
+        over = [f"f{i}.yaml" for i in range(audit_report.MAX_REMEDIATION_PATHS + 1)]
+        doc = make_doc(findings=[self.multi(paths=over)])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(str(audit_report.MAX_REMEDIATION_PATHS), str(exc.exception))
+
+    def test_the_cap_itself_is_allowed(self):
+        at = [f"f{i}.yaml" for i in range(audit_report.MAX_REMEDIATION_PATHS)]
+        audit_report.validate_findings(make_doc(findings=[self.multi(paths=at)]), AUDIT)
+
+    def test_a_list_is_still_refused_on_a_gcloud_remediation(self):
+        doc = make_doc(
+            findings=[
+                make_finding(
+                    remediation={"kind": "gcloud", "path": ["a.yaml"], "note": "n"}
+                )
+            ]
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[0].remediation.path", str(exc.exception))
+
+    def test_a_lone_path_stays_a_string_through_validation(self):
+        # Envelopes written before this change read back and re-serialise
+        # unchanged, so `carry_unchanged_findings` still sees byte-identical
+        # remediations and does not rewrite prose that did not move.
+        doc = make_doc(findings=[manifest_finding("a", "a.yaml")])
+        audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(doc["findings"][0]["remediation"]["path"], "a.yaml")
+
+    # -- staging and grouping --------------------------------------------- #
+
+    def test_every_named_file_is_staged(self):
+        self.assertEqual(
+            audit_report.manifest_paths([self.multi()]),
+            sorted([self.TOPIC, self.CLUSTER]),
+        )
+
+    def test_findings_sharing_one_of_two_files_become_a_single_pr(self):
+        # This is the whole point on a real fleet: sixteen clusters each pair
+        # their own manifest with the one shared topic, so the topic path
+        # transitively merges all sixteen into one reviewable pull request.
+        # The shared topic sits in a different slot in each finding, so an
+        # implementation that reads only `path[0]` splits them into two pull
+        # requests and fails here.
+        groups = audit_report.remediation_groups(
+            [
+                self.multi("a", [self.TOPIC, "gcp/c1.yaml"]),
+                self.multi("b", ["gcp/c2.yaml", self.TOPIC]),
+                manifest_finding("c", "gcp/unrelated.yaml"),
+            ]
+        )
+        self.assertEqual(
+            [[f["id"] for f in g] for g in groups], [["a", "b"], ["c"]]
+        )
+
+    # -- rendering and the on-disk check ---------------------------------- #
+
+    def test_the_ledger_links_every_file_in_declaration_order(self):
+        repo = "gke-agentic/adamparco-infra"
+        text = "\n".join(audit_report.render_finding(self.multi(), repo=repo))
+        for path in (self.TOPIC, self.CLUSTER):
+            self.assertIn(f"](/{repo}/blob/HEAD/{path})", text)
+        self.assertLess(text.index(self.TOPIC), text.index(self.CLUSTER))
+
+    def test_a_finding_degrades_when_only_some_of_its_files_were_written(self):
+        # Staging the half that exists is worse than staging none: it merges the
+        # cluster edit without the topic it references, which is exactly the
+        # split this feature exists to prevent.
+        #
+        # Each slot takes a turn at being the missing one. Checking only the
+        # first declared path catches the `written=[CLUSTER]` case by accident
+        # and lets `written=[TOPIC]` through, so one order alone proves nothing.
+        for missing, written in ((self.TOPIC, self.CLUSTER), (self.CLUSTER, self.TOPIC)):
+            with self.subTest(missing=missing):
+                root = self.tmp_path / f"repo-{Path(missing).name}"
+                (root / "gcp").mkdir(parents=True)
+                (root / written).write_text("kind: X\n", encoding="utf-8")
+                problem = audit_report.remediation_file_problem(self.multi(), root)
+                self.assertIsNotNone(problem)
+                self.assertIn(missing, problem)
+
+    def test_a_finding_passes_when_all_of_its_files_were_written(self):
+        root = self.tmp_path / "repo"
+        (root / "gcp").mkdir(parents=True)
+        for path in (self.TOPIC, self.CLUSTER):
+            (root / path).write_text("kind: X\n", encoding="utf-8")
+        self.assertIsNone(audit_report.remediation_file_problem(self.multi(), root))
 
 
 class TestFindingState(BaseTestCase):
