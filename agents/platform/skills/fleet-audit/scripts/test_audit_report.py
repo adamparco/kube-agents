@@ -856,10 +856,19 @@ class TestRenderBody(unittest.TestCase):
         self.assertEqual(audit_report.manifest_paths([finding]), [])
 
     def test_manifest_remediation_links_the_path(self):
-        body = render_body(make_doc(), generated_at=NOW)
+        """And links it somewhere a reader can actually reach.
+
+        This assertion used to require the bare relative form,
+        `[`path`](path)`, which is what the renderer emitted and what issue #110
+        published. GitHub only rewrites a relative link inside a Markdown file
+        in the repository; in an issue body it leaves the href alone, so the
+        browser resolves it against `/issues/110` and the click 404s. The test
+        held the defect in place, so it asserts the repository-rooted form now.
+        """
+        body = render_body(make_doc(), generated_at=NOW, repo="acme/fleet")
         self.assertIn(
             "[`clusters/prod-us-east/payments-netpol.yaml`]"
-            "(clusters/prod-us-east/payments-netpol.yaml)",
+            "(/acme/fleet/blob/HEAD/clusters/prod-us-east/payments-netpol.yaml)",
             body,
         )
 
@@ -6959,6 +6968,13 @@ class TestReportStore(HarnessTestCase):
             audit_id=AUDIT,
             gaps=[],
             states={str(f["id"]): "open" for f in doc["findings"]},
+            # The slug `resolve_repo` is patched to return for this harness. A
+            # manifest path renders as a blob URL when the repository is known
+            # and as bare code when it is not, so a probe that omits it measures
+            # a shorter body than the run publishes: the budget it derives then
+            # drops the minor finding from *both* renders, leaving the relink
+            # nothing to change and this fixture nothing to compare.
+            repo="acme/fleet",
         )
 
         def fitted(budget):
@@ -7055,6 +7071,10 @@ class TestReportStore(HarnessTestCase):
             audit_id=AUDIT,
             gaps=[],
             states={str(f["id"]): "open" for f in doc["findings"]},
+            # As in `relink_drops_a_finding`: the slug `resolve_repo` is patched
+            # to return, so the probe charges for the blob URL a manifest path
+            # renders into rather than the shorter bare path.
+            repo="acme/fleet",
         )
 
         def fitted(budget):
@@ -10816,6 +10836,202 @@ class TestGcloudEnumCasing(unittest.TestCase):
         )
         self.assertEqual(
             finding["remediation"]["note"], "gcloud x --release-channel=regular"
+        )
+
+
+class TestManifestRemediationLink(unittest.TestCase):
+    """A `kind: manifest` path must not render as a bare relative link.
+
+    GitHub rewrites a relative link to a blob URL only inside a Markdown file in
+    the repository. In an issue body it leaves the href alone, so the browser
+    resolves it against the issue's own URL and 404s. Live run 2026-09-05
+    published one on issue #110; the rendered `body_html` came back carrying the
+    relative path verbatim.
+    """
+
+    REPO = "gke-agentic/adamparco-infra"
+    PATH = "gcp/spot-capacity-test.yaml"
+
+    def finding(self, **overrides):
+        base = {
+            "id": "single-zone-nodepool.spot-capacity-test._.nodepool-spot-pool",
+            "severity": "major",
+            "title": "spot-pool is locked to a single zone",
+            "cluster": "spot-capacity-test",
+            "namespace": "",
+            "object": "NodePool/spot-pool",
+            "evidence": {"command": "gcloud container node-pools list", "excerpt": "x"},
+            "recommendation": {"action": "a", "rationale": "b", "risk": "c"},
+            "remediation": {"kind": "manifest", "path": self.PATH, "note": "n"},
+        }
+        base.update(overrides)
+        return base
+
+    def test_the_repo_produces_an_absolute_blob_url(self):
+        text = "\n".join(audit_report.render_finding(self.finding(), repo=self.REPO))
+        self.assertIn(f"](/{self.REPO}/blob/HEAD/{self.PATH})", text)
+        self.assertNotIn(f"]({self.PATH})", text)
+
+    def test_without_a_repo_it_is_plain_code_not_a_dead_link(self):
+        text = "\n".join(audit_report.render_finding(self.finding()))
+        self.assertIn(f"`{self.PATH}`", text)
+        self.assertNotIn(f"]({self.PATH})", text)
+
+    def test_the_note_still_follows_the_path(self):
+        text = "\n".join(audit_report.render_finding(self.finding(), repo=self.REPO))
+        self.assertIn("— n", text)
+
+    def test_a_gcloud_remediation_grows_no_link(self):
+        finding = self.finding(
+            remediation={"kind": "gcloud", "note": "gcloud container clusters update x"}
+        )
+        text = "\n".join(audit_report.render_finding(finding, repo=self.REPO))
+        self.assertNotIn("blob/HEAD", text)
+
+    def test_the_published_body_carries_the_absolute_url(self):
+        doc = {
+            "audit": "stockout-prevention",
+            "findings": [self.finding()],
+            "scope": {"clusters": [{"name": "spot-capacity-test"}]},
+        }
+        body = audit_report.render_issue_body(
+            doc, generated_at=NOW, gaps=[], repo=self.REPO
+        ).body
+        self.assertIn(f"/{self.REPO}/blob/HEAD/{self.PATH}", body)
+
+    def test_no_relative_markdown_link_survives_in_a_published_body(self):
+        doc = {
+            "audit": "stockout-prevention",
+            "findings": [self.finding()],
+            "scope": {"clusters": [{"name": "spot-capacity-test"}]},
+        }
+        body = audit_report.render_issue_body(
+            doc, generated_at=NOW, gaps=[], repo=self.REPO
+        ).body
+        # Every markdown link target must be absolute, root-relative, or an
+        # in-page anchor -- the three forms GitHub resolves from an issue body.
+        for target in re.findall(r"\]\(([^)]+)\)", body):
+            self.assertTrue(
+                target.startswith(("http://", "https://", "/", "#")),
+                f"relative link target would 404 from an issue body: {target!r}",
+            )
+
+    def test_the_budget_charges_for_the_longer_link(self):
+        """Costing must render with the same `repo` the body will use.
+
+        The blob URL is longer than the bare path it replaced, so a costing pass
+        that omitted `repo` would under-charge every manifest finding against the
+        budget that exists to keep the body under GitHub's limit.
+        """
+        findings = [
+            self.finding(id=f"single-zone-nodepool.c{i}._.nodepool-p{i}")
+            for i in range(40)
+        ]
+        with_repo, _ = audit_report.select_rendered_findings(
+            findings, 6000, repo=self.REPO
+        )
+        without, _ = audit_report.select_rendered_findings(findings, 6000)
+        self.assertLessEqual(len(with_repo), len(without))
+
+
+class TestGcloudFormatQuoting(unittest.TestCase):
+    """A gcloud format expression is parenthesised, so bash eats it unquoted.
+
+    `--format=value(x)` is not a command that prints the wrong field, it is a
+    syntax error before gcloud is reached. The fenced commands a collector
+    records arrive quoted; the ones the model writes into prose do not.
+    """
+
+    def quote(self, text):
+        return audit_report.quote_gcloud_format_projections(text)
+
+    def test_the_live_defect_is_corrected(self):
+        # 2026-09-04 compliance-audit shipped this in `recommendation.risk` on
+        # fifteen findings, each of which dies with *syntax error near
+        # unexpected token `('* the moment a reader pastes it.
+        self.assertEqual(
+            self.quote(
+                "gcloud container clusters describe adam-new-cluster "
+                "--format=value(controlPlaneEndpointsConfig.ipEndpointsConfig"
+                ".publicEndpoint)"
+            ),
+            "gcloud container clusters describe adam-new-cluster "
+            "--format='value(controlPlaneEndpointsConfig.ipEndpointsConfig"
+            ".publicEndpoint)'",
+        )
+
+    def test_the_space_separated_form_is_corrected_too(self):
+        self.assertEqual(
+            self.quote("gcloud x --format value(name,location)"),
+            "gcloud x --format 'value(name,location)'",
+        )
+
+    def test_an_already_single_quoted_expression_is_untouched(self):
+        # Double-quoting an already-quoted command is the same class of defect
+        # in the other direction, so the rewrite has to see the quote.
+        note = "gcloud x --format 'json(a,b)'"
+        self.assertEqual(self.quote(note), note)
+
+    def test_an_already_double_quoted_expression_is_untouched(self):
+        note = 'gcloud x --format="json(a,b)"'
+        self.assertEqual(self.quote(note), note)
+
+    def test_prose_parentheses_are_not_quoted(self):
+        prose = "Authorized Networks (the weaker control) is preferred here."
+        self.assertEqual(self.quote(prose), prose)
+
+    def test_every_projection_gcloud_accepts_is_covered(self):
+        for projection in audit_report._GCLOUD_FORMAT_PROJECTIONS:
+            with self.subTest(projection=projection):
+                self.assertEqual(
+                    self.quote("gcloud x --format=%s(a)" % projection),
+                    "gcloud x --format='%s(a)'" % projection,
+                )
+
+    def test_the_risk_field_is_corrected_by_validation(self):
+        # `risk` is the third field carrying a pasteable command and the one
+        # left out when the enum normaliser was written; it is where the live
+        # defect shipped.
+        finding = make_finding(
+            fid="a",
+            recommendation={
+                "action": "a",
+                "rationale": "r",
+                "risk": "Confirm with `gcloud x --format=value(status)` first.",
+            },
+            remediation={"kind": "gcloud", "note": "gcloud x --format=value(status)"},
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["recommendation"]["risk"],
+            "Confirm with `gcloud x --format='value(status)'` first.",
+        )
+        self.assertEqual(
+            finding["remediation"]["note"], "gcloud x --format='value(status)'"
+        )
+
+    def test_a_carried_finding_is_corrected_on_republish(self):
+        # An unchanged finding is re-rendered from the stored document rather
+        # than from this run's validation, so a note written before the rewrite
+        # existed would otherwise be republished broken every morning forever.
+        stored = make_finding(
+            fid="carried",
+            recommendation={
+                "action": "a",
+                "rationale": "r",
+                "risk": "Check `gcloud x --format=value(status)`.",
+            },
+            remediation={"kind": "gcloud", "note": "gcloud x --format=value(status)"},
+        )
+        carried = audit_report._recased_carry(stored)
+        self.assertEqual(
+            carried["recommendation"]["risk"],
+            "Check `gcloud x --format='value(status)'`.",
+        )
+        # The copy must not reach back into the stored record.
+        self.assertEqual(
+            stored["recommendation"]["risk"],
+            "Check `gcloud x --format=value(status)`.",
         )
 
 

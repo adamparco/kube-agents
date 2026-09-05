@@ -416,6 +416,20 @@ _GCLOUD_ENUM_FLAG_RE = re.compile(
     r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>[A-Za-z0-9_-]+)"
 )
 
+# A gcloud format expression is parenthesised, and bash reads a bare `(` as a
+# subshell: pasting `--format=value(status)` is a syntax error, not a command
+# that prints the wrong thing. The fenced commands a collector records are
+# already quoted; the ones the model writes into prose are the ones that are
+# not, and a reader copies those out of the Recommendation and Risk lines just
+# as readily. Match only an unquoted expression -- the leading group asserts the
+# character before the projection is neither quote, so an already-correct
+# `--format 'json(a,b)'` is left alone rather than double-quoted.
+_GCLOUD_FORMAT_PROJECTIONS = ("value", "json", "table", "csv", "yaml", "flattened")
+_GCLOUD_BARE_FORMAT_RE = re.compile(
+    r"(?P<flag>--format)(?P<sep>[= ])(?P<proj>(?:%s)\([^)'\"]*\))"
+    % "|".join(_GCLOUD_FORMAT_PROJECTIONS)
+)
+
 # Both directories must live on the PVC. `gh` and `git` are not binaries in the
 # agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
 # sidecar that runs the real tool in *its* filesystem. Only /opt/data is shared
@@ -626,6 +640,19 @@ MAX_TITLE_CHARS = 300
 MAX_TEXT_CHARS = 1500
 MAX_NOTE_CHARS = 2000
 MAX_CELL_CHARS = 120
+# A `kind: manifest` remediation names a file in the GitOps repository, and the
+# ledger used to link it as the bare relative path. GitHub rewrites a relative
+# link to a blob URL only inside a Markdown *file* in the repository; in an
+# issue body it leaves the href alone, so the browser resolves it against the
+# issue's own URL. Live run 2026-09-05 published
+# `[gcp/spot-capacity-test.yaml](gcp/spot-capacity-test.yaml)` on issue #110 and
+# the rendered href came back as that same relative path, which from
+# `/issues/110` points at `/gke-agentic/adamparco-infra/gcp/spot-capacity-test.yaml`
+# -- a 404. Only `manifest` findings carry a path, so the dead link lands on
+# exactly the findings a reviewer is most likely to click: the PR-resolvable
+# ones. Root-relative rather than absolute so no host is hardcoded, and `HEAD`
+# rather than a branch name because the default branch is not knowable here.
+REMEDIATION_BLOB_URL = "/{repo}/blob/HEAD/{path}"
 # The not-applicable table's reason column, on the same reasoning as
 # MAX_COMMAND_CHARS: a cell nobody can act on is not worth the space it saves.
 # A reason is the only claim in the document that shrinks the coverage
@@ -3072,33 +3099,53 @@ def normalise_gcloud_enum_values(note: str) -> str:
     return _GCLOUD_ENUM_FLAG_RE.sub(rewrite, note)
 
 
-def normalise_finding_commands(finding: dict) -> None:
-    """Spell every gcloud enum value `finding` publishes the way gcloud takes it.
+def quote_gcloud_format_projections(text: str) -> str:
+    """Single-quote a bare `--format=value(...)` so pasting it is not a syntax error.
 
-    Two fields carry a command a reader pastes, and both have to be corrected
-    or neither is worth correcting. `remediation.note` is what `/remediate`
-    reads; `recommendation.action` is what the issue body renders *first*, and
-    the model writes the same command into both. Fixing the note alone
-    published `--release-channel=REGULAR` on the Recommendation line with
-    `--release-channel=regular` in the fix block seven lines below it, which
-    tells a reader the audit cannot spell its own command.
-
-    Passing prose through is safe: the rewrite only fires on a value directly
-    following a flag in the table, so "cohort peers run Regular" and "enrolled
-    in the Rapid channel" are untouched. `evidence` is deliberately excluded —
-    it records the command a collector actually ran, and correcting that would
-    misreport what happened rather than fix anything.
+    gcloud accepts the expression unquoted only because it never reaches gcloud
+    unquoted: the shell reads `(` first. A reader who copies the Recommendation
+    line gets `bash: syntax error near unexpected token '('` rather than the
+    field the finding told them to check, so the command is not merely
+    inelegant, it does not run.
     """
+    return _GCLOUD_BARE_FORMAT_RE.sub(
+        lambda m: f"{m.group('flag')}{m.group('sep')}'{m.group('proj')}'", text
+    )
+
+
+def normalise_finding_commands(finding: dict) -> None:
+    """Make every gcloud command `finding` publishes one a reader can paste.
+
+    Three fields carry a command, and all three have to be corrected or none is
+    worth correcting. `remediation.note` is what `/remediate` reads;
+    `recommendation.action` is what the issue body renders *first*; and
+    `recommendation.risk` is where a check tells the reader how to confirm the
+    fix landed. The model writes the same command into all of them. Fixing the
+    note alone published `--release-channel=REGULAR` on the Recommendation line
+    with `--release-channel=regular` in the fix block seven lines below it,
+    which tells a reader the audit cannot spell its own command; leaving `risk`
+    out shipped fifteen copies of an unquoted `--format=value(...)` that dies in
+    bash before it reaches gcloud.
+
+    Passing prose through is safe: the enum rewrite only fires on a value
+    directly following a flag in the table, so "cohort peers run Regular" and
+    "enrolled in the Rapid channel" are untouched, and the format rewrite only
+    fires on a parenthesised projection directly following `--format`.
+    `evidence` is deliberately excluded — it records the command a collector
+    actually ran, and correcting that would misreport what happened rather than
+    fix anything.
+    """
+    def fix(text: str) -> str:
+        return quote_gcloud_format_projections(normalise_gcloud_enum_values(text))
+
     recommendation = finding.get("recommendation")
-    if isinstance(recommendation, dict) and isinstance(
-        recommendation.get("action"), str
-    ):
-        recommendation["action"] = normalise_gcloud_enum_values(
-            recommendation["action"]
-        )
+    if isinstance(recommendation, dict):
+        for field in ("action", "risk"):
+            if isinstance(recommendation.get(field), str):
+                recommendation[field] = fix(recommendation[field])
     remediation = finding.get("remediation")
     if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
-        remediation["note"] = normalise_gcloud_enum_values(remediation["note"])
+        remediation["note"] = fix(remediation["note"])
 
 
 def severity_counts(findings: list[dict]) -> dict[str, int]:
@@ -5305,7 +5352,11 @@ def index_overhead(
 
 
 def render_finding(
-    finding: dict, *, state: str | None = None, pr_url: str | None = None
+    finding: dict,
+    *,
+    state: str | None = None,
+    pr_url: str | None = None,
+    repo: str | None = None,
 ) -> list[str]:
     fid = str(finding.get("id", ""))
     # Every free-text field is clipped, not only the evidence. The body budget
@@ -5391,7 +5442,16 @@ def render_finding(
         path = str(remediation.get("path", ""))
         note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
         suffix = f" — {note}" if note else ""
-        lines.append(f"- **Remediation (manifest):** [`{path}`]({path}){suffix}")
+        # Plain code when the repository is unknown: a reader can still paste the
+        # path, whereas a link that 404s costs them the round trip to find that
+        # out. Callers that publish a real ledger all have the slug in hand.
+        target = (
+            REMEDIATION_BLOB_URL.format(repo=repo, path=path)
+            if repo and path
+            else ""
+        )
+        rendered_path = f"[`{path}`]({target})" if target else f"`{path}`"
+        lines.append(f"- **Remediation (manifest):** {rendered_path}{suffix}")
     elif kind == "gcloud":
         lines.append("- **Remediation (gcloud):**")
         lines.append("")
@@ -5473,6 +5533,7 @@ def select_rendered_findings(
     *,
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
+    repo: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
@@ -5506,6 +5567,11 @@ def select_rendered_findings(
             finding,
             state=(states or {}).get(fid),
             pr_url=(pr_urls or {}).get(fid),
+            # Same `repo` the body will render with: a blob URL is longer than
+            # the bare path it replaced, so costing without it under-charges
+            # every manifest finding and can overflow the budget it exists to
+            # keep.
+            repo=repo,
         )
         cost = len("\n".join(rendered)) + 2
         cost += len(fid) + 3  # its slot in the hidden delta block
@@ -5638,6 +5704,7 @@ def _render_findings(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     gaps: list[str] | None = None,
+    repo: str | None = None,
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -5670,7 +5737,7 @@ def _render_findings(
     )
 
     rendered, omitted = select_rendered_findings(
-        findings, budget, states=states, pr_urls=pr_urls
+        findings, budget, states=states, pr_urls=pr_urls, repo=repo
     )
 
     # A one-row-per-finding index, so the state of the whole stream is legible
@@ -5702,7 +5769,7 @@ def _render_findings(
             fid = str(finding.get("id", ""))
             out.append("")
             out += render_finding(
-                finding, state=states.get(fid), pr_url=pr_urls.get(fid)
+                finding, state=states.get(fid), pr_url=pr_urls.get(fid), repo=repo
             )
 
     if omitted:
@@ -5722,13 +5789,16 @@ def _render_findings(
         out += [
             "",
             f"_{len(omitted)} further finding(s) are omitted from this description "
-            f"to stay inside GitHub's body limit: {breakdown}. The counts in the "
-            "title and in the summary above are the true totals. Findings are cut "
-            "from the least-severe end of the list, which is not the same as the "
-            "omitted ones being less severe than those shown — the per-severity "
-            "headings above give how many of each made it. They are kept in full "
-            "in this run's stored report; ask the agent for that report to read "
-            "them._",
+            f"to stay inside this report's {BODY_BUDGET:,}-character findings "
+            f"budget, which is set below GitHub's own {MAX_BODY_CHARS:,} limit to "
+            f"leave room for the blocks appended after the findings: {breakdown}. "
+            "The counts in the title and in the summary above are the true totals. "
+            "Findings are cut from the least-severe end of the list, which is not "
+            "the same as the omitted ones being less severe than those shown — a "
+            "severity heading above gives how many of that severity made it, and a "
+            "severity with no heading at all had every one of its findings cut. "
+            "They are kept in full in this run's stored report; ask the agent for "
+            "that report to read them._",
         ]
     return out, omitted
 
@@ -5970,6 +6040,7 @@ def render_issue_body(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     withheld: list[str] | None = None,
+    repo: str | None = None,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -6016,6 +6087,7 @@ def render_issue_body(
         states=states,
         pr_urls=pr_urls,
         gaps=gaps,
+        repo=repo,
     )
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
@@ -6321,7 +6393,15 @@ def render_remediation_pr_body(
 
     out += ["## Files", ""]
     for path in paths:
-        out.append(f"- [`{path}`]({path})")
+        # Plain code, not a link. A pull request body is not a file in the
+        # repository, so GitHub leaves a relative href alone and the browser
+        # resolves it against the pull request's own URL -- the same 404 the
+        # ledger used to publish. The blob URL that fixes it there is wrong
+        # here: it names the default branch, while the version this pull
+        # request is about is the one on its head branch, which for a file the
+        # remediation creates does not exist on the default branch at all. The
+        # Files changed tab is the navigation a reviewer already has.
+        out.append(f"- `{path}`")
 
     out += [
         "",
@@ -6975,7 +7055,9 @@ def refresh_coverage_ledger(
     # to say than what is published.
     wanted = coverage_issue_title(audit_id, gaps)
     body_file = _write_temp(
-        render_issue_body(data, generated_at=now, audit_id=audit_id, gaps=gaps).body
+        render_issue_body(
+            data, generated_at=now, audit_id=audit_id, gaps=gaps, repo=repo
+        ).body
     )
     try:
         res = gh(
@@ -8077,6 +8159,7 @@ def _handle_finish_dry_run(
         gaps=gaps,
         states=states,
         withheld=plan.withheld,
+        repo=repo,
     )
     if rendered.partial:
         log(
@@ -8727,7 +8810,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             # before. Open one: an audit that cannot speak for the fleet has
             # something to say, and it must land somewhere durable.
             rendered = render_issue_body(
-                data, generated_at=now, audit_id=audit_id, gaps=gaps
+                data, generated_at=now, audit_id=audit_id, gaps=gaps, repo=repo
             )
             body_file = _write_temp(rendered.body)
             try:
@@ -8898,6 +8981,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         states=states,
         pr_urls=pr_urls,
         withheld=plan.withheld,
+        repo=repo,
     )
     if rendered.partial:
         log(
@@ -9058,6 +9142,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 states=states,
                 pr_urls=pr_urls,
                 withheld=plan.withheld,
+                repo=repo,
             )
             relink = _write_temp(relinked.body)
             try:
