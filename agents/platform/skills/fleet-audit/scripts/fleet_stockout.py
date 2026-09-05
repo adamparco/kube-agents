@@ -1028,6 +1028,14 @@ def _emit(slug: str, hit: dict) -> dict:
         # excerpt reliably enough to bet a published sentence on it. See
         # `adopt_arm_impact` in audit_report.py.
         emitted["impact_authoritative"] = True
+    if hit.get("command"):
+        # The command that produced *this* candidate, for a check that issues
+        # one per sub-target rather than one per cluster. The entry's
+        # `commands` map holds a single record per slug, so §3.8's per-shape
+        # `capacity-history` calls and 3.10's per-region `regions describe`
+        # calls overwrite each other there and every finding inherits the last
+        # one. `adopt_collector_evidence` prefers this field when it is set.
+        emitted["command"] = hit["command"]
     return emitted
 
 
@@ -1296,6 +1304,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         first = advice[0] if isinstance(advice, list) and advice else advice
         hit, limitation = check_spot_scarcity(machine_type, shapes[machine_type], region, first)
         if hit:
+            hit["command"] = shlex.join(advice_argv)
             candidates.append(_emit("spot-scarcity-risk", hit))
         if limitation:
             limitations.append(limitation)
@@ -1361,6 +1370,7 @@ def collect_project(project: str, cluster_regions: set[str], *, run: RunFn) -> d
             for hit in [check_quota(quota)]:
                 if hit:
                     hit["excerpt"] = f"{region}: {hit['excerpt']}"
+                    hit["command"] = shlex.join(q_argv)
                     quota_candidates.append(_emit("quota-exhaustion-risk", hit))
 
     if reservations is None and not quota_records:

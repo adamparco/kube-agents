@@ -3863,9 +3863,20 @@ def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> lis
             if not isinstance(candidate, dict):
                 continue
             keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            # A candidate may name the command that produced *it*, and where it
+            # does, that beats the per-slug lookup. `commands` is one record per
+            # check per target, so a check issuing one command per sub-target --
+            # one `capacity-history` call per Spot machine shape, one `regions
+            # describe` per region -- can record only one of them, and every
+            # finding it emits then cites whichever survived. On a cluster with
+            # two Spot shapes that is a published command naming the other
+            # shape: an evidence line the reviewer can run and get data about
+            # something else. Both halves still move together, since the
+            # excerpt below is the same candidate's.
             by_id[derive_finding_id(keyed)] = (
                 candidate,
-                commands.get(str(candidate.get("check")), ""),
+                str(candidate.get("command") or "").strip()
+                or commands.get(str(candidate.get("check")), ""),
             )
 
     adopted = []

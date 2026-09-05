@@ -8516,6 +8516,45 @@ class TestAdoptCollectorEvidence(unittest.TestCase):
         for manifest in (None, {}, {"clusters": []}):
             self.assertEqual(audit_report.adopt_collector_evidence([finding], manifest), [])
 
+    def test_a_candidates_own_command_beats_the_per_slug_record(self):
+        """A check that issues one command per sub-target.
+
+        `commands` holds one record per check per target, so §3.8's
+        `capacity-history` call — one per Spot machine shape — keeps only the
+        last shape's, and 3.10's `regions describe` keeps only the first
+        region's. Every finding the check emits then cites that one command,
+        which on a cluster with two Spot shapes is a published evidence line
+        the reviewer can run and get data about the other shape.
+        """
+        own = (
+            "gcloud beta compute advice capacity-history --region us-east4 "
+            "--machine-type e2-standard-4 --provisioning-model SPOT --types PREEMPTION,PRICE"
+        )
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate(command=own)])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["command"], own)
+        self.assertEqual(finding["evidence"]["excerpt"], "zero NetworkPolicies")
+
+    def test_a_candidate_with_no_command_of_its_own_still_takes_the_slugs(self):
+        """The shape every other check emits, unchanged."""
+        finding = make_finding()
+        audit_report.adopt_collector_evidence([finding], self.manifest([self.candidate()]))
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
+    def test_a_blank_candidate_command_falls_back_rather_than_blanking(self):
+        """An empty string is not an override — it is the absence of one, and
+        the half-swap guard would otherwise drop the whole adoption and leave
+        the model's excerpt standing beside the model's command."""
+        finding = make_finding()
+        adopted = audit_report.adopt_collector_evidence(
+            [finding], self.manifest([self.candidate(command="  ")])
+        )
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["evidence"]["command"], self.COMMAND)
+
 
 class TestAdoptArmImpact(unittest.TestCase):
     """A multi-arm check's `impact` reports *which arm fired*, so the collector

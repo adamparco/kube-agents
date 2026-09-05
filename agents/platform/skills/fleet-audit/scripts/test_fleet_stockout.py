@@ -9,6 +9,7 @@ problem converting them was meant to solve."""
 
 import json
 import os
+import shlex
 import sys
 import unittest
 from pathlib import Path
@@ -1342,6 +1343,32 @@ class CollectClusterTest(unittest.TestCase):
         hits = [c for c in entry["candidates"] if c["check"] == "spot-scarcity-risk"]
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
+
+    def test_each_scarce_shape_carries_the_read_that_found_it(self):
+        """`commands` is one record per check per cluster, so two shapes
+        overwrite each other there and both findings would cite the last read.
+        On the live fleet `spot-capacity-test` asks for two shapes, and the
+        record that survived named the one that produced no finding — an
+        evidence line a reviewer runs to get data about a different machine
+        type. `adopt_collector_evidence` prefers the candidate's own command.
+        """
+        # One shape each, so both clear §3.8's second arm; two classes rather
+        # than two priorities on one, so the findings differ in `object` and
+        # survive as two.
+        classes = [
+            compute_class("gpu", [{"machineType": "a2-highgpu-1g", "spot": True}]),
+            compute_class("cpu", [{"machineType": "n2-standard-8", "spot": True}]),
+        ]
+        entry = self.run_with(dump_items=classes, advice=lambda mt: capacity_history([0.4] * 10, mt))
+        hits = {c["object"]: c for c in entry["candidates"] if c["check"] == "spot-scarcity-risk"}
+        self.assertEqual(set(hits), {"ComputeClass/gpu", "ComputeClass/cpu"})
+        wanted = {"ComputeClass/gpu": "a2-highgpu-1g", "ComputeClass/cpu": "n2-standard-8"}
+        for obj, hit in hits.items():
+            argv = shlex.split(hit["command"])
+            self.assertEqual(argv[argv.index("--machine-type") + 1], wanted[obj])
+        # And the single per-slug record cannot serve both: it holds one read.
+        recorded = [c for c in entry["commands"] if c["check"] == "spot-scarcity-risk"]
+        self.assertEqual(len(recorded), 1)
 
     def test_the_shape_ceiling_names_what_it_did_not_read(self):
         """A collector that quietly stops looking is the failure this whole
