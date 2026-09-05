@@ -3148,6 +3148,224 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
 
+class TestRevertedGcloudRemediations(HarnessTestCase):
+    """A `gcloud` fix Config Connector will undo is not a fix.
+
+    On 2026-09-05 the `fleet-consistency-drift` ledger carried two of these.
+    `drift-peer-std-4`'s declaration sets `loggingService: none` and the finding
+    said to run `--logging=SYSTEM,WORKLOAD`; `drift-peer-std-9`'s sets
+    `releaseChannel.channel: RAPID` against a `--release-channel=regular`. Both
+    commands work when pasted and both are reverted by the next reconcile, so
+    the operator sees the finding return every week having been fixed every
+    week. The Upgrade & Patch Readiness SOP had the rule; the drift SOP said the
+    opposite. This is the backstop for the model getting it wrong either way.
+    """
+
+    def declare(self, relative, name, spec, kind="ContainerCluster"):
+        """Write a Config Connector declaration into the clone."""
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = [
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1",
+            f"kind: {kind}",
+            "metadata:",
+            f"  name: {name}",
+            "  namespace: kubeagents-system",
+            "spec:",
+        ] + [f"  {line}" for line in spec]
+        target.write_text("\n".join(body) + "\n", encoding="utf-8")
+        return target
+
+    def gcloud_finding(self, note, obj="Cluster/drift-peer-std-4"):
+        return make_finding(
+            obj=obj, remediation={"kind": "gcloud", "note": note}
+        )
+
+    def test_a_declared_field_degrades_and_names_the_file(self):
+        self.declare(
+            "gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"]
+        )
+        findings = [self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")]
+        degraded = audit_report.degrade_reverted_gcloud_remediations(
+            findings, self.workspace
+        )
+        self.assertEqual(degraded, [findings[0]["id"]])
+        remediation = findings[0]["remediation"]
+        self.assertEqual(remediation["kind"], "manual")
+        self.assertIn("gcp/drift-peer-std-4.yaml", remediation["note"])
+        self.assertIn("loggingService", remediation["note"])
+        # The command still has to be readable once the note renders as prose.
+        self.assertIn("```bash", remediation["note"])
+        self.assertIn("--logging=SYSTEM,WORKLOAD", remediation["note"])
+
+    def test_a_field_the_declaration_omits_leaves_gcloud_alone(self):
+        # `state-into-spec: absent` means Config Connector holds the fields its
+        # spec names and nothing else, so a gcloud change to an omitted field
+        # sticks. Degrading here would replace a working fix with prose.
+        self.declare(
+            "gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"]
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container clusters update x --enable-master-authorized-networks"
+            )
+        ]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_undeclared_cluster_leaves_gcloud_alone(self):
+        self.declare(
+            "gcp/someone-else.yaml", "someone-else", ["loggingService: none"]
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+
+    def test_a_name_in_a_label_is_not_a_declaration(self):
+        # The trap every SOP in this skill warns about: `grep "name: <object>"`
+        # matches label lines. A false hit sends the operator to a file that
+        # governs nothing, so the index parses rather than greps.
+        target = self.workspace / "clusters/x/workload.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+            "  name: something-else\n  labels:\n"
+            "    app.kubernetes.io/name: drift-peer-std-4\n"
+            "    tracked-by: container.cnrm.cloud.google.com\n"
+            "spec:\n  loggingService: none\n",
+            encoding="utf-8",
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+
+    def test_a_prefix_sharing_cluster_is_not_a_declaration(self):
+        self.declare(
+            "gcp/drift-peer-std-40.yaml", "drift-peer-std-40", ["loggingService: none"]
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+
+    def test_resource_id_wins_over_metadata_name(self):
+        # KCC lets the CR be named anything and `spec.resourceID` carry the real
+        # GCP name. The fleet is matched by the name GKE reports.
+        self.declare(
+            "gcp/cr.yaml",
+            "some-kcc-object-name",
+            ["resourceID: drift-peer-std-4", "releaseChannel:", "  channel: RAPID"],
+        )
+        findings = [self.gcloud_finding("gcloud ... --release-channel=regular")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [findings[0]["id"]],
+        )
+
+    def test_a_flag_prefix_does_not_match_a_longer_flag(self):
+        # `--logging-variant` is a node-pool field this table does not claim;
+        # matching it as `--logging` would degrade a correct finding.
+        self.declare(
+            "gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"]
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging-variant=MAX_THROUGHPUT")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+
+    def test_a_manifest_remediation_is_untouched(self):
+        self.declare(
+            "gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"]
+        )
+        findings = [
+            make_finding(
+                obj="Cluster/drift-peer-std-4",
+                remediation={
+                    "kind": "manifest",
+                    "path": "gcp/drift-peer-std-4.yaml",
+                    "note": "--logging=SYSTEM,WORKLOAD",
+                },
+            )
+        ]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
+
+    def test_a_node_pool_matches_only_a_node_pool_declaration(self):
+        self.declare(
+            "gcp/pool.yaml",
+            "spot-pool",
+            ["management:", "  autoUpgrade: false"],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update spot-pool --enable-autoupgrade",
+                obj="NodePool/spot-pool",
+            )
+        ]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [findings[0]["id"]],
+        )
+
+    def test_an_unparseable_yaml_file_does_not_stop_the_sweep(self):
+        bad = self.workspace / "gcp/broken.yaml"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text(
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\n"
+            "kind: ContainerCluster\n  bad: [indent\n",
+            encoding="utf-8",
+        )
+        self.declare(
+            "gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"]
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [findings[0]["id"]],
+        )
+
+    def test_a_clone_with_no_declarations_costs_nothing(self):
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(
+            audit_report.degrade_reverted_gcloud_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+
 class TestCarryUnchangedFindings(unittest.TestCase):
     """An unchanged finding keeps last run's words.
 

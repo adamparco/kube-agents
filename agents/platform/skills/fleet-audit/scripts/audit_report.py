@@ -429,6 +429,56 @@ _GCLOUD_ENUM_FLAG_RE = re.compile(
     r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>[A-Za-z0-9_-]+)"
 )
 
+# The Config Connector spec field each gcloud flag writes. A fleet whose clusters
+# are declared as KCC `ContainerCluster`/`ContainerNodePool` resources reconciles
+# its spec continuously, so a `kind: gcloud` remediation against a field the
+# declaration carries is undone minutes after the operator pastes it -- and the
+# finding returns on the next run, having been "fixed" every week. The Upgrade &
+# Patch Readiness Audit's SOP has said so since it was written ("if it is managed
+# declaratively, a `gcloud` fix would be reverted on the next reconcile, so emit
+# `kind: manifest`"); the drift stream's SOP said the opposite ("a control-plane
+# flag is a command to run, not a file to merge") and shipped two such commands on
+# 2026-09-05, against `drift-peer-std-4`'s declared `loggingService` and
+# `drift-peer-std-9`'s declared `releaseChannel`.
+#
+# Only the flags whose KCC field is unambiguous are listed. `--logging` and
+# `--monitoring` each map to two possible fields because the CRD accepts the
+# legacy scalar and the component-config block, and a declaration carrying either
+# one owns the setting. A flag absent from this table is not checked: guessing a
+# field name would degrade a correct `gcloud` finding, which is the more expensive
+# error of the two.
+KCC_SPEC_FIELD_FOR_GCLOUD_FLAG: dict[str, tuple[str, ...]] = {
+    "--release-channel": ("releaseChannel",),
+    "--logging": ("loggingService", "loggingConfig"),
+    "--monitoring": ("monitoringService", "monitoringConfig"),
+    "--enable-managed-prometheus": ("monitoringConfig",),
+    "--disable-managed-prometheus": ("monitoringConfig",),
+    "--binauthz-evaluation-mode": ("binaryAuthorization",),
+    "--enable-intra-node-visibility": ("networkingMode", "enableIntranodeVisibility"),
+    "--enable-master-authorized-networks": ("masterAuthorizedNetworksConfig",),
+    "--master-authorized-networks": ("masterAuthorizedNetworksConfig",),
+    "--enable-network-policy": ("networkPolicy",),
+    "--enable-shielded-nodes": ("enableShieldedNodes",),
+    "--database-encryption-key": ("databaseEncryption",),
+    "--workload-pool": ("workloadIdentityConfig",),
+    "--enable-autoupgrade": ("management",),
+    "--enable-autorepair": ("management",),
+    "--maintenance-window-start": ("maintenancePolicy",),
+    "--maintenance-window-end": ("maintenancePolicy",),
+    "--maintenance-window-recurrence": ("maintenancePolicy",),
+}
+
+# The apiGroup suffix every Config Connector CRD shares.
+KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+
+# The `object` prefixes naming a GCP control-plane resource KCC can declare. A
+# finding on anything else -- a Deployment, a Namespace -- is not in scope here
+# even if a name collides.
+_KCC_OBJECT_KINDS = {
+    "Cluster": ("ContainerCluster",),
+    "NodePool": ("ContainerNodePool",),
+}
+
 # A gcloud format expression is parenthesised, and bash reads a bare `(` as a
 # subshell: pasting `--format=value(status)` is a syntax error, not a command
 # that prints the wrong thing. The fenced commands a collector records are
@@ -7890,6 +7940,162 @@ def remediation_file_problem(finding: dict, root: Path) -> str | None:
     )
 
 
+def kcc_declarations(root: Path) -> dict[tuple[str, str], tuple[str, set[str]]]:
+    """Index the Config Connector resources a GitOps clone declares.
+
+    Maps `(kind, metadata.name)` to the clone-relative path of the file holding
+    it and the set of top-level `spec` keys it sets. That key set is the whole
+    point: Config Connector holds the fields its spec *names* and leaves the
+    rest to whoever set them, so a declaration is only evidence that a gcloud
+    change will be reverted when it carries the field being changed.
+
+    Parsed rather than grepped, deliberately. Every SOP in this skill warns that
+    `grep "name: <object>"` is kind-blind and unanchored -- it matches
+    `app.kubernetes.io/name:` label lines and names that merely share a prefix --
+    and a false hit here degrades a correct `gcloud` finding into a `manual` one
+    that tells the operator to edit a file governing nothing.
+
+    Returns `{}` when PyYAML is absent or the clone is unreadable. That is the
+    safe direction: the check stops running and every `gcloud` remediation
+    publishes as written, which is the behaviour that shipped before this
+    existed. Failing a run over a missing parser would trade two wrong
+    remediations for no report at all.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the check
+    except ImportError:
+        return {}
+
+    index: dict[tuple[str, str], tuple[str, set[str]]] = {}
+    try:
+        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
+    except OSError:
+        return {}
+    for path in paths:
+        # `.git` holds packed objects, not manifests, and rglob walks into it.
+        if ".git" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if KCC_API_GROUP_SUFFIX not in text:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            # A file this audit cannot parse is a file it cannot make a claim
+            # about. Skipping leaves the finding's `gcloud` kind untouched.
+            continue
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            api = str(doc.get("apiVersion") or "")
+            kind = str(doc.get("kind") or "")
+            if KCC_API_GROUP_SUFFIX not in api or not kind:
+                continue
+            meta = doc.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            # `resourceID` overrides `metadata.name` as the GCP resource's real
+            # name when present, and the fleet's clusters are matched by the
+            # name GKE reports, not the name the CR happens to carry.
+            spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            name = str(spec.get("resourceID") or meta.get("name") or "")
+            if not name:
+                continue
+            try:
+                relative = str(path.relative_to(root))
+            except ValueError:
+                continue
+            index[(kind, name)] = (relative, {str(k) for k in spec})
+    return index
+
+
+def reverted_gcloud_problem(
+    finding: dict, declarations: dict[tuple[str, str], tuple[str, set[str]]]
+) -> tuple[str, str] | None:
+    """`None` if this `gcloud` fix will survive its next reconcile; else why not.
+
+    Returns `(clone-relative path of the declaration, the spec field it holds)`.
+    Split from the rewrite for the same reason `remediation_file_problem` is:
+    the `--dry-run` paths ask the question to warn, and a dry run that rewrote
+    the document it is previewing would show a body the real run never emits.
+    """
+    remediation = finding.get("remediation") or {}
+    if remediation.get("kind") != "gcloud":
+        return None
+    obj = str(finding.get("object") or "")
+    prefix, _, name = obj.partition("/")
+    kinds = _KCC_OBJECT_KINDS.get(prefix)
+    if not kinds or not name:
+        return None
+    note = str(remediation.get("note") or "")
+    if not note:
+        return None
+    for kind in kinds:
+        entry = declarations.get((kind, name))
+        if entry is None:
+            continue
+        relative, declared = entry
+        for flag, fields in KCC_SPEC_FIELD_FOR_GCLOUD_FLAG.items():
+            # Match the flag as a whole word: `--logging` must not fire on
+            # `--logging-variant`, which writes a node-pool field this table
+            # deliberately does not claim.
+            if not re.search(rf"{re.escape(flag)}(?=[=\s]|$)", note):
+                continue
+            held = [f for f in fields if f in declared]
+            if held:
+                return relative, held[0]
+    return None
+
+
+def degrade_reverted_gcloud_remediations(
+    findings: list[dict], root: Path
+) -> list[str]:
+    """Rewrite `gcloud` fixes Config Connector would undo, and report them.
+
+    Degrades to `manual` rather than promoting to `manifest`: promoting would
+    claim a file this run never wrote, and `remediation.path` must name a real
+    file on disk when `finish` stages it. The finding, its evidence and its
+    recommendation all survive; what changes is that the ledger stops printing a
+    pasteable command whose effect is reverted minutes later, and names the file
+    the change belongs in instead. The SOPs tell the model to emit `kind:
+    manifest` for these up front -- this is the backstop for when it does not,
+    the same shape as `degrade_missing_remediations`.
+
+    Returns the ids that were degraded, for the caller to log.
+    """
+    if not findings:
+        return []
+    declarations = kcc_declarations(root)
+    if not declarations:
+        return []
+    degraded: list[str] = []
+    for finding in findings:
+        problem = reverted_gcloud_problem(finding, declarations)
+        if problem is None:
+            continue
+        relative, field = problem
+        remediation = finding.get("remediation") or {}
+        note = str(remediation.get("note", "")).strip()
+        remediation["kind"] = "manual"
+        # A `gcloud` note is rendered inside a bash fence and a `manual` note as
+        # prose, so changing the kind changes how the existing text renders. Fence
+        # it here to keep it pasteable -- it still states the desired end state,
+        # and an operator who has already flipped that field in the file may want
+        # it to close the gap before the next sync.
+        remediation["note"] = (
+            f"This object is declared in the GitOps repository at `{relative}`, "
+            f"whose spec sets `{field}`. Config Connector holds that field against "
+            "out-of-band changes, so the command below is reverted on the next "
+            "reconcile and this finding returns on the next run. Make the change "
+            "in that file instead."
+        ) + (f"\n\n```bash\n{note}\n```" if note else "")
+        degraded.append(str(finding.get("id", "")))
+    return degraded
+
+
 def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     """Downgrade manifest findings whose file was never written, and report them.
 
@@ -8120,6 +8326,11 @@ def _handle_finish_dry_run(
         log(
             f"WARNING: {fid}'s remediation path is not a readable file inside "
             f"{root}; it degrades to a manual remediation and opens no pull request."
+        )
+    for fid in degrade_reverted_gcloud_remediations(findings, root):
+        log(
+            f"DRY RUN: {fid}'s gcloud remediation targets a field the GitOps "
+            "repository declares through Config Connector; it degrades to manual."
         )
     paths = manifest_paths(findings)
 
@@ -8596,6 +8807,13 @@ def handle_finish(args: argparse.Namespace) -> None:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
+        )
+    for fid in degrade_reverted_gcloud_remediations(findings, root):
+        log(
+            f"WARNING: {fid}'s gcloud remediation targets a field the GitOps "
+            "repository declares through Config Connector, so it would be "
+            "reverted on the next reconcile; it is published as manual, naming "
+            "the file to change instead."
         )
 
     # "Absent from this document" only means "fixed" if the audit actually
