@@ -1396,14 +1396,22 @@ class TestValidation(unittest.TestCase):
 
         If a new single-token slug is added, this fails and whoever added it
         decides deliberately whether the title guard can still see it.
+
+        `underrequest` was that decision, made on 2026-09-05. It keeps the bare
+        form rather than taking a hyphen because it is one half of a pair with
+        `overrequest` -- the two checks ask opposite questions of the same
+        number, and naming one of them `under-request` would read as a
+        different kind of thing. It buys the same exemption for the same
+        reason: "Underrequested memory on Deployment/litellm" is the prose
+        title its SOP asks for, and the guard must not reject it.
         """
         every = set()
         for audit in audit_report.AUDITS:
             every |= set(audit_report.audit_checks(audit))
-        self.assertEqual({"overrequest"}, {s for s in every if "-" not in s})
+        self.assertEqual({"overrequest", "underrequest"}, {s for s in every if "-" not in s})
 
     def test_a_hyphenated_slug_is_still_rejected_on_the_boundary(self):
-        """82 of 84 slugs carry a hyphen and stay fully enforced."""
+        """87 of 89 slugs carry a hyphen and stay fully enforced."""
         doc = make_doc(
             findings=[make_finding(check="netpol-missing", title="netpol-missing in payments")]
         )

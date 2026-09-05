@@ -186,6 +186,13 @@ AUDITS: dict[str, AuditSpec] = {
             "scaledown-blocked",
             "terminal-pods",
             "idle-namespace",
+            # Reads as the odd one out, and is: `underrequest` is §3.1's other
+            # half and belongs beside it. It sits last because this tuple is
+            # the SOP's heading order, and inserting a §3.2 would renumber
+            # eight sections that fifteen lines of that SOP's prose refer to by
+            # number — churn no check can verify afterwards. §3.1 and §3.11
+            # cross-reference each other instead.
+            "underrequest",
         ),
         # §3.4–3.6 read Compute Engine objects that belong to a project, not to
         # a cluster; the SOP's §3 project-scoped rule puts them on their own
@@ -193,8 +200,12 @@ AUDITS: dict[str, AuditSpec] = {
         scopes=(
             (
                 "cluster",
+                # A membership test for which scope a slug belongs to, so
+                # `underrequest` sits next to its pair here rather than last
+                # the way the roster above has to order it.
                 (
                     "overrequest",
+                    "underrequest",
                     "orphan-pv",
                     "unconsumed-pvc",
                     "idle-nodepool",
@@ -2866,11 +2877,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # and a normalising comparison cannot tell them apart.
         #
         # Only a hyphenated slug is matched, and only on a word boundary.
-        # Eighty-two of the eighty-four slugs carry a hyphen, which no prose
+        # Eighty-seven of the eighty-nine slugs carry a hyphen, which no prose
         # title spells -- "Netpol-Missing in payments" can only be the slug.
-        # The two that do not, `overrequest` and the derived `uncohorted`, are
-        # ordinary English words, and a bare `startswith` rejected
-        # "Overrequested CPU on Deployment/payments-api" and "Uncohorted
+        # The ones that do not -- `overrequest`, `underrequest`, and the
+        # derived `uncohorted` -- are ordinary English words, and a bare
+        # `startswith` rejected "Overrequested CPU on Deployment/payments-api",
+        # "Underrequested memory on Deployment/litellm" and "Uncohorted
         # cluster drifts on six facets": the prose titles their own SOPs ask
         # for. That is not a cosmetic refusal. `finish` raises here, after
         # collection, inspection and publication have all already run, so a
