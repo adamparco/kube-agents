@@ -108,6 +108,13 @@ DEFAULT_LEASE_TTL_HOURS = 24.0
 # The branch a pull request targets when nothing better can be determined —
 # which is only when there is no clone to ask yet. See `resolve_base_branch`.
 DEFAULT_BASE_BRANCH = "main"
+# How long `get_managed_repo_entries` waits on the API server before giving up.
+# One namespaced GET against an in-cluster endpoint, so this is not a budget so
+# much as a ceiling on a call that has no other one: unbounded, an API server
+# that accepts the connection and then stops talking hangs the caller forever
+# rather than failing it, and the audit path that reads this on every run has no
+# timeout of its own to catch that.
+CONFIGMAP_READ_TIMEOUT_SECONDS = 30
 
 
 class GitOpsRepoEmpty(RuntimeError):
@@ -700,9 +707,18 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=CONFIGMAP_READ_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as e:
         raise RuntimeError("kubectl binary not found in PATH") from e
+    except subprocess.TimeoutExpired as e:
+        # Same RuntimeError as every other failure here, because every caller
+        # already handles one and none of them can do anything with a distinct
+        # type: a list that cannot be read is a list that cannot be read.
+        raise RuntimeError(
+            f"Timed out after {CONFIGMAP_READ_TIMEOUT_SECONDS}s reading ConfigMap "
+            f"{cfg_name} in namespace {ns}"
+        ) from e
     except subprocess.CalledProcessError as e:
         err_msg = (e.stderr or e.stdout or "").strip()
         raise RuntimeError(

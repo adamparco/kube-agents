@@ -329,8 +329,13 @@ data:
         enabled: false
         extra:
           rich_blocks: true
+      teams:
+        enabled: false
+        extra:
+          adaptive_cards: true
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
+    HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=today
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
@@ -584,6 +589,8 @@ spec:
               value: /tmp/credential-proxy/home
             - name: CREDENTIAL_PROXY_POLICY
               value: /etc/credential-proxy/policy.json
+            - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
+              value: "16777216"
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
@@ -892,6 +899,8 @@ spec:
               value: "true"
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
             - name: CREDENTIAL_PROXY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: CREDENTIAL_PROXY_TOKEN_FILE
@@ -989,6 +998,8 @@ spec:
               value: /opt/data
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
             - name: HOME
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
@@ -1251,6 +1262,8 @@ spec:
         - ipBlock:
             cidr: 169.254.20.10/32
         - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
             cidr: 10.96.0.10/32
     - ports:
         - port: 8765
@@ -1409,6 +1422,8 @@ spec:
               k8s-app: node-local-dns
         - ipBlock:
             cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
     - ports:

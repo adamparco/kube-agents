@@ -1,43 +1,1675 @@
 #!/usr/bin/env python3
 """Unit tests for networking_audit.py."""
 
-import unittest
-from unittest.mock import patch
-
+import hashlib
 import os
 import sys
+import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-import networking_audit
+import networking_audit as na  # noqa: E402
 
-class TestNetworkingAudit(unittest.TestCase):
-    @patch("networking_audit.run_gcloud_json")
-    def test_audit_project_networking_rejected_psc(self, mock_gcloud):
-        mock_gcloud.return_value = [
+FLEET_AUDIT_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "fleet-audit", "scripts")
+sys.path.insert(0, os.path.abspath(FLEET_AUDIT_SCRIPTS))
+
+
+def run_of(rc: int, stdout: str = "", stderr: str = "") -> na.Run:
+    return na.Run(["gcloud"], rc, stdout, stderr, 0.01)
+
+
+class RunAndGateTest(unittest.TestCase):
+    def test_gate_closes_on_nonzero_rc(self):
+        parsed, result = na.run_and_gate(["x"], run=lambda argv: run_of(1, "[]", "denied"))
+        self.assertIsNone(parsed)
+        self.assertEqual(result.rc, 1)
+
+    def test_gate_closes_on_empty_stdout(self):
+        parsed, _ = na.run_and_gate(["x"], run=lambda argv: run_of(0, "   "))
+        self.assertIsNone(parsed)
+
+    def test_gate_closes_on_non_json(self):
+        parsed, _ = na.run_and_gate(["x"], run=lambda argv: run_of(0, "not json"))
+        self.assertIsNone(parsed)
+
+    def test_gate_opens_on_clean_json(self):
+        parsed, _ = na.run_and_gate(["x"], run=lambda argv: run_of(0, "[1, 2]"))
+        self.assertEqual(parsed, [1, 2])
+
+
+class UrlHelpersTest(unittest.TestCase):
+    def test_last_segment(self):
+        self.assertEqual(na._last_segment("https://x/y/z"), "z")
+        self.assertEqual(na._last_segment(""), "")
+
+    def test_region_of_subnet_link(self):
+        link = "https://www.googleapis.com/compute/v1/projects/p/regions/us-central1/subnetworks/gke-pods-subnet"
+        self.assertEqual(na._region_of_subnet_link(link), "us-central1")
+
+    def test_region_of_subnet_link_empty(self):
+        self.assertEqual(na._region_of_subnet_link(""), "")
+
+
+class SubnetIpExhaustionTest(unittest.TestCase):
+    def test_flags_primary_range_over_85_percent(self):
+        hit = na.check_subnet_ip_exhaustion(
+            {"subnetwork": ".../subnetworks/gke-pods-subnet", "ipCidrRange": "10.0.0.0/24", "ipUtilization": 0.9}
+        )
+        self.assertEqual(hit["object"], "Subnet/gke-pods-subnet")
+        self.assertIn("90.0%", hit["excerpt"])
+
+    def test_flags_secondary_range_over_85_percent(self):
+        hit = na.check_subnet_ip_exhaustion(
             {
-                "name": "psc-ep-1",
-                "region": "projects/p/regions/us-central1",
-                "target": "projects/p/regions/us-central1/serviceAttachments/sa-1",
-                "pscConnectionStatus": "REJECTED"
+                "subnetwork": ".../subnetworks/gke-pods-subnet",
+                "ipCidrRange": "10.0.0.0/24",
+                "ipUtilization": 0.2,
+                "secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/20", "ipUtilization": 0.95}],
+            }
+        )
+        self.assertIn("secondary range pods", hit["excerpt"])
+
+    def test_does_not_flag_healthy_subnet(self):
+        hit = na.check_subnet_ip_exhaustion(
+            {"subnetwork": ".../subnetworks/gke-pods-subnet", "ipCidrRange": "10.0.0.0/24", "ipUtilization": 0.5}
+        )
+        self.assertIsNone(hit)
+
+    def test_missing_utilization_field_is_not_a_crash(self):
+        hit = na.check_subnet_ip_exhaustion({"subnetwork": ".../subnetworks/x", "ipCidrRange": "10.0.0.0/24"})
+        self.assertIsNone(hit)
+
+
+class RouterNatTest(unittest.TestCase):
+    def router(self, **overrides):
+        base = {
+            "name": "nat-router",
+            "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-central1",
+            "nats": [{"name": "nat-gw", "natIpAllocateOption": "AUTO_ONLY", "enableDynamicPortAllocation": True, "maxPortsPerVm": 4096}],
+        }
+        base.update(overrides)
+        return base
+
+    def test_flags_missing_auto_allocated_ip(self):
+        status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": []}]}}
+        hit = na.check_router_nat(self.router(), status, {})
+        self.assertEqual(hit["object"], "Router/us-central1/nat-router")
+        self.assertIn("no auto-allocated external IP", hit["excerpt"])
+
+    def test_two_same_named_routers_in_two_regions_are_two_objects(self):
+        """Both land in the one `project/<p>` target, so a bare name would give
+        them one finding identity and `finish` would refuse the document."""
+        status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": []}]}}
+        east = self.router(region="https://www.googleapis.com/compute/v1/projects/p/regions/us-east4")
+        objects = {
+            na.check_router_nat(self.router(), status, {})["object"],
+            na.check_router_nat(east, status, {})["object"],
+        }
+        self.assertEqual(objects, {"Router/us-central1/nat-router", "Router/us-east4/nat-router"})
+
+    def test_does_not_flag_healthy_auto_allocation(self):
+        status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["34.1.2.3"]}]}}
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 512}]}]}
+        hit = na.check_router_nat(self.router(), status, mappings)
+        self.assertIsNone(hit)
+
+    def test_flags_port_ceiling_at_80_percent(self):
+        status = {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["34.1.2.3"]}]}}
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 3277}]}]}  # 80.0% of 4096
+        hit = na.check_router_nat(self.router(), status, mappings)
+        self.assertIn("vm-1", hit["excerpt"])
+        self.assertIn("3277/4096", hit["excerpt"])
+
+    def test_static_allocation_is_never_measured_against_its_own_reservation(self):
+        """With dynamic port allocation off, Cloud NAT hands every VM exactly
+        `minPortsPerVm` ports, so `numTotalNatPorts` is the ceiling and the
+        ratio is the constant 1.0. Measuring it flagged `critical` port
+        exhaustion for every VM behind every stock gateway, every day."""
+        router = self.router(nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "minPortsPerVm": 64, "natIps": ["34.1.2.3"]}])
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 64}]}]}
+        self.assertIsNone(na.check_router_nat(router, None, mappings))
+
+        # Same gateway on GCP's stock ceiling, which `routers list` omits.
+        stock = self.router(nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "natIps": ["34.1.2.3"]}])
+        self.assertIsNone(na.check_router_nat(stock, None, mappings))
+
+    def test_a_dynamic_nat_on_the_default_ceiling_uses_the_dynamic_default(self):
+        router = self.router(
+            nats=[{"name": "nat-gw", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "natIps": ["34.1.2.3"]}]
+        )
+        mappings = {"nat-gw": [{"instanceName": "vm-1", "interfaceNatMappings": [{"numTotalNatPorts": 60000}]}]}  # 91.6% of 65536
+        hit = na.check_router_nat(router, None, mappings)
+        self.assertIn("60000/65536", hit["excerpt"])
+
+    def test_two_gateways_on_one_router_do_not_cross_attribute(self):
+        """A router's mapping used to be read once, unfiltered, and compared
+        against each gateway's ceiling in turn -- so `wide`'s VM at 4096 ports
+        was measured a second time against `narrow`'s 1024 and reported at
+        400%. Each gateway is keyed to its own `--nat-name` read."""
+        router = self.router(
+            nats=[
+                {"name": "wide", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "maxPortsPerVm": 8192, "natIps": ["34.1.2.3"]},
+                {"name": "narrow", "natIpAllocateOption": "MANUAL_ONLY", "enableDynamicPortAllocation": True, "maxPortsPerVm": 1024, "natIps": ["34.1.2.4"]},
+            ]
+        )
+        mappings = {
+            "wide": [{"instanceName": "busy-vm", "interfaceNatMappings": [{"numTotalNatPorts": 4096}]}],  # 50% of 8192
+            "narrow": [{"instanceName": "quiet-vm", "interfaceNatMappings": [{"numTotalNatPorts": 64}]}],  # 6% of 1024
+        }
+        self.assertIsNone(na.check_router_nat(router, None, mappings))
+
+    def test_no_mapping_data_is_not_a_crash(self):
+        hit = na.check_router_nat(self.router(), {"result": {"natStatus": [{"name": "nat-gw", "autoAllocatedNatIps": ["1.2.3.4"]}]}}, None)
+        self.assertIsNone(hit)
+
+
+class PscRoutingTest(unittest.TestCase):
+    def test_flags_rejected_service_attachment(self):
+        hits = na.check_psc_routing(
+            [{"name": "psc-ep-1", "target": "projects/p/regions/us-central1/serviceAttachments/sa-1", "pscConnectionStatus": "REJECTED"}]
+        )
+        self.assertEqual(hits, [{"object": "ForwardingRule/global/psc-ep-1", "excerpt": "pscConnectionStatus: REJECTED"}])
+
+    def test_a_regional_rule_carries_its_region_in_the_object(self):
+        hits = na.check_psc_routing(
+            [
+                {
+                    "name": "psc-ep-1",
+                    "region": "https://www.googleapis.com/compute/v1/projects/p/regions/us-east4",
+                    "target": "projects/p/regions/us-east4/serviceAttachments/sa-1",
+                    "pscConnectionStatus": "CLOSED",
+                }
+            ]
+        )
+        self.assertEqual(hits[0]["object"], "ForwardingRule/us-east4/psc-ep-1")
+
+    def test_does_not_flag_accepted(self):
+        hits = na.check_psc_routing(
+            [{"name": "psc-ep-2", "target": "projects/p/regions/us-central1/serviceAttachments/sa-2", "pscConnectionStatus": "ACCEPTED"}]
+        )
+        self.assertEqual(hits, [])
+
+    def test_ignores_non_psc_forwarding_rules(self):
+        hits = na.check_psc_routing([{"name": "lb-rule", "target": "projects/p/global/targetHttpProxies/lb", "pscConnectionStatus": ""}])
+        self.assertEqual(hits, [])
+
+    def test_empty_list(self):
+        self.assertEqual(na.check_psc_routing([]), [])
+
+
+class MtuMismatchTest(unittest.TestCase):
+    def test_flags_active_peering_with_differing_mtu(self):
+        networks = [
+            {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "mtu": 1500, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/vpc-a--vpc-b")
+
+    def test_does_not_double_count_the_pair_from_both_sides(self):
+        networks = [
+            {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "mtu": 1500, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+
+    def test_does_not_flag_matching_mtu(self):
+        networks = [
+            {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_does_not_flag_inactive_peering(self):
+        networks = [
+            {"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-b", "state": "INACTIVE"}]},
+            {"name": "vpc-b", "mtu": 1500, "peerings": []},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_peer_outside_this_project_is_not_a_crash(self):
+        networks = [{"name": "vpc-a", "mtu": 1460, "peerings": [{"network": ".../networks/other-project-vpc", "state": "ACTIVE"}]}]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_an_absent_mtu_key_is_the_default_and_still_mismatches(self):
+        """The shape `networks list` actually returns, and the only one that fires.
+
+        GCP omits `mtu` on every network left at 1460, so the mismatch that
+        happens in practice -- a default network peered with one raised to 8896
+        -- arrives with the key present on one side only.
+        """
+        networks = [
+            {"name": "vpc-default", "peerings": [{"network": ".../networks/vpc-jumbo", "state": "ACTIVE"}]},
+            {"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/vpc-default", "state": "ACTIVE"}]},
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/vpc-default--vpc-jumbo")
+        self.assertIn("vpc-default mtu=1460", hits[0]["excerpt"])
+        self.assertIn("vpc-jumbo mtu=8896", hits[0]["excerpt"])
+
+    def test_two_networks_both_silent_about_mtu_agree(self):
+        networks = [
+            {"name": "vpc-a", "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_a_silent_network_matches_one_that_spells_the_default_out(self):
+        networks = [
+            {"name": "vpc-a", "peerings": [{"network": ".../networks/vpc-b", "state": "ACTIVE"}]},
+            {"name": "vpc-b", "mtu": 1460, "peerings": [{"network": ".../networks/vpc-a", "state": "ACTIVE"}]},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_an_unlisted_peer_is_not_defaulted_into_a_mismatch(self):
+        """Absent from the listing is unknown; absent `mtu` on a listed network is 1460.
+
+        Collapsing the two would invent a finding against every jumbo-MTU VPC
+        peered out to another project.
+        """
+        networks = [{"name": "vpc-jumbo", "mtu": 8896, "peerings": [{"network": ".../networks/elsewhere", "state": "ACTIVE"}]}]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_a_peer_in_another_project_does_not_resolve_to_the_local_namesake(self):
+        """`default` is the most common network name in GCP, so a bare-name
+        lookup resolves a cross-project peering to this project's `default` and
+        compares the wrong two MTUs. Both sides here are 8896 — a healthy
+        peering — and the only way to report one is to have compared
+        `vpc-jumbo` against the local `default` instead.
+        """
+        networks = [
+            {
+                "name": "default",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                "peerings": [],
             },
             {
-                "name": "psc-ep-2",
-                "region": "projects/p/regions/us-central1",
-                "target": "projects/p/regions/us-central1/serviceAttachments/sa-2",
-                "pscConnectionStatus": "ACCEPTED"
+                "name": "vpc-jumbo",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/other-proj/global/networks/default",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+    def test_a_peer_in_this_project_still_resolves_through_its_self_link(self):
+        """The other half of the pair: same URL shape, same project, so the
+        lookup must hit. Without it the fix above would be a check that never
+        fires rather than one that stopped colliding.
+        """
+        networks = [
+            {
+                "name": "default",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+            {
+                "name": "vpc-jumbo",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [],
+            },
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
+        self.assertIn("default mtu=1460", hits[0]["excerpt"])
+        self.assertIn("vpc-jumbo mtu=8896", hits[0]["excerpt"])
+
+    def test_a_peering_given_as_a_partial_url_resolves(self):
+        """`NetworkPeering.network` is documented as a full *or* partial URL.
+
+        A partial one carries no `projects/` segment, so keying it as a bare
+        name left it unable to join a `selfLink`-keyed listing: a real
+        1460-vs-8896 mismatch read clean, with nothing logged. Relative means
+        the audited project, so it is qualified with it.
+        """
+        networks = [
+            {
+                "name": "default",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/default",
+                "peerings": [
+                    {"network": "global/networks/vpc-jumbo", "state": "ACTIVE"}
+                ],
+            },
+            {
+                "name": "vpc-jumbo",
+                "selfLink": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [],
+            },
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
+
+    def test_a_listing_entry_without_a_self_link_still_joins_a_full_url(self):
+        """The check must not depend on `networks list` emitting `selfLink`.
+
+        If it stops, every entry keys on its bare name, a fully-qualified
+        `peerings[].network` matches none of them, and the check reports clean
+        for the whole project without erroring -- the silent blind spot this
+        file refuses to accept for the PSC filter. Qualifying a `selfLink`-less
+        entry with the audited project is what keeps the join working.
+        """
+        networks = [
+            {
+                "name": "default",
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/vpc-jumbo",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+            {"name": "vpc-jumbo", "mtu": 8896, "peerings": []},
+        ]
+        hits = na.check_mtu_mismatch(networks, "p")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "NetworkPeering/default--vpc-jumbo")
+
+    def test_qualifying_a_relative_peer_does_not_reach_another_project(self):
+        """The control for both tests above: qualification uses the audited
+        project, so a `selfLink`-less listing does not become a namespace a
+        cross-project peering can accidentally land in.
+        """
+        networks = [
+            {
+                "name": "vpc-jumbo",
+                "mtu": 8896,
+                "peerings": [
+                    {
+                        "network": "https://www.googleapis.com/compute/v1/projects/other-proj/global/networks/default",
+                        "state": "ACTIVE",
+                    }
+                ],
+            },
+            {"name": "default", "peerings": []},
+        ]
+        self.assertEqual(na.check_mtu_mismatch(networks, "p"), [])
+
+
+class CloudArmorTest(unittest.TestCase):
+    def test_flags_preview_rule_on_production_backend(self):
+        policies = [{"name": "waf-1", "rules": [{"priority": 1000, "preview": True}, {"priority": 2147483647, "preview": False}]}]
+        backends = [{"name": "checkout-api", "securityPolicy": ".../securityPolicies/waf-1"}]
+        hits = na.check_cloud_armor(policies, backends)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "SecurityPolicy/waf-1")
+        self.assertIn("checkout-api", hits[0]["excerpt"])
+
+    def test_does_not_flag_preview_on_staging_backend(self):
+        policies = [{"name": "waf-1", "rules": [{"priority": 1000, "preview": True}]}]
+        backends = [{"name": "checkout-staging", "securityPolicy": ".../securityPolicies/waf-1"}]
+        self.assertEqual(na.check_cloud_armor(policies, backends), [])
+
+    def test_ignores_the_implicit_default_rule_in_preview(self):
+        policies = [{"name": "waf-1", "rules": [{"priority": 2147483647, "preview": True}]}]
+        backends = [{"name": "checkout-api", "securityPolicy": ".../securityPolicies/waf-1"}]
+        self.assertEqual(na.check_cloud_armor(policies, backends), [])
+
+    def test_flags_conflicting_priorities_on_a_production_backend(self):
+        policies = [{"name": "waf-2", "rules": [{"priority": 1000}, {"priority": 1000}]}]
+        backends = [{"name": "checkout-api", "securityPolicy": ".../securityPolicies/waf-2"}]
+        hits = na.check_cloud_armor(policies, backends)
+        self.assertIn("conflicting rule priorities: [1000]", hits[0]["excerpt"])
+
+    def test_the_production_gate_governs_the_priority_limb_too(self):
+        """§2.5's Do-NOT-flag rule is written about the check, not about its
+        first condition. Gating only the preview branch reported a priority
+        collision on every policy in the project — including ones protecting a
+        `dev` backend and ones protecting nothing at all, where the effective
+        policy governs no traffic to be unpredictable about."""
+        policies = [{"name": "waf-2", "rules": [{"priority": 1000}, {"priority": 1000}]}]
+        for label, backends in (
+            ("unattached", []),
+            ("staging only", [{"name": "checkout-staging", "securityPolicy": ".../securityPolicies/waf-2"}]),
+        ):
+            with self.subTest(label):
+                self.assertEqual(na.check_cloud_armor(policies, backends), [])
+
+    def test_unattached_policy_is_never_flagged_for_preview(self):
+        policies = [{"name": "waf-3", "rules": [{"priority": 1000, "preview": True}]}]
+        self.assertEqual(na.check_cloud_armor(policies, []), [])
+
+
+class CollectProjectTest(unittest.TestCase):
+    def fake_run(self, responses: dict) -> na.RunFn:
+        """`responses` maps a substring of the joined argv to a `Run`. First
+        match wins, in insertion order, so a test can stub only the calls it
+        cares about."""
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            for needle, result in responses.items():
+                if needle in joined:
+                    return result
+            raise AssertionError(f"unstubbed command: {joined}")
+
+        return run
+
+    def test_subnet_targets_and_project_target_both_collected(self):
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-central1/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/24", "ipUtilization": 0.1}]',
+            ),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        names = {e["name"] for e in entries}
+        self.assertIn("proj-1/us-central1/s1", names)
+        self.assertIn("project/proj-1", names)
+        self.assertEqual(len(entries), 2)
+        project_entry = next(e for e in entries if e["name"] == "project/proj-1")
+        self.assertEqual(project_entry["outcome"], "collected")
+        self.assertEqual({c["check"] for c in project_entry["commands"]}, {
+            "cloud-nat-exhaustion", "psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
+        })
+
+    def test_the_psc_read_carries_no_server_side_filter(self):
+        """`check_psc_routing` selects the PSC rules itself.
+
+        The filter it replaced asked gcloud's `:` operator to match
+        `ServiceAttachment` against a URL spelling it `serviceAttachments`. A
+        change to that operator returns an empty list, and an empty list is
+        indistinguishable from a healthy project -- the check would report
+        `CLEAN` while reading nothing.
+        """
+        seen = []
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "forwarding-rules list" in joined:
+                seen.append(argv)
+            return run_of(0, "[]")
+
+        na.collect_project("proj-1", run=run)
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("--filter", seen[0])
+        self.assertNotIn("target:ServiceAttachment", " ".join(seen[0]))
+
+    def test_every_read_behind_a_check_reaches_that_checks_command(self):
+        """Three checks take more than one read, and `commands[slug] = record`
+        published only the last: Cloud Armor's entry named `backend-services
+        list`, which carries no rule and reproduces no verdict, and the NAT
+        entry named whichever router was read last."""
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(0, "[]"),
+            # Dynamic port allocation on: the mapping read only happens for a
+            # gateway whose ratio can move, so a static NAT here would make
+            # this a two-read check and the third fragment unreachable.
+            "routers list": run_of(
+                0,
+                '[{"name": "r-east", "region": "https://x/projects/proj-1/regions/us-east4", '
+                '"nats": [{"name": "nat-gw", "enableDynamicPortAllocation": true, "maxPortsPerVm": 4096}]}]',
+            ),
+            "routers get-status": run_of(0, '{"result": {"natStatus": []}}'),
+            "routers get-nat-mapping-info": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        commands = {c["check"]: c["command"] for c in entries[-1]["commands"]}
+
+        nat = commands["cloud-nat-exhaustion"]
+        for fragment in ("routers list", "routers get-status r-east", "routers get-nat-mapping-info r-east"):
+            self.assertIn(fragment, nat)
+
+        armor = commands["cloud-armor-false-positive"]
+        self.assertIn("security-policies list", armor)
+        self.assertIn("backend-services list", armor)
+
+    def test_a_joined_command_stays_under_the_harness_ceiling(self):
+        """`finish` refuses the whole document over an oversized `command`, so
+        an unbounded join would trade a misleading field for no report at all."""
+        reads = [(f"gcloud compute routers get-nat-mapping-info router-{i} --region us-east4 --project proj-1 --format json", run_of(0, "[]")) for i in range(200)]
+        record = na._joined_record(reads)
+        self.assertLessEqual(len(record["command"]), na.MAX_COMMAND_CHARS)
+        self.assertTrue(record["command"].startswith("gcloud "))
+        self.assertIn("more read(s) of the same shape", record["command"])
+
+    def test_subnets_list_usable_failure_surfaces_a_gate_failed_entry_and_the_project_target_survives(self):
+        responses = {
+            "subnets list-usable": run_of(1, "", "denied"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertEqual(len(entries), 2)
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("subnet-ip-exhaustion", subnet_entry["error"])
+        project_entry = next(e for e in entries if e["name"] == "project/proj-1")
+        self.assertEqual(project_entry["outcome"], "collected")
+
+    def test_an_empty_list_usable_with_visible_subnets_surfaces_a_gap(self):
+        # The production shape. On the deployed install `list-usable` answers
+        # rc=0 with `[]` because the audit identity lacks
+        # compute.subnetworks.use, while `subnets list` sees 42. rc=0 and
+        # valid JSON satisfy run_and_gate, so before this the scope was
+        # reported fully covered with zero subnets in it -- subnet-ip-
+        # exhaustion silently measured nothing on every run.
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(0, '[{"name": "s1"}, {"name": "s2"}]'),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("subnet-ip-exhaustion", subnet_entry["error"])
+        self.assertIn("compute.subnetworks.use", subnet_entry["error"])
+        self.assertIn("2", subnet_entry["error"])
+
+    def test_subnets_without_the_utilization_field_are_a_gap_not_a_clean_pass(self):
+        # What the deployed install returns once compute.subnetworks.use is
+        # granted: real subnets, and not one carries ipUtilization -- the
+        # field is absent from gcloud's UsableSubnetwork in v1, beta and
+        # alpha. check_subnet_ip_exhaustion returns None for each, which
+        # reads exactly like "measured, all healthy" unless it is caught here.
+        # With the Network Analyzer fallback also unavailable (API off, or the
+        # insight read refused), the gap is the only honest outcome.
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/20"}, '
+                '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+                '"ipCidrRange": "10.1.0.0/20", '
+                '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}]',
+            ),
+            "recommender insights list": run_of(1, "", "PERMISSION_DENIED"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entries = [e for e in entries if e["name"].endswith("/subnets")]
+        self.assertEqual(len(subnet_entries), 1)
+        self.assertEqual(subnet_entries[0]["outcome"], "gate-failed")
+        self.assertIn("ipUtilization", subnet_entries[0]["error"])
+        self.assertIn("2 subnets", subnet_entries[0]["error"])
+        # Name the permission an operator has to grant, not just the symptom.
+        self.assertIn("networkAnalyzerIpAddressInsights.list", subnet_entries[0]["error"])
+        # And no per-subnet target claiming it was collected.
+        self.assertEqual([e for e in entries if e["name"].startswith("proj-1/")], [])
+
+    # --- Network Analyzer fallback ------------------------------------- #
+    #
+    # gcloud's UsableSubnetwork carries no utilization field on any API
+    # version, so `list-usable` alone can never run subnet-ip-exhaustion. The
+    # measurement lives in google.networkanalyzer.vpcnetwork.ipAddressInsight
+    # -- not google.compute.subnetwork.IpUtilizationInsight, which is not a
+    # real insight type and which the API rejects with INVALID_ARGUMENT.
+
+    INSIGHT = (
+        '[{"content": {"ipUtilizationSummaryInfo": [{'
+        '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+        '"networkStats": [{'
+        '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+        '"subnetStats": [{'
+        '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/s1", '
+        '"subnetRangeStats": ['
+        '{"allocationRatio": 0.9, "subnetRangePrefix": "10.0.0.0/20"}, '
+        '{"allocationRatio": 0.95, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}'
+        ']}]}]}]}}]'
+    )
+
+    def _two_subnets(self) -> str:
+        """One subnet the insight covers, and one it can never cover.
+
+        `s2` sits in a Shared VPC host project. `list-usable` reaches across the
+        share and the insight does not, so `s2` is absent from the insight for a
+        reason that says nothing about its allocations -- which is the one
+        absence `_zero_fill_unallocated` refuses to read as 0%. A same-project
+        subnet the insight omits is empty and gets measured; see
+        `test_a_same_project_subnet_the_insight_omits_is_measured_at_zero`.
+        """
+        return (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/s2", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+
+    def test_the_insight_backfills_utilization_and_the_check_then_fires(self):
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        # No gate-failed target: the fallback supplied the missing field.
+        self.assertEqual([e for e in entries if e["name"].endswith("/subnets")], [])
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertEqual(s1["outcome"], "collected")
+        # 0.9 primary and 0.95 secondary are both over the 0.85 threshold.
+        excerpt = s1["candidates"][0]["excerpt"]
+        self.assertIn("primary range 10.0.0.0/20", excerpt)
+        self.assertIn("secondary range pods", excerpt)
+
+    def test_a_subnet_the_insight_cannot_cover_is_not_applicable_not_clean(self):
+        # A Shared VPC host project's subnet is visible to `list-usable` and
+        # invisible to this project's insight, so no surface measures it.
+        # Running the check against it would return None -- "nothing wrong
+        # here" -- so it has to be declared unmeasured instead.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
+        not_applicable = {na_entry["check"] for na_entry in s2["checks_not_applicable"]}
+        self.assertIn("subnet-ip-exhaustion", not_applicable)
+        self.assertEqual(s2["candidates"], [])
+        # The covered one must NOT carry the not-applicable marker.
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertNotIn(
+            "subnet-ip-exhaustion",
+            {na_entry["check"] for na_entry in s1["checks_not_applicable"]},
+        )
+
+    def test_a_name_shared_across_a_shared_vpc_stays_two_targets(self):
+        """`default` exists in the host project and in this one, and
+        `list-usable` returns both.
+
+        Naming both after the audited project gave two targets one name, and
+        `validate_scope` refuses a document whose target names collide -- so
+        `finish` exited 2 and the run published *nothing*, rather than the audit
+        losing the one duplicate. Nothing on a single-project fleet reaches it,
+        which is why it sat: all 42 subnets on the live fleet are owned by the
+        project being audited, and `auto` mode names every one of them
+        `default`.
+        """
+        both = (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/default", '
+            '"ipCidrRange": "10.0.0.0/20"}, '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/default", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+        # The insight is project-scoped, so it measures this project's
+        # `default` and never the host project's. It has to cover at least one
+        # subnet or the enumeration gate fails and no per-subnet target is
+        # emitted at all -- which is the state that hid this bug.
+        insight = (
+            '[{"content": {"ipUtilizationSummaryInfo": [{'
+            '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+            '"networkStats": [{'
+            '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+            '"subnetStats": [{'
+            '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/default", '
+            '"subnetRangeStats": ['
+            '{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}'
+            "]}]}]}]}}]"
+        )
+        responses = {
+            "subnets list-usable": run_of(0, both),
+            "recommender insights list": run_of(0, insight),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        names = [e["name"] for e in entries]
+        self.assertEqual(len(set(names)), len(names), f"target names collide: {names}")
+        subnets = [e for e in entries if e["name"].endswith("/us-east4/default")]
+        self.assertEqual(
+            sorted(e["name"] for e in subnets),
+            ["host-1/us-east4/default", "proj-1/us-east4/default"],
+        )
+        # `project` has to move with the name; the scope table resolves a
+        # target back to a project through it.
+        self.assertEqual(
+            {e["name"]: e["project"] for e in subnets},
+            {
+                "host-1/us-east4/default": "host-1",
+                "proj-1/us-east4/default": "proj-1",
+            },
+        )
+
+    def test_the_unmeasured_reason_is_marked_so_the_ledger_can_tell_it_apart(self):
+        """`checks_not_applicable` carries two dispositions that read alike.
+
+        "Autopilot owns the node pools" is permanent, and absence of a finding
+        under it is a clean verdict. "The surface published no figure" is not:
+        nobody looked, and it flips back the day Network Analyzer catches up.
+        `audit_report` reads this prefix to decide which of the two it has, so
+        the collector has to stamp it — the wording alone is not a contract.
+        """
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
+        entry = next(
+            d for d in s2["checks_not_applicable"] if d["check"] == "subnet-ip-exhaustion"
+        )
+        self.assertTrue(entry["reason"].startswith(na.UNEVALUATED_MARKER))
+
+    def test_no_target_declares_a_check_outside_its_own_scope_inapplicable(self):
+        """The 168 rows this replaced said nothing and cost a reader real time.
+
+        Every subnet used to declare the four project-scoped checks
+        not-applicable and the project declared the subnet one, on every run.
+        `audit_report.audit_target_checks` already scopes each check to a
+        target kind, so none of those slugs was ever in the denominator they
+        appeared to be shrinking — 169 rows of a table asserting that a subnet
+        is not a project.
+        """
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        import audit_report
+
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertTrue(entries, "no targets; this test would pass vacuously")
+        for entry in entries:
+            owned = set(
+                audit_report.audit_target_checks(
+                    "gcp-networking-fabric-audit", entry["name"]
+                )
+            )
+            declared = {d["check"] for d in entry.get("checks_not_applicable") or []}
+            self.assertLessEqual(
+                declared,
+                owned,
+                f"{entry['name']} declares a check it was never asked to run",
+            )
+
+    def test_an_unmeasured_subnet_carries_the_limitation_finish_will_ask_for(self):
+        # An unmeasured subnet owes one check and has it declared
+        # not-applicable, so §6 filters its `checks_run` down to []. `finish`
+        # rejects an empty `checks_run` unless that target says in
+        # `limitations` why nothing ran, and the model writing that sentence is
+        # what produced three different restatements across three live runs.
+        # Emitting it here makes the wording the collector's, not a model's.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
+        self.assertEqual(s2["limitations"], na.UNMEASURED_SUBNET_LIMITATION)
+        self.assertIn("subnet-ip-exhaustion", s2["limitations"])
+        # The measured subnet ran its check, so a limitation there would put a
+        # target that refused nothing into `coverage_gaps` and make the run
+        # partial.
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertNotIn("limitations", s1)
+        # Provenance is unchanged: the unmeasured subnet still records the pair
+        # of reads that established it as unmeasured. Dropping the command is
+        # the tempting way to clear the same `finish` rejection, and it would
+        # hand the reader a target with no evidence of having been looked at.
+        self.assertEqual(
+            [c["check"] for c in s2["commands"]], ["subnet-ip-exhaustion"]
+        )
+
+    # A subnet whose primary and one secondary are published, and whose other
+    # secondary is not. This is `us-east4/default` on the live fleet: Network
+    # Analyzer published 14 of its 16 pod ranges, omitting the two belonging to
+    # Autopilot clusters parked at zero nodes.
+    PARTIAL_INSIGHT = (
+        '[{"content": {"ipUtilizationSummaryInfo": [{'
+        '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+        '"networkStats": [{'
+        '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+        '"subnetStats": [{'
+        '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/s1", '
+        '"subnetRangeStats": ['
+        '{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}, '
+        '{"allocationRatio": 0.2, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}'
+        ']}]}]}]}}]'
+    )
+
+    def _subnet_with_two_secondaries(self) -> str:
+        return (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": ['
+            '{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}, '
+            '{"rangeName": "ap-pods", "ipCidrRange": "10.8.0.0/14"}]}]'
+        )
+
+    def _partial_responses(self) -> dict:
+        return {
+            "subnets list-usable": run_of(0, self._subnet_with_two_secondaries()),
+            "recommender insights list": run_of(0, self.PARTIAL_INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+
+    def test_a_range_the_insight_skips_is_read_as_empty_not_as_a_gap(self):
+        # The insight lists a range only when something is allocated in it: on
+        # the live fleet it published 15 range records for the whole project and
+        # not one sat at `allocationRatio: 0`. So a range it skipped inside a
+        # subnet it covered is empty, the same signal a skipped subnet carries.
+        # Reading it as unmeasured instead put a standing coverage gap on the one
+        # subnet that had anything in it, and issue #122 could never close.
+        entries = na.collect_project("proj-1", run=self.fake_run(self._partial_responses()))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertEqual(s1["outcome"], "collected")
+        self.assertNotIn("limitations", s1)
+        # Cleared by measuring the range, not by excusing the check: the slug
+        # stays out of `checks_not_applicable` and in the coverage denominator.
+        self.assertEqual(s1["checks_not_applicable"], [])
+        self.assertEqual([c["check"] for c in s1["commands"]], ["subnet-ip-exhaustion"])
+        # 0% is a reading, so the empty range reaches a verdict like any other.
+        # Nothing here is over the threshold, so there is nothing to report.
+        self.assertEqual(s1["candidates"], [])
+
+    def test_a_skipped_range_does_not_cost_the_subnet_its_finding(self):
+        # The zero-fill must not write over what the insight did publish. Same
+        # fixture with the one published secondary over the threshold: the
+        # finding survives, and the skipped range stays out of the excerpt
+        # because 0% is nowhere near it.
+        responses = self._partial_responses()
+        responses["recommender insights list"] = run_of(
+            0, self.PARTIAL_INSIGHT.replace('"allocationRatio": 0.2', '"allocationRatio": 0.95')
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        excerpt = s1["candidates"][0]["excerpt"]
+        self.assertIn("secondary range pods", excerpt)
+        self.assertIn("95.0% utilized", excerpt)
+        self.assertNotIn("ap-pods", excerpt)
+        self.assertNotIn("limitations", s1)
+
+    def test_a_named_range_the_insight_could_not_measure_is_not_zero_filled(self):
+        # The one distinction this whole helper rests on. The insight *named*
+        # `ap-pods` and gave a figure `_utilization_by_subnet` will not accept
+        # -- null here, a string or a missing key elsewhere. That is a read that
+        # failed, not a measured zero, and zero-filling it would clear a range
+        # that could be at 99% with no evidence either way. Only a range the
+        # insight never mentioned is empty.
+        responses = self._partial_responses()
+        responses["recommender insights list"] = run_of(
+            0,
+            self.PARTIAL_INSIGHT.replace(
+                '{"allocationRatio": 0.2, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}',
+                '{"allocationRatio": 0.2, "subnetRangeName": "pods", "subnetRangePrefix": "10.4.0.0/14"}, '
+                '{"allocationRatio": null, "subnetRangeName": "ap-pods", "subnetRangePrefix": "10.8.0.0/14"}',
+            ),
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertIn("limitations", s1, "an unreadable range was silently zero-filled")
+        self.assertEqual(s1["limitations"], na.PARTIAL_SUBNET_LIMITATION.format(
+            measured=2, total=3, names="ap-pods"
+        ))
+        # A gap in the reading, not an excuse for the check: the slug stays in
+        # the coverage denominator and the subnet keeps its verdict on the two
+        # ranges that were measured.
+        self.assertEqual(s1["checks_not_applicable"], [])
+        self.assertEqual(s1["outcome"], "collected")
+
+    def test_a_primary_the_insight_never_published_is_not_zero_filled(self):
+        # The evidence behind the zero-fill is entirely alias-IP: it says where
+        # Pod ranges are used and nothing about a primary, which ILB VIPs, PSC
+        # endpoints and reserved static internal addresses all consume without
+        # an alias range in sight. So an unpublished primary stays unmeasured
+        # even though the skipped secondary beside it is zero-filled.
+        responses = self._partial_responses()
+        responses["recommender insights list"] = run_of(
+            0, self.PARTIAL_INSIGHT.replace(
+                '{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}, ', ""
+            )
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertIn("limitations", s1, "an unpublished primary was silently zero-filled")
+        self.assertEqual(s1["limitations"], na.PARTIAL_SUBNET_LIMITATION.format(
+            measured=2, total=3, names="the primary range"
+        ))
+        self.assertEqual(s1["checks_not_applicable"], [])
+
+    def test_zero_fill_skipped_ranges_only_touches_covered_in_project_subnets(self):
+        # Unit-level guards for the two subnets this must keep its hands off.
+        # `theirs` is in `by_subnet` only to make the project guard the thing
+        # under test -- a project-scoped insight never names a Shared VPC host
+        # subnet, so without the entry the `in by_subnet` check would carry the
+        # assertion and the guard could be deleted with the suite still green.
+        # `primaryless` guards the other direction: covered, in project, and its
+        # primary still must not be touched.
+        subnets = [
+            {
+                "subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/covered",
+                "ipUtilization": 0.1,
+                "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.2}, {"rangeName": "ap-pods"}],
+            },
+            {"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/omitted"},
+            {
+                "subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/theirs",
+                "secondaryIpRanges": [{"rangeName": "svc"}],
+            },
+            {
+                "subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/primaryless",
+                "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.4}],
+            },
+        ]
+        by_subnet = {
+            "us-east4/covered": {"primary": 0.1, "secondary": {"pods": 0.2}, "listed": {"pods"}},
+            "us-east4/theirs": {"primary": 0.3, "secondary": {}, "listed": set()},
+            "us-east4/primaryless": {"primary": None, "secondary": {"pods": 0.4}, "listed": {"pods"}},
+        }
+        self.assertEqual(na._zero_fill_skipped_ranges(subnets, by_subnet, "proj-1"), 1)
+        self.assertEqual(subnets[0]["secondaryIpRanges"][1]["ipUtilization"], 0.0)
+        # Published figures survive untouched.
+        self.assertEqual(subnets[0]["ipUtilization"], 0.1)
+        self.assertEqual(subnets[0]["secondaryIpRanges"][0]["ipUtilization"], 0.2)
+        # A subnet the insight omitted entirely is `_zero_fill_unallocated`'s to
+        # judge, and a host project's subnet is nobody's.
+        self.assertNotIn("ipUtilization", subnets[1])
+        self.assertNotIn("ipUtilization", subnets[2]["secondaryIpRanges"][0])
+        self.assertNotIn("ipUtilization", subnets[3])
+
+    def _same_project_pair(self) -> str:
+        """Both subnets in the audited project; the insight covers only `s1`."""
+        return (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}, '
+            '{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s2", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+
+    def _same_project_responses(self) -> dict:
+        return {
+            "subnets list-usable": run_of(0, self._same_project_pair()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+
+    def test_a_same_project_subnet_the_insight_omits_is_measured_at_zero(self):
+        # The 41-of-42 case, and the whole reason issue #122 read as an audit
+        # that could not run. Network Analyzer publishes one project-wide
+        # summary and omits a subnet holding no allocation, so on an auto-mode
+        # network it covers `us-east4/default` and skips the 41 empty regional
+        # `default`s. Absent means empty, and empty is 0% -- a reading, not a
+        # blank. Calling it UNEVALUATED made 41 targets into coverage gaps.
+        entries = na.collect_project("proj-1", run=self.fake_run(self._same_project_responses()))
+        s2 = next(e for e in entries if e["name"] == "proj-1/us-east4/s2")
+        self.assertEqual(s2["outcome"], "collected")
+        self.assertEqual(s2["checks_not_applicable"], [])
+        # Measured and healthy, so nothing to report and nothing to disclose.
+        self.assertEqual(s2["candidates"], [])
+        self.assertNotIn("limitations", s2)
+        # Still credited with the reads that measured it.
+        self.assertEqual([c["check"] for c in s2["commands"]], ["subnet-ip-exhaustion"])
+
+    def test_zero_filling_leaves_a_subnet_the_insight_did_cover_alone(self):
+        # 0% is inferred from whole-subnet absence, never written over a figure
+        # the insight actually published -- `s1` is at 0.9/0.95 and must keep
+        # both, or the fix silently clears the findings it was meant to keep.
+        entries = na.collect_project("proj-1", run=self.fake_run(self._same_project_responses()))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        excerpt = s1["candidates"][0]["excerpt"]
+        self.assertIn("90.0% utilized", excerpt)
+        self.assertIn("95.0% utilized", excerpt)
+
+    def test_zero_fill_needs_the_insight_to_have_published_something(self):
+        # An insight that covers nothing at all is Network Analyzer not yet
+        # warmed up, not a fleet of empty subnets. The existing gate returns
+        # gate-failed there, and zero-filling must not run ahead of it and
+        # declare all 42 subnets clean.
+        responses = self._same_project_responses()
+        responses["recommender insights list"] = run_of(0, "[]")
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        gate = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(gate["outcome"], "gate-failed")
+        self.assertEqual([e for e in entries if e["name"].startswith("proj-1/us-east4/")], [])
+
+    def test_zero_fill_skips_a_subnet_outside_the_audited_project(self):
+        # Unit-level guard for the Shared VPC case the fixtures above rely on.
+        subnets = [
+            {"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/mine"},
+            {"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/theirs"},
+        ]
+        self.assertEqual(na._zero_fill_unallocated(subnets, {}, "proj-1"), 1)
+        self.assertEqual(subnets[0]["ipUtilization"], 0.0)
+        self.assertNotIn("ipUtilization", subnets[1])
+
+    def test_a_fully_covered_subnet_carries_no_limitation(self):
+        # The other half: the limitation appears because a range was missed,
+        # not because the code now writes one on every subnet. A subnet whose
+        # every range was published must stay clean, or the stream is partial
+        # in perpetuity for no reason.
+        responses = self._partial_responses()
+        responses["subnets list-usable"] = run_of(
+            0,
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20", '
+            '"secondaryIpRanges": [{"rangeName": "pods", "ipCidrRange": "10.4.0.0/14"}]}]',
+        )
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        self.assertNotIn("limitations", s1)
+
+    def test_unmeasured_ranges_names_the_primary_and_reads_presence(self):
+        self.assertEqual(na._unmeasured_ranges({"ipUtilization": 0.0}), [])
+        self.assertEqual(
+            na._unmeasured_ranges({"ipCidrRange": "10.0.0.0/20"}), ["the primary range"]
+        )
+        # 0.0 is measured-and-empty on a secondary too.
+        self.assertEqual(
+            na._unmeasured_ranges(
+                {"ipUtilization": 0.1, "secondaryIpRanges": [{"rangeName": "a", "ipUtilization": 0.0}]}
+            ),
+            [],
+        )
+        self.assertEqual(
+            na._unmeasured_ranges(
+                {"ipUtilization": 0.1, "secondaryIpRanges": [{"rangeName": "a"}, {"ipUtilization": 0.3}]}
+            ),
+            ["a"],
+        )
+
+    def test_an_insight_that_covers_nothing_is_a_gap(self):
+        # Reads cleanly, publishes nothing that matches. Distinct from the
+        # read failing, and the message has to say so -- Network Analyzer
+        # takes about a day to publish after the API is switched on.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, "[]"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("published stats for 0", subnet_entry["error"])
+        self.assertEqual([e for e in entries if e["name"].startswith("proj-1/")], [])
+
+    def test_the_insight_is_not_consulted_when_list_usable_already_answers(self):
+        # If a future gcloud starts populating the field, the extra API call
+        # is waste -- and an unstubbed `recommender` here would raise.
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/20", "ipUtilization": 0.1}]',
+            ),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertEqual(
+            next(e for e in entries if e["name"] == "proj-1/us-east4/s1")["outcome"],
+            "collected",
+        )
+
+    def test_the_published_command_names_the_read_that_produced_the_figure(self):
+        # `list-usable` enumerated the subnets; the insight measured them. A
+        # reader handed only the enumeration re-runs it, finds no
+        # `ipUtilization` anywhere in the output, and cannot check the verdict
+        # against anything -- so the recorded command has to name both.
+        responses = {
+            "subnets list-usable": run_of(0, self._two_subnets()),
+            "recommender insights list": run_of(0, self.INSIGHT),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        command = next(c for c in s1["commands"] if c["check"] == "subnet-ip-exhaustion")["command"]
+        self.assertTrue(command.startswith("gcloud compute networks subnets list-usable"))
+        self.assertIn(f"--insight-type {na._IP_INSIGHT_TYPE}", command)
+        # Both halves run, in order, from one shell -- not two lines a reader
+        # has to reassemble. The appendix caps a command at 2000 characters.
+        self.assertIn(" && gcloud recommender insights list", command)
+        self.assertLess(len(command), 2000)
+        # Every subnet in the run carries it, including the unmeasured one:
+        # the same pair of reads is what established it as unmeasured.
+        s2 = next(e for e in entries if e["name"] == "host-1/us-east4/s2")
+        self.assertEqual(
+            next(c for c in s2["commands"] if c["check"] == "subnet-ip-exhaustion")["command"],
+            command,
+        )
+
+    def test_the_published_command_is_the_enumeration_alone_when_it_answers(self):
+        # The mirror of the test above: no backfill ran, so naming the insight
+        # would credit a read this run never made.
+        responses = {
+            "subnets list-usable": run_of(
+                0,
+                '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+                '"ipCidrRange": "10.0.0.0/20", "ipUtilization": 0.1}]',
+            ),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        s1 = next(e for e in entries if e["name"] == "proj-1/us-east4/s1")
+        command = next(c for c in s1["commands"] if c["check"] == "subnet-ip-exhaustion")["command"]
+        self.assertNotIn("recommender", command)
+        self.assertNotIn("&&", command)
+
+    def test_utilization_by_subnet_splits_primary_from_secondary(self):
+        # The insight marks the primary range by omitting subnetRangeName.
+        # Reading a named entry as the primary would attribute a pod range's
+        # utilization to the node range.
+        by_subnet = na._utilization_by_subnet(
+            "proj-1", run=self.fake_run({"recommender insights list": run_of(0, self.INSIGHT)})
+        )
+        self.assertEqual(list(by_subnet), ["us-east4/s1"])
+        self.assertEqual(by_subnet["us-east4/s1"]["primary"], 0.9)
+        self.assertEqual(by_subnet["us-east4/s1"]["secondary"], {"pods": 0.95})
+
+    def test_utilization_key_matches_across_the_two_uri_forms(self):
+        # `list-usable` returns an https:// self-link and the insight returns
+        # a //compute.googleapis.com/ resource URI. Keying on the bare name
+        # would also collide: an auto-mode network calls a subnet `default` in
+        # every one of its 42 regions.
+        self.assertEqual(
+            na._utilization_key("https://www.googleapis.com/compute/v1/projects/p/regions/us-east4/subnetworks/default"),
+            na._utilization_key("//compute.googleapis.com/projects/p/regions/us-east4/subnetworks/default"),
+        )
+        self.assertNotEqual(
+            na._utilization_key("//compute.googleapis.com/projects/p/regions/us-east4/subnetworks/default"),
+            na._utilization_key("//compute.googleapis.com/projects/p/regions/us-west1/subnetworks/default"),
+        )
+
+    def test_backfill_does_not_overwrite_a_first_party_reading(self):
+        subnets = [
+            {
+                "subnetwork": "https://x/projects/p/regions/us-east4/subnetworks/s1",
+                "ipUtilization": 0.2,
+                "secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.3}],
             }
         ]
+        by_subnet = {"us-east4/s1": {"primary": 0.9, "secondary": {"pods": 0.95}}}
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet, "p"), 0)
+        self.assertEqual(subnets[0]["ipUtilization"], 0.2)
+        self.assertEqual(subnets[0]["secondaryIpRanges"][0]["ipUtilization"], 0.3)
 
-        findings = networking_audit.audit_project_networking("test-proj")
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0]["check"], "psc-routing-deadlock")
-        self.assertEqual(findings[0]["object"], "ForwardingRule/psc-ep-1")
+    def test_backfill_reports_how_many_subnets_it_reached(self):
+        subnets = [
+            {"subnetwork": "https://x/projects/p/regions/us-east4/subnetworks/s1"},
+            {"subnetwork": "https://x/projects/p/regions/us-west1/subnetworks/s2"},
+        ]
+        by_subnet = {"us-east4/s1": {"primary": 0.4, "secondary": {}}}
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet, "p"), 1)
+        self.assertEqual(subnets[0]["ipUtilization"], 0.4)
+        self.assertNotIn("ipUtilization", subnets[1])
 
-    @patch("networking_audit.run_gcloud_json")
-    def test_audit_project_networking_empty(self, mock_gcloud):
-        mock_gcloud.return_value = []
-        findings = networking_audit.audit_project_networking("test-proj")
-        self.assertEqual(findings, [])
+    def test_backfill_does_not_bleed_a_ratio_onto_another_projects_subnet(self):
+        """The insight is scoped to one project; `list-usable` is not.
+
+        `_utilization_key` is `region/name` with no project segment, so a
+        Shared VPC host project's `us-east4/default` matches the audited
+        project's `us-east4/default` exactly. Without the guard the host
+        subnet inherits the audited one's ratio and publishes as a critical
+        on the strength of a measurement that was never about it -- the same
+        absence `_zero_fill_unallocated` and `_zero_fill_skipped_ranges`
+        already refuse to act on.
+        """
+        subnets = [
+            {"subnetwork": "https://x/projects/host-proj/regions/us-east4/subnetworks/default"},
+            {"subnetwork": "https://x/projects/p/regions/us-east4/subnetworks/default"},
+        ]
+        by_subnet = {"us-east4/default": {"primary": 0.97, "secondary": {}}}
+        self.assertEqual(na._backfill_utilization(subnets, by_subnet, "p"), 1)
+        self.assertNotIn("ipUtilization", subnets[0])
+        self.assertEqual(subnets[1]["ipUtilization"], 0.97)
+
+    def test_a_subnet_measured_at_zero_utilization_is_not_treated_as_unmeasured(self):
+        # 0.0 is a measurement. Testing presence rather than truthiness is the
+        # difference between "this subnet is empty" and "nobody looked".
+        self.assertTrue(na._carries_utilization({"ipUtilization": 0.0}))
+        self.assertTrue(
+            na._carries_utilization(
+                {"secondaryIpRanges": [{"rangeName": "pods", "ipUtilization": 0.0}]}
+            )
+        )
+        self.assertFalse(na._carries_utilization({"ipCidrRange": "10.0.0.0/20"}))
+        self.assertFalse(
+            na._carries_utilization({"secondaryIpRanges": [{"rangeName": "pods"}]})
+        )
+        self.assertFalse(na._carries_utilization({"ipUtilization": None}))
+
+    def test_an_empty_list_usable_with_no_subnets_at_all_is_not_a_gap(self):
+        # The other reading of the same `[]`, and it must stay quiet: a
+        # project with no subnets is a real empty scope, and reporting a
+        # coverage gap for it would cry wolf on every run.
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(0, "[]"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        self.assertEqual([e for e in entries if e["name"].endswith("/subnets")], [])
+
+    def test_an_empty_list_usable_gates_closed_when_the_tie_breaker_also_fails(self):
+        # Neither reading can be ruled out, so fail closed rather than pick
+        # the cheerful one -- the whole point of the gate.
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            "subnets list": run_of(1, "", "permission denied"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        subnet_entry = next(e for e in entries if e["name"] == "project/proj-1/subnets")
+        self.assertEqual(subnet_entry["outcome"], "gate-failed")
+        self.assertIn("corroborating", subnet_entry["error"])
+        self.assertIn("permission denied", subnet_entry["error"])
+
+    def test_one_failed_project_level_read_gates_the_whole_project_target_closed(self):
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            # Must follow the -usable key: first match wins in insertion
+            # order and "subnets list" is a prefix of it. Empty here means
+            # the project really has no subnets, so no coverage gap.
+            "subnets list": run_of(0, "[]"),
+            "routers list": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(1, "", "permission denied"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        project_entry = next(e for e in entries if e["name"] == "project/proj-1")
+        self.assertEqual(project_entry["outcome"], "gate-failed")
+        self.assertIn("mtu-packet-fragmentation", project_entry["error"])
+
+    def test_router_with_nat_pulls_status_and_mapping(self):
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            # Must follow the -usable key: first match wins in insertion
+            # order and "subnets list" is a prefix of it. Empty here means
+            # the project really has no subnets, so no coverage gap.
+            "subnets list": run_of(0, "[]"),
+            "routers list": run_of(
+                0,
+                '[{"name": "r1", "region": ".../regions/us-central1", '
+                '"nats": [{"name": "n1", "natIpAllocateOption": "AUTO_ONLY", "enableDynamicPortAllocation": true, "maxPortsPerVm": 4096}]}]',
+            ),
+            "get-status": run_of(0, '{"result": {"natStatus": [{"name": "n1", "autoAllocatedNatIps": []}]}}'),
+            "get-nat-mapping-info": run_of(0, "[]"),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        project_entry = next(e for e in entries if e["name"] == "project/proj-1")
+        self.assertEqual(len(project_entry["candidates"]), 1)
+        self.assertEqual(project_entry["candidates"][0]["check"], "cloud-nat-exhaustion")
+
+    def test_router_without_nats_skips_status_and_mapping_calls(self):
+        responses = {
+            "subnets list-usable": run_of(0, "[]"),
+            # Must follow the -usable key: first match wins in insertion
+            # order and "subnets list" is a prefix of it. Empty here means
+            # the project really has no subnets, so no coverage gap.
+            "subnets list": run_of(0, "[]"),
+            "routers list": run_of(0, '[{"name": "r1", "region": ".../regions/us-central1", "nats": []}]'),
+            "forwarding-rules list": run_of(0, "[]"),
+            "networks list": run_of(0, "[]"),
+            "security-policies list": run_of(0, "[]"),
+            "backend-services list": run_of(0, "[]"),
+        }
+        entries = na.collect_project("proj-1", run=self.fake_run(responses))
+        project_entry = next(e for e in entries if e["name"] == "project/proj-1")
+        self.assertEqual(project_entry["outcome"], "collected")
+        self.assertEqual(project_entry["candidates"], [])
+
+
+class CollectFleetTest(unittest.TestCase):
+    def test_sweeps_every_monitored_project(self):
+        os.environ["MONITORED_PROJECT_IDS"] = "proj-1,proj-2"
+        os.environ.pop("GCP_PROJECT_ID", None)
+        try:
+            def run(argv, **kwargs):
+                return run_of(0, "[]")
+
+            manifest = na.collect_fleet(run=run)
+            projects = {c["project"] for c in manifest["clusters"]}
+            self.assertEqual(projects, {"proj-1", "proj-2"})
+            self.assertEqual(manifest["audit"], "gcp-networking-fabric-audit")
+            self.assertIn("version", manifest)
+        finally:
+            os.environ.pop("MONITORED_PROJECT_IDS", None)
+
+    def test_single_project_override(self):
+        def run(argv, **kwargs):
+            return run_of(0, "[]")
+
+        manifest = na.collect_fleet("proj-only", run=run)
+        self.assertEqual({c["project"] for c in manifest["clusters"]}, {"proj-only"})
+
+    def test_one_project_crashing_costs_that_project_and_no_other(self):
+        """`future.result()` re-raises, and the SOP redirects stdout into the
+        manifest — so an unmodelled exception on one project used to leave a
+        zero-byte file and lose the whole fleet. Only `GateFailure` was
+        modelled; a `TypeError` off an unexpected API shape was not."""
+        os.environ["MONITORED_PROJECT_IDS"] = "proj-good,proj-bad"
+        os.environ.pop("GCP_PROJECT_ID", None)
+        try:
+            def run(argv, **kwargs):
+                if "proj-bad" in argv:
+                    raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
+                return run_of(0, "[]")
+
+            manifest = na.collect_fleet(run=run)
+            by_project = {c["project"]: c for c in manifest["clusters"]}
+            self.assertEqual(set(by_project), {"proj-good", "proj-bad"})
+            self.assertEqual(by_project["proj-good"]["outcome"], "collected")
+            self.assertEqual(by_project["proj-bad"]["outcome"], "gate-failed")
+            self.assertIn("TypeError", by_project["proj-bad"]["error"])
+        finally:
+            os.environ.pop("MONITORED_PROJECT_IDS", None)
+
+
+class ManifestComposesWithAuditReportTest(unittest.TestCase):
+    """`collect_fleet`'s real output, run through `audit_report`'s own
+    `cross_check_manifest` — the same integration shape
+    `test_collect.py`'s `TestManifestComposesWithAuditReport` uses for the
+    other two streams."""
+
+    def test_checks_run_copied_from_a_collected_target_survives_cross_check(self):
+        import audit_report
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "subnets list-usable" in joined:
+                return run_of(
+                    0,
+                    '[{"subnetwork": "https://x/projects/proj-1/regions/us-central1/subnetworks/s1", '
+                    '"ipCidrRange": "10.0.0.0/24", "ipUtilization": 0.9}]',
+                )
+            return run_of(0, "[]")
+
+        manifest = na.collect_fleet("proj-1", run=run)
+        subnet_entry = next(c for c in manifest["clusters"] if c["name"] == "proj-1/us-central1/s1")
+        project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/proj-1")
+
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {
+                "clusters": [
+                    {"name": subnet_entry["name"], "checks_run": [{"check": "subnet-ip-exhaustion", "command": subnet_entry["commands"][0]["command"]}]},
+                    {
+                        "name": project_entry["name"],
+                        "checks_run": [{"check": c["check"], "command": c["command"]} for c in project_entry["commands"]],
+                    },
+                ],
+                "skipped": [],
+            },
+        }
+        audit_report.cross_check_manifest(data, manifest)  # must not raise
+
+    def test_a_check_claimed_but_absent_from_a_collected_target_is_rejected(self):
+        import audit_report
+
+        def run(argv, **kwargs):
+            return run_of(0, "[]")
+
+        manifest = na.collect_fleet("proj-1", run=run)
+        project_entry = next(c for c in manifest["clusters"] if c["name"] == "project/proj-1")
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {
+                "clusters": [
+                    {"name": project_entry["name"], "checks_run": [{"check": "subnet-ip-exhaustion", "command": "gcloud compute networks subnets list-usable --project proj-1 --format json"}]}
+                ],
+                "skipped": [],
+            },
+        }
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(data, manifest)
+
+    def _fleet_with_one_unmeasured_subnet(self):
+        """One subnet Network Analyzer measured, one it did not — the auto-mode
+        shape, 1-of-2 here and 1-of-42 on the live fleet. Utilization is well
+        under the threshold so the run carries no findings and the assertions
+        below are about coverage alone."""
+        insight = (
+            '[{"content": {"ipUtilizationSummaryInfo": [{'
+            '"projectUri": "//cloudresourcemanager.googleapis.com/projects/proj-1", '
+            '"networkStats": [{'
+            '"networkUri": "//compute.googleapis.com/projects/proj-1/global/networks/default", '
+            '"subnetStats": [{'
+            '"subnetUri": "//compute.googleapis.com/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"subnetRangeStats": [{"allocationRatio": 0.1, "subnetRangePrefix": "10.0.0.0/20"}]'
+            "}]}]}]}}]"
+        )
+        # `s2` is a Shared VPC host project's subnet: enumerated by
+        # `list-usable`, outside this project's insight, so genuinely
+        # unmeasured. A same-project subnet the insight omits is empty and
+        # `_zero_fill_unallocated` measures it at 0% instead.
+        subnets = (
+            '[{"subnetwork": "https://x/projects/proj-1/regions/us-east4/subnetworks/s1", '
+            '"ipCidrRange": "10.0.0.0/20"}, '
+            '{"subnetwork": "https://x/projects/host-1/regions/us-east4/subnetworks/s2", '
+            '"ipCidrRange": "10.1.0.0/20"}]'
+        )
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "subnets list-usable" in joined:
+                return run_of(0, subnets)
+            if "recommender insights list" in joined:
+                return run_of(0, insight)
+            return run_of(0, "[]")
+
+        return na.collect_fleet("proj-1", run=run)
+
+    @staticmethod
+    def _scope_entry(entry: dict) -> dict:
+        """§2's rule, applied literally: copy `commands` minus any slug this
+        same target declares not-applicable, and carry the collector's
+        `checks_not_applicable` and `limitations` through untouched."""
+        na_slugs = {d["check"] for d in entry.get("checks_not_applicable") or []}
+        out = {
+            "name": entry["name"],
+            "location": entry["location"],
+            "project": entry["project"],
+            "checks_run": [
+                {"check": c["check"], "command": c["command"]}
+                for c in entry["commands"]
+                if c["check"] not in na_slugs
+            ],
+            "checks_not_applicable": entry.get("checks_not_applicable") or [],
+        }
+        if entry.get("limitations"):
+            out["limitations"] = entry["limitations"]
+        return out
+
+    def test_the_section_two_recipe_publishes_on_the_first_attempt(self):
+        # The daily failure, end to end. Both halves of §2's rule are needed:
+        # the not-applicable filter, or `cross_check_manifest` refuses the
+        # claim; and the collector's `limitations`, or `validate_findings`
+        # refuses the empty `checks_run` the filter leaves behind.
+        import audit_report
+
+        manifest = self._fleet_with_one_unmeasured_subnet()
+        s1 = next(c for c in manifest["clusters"] if c["name"].endswith("/s1"))
+        s2 = next(c for c in manifest["clusters"] if c["name"].endswith("/s2"))
+        project = next(c for c in manifest["clusters"] if c["name"] == "project/proj-1")
+        self.assertEqual(s2["limitations"], na.UNMEASURED_SUBNET_LIMITATION)
+
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {
+                "clusters": [self._scope_entry(e) for e in (s1, s2, project)],
+                "skipped": [],
+            },
+            "findings": [],
+        }
+        # The measured subnet still reports its check; the unmeasured one
+        # reports none, which is the shape that used to need a second attempt.
+        self.assertEqual([c["check"] for c in data["scope"]["clusters"][0]["checks_run"]],
+                         ["subnet-ip-exhaustion"])
+        self.assertEqual(data["scope"]["clusters"][1]["checks_run"], [])
+
+        audit_report.cross_check_manifest(data, manifest)
+        audit_report.validate_findings(data, "gcp-networking-fabric-audit")
+        # And the run is not partial. The unmeasured subnet refused no check
+        # its roster still owed, so it is not a coverage gap — if this starts
+        # returning the limitation, every auto-mode fleet goes permanently
+        # partial and the ledger can never close.
+        self.assertEqual(audit_report.coverage_gaps(data), [])
+
+    def test_copying_commands_verbatim_is_the_rejection_section_two_now_avoids(self):
+        # §2 used to say "copy its `commands` list verbatim". On an unmeasured
+        # subnet that claims IP-exhaustion coverage nobody has, and it is the
+        # first of the two rejections the live run paid every morning.
+        import audit_report
+
+        manifest = self._fleet_with_one_unmeasured_subnet()
+        s2 = next(c for c in manifest["clusters"] if c["name"].endswith("/s2"))
+        # Every collected target has to appear or a different rule fires
+        # first — only s2's `checks_run` is the unfiltered copy under test.
+        clusters = [self._scope_entry(e) for e in manifest["clusters"]]
+        verbatim = next(c for c in clusters if c["name"].endswith("/s2"))
+        verbatim["checks_run"] = [
+            {"check": c["check"], "command": c["command"]} for c in s2["commands"]
+        ]
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {"clusters": clusters, "skipped": []},
+            "findings": [],
+        }
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(data, manifest)
+        self.assertIn("subnet-ip-exhaustion", str(caught.exception))
+
+    def test_filtering_without_the_limitation_is_the_second_rejection(self):
+        # And the other half. Dropping the collector's `limitations` — by
+        # rewording it to nothing, or by a future collector not emitting it —
+        # leaves an empty `checks_run` that reads as "read it, checked
+        # nothing", which is the rejection the run paid on its second attempt.
+        import audit_report
+
+        manifest = self._fleet_with_one_unmeasured_subnet()
+        s2 = next(c for c in manifest["clusters"] if c["name"].endswith("/s2"))
+        stripped = self._scope_entry(s2)
+        stripped.pop("limitations")
+        data = {
+            "audit": "gcp-networking-fabric-audit",
+            "scope": {"clusters": [stripped], "skipped": []},
+            "findings": [],
+        }
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.validate_findings(data, "gcp-networking-fabric-audit")
+        self.assertIn("checks_run", str(caught.exception))
+
+
+class ChecksRevisionTest(unittest.TestCase):
+    """This collector tells the harness which version of itself ran.
+
+    `audit_report.py` compares this run's revision with the previous run's to
+    decide whether a finding that stopped appearing was fixed or merely stopped
+    being looked for. Publishing nothing gives it no signal, and it falls back
+    to claiming a fix.
+    """
+
+    def test_the_revision_is_a_digest_of_this_collectors_source(self):
+        path = Path(na.__file__).resolve()
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        self.assertEqual(na.CHECKS_REVISION, expected)
+
+    def test_the_manifest_carries_it(self):
+        """Driven, not grepped.
+
+        The constant is inert unless it reaches the manifest `audit_report.py`
+        reads, and asserting the assignment is present in the source passes
+        just as well when the key lands in a branch nothing takes. `run`
+        answers `[]`, so the collector lists an empty fleet and returns its
+        manifest without reaching a project.
+        """
+        manifest = na.collect_fleet(
+            "acme", run=lambda argv, **kwargs: na.Run(argv, 0, "[]", "", 0.01)
+        )
+        self.assertEqual(manifest["checks_revision"], na.CHECKS_REVISION)
+        self.assertEqual(manifest["version"], na.MANIFEST_VERSION)
+
 
 if __name__ == "__main__":
     unittest.main()

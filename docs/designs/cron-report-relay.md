@@ -516,12 +516,20 @@ every one of them is visible to a job author:
   Slack. A job that wants one voice names one target.
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
-  one. A job left on `all` therefore reports twice — once flat into the channel
-  and once through the Chat Agent — on either platform, now that
-  `home_target_env` restores the Google Chat channel too. So the whole Platform
-  Agent roster names `"chat"` rather than relying on the expansion, which is
-  also the only way to say "relay, and do not also post flat" at all: the token
-  is additive, so there is no value that subtracts a target from `all`.
+  one. A job left on `all` used to report twice — once flat into the channel and
+  once through the Chat Agent — on either platform, now that `home_target_env`
+  restores the Google Chat channel too. The relay leg now subtracts instead:
+  `adapter.sibling_delivery_targets` resolves the job's `deliver` in the cron
+  child, where alone `all` is known to have expanded, and sends the set as
+  `also_delivered_to`; `relay_cron_report` skips those platforms, so a
+  channel gets the composed report or the raw one and never both. The
+  subtraction is deliberately one-sided — where it would empty the list it fans
+  out to every platform anyway, because `also_delivered_to` says what the
+  scheduler _intended_ to send and a channel that resolved can still fail on the
+  send. Two copies is a nuisance; none is a missed audit. So the whole Platform
+  Agent roster still names `"chat"`: the `deliver` token itself remains additive,
+  and `"chat"` is the only way to ask for one composed copy without depending on
+  a subtraction that is designed to give up rather than risk silence.
   No migration was needed to get there: `deliver` is
   an image-owned key on a named profile, so the entrypoint's existing cron merge
   rewrites it on every live volume at the next pod start (`agents/platform/cron/README.md`
@@ -538,9 +546,16 @@ every one of them is visible to a job author:
   saying so only in a log is how the seven consecutive failures above went
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
-  `"relay": "degraded"` next to `"status": "delivered"`. A fan-out leg that
-  failed while another landed is reported the same way and for the same reason,
-  through `undelivered` — see [Which platforms a report is posted
+  `"relay": "degraded"` next to `"status": "delivered"`.
+  `relay` collapses more than one cause and both callers phrased it as the
+  failed turn, so the body also carries `relay_detail`: the reason in words. It
+  names the cause and never a platform.
+  A send that lands on one platform and not another is a different case, and not
+  a degradation — the report reached a channel, so `relay` stays `ok` — but one
+  audience has nothing, so the body carries `undelivered`: the platforms that
+  missed it, as a list of names. Holding the two fields apart is what stops a
+  consumer reporting the same miss twice, once as prose and once as a list — see
+  [Which platforms a report is posted
   to](#which-platforms-a-report-is-posted-to).
   That is the whole reason the route blocks rather than accepting into a
   background task: answering `accepted` first would make each of those failures

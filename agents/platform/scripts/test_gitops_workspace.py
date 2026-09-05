@@ -662,7 +662,13 @@ class TestResolveRepo(WorkspaceTestCase):
 
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: "acme/from-remote"
+        # `*a, **k`: the real function is `get_current_git_repo(cwd=None)` and
+        # `resolve_repo`'s workspace branch calls it as `(cwd=...)`. That branch
+        # is unreachable here -- no `audit_id` -- but it sits inside a bare
+        # `except Exception: pass`, so the day it becomes reachable a zero-arg
+        # stub would raise TypeError, be swallowed, and the test would keep
+        # passing off the fallback it was written to bypass.
+        module.get_current_git_repo = lambda *a, **k: "acme/from-remote"
         with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(
                 gitops_workspace.resolve_repo(),
@@ -759,6 +765,28 @@ class TestResolveRepo(WorkspaceTestCase):
                 gitops_workspace.get_managed_github_repos()
             self.assertIn("kubectl binary not found", str(caught.exception))
 
+    def test_get_managed_github_repos_bounds_the_kubectl_read(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return CompletedProcess(args=cmd, returncode=0, stdout="{}", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            gitops_workspace.get_managed_github_repos()
+        self.assertEqual(
+            captured.get("timeout"), gitops_workspace.CONFIGMAP_READ_TIMEOUT_SECONDS
+        )
+
+    def test_get_managed_github_repos_raises_on_kubectl_timeout(self):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["kubectl"], 30),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("Timed out", str(caught.exception))
+
     def test_get_managed_github_repos_raises_on_invalid_json(self):
         fake_cm = CompletedProcess(
             args=["kubectl"],
@@ -820,7 +848,7 @@ class TestResolveRepo(WorkspaceTestCase):
 
     def test_all_sources_failing_raises_runtime_error(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: None
+        module.get_current_git_repo = lambda *a, **k: None
         with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()

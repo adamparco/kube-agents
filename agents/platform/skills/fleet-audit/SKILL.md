@@ -26,7 +26,7 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these seven audit ids may own a ledger. Any other id is rejected before a single git or gh
+Only these nine audit ids may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
@@ -40,6 +40,8 @@ watchdog — **not** a prettified form of the audit id:
 | `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`              |
 | `ai-security-audit`           | `[audit] AI Workload Security Audit — 7 findings (2 critical)`                 |
 | `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
+| `gcp-networking-fabric-audit` | `[audit] GCP Networking Fabric & VPC IPAM Audit — 7 findings (2 critical)`     |
+| `gce-compute-fleet-audit`     | `[audit] GCE Compute Engine and MIG Fleet Audit — 7 findings (2 critical)`     |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -47,24 +49,15 @@ fails if the two drift apart. Do not restate a title anywhere else.
 ## Running a stream on demand
 
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
-for one command per stream:
+for one trigger per stream. `AGENTS.md`'s "Run the `<x>` cron job now" bullet owns the procedure and
+owns why neither `hermes cron run` nor `cronjob(action='run')` is it: move the job's schedule a
+couple of minutes ahead, let `profile-cron-tick` take it, put the schedule back. `cron/jobs.json`
+holds the value to restore.
 
-```
-HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run compliance-audit
-```
-
-Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
-`profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
-picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
-stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
-
-`cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
-one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the
-dispatch pool is full, it
-executes the job synchronously inside the session that calls it, which is the re-enactment the next
-paragraph exists to prevent. Elsewhere it hands the run to the background delegation executor and
-returns a handle; that is closer to what you want, but `hermes cron run` is the one route that
-behaves identically on every runtime and always runs in a fresh process.
+The tick runs the stream through the identical path the 06:20 tick uses, with its prompt verbatim,
+its `skills` preloaded, and this profile's `max_turns`. `started.json` appearing in the stream's
+report-store directory is the run having taken the lock; `hermes cron list` shows `Execution:
+running` from the same moment.
 
 **Do not run the audit yourself in the session that received the request.** A triggered run gets its
 own process and its own turn budget. A session that improvises the audit instead has neither — and
@@ -80,6 +73,14 @@ is running and what each attempt did.
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
 stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
 own `deliver` setting; repeating them here sends the same content twice.
+
+## Answering a question about a past run
+
+"What did the last compliance audit find?" is a file read, not a run and not a `gh issue view`.
+`finish` keeps what it published under `/opt/data/fleet-audit/reports/<audit-id>/`, and reading that
+store belongs to the `fleet-audit-reports` skill
+([SKILL.md](../fleet-audit-reports/SKILL.md)) — the layout, the bounded query script, and what a
+missing record means. Nothing in this skill reads it.
 
 ## The two-command lifecycle
 
@@ -97,10 +98,19 @@ can no longer reset another stream's working copy out from under it. The reposit
 Before inspecting anything, claim the workspace:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start \
+python3 ./skills/fleet-audit/scripts/audit_report.py start \
   --audit <audit-id> \
   [--repo "<owner>/<repo>"]
 ```
+
+**`python3` is load-bearing, not decoration.** The file is executable and carries a shebang, but
+running it by path makes the gateway's lifecycle guard read its text and walk every path-shaped
+token in it as a script it must scan too. Two of those tokens — `/opt/defaults/scripts` and
+`/opt/data/scripts` — are real directories, the guard fails closed on a reference it cannot read as
+a script, and the command is refused with a message about restarting the gateway that has nothing
+to do with what was asked. Naming an interpreter makes the file an argument rather than the
+executable, so nothing reads it. Every invocation in this file and in all nine SOPs is spelled
+that way; do not shorten one back.
 
 This resolves the target repository (using `--repo` if specified, falling back to the single configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints a repo-scoped GitHub token, clones or refreshes the
 GitOps workspace and leaves it on a clean `main`, ensures the audit's labels exist, locates the
@@ -121,6 +131,20 @@ stream's open ledger issue, and clears any findings document a crashed run left 
 ```
 
 Write your findings to the `findings_path` it gives you. Do not pick your own path.
+
+**Exit code 3 is not a crash — it is another run of this stream already holding it.** `start` prints
+`RUN IN PROGRESS` with the holding pid, session, and start time and writes no JSON. Stop; do not
+retry, do not route around it, and do not start inspecting without a workspace. Say the stream is
+busy and give the pid and start time from the message. A holder is released when its run finishes
+and is judged dead automatically if the pod restarted under it, its clock is nonsense, or two hours
+pass — so this clears itself.
+
+**If you have lost track of your workspace, re-run `start` — that is the whole recovery.** A stream
+held by your own session is resumed, not refused: you get the same workspace, the same
+`findings_path`, and whatever you had already written to it, with the run's original start time
+intact. So exit code 3 always means a _different_ run, and it is never yours to clear. `--steal-lock`
+is an operator command for a holder a human has confirmed is dead; taking it from a run that is
+still going leaves both writing this one stream. Do not reach for it on your own.
 
 `checks` is your stream's full roster, handed over so coverage never depends on how far into the SOP
 you read. **It is the work list, not a substitute for the SOP** — the slug says which check, the SOP
@@ -153,6 +177,36 @@ If a remediation is a declarative file, write that file **under the `workspace` 
 reported** and name its repo-relative path in the finding. The harness puts it on a branch of its
 own.
 
+**The Declaration Rule — where that file goes.** A remediation that changes an object the repo
+already declares goes to that declaration: locate it (`grep -rl "name: <object>" --include='*.yaml'
+.`), name that file's repo-relative path, and rewrite it as the object's complete desired manifest.
+Open the hits before trusting them — `grep` is kind-blind and unanchored, so it also matches
+`app.kubernetes.io/name:` label lines and objects whose names merely share a prefix, and a hit is
+not a declaration until you have opened it and confirmed it declares the object you observed, on the
+cluster you observed it on. Hits landing in more than one directory, or none tied to the target
+cluster, and the finding is `kind: manual`.
+
+A remediation that **creates an object the repo does not yet declare is a `manifest` too** — the
+whole point of a GitOps repo is that new objects arrive through it, and an audit that can only
+describe the file it would have written leaves the finding unresolvable. Two things must hold
+first. The object must be genuinely absent, from the cluster as well as from the repo: one that is
+live but whose declaration you merely failed to find is the case above, and a second file claiming
+it is a duplicate resource id that both Config Sync and Argo reject. And the directory you write
+into must already be reconciled onto the target, which you establish from a **sibling** — another
+object declared here that belongs to the same target you are fixing. What counts as a sibling
+follows the target's scope: for a cluster-scoped finding, another object applied to that cluster;
+for a project- or subnet-scoped one, another declaration governing that same project, whether it is
+a Config Connector resource or a Terraform file. Write the new file beside the sibling, named after
+the object, following the sibling's conventions rather than your own: same file-per-object
+granularity, same labels and namespace fields. Never a new top-level directory and never a parent
+that is not already in the clone, because the repository is reconciled by a tool that applies a
+fixed set of paths, and a file outside them is applied by nothing — which makes the pull request a
+no-op that reads as a fix.
+
+No sibling means the target is not wired to this repo. Then the finding is `kind: manual`, the
+manifest you would have written goes in `recommendation.action`, and `recommendation.rationale` says
+which of the two you established and how you established it.
+
 **Do not leave unrelated uncommitted work in that tree during an audit.** Opening a remediation pull
 request requires switching branches, and the harness forces the switch. It snapshots and restores
 every path you declared, and returns you to the branch you started on — but a file it was never told
@@ -161,23 +215,36 @@ about is not covered by that guarantee.
 ### Step 3 — `finish`
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish \
+python3 ./skills/fleet-audit/scripts/audit_report.py finish \
   --audit <audit-id> \
   --findings-file <findings_path> \
+  --manifest-file <manifest_path> \
   [--repo "<owner>/<repo>"]
 ```
+
+**`--manifest-file` is not optional.** Without it nothing checks the document against what the
+collector actually ran, so a fabricated or truncated scope publishes unchallenged — and until it
+was refused, omitting it was silent. On a run where the collector produced no manifest at all,
+pass `--no-collector-manifest '<why>'` in its place: that publishes, but records the reason as a
+coverage gap and reports the run as partial. Your stream's SOP names the manifest path its
+collector writes.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with nine fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
-`partial`, `coverage_gaps`, and `silent_ok`:
+JSON line with thirteen fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
+`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled
+run replies; see [The clean run](#the-clean-run)), and three timing fields: `inspect_s`
+(wall-clock from `start` to `finish`, i.e. the inspection phase; `null` when `start`'s
+timestamp file is missing), `publish_s` (time `finish` itself spent publishing), and `collect_s`
+(the collector's own wall-clock; `null` on a run that passed no collector manifest). The timing
+fields are telemetry — read them for the report if useful, never branch on them:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: 2 critical, 4 major, 1 minor (7 new, 1 PR opened) — …","inspect_s":214.0,"publish_s":41.5,"collect_s":18.2}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: 0 critical, 5 major, 2 minor (2 new, 3 resolved, 1 PR closed) — …","inspect_s":180.2,"publish_s":38.9,"collect_s":16.7}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: clean, ledger closed (5 resolved, 1 PR closed) — …","inspect_s":95.1,"publish_s":12.3,"collect_s":null}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -188,10 +255,10 @@ the directory you happen to be standing in, so "the manifest is missing" is a fi
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
-the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
+the message names and re-run; never delete the finding that tripped it. Four things reach exit 2:
 the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else
-broke.
+JSON, `--audit` is not one of the registered ids above, or neither `--manifest-file` nor
+`--no-collector-manifest` was given. Exit 1 is fatal and means something else broke.
 
 ### Partial coverage
 
@@ -203,24 +270,35 @@ if and only if `coverage_gaps` is non-empty, and you can report from either.
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
 that _can_ apply to it is a fully covered cluster. Without that, a fleet of Autopilot clusters is
-permanently partial: the ledger never closes, `resolved` is pinned at `0`, and no stale remediation
-pull request is ever cleaned up.
+permanently partial: the ledger never closes, no finding on any of those clusters can ever be
+announced as resolved, and their remediation pull requests are never cleaned up.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
 about what the run may conclude changes. Coverage is the only thing `partial` tracks.
 
 A gap changes what the run is _allowed to conclude_, because a finding's absence from an unread
-cluster is not evidence that it was fixed. Over a partial run the harness:
+cluster is not evidence that it was fixed. It changes that **for the cluster the gap names**, not
+for the stream: one unreadable cluster does not stop the audit reporting a fix on the fifteen it
+did read. Over a partial run the harness:
 
-- reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
-- closes **no** remediation pull request as stale, so a fix survives to the next complete run;
+- holds back only the findings that sat on a gapped cluster — they stay in the ledger and out of
+  `resolved`, while a finding elsewhere that has genuinely gone away is still announced as fixed;
+- keeps **their** remediation pull requests open, so a fix survives to the next run that covers
+  that cluster, and closes the stale ones whose clusters this run did read;
 - does **not** close the ledger, even with zero findings — `status` is still `CLEAN`, but the issue
   stays open and gains a comment naming the gaps. The stream self-heals the day the fleet is fully
   readable again.
 
-A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
-and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
+Two gaps are wider than one cluster and hold everything back: a waived collector manifest, and a
+gap that belongs to no target at all — a whole kind of object nobody enumerated.
+
+A run whose coverage **changed** is never `[SILENT]` — `finish` returns `silent_ok: false` for it,
+and counts the gaps in the `chat_summary` line it hands you to send. A gap that has not moved since
+the last run is not news a second time, so a stream with a standing gap it cannot close still goes
+quiet; the gap stays in the ledger and in `coverage_gaps` either way. The gaps themselves are named
+in the ledger, which is what the link is for; name them in your answer too when a person asked for
+the run. See [The clean run](#the-clean-run) for the full rule.
 
 ## The findings document
 
@@ -279,7 +357,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
   },
   "findings": [
     {
-      "id": "netpol-missing-payments",
+      "check": "netpol-missing",
       "severity": "critical",
       "title": "payments namespace has no NetworkPolicy",
       "cluster": "prod-us-east",
@@ -314,6 +392,7 @@ field, and publishes nothing:
 - `checks_run` is **required on every cluster** (the example above shows three entries per cluster
   for brevity; a real run carries one per check it ran). Each entry is an object with two required
   fields:
+
   - **`check`** — the backticked slug from the SOP heading that defines it (`netpol-missing`, not
     "2.6" and not prose). An unknown slug or a duplicate is rejected.
   - **`command`** — the literal invocation you issued on that cluster for that check, with its
@@ -329,6 +408,7 @@ field, and publishes nothing:
 
 - `checks_not_applicable` is **optional**, and says which checks the cluster's shape rules out.
   Each entry is an object with two required fields:
+
   - **`check`** — the same slugs `checks_run` uses. An unknown slug, a duplicate, or a slug that
     also appears in this cluster's `checks_run` is rejected: a check either ran or could not.
   - **`reason`** — why the check _cannot_ apply here, naming the property of the cluster that rules
@@ -341,6 +421,14 @@ field, and publishes nothing:
   forbids — a check you could have run and did not is a `limitations` note and a real gap. Every
   entry is published in the ledger under _Not applicable_, with its reason, where a reviewer who
   knows the cluster can call an excuse for what it is.
+
+  In most cases you will not write this field at all: the collector declares its own skips, and what
+  it declares is carried through for you. What the harness rejects is the contradiction — a slug the
+  manifest records as a successful command on that cluster, which the collector did not itself
+  declare inapplicable. The collector ran that check and completed it, so it was covered. "The
+  command ran and found zero objects of that kind" is a clean result, not an inapplicable check.
+  Where the collector never reached the check — a target it could not read, a slug it does not carry
+  — the judgment is still yours.
 
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
@@ -361,6 +449,14 @@ field, and publishes nothing:
   findings agreeing on all four are the same finding, and the document is refused rather than
   silently collapsed.
 
+  `object` is `Kind/name` and is refused without both halves. A bare `Cluster` names every cluster
+  and none in particular; a finding against the cluster itself is `Cluster/<the cluster's name>`,
+  repeating the name that is already in `cluster`. That repetition is the point — on 2026-08-29 the
+  compliance stream wrote `Cluster/kube-agents-host` one day and `Cluster` the next for four
+  unchanged public control planes, and the ledger announced all four as resolved and re-opened them
+  as new. Derivation stopped the model spelling an id three ways; it cannot stop the model spelling
+  one of the id's four inputs two ways, so this one field has a shape.
+
   The derived id still has to satisfy `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..` run and
   no `.lock` suffix, and is shortened to fit: the id is the join key of the ledger's hidden delta
   block and of the `audit-persists:<id>` marker — both line-anchored regexes a space or a newline
@@ -372,6 +468,10 @@ field, and publishes nothing:
   it is the same next week.
 
 - `severity` is one of `critical`, `major`, `minor`.
+- `title` **says what is wrong, not which check found it.** "payments namespace has no
+  NetworkPolicy", never "netpol-missing on Namespace/payments (prod-us-east)". The rendered heading
+  is followed immediately by a `**Where:**` line carrying the cluster, the namespace and the object,
+  so a title built out of those three restates them and leaves no field saying what happened.
 - `namespace` may be empty for cluster-scoped objects.
 - `evidence.command` is **required and non-empty**.
 - `recommendation` is **required on every finding**, with all three of `action`, `rationale`, and
@@ -379,6 +479,18 @@ field, and publishes nothing:
 - `remediation.kind` is `manifest`, `gcloud`, or `manual`. `path` is required for `manifest`
   (repo-relative, no `..`, no absolute paths, no glob metacharacters) and forbidden for the other
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
+- **A `gcloud` note is a command that runs, not the finding restated in flag form.** A flag takes
+  the value `gcloud` accepts, which is routinely not the one the API reported, and pasting the
+  observed value straight through is how that goes wrong. Enum fields are the trap, because
+  `gcloud`'s choices are lowercase where the API's are not: the 2026-09-01
+  `fleet-consistency-drift` run read `.releaseChannel.channel=RAPID` and shipped
+  `--release-channel=REGULAR`, which fails on paste with _Invalid choice: 'REGULAR'. Did you mean
+  'regular'?_. A reader who pastes that reasonably concludes the finding is wrong rather than the
+  command, so one bad flag discredits a true finding. Names move too, not just cases — the fix for
+  a `loggingConfig.componentConfig.enableComponents` of `SYSTEM_COMPONENTS,WORKLOADS` is
+  `--logging=SYSTEM,WORKLOAD`. Write the flag's own vocabulary, and if you cannot confirm what
+  that is, the finding is `kind: manual` and the command belongs in `recommendation.action` as
+  prose.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
   namespace — grep the clone for `namespace: <namespace>`, then **open the hits and confirm one
@@ -419,17 +531,21 @@ that skipped eight of eleven checks and found nothing has not found nothing; it 
 before this field existed it published as `CLEAN` and closed the ledger.
 
 Which means the two ways to defeat all of this are to claim a check you did not run, or to park one
-in `checks_not_applicable` that you simply did not get to. The harness runs as a subprocess of you;
-it cannot see your tool calls, so it cannot verify either claim — an inflated `checks_run` converts
-a partial audit straight back into a false all-clear, and a padded `checks_not_applicable` does the
-same by shrinking the denominator until the shortfall disappears. Publication is what makes both
-expensive and, more importantly, **falsifiable**: every command you name is published under _How
-this run checked the fleet_, and every exclusion with its reason under _Not applicable_, where a
-reviewer or the next run can re-run the one and contest the other. Record each entry as its check
-completes and paste the command you actually issued. Never add entries in advance, never round the
-list up to the roster because the SOP happens to define that many, never write a command you did not
-run, and never write a `reason` that does not name a property of the cluster — a fabricated one is a
-lie with your name on it in a public issue, which is a worse outcome for you than an honest `7/11`.
+in `checks_not_applicable` that you simply did not get to. An inflated `checks_run` converts a
+partial audit straight back into a false all-clear, and a padded `checks_not_applicable` does the
+same by shrinking the denominator until the shortfall disappears. The collector's manifest catches
+both where it reaches: `checks_run` must match a successful command it recorded, and a check it
+recorded as run and clean cannot be declared inapplicable over the top of it. Neither rule reaches
+the checks you ran by hand on a target the collector could not read — the harness runs as a
+subprocess of you and cannot see your tool calls.
+
+Publication is what makes the rest falsifiable: every command you name is published under _How this
+run checked the fleet_, and every exclusion with its reason under _Not applicable_, where a reviewer
+or the next run can re-run the one and contest the other. Record each entry as its check completes
+and paste the command you actually issued. Never add entries in advance, never round the list up to
+the roster because the SOP happens to define that many, never write a command you did not run, and
+never write a `reason` that does not name a property of the cluster — a fabricated one is a lie with
+your name on it in a public issue, which is a worse outcome for you than an honest `7/11`.
 
 An honest shortfall costs you nothing. It marks the run `partial`, keeps the ledger open, and gets
 picked up next run. That is the system working.
@@ -473,7 +589,9 @@ Corollaries:
 ## What the ledger says about each finding
 
 Every finding renders in exactly one state, computed fresh each run from whether it still reproduces
-and what pull request sits on its branch. Nothing is stored between runs.
+and what pull request sits on its branch. No stored state feeds it — the report store
+([Answering a question about a past run](#answering-a-question-about-a-past-run)) keeps the previous
+run's ids, not this run's states.
 
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
@@ -486,7 +604,9 @@ and what pull request sits on its branch. Nothing is stored between runs.
 Every row above says "reproduces", and that is not an accident: **a finding that stopped reproducing
 is not in the document at all**, so it has no row in the ledger to carry a state. Two further states
 exist in the code — `resolved` and `resolved-merged` — but neither is ever rendered here. A
-resolution is announced in the delta comment, by id and title recovered from the previous body, and
+resolution is announced in the delta comment, by id and title recovered from the previous run's
+envelope in the on-pod report store — not from the ledger body, which a GitHub truncation can make
+unreadable — and
 the finding's open pull request is closed as stale. A resolution whose fix had already **merged** is
 the ordinary, expected ending, so nothing extra is closed and nothing extra is said.
 
@@ -528,12 +648,19 @@ to put in a diff otherwise. Three paths lead there:
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
   access to the repository. This path is uncapped: a human asked for that one by name.
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
-  finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
-  `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
+  finding; the agent answers with the `remediate` subcommand — **never with `submit-suggestion`**,
+  whose pull requests this audit cannot deduplicate, refresh, or close. Uncapped for the same reason
+  as `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
   (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
   requests only: a finding whose pull request a human closed is reported as `superseded`, never
   re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
   above stays with the write-gated comment.
+
+"In the agent's own task" is the whole qualifier. `remediate` has no authorization gate of its own —
+its safety rests on only a human being able to reach it — while the ledger thread is full of asks
+the harness's gates exist to refuse: a `/remediate` from a non-collaborator, prose that was never a
+command, a months-old request a human close superseded. Reading "a reviewer has asked" off the
+thread and answering it with the uncapped subcommand turns every one of those into a pull request.
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 
@@ -576,7 +703,7 @@ subcommand would report as `superseded`. Run a direct ask's targets through it, 
 per id:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
+python3 ./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
   --findings-file <findings_path> --finding <id> [--finding <id> …] [--issue <n>] \
   [--repo "<owner>/<repo>"]
 ```
@@ -586,9 +713,10 @@ one `--finding` produces one pull request (or one, shared, for the group that pa
 five more for critical findings the requester never mentioned and cannot tell apart from the one they
 did. Auto-promotion happens in `finish`, where the whole fleet is being reported on anyway.
 
-It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, and `refused`:
+It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, `refused`, and
+`duration_s` (telemetry: how long the command itself took):
 
-- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"superseded":[],"refused":["ns-quota"]}`
+- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"superseded":[],"refused":["ns-quota"],"duration_s":18.4}`
 
 `superseded` names targets whose pull request a human closed: that close stands, and the
 subcommand does not re-propose them. Revival belongs to the write-gated `/remediate` comment
@@ -619,7 +747,7 @@ the files, not on a finding id, and that is load-bearing: ids are regenerated ev
 named after one of them gets renamed the day that finding resolves — orphaning the open pull request
 and opening a duplicate against the same file.
 
-The branch name is the only join key. There is no state file: `finish` reconstructs the entire
+The branch name is the only join key, and no state file backs it: `finish` reconstructs the entire
 finding-to-pull-request mapping from one `gh pr list` call.
 
 ## Size
@@ -643,10 +771,11 @@ emits the **first** finding whatever it costs, so before those three were clippe
 identifier on one finding could overflow the whole body and publish nothing at all, every morning,
 until that finding stopped reproducing.
 
-Resolution accounting is unaffected by truncation, because the two halves of the delta are measured
-against different sets: **new** is judged against what the body rendered, and **resolved** against
-every finding in the document, rendered or not. A finding cut for space still reproduces and is
-never reported as fixed.
+Delta accounting is unaffected by truncation, because both halves are measured against what the
+previous run knew — the ids its body rendered plus every finding in its stored document — and
+judged against every finding in this document, rendered or not. A finding cut for space still
+reproduces and is never reported as fixed; one that loses a budget contest and wins the next is not
+reported as new.
 
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
 `checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the
@@ -662,8 +791,9 @@ unanswered in the thread, comments the date and the clusters covered, closes the
 completed**, and closes every remediation pull request still open for the stream. The answers come
 first, deliberately: a reply posted after the close would land on an issue nobody is watching.
 
-**Zero findings plus a coverage gap is not a clean run, and it is not silent even on a stream with
-no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
+**Zero findings plus a coverage gap is not a clean run, and the run that acquires the gap is not
+silent even on a stream with no ledger.** With gaps, the harness opens one — titled
+`coverage incomplete (n gaps, 0 findings)`
 rather than the all-clear phrasing — so the run leaves a durable artifact saying what it could not
 see. Without this, a stream that inspected nothing produced no issue, no comment, and nothing to
 notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
@@ -677,16 +807,59 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no coverage gap, and no remediation pull request opened or closed.
+> new, nothing resolved, no change in coverage since the last run, and no remediation pull request
+> opened or closed.
+
+Coverage counts as _movement_, not as a state. A gap speaks on the run that acquires it and on any
+run that widens or narrows it; an unchanged gap does not speak again. Using the gap list itself
+made a stream with a gap it could not close incapable of silence — the fleet-consistency drift
+audit sent fourteen consecutive messages at 0 new, 0 resolved, and a byte-identical summary,
+because one cluster had no `environment` label and so had no cohort to compare against. The
+shortfall is still in the ledger body, in `coverage_gaps`, and in the run log; it has just stopped
+being a reason to send.
 
 Two rules follow, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
-  report, and every report carries `issue_url` in full.
+- On a **scheduled** run, your entire final response is `chat_summary` — the string `finish`
+  returned, copied out of the JSON with nothing before it and nothing after it. On `silent_ok: true`
+  that string is exactly `[SILENT]`, so obeying the flag and copying the field are the same act. On
+  anything else it is the one line, already carrying the severity counts, the delta, and `issue_url`.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
+
+**`chat_summary` is copied, not composed.** A scheduled run's answer goes straight to the home
+channel, so the response _is_ the message — there is no operator on the other end to skim past a
+preamble. The line is rendered from this payload for the reason `silent_ok` is computed from it: the
+instruction "reply with one line: counts by severity, new vs. resolved, and the `issue_url`" was
+prose, and on 2026-08-30 a scheduled run answered it with sixteen hundred characters — its own exit
+codes, a markdown heading, and every finding in the ledger restated underneath a link to the ledger.
+The numbers were all in the JSON. Reassembling them was the step that went wrong, so the harness
+does it. Send the string; the link is the report.
+
+Do not announce the copying either. The first scheduled run under this rule replied `The audit run
+completed successfully. Per the skill's instructions, this is a scheduled run and my entire final
+response must be exactly chat_summary copied verbatim.` — and then the line, correctly. Quoting the
+rule back is not following it: the channel got two sentences ahead of the one that was wanted, and
+the second of them was about this document. Whatever reasoning got you to the string stays where the
+reasoning goes. The response is the string.
+
+**Silence is a message not sent, never a message about silence.** `[SILENT]` is a token the
+scheduler consumes to suppress the delivery; it is not text for a human and it is not an
+announcement you make. So a silent run does not explain that it is staying quiet, does not report
+`silent_ok: true`, does not summarise what it decided not to say, and does not quote the token
+inside a sentence. Any of those and the run has already spoken.
+
+That is not hypothetical. On 2026-08-30 six scheduled runs across four streams answered a
+`silent_ok: true` with two to four hundred characters of prose about the flag — `The run completed
+successfully with status: CLEAN, silent_ok: true…` — and left `[SILENT]` alone on the final line
+underneath. Every one of them reached the channel's doorstep and was suppressed only because the
+scheduler's matcher tolerates a trailing marker. Nothing about the audit made them silent. Move the
+token one line up into the prose and all six get delivered.
+
+So there is exactly one silent response, and it is the eight characters `chat_summary` already
+handed you.
 
 Two clean runs come back `silent_ok: false`, and both matter:
 
@@ -696,12 +869,18 @@ Two clean runs come back `silent_ok: false`, and both matter:
 - **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
   nothing" and "I could not look" must not arrive as the same silence.
 
-There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
-previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
-declaring every live finding new. `silent_ok` follows the counts it can defend and comes back `true`
-on an otherwise quiet run. The run logs
-`Previous ledger body was unreadable; skipping the delta comment` to stderr and the ledger is still
-rewritten correctly — the issue carries the truth either way.
+There is one case where the harness reports `new: 0, resolved: 0` without knowing it: the stream has
+an open ledger but the previous run's stored report cannot be trusted — absent (a wiped volume),
+unreadable or not a JSON object, written for a different issue number, or carrying a superseded
+`id_scheme`. An unknowable memory is not an empty one, so all of them land in the same place: the
+delta is withheld rather than every live finding declared new. There is no partial version of it — a
+scheme mismatch withholds the whole delta, not `resolved` alone. `silent_ok` follows the counts it
+can defend and comes back `true` on an otherwise quiet run. Each trigger logs its own stderr line
+naming which one fired, and a ledger rewrite adds `The previous run's report is unavailable (see
+above); skipping the delta comment rather than announcing every live finding as new. This run's own
+store write restores the delta from the next run on.` The ledger is still rewritten correctly — the
+issue carries the truth either way. A stream with **no** open ledger is not this case: that run is
+genuinely the first, and everything in it is new.
 
 ## Red lines
 
@@ -723,6 +902,11 @@ rewritten correctly — the issue carries the truth either way.
 - **Never open a second ledger issue for a stream.** Do not call `gh issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.
+- **Never post `/remediate` on the ledger.** The ledger body advertises that command to human
+  reviewers; it is not addressed to you. Promoting a fix is the reviewer's call, and `finish`
+  ignores a `/remediate` from a machine account — so the comment achieves nothing but noise on a
+  customer's issue. A request already sitting in the thread is the harness's to answer too, not
+  yours: `start` hands you the ones that passed its gates as `pending_remediation_requests`.
 - **Never reopen a merged remediation pull request.** A persisting finding gets a comment and a
   ledger state, not a resurrection.
 - **Never delete a remediation branch.** The harness closes stale pull requests and leaves the

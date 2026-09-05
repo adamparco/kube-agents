@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -482,8 +483,8 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("dashboard readiness probe must not use curl --fail: any HTTP response proves the listener is up, got %q", cmd)
 			}
 		}
-		if len(dashboardC.Env) != 6 {
-			t.Errorf("expected 6 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 7 {
+			t.Errorf("expected 7 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -1266,6 +1267,91 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	}
 }
 
+// TestCredentialProxyOutputCapClearsTheLargestFleetDump pins the output cap the
+// sidecar runs with. Every command an agent issues arrives through this proxy,
+// so the cap bounds a cluster dump; at the proxy's own 4 MiB default the
+// fleet-audit workload dump for kube-agents-host measured 3,866,719 bytes, 92%
+// of the way there, and crossing it truncates the JSON mid-string and drops
+// that cluster out of compliance-audit and ai-security-audit.
+//
+// The name is on mergeCredentialProxyEnv's reserved list, so the second half
+// matters as much as the first: setting it here is the only way it gets set at
+// all, and a value in spec.deployment.env cannot raise or lower it.
+func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{
+						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
+					},
+				},
+			},
+		},
+	}
+
+	env := make(map[string]string)
+	for _, item := range buildCredentialProxySidecar(agent, "/opt/hermes").Env {
+		env[item.Name] = item.Value
+	}
+
+	// Without this the override half of the test is vacuous: a spec env list
+	// that never reaches the merge would also produce the operator's value.
+	if env["UNRESERVED_PASSENGER"] != "arrived" {
+		t.Fatalf("spec.deployment.env never reached the sidecar, so the override below proves nothing")
+	}
+
+	const want = "16777216" // 16 MiB
+	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
+		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
+	}
+	// The measured worst case, so a future reduction of the cap has to argue
+	// with the number rather than pass silently.
+	const largestObservedDump = 3866719
+	capBytes, err := strconv.Atoi(env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"])
+	if err != nil {
+		t.Fatalf("proxy output cap is not an integer: %v", err)
+	}
+	if capBytes <= largestObservedDump {
+		t.Errorf("proxy output cap %d does not clear the largest observed dump %d", capBytes, largestObservedDump)
+	}
+
+	// The other half of the argument, which the floor above cannot make: a cap
+	// this side of the fleet's needs is still wrong if the container cannot
+	// hold it. Five live copies of a capped output exist per in-flight command
+	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
+	// response -- and the commands in flight are one per kanban worker plus
+	// the front-door session. Nothing bounds that concurrency inside the
+	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
+	// memory limit alongside the ~250Mi this sidecar holds steady, or an
+	// OOMKill takes gcloud, kubectl, gh and git away from the whole Pod.
+	//
+	// Five workers rather than defaultKanbanMaxInProgress, because that
+	// default is overridable and resolveResources sizes the agent container
+	// for the five-way fan-out it has actually observed. The sidecar is sized
+	// for the same install.
+	//
+	// And two capped streams per command, not one. `_execute` truncates stdout
+	// and stderr in two independent calls -- see the pair of `self._truncate`
+	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
+	// single command can hold 2x it. Modelling one stream understates the
+	// burst by half, which is the direction that lets a too-large cap pass.
+	const copiesPerCommand = 5
+	const streamsPerCommand = 2
+	const steadyStateBytes = 250 << 20
+	const observedFanOut = 5
+	inFlight := int64(observedFanOut + 1)
+	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	limits := buildCredentialProxySidecar(agent, "/opt/hermes").Resources.Limits
+	limit := limits.Memory().Value()
+	if burst+steadyStateBytes > limit {
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the sidecar's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+			capBytes, burst, inFlight, limit, int64(steadyStateBytes))
+	}
+}
+
 // TestBuildPodTemplateSpecIsolatesTheSidecarUser covers the two Pod-level halves
 // of the credential boundary: the sandbox must not be able to read the sidecar's
 // process state, and the two must not run as one user.
@@ -1581,6 +1667,117 @@ func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
 	}
 }
 
+// TestKustomizeCoreEgressDNSPeersMatchTheOperator pins the static Kustomize DNS
+// rule to the one buildNetworkPolicy renders. They are two hand-maintained
+// copies of the same peer list, and nothing else compares them: the only other
+// test reading these files checks podSelector alone.
+//
+// The drift is not hypothetical. Every other static copy in the tree — the
+// chart's litellm and github-minter policies, the LiteLLM integration base, the
+// examples — already named the Cloud DNS resolver while this file did not, and
+// no test noticed until a Cloud DNS install lost name resolution. The regression
+// this catches is the reverse: someone edits the builder, `go test ./...` stays
+// green, and Kustomize installs quietly get a different resolver set.
+//
+// It compares ipBlock CIDRs only. The selector peers are equivalent but not
+// textually comparable across a Go literal and a YAML document, and pinning
+// those would make the test fail on cosmetic edits rather than on drift.
+func TestKustomizeCoreEgressDNSPeersMatchTheOperator(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	var manifest struct {
+		Spec struct {
+			Egress []struct {
+				Ports []struct {
+					Port int32 `yaml:"port"`
+				} `yaml:"ports"`
+				To []struct {
+					IPBlock struct {
+						CIDR string `yaml:"cidr"`
+					} `yaml:"ipBlock"`
+				} `yaml:"to"`
+			} `yaml:"egress"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("failed to unmarshal %s: %v", path, err)
+	}
+
+	// The static file's DNS rule carries a 0.0.0.0/0 peer with an except list,
+	// which the operator's does not; compare the single-host grants, which are
+	// the resolvers themselves.
+	static := map[string]bool{}
+	for _, rule := range manifest.Spec.Egress {
+		isDNS := len(rule.Ports) > 0
+		for _, port := range rule.Ports {
+			if port.Port != dnsPort {
+				isDNS = false
+			}
+		}
+		if !isDNS {
+			continue
+		}
+		for _, peer := range rule.To {
+			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
+				static[peer.IPBlock.CIDR] = true
+			}
+		}
+	}
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+	}
+	// Every port-53 rule, not egressCIDRsForPort, which returns at the first one
+	// it finds. The static side above iterates the whole file, and comparing one
+	// operator rule against all of the manifest's would report parity for a
+	// second operator rule nobody had mirrored — the exact drift this test is
+	// here to catch, and a split into two port-53 rules is a plausible edit given
+	// that separate rules are how this policy keeps grants from widening one
+	// another.
+	rendered := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+	operator := map[string]bool{}
+	for _, rule := range rendered.Spec.Egress {
+		// Written out rather than through ruleNamesPort, which counts a rule with
+		// no ports as naming every one of them. That is right for its callers and
+		// wrong here: such a rule's peers are not DNS peers, and folding them into
+		// this set would report drift against the static file for peers the static
+		// file's DNS rule was never supposed to carry.
+		namesDNS := false
+		for _, candidate := range rule.Ports {
+			if candidate.Port != nil && candidate.Port.IntValue() == dnsPort {
+				namesDNS = true
+				break
+			}
+		}
+		if !namesDNS {
+			continue
+		}
+		for _, peer := range rule.To {
+			if peer.IPBlock == nil {
+				continue
+			}
+			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
+				operator[peer.IPBlock.CIDR] = true
+			}
+		}
+	}
+
+	for cidr := range operator {
+		if !static[cidr] {
+			t.Errorf("the operator's DNS rule grants %s and %s does not; a Kustomize install gets a "+
+				"different resolver set from an operator-managed one", cidr, filepath.Base(path))
+		}
+	}
+	for cidr := range static {
+		if !operator[cidr] {
+			t.Errorf("%s grants %s on port 53 and the operator's DNS rule does not", filepath.Base(path), cidr)
+		}
+	}
+}
+
 // fqdnPatternsFromPolicy returns the egress match patterns buildFQDNNetworkPolicy emits.
 func fqdnPatternsFromPolicy(t *testing.T) []string {
 	t.Helper()
@@ -1659,6 +1856,8 @@ func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 		"api.github.com",
 		"objects.githubusercontent.com",
 		"slack.com",
+		"login.microsoftonline.com",
+		"smba.botframework.com",
 	}
 
 	for _, host := range hostnames {
@@ -1903,6 +2102,194 @@ func TestBuildConfigMapSlackRichBlocks(t *testing.T) {
 			}
 			if got := cfg.Platforms.Slack.Extra["rich_blocks"]; got != true {
 				t.Errorf("platforms.slack.extra.rich_blocks = %v, want true; got:\n%s", got, raw)
+			}
+		})
+	}
+}
+
+func TestBuildDeploymentTeamsIntegration(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
+					Enabled: ptr.To(true),
+					AppIdSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "custom-teams-secret"},
+						Key:                  "teams-app-id",
+					},
+					AppPasswordSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "custom-teams-secret"},
+						Key:                  "teams-app-pwd",
+					},
+					TenantId:        "teams-tenant-guid",
+					AllowedUsers:    []string{"user-aad-123", "admin-aad-456"},
+					HomeChannel:     "19:channel-id@thread.tacv2",
+					HomeChannelName: "operations",
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if _, ok := envMap["TEAMS_APP_ID"]; ok {
+		t.Error("expected TEAMS_APP_ID to be absent from sandbox")
+	}
+	if _, ok := envMap["TEAMS_APP_PASSWORD"]; ok {
+		t.Error("expected TEAMS_APP_PASSWORD to be absent from sandbox")
+	}
+	if envMap["TEAMS_RELAY_URL"].Value != "http://127.0.0.1:8765" {
+		t.Errorf("expected credential-free Teams relay URL, got %v", envMap["TEAMS_RELAY_URL"])
+	}
+	if envMap["TEAMS_ALLOWED_USERS"].Value != "user-aad-123,admin-aad-456" {
+		t.Errorf("expected TEAMS_ALLOWED_USERS user-aad-123,admin-aad-456, got %s", envMap["TEAMS_ALLOWED_USERS"].Value)
+	}
+	if envMap["TEAMS_ALLOW_ALL_USERS"].Value != "false" {
+		t.Errorf("expected TEAMS_ALLOW_ALL_USERS false by default, got %s", envMap["TEAMS_ALLOW_ALL_USERS"].Value)
+	}
+	if envMap["TEAMS_TENANT_ID"].Value != "teams-tenant-guid" {
+		t.Errorf("expected TEAMS_TENANT_ID teams-tenant-guid, got %s", envMap["TEAMS_TENANT_ID"].Value)
+	}
+	if envMap["TEAMS_HOME_CHANNEL"].Value != "19:channel-id@thread.tacv2" {
+		t.Errorf("expected TEAMS_HOME_CHANNEL 19:channel-id@thread.tacv2, got %s", envMap["TEAMS_HOME_CHANNEL"].Value)
+	}
+	if envMap["TEAMS_HOME_CHANNELName"].Value != "operations" && envMap["TEAMS_HOME_CHANNEL_NAME"].Value != "operations" {
+		t.Errorf("expected TEAMS_HOME_CHANNEL_NAME operations, got %s", envMap["TEAMS_HOME_CHANNEL_NAME"].Value)
+	}
+
+	proxyEnv := make(map[string]corev1.EnvVar)
+	for _, env := range buildCredentialProxySidecar(agent, "/opt/hermes").Env {
+		proxyEnv[env.Name] = env
+	}
+	if proxyEnv["TEAMS_APP_ID"].ValueFrom.SecretKeyRef.Name != "custom-teams-secret" || proxyEnv["TEAMS_APP_ID"].ValueFrom.SecretKeyRef.Key != "teams-app-id" {
+		t.Errorf("expected proxy TEAMS_APP_ID custom-teams-secret/teams-app-id, got %v", proxyEnv["TEAMS_APP_ID"].ValueFrom)
+	}
+	if proxyEnv["TEAMS_APP_PASSWORD"].ValueFrom.SecretKeyRef.Name != "custom-teams-secret" || proxyEnv["TEAMS_APP_PASSWORD"].ValueFrom.SecretKeyRef.Key != "teams-app-pwd" {
+		t.Errorf("expected proxy TEAMS_APP_PASSWORD custom-teams-secret/teams-app-pwd, got %v", proxyEnv["TEAMS_APP_PASSWORD"].ValueFrom)
+	}
+	if proxyEnv["TEAMS_TENANT_ID"].Value != "teams-tenant-guid" {
+		t.Errorf("expected proxy TEAMS_TENANT_ID teams-tenant-guid, got %v", proxyEnv["TEAMS_TENANT_ID"].Value)
+	}
+}
+
+func TestBuildDeploymentTeamsAllowAllUsers(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
+					Enabled:       ptr.To(true),
+					AllowAllUsers: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if envMap["TEAMS_ALLOW_ALL_USERS"].Value != "true" {
+		t.Errorf("expected TEAMS_ALLOW_ALL_USERS true, got %s", envMap["TEAMS_ALLOW_ALL_USERS"].Value)
+	}
+}
+
+func TestBuildDeploymentTeamsDefaultDisallowAllUsers(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if envMap["TEAMS_ALLOW_ALL_USERS"].Value != "false" {
+		t.Errorf("expected TEAMS_ALLOW_ALL_USERS false by default, got %s", envMap["TEAMS_ALLOW_ALL_USERS"].Value)
+	}
+}
+
+func TestBuildConfigMapTeamsEnabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent, nil)
+	yamlContent := defaultProfileYAML(t, cm)
+	if !strings.Contains(yamlContent, "teams:") || !strings.Contains(yamlContent, "enabled: true") {
+		t.Errorf("expected config.yaml to enable teams platform, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "typing_status_text: Kage is thinking…") {
+		t.Errorf("expected config.yaml to set teams typing status text, got:\n%s", yamlContent)
+	}
+}
+
+func TestBuildConfigMapTeamsAdaptiveCards(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		integration *agentv1alpha1.PlatformAgentIntegrationSpec
+	}{
+		{"teams enabled", &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Teams: &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true)},
+		}},
+		{"no integration", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Integration: tc.integration},
+			}
+
+			var cfg struct {
+				Platforms struct {
+					Teams struct {
+						Extra map[string]any `json:"extra"`
+					} `json:"teams"`
+				} `json:"platforms"`
+			}
+			raw := defaultProfileYAML(t, buildConfigMap(agent, nil))
+			if err := k8syaml.Unmarshal([]byte(raw), &cfg); err != nil {
+				t.Fatalf("the default profile overlay is not parseable: %v\n%s", err, raw)
+			}
+			if got := cfg.Platforms.Teams.Extra["adaptive_cards"]; got != true {
+				t.Errorf("platforms.teams.extra.adaptive_cards = %v, want true; got:\n%s", got, raw)
 			}
 		})
 	}
@@ -2761,10 +3148,14 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// loopback bearer, which is not conditional on anything; see the next test.
+	// three unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, and the mode switch.
 	bare := renderManagedEnv(newTestPlatformAgent())
-	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"+kubeagentsModeEnvKey+"=today\n"; got != want {
-		t.Errorf("renderManagedEnv with no integration = %q, want %q", got, want)
+	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
+		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
+		kubeagentsModeEnvKey + "=today\n"
+	if bare != want {
+		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
 }
 
@@ -2909,6 +3300,80 @@ func TestDashboardLoadsTheSameConfigAsTheGateway(t *testing.T) {
 	if !ok || dashDir != gwDir {
 		t.Errorf("HERMES_MANAGED_DIR = %q on the dashboard but %q on the gateway; the mount is only "+
 			"read when this names it", dashDir, gwDir)
+	}
+}
+
+// TestHermesHomeModeGrantsTheCredentialProxyGroupAccess pins the mode Hermes re-applies to
+// $HERMES_HOME on every process start. Without HERMES_HOME_MODE it defaults to 0700, and
+// a cron or kanban worker runs with $HERMES_HOME set to profiles/platform — the directory
+// the credential proxy writes a kubeconfig into for `gcloud container clusters
+// get-credentials`. The proxy is uid 10001 and the agent is 10000, so 0700 denies it and
+// the mkdir fails with EACCES on every proxied command the worker makes.
+//
+// The assertion is on the permission bits rather than the literal string: what the proxy
+// needs is group write (mkdir on the parent) plus group execute (traverse), and a future
+// mode that keeps the string plausible while dropping either would reintroduce the bug.
+// Group read is asserted too — the proxy stats what it filed.
+func TestHermesHomeModeGrantsTheCredentialProxyGroupAccess(t *testing.T) {
+	dep := buildDeployment(haAgent("mode-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	raw, found := envValue(gateway, "HERMES_HOME_MODE")
+	if !found {
+		t.Fatalf("no HERMES_HOME_MODE on the gateway; hermes falls back to 0700 and every proxied " +
+			"command from a cron or kanban worker fails with EACCES")
+	}
+	mode, err := strconv.ParseInt(raw, 8, 32)
+	if err != nil {
+		t.Fatalf("HERMES_HOME_MODE = %q, which hermes parses as octal and this does not: %v", raw, err)
+	}
+	for _, bit := range []struct {
+		mask int64
+		what string
+		why  string
+	}{
+		{0o070, "group rwx", "the credential proxy (uid 10001, gid 10000) must traverse into " +
+			"$HERMES_HOME and mkdir .kubeconfigs/ and workspace/ inside it"},
+		{0o700, "owner rwx", "the agent itself owns these directories and must keep full access"},
+	} {
+		if mode&bit.mask != bit.mask {
+			t.Errorf("HERMES_HOME_MODE = %q lacks %s (%04o & %03o = %03o); %s",
+				raw, bit.what, mode, bit.mask, mode&bit.mask, bit.why)
+		}
+	}
+	if mode&0o007 != 0 {
+		t.Errorf("HERMES_HOME_MODE = %q grants `other` %03o, but no uid on this volume reaches it "+
+			"— both containers that mount the PVC are in gid 10000", raw, mode&0o007)
+	}
+	// Setgid is the half of this the permission bits above cannot see. Group rwx lets the
+	// proxy mkdir inside $HERMES_HOME; setgid is what makes the directory it creates carry
+	// gid 10000 rather than the creating process's own primary group, so the *next* writer
+	// still gets in. 0770 passes every assertion above and loses that on the second hop.
+	if mode&0o2000 == 0 {
+		t.Errorf("HERMES_HOME_MODE = %q has no setgid bit; directories the credential proxy "+
+			"creates under $HERMES_HOME would not inherit gid 10000 and the agent could not "+
+			"write into them", raw)
+	}
+
+	// The dashboard runs hermes against the same directories. A different mode there means
+	// the two containers re-chmod the PVC out from under each other on every start.
+	dash := containerNamed(t, dep, "platform-agent-dashboard")
+	if dashMode, ok := envValue(dash, "HERMES_HOME_MODE"); !ok || dashMode != raw {
+		t.Errorf("HERMES_HOME_MODE = %q on the dashboard but %q on the gateway (found=%v); both run "+
+			"hermes against the same PVC, so they must agree", dashMode, raw, ok)
+	}
+
+	// Container.Env is the LOWEST of the three layers hermes reads — the managed .env
+	// beats the PVC .env beats the process environment — so the two assertions above
+	// establish the operator's intent and not the outcome. One `HERMES_HOME_MODE=0777`
+	// line in $HERMES_HOME/.env outranks them, the agent can write that line, and
+	// sandbox-credential-cleanup does not remove it, so it survives upgrades. Every
+	// directory hermes secures on the shared PVC widens and the pod stays green.
+	// The pin in renderManagedEnv is what makes the mode above the value that holds.
+	managed := renderManagedEnv(newTestPlatformAgent())
+	if !strings.Contains(managed, "HERMES_HOME_MODE="+raw+"\n") {
+		t.Errorf("HERMES_HOME_MODE is %q in the container env but not pinned in the managed .env:\n%s",
+			raw, managed)
 	}
 }
 
@@ -3387,6 +3852,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
+				{Name: "HERMES_HOME_MODE", Value: "0777"},
 			},
 		},
 	}
@@ -3413,8 +3879,8 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	}
 
 	// AGENT_SHARED_STATE_SETUP is operator-owned for the same reason and by the same
-	// means — appended after the plugin merge, so the kubelet's last-wins resolution
-	// lands on the operator's value. A plugin that could set it to `skip` would switch
+	// means — appended after the plugin merge, so lastWinsEnv's collapse lands on the
+	// operator's value. A plugin that could set it to `skip` would switch
 	// off the entrypoint's shared-state setup for the whole agent, and the resulting
 	// unpopulated $HERMES_HOME surfaces nowhere near the plugin that caused it.
 	if env["AGENT_SHARED_STATE_SETUP"] != "owner" {
@@ -3430,8 +3896,142 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 		t.Errorf("plugin must not be able to override HERMES_MANAGED_DIR, got %q",
 			env["HERMES_MANAGED_DIR"])
 	}
+	// HERMES_HOME_MODE is operator-owned by the same means. An arbitrary value reaches
+	// every directory hermes secures on the shared PVC — 0777 would open the agent's
+	// sessions, memories and logs to anything else that mounts it — and nothing about the
+	// widened tree surfaces as an unhealthy pod.
+	//
+	// A plugin is not the only writer that can reach this name, and this assertion covers
+	// only the plugin. The PVC .env outranks Container.Env whatever a plugin does, which
+	// is why the value is pinned in renderManagedEnv too; see the tail of
+	// TestHermesHomeModeGrantsTheCredentialProxyGroupAccess.
+	if env["HERMES_HOME_MODE"] != hermesHomeMode {
+		t.Errorf("plugin must not be able to override HERMES_HOME_MODE, got %q",
+			env["HERMES_HOME_MODE"])
+	}
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])
+	}
+	// The four assertions above read the env as a map, so they pass whether the operator
+	// won by replacing the plugin's entry or by appending a second one the kubelet would
+	// collapse. Those are not the same outcome. `Container.Env` carries
+	// `patchMergeKey=name` and the controller applies server-side, so a second entry is
+	// refused by the API server -- ".spec.template.spec.containers[name=\"platform-agent\"]
+	// .env: duplicate entries for key" -- and the Deployment never reconciles at all.
+	// Count each one; the map read cannot see the failure it is asserting against.
+	for _, name := range []string{
+		"CREDENTIAL_PROXY_URL",
+		"AGENT_SHARED_STATE_SETUP",
+		"HERMES_MANAGED_DIR",
+		"HERMES_HOME_MODE",
+	} {
+		if counts[name] != 1 {
+			t.Errorf("expected %s exactly once, got %d occurrences; a repeated env name is "+
+				"rejected by server-side apply, so this stalls the gateway rather than "+
+				"letting the operator's value win", name, counts[name])
+		}
+	}
+}
+
+// allContainers is every container the API server validates env on, which is not
+// `Spec.Containers`. The credential proxy is a *native sidecar* — a normal container
+// with RestartPolicy: Always, which Kubernetes requires be declared in
+// `Spec.InitContainers` — so a test that walks only `Spec.Containers` cannot see it, and
+// its env is merged by `mergeCredentialProxyEnv` rather than by `mergeEnvVars`. Those two
+// functions dedup differently, so that is exactly the container a duplicate-env test most
+// needs to reach.
+func allContainers(spec corev1.PodSpec) []corev1.Container {
+	return append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+}
+
+// TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets is the general form of
+// the four-name count loop above, and the reason it is separate: that list has to be
+// maintained and this one cannot go stale. Every variable the operator sets in the
+// baseline is overridden here, so a twelfth operator-owned name added after this is
+// written is covered the day it is added. It walks init containers too — see
+// allContainers — so the credential proxy, whose env is merged by a different function
+// from every other container's, is inside the property rather than beside it.
+//
+// Two inputs, because the two merges take different ones. A plugin's `spec.env` reaches
+// `mergeEnvVars` and never reaches the proxy: `buildCredentialProxyEnv` merges
+// `agent.Spec.Deployment.Env` and nothing else. Driving the plugin alone walked the
+// proxy's containers and called `mergeCredentialProxyEnv` zero times, so the
+// differing-dedup-function invariant the comment above names was the one thing the test
+// did not grade. `Spec.Deployment.Env` carries the same override set for that reason.
+//
+// The gap is real and the reserved list is what stands in it: `buildCredentialProxyEnv`
+// appends CREDENTIAL_PROXY_WORKSPACE_ROOT, EVENT_WATCHER_CLUSTER_NAME and
+// EVENT_WATCHER_ENABLED *after* the merge runs, and only a hand-maintained list keeps a
+// CR that names one of them from producing a duplicate — which is exactly the "list that
+// has to be maintained" this test exists to replace.
+//
+// The property is not "the operator wins" — the test above covers that for the names
+// where it matters. It is that no name appears twice at all. `Container.Env` carries
+// patchMergeKey=name and the controller applies server-side, so the API server refuses
+// a duplicate outright and the gateway stops reconciling; the pod keeps running the
+// spec it already had, which is why the failure reads as "my change did nothing"
+// rather than as an error.
+func TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "dup-agent", Namespace: "test-ns"},
+	}
+
+	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true})
+	var pluginEnv []corev1.EnvVar
+	for _, container := range allContainers(baseline.Spec) {
+		for _, e := range container.Env {
+			pluginEnv = append(pluginEnv, corev1.EnvVar{Name: e.Name, Value: "plugin-supplied"})
+		}
+	}
+	if len(pluginEnv) == 0 {
+		t.Fatalf("expected the baseline pod spec to set at least one env var")
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "dupenv"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "dup-agent",
+			Image:    "gcr.io/env:v1",
+			Env:      pluginEnv,
+		},
+	}
+	// Same names again through the one input the proxy's merge reads. Values
+	// differ from the plugin's so a container taking the wrong source is
+	// visible in a failure message rather than hidden behind matching strings.
+	//
+	// Deduplicated, unlike pluginEnv, because this list has to be a CR the API
+	// server would accept: DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so a repeated name is refused before the operator sees
+	// it. Feeding one anyway reports four duplicates on the proxy that no CR
+	// can produce — HERMES_HOME_MODE and HERMES_MANAGED_DIR are each set on
+	// both the gateway and the dashboard, so walking every container collects
+	// them twice — and a false failure here would be read as the reserved list
+	// being incomplete when it is not.
+	seen := map[string]struct{}{}
+	deploymentEnv := make([]corev1.EnvVar, 0, len(pluginEnv))
+	for _, e := range pluginEnv {
+		if _, dup := seen[e.Name]; dup {
+			continue
+		}
+		seen[e.Name] = struct{}{}
+		deploymentEnv = append(deploymentEnv, corev1.EnvVar{Name: e.Name, Value: "cr-supplied"})
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: deploymentEnv}
+
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
+	for _, container := range allContainers(pod.Spec) {
+		counts := map[string]int{}
+		for _, e := range container.Env {
+			counts[e.Name]++
+		}
+		for name, n := range counts {
+			if n != 1 {
+				t.Errorf("container %s: env %s appears %d times; server-side apply rejects "+
+					"a duplicate env name outright (\"duplicate entries for key\"), so the "+
+					"gateway would stop reconciling rather than resolve to a value",
+					container.Name, name, n)
+			}
+		}
 	}
 }
 

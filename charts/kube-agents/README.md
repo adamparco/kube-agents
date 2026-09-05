@@ -62,20 +62,24 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 no defaults — rendering fails until they are set.
 
 These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
-chart enables by default. On a cluster that has no such RuntimeClass the
-operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
-add `--set platformAgent.deployment.availability.runtimeClassName=""` to run on
-the standard container runtime. See
-[Agent runtime knobs](#agent-runtime-knobs) for what the sandbox needs.
+chart enables by default. On a cluster that cannot run it the operator reports
+`Degraded` and never writes the agent Deployment; add
+`--set platformAgent.deployment.availability.runtimeClassName=""` to run on the
+standard container runtime. See [Agent runtime knobs](#agent-runtime-knobs) for
+what the sandbox needs.
 
 **Upgrading an existing release picks this up too.** Helm applies the new
 chart's defaults for any key your release does not already set, so a release
 installed before this default and upgraded without pinning the value starts
-asking for the sandbox. On a cluster with no `gvisor` RuntimeClass that upgrade
-is quiet rather than loud: the operator stops at its RuntimeClass check before
-touching the workload, so the agent Deployment from the previous reconcile keeps
-running on the standard runtime — and every later change to the CR goes
-unapplied — while `.status` reports `Degraded` with `RuntimeClassNotFound`.
+asking for the sandbox. On a cluster that cannot run it that upgrade is quiet
+rather than loud: the operator stops at its RuntimeClass check before touching
+the workload, so the agent Deployment from the previous reconcile keeps running
+on the standard runtime — and every later change to the CR goes unapplied —
+while `.status` reports `Degraded` with `RuntimeClassNotFound` where the
+RuntimeClass is absent, or `RuntimeClassUnschedulable` where it exists but no
+node carries its scheduling labels. That second case is the one GKE Standard
+actually hits: `gvisor` is a cluster addon and is present whether or not any
+node pool has GKE Sandbox enabled.
 `helm upgrade` itself reports success. Pass the same `--set …runtimeClassName=""`
 to stay on the standard runtime, or check
 `kubectl get platformagent -n kubeagents-system -o jsonpath='{.items[0].status}'`

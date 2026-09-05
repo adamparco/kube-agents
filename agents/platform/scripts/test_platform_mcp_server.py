@@ -836,6 +836,29 @@ class TestReportToChat(unittest.TestCase):
 
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
     @patch("urllib.request.urlopen")
+    def test_a_degraded_relay_says_which_degradation_the_route_reported(self, mock_urlopen):
+        """Two outcomes share the `degraded` verdict and want opposite answers.
+
+        This tool used to state the failed-turn one unconditionally, so an agent
+        whose report simply never reached one platform was told its raw text was
+        in the channel marked `[unrelayed]` — and the agent's next move follows
+        from that sentence, not from the verdict above it.
+        """
+        detail = "the composed report never reached google_chat (it reached slack)"
+        mock_urlopen.return_value = self._urlopen(
+            json.dumps(
+                {"status": "delivered", "relay": "degraded", "relay_detail": detail, "session_id": "s1"}
+            ).encode()
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn(detail, result)
+        self.assertNotIn("[unrelayed]", result)
+        # Unchanged whichever cause it was: delivered, and no retry.
+        self.assertNotIn("ERROR", result)
+        self.assertIn("do not send it again", result.lower())
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
     def test_a_composed_relay_is_a_plain_success(self, mock_urlopen):
         """`ok` is what the route sends when the Chat Agent framed the report."""
         mock_urlopen.return_value = self._urlopen(

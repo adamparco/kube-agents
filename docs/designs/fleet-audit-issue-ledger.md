@@ -5,7 +5,7 @@
 > back to it. It replaces the model in which each audit stream owned one continuously-rewritten Pull
 > Request.
 
-**Scope:** How the six autonomous audit watchdogs publish findings and propose fixes.
+**Scope:** How the eight autonomous audit watchdogs publish findings and propose fixes.
 **Supersedes:** the PR-as-report model introduced in `424a345`.
 
 ---
@@ -45,23 +45,28 @@ Two tiers. The issue is the only always-on object.
 One open GitHub issue per audit stream, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
-- The run-over-run delta mechanism is carried over unchanged: the hidden
-  `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
-  `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of
-  findings the body actually rendered, which under the size budget of §7.1 may be a strict subset of
-  the run's findings.
+- The hidden `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body, and
+  `compute_delta` is reused verbatim. What the marker _lists_ is the set of findings the body
+  actually rendered, which under the size budget of §7.1 may be a strict subset of the run's
+  findings. It is the body's published machine-readable contract — bench's verifiers parse it to
+  grade audit evals — rather than the delta's memory; the previous run's ids come from a local
+  report store on the PVC, described in §4.8 of
+  [`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md).
 - Findings render as rows in a findings table with per-finding anchors, each row naming its
   remediation state and, where one exists, its remediation PR.
 - A clean run closes the issue **as completed** and closes any remediation PRs still open for that
   stream.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no coverage gap, and no remediation PR opened or closed. If any of those fails
+  `resolved == 0`, coverage unchanged since the last run, and no remediation PR opened or closed.
+  If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
-  could not read the whole fleet is never silent even when both counters are zero, because "I found
-  nothing" and "I could not look" are different statements and only one of them is reassuring
-  (§7.4). `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports regardless.
+  has just discovered it cannot read the whole fleet is never silent even when both counters are
+  zero, because "I found nothing" and "I could not look" are different statements and only one of
+  them is reassuring (§7.4). A gap it has already reported and cannot close is not that discovery
+  a second time. `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports
+  regardless.
 
 ### Tier 2 — remediation pull requests
 
@@ -90,13 +95,13 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   segment and no `.lock` suffix — even though the path digest took it out of the branch name. The
   original justification was that it was a git ref component; that is no longer true, and a rule
   whose stated reason has evaporated is a rule someone deletes. Two live reasons replace it. The id
-  is the **join key** of the ledger's hidden delta block and of the `audit-persists:<id>` marker,
-  both matched by line-anchored regexes that whitespace or a stray newline would silently break —
-  and a silent break here means the delta reports every finding as new. And it is **typed by a
-  human** in `/remediate <id>`, which rules out case variation and shell metacharacters. The git
-  constraints are kept as a superset rather than relaxed: they cost nothing, the SOP-generated
-  shapes already satisfy them, and a future change that puts an id back in a ref then finds the
-  gate already in place. The
+  is the **join key** of the run-over-run delta and of two line-anchored markers — the hidden delta
+  block in a remediation pull request body and `audit-persists:<id>` — where whitespace or a stray
+  newline silently breaks the match, leaving a stale pull request open and re-posting a persistence
+  comment every morning. And it is **typed by a human** in `/remediate <id>`, which rules out case
+  variation and shell metacharacters. The git constraints are kept as a superset rather than
+  relaxed: they cost nothing, the SOP-generated shapes already satisfy them, and a future change
+  that puts an id back in a ref then finds the gate already in place. The
   SOPs already build ids deterministically from lowercased slugs; the rule makes that a hard gate
   rather than a convention, and `hack/check-docs-terminology.sh` now extracts the pattern from
   `FINDING_ID_RE` and fails the build if any document quotes a different one.
@@ -230,10 +235,12 @@ could not read the cluster has no standing to assert it.
 
 The comment does **not** print the command that no longer reproduces, or its output, and an earlier
 draft of this section promising both was wrong about what is knowable at that moment. A resolved
-finding is by definition absent from the current document, so its evidence is not in hand; the only
-place it survives is the previous ledger body, and recovering it would mean parsing rendered
-Markdown back into fields. The renderer emits the command only on the rare path where a caller
-supplies the finding — and says nothing rather than print an empty code fence.
+finding is by definition absent from the current document, so its evidence is not in this run's
+hand. Since §4.8 the previous run's whole `document` is on the PVC, so the old field _is_
+recoverable — but it is the command as it read on the run before, against a fleet that has since
+changed, and printing it beside "no longer reproduces" invites a reader to paste a stale command
+and treat whatever it returns as the audit's claim. The renderer emits the command only on the rare
+path where a caller supplies the finding — and says nothing rather than print an empty code fence.
 
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
 
@@ -297,8 +304,8 @@ one.** A finding that no longer reproduces is absent from the run's document, so
 the findings table to carry a state — `derive_finding_state` is only ever called with
 `reproduces=True` in production, and the two resolved labels never reach a reader. What the reader
 sees instead is the delta comment, which names the resolution by id and by the title recovered from
-the previous body. The distinction between the two states survives only in the code, where it
-decides whether a pull request is closed as stale or left alone because it already merged.
+the stored previous document. The distinction between the two states survives only in the code,
+where it decides whether a pull request is closed as stale or left alone because it already merged.
 
 Three of the rendered rows are easy to misread, and two of them were wrong in an earlier draft:
 
@@ -397,9 +404,12 @@ branch.
 1. Validate the document (existing validator plus `recommendation`, the finding-id charset rule of
    §2, and the scope rules of §7.2).
 2. Reconcile: one `gh pr list` call builds the finding→PR state map from head branch names.
-3. Compute the delta against the ledger issue's `<!-- audit-findings -->` marker, unless its
-   `<!-- audit-id-scheme -->` stamp names a scheme this run cannot join against — then `resolved`
-   is withheld for the one run it takes to rewrite the block.
+3. Compute the delta against the local report store's `latest.json`
+   ([`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.8), trusted
+   only when its `issue_number` matches the ledger just found and its `id_scheme` matches this
+   run's. A store that is absent, written for another ledger, or scheme-stale makes the previous
+   run _unknowable_ rather than empty, so the run publishes with no delta claim at all — `new: 0`,
+   `resolved: 0`, and no delta comment.
 4. Compute coverage gaps (§7.4). A gap does not stop the run; it narrows what the run may conclude.
 5. Clean run → answer every unanswered `/remediate` on the ledger, then close the ledger issue as
    completed, close every open remediation PR for the stream, print `CLEAN`. **Unless the run is
@@ -442,7 +452,12 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — nine keys, always all nine:
+Exit contract — thirteen keys, always all thirteen. The nine semantic keys below decide
+behaviour. `chat_summary` carries the whole of what a scheduled run replies, and the three timing
+keys (`inspect_s`, `publish_s`, `collect_s`) are telemetry added by
+[`fleet-audit-collectors-and-status.md`](fleet-audit-collectors-and-status.md) §4.4; all four are
+elided from the examples for width. `inspect_s` is `null` when `start`'s timestamp file is missing
+and `collect_s` is `null` on a run that passed no collector manifest:
 
 - `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
 - `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
@@ -545,9 +560,10 @@ headroom for the trailing marker and for anything a later section appends.
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
-  body contains, not the full finding set. Otherwise the next run would see a truncated finding
-  absent from the previous marker, or present in it and absent from the body, and report a finding
-  that is very much still reproducing as _resolved_. The marker is itself a size term and was
+  body contains, not the full finding set, and the report store's `current_ids` carries that same
+  rendered set. Otherwise the next run would see a truncated finding absent from the previous run's
+  ids, or present in them and absent from the body, and report a finding that is very much still
+  reproducing as _resolved_. The marker is itself a size term and was
   unbounded: 1,250 finding ids render 80,526 characters of marker alone, over the limit before a
   single word of prose. That figure came from an earlier reading of the obtainability SOP's
   roll-up rule; that SOP now caps a check at 25 findings per cluster
@@ -556,14 +572,24 @@ headroom for the trailing marker and for anything a later section appends.
   the cap is per check per cluster, six streams run against a fleet of unknown size, and a size
   term that grows with the fleet and is invisible in the rendered body is the worst kind to leave
   unbounded.
-- **The two halves of the delta are measured against different sets**, because "appeared" and "was
-  fixed" are different claims and truncation breaks them apart. `new` is _rendered minus previous_:
-  the previous marker records what the last body rendered, so comparing it to anything wider
-  announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
-  minus **every** current finding, rendered or not_: a finding cut for space still reproduces, and
-  calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
-  to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
-  one is chosen.
+- **Both halves of the delta are measured against what the previous run _knew_**, which is wider
+  than what its body had room to show: its stored `current_ids` union every finding in its stored
+  `document`. Both halves are also measured against **every** current finding, rendered or not:
+  `new` is _that wide current set minus the union_, and `resolved` is _the union minus that same
+  wide current set_. A finding cut for space still reproduces, so calling it resolved puts a fix
+  that never happened in writing, on the one finding nobody can see to contradict it — and a
+  finding that loses one budget contest and wins the next is not new either, which the
+  rendered-minus-rendered rule this replaces could not express. The two halves have to agree on
+  which current set they judge against, or the ledger contradicts itself: an earlier revision
+  measured `new` against the rendered set alone, and on 2026-09-02 a planted workload produced
+  three obtainability findings with room in the body for two, so the ledger said "2 new" and then
+  "3 resolved" — announcing a fix for something it had never reported broken. On 2026-08-30
+  stockout-prevention published "18 new, 15 resolved" for a run that had in truth found nothing new
+  and seen 49 findings fixed: the previous body had rendered 15 of its 67 findings, so the 18 that
+  survived into the next run all read as new and 34 real fixes went unannounced. The union is taken
+  rather than the document alone because a stored document that is absent or malformed yields an
+  empty set, which would announce every live finding as new — the failure the rendered-only rule
+  existed to prevent, let back in through the wider set.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -745,9 +771,9 @@ than as two separate gaps. The denominator is the stream's roster minus that clu
 check nobody ran.
 
 Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
-economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
-the full set of withheld conclusions — no resolved claims, no stale-closes, no ledger closure, not
-`[SILENT]` — without a second mechanism to keep in step with the first.
+economy of the change. Everything below already keys off the gaps, so an incomplete run inherits
+the withheld conclusions — resolved claims and stale-closes for the affected targets, and ledger
+closure and `[SILENT]` for the stream — without a second mechanism to keep in step with the first.
 
 The reason this needs a name is that the whole ledger rests on one inference: _a finding that was in
 yesterday's document and is not in today's has been fixed._ That inference is sound only over a
@@ -756,16 +782,29 @@ of absence, and acting on it does real damage — it announces fixes that did no
 closes the pull request that was going to make them happen.
 
 So over a partial run the harness withholds exactly the conclusions that depend on complete
-coverage, and nothing else:
+coverage, and nothing else. Two of the four are withheld **per target** rather than stream-wide:
+`coverage_gap_targets` names the targets this run's gaps cover, and
+`unverifiable_findings` turns that into the ids sitting on them. A gap that names no target at all
+still reads as the whole stream, which is the widest answer and the safe one.
 
-- `resolved` is reported as `0` and no resolved-delta is posted. Findings that genuinely were fixed
-  are simply reported the next time the fleet is fully readable.
-- No remediation PR is stale-closed. Every open fix survives to the next complete run.
-- Zero findings does not close the ledger. `status` is still `CLEAN` — the audit found nothing, and
+- `resolved` counts only findings on targets this run **did** read; one on an unreadable target is
+  reported as still open, and is announced fixed the next time that target is readable. Reading
+  this stream-wide was the earlier rule, and it cost more than it protected:
+  `fleet-consistency-drift` carried one gap on `kube-agents-host` for six consecutive runs — a
+  cluster held out of every cohort for want of an `environment` label, a gap that never clears on
+  its own — while both of its live findings sat elsewhere, so a fix to either could never have
+  been reported.
+- No remediation PR is stale-closed **for a finding on an unreadable target**. Its fix survives to
+  the next run that can reach it.
+- Zero findings does not close the ledger — this one stays stream-wide, on any gap at all. `status` is still `CLEAN` — the audit found nothing, and
   saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
   gaps, so the stream self-heals the day the unreadable clusters come back.
-- The run is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5). "I found nothing" and "I
-  could not look" must not arrive in chat as the same silence.
+- The run is never `[SILENT]` on a gap that **moved**: `finish` returns `silent_ok: false` (§7.5)
+  when this run's `coverage_gaps` differ from the stored envelope's, or when there is no stored
+  envelope to compare against, also stream-wide. "I found nothing" and "I could not look" must not
+  arrive in chat as the same silence — so the gap speaks on the run that acquires it and on every
+  run that widens or narrows it. It does not speak again unchanged: that made a stream with a gap
+  it cannot close incapable of silence, which §7.5 records.
 
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
 published normally, and new fixes are still proposed for them. A partial audit is a partial audit,
@@ -776,8 +815,9 @@ tempting generalisation — also raising it when the body budget (§7.1) dropped
 description — was implemented and then removed, because the two are not the same kind of incomplete
 and the flag has one job. A coverage gap means the audit did not look, which is precisely why it
 suppresses the resolved count. Truncation means it looked, found everything, counted it all in the
-title, and could not print the tail; resolution accounting is untouched, because the delta block
-already carries only the ids the body rendered (§2). Folding them together produced
+title, and could not print the tail; delta accounting is untouched, because the store carries both
+the rendered ids and the full document and §7.1 measures against the union of the two. Folding them
+together produced
 `partial: true` with an empty `coverage_gaps` — a flag six SOPs instruct the agent to explain to a
 human, with nothing to explain it with. Truncation is surfaced where it belongs: a line in the body
 naming the count it dropped, and a `WARNING` in the run log.
@@ -794,13 +834,14 @@ URL. An earlier run of the same job, the same morning, had got the same rule rig
 applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
-moved nothing an operator needs to hear about — nothing new, nothing resolved, no coverage gap, no
+moved nothing an operator needs to hear about — nothing new, nothing resolved, no change in
+coverage since the last run, no
 remediation PR opened or closed — and it is computed from the numbers `finish` is about to _report_,
-not the ones it privately knows. A partial run reports `resolved: 0`; an unreadable previous body
-makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
-and the report can never disagree. The PR counters are in the conjunction because opening a fix is
-news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
-while a pull request now exists that did not before.
+not the ones it privately knows. A partial run reports `resolved: 0`; a report store this run cannot
+trust makes the delta unknowable and reports `new: 0` and `resolved: 0`. `silent_ok` follows what
+was published, so the flag and the report can never disagree. The PR counters are in the conjunction
+because opening a fix is news even on a run that found nothing new: the ids were already in the
+ledger, so `new` is zero, while a pull request now exists that did not before.
 
 `silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
 to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
@@ -808,9 +849,9 @@ the second half of the rule lives with the agent and cannot be moved into the ha
 on-demand run is never silent.** A run a person asked for — a kanban card naming the stream, or a
 request straight from chat — reports its outcome and its ledger URL whatever `silent_ok` says, and
 every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule
-cannot reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks
-the job due for the next `profile-cron-tick` instead of re-enacting the audit in the session that
-fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
+cannot reach: "run the `<x>` cron job now" is answered by nudging the job's schedule so the next
+`profile-cron-tick` fires it, instead of re-enacting the audit in the session that fielded the
+request. That run takes the same execute → save → deliver → mark path as a scheduled
 one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
 the session that triggered it says only that the job is queued and leaves the report to the run.
 
@@ -824,6 +865,25 @@ the Tier 1 ledger and nowhere else. `silent_ok` still earns its keep on the disp
 person is demonstrably waiting; on the scheduled path it currently gates a delivery leg that has no
 destination. If a scheduled chat ping is ever wanted it belongs on the Chat Agent, which owns
 ingress, and it should carry a pointer — title, counts, ledger URL — not the report.
+
+**That last paragraph stopped being true on 2026-08-19**, and the rule above was re-priced on
+2026-09-02 because of it. #731 gave the scheduled path the destination this section says it lacks,
+delivering exactly the pointer described — title, counts, ledger URL. The "never `[SILENT]` on a
+gap" rule was written on 2026-08-04 on the explicit ground that making it loud gated nothing, and
+nobody revisited it when the leg acquired a destination fifteen days later. The
+fleet-consistency drift audit then sent fourteen consecutive messages at 0 new, 0 resolved, and a
+byte-identical summary: `kube-agents-host` carries no `environment` label, so it has no cohort,
+skips all nineteen checks, and produces the same gap every morning.
+
+So the verdict now asks whether coverage _moved_ rather than whether a gap exists
+(`coverage_changed` in `audit_report.py`). The three cases it decides — no gaps, gaps with no
+readable previous envelope, gaps on both sides — are in that function's docstring. Everything §7.4
+was protecting still holds: the gap is announced when it appears and whenever it changes, and the
+standing shortfall stays in the ledger body, on the stored envelope, and in the run log.
+
+One inconsistency this resolves rather than introduces: the same run already declined to post a
+GitHub delta comment at 0 new / 0 resolved. Unchanged-means-quiet was being applied to the ledger
+and not to chat.
 
 ## 8. Labels
 
@@ -1082,9 +1142,10 @@ remediation PR opened or closed — asserted on both `finish` branches, since ea
 JSON. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
 governance-job bullet names the Platform Agent's own roster
 (`/opt/data/profiles/platform/cron/jobs.json`) and `profile-cron-tick`, the on-demand bullet names
-`hermes cron run` and `cronjob(action='run')` so that "run it now" stays a trigger rather than a
-re-enactment, `SOUL.md` requires the artifact URL in the card summary before its first numbered
-section, and every SOP in `audit_report.AUDITS` contains both `silent_ok` and "on-demand".
+the schedule nudge and both shortcuts it rules out — `hermes cron run` and `cronjob(action='run')` —
+so that "run it now" stays a trigger rather than a re-enactment, `SOUL.md` requires the artifact URL
+in the card summary before its first numbered section, and every SOP in `audit_report.AUDITS`
+contains both `silent_ok` and "on-demand".
 
 **Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than
 the recorded runner, and it is the one whose defect is invisible to a mock: `ensure_workspace`

@@ -159,17 +159,25 @@ Their SOPs under `../governance/` are deliberately left in place: an SOP is
 inert without a job to run it, and keeping them makes reviving a watchdog a
 roster edit rather than an archaeology exercise.
 
-## Hard-coded line numbers in prompts
+## What stops a prompt skimming its SOP
 
-Each governance prompt cites its SOP's total length and the line range of its
-checks section. Those numbers are load-bearing — they are what stops a model
-reading the first screen and reporting a clean fleet it never looked at — and
-they rot the moment an SOP is edited.
-`test_cron_prompts_cite_the_real_sop_geography` in
-`../skills/fleet-audit/scripts/test_audit_report.py` re-derives both from the
-SOP itself, so an edit that skips re-measuring fails there rather than at 06:20
-in production. Run it after touching anything in `../governance/`.
+Each governance prompt names its stream's collector script — "Run the collector
+(`skills/fleet-audit/scripts/collect.py compliance-audit`) first and read its
+manifest before doing anything else" — and that name is load-bearing: it is what
+stops a model reading the first screen of an SOP and reporting a clean fleet it
+never looked at. `test_cron_prompts_name_the_real_collector_invocation` in
+`../skills/fleet-audit/scripts/test_audit_report.py` re-derives the invocation
+from the SOP's own "Run the collector" instruction, so a prompt that drifts from
+its SOP fails there rather than at 06:20 in production. Run it after touching
+anything in `../governance/`.
 
-No prompt is quoted here on purpose. A copy in prose is one more place for the
-same numbers to go stale, and the test above checks the roster against the SOPs
-— not this file against the roster.
+Prompts used to cite each SOP's total length and the line range of its checks
+section instead. Those numbers rotted on every SOP edit, and every stream now
+runs through a collector, so `finish --manifest-file` cross-checking `checks_run`
+against the commands the collector actually ran is a stronger guarantee than a
+self-reported line count was. `test_check_rosters_match_the_sops` separately
+keeps the check rosters honest by scanning the whole SOP rather than a citation.
+
+No prompt is quoted here on purpose. A copy in prose is one more place to go
+stale, and the tests above check the roster against the SOPs — not this file
+against the roster.

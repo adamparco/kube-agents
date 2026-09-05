@@ -669,8 +669,9 @@ print(f"managed scope: {len(keys)} pinned config keys from {managed_scope.get_ma
     echo "WARN: $MANAGED_DIR/config.yaml did not load as a managed scope (unparseable, or missing the model keys) — hermes fails open, so the agent is running UNPINNED" >&2
 fi
 
-# The same assertion for the ONE key in the managed .env that is not about chat, and the
-# only one whose absence takes the whole API surface down rather than degrading a feature.
+# The same assertion for one of the two keys in the managed .env that are not about chat
+# (HERMES_HOME_MODE is the other), and the only one whose absence takes the whole API
+# surface down rather than degrading a feature.
 #
 # What it is guarding against, and why it needs guarding at all (issue #786). Hermes'
 # Docker stage2 hook — step 1 above, upstream's, in every container — generates a strong

@@ -662,6 +662,109 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	}
 }
 
+// GKE ships the `gvisor` RuntimeClass as a cluster addon on every cluster,
+// present whether or not GKE Sandbox is enabled on any node pool -- so "the
+// object exists" clears on a Standard cluster that cannot run it. Adopting it
+// there deletes the one replica (Recreate, RWO volume) and replaces it with a
+// Pod that stays Pending: a full outage, arrived at through the check meant to
+// prevent one. The node-selector half is what closes that.
+func TestValidateRuntimeClass_NodeSelector(t *testing.T) {
+	scheme := setupScheme()
+
+	rcWithSelector := func() *nodev1.RuntimeClass {
+		return &nodev1.RuntimeClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "gvisor"},
+			Handler:    "gvisor",
+			Scheduling: &nodev1.Scheduling{
+				NodeSelector: map[string]string{"sandbox.gke.io/runtime": "gvisor"},
+			},
+		}
+	}
+	agent := func() *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "rc-sel", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						Availability: &agentv1alpha1.AvailabilitySpec{
+							RuntimeClassName: ptr.To("gvisor"),
+						},
+					},
+				},
+			},
+		}
+	}
+	servingDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "rc-sel-gateway", Namespace: "test-ns"},
+		Status:     appsv1.DeploymentStatus{ReadyReplicas: 1},
+	}
+	sandboxNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "gke-sandbox-node",
+			Labels: map[string]string{"sandbox.gke.io/runtime": "gvisor"},
+		},
+	}
+	// A node in the cluster, but not one this RuntimeClass can land on. Without
+	// it the List would come back empty whether or not the selector were passed.
+	plainNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "gke-plain-node"}}
+
+	cases := []struct {
+		name       string
+		objects    []client.Object
+		wantReason string
+	}{
+		{
+			name:       "no matching node and a replica to lose is refused",
+			objects:    []client.Object{rcWithSelector(), servingDeployment, plainNode},
+			wantReason: "RuntimeClassUnschedulable",
+		},
+		{
+			// First install: nothing is serving, so writing the workload costs
+			// nothing and a Pending Pod is what an autoscaler configured to
+			// provision sandbox nodes reacts to. Refusing would leave it
+			// waiting on a Pod that is never created.
+			name:       "no matching node and nothing running is allowed",
+			objects:    []client.Object{rcWithSelector(), plainNode},
+			wantReason: "",
+		},
+		{
+			name:       "a matching node is allowed",
+			objects:    []client.Object{rcWithSelector(), servingDeployment, plainNode, sandboxNode},
+			wantReason: "",
+		},
+		{
+			// No selector means every node can run it; there is nothing to ask.
+			name: "a RuntimeClass with no scheduling constraint is allowed",
+			objects: []client.Object{
+				&nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor"}, Handler: "gvisor"},
+				servingDeployment,
+				plainNode,
+			},
+			wantReason: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := agent()
+			cl := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(append([]client.Object{a}, tc.objects...)...).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+			reason, msg, err := r.validateRuntimeClass(context.Background(), a)
+			if err != nil {
+				t.Fatalf("validateRuntimeClass: %v", err)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q (msg: %s)", reason, tc.wantReason, msg)
+			}
+			if reason != "" && !strings.Contains(msg, "sandbox.gke.io/runtime=gvisor") {
+				t.Errorf("message does not name the labels a node would need: %s", msg)
+			}
+		})
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	scheme := setupScheme()
 
@@ -980,11 +1083,20 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		return nil
 	}
 
+	// 5 peers: the kube-dns and node-local-dns selectors, the NodeLocal DNSCache
+	// link-local address, the Cloud DNS resolver at 169.254.169.254, and the one
+	// resolved ClusterIP.
 	ruleDNS := findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["k8s-app"] == "kube-dns"
 	})
-	if ruleDNS == nil || len(ruleDNS.To) != 4 {
-		t.Errorf("expected 4 peers in DNS egress rule")
+	if ruleDNS == nil || len(ruleDNS.To) != 5 {
+		t.Errorf("expected 5 peers in DNS egress rule")
+	}
+	if findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+	}) == nil {
+		t.Error("the DNS rule does not name 169.254.169.254, so a Cloud DNS for GKE cluster " +
+			"cannot resolve and every named destination below becomes unreachable")
 	}
 	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
@@ -1482,8 +1594,13 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
 	// to the platform goldens, which are snapshots that `go test -update` re-blesses
 	// from whatever the code emits.
+	//
+	// 53 is on the list and is not a credential port: under Cloud DNS for GKE the node
+	// answers DNS at this address, and the DNS rule names it for that and nothing else.
+	// This assertion is the guard on that — a change that widened the DNS rule to carry
+	// 80, or the port-80 rule to carry 53, fails here rather than in review.
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{80, 988}
+	wantPorts := []int32{53, 80, 988}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
@@ -1511,9 +1628,42 @@ func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
 	}
 
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{80, 1988}
+	wantPorts := []int32{53, 80, 1988}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	}
+}
+
+// TestBuildNetworkPolicy_ResolverIsNotDuplicatedByDNSClusterIPs covers the
+// operator who reads their Cloud DNS nodes' --cluster-dns and puts that value in
+// spec.networkPolicy.dnsClusterIPs. It is the same address the DNS rule already
+// grants unconditionally, and the two peers are built by separate
+// formatCIDRPeers calls, which dedupe only within themselves.
+func TestBuildNetworkPolicy_ResolverIsNotDuplicatedByDNSClusterIPs(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	profile := defaultTestNetpolProfile()
+	profile.DNSClusterIPs = []string{metadataLinkLocalIP}
+
+	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+
+	occurrences := 0
+	for i := range netpol.Spec.Egress {
+		if !ruleNamesPort(netpol.Spec.Egress[i], 53) {
+			continue
+		}
+		for _, peer := range netpol.Spec.Egress[i].To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
+				occurrences++
+			}
+		}
+	}
+	if occurrences != 1 {
+		t.Errorf("expected %s/32 exactly once among the port-53 peers, got %d", metadataLinkLocalIP, occurrences)
 	}
 }
 

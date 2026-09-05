@@ -283,17 +283,40 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 10. Validate RuntimeClass if specified
-	if err := r.validateRuntimeClass(ctx, instance); err != nil {
-		if errors.IsNotFound(err) {
-			rcName := *instance.Spec.Deployment.Availability.RuntimeClassName
-			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
-			log.Info(msg)
-			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
-				return ctrl.Result{}, statusErr
-			}
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
+	rcReason, rcMsg, err := r.validateRuntimeClass(ctx, instance)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
+	}
+	if rcReason != "" {
+		log.Info(rcMsg)
+		// The guardrail note at step 10e applies here too, and it did not used
+		// to. When this refusal had only RuntimeClassNotFound it withheld the
+		// gateway policy from an install whose RuntimeClass object is absent —
+		// on GKE, a first install where nothing is running yet, so withholding
+		// everything is harmless. RuntimeClassUnschedulable inverts that
+		// precondition: it fires only when workloadHasReadyReplica is true, so
+		// it is a long-lived healthy install that starts requeueing every 30
+		// seconds forever the moment a node-pool replacement drops the sandbox
+		// labels. Without this the agent keeps serving while its policies are
+		// never reconciled again, and an operator triaging with `kubectl delete
+		// netpol --all` never gets them back — leaving nothing selecting the
+		// agent Pod, so NetworkPolicy default-allows and the pod has
+		// unrestricted egress including the metadata server, behind a Degraded
+		// status naming only the RuntimeClass.
+		//
+		// Gateway policy only, deliberately: the egress policy is withheld by
+		// refusalStillRendersTheGuardrail for every reason but
+		// EgressAllowlistRefused, and that is right here. Step 10c's layout
+		// check has not run yet at this point, so on an Allowlist install with
+		// a sidecar broker the egress policy would govern the broker too and
+		// take away the credentials it exists to mint.
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, rcReason); err != nil {
+			return ctrl.Result{}, err
+		}
+		if statusErr := r.updateStatusDegraded(ctx, instance, rcReason, rcMsg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// 10b. Refuse a broker split that would strand the event watcher.
@@ -376,10 +399,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// This closes the hazard at the two egress refusals only — this one
-		// and step 10c's. The two refusals above them — step 10's
-		// RuntimeClassNotFound and step 10b's SplitBrokerStrandsEventWatcher —
-		// return without reconciling the gateway policy and still have it.
+		// Step 10's RuntimeClass refusal now reconciles the gateway policy for
+		// the same reason, so the remaining gap is step 10b's
+		// SplitBrokerStrandsEventWatcher, which returns without reconciling it.
 		// Issue #964 tracks that; do not read the rule stated here as one the
 		// whole function keeps yet.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
@@ -2052,18 +2074,102 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	return phase, reason, message
 }
 
-func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// validateRuntimeClass asks whether the requested RuntimeClass can actually run
+// this agent, which is two questions rather than one.
+//
+// Whether the object exists is the cheap half, and on GKE it is nearly free:
+// `gvisor` ships as a cluster addon on every GKE cluster, present whether or
+// not GKE Sandbox is enabled on any node pool. A check that stops there passes
+// on a Standard cluster with no sandbox pool, the workload is written with
+// `runtimeClassName: gvisor`, and its Pod goes Unschedulable -- and because the
+// agent is one replica on a RWO volume under a Recreate strategy, the running
+// Pod is deleted before the replacement is attempted. The agent goes fully
+// offline rather than degraded, which is the outcome this function exists to
+// prevent and did not.
+//
+// So the second question: does any node carry the labels in the RuntimeClass's
+// `scheduling.nodeSelector`? Node readiness is deliberately not part of it --
+// the question is whether the node pool exists, and every node in it being
+// NotReady mid-upgrade is not an answer of "no".
+//
+// It refuses only when refusing is the safer of the two, which is when there is
+// already a Ready replica to lose. On a first install nothing is running, so
+// the workload is written and its Pod sits Pending -- which is also what lets a
+// cluster autoscaler provisioning sandbox nodes see the Pod and react. Blocking
+// there would leave it waiting on a Pod that is never created.
+//
+// Returns (reason, message, error). A non-empty reason is a refusal for the
+// caller to report as Degraded; an error is a read that failed.
+func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string, error) {
 	if agent.Spec.Deployment == nil || agent.Spec.Deployment.Availability == nil || agent.Spec.Deployment.Availability.RuntimeClassName == nil || *agent.Spec.Deployment.Availability.RuntimeClassName == "" {
-		return nil
+		return "", "", nil
 	}
 
 	rcName := *agent.Spec.Deployment.Availability.RuntimeClassName
 	rc := &nodev1.RuntimeClass{}
-	err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc)
-	if err != nil {
-		return err
+	if err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc); err != nil {
+		if errors.IsNotFound(err) {
+			return "RuntimeClassNotFound", fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName), nil
+		}
+		return "", "", err
 	}
-	return nil
+
+	// No node selector means every node can run it, so there is nothing to ask.
+	if rc.Scheduling == nil || len(rc.Scheduling.NodeSelector) == 0 {
+		return "", "", nil
+	}
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes, client.MatchingLabels(rc.Scheduling.NodeSelector)); err != nil {
+		return "", "", fmt.Errorf("failed to list nodes matching RuntimeClass %q: %w", rcName, err)
+	}
+	if len(nodes.Items) > 0 {
+		return "", "", nil
+	}
+
+	ready, err := r.workloadHasReadyReplica(ctx, agent)
+	if err != nil {
+		return "", "", err
+	}
+	if !ready {
+		return "", "", nil
+	}
+
+	// Sorted, because a status message assembled from a map would come out in a
+	// different order on each reconcile and rewrite the CR every time.
+	selector := make([]string, 0, len(rc.Scheduling.NodeSelector))
+	for k, v := range rc.Scheduling.NodeSelector {
+		selector = append(selector, fmt.Sprintf("%s=%s", k, v))
+	}
+	slices.Sort(selector)
+	return "RuntimeClassUnschedulable", fmt.Sprintf(
+		"RuntimeClass '%s' exists but no node carries its scheduling labels (%s), so a Pod requesting it cannot be scheduled. On GKE the RuntimeClass is a cluster addon and is present whether or not GKE Sandbox is enabled on any node pool. The running agent was left in place rather than replaced by a Pod that would stay Pending: provision a GKE Sandbox node pool, or clear spec.deployment.availability.runtimeClassName.",
+		rcName, strings.Join(selector, ",")), nil
+}
+
+// workloadHasReadyReplica reports whether this agent currently has something
+// serving that a rewrite of its Pod template would take away. A missing
+// workload is not an error here -- it is the first-install case, and the
+// answer is no.
+func (r *PlatformAgentReconciler) workloadHasReadyReplica(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
+	if useStatefulSet(agent) {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, key, sts); err != nil {
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to get StatefulSet %s: %w", key.Name, err)
+		}
+		return sts.Status.ReadyReplicas > 0, nil
+	}
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, key, dep); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get Deployment %s: %w", key.Name, err)
+	}
+	return dep.Status.ReadyReplicas > 0, nil
 }
 
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {

@@ -66,6 +66,8 @@ Four things in the stack are not symmetric — destroying them is not the invers
 
 These steps are irreversible and run **before** Terraform's own prompt, which is why the script asks for one confirmation up front (`--non-interactive` skips it).
 
+One thing the teardown leaves behind bites only on the way back in. `terraform destroy` soft-deletes the project-level custom role `kubeagentsSubnetUtilizationReader`, and GCP holds that name for between 7 and 37 days. Reinstalling within the first 7 days is fine; after that the reinstall's `terraform apply` fails until the window closes, and the way through is `gcloud iam roles undelete kubeagentsSubnetUtilizationReader --project <project>`. The [`kube-agents-iam` module README](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam#readme) is canonical for this and for why the role id is not a variable.
+
 **No Terraform state anywhere.** With no state in the GCS bucket and none locally, the uninstaller exits **3** without touching anything and says so. Either nothing is installed against those coordinates — the ordinary answer on a clean project, and not a failure — or the install was created by a pre-Terraform release, which this uninstaller cannot take apart. For the second case, re-run with `--source-ref=<the release that installed it>` — the uninstaller fetches that release and hands over to its own `uninstall.sh`, so the code that made the install is what takes it apart:
 
 ```bash

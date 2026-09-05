@@ -338,9 +338,10 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and the only pin here that is not about chat. Every other key below
-	// exists because the agent could otherwise write a competing value into the PVC .env;
-	// this one exists because something already does, on every boot, without being asked.
+	// UNCONDITIONAL, and one of the two pins here that are not about chat. Every chat key
+	// below exists because the agent could otherwise write a competing value into the PVC
+	// .env; this one exists because something already does, on every boot, without being
+	// asked.
 	//
 	// Hermes' Docker stage2 hook generates a strong random API_SERVER_KEY into
 	// $HERMES_HOME/.env whenever that file does not already carry one, and
@@ -364,6 +365,20 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// sidecar's AGENT_API_UPSTREAM_KEY and to the probe's bearer, reintroducing exactly
 	// the several-parties-must-agree problem this closes.
 	add("API_SERVER_KEY", loopbackAgentAPIKey)
+
+	// The second non-chat pin, and it closes a claim the container env cannot make on its
+	// own. Setting HERMES_HOME_MODE in Container.Env puts it in the LOWEST-precedence
+	// layer of the three: the managed .env beats the PVC .env beats the process
+	// environment. So a single `HERMES_HOME_MODE=0777` line in $HERMES_HOME/.env — which
+	// the agent can write, and which sandbox-credential-cleanup does not remove, so it
+	// survives every upgrade — silently widens every directory hermes secures on the
+	// shared PVC. Sessions, memories and logs open to anything else that mounts it, and
+	// the pod stays green throughout.
+	//
+	// Not a regression this branch introduced; the route predates it. But the container
+	// env alone was never the guarantee it reads as, and pinning here is what makes it
+	// one: save_env_value refuses to write a key this file holds.
+	add("HERMES_HOME_MODE", hermesHomeMode)
 
 	// The mode pin, also unconditional and also not about chat. The managed key
 	// is the only way the mode reaches the agent runtime, and pinning it is what
@@ -394,6 +409,19 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		add("SLACK_RELAY_URL", credentialProxyBaseURL(agent))
 		add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
 		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
+	}
+
+	if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+		add("TEAMS_RELAY_URL", credentialProxyBaseURL(agent))
+		add("TEAMS_ALLOWED_USERS", strings.Join(teams.AllowedUsers, ","))
+		allowAll := false
+		if teams.AllowAllUsers != nil {
+			allowAll = *teams.AllowAllUsers
+		}
+		add("TEAMS_ALLOW_ALL_USERS", strconv.FormatBool(allowAll))
+		if teams.TenantId != "" {
+			add("TEAMS_TENANT_ID", teams.TenantId)
+		}
 	}
 
 	if len(lines) == platformStart {
@@ -572,6 +600,12 @@ const (
 	// managedScopeDir is managed_scope.py's POSIX default. HERMES_MANAGED_DIR is set to
 	// it explicitly anyway, so the policy is visible in `kubectl get pod -o yaml`.
 	managedScopeDir = "/etc/hermes"
+
+	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
+	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
+	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
+	// is not an alternative.
+	hermesHomeMode = "2770"
 
 	// managedConfigKey holds the render in the config ConfigMap. Deliberately NOT of the
 	// `profile-<name>.overlay.yaml` shape: that glob is what the entrypoint walks to find
@@ -1340,6 +1374,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 				// untouched. Carries `rich_blocks` — see the note where it is set.
 				Extra map[string]any `json:"extra,omitempty"`
 			} `json:"slack"`
+			Teams struct {
+				Enabled          bool           `json:"enabled"`
+				TypingStatusText string         `json:"typing_status_text,omitempty"`
+				Extra            map[string]any `json:"extra,omitempty"`
+			} `json:"teams"`
 		} `json:"platforms"`
 		// Chat verbosity, keyed by platform. Read by the gateway's chat adapters
 		// and inert on a profile that receives no chat ingress, so it meets the
@@ -1388,6 +1427,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// whichever path ends up turning Slack on. Kept in sync with the same block in
 	// agents/chat/config.yaml, which carries the full note.
 	cfg.Platforms.Slack.Extra = map[string]any{"rich_blocks": true}
+	cfg.Platforms.Teams.Extra = map[string]any{"adaptive_cards": true}
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
@@ -1403,6 +1443,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		}
 		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
 			cfg.Platforms.Slack.Enabled = *slack.Enabled
+		}
+		if teams := agent.Spec.Integration.Teams; teams != nil && teams.Enabled != nil {
+			cfg.Platforms.Teams.Enabled = *teams.Enabled
+			if *teams.Enabled {
+				cfg.Platforms.Teams.TypingStatusText = "Kage is thinking…"
+				if teams.AdaptiveCards != nil {
+					cfg.Platforms.Teams.Extra["adaptive_cards"] = *teams.AdaptiveCards
+				}
+			}
 		}
 	}
 
@@ -1732,6 +1781,23 @@ type renderOptions struct {
 	otlpDisabled bool
 }
 
+// lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
+// surviving one where it already sits. Order is otherwise untouched, so on the ordinary
+// render -- no plugin naming an operator-owned variable -- the result is the input.
+func lastWinsEnv(env []corev1.EnvVar) []corev1.EnvVar {
+	lastIndex := make(map[string]int, len(env))
+	for i, e := range env {
+		lastIndex[e.Name] = i
+	}
+	out := make([]corev1.EnvVar, 0, len(lastIndex))
+	for i, e := range env {
+		if lastIndex[e.Name] == i {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -1982,6 +2048,44 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				})
 			}
 		}
+		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+			allowAll := false
+			if teams.AllowAllUsers != nil {
+				allowAll = *teams.AllowAllUsers
+			}
+			envVars = append(envVars, []corev1.EnvVar{
+				{
+					Name:  "TEAMS_RELAY_URL",
+					Value: credentialProxyBaseURL(agent),
+				},
+				{
+					Name:  "TEAMS_ALLOWED_USERS",
+					Value: strings.Join(teams.AllowedUsers, ","),
+				},
+				{
+					Name:  "TEAMS_ALLOW_ALL_USERS",
+					Value: strconv.FormatBool(allowAll),
+				},
+			}...)
+			if teams.TenantId != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "TEAMS_TENANT_ID",
+					Value: teams.TenantId,
+				})
+			}
+			if teams.HomeChannel != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "TEAMS_HOME_CHANNEL",
+					Value: teams.HomeChannel,
+				})
+			}
+			if teams.HomeChannelName != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "TEAMS_HOME_CHANNEL_NAME",
+					Value: teams.HomeChannelName,
+				})
+			}
+		}
 	}
 
 	if replicas > 1 {
@@ -2024,6 +2128,27 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "HERMES_MANAGED_DIR",
 		Value: managedScopeDir,
+	})
+	// The other half of the umask note at the top of this file. That umask governs what
+	// the entrypoints create; this governs what Hermes then re-tightens. Hermes chmods
+	// HERMES_HOME and ten named subdirectories to 0700 on every process start, and a cron
+	// or kanban worker runs with HERMES_HOME pointed at profiles/platform — the directory
+	// the credential proxy has to write into when `gcloud container clusters
+	// get-credentials` files a kubeconfig under .kubeconfigs/ and a pin under workspace/.
+	// The proxy is uid 10001 since the uid split, so 0700 leaves it nothing and the mkdir
+	// fails with EACCES. Group access is the whole fix: both containers that mount this
+	// volume are in gid 10000, and no uid on it reaches `other`. Setgid so children keep
+	// inheriting the group the way the umask already assumes.
+	//
+	// A chmod cannot substitute for this. `ensure_hermes_home` re-applies the mode before
+	// the worker does any work, so a directory widened by hand is 0700 again by the time
+	// the first proxied command runs.
+	//
+	// Appended after the plugin merge like the two above it: an arbitrary value here would
+	// widen every directory Hermes secures on the PVC, so it is not a plugin's to set.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HERMES_HOME_MODE",
+		Value: hermesHomeMode,
 	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
@@ -2736,6 +2861,40 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
 		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
+		// 16 MiB, four times the proxy's own default. Every command an agent
+		// runs arrives here -- its `kubectl` is a shim that posts an argv
+		// vector to this sidecar -- so this cap, not the API server, is what
+		// bounds a cluster dump. On 2026-08-30 the fleet-audit workload dump
+		// for kube-agents-host measured 3,866,719 bytes against the 4 MiB
+		// default: 92% of it, roughly twelve more workloads from the edge.
+		// Crossing it truncates the JSON mid-string, which fails the
+		// collectors' parse gate and drops that whole cluster out of
+		// compliance-audit and ai-security-audit as a coverage gap.
+		//
+		// The cap does not bound the read: `_execute` takes the subprocess to
+		// completion with `communicate()` before it slices, so the full output
+		// is resident whatever this says. What it does bound is the slice that
+		// survives, and that copy is then JSON-escaped and encoded for the
+		// response -- so raising it costs on the order of three times the
+		// increase per in-flight request rather than nothing.
+		//
+		// Which is what puts a ceiling on it, and the ceiling is this
+		// container's own 2Gi memory limit below rather than anything about
+		// the fleet. Count five live copies of a capped output per stream --
+		// the subprocess bytes, the slice, the decoded str, the JSON-escaped
+		// str, the encoded response -- and two capped streams per command,
+		// because `_execute` truncates stdout and stderr in two independent
+		// calls, so the cap is a per-stream ceiling. Ten copies, then, against
+		// the five-way kanban fan-out resolveResources sizes the agent
+		// container for, plus the front-door session, each issuing one
+		// command. At 16 MiB that is ~960 MiB of burst on top of the ~250 MiB
+		// this sidecar holds steady, which the limit absorbs; at 32 MiB it
+		// does not, and an OOMKill here takes gcloud, kubectl, gh and git away
+		// from the whole Pod. Raising this means raising the limit with it,
+		// and the cap test asserts the pair so the two cannot drift apart
+		// silently -- it is the arithmetic above, so believe it over this
+		// paragraph if they ever disagree again.
+		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "16777216"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
@@ -2843,6 +3002,15 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				corev1.EnvVar{Name: "SLACK_APP_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")}},
 			)
 		}
+		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+			envVars = append(envVars,
+				corev1.EnvVar{Name: "TEAMS_APP_ID", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(teams.AppIdSecretRef, defaultPlatformAgentSecrets, "TEAMS_APP_ID")}},
+				corev1.EnvVar{Name: "TEAMS_APP_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(teams.AppPasswordSecretRef, defaultPlatformAgentSecrets, "TEAMS_APP_PASSWORD")}},
+			)
+			if teams.TenantId != "" {
+				envVars = append(envVars, corev1.EnvVar{Name: "TEAMS_TENANT_ID", Value: teams.TenantId})
+			}
+		}
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
@@ -2930,6 +3098,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 			result = append(result, env)
 		}
 	}
+	// No dedup pass over `custom` here, deliberately. The reserved set above
+	// closes managed-vs-custom: every `managed` name is in it. Custom-vs-custom
+	// is closed a layer earlier -- `custom` is `spec.deployment.env` and
+	// nothing else, and DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so the API server refuses a CR that repeats a name
+	// before the operator ever sees it. Adding `lastWinsEnv` here would read as
+	// though that were in doubt.
 	return result
 }
 
@@ -3225,10 +3400,11 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
 	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
 	// plugins mounted but never enabled — would look like the plugin was broken rather
-	// than the cause. Appending after the merge leaves the operator's entry last, and the
-	// kubelet collapses duplicate env names last-wins. Same mechanism, same reason, as
+	// than the cause. Appending after the merge leaves the operator's entry last, and
+	// lastWinsEnv below keeps the last of each name. Same mechanism, same reason, as
 	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
-	// reordering here is silent.
+	// reordering here is silent. What happens without that collapse is not the kubelet
+	// picking a winner -- see the comment on lastWinsEnv below, which owns that.
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
@@ -3262,6 +3438,21 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
 	})
+
+	// Every "appended after the merge" comment above rests on the kubelet collapsing a
+	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`
+	// carries `patchMergeKey=name` and the controller applies server-side, so the API
+	// server refuses the object before it exists:
+	//
+	//   .spec.template.spec.containers[name="platform-agent"].env:
+	//   duplicate entries for key [name="HERMES_HOME_MODE"]
+	//
+	// So a plugin naming one of those variables did not lose the argument -- it stalled
+	// the gateway's reconciliation outright, leaving the running pod on whatever it last
+	// had and nothing in the Deployment to show why. Collapse here, once, at the only
+	// point every append has already run, rather than at each of them; last-wins is the
+	// semantics they were all written for, so this changes no rendered value.
+	gatewayEnvVars = lastWinsEnv(gatewayEnvVars)
 
 	containers := []corev1.Container{
 		{
@@ -3312,6 +3503,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// agent had changed for itself.
 				Name:  "HERMES_MANAGED_DIR",
 				Value: managedScopeDir,
+			},
+			{
+				// Same value as the gateway's for a second reason: this container runs
+				// Hermes against the same directories, so a different mode here would mean
+				// the two containers took turns re-chmod'ing the PVC out from under each
+				// other on every start.
+				Name:  "HERMES_HOME_MODE",
+				Value: hermesHomeMode,
 			},
 			{
 				Name:  "HOME",
@@ -4054,6 +4253,10 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.slack.com",
 		"*.slack-edge.com",
 		"*.slack-msgs.com",
+		"login.microsoftonline.com",
+		"*.login.microsoftonline.com",
+		"botframework.com",
+		"*.botframework.com",
 	}
 
 	matches := make([]interface{}, 0, len(patterns))
@@ -4156,6 +4359,28 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 	return peers
 }
 
+// peersNotAlreadyPresent returns the candidates whose ipBlock CIDR no peer in
+// present already names. It exists because formatCIDRPeers dedupes only within
+// a single call, so two calls contributing to one rule's peer list can each
+// emit the same CIDR. Peers carrying no ipBlock are always kept: a selector
+// peer is not comparable to a CIDR and is never the duplicate being removed.
+func peersNotAlreadyPresent(present, candidates []networkingv1.NetworkPolicyPeer) []networkingv1.NetworkPolicyPeer {
+	seen := make(map[string]bool, len(present))
+	for _, peer := range present {
+		if peer.IPBlock != nil {
+			seen[peer.IPBlock.CIDR] = true
+		}
+	}
+	kept := make([]networkingv1.NetworkPolicyPeer, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.IPBlock != nil && seen[candidate.IPBlock.CIDR] {
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	return kept
+}
+
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
 //
@@ -4244,17 +4469,67 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		},
 	}
 
+	// Cloud DNS for GKE. There the cluster does not resolve through kube-dns at
+	// all: the node answers DNS on the metadata address, and a Pod's resolv.conf
+	// names 169.254.169.254. So none of the peers above is the resolver, and
+	// without this one the Pod has no name resolution — which is a total outage,
+	// because every destination in the rules below is reached by name.
+	//
+	// Unconditional rather than detected. Cloud DNS is detectable in principle —
+	// kubelet's --cluster-dns carries this address there, so the operator's own
+	// resolv.conf names it — but the discovery this policy already does is
+	// resolveNetpolProfile reading the kube-system/kube-dns Service ClusterIP,
+	// and under Cloud DNS that Service still exists and still answers nothing.
+	// That discovery succeeds and is wrong, which is the failure being avoided:
+	// a detector that guesses wrong costs the install its name resolution, while
+	// granting the peer always costs one port-53 rule on clusters not using it.
+	//
+	// On a kube-dns cluster the Pod's resolver is the kube-dns ClusterIP, so the
+	// peer carries no traffic — but it is not inert. On GCE this address answers
+	// DNS on 53 unless Workload Identity's gke-metadata-server or metadata
+	// concealment intercepts it, so on a cluster running neither, the rule does
+	// reach the node's GCE resolver. That is a resolver and not a credential
+	// path: the token API is HTTP on 80 pre-NAT and 988 post-NAT.
+	//
+	// Port 53 only. Rule 2 below grants the same address on TCP 80 for token
+	// fetches; these two are the whole of the metadata server's reach from this
+	// Pod, and they are separate rules so that neither widens the other.
+	//
+	// Through metadataResolverCIDR, the name the sibling builder grants it under,
+	// so a grep for that constant finds both places the resolver is permitted.
+	//
+	// It evaluates to the same peer as linkLocalPeers above, and is written out
+	// again rather than reusing that slice so the two can diverge. The DNS grant
+	// is IPv4-only on purpose: fd20:ce::254 is documented as a metadata endpoint
+	// rather than as a resolver, and no static copy in charts/ or
+	// deploy/kustomize names it in a DNS rule, so it stays out until a dual-stack
+	// Cloud DNS cluster is observed naming it in a Pod's resolv.conf. Reusing
+	// linkLocalPeers would grant it here the day that slice grows an IPv6 entry,
+	// which is a decision about the token rules and not about this one.
+	dnsPeers = append(dnsPeers, formatCIDRPeers([]string{metadataResolverCIDR}, true)...)
+
 	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
 	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
-	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
-	// operator, which always widen to a single host. The default is the fallback for
+	// dedupes. enforceMinPrefix is false for dnsIPs because these are bare IPs
+	// resolved by the operator, which always widen to a single host; the resolver
+	// peer above passes true, as linkLocalPeers does, and a bare address clears
+	// the floor either way. The default is the fallback for
 	// nothing surviving, not for each entry that does not parse -- two bad entries
 	// used to emit the default twice.
 	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
 	if len(dnsIPPeers) == 0 {
 		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
 	}
-	dnsPeers = append(dnsPeers, dnsIPPeers...)
+	// formatCIDRPeers dedupes within one call, not across the two above, and on a
+	// Cloud DNS cluster the two overlap: 169.254.169.254 is what kubelet's
+	// --cluster-dns carries there, so an operator setting
+	// spec.networkPolicy.dnsClusterIPs to the value their nodes actually use
+	// names the address this rule already grants. Without this filter that
+	// renders the same ipBlock twice — legal, and no wider, but a policy sold as
+	// auditable should not make a reader wonder which of the two is doing the
+	// work. buildAgentEgressNetworkPolicy calls the same helper on its own DNS
+	// rule, which is built from a different peer list.
+	dnsPeers = append(dnsPeers, peersNotAlreadyPresent(dnsPeers, dnsIPPeers)...)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
@@ -4585,4 +4860,3 @@ func buildPluginStagingContainerName(pluginName string) string {
 	}
 	return name
 }
-

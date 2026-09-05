@@ -340,9 +340,28 @@ def test_audit_report_ledger_dryrun_all_streams(
         "findings": [],
     }
 
+    # `finish` refuses to publish a document nothing checked, dry-run included --
+    # the rehearsal has to fail the same way the real call would, or an agent
+    # learns the flag is optional and discovers otherwise at publish time. The
+    # manifest here mirrors the document above, so the stream is exercised
+    # through the cross-check rather than around it.
+    mock_manifest = {
+        "audit": audit_id,
+        "clusters": [
+            {
+                "name": cluster,
+                "outcome": "collected",
+                "commands": [{"check": valid_check, "rc": 0}],
+            }
+        ],
+    }
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(mock_findings, f)
         temp_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(mock_manifest, f)
+        manifest_path = f.name
 
     try:
         proc = subprocess.run(
@@ -352,6 +371,7 @@ def test_audit_report_ledger_dryrun_all_streams(
                 "finish",
                 f"--audit={audit_id}",
                 f"--findings-file={temp_path}",
+                f"--manifest-file={manifest_path}",
                 "--dry-run",
             ],
             capture_output=True,
@@ -363,8 +383,9 @@ def test_audit_report_ledger_dryrun_all_streams(
             f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        for path in (temp_path, manifest_path):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 @pytest.mark.parametrize(
@@ -412,6 +433,12 @@ def test_audit_report_github_api_lifecycle_mocked(
     # seven ways, so anything missed here leaks into the next parameter's run.
     original_workspace = audit_report.GITOPS_WORKSPACE
     original_scratch = audit_report.SCRATCH_DIR
+    # REPORTS_DIR joins it for a second reason: `finish` below is a real one, so
+    # it reaches `write_report`. Unpatched, that is the *live* store on the
+    # install this suite runs against -- seven synthetic runs written over seven
+    # streams' `latest.json`, and the next real run of each reads that memory
+    # and announces its whole finding set as new.
+    original_reports = audit_report.REPORTS_DIR
     original_repo_root = audit_report.repo_root
     original_run_cmd = audit_report.run_cmd
     original_refresh = audit_report.refresh_credentials
@@ -450,10 +477,16 @@ def test_audit_report_github_api_lifecycle_mocked(
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
         audit_report.SCRATCH_DIR = str(tmp_path)
+        audit_report.REPORTS_DIR = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
-        audit_report.refresh_credentials = lambda repo=None: None
-        audit_report.resolve_repo = lambda: "test-org-kube-agent/agents-repo"
+        audit_report.refresh_credentials = lambda *args, **kwargs: None
+        # `*args, **kwargs`: `handle_finish` calls this as
+        # `resolve_repo(audit_id=…, repo=…)`. A zero-arg stub raised TypeError there,
+        # `main()`'s blanket handler turned that into exit 1, and all seven audit
+        # cases failed on the stub rather than on the product — with the
+        # release-candidate pipeline as the only thing running them.
+        audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
 
         valid_check = audit_report.AUDITS[audit_id].checks[0] if audit_id in audit_report.AUDITS and audit_report.AUDITS[audit_id].checks else "single-zone-nodepool"
@@ -493,7 +526,27 @@ def test_audit_report_github_api_lifecycle_mocked(
         findings_file = tmp_path / f"findings_{audit_id}.json"
         findings_file.write_text(json.dumps(doc), encoding="utf-8")
 
-        exit_code = audit_report.main(["finish", f"--audit={audit_id}", f"--findings-file={findings_file}"])
+        # See the dry-run test above: `finish` will not publish without a
+        # manifest, so this one mirrors the document it publishes.
+        manifest_file = tmp_path / f"manifest_{audit_id}.json"
+        manifest_file.write_text(
+            json.dumps({
+                "audit": audit_id,
+                "clusters": [{
+                    "name": "platform-agent-host",
+                    "outcome": "collected",
+                    "commands": [{"check": valid_check, "rc": 0}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        exit_code = audit_report.main([
+            "finish",
+            f"--audit={audit_id}",
+            f"--findings-file={findings_file}",
+            f"--manifest-file={manifest_file}",
+        ])
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
         all_commands = [" ".join(c) for c in calls]
@@ -518,6 +571,14 @@ def test_audit_report_github_api_lifecycle_mocked(
             "SECURITY/SAFETY VIOLATION: Audit unexpectedly attempted to create a pull request!"
         )
 
+        # 5. Assert this run's report landed in the redirected store. Without
+        #    it the REPORTS_DIR patch above is invisible: `write_report` never
+        #    raises, so dropping the patch would move these writes back onto the
+        #    live store and nothing here would notice.
+        assert (tmp_path / "reports" / audit_id / "latest.json").is_file(), (
+            f"Expected '{audit_id}' finish to write latest.json under the test store."
+        )
+
     finally:
         audit_report.run_cmd = original_run_cmd
         audit_report.refresh_credentials = original_refresh
@@ -525,4 +586,5 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.repo_root = original_repo_root
         audit_report.GITOPS_WORKSPACE = original_workspace
         audit_report.SCRATCH_DIR = original_scratch
+        audit_report.REPORTS_DIR = original_reports
         audit_report.set_workspace(None)

@@ -24,15 +24,15 @@ Why a card rather than the cron job the watchdogs use
 -----------------------------------------------------
 ``../cron/README.md`` argues, correctly, that a card is not a cron run: the
 indirection strips ``skills``, ``model`` and ``deliver`` from the thing that
-ends up running, which is why the seven governance audits were moved back onto
+ends up running, which is why the governance audits were moved back onto
 this roster. That argument is about jobs that fire unconditionally and whose
 entire product *is* the cron delivery. A poller is the inverse. It has nothing
 to deliver on almost every tick; its product goes to GitHub, not to chat; and a
 card appears only in the rare case where there is genuine work. What it gives
 up it can afford — the card body names the skill, and ``model``/``max_turns``
 take their defaults — and the one thing it must not give up, an audible
-failure, stays here: this job keeps ``deliver: "all"``, and anything printed to
-stdout below is a fault report that reaches the room.
+failure, stays here: this job carries ``deliver: "chat"``, so anything printed
+to stdout below is a fault report the Planning Agent posts to the room.
 
 One watcher, several sweeps
 ---------------------------
@@ -85,6 +85,8 @@ SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 ASSIGNEE = "platform"
 
 RESOLVER_REL = "skills/github-issue-resolver/scripts/resolver.py"
+PLATFORM_PROFILE_DIR = "profiles/platform"
+PLATFORM_TEMPLATE_DIR = "/opt/platform-template"
 
 # The one filesystem both this container and the credential sidecar can see.
 # `resolver.py` and `audit_report.py` pin the same path for the same reason.
@@ -195,7 +197,17 @@ def selected_sweeps() -> tuple[tuple[str, ...], list[str]]:
 
 
 def _resolver_path() -> Path:
-    return hermes_home() / RESOLVER_REL
+    home = hermes_home()
+    candidates = (
+        home / PLATFORM_PROFILE_DIR / RESOLVER_REL,
+        home / RESOLVER_REL,
+        Path(PLATFORM_TEMPLATE_DIR) / RESOLVER_REL,
+        Path(__file__).resolve().parent.parent / RESOLVER_REL,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return home / RESOLVER_REL
 
 
 def run_resolver_poll() -> dict:
