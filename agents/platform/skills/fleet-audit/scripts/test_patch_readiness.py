@@ -147,9 +147,15 @@ class MasterBehindTest(unittest.TestCase):
 
 
 class PoolSkewTest(unittest.TestCase):
-    def test_autopilot_is_never_flagged(self):
+    def test_autopilot_is_judged_like_any_other_cluster(self):
+        """Autopilot node pools carry a real `version`, so a skew there is an
+        observation and not a category error. The operator cannot fix it, which
+        makes the finding `kind: manual` per the SOP -- it does not make the
+        ten-minor gap below untrue."""
         c = cluster(autopilot=True, node_pools=[pool(version="1.20.0-gke.1")])
-        self.assertEqual(pr.check_pool_skew(c), [])
+        hits = pr.check_pool_skew(c)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
 
     def test_three_minors_behind_is_critical(self):
         c = cluster(master="1.33.0-gke.1", node_pools=[pool(version="1.30.0-gke.1")])
@@ -233,10 +239,17 @@ class NoChannelTest(unittest.TestCase):
 
 
 class NoAutoupgradeAutorepairTest(unittest.TestCase):
-    def test_autopilot_is_never_flagged(self):
+    def test_autopilot_is_read_rather_than_assumed(self):
+        """GKE guarantees both are on under Autopilot and the API says so on
+        every pool. The audit's job is to confirm that from the response, not
+        to skip the field on the strength of the guarantee -- the run where
+        they disagree is the only one that matters."""
         c = cluster(autopilot=True, node_pools=[pool(auto_upgrade=False, auto_repair=False)])
-        self.assertEqual(pr.check_no_autoupgrade(c), [])
-        self.assertEqual(pr.check_no_autorepair(c), [])
+        self.assertEqual(len(pr.check_no_autoupgrade(c)), 1)
+        self.assertEqual(len(pr.check_no_autorepair(c)), 1)
+        healthy = cluster(autopilot=True, node_pools=[pool()])
+        self.assertEqual(pr.check_no_autoupgrade(healthy), [])
+        self.assertEqual(pr.check_no_autorepair(healthy), [])
 
     def test_flags_disabled_autoupgrade(self):
         c = cluster(node_pools=[pool(auto_upgrade=False)])
@@ -340,9 +353,15 @@ class BlockingExclusionTest(unittest.TestCase):
 
 
 class StaleImageTypeTest(unittest.TestCase):
-    def test_autopilot_is_never_flagged(self):
+    def test_autopilot_pools_carry_an_image_type_and_are_checked(self):
+        """`config.imageType` is populated on Autopilot pools (`COS_CONTAINERD`
+        on the fleet measured 2026-09-05), so the old reason for skipping --
+        that no pool there carries one -- described a response GKE does not
+        return."""
         c = cluster(autopilot=True, node_pools=[pool(image_type="COS")])
-        self.assertEqual(pr.check_stale_image_type(c, BASELINE), [])
+        self.assertEqual(len(pr.check_stale_image_type(c, BASELINE)), 1)
+        healthy = cluster(autopilot=True, node_pools=[pool(image_type="COS_CONTAINERD")])
+        self.assertEqual(pr.check_stale_image_type(healthy, BASELINE), [])
 
     def test_flags_deprecated_cos(self):
         c = cluster(node_pools=[pool(image_type="COS")])
@@ -697,21 +716,23 @@ class CollectFleetTest(unittest.TestCase):
         self.assertEqual({c["project"] for c in manifest["clusters"]}, {"base"})
 
 
-class AutopilotNotApplicableTest(unittest.TestCase):
-    """The four node-pool checks on an Autopilot cluster.
+class AutopilotNodePoolChecksTest(unittest.TestCase):
+    """The four node-pool checks on an Autopilot cluster: they run.
 
-    Every one of these passed before the collector declared anything, because
-    each `check_*` function already returned no hits on Autopilot and the tests
-    asked only about hits. Nothing asked what the *manifest* said, and the
-    manifest said the checks had run and found the cluster clean — the same
-    shape a healthy Standard cluster produces.
+    They used to be declared `checks_not_applicable`, each with a reason saying
+    the field was not there to read. It is. `clusters list` returns Autopilot
+    node pools with `version`, `config.imageType`, and a `management` block
+    populated -- five pools per cluster on the fleet measured 2026-09-05 -- so
+    the question these checks ask does arise on Autopilot and the API answers
+    it. Autopilot removes the knob, not the reading, and an audit that skips
+    the read is asserting the platform's guarantee rather than verifying it.
     """
 
-    NA = ("pool-skew", "no-autoupgrade", "no-autorepair", "stale-image-type")
+    POOL_CHECKS = ("pool-skew", "no-autoupgrade", "no-autorepair", "stale-image-type")
 
-    def collect(self, *, autopilot, server_config_rc=0):
+    def collect(self, *, autopilot, server_config_rc=0, node_pools=None, master="1.30.5-gke.100"):
         responses = {
-            "clusters list": run_of(0, json.dumps([cluster(autopilot=autopilot)])),
+            "clusters list": run_of(0, json.dumps([cluster(autopilot=autopilot, master=master, node_pools=node_pools)])),
             "get-server-config": run_of(server_config_rc, json.dumps(server_config()) if server_config_rc == 0 else "", "denied"),
         }
 
@@ -726,21 +747,54 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         entry = entries[0]
         return entry, {c["check"] for c in entry["commands"]}, {e["check"] for e in entry.get("checks_not_applicable") or []}
 
-    def test_autopilot_declares_all_four_with_a_reason(self):
-        entry, _, declared = self.collect(autopilot=True)
-        self.assertEqual(declared, set(self.NA))
-        for e in entry["checks_not_applicable"]:
-            self.assertIn("Autopilot", e["reason"])
-
-    def test_autopilot_claims_none_of_the_four_as_a_command_that_ran(self):
-        _, ran, _ = self.collect(autopilot=True)
-        self.assertEqual(ran & set(self.NA), set())
-
-    def test_a_standard_cluster_declares_nothing_and_runs_all_four(self):
-        entry, ran, declared = self.collect(autopilot=False)
+    def test_autopilot_runs_all_four_and_declares_nothing_inapplicable(self):
+        entry, ran, declared = self.collect(autopilot=True)
+        self.assertTrue(set(self.POOL_CHECKS) <= ran)
         self.assertEqual(declared, set())
         self.assertNotIn("checks_not_applicable", entry)
-        self.assertTrue(set(self.NA) <= ran)
+
+    def test_a_standard_cluster_is_treated_identically(self):
+        """The whole distinction is gone, so the two shapes now produce the
+        same dispositions -- which is the claim worth pinning, because a
+        divergence that reappears would reappear silently."""
+        _, ap_ran, ap_declared = self.collect(autopilot=True)
+        _, std_ran, std_declared = self.collect(autopilot=False)
+        self.assertEqual(ap_ran, std_ran)
+        self.assertEqual(ap_declared, std_declared)
+
+    def test_the_checks_actually_read_the_autopilot_fields(self):
+        """The point of running them. If GKE ever returns a pool with
+        auto-upgrade off, a deprecated image, or a minor's worth of version
+        skew, an Autopilot cluster is where nobody is looking -- so each of the
+        three must produce a finding from data the old code declined to read.
+        """
+        pools = [pool(
+            "ap-pool-1",
+            version="1.28.5-gke.100",  # two minors behind the 1.30.5 control plane
+            auto_upgrade=False,
+            auto_repair=False,
+            image_type="UBUNTU",  # deprecated, and absent from validImageTypes
+        )]
+        entry, _, _ = self.collect(autopilot=True, node_pools=pools)
+        found = {c["check"] for c in entry["candidates"]}
+        self.assertTrue({"pool-skew", "no-autoupgrade", "no-autorepair", "stale-image-type"} <= found)
+
+    def test_a_healthy_autopilot_cluster_still_reports_nothing(self):
+        """Running the checks must not manufacture findings out of the normal
+        Autopilot shape -- otherwise this trades four honest n/a entries for
+        four per-cluster false positives across the fleet."""
+        entry, _, _ = self.collect(autopilot=True)
+        found = {c["check"] for c in entry["candidates"]}
+        self.assertEqual(found & set(self.POOL_CHECKS), set())
+
+    def test_an_autopilot_rollout_one_patch_behind_is_not_a_finding(self):
+        """The one way an Autopilot pool innocently trails its control plane:
+        Google upgrades the control plane first and rolls nodes over the days
+        after. `check_pool_skew` already excluded that case for Standard; it is
+        what makes running the check on Autopilot safe rather than noisy."""
+        pools = [pool("ap-pool-1", version="1.30.4-gke.100")]
+        entry, _, _ = self.collect(autopilot=True, node_pools=pools)
+        self.assertNotIn("pool-skew", {c["check"] for c in entry["candidates"]})
 
     def test_no_slug_is_both_run_and_inapplicable(self):
         """`stale-image-type` was written into `commands` from the baseline
@@ -749,17 +803,17 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         _, ran, declared = self.collect(autopilot=True)
         self.assertEqual(ran & declared, set())
 
-    def test_a_missing_baseline_does_not_turn_stale_image_type_into_a_gap(self):
-        """Inapplicable beats unread: the check has no object on Autopilot
-        whether or not `get-server-config` answered."""
+    def test_a_missing_baseline_is_a_gap_for_both_baseline_checks(self):
+        """`stale-image-type` needs the location roster to judge an image
+        against, so a failed `get-server-config` leaves it unread -- a real
+        coverage gap, and no longer excused as inapplicable."""
         _, ran, declared = self.collect(autopilot=True, server_config_rc=1)
-        self.assertIn("stale-image-type", declared)
         self.assertNotIn("stale-image-type", ran)
+        self.assertNotIn("stale-image-type", declared)
 
     def test_master_behind_stays_a_real_check_on_autopilot(self):
-        """An Autopilot control plane has a version like any other, so this one
-        is not inapplicable — and when the baseline fails it is a genuine gap,
-        not something to excuse."""
+        """An Autopilot control plane has a version like any other, and when
+        the baseline fails it is a genuine gap, not something to excuse."""
         _, ran, declared = self.collect(autopilot=True)
         self.assertNotIn("master-behind", declared)
         self.assertIn("master-behind", ran)
@@ -767,13 +821,13 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertNotIn("master-behind", ran_no_baseline)
         self.assertNotIn("master-behind", declared_no_baseline)
 
-    def test_the_two_together_account_for_the_whole_roster(self):
-        """The point of the change, stated against audit_report's own roster:
-        an Autopilot cluster owes a disposition for all ten checks, and after
-        this it has one for each without the model supplying any of them."""
+    def test_the_run_list_accounts_for_the_whole_roster(self):
+        """An Autopilot cluster owes a disposition for all ten checks, and now
+        every one of them is a check that ran rather than one excused."""
         _, ran, declared = self.collect(autopilot=True)
         roster = set(audit_report.AUDITS["security-patch-orchestrator"].checks)
         self.assertEqual(roster - ran - declared, set())
+        self.assertEqual(roster, ran)
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

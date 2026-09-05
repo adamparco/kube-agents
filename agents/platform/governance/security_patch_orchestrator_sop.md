@@ -49,48 +49,25 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
    ```json
    {
-     "check": "pool-skew",
-     "reason": "GKE Autopilot: Google manages the node pools, there are none to skew."
+     "check": "<slug>",
+     "reason": "<the property of this cluster that rules the check out>"
    }
    ```
 
-   Same slugs as `checks_run`, and the `reason` must say why the check _cannot_ apply here — "N/A" and "not applicable" are rejected; name the property of the cluster that rules it out. Those checks leave the denominator instead of counting as missing, so an Autopilot cluster reads as complete at six of six rather than forever-incomplete at six of ten. This matters more here than anywhere: on a fleet that is mostly Autopilot, without it every run is partial forever, no finding on an Autopilot cluster can ever be announced as resolved, the ledger can never close, and their stale remediation PRs are never cleaned up. Use it only for checks the cluster's shape rules out. A check you could have run and did not is a `limitations` note and a real gap, and the validator rejects a slug in both lists, a duplicate, an unknown slug, and a reason under sixteen characters.
+   Same slugs as `checks_run`, and the `reason` must say why the check _cannot_ apply here — "N/A" and "not applicable" are rejected; name the property of the cluster that rules it out. Those checks leave the denominator instead of counting as missing.
+
+   **No GKE cluster shape currently rules any of these ten checks out, so on this fleet the list stays empty.** Autopilot was the one candidate and is not one: step 6 explains why its node pools are read like any other's. Before declaring a check inapplicable, confirm from the API response that the field it reads is genuinely absent, rather than reasoning from what the platform is documented to manage — that reasoning is exactly what put four checks in this list on every Autopilot cluster while the response carried the data all along. Use it only for checks the cluster's shape rules out. A check you could have run and did not is a `limitations` note and a real gap, and the validator rejects a slug in both lists, a duplicate, an unknown slug, and a reason under sixteen characters.
 
 4. **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator rejects a document whose two lists overlap, and any finding whose `cluster` names a `scope.skipped` entry.
 5. Record every cluster you could **not** read in `scope.skipped` with a specific reason. The collector decides the first two of these for you: a cluster it enumerated but §1.5 rules out carries `outcome: "out-of-scope"` in the manifest, with the reason in `error` — copy that reason rather than inventing one. Skip, do not flag:
    - `status` is `PROVISIONING`, `STOPPING`, or `ERROR` — the object is mid-flight or broken; version data is meaningless.
    - `enableKubernetesAlpha: true` — alpha clusters cannot be upgraded and auto-expire by design.
    - A project that errors on list (permission, API disabled). Record it as `{"cluster": "project/<project>", "reason": "…"}` — that exact spelling, because it is the one the collector already put in the manifest, and the cross-check rejects the document if the two disagree.
-6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10 there and declare the four node-pool checks inapplicable rather than missing —
+6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped, and **all ten checks run there**, node-pool checks included. `clusters list` returns an Autopilot cluster's node pools like any other's, each carrying `version`, `config.imageType`, and a `management` block with `autoUpgrade` and `autoRepair` populated — five pools per cluster on the fleet measured 2026-09-05. The four node-pool checks used to be declared inapplicable there on the grounds that no such pool or field existed, which describes a response GKE does not return.
 
-   ```json
-   {
-     "name": "<name>",
-     "location": "<loc>",
-     "project": "<p>",
-     "checks_run": [{ "check": "master-behind", "command": "…" }],
-     "checks_not_applicable": [
-       {
-         "check": "pool-skew",
-         "reason": "GKE Autopilot: Google manages the node pools; no user-managed pool to skew."
-       },
-       {
-         "check": "no-autoupgrade",
-         "reason": "GKE Autopilot: node auto-upgrade is enforced by Google and not configurable."
-       },
-       {
-         "check": "no-autorepair",
-         "reason": "GKE Autopilot: node auto-repair is enforced by Google and not configurable."
-       },
-       {
-         "check": "stale-image-type",
-         "reason": "GKE Autopilot: Google selects the node image; the operator cannot choose one."
-       }
-     ]
-   }
-   ```
+   What Autopilot takes away is the knob, not the reading. A check is inapplicable when the cluster's shape means the question cannot arise; here it arises and the API answers it, so declining to look means asserting Google's guarantee rather than confirming it — and the run where the API disagrees with the guarantee is the only one that would have mattered. Remediability is the separate axis, and §4 already carries it: a node-pool finding on an Autopilot cluster is `kind: manual`, because the operator has nothing to set.
 
-   — which leaves the cluster fully covered at six of six instead of dragging every run into partial coverage. Do not also name those four in `limitations`; that is the field for a check that could have run here and did not. Skipping the cluster outright would suppress every cluster-scoped finding you did prove there.
+   So an Autopilot cluster is covered at ten of ten by running ten checks, not at six of six by excusing four. Nothing about this makes a run partial: these are checks that ran and passed.
 
 ### 2. Establish the version baseline
 
@@ -146,7 +123,7 @@ This stream's targets are GKE control-plane and node-pool metadata, not workload
 
 - **Command:** `gcloud container node-pools describe <pool> --cluster=<cluster> --location=<loc> --project=<p> --format="value(version,status)"`
 - **Flag when:** compare each `nodePools[].version` against `currentMasterVersion`. Major versions differ or the pool is **≥ 3 minors** behind; the pool is exactly **2 minors** behind; the pool is exactly **1 minor** behind; the pool is on the same minor but an older `(PATCH, BUILD)`. Separately, flag a pool whose version is **ahead of** the control plane — GKE never produces that state, so it signals a broken or hand-edited pool.
-- **Do NOT flag:** Autopilot clusters (Google owns those pools; step 1 records that in `checks_not_applicable`, never in `limitations`, and the cluster is still in `scope.clusters`); a pool `RECONCILING`/`PROVISIONING`, or a cluster `RECONCILING`; a pool one patch behind the control plane while the cluster is mid-rollout. GKE upgrades the control plane first and drains pools afterwards, so transient one-patch lag is normal operation.
+- **Do NOT flag:** a pool `RECONCILING`/`PROVISIONING`, or a cluster `RECONCILING`; a pool one patch behind the control plane while the cluster is mid-rollout. GKE upgrades the control plane first and drains pools afterwards, so transient one-patch lag is normal operation. That last exclusion is also what makes this check safe on Autopilot, where the staged node rollout is the only innocent way a pool trails: Autopilot pools carry a real `version` and are checked, and a gap of a whole minor there is the skew policy running out rather than a rollout in flight. It is `kind: manual` — worth a support case, with no knob for the operator.
 - **Severity:** ≥ 3 minors or major mismatch → **critical** (outside GKE's documented skew policy: nodes may be no more than two minor versions behind the control plane). Exactly 2 minors → **major** (at the ceiling — the next control-plane minor upgrade is blocked until the pool moves). Exactly 1 minor → **major** if `management.autoUpgrade` is `false`, else **minor**. Patch-only drift → **minor**. Pool ahead of control plane → **major**.
 - **Impact:** "Node pool `<pool>` runs `<v>`, `<n>` minor versions behind control plane `<m>` — at or beyond GKE's two-minor skew ceiling, which blocks the cluster's next control-plane upgrade."
 - **Remediation:** `kind: gcloud` — `gcloud container clusters upgrade <cluster> --location=<loc> --project=<p> --node-pool=<pool> --cluster-version=<currentMasterVersion>`.
@@ -174,20 +151,20 @@ This stream's targets are GKE control-plane and node-pool metadata, not workload
 #### 3.5 Node-pool auto-upgrade disabled (`no-autoupgrade`)
 
 - **Command:** `gcloud container node-pools describe <pool> --cluster=<cluster> --location=<loc> --project=<p> --format="value(management.autoUpgrade)"`
-- **Flag when:** `management.autoUpgrade` is `false` or absent.
-- **Do NOT flag:** Autopilot clusters; pools in a cluster already skipped in step 1.
+- **Flag when:** `management.autoUpgrade` is `false` or absent. Autopilot pools included — GKE keeps it on there and the response says so on every pool, which is a thing to confirm rather than assume.
+- **Do NOT flag:** pools in a cluster already skipped in step 1.
 - **Severity:** **major** — the pool will drift out of the skew window on its own and eventually block the control plane.
 - **Impact:** "Node pool `<pool>` has auto-upgrade disabled; its nodes will fall behind the control plane until someone upgrades them by hand."
-- **Remediation:** `kind: gcloud` — `gcloud container node-pools update <pool> --cluster=<cluster> --location=<loc> --project=<p> --enable-autoupgrade`; or `kind: manifest` when the pool is a Config Connector `ContainerNodePool`.
+- **Remediation:** `kind: gcloud` — `gcloud container node-pools update <pool> --cluster=<cluster> --location=<loc> --project=<p> --enable-autoupgrade`; or `kind: manifest` when the pool is a Config Connector `ContainerNodePool`. On an Autopilot cluster it is `kind: manual`: the setting is Google's, so the action is a support case, and the finding means GKE returned something its own contract says it will not.
 
 #### 3.6 Node-pool auto-repair disabled (`no-autorepair`)
 
 - **Command:** `gcloud container node-pools describe <pool> --cluster=<cluster> --location=<loc> --project=<p> --format="value(management.autoRepair)"`
-- **Flag when:** `management.autoRepair` is `false` or absent.
-- **Do NOT flag:** Autopilot clusters; pools in a cluster already skipped in step 1.
+- **Flag when:** `management.autoRepair` is `false` or absent. Autopilot pools included, for the reason 3.5 gives.
+- **Do NOT flag:** pools in a cluster already skipped in step 1.
 - **Severity:** **minor** — an availability and node-hygiene gap rather than a patch-currency gap.
 - **Impact:** "Node pool `<pool>` has auto-repair disabled; unhealthy nodes stay in the pool until an operator notices."
-- **Remediation:** `kind: gcloud` — `gcloud container node-pools update <pool> --cluster=<cluster> --location=<loc> --project=<p> --enable-autorepair`.
+- **Remediation:** `kind: gcloud` — `gcloud container node-pools update <pool> --cluster=<cluster> --location=<loc> --project=<p> --enable-autorepair`; `kind: manual` on Autopilot.
 
 #### 3.7 No maintenance window configured (`no-maintenance-window`)
 
@@ -211,7 +188,7 @@ This stream's targets are GKE control-plane and node-pool metadata, not workload
 
 - **Command:** `gcloud container node-pools describe <pool> --cluster=<cluster> --location=<loc> --project=<p> --format="value(config.imageType)"`
 - **Flag when:** `config.imageType` is absent from the cached `validImageTypes[]` for that location, **or** it is exactly `COS`, `UBUNTU`, or `WINDOWS_SAC` — the pre-containerd and deprecated-servicing variants.
-- **Do NOT flag:** any image type present in `validImageTypes[]` and not on the deprecated list (`COS_CONTAINERD`, `UBUNTU_CONTAINERD`, `WINDOWS_LTSC_CONTAINERD`, and whatever else that location currently offers); Autopilot clusters; casing differences — compare case-insensitively.
+- **Do NOT flag:** any image type present in `validImageTypes[]` and not on the deprecated list (`COS_CONTAINERD`, `UBUNTU_CONTAINERD`, `WINDOWS_LTSC_CONTAINERD`, and whatever else that location currently offers); casing differences — compare case-insensitively. Autopilot pools are checked: they carry a `config.imageType` like any other (`COS_CONTAINERD` on the fleet measured 2026-09-05), and a finding there is `kind: manual` since Google picks the image.
 - **Severity:** **major** — a node image the location no longer offers cannot receive node-image patches and blocks future upgrades.
 - **Impact:** "Node pool `<pool>` runs image type `<t>`, which `<loc>` no longer offers; the pool cannot take node-image patches."
 - **Remediation:** `kind: gcloud` — `gcloud container clusters upgrade <cluster> --location=<loc> --project=<p> --node-pool=<pool> --image-type=<target>`. Image type changes go through `clusters upgrade`, not `node-pools update`; confirm the flag with `gcloud container clusters upgrade --help` before recording it.
@@ -248,7 +225,7 @@ For `kind: manifest`, **edit the Config Connector declaration the grep above fou
 
 Write the document to the `findings_path` from step 0 with `audit: "security-patch-orchestrator"` (it must match `--audit` exactly), the populated `scope.clusters`/`scope.skipped`, and the findings array — `[]` for a clean audit. Every finding needs a non-empty `check`, `severity`, `title`, `cluster`, `object`, `impact`, `evidence.command`, `recommendation`, and `remediation.kind`; `namespace` is `""` here, and no finding carries an `id` — the harness derives it (§2). Before writing, self-check: no two findings sharing a `(check, cluster, object)` triple, and no `object` carrying a version or a date; every `evidence.command` a literal command you actually ran; `remediation.path` set for and only for `kind: "manifest"`, and present on disk; `scope.clusters` non-empty, every entry carrying a `checks_run` list of `{check, command}` objects naming the §3 checks that actually ran on that cluster and the commands that ran them — never the full ten because the SOP lists ten — every entry's `limitations` non-empty where present, and every `scope.skipped` entry carrying both `cluster` and `reason`, with the two lists disjoint and no finding naming a skipped cluster. A schema violation publishes nothing — `finish` exits 2 and the ledger is untouched — so validate here rather than discover it there.
 
-Read your `checks_run` lists once more before you write. Padding one to ten because §3 lists ten checks is the one entry in this document that converts a partial audit back into a false all-clear — the harness cannot see the check you skipped, so it takes the list at its word. The `command` on each entry is what makes that padding falsifiable rather than free: it is published verbatim, so an invented command is a false statement in a public issue. `checks_not_applicable` is the same lie wearing a different field: it removes checks from the denominator, so a slug parked there because you ran out of turns is a coverage gap the ledger will never show. It is published too — every exclusion and its reason render under _Not applicable_, where a reviewer who knows the cluster can call it. An honest six-of-ten costs you nothing but an open ledger, and an honest six-of-six on an Autopilot cluster closes it.
+Read your `checks_run` lists once more before you write. Padding one to ten because §3 lists ten checks is the one entry in this document that converts a partial audit back into a false all-clear — the harness cannot see the check you skipped, so it takes the list at its word. The `command` on each entry is what makes that padding falsifiable rather than free: it is published verbatim, so an invented command is a false statement in a public issue. `checks_not_applicable` is the same lie wearing a different field: it removes checks from the denominator, so a slug parked there because you ran out of turns is a coverage gap the ledger will never show. It is published too — every exclusion and its reason render under _Not applicable_, where a reviewer who knows the cluster can call it. An honest six-of-ten costs you nothing but an open ledger. On this fleet the list is empty and every cluster, Autopilot included, is a ten-of-ten: see step 6.
 
 **`recommendation` is required on every finding.** Three sub-fields, all non-empty strings, no exceptions. Almost nothing in this audit is promotable, and that is precisely why: a `gcloud` finding a human runs by hand needs the argument for the fix more than a mergeable diff does, and the reasoning is only cheap while the evidence is in front of you.
 
@@ -281,7 +258,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit security-pat
 
 One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled run replies), and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
-**`partial` is the coverage flag.** It is `true` when any cluster landed in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` lists those gaps as readable sentences. An upgrade audit that could not reach a cluster has no idea whether that cluster's node pools are still behind, so the harness will not let the run act as if it does — about that cluster: its findings stay out of `resolved` and their remediation PRs stay open, while a pool this run did read and found upgraded is still announced resolved and its stale PR still closed. Even a findings-free run keeps the ledger open — `status: "CLEAN"`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag: it left the denominator, so an Autopilot cluster that ran everything that _can_ apply to it is a fully covered cluster. It is a coverage flag and nothing more: `true` if and only if `coverage_gaps` is non-empty. The step 5 size budget does not raise it, because a description that could not carry every finding still counted them all in the title and names in the body what it dropped.
+**`partial` is the coverage flag.** It is `true` when any cluster landed in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` lists those gaps as readable sentences. An upgrade audit that could not reach a cluster has no idea whether that cluster's node pools are still behind, so the harness will not let the run act as if it does — about that cluster: its findings stay out of `resolved` and their remediation PRs stay open, while a pool this run did read and found upgraded is still announced resolved and its stale PR still closed. Even a findings-free run keeps the ledger open — `status: "CLEAN"`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag: it left the denominator, so a cluster that ran everything that _can_ apply to it is a fully covered cluster. It is a coverage flag and nothing more: `true` if and only if `coverage_gaps` is non-empty. The step 5 size budget does not raise it, because a description that could not carry every finding still counted them all in the title and names in the body what it dropped.
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no change in coverage since the last run, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 

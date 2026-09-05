@@ -272,8 +272,13 @@ def _pool_status_excludes(pool: dict, cluster: dict) -> bool:
 
 
 def check_pool_skew(cluster: dict) -> list[dict]:
-    if (cluster.get("autopilot") or {}).get("enabled"):
-        return []
+    # Autopilot is not excluded. Its node pools carry a real `version` and can
+    # genuinely trail the control plane, and the one Autopilot-specific way
+    # that happens innocently -- Google upgrading the control plane first and
+    # rolling nodes over the following days -- is already the `minor_gap == 0`
+    # one-patch-behind case below, which does not flag. A *minor*-level gap on
+    # Autopilot is not a rollout in progress; it is the skew policy running
+    # out, and it is worth a support case even though the operator has no knob.
     master_t = parse_version(cluster.get("currentMasterVersion") or "")
     if master_t is None:
         return []
@@ -364,8 +369,8 @@ def _observed(mapping: dict, key: str, path: str) -> str:
 
 
 def check_no_autoupgrade(cluster: dict) -> list[dict]:
-    if (cluster.get("autopilot") or {}).get("enabled"):
-        return []
+    # Runs on Autopilot too: the field is there and reads `true`, so this
+    # verifies the platform's guarantee instead of taking it on trust.
     return [
         {
             "object": f"NodePool/{p.get('name', '')}",
@@ -377,8 +382,7 @@ def check_no_autoupgrade(cluster: dict) -> list[dict]:
 
 
 def check_no_autorepair(cluster: dict) -> list[dict]:
-    if (cluster.get("autopilot") or {}).get("enabled"):
-        return []
+    # Autopilot included, for the reason `check_no_autoupgrade` gives.
     return [
         {
             "object": f"NodePool/{p.get('name', '')}",
@@ -430,7 +434,10 @@ def check_blocking_exclusion(cluster: dict, *, now: datetime, has_version_findin
 
 
 def check_stale_image_type(cluster: dict, baseline: dict | None) -> list[dict]:
-    if baseline is None or (cluster.get("autopilot") or {}).get("enabled"):
+    # Autopilot included: its pools carry `config.imageType` like any other
+    # (`COS_CONTAINERD` on the fleet measured 2026-09-05), so the check reads a
+    # real value rather than declining on the belief that there is none.
+    if baseline is None:
         return []
     valid = baseline["validImageTypes"]
     hits = []
@@ -499,49 +506,30 @@ def _emit(slug: str, hit: dict) -> dict:
     }
 
 
-# The four checks whose object does not exist on Autopilot, with the reason.
-# Google owns an Autopilot cluster's nodes and exposes no user-managed node
-# pool, which is why `check_pool_skew`, `check_no_autoupgrade`,
-# `check_no_autorepair` and `check_stale_image_type` each already return no
-# hits there.
+# The four node-pool checks used to be declared `checks_not_applicable` on
+# Autopilot, each with a reason saying the field was not there to read:
+# "exposes no user node pool whose version could skew", "there is no node pool
+# management setting to inspect", "exposes no user node pool carrying a
+# config.imageType". Every one of those is false. `clusters list` returns
+# Autopilot node pools like any other -- five per cluster on the fleet measured
+# 2026-09-05, each carrying `version`, `config.imageType`, and a `management`
+# block with `autoUpgrade` and `autoRepair` both explicitly `true`.
 #
-# Returning no hits was the whole of it, and that is the bug. This collector
-# issues one `clusters list` per project -- never a `describe`, per the module
-# docstring -- and records it against every slug, so an Autopilot cluster's
-# manifest said `pool-skew` ran at rc=0 and found nothing
-# -- indistinguishable from a Standard cluster whose pools are all in step.
-# Whether the run then told the truth came down to whether the model happened
-# to know GKE well enough to overrule its own manifest. On 2026-08-29 it did,
-# and three Autopilot clusters came back `checks_run=6 n/a=4`; the same
-# manifest read by a model that did not would report ten checks passed on a
-# cluster where four of them were never evaluated.
+# Which makes the disposition wrong, not just its wording. A check is not
+# applicable when the cluster's shape means the question cannot arise; here the
+# question arises and the API answers it. What Autopilot removes is the *knob*,
+# not the *reading* -- and an audit that declines to read a field because it
+# trusts the platform's guarantee about that field is asserting the answer
+# rather than checking it. If GKE ever returns `autoUpgrade: false` on an
+# Autopilot pool, that is a finding worth a support case, and the version of
+# this collector that declared the check inapplicable is the one that would
+# never see it.
 #
-# `fleet_waste.py` reached this conclusion first and its comment records the
-# other direction of the same failure: a model that remembers three of four
-# slugs publishes a coverage gap for a check the cluster does not owe. Neither
-# direction is the model's to get right. `autopilot` is a fact the collector
-# already holds, so the disposition belongs here, where it is the same on every
-# run -- and cross_check_manifest's note on `checks_not_applicable` asks for
-# exactly this, in every collector, as the prerequisite to adjudicating the
-# field at all.
-_AUTOPILOT_NOT_APPLICABLE = {
-    "pool-skew": (
-        "GKE Autopilot: Google manages the nodes and exposes no user node pool "
-        "whose version could skew from the control plane."
-    ),
-    "no-autoupgrade": (
-        "GKE Autopilot: node auto-upgrade is always on and not user-settable, "
-        "so there is no node pool management setting to inspect."
-    ),
-    "no-autorepair": (
-        "GKE Autopilot: node auto-repair is always on and not user-settable, "
-        "so there is no node pool management setting to inspect."
-    ),
-    "stale-image-type": (
-        "GKE Autopilot: Google selects the node image and exposes no user node "
-        "pool carrying a config.imageType."
-    ),
-}
+# So all four run everywhere. On Autopilot they pass, which costs one dict
+# lookup and converts four declined checks per cluster into four verified ones.
+# The SOP carries the other half: a hit on an Autopilot cluster is
+# `kind: manual`, because detection and remediation are separate axes and only
+# the second one Google owns.
 
 
 def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) -> tuple[list[str], list[dict], list[dict]]:
@@ -585,16 +573,12 @@ def collect_one_cluster(cluster: dict, baseline: dict | None, *, now: datetime) 
             candidates.append(_emit("master-behind", master_behind_hit))
         candidates += [_emit("stale-image-type", hit) for hit in check_stale_image_type(cluster, baseline)]
 
-    # Declared whether or not the baseline arrived: a check that cannot apply
-    # to this cluster is not waiting on a read. `master-behind` is the other
-    # half of that -- an Autopilot control plane has a real version, so a
-    # missing baseline leaves it a genuine gap rather than an inapplicable
-    # check, and it stays out of this table.
-    if (cluster.get("autopilot") or {}).get("enabled"):
-        not_applicable = [{"check": slug, "reason": reason} for slug, reason in _AUTOPILOT_NOT_APPLICABLE.items()]
-        slugs = [slug for slug in slugs if slug not in _AUTOPILOT_NOT_APPLICABLE]
-    else:
-        not_applicable = []
+    # No cluster shape on GKE rules any of these ten checks out: the one
+    # candidate was the four node-pool checks on Autopilot, and the comment
+    # above `check_pool_skew` records why that was wrong. A check the collector
+    # could not run for want of data is a `limitations` gap instead, which is
+    # what a missing `master-behind` baseline already produces.
+    not_applicable: list[dict] = []
 
     return slugs, candidates, not_applicable
 
