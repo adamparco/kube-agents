@@ -151,6 +151,17 @@ OVERREQUEST_FLOOR_GIB = 0.125
 # scheduling, and it is an upstream chart default no operator here owns.
 UNDERREQUEST_FLOOR_MIB = 128.0
 
+# `check_unsized`'s floor is not a materiality test like the two above -- it does
+# not decide whether to report, only what number to recommend. Everything this
+# check finds is worth reporting whatever its size, because the cost is the
+# scheduler booking zero rather than the request being wrong by some margin. But
+# 2x a near-silent sidecar's peak is `1m`/`1Mi`, which no scheduler decision
+# turns on and which leaves the pod as `Burstable`-in-name-only. On the live
+# fleet `argocd-dex-server` peaks at 0.4 millicores; recommending `1m` would
+# have been a manifest edit that changes nothing observable.
+UNSIZED_FLOOR_VCPU = 0.01
+UNSIZED_FLOOR_MIB = 32.0
+
 SYSTEM_NAMESPACES = frozenset(
     {
         "kube-system", "kube-public", "kube-node-lease", "gmp-system", "gmp-public", "gke-gmp-system",
@@ -1626,8 +1637,166 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
     return hits
 
 
+def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]:
+    """The population `_eligible_pods_by_owner` drops for declaring no request.
+
+    Every other exclusion is the same and applied in the same order, so a pod
+    lands in exactly one of the two sets: a controller is either sized (and its
+    value is 3.1/3.11's question) or unsized (and its value is 3.12's).
+    """
+    by_owner: dict[tuple, dict] = {}
+    for pod in context["pods"]:
+        meta, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
+        ns, name = meta.get("namespace", ""), meta.get("name", "")
+        if _is_system_namespace(ns):
+            continue
+        if status.get("phase") in ("Pending", "Terminating"):
+            continue
+        age = _age_days(status.get("startTime", ""), now=now)
+        if age is not None and age < (1 / 24):
+            continue
+        owners = meta.get("ownerReferences") or []
+        if any(o.get("kind") in ("Job",) for o in owners):
+            continue
+        if any(o.get("kind") == "DaemonSet" for o in owners):
+            continue
+        containers = spec.get("containers") or []
+        if not containers:
+            continue
+        requests = [(c.get("resources") or {}).get("requests") or {} for c in containers]
+        if any(requests):
+            continue  # sized: 3.1 and 3.11 own it
+        kind, owner_name = _sizing_owner(meta)
+        entry = by_owner.setdefault(
+            (ns, kind, owner_name),
+            {"ns": ns, "pods": [], "containers": [], "oldest_h": None},
+        )
+        entry["pods"].append({"ns": ns, "name": name})
+        for container in containers:
+            if container.get("name") and container["name"] not in entry["containers"]:
+                entry["containers"].append(container["name"])
+        if age is not None:
+            entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * 24)
+    return by_owner
+
+
+def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
+    """A controller that declares no request at all, priced from its usage.
+
+    §3.1 says it owns the request *value* and that the Workload Reliability
+    audit's `no-requests` owns the request's *absence*, "deferring the sizing
+    to here, where the usage history is". Nothing here accepted the handoff:
+    both sizing checks skip a container with no request, so the number was
+    never produced and the deferral ended nowhere. On the sixteen-cluster
+    adamparco-kage fleet on 2026-09-05 that was seven of the twenty-one
+    eligible controllers -- every Argo CD component on the hub, including an
+    application controller peaking at 0.18 vCPU and 1.6 GiB that the scheduler
+    books as zero. The reliability audit named all seven and, as designed,
+    proposed no number for any of them.
+
+    So this check states the number and nothing else. It never reports that a
+    request is missing -- that finding already exists in the other stream, and
+    §3.1's boundary rule is about the two audits not restating one another's
+    half. There is no oscillation risk in the pair: once the request lands at
+    2x the peak the workload sits at ~50% of it, which is neither idle enough
+    for 3.1 nor above the mean for 3.11, and `no-requests` stops firing too.
+    """
+    if not usage_peaks:
+        return []
+    by_owner = _unsized_pods_by_owner(context, now=now)
+
+    hits = []
+    for (_ns, kind, name), entry in by_owner.items():
+        peak_cpu = peak_mem = 0.0
+        measured = False
+        for pod in entry["pods"]:
+            key = (pod["ns"], pod["name"])
+            if key in usage_peaks:
+                measured = True
+            cpu, mem = usage_peaks.get(key, (0.0, 0.0))
+            peak_cpu += cpu
+            peak_mem += mem
+        # The whole finding is the measurement, so an unmeasured controller has
+        # nothing to say. Reporting it anyway would recommend requesting zero,
+        # which is the state being complained about.
+        if not measured:
+            continue
+
+        replicas = len(entry["pods"])
+        oldest_h = entry["oldest_h"]
+        window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
+        # §3.1's 2x, per replica, because the manifest declares one replica's
+        # request. Floored at the smallest values worth writing into a manifest
+        # so a near-silent sidecar is not handed a `1m`/`1Mi` request that no
+        # scheduler decision can turn on.
+        raw_cpu, raw_mem_mib = peak_cpu / replicas * 2, peak_mem / replicas * 2
+        want_cpu = max(raw_cpu, UNSIZED_FLOOR_VCPU)
+        want_mem_mib = max(raw_mem_mib, UNSIZED_FLOOR_MIB)
+        # Autopilot bills on requests and injects its own defaults where a
+        # manifest declares none, so an unsized workload there is not merely
+        # unbooked -- it is being charged for a number nobody chose. Same
+        # one-level bump §3.1 takes, and it stops at `major` for §3's reason:
+        # a `critical` manifest remediation opens a merge-ready pull request,
+        # and a right-size patch is never that urgent.
+        severity = "major" if autopilot else "minor"
+        # §3.1's units are vCPU and GiB, and this check does not use them. The
+        # workloads it finds are small by construction -- nobody forgets a
+        # request on the thing sized for the cluster -- and at that end `%.3f`
+        # vCPU and `%.2f` GiB round to zero. The live fleet on 2026-09-05
+        # produced "peak observed 0.000 vCPU / 0.03 GiB ... sized at 0.010
+        # vCPU / 68Mi", where the CPU figure reads as nothing at all and the
+        # memory figure cannot be compared to its own recommendation without
+        # arithmetic. So: millicores and mebibytes, the units the manifest
+        # edit is written in, and the peak is directly twice-able by eye.
+        peak_cpu_m, want_cpu_m = peak_cpu * 1000, want_cpu * 1000
+        excerpt = (
+            f"declares no CPU or memory request on "
+            f"{'container' if len(entry['containers']) == 1 else 'containers'} "
+            f"{', '.join(entry['containers'])}; peak observed {peak_cpu_m:.1f}m vCPU / "
+            f"{peak_mem:.0f}Mi over the trailing {window_h}h (Cloud Monitoring). "
+            f"Sized at 2x the peak that is {want_cpu_m:.0f}m / {want_mem_mib:.0f}Mi per replica"
+        )
+        if replicas > 1:
+            excerpt += (
+                f" — the peak above spans {replicas} replicas, and the manifest change is per replica"
+            )
+        # Without this the arithmetic in the sentence above is visibly wrong:
+        # `argocd-dex-server` peaks at 0.4m and is recommended 10m, and a
+        # reviewer who checks the doubling finds it off by twenty-five times.
+        # Read off the pre-floor values, not by comparing the floored result
+        # back against a re-derivation of them: `0.09 * 3 / 3 * 2` does not
+        # round-trip, and a three-replica controller nowhere near the floor
+        # claimed to be sitting on it.
+        floored = [
+            dim
+            for dim, hit in (
+                ("cpu", raw_cpu < UNSIZED_FLOOR_VCPU),
+                ("memory", raw_mem_mib < UNSIZED_FLOOR_MIB),
+            )
+            if hit
+        ]
+        if floored:
+            names = {"cpu": f"{UNSIZED_FLOOR_VCPU * 1000:.0f}m", "memory": f"{UNSIZED_FLOOR_MIB:.0f}Mi"}
+            excerpt += (
+                f" — the {' and '.join(floored)} figure is the "
+                f"{'/'.join(names[d] for d in floored)} floor rather than 2x the peak, "
+                f"which is below anything worth writing into a manifest"
+            )
+        excerpt += "."
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"{kind}/{name}",
+                "excerpt": excerpt,
+                "severity": severity,
+            }
+        )
+    return hits
+
+
 IMPACT = {
     "overrequest": "This controller reserves far more than it uses, so the scheduler and autoscaler size the cluster for capacity nothing needs.",
+    "unsized-workload": "With no request declared, the scheduler books nothing for this controller: it lands on nodes that are already full, it is BestEffort so kubelet evicts it first under pressure, and the autoscaler cannot count it when sizing the cluster.",
     "underrequest": "Sustained memory use above the request means the scheduler has under-booked every node this controller lands on, and kubelet ranks Burstable pods for eviction by exactly this overage — so it is the first thing evicted when any workload on that node needs memory.",
     "orphan-pv": "The backing disk still exists and no claim can bind it -- capacity paid for and unusable.",
     "unconsumed-pvc": "Provisioned storage sits bound with nothing reading or writing it.",
@@ -1845,11 +2014,18 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
 
     if metrics_ok:
         commands["overrequest"] = usage_record
+        commands["unsized-workload"] = usage_record
         for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
             emitted = _emit("overrequest", hit)
             if hit.get("_guaranteed"):
                 emitted["needs_triage"] = "guaranteed-qos"
             candidates.append(emitted)
+        # Same peak read, the complementary population: 3.1 sizes the
+        # controllers that declared a request, 3.12 the ones that did not.
+        candidates += [
+            _emit("unsized-workload", h)
+            for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
+        ]
     elif not context["nodes"]:
         # A cluster with no nodes cannot be over-requesting: there is no
         # capacity for a reservation to waste, and nothing has run for a
@@ -1874,14 +2050,27 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
                 ),
             }
         )
+        not_applicable.append(
+            {
+                "check": "unsized-workload",
+                "reason": (
+                    "This cluster has no nodes, so nothing has run and Cloud "
+                    "Monitoring holds no usage history for it. A request cannot "
+                    "be sized from a measurement that does not exist, and this "
+                    "check reports nothing else -- the absence of a request is "
+                    "the Workload Reliability audit's no-requests finding."
+                ),
+            }
+        )
     else:
         # §2's metrics degradation. `overrequest` already dropped out of
         # `commands` on its own, so §6 was raising it as a gap with no reason
         # attached -- a reader saw the check named and had nothing to tell them
         # whether it was denied, throttled, or never attempted.
         limitations.append(
-            f"overrequest could not be measured on this cluster: the Cloud "
-            f"Monitoring usage read failed (rc={usage_result.rc}) — "
+            f"overrequest and unsized-workload could not be measured on this "
+            f"cluster: the Cloud Monitoring usage read failed "
+            f"(rc={usage_result.rc}) — "
             f"{usage_result.stderr.strip()[:200] or 'no detail'}"
         )
 

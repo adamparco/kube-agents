@@ -1462,6 +1462,175 @@ class UnderrequestTest(unittest.TestCase):
         self.assertNotIn("replica", excerpt)
 
 
+class UnsizedWorkloadTest(unittest.TestCase):
+    """§3.12 -- the population §3.1 and §3.11 both skip.
+
+    Both sizing checks drop a container that declares no request, on the
+    grounds that the Workload Reliability audit's `no-requests` owns it. That
+    audit reports the absence and, by design, proposes no number, deferring the
+    value to here. Until this check existed the deferral ended nowhere: on the
+    sixteen-cluster fleet on 2026-09-05 seven of twenty-one eligible
+    controllers -- every Argo CD component on the hub -- were named by neither.
+    """
+
+    def pod(self, ns="argocd", name="argocd-repo-server-1", owner_kind="ReplicaSet",
+            owner_name="argocd-repo-server", started="2026-01-01T00:00:00Z", containers=None):
+        return obj(
+            "Pod", name, ns=ns,
+            **{
+                "spec.containers": containers or [{"name": "repo-server", "resources": {}}],
+                "status.startTime": started,
+                "status.phase": "Running",
+                "metadata.ownerReferences": [{"kind": owner_kind, "name": owner_name}],
+            },
+        )
+
+    def check(self, pods, peaks, autopilot=False):
+        return fw.check_unsized({"pods": pods}, peaks, now=NOW, autopilot=autopilot)
+
+    def test_flags_a_controller_that_declares_no_request(self):
+        """`argocd-application-controller` on the live hub: the scheduler books
+        zero for a workload peaking at 0.175 vCPU and 1.587 GiB."""
+        pod = self.pod(name="argocd-application-controller-0", owner_kind="StatefulSet",
+                       owner_name="argocd-application-controller")
+        peaks = {("argocd", "argocd-application-controller-0"): (0.175, 1625.0)}
+        hits = self.check([pod], peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "StatefulSet/argocd-application-controller")
+        self.assertEqual(hits[0]["namespace"], "argocd")
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_the_excerpt_carries_the_measured_peak_and_the_recommendation(self):
+        """`adopt_collector_evidence` overwrites whatever the model wrote with
+        this string, so the number remediation sizes off has to be in it."""
+        pod = self.pod()
+        peaks = {("argocd", "argocd-repo-server-1"): (0.0071, 66.6)}
+        excerpt = self.check([pod], peaks)[0]["excerpt"]
+        self.assertIn("declares no CPU or memory request", excerpt)
+        self.assertIn("peak observed 7.1m vCPU / 67Mi", excerpt)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("14m / 133Mi per replica", excerpt)
+        self.assertNotIn("floor", excerpt)
+
+    def test_the_excerpt_is_written_in_the_units_of_the_manifest_edit(self):
+        """§3.1's vCPU and GiB round this population to zero -- nobody forgets
+        a request on the workload sized for the cluster, so everything here is
+        small. The live fleet on 2026-09-05 produced "peak observed 0.000 vCPU
+        / 0.03 GiB ... sized at 0.010 vCPU / 68Mi": a CPU peak that reads as
+        nothing, beside a memory recommendation in different units from the
+        measurement it is derived from."""
+        peaks = {("argocd", "argocd-repo-server-1"): (0.0004, 34.0)}
+        excerpt = self.check([self.pod()], peaks)[0]["excerpt"]
+        self.assertIn("0.4m vCPU", excerpt)
+        self.assertIn("34Mi over the trailing", excerpt)
+        self.assertNotIn("0.000", excerpt)
+        self.assertNotIn("GiB", excerpt)
+
+    def test_a_floored_figure_says_it_is_the_floor(self):
+        """Otherwise the arithmetic in the excerpt is visibly wrong: a
+        controller peaking at 0.4m recommended 10m is off by twenty-five
+        times, and a reviewer who checks the doubling finds it."""
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.0004, 34.0)})[0]["excerpt"]
+        self.assertIn("the cpu figure is the 10m floor rather than 2x the peak", excerpt)
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.0004, 4.0)})[0]["excerpt"]
+        self.assertIn("the cpu and memory figure is the 10m/32Mi floor", excerpt)
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.5, 4.0)})[0]["excerpt"]
+        self.assertIn("the memory figure is the 32Mi floor", excerpt)
+
+    def test_it_never_reports_the_absence_itself(self):
+        """§3.1's boundary rule: the two audits do not restate one another's
+        half. This one states the number; `no-requests` states that there is
+        no number. An excerpt phrased as a missing-request finding would put
+        the same defect in two ledgers under two severities."""
+        excerpt = self.check([self.pod()], {("argocd", "argocd-repo-server-1"): (0.01, 64.0)})[0]["excerpt"]
+        for phrasing in ("missing", "should declare", "no requests set", "unset"):
+            self.assertNotIn(phrasing, excerpt.lower())
+
+    def test_a_sized_controller_is_left_to_the_other_two_checks(self):
+        """The complement of `_eligible_pods_by_owner`: a pod lands in exactly
+        one of the two populations, so a controller cannot be both sized badly
+        and unsized."""
+        pod = OverrequestTest().deployment_pod()
+        self.assertEqual(self.check([pod], {("default", "api-1"): (0.9, 3072.0)}), [])
+
+    def test_a_partially_sized_controller_belongs_to_the_sizing_checks(self):
+        """One container with a request and one without is a pod the other two
+        checks already measure, and `_eligible_pods_by_owner` admits it on
+        `any(requests)`. Claiming it here too would double-report it."""
+        pod = self.pod(containers=[
+            {"name": "main", "resources": {"requests": {"cpu": "100m"}}},
+            {"name": "sidecar", "resources": {}},
+        ])
+        self.assertEqual(self.check([pod], {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}), [])
+
+    def test_an_unmeasured_controller_is_not_reported(self):
+        """The whole finding is the measurement. With no Monitoring answer the
+        recommendation would be to request zero, which is the state being
+        complained about."""
+        self.assertEqual(self.check([self.pod()], {("argocd", "other-pod"): (0.5, 500.0)}), [])
+        self.assertEqual(self.check([self.pod()], {}), [])
+
+    def test_a_measured_but_idle_controller_still_gets_a_floor(self):
+        """A near-silent sidecar measured at almost nothing must not be handed
+        a `0m`/`0Mi` request: no scheduler decision turns on it, and it is the
+        same BestEffort pod afterwards."""
+        peaks = {("argocd", "argocd-repo-server-1"): (0.0001, 1.0)}
+        excerpt = self.check([self.pod()], peaks)[0]["excerpt"]
+        self.assertIn("10m / 32Mi per replica", excerpt)
+
+    def test_it_shares_the_sizing_checks_exclusions(self):
+        """A DaemonSet, a Job pod, or a pod under an hour old is out of scope
+        for the sizing checks, and declaring no request does not put it back
+        in. `no-requests` on a DaemonSet is a real reliability finding; the
+        request value still is not this stream's to set."""
+        peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
+        cases = {
+            "daemonset": dict(owner_kind="DaemonSet", owner_name="ds"),
+            "job": dict(owner_kind="Job", owner_name="batch"),
+            "young": dict(started="2026-07-31T23:30:00Z"),
+            "system-namespace": dict(ns="kube-system"),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                key = (kwargs.get("ns", "argocd"), "argocd-repo-server-1")
+                self.assertEqual(self.check([self.pod(**kwargs)], {key: (0.01, 64.0)}), [])
+        self.assertEqual(len(self.check([self.pod()], peaks)), 1)  # the control
+
+    def test_the_recommendation_is_per_replica(self):
+        """The peak sums across replicas; the manifest declares one replica's
+        request. Dividing is the difference between a 2x headroom and a 2N x
+        one -- which on a three-replica controller reserves six times what it
+        needs and turns this finding into an `overrequest` next week."""
+        # Three replicas, so 2x-per-replica (0.18) is distinct from both the
+        # summed peak (0.27) and one replica's share of it (0.09) -- at two
+        # replicas the first two collide and the test would pass either way.
+        pods = [self.pod(name=f"argocd-repo-server-{i}") for i in (1, 2, 3)]
+        peaks = {("argocd", f"argocd-repo-server-{i}"): (0.09, 100.0) for i in (1, 2, 3)}
+        excerpt = self.check(pods, peaks)[0]["excerpt"]
+        self.assertIn("peak observed 270.0m vCPU / 300Mi", excerpt)
+        self.assertIn("180m / 200Mi per replica", excerpt)
+        self.assertIn("spans 3 replicas", excerpt)
+        # `0.09 * 3 / 3 * 2` does not round-trip, and comparing the floored
+        # result back against a re-derivation of the raw value claimed this
+        # controller -- eighteen times the CPU floor -- was sitting on it.
+        self.assertNotIn("floor", excerpt)
+
+    def test_autopilot_takes_the_same_one_level_bump_as_overrequest(self):
+        """Autopilot bills on requests and substitutes its own default where a
+        manifest declares none, so the number is being paid for either way."""
+        pod = self.pod()
+        peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
+        self.assertEqual(self.check([pod], peaks, autopilot=True)[0]["severity"], "major")
+
+    def test_it_never_reaches_critical(self):
+        """§3 caps a manifest remediation below `critical`, which opens a
+        merge-ready pull request. A right-size patch is never that urgent."""
+        peaks = {("argocd", "argocd-repo-server-1"): (8.0, 65536.0)}
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                self.assertNotEqual(self.check([self.pod()], peaks, autopilot=autopilot)[0]["severity"], "critical")
+
+
 class UnattachedDiskTest(unittest.TestCase):
     def disk(self, name="d1", size_gb=200, created="2026-01-01T00:00:00Z", disk_type="pd-standard", users=None):
         return {"name": name, "sizeGb": str(size_gb), "type": disk_type, "creationTimestamp": created, "zone": "us-central1-a", "users": users or []}
@@ -2079,11 +2248,13 @@ class CollectClusterTest(unittest.TestCase):
         # where the check is not applicable rather than degraded.
         entry = self._metrics_down(obj("Node", "node-1"))
         self.assertEqual(entry["outcome"], "collected")
+        # Both checks read the same peak query, so they are lost together.
         self.assertNotIn("overrequest", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("unsized-workload", {c["check"] for c in entry["commands"]})
         # Dropping the check out of `commands` is only half the job: §6 raises
         # it as a gap either way, and without this the ledger named a check
         # nobody could explain.
-        self.assertIn("overrequest could not be measured", entry["limitations"])
+        self.assertIn("overrequest and unsized-workload could not be measured", entry["limitations"])
         self.assertIn("Cloud Monitoring", entry["limitations"])
 
     def test_a_denied_usage_read_says_so_rather_than_saying_no_data(self):
@@ -2104,15 +2275,16 @@ class CollectClusterTest(unittest.TestCase):
         # Autopilot peers on 2026-08-29 -- a gap naming a check that had no
         # object to run against.
         #
-        # Both sizing checks take the same exemption, and for the same reason:
-        # neither an over- nor an under-sized request can exist where nothing
-        # is scheduled.
+        # All three sizing checks take the same exemption, and for the same
+        # reason: neither an over- nor an under-sized request can exist where
+        # nothing is scheduled, and an absent one cannot be sized from a
+        # history that was never recorded.
         entry = self._metrics_down()
         self.assertEqual(entry["outcome"], "collected")
         self.assertNotIn("limitations", entry)
         self.assertEqual(
             {na["check"] for na in entry["checks_not_applicable"]},
-            {"overrequest", "underrequest"},
+            {"overrequest", "underrequest", "unsized-workload"},
         )
         for na in entry["checks_not_applicable"]:
             self.assertIn("no nodes", na["reason"])
