@@ -1326,6 +1326,149 @@ class OverrequestTest(unittest.TestCase):
         self.assertIn("Totals span 2 replicas", excerpt)
 
 
+class OverrequestResizeIsANoOpTest(unittest.TestCase):
+    """A finding whose own remediation changes nothing is not reported.
+
+    §3.1 resizes an idle request to `ceil(peak x 2)` per replica, floored at
+    `50m` / `64Mi`. A controller already sitting on that floor on every
+    dimension the finding calls idle has a recommendation identical to the
+    request it already declares -- so no manifest edit closes it and the model,
+    following the rule correctly, answers "already at the sizing floor; no
+    resize is possible". The 2026-09-05 cost report carried three of them
+    (`hello-world` on `adam-new-cluster`, `adamparco-gitops` and
+    `ap-ap-deploy-test`), each graded `major` by the Autopilot bump.
+    """
+
+    pod = OverrequestTest().deployment_pod
+
+    def hits(self, pods, peaks, autopilot=False):
+        return fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=autopilot)
+
+    def test_a_controller_already_on_the_floor_is_not_reported(self):
+        # `hello-world` verbatim: two replicas at 50m/64Mi each, peaking at
+        # 0.010 vCPU / 19 MiB across both over the week. Idle on both
+        # dimensions, material on CPU at exactly 100m -- and unshrinkable,
+        # because 2x the per-replica peak clamps to the floor it is already on.
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="50m", mem_req="64Mi") for i in (1, 2)]
+        peaks = {("default", "hw-1"): (0.005, 9.5), ("default", "hw-2"): (0.005, 9.5)}
+        self.assertEqual(self.hits(pods, peaks), [])
+        # And the Autopilot bump does not resurrect it: the drop happens before
+        # severity is decided, so it is not merely graded down to `minor`.
+        self.assertEqual(self.hits(pods, peaks, autopilot=True), [])
+
+    def test_one_millicore_above_the_floor_is_still_reported(self):
+        """The control that says it is this gate and not the materiality floor.
+
+        51m per replica is over the resize floor by the smallest amount a
+        manifest can express, and 102m of request still clears the 100m
+        materiality floor -- so the only thing separating it from the case
+        above is whether a resize would change the number.
+        """
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="51m", mem_req="64Mi") for i in (1, 2)]
+        peaks = {("default", "hw-1"): (0.005, 9.5), ("default", "hw-2"): (0.005, 9.5)}
+        self.assertEqual([h["object"] for h in self.hits(pods, peaks)], ["ReplicaSet/hello-world"])
+
+    def test_a_three_replica_controller_on_the_floor_is_not_reported(self):
+        """The per-replica quotient is a float, and an exact `>` fails here.
+
+        Three pods of `50m` sum to 0.15000000000000002, so a third of the total
+        is a hair above the 50m the controller declares -- which an exact
+        comparison reads as a reclaimable delta and reports. Every
+        three-replica controller on the floor would come back.
+        """
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="50m", mem_req="64Mi") for i in (1, 2, 3)]
+        peaks = {("default", f"hw-{i}"): (0.005, 9.5) for i in (1, 2, 3)}
+        self.assertEqual(self.hits(pods, peaks), [])
+
+    def test_a_floor_bound_dimension_does_not_veto_a_shrinkable_one(self):
+        """CPU is on the floor; memory is idle at 8 GiB with 7-and-change to
+        give back. The finding is about the memory, and it says so."""
+        pod = self.pod(cpu_req="50m", mem_req="8Gi")
+        hits = self.hits([pod], {("default", "api-1"): (0.001, 100.0)})
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on memory only", hits[0]["excerpt"])
+
+    def test_a_floor_bound_dimension_is_not_described_as_in_use(self):
+        """CPU at 2% of a 50m request is idle, just not reclaimable.
+
+        The excerpt's single-dimension clause exists to stop a reader resizing
+        a dimension the workload is consuming. Reusing that wording for a
+        floor-bound dimension would tell the reviewer something false about the
+        workload -- and this excerpt is what `adopt_collector_evidence`
+        substitutes for whatever the model wrote, so it is the version that
+        reaches the ledger.
+        """
+        pod = self.pod(cpu_req="50m", mem_req="8Gi")
+        excerpt = self.hits([pod], {("default", "api-1"): (0.001, 100.0)})[0]["excerpt"]
+        self.assertIn("cpu is already at the 50m/64Mi sizing floor", excerpt)
+        self.assertNotIn("in use", excerpt)
+
+    def test_a_dimension_genuinely_in_use_still_says_so(self):
+        # The control for the branch above: memory at 86% of its request is
+        # excluded for the original reason, and the original wording holds.
+        pod = self.pod(cpu_req="1100m", mem_req="1Gi")
+        excerpt = self.hits([pod], {("default", "api-1"): (0.167, 880.0)})[0]["excerpt"]
+        self.assertIn("memory is in use and must not be resized", excerpt)
+
+    def test_a_shrinkable_dimension_in_use_does_not_rescue_the_finding(self):
+        """Only the dimensions the finding calls idle are consulted.
+
+        Memory here is at 39% of its request -- not idle, so the excerpt never
+        proposes touching it -- and `2x peak` would nonetheless come out below
+        what it declares. Letting that count would publish a finding whose only
+        reclaimable dimension is one §3.1 forbids resizing.
+        """
+        pods = [self.pod(name=f"api-{i}", cpu_req="50m", mem_req="1Gi") for i in (1, 2, 3, 4)]
+        peaks = {("default", f"api-{i}"): (0.0005, 400.0) for i in (1, 2, 3, 4)}
+        # Material on CPU: 4 x 50m is 200m, twice the 100m floor.
+        self.assertEqual(self.hits(pods, peaks), [])
+
+    def test_memory_on_the_floor_is_dropped_when_cpu_is_in_use(self):
+        # The mirror of the case above: memory is the idle dimension, it clears
+        # the 0.125 GiB materiality floor only because there are two replicas,
+        # and 64Mi each is exactly the resize floor.
+        pods = [self.pod(name=f"api-{i}", cpu_req="1", mem_req="64Mi") for i in (1, 2)]
+        peaks = {("default", f"api-{i}"): (0.9, 10.0) for i in (1, 2)}
+        self.assertEqual(self.hits(pods, peaks), [])
+
+    def test_the_resize_floors_match_the_sop(self):
+        self.assertEqual(fw.OVERREQUEST_RESIZE_FLOOR_VCPU, 0.05)
+        self.assertEqual(fw.OVERREQUEST_RESIZE_FLOOR_MIB, 64.0)
+        self.assertEqual(fw.OVERREQUEST_PEAK_MULTIPLIER, 2)
+
+    def test_the_gate_is_evaluated_per_replica_and_not_on_the_totals(self):
+        """Ten replicas on the floor total 500m, which shrinks; each does not.
+
+        Reading the gate off the summed request would report the largest
+        instance of exactly the shape it exists to drop -- and the
+        recommendation the reader then gets is `50m`, which is what all ten
+        pods already declare.
+        """
+        pods = [self.pod(name=f"hw-{i}", owner_name="hello-world", cpu_req="50m", mem_req="64Mi") for i in range(10)]
+        peaks = {("default", f"hw-{i}"): (0.005, 9.5) for i in range(10)}
+        self.assertEqual(self.hits(pods, peaks), [])
+        self.assertFalse(
+            fw._resize_shrinks_request(0.5, 0.05, 10, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+        # The same totals read as a single replica do shrink, which is what a
+        # totals-based gate would have computed.
+        self.assertTrue(
+            fw._resize_shrinks_request(0.5, 0.05, 1, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+
+    def test_a_replica_count_of_zero_is_not_a_division(self):
+        self.assertFalse(
+            fw._resize_shrinks_request(1.0, 0.0, 0, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+
+    def test_a_request_below_the_floor_is_a_raise_and_not_a_shrink(self):
+        # 10m per replica is under the 50m the rule would resize it to, so the
+        # answer is not "shrink by a little", it is "do not touch this".
+        self.assertFalse(
+            fw._resize_shrinks_request(0.01, 0.0, 1, floor=fw.OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001)
+        )
+
+
 class UnderrequestTest(unittest.TestCase):
     """§3.11 -- the other direction of the same sizing edit as `overrequest`."""
 

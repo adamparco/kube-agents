@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -135,6 +136,26 @@ MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 # grades `major`.
 OVERREQUEST_FLOOR_VCPU = 0.1
 OVERREQUEST_FLOOR_GIB = 0.125
+
+# The floor the SOP's remediation clamps a resized request to: `ceil(peak x 2)`
+# per replica, never below `50m` / `64Mi`. This is a different quantity from the
+# materiality floors above, which decide whether a request is large enough to be
+# worth reporting; these decide what the new request would be.
+#
+# A controller already sitting at this floor on every dimension the excerpt calls
+# idle has a recommendation identical to the request it already declares, so the
+# finding proposes no change and no manifest edit closes it. The 2026-09-05 cost
+# report carried three of them -- `hello-world` on `adam-new-cluster`,
+# `adamparco-gitops` and `ap-ap-deploy-test`, each 50m/64Mi per replica, each
+# graded `major` by the Autopilot bump, and each answered by the model with
+# "already at the sizing floor; no manifest resize is possible". Three findings a
+# week that the audit's own remediation rule proves unactionable teach a reader
+# to scroll past the section they are in.
+OVERREQUEST_RESIZE_FLOOR_VCPU = 0.05
+OVERREQUEST_RESIZE_FLOOR_MIB = 64.0
+
+# The headroom multiplier §3.1 sizes a resized request at.
+OVERREQUEST_PEAK_MULTIPLIER = 2
 
 # `check_underrequest`'s floor is on the overage -- how far sustained usage sits
 # above the request -- rather than on the request, because that overage is the
@@ -1434,6 +1455,50 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
     return by_owner
 
 
+def _resize_shrinks_request(
+    request_total: float, peak_total: float, replicas: int, *, floor: float, unit: float
+) -> bool:
+    """Would §3.1's resize actually lower this dimension's request?
+
+    The remediation is `ceil(peak x 2)` per replica, clamped up to `50m` /
+    `64Mi`. Where that arithmetic lands on the request the controller already
+    declares, the dimension is idle but not reclaimable: no manifest edit
+    closes it, and the model, following the rule correctly, answers "already at
+    the sizing floor". The 2026-09-05 cost report carried three findings that
+    were nothing but this -- `hello-world` on `adam-new-cluster`,
+    `adamparco-gitops` and `ap-ap-deploy-test`, each 50m/64Mi per replica and
+    each graded `major` by the Autopilot bump.
+
+    This is not the materiality floor relaxing. That floor asks whether the
+    *request* is large enough to be worth reporting and deliberately ignores
+    the reclaimable delta, because a 199m delta on a 200m request is worth
+    taking. This asks whether a reclaimable delta exists at all once the resize
+    floor is applied -- a strictly narrower question.
+
+    In practice only that floor can make the answer "no". A dimension reaches
+    here having passed `peak <= 0.2 * request`, so `2 x peak` is at most 40% of
+    the request and always shrinks it. The `ceil` is applied rather than
+    assumed away so this stays a faithful evaluation of the rule if the idle
+    ratio or either floor moves.
+
+    `unit` is the smallest amount a manifest can express -- a millicore for
+    CPU, a MiB for memory -- which is what the `ceil` rounds up to. Both totals
+    are summed across the controller's pods; the edit is per replica.
+    """
+    if replicas <= 0:
+        return False
+    request_per_replica = request_total / replicas
+    peak_per_replica = peak_total / replicas
+    rounded = math.ceil(peak_per_replica * OVERREQUEST_PEAK_MULTIPLIER / unit) * unit
+    target = max(floor, rounded)
+    # A relative tolerance, because the request is a per-replica quotient of a
+    # sum: three pods of `50m` total 0.15000000000000002, and a third of that
+    # is a hair over 0.05. An exact `>` would call that hair a reclaimable
+    # delta and report every three-replica controller sitting on the floor --
+    # the exact shape this gate exists to drop.
+    return request_per_replica - target > max(request_per_replica, target) * 1e-9
+
+
 def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
     """`usage_peaks` is `fetch_usage_peaks`'s `(ns, pod) -> (cores, MiB)`.
 
@@ -1492,8 +1557,24 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # separate sizing decision and gets a separate verdict; only the idle
         # one contributes to the reclaimable delta, so a finding never proposes
         # shrinking a request the workload is actually consuming.
-        cpu_idle = bool(cpu_req_total) and peak_cpu / cpu_req_total <= 0.2
-        mem_idle = bool(mem_req_total) and peak_mem / mem_req_total <= 0.2
+        cpu_unused = bool(cpu_req_total) and peak_cpu / cpu_req_total <= 0.2
+        mem_unused = bool(mem_req_total) and peak_mem / mem_req_total <= 0.2
+        if not (cpu_unused or mem_unused):
+            continue
+        # Idle is not the same as reclaimable. §3.1 resizes a request to
+        # `ceil(peak x 2)` per replica but never below `50m` / `64Mi`, so a
+        # dimension already on that floor has a recommendation identical to
+        # what it declares. Narrowing here rather than at the end means the
+        # materiality floor, the reclaimable delta, the severity and the
+        # excerpt all read the same verdict: a controller with nothing to give
+        # back on any dimension is dropped, and one with a floor-bound
+        # dimension alongside a shrinkable one reports only the shrinkable one.
+        cpu_idle = cpu_unused and _resize_shrinks_request(
+            cpu_req_total, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+        )
+        mem_idle = mem_unused and _resize_shrinks_request(
+            mem_req_total, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+        )
         if not (cpu_idle or mem_idle):
             continue
 
@@ -1536,10 +1617,21 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if len(dimensions) == 1:
             over = dimensions[0]
             at = (peak_cpu / cpu_req_total) if over == "cpu" else (peak_mem / mem_req_total)
-            excerpt += (
-                f". Over-requested on {over} only ({at * 100:.0f}% of request); the other dimension is "
-                f"in use and must not be resized"
+            # Two reasons a dimension can be left out, and they call for
+            # opposite handling. "In use" means resizing it would take away
+            # something the workload consumes. "On the floor" means it is idle
+            # too, but `ceil(peak x 2)` clamps to what it already declares, so
+            # there is nothing to take. Saying "in use" of a floor-bound
+            # dimension would be a false statement about the workload, and the
+            # excerpt is the one part of the finding `adopt_collector_evidence`
+            # guarantees reaches the reviewer.
+            other, other_unused = ("memory", mem_unused) if over == "cpu" else ("cpu", cpu_unused)
+            why = (
+                "already at the 50m/64Mi sizing floor and cannot be reduced further"
+                if other_unused
+                else "in use and must not be resized"
             )
+            excerpt += f". Over-requested on {over} only ({at * 100:.0f}% of request); {other} is {why}"
         if replicas > 1:
             excerpt += (
                 f". Totals span {replicas} replicas — per replica that is "
