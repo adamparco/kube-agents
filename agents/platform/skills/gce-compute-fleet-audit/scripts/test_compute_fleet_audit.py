@@ -70,40 +70,6 @@ def mig(name: str = "mig-1", zone: str = "us-central1-a", **actions) -> dict:
     }
 
 
-def disk(name: str = "disk-1", zone: str = "us-central1-a", **overrides) -> dict:
-    """One `compute disks list` item, attached and healthy unless told otherwise.
-
-    The baseline is attached on purpose. A fixture of zero disks and zero
-    snapshots used to stand in for a clean project, which meant every
-    `collect_project` test ran §2.5 and §2.6 over nothing and asserted the
-    silence that produced — the exact shape those two checks now declare
-    inapplicable.
-    """
-    base = {
-        "name": name,
-        "selfLink": f"https://x/projects/proj-1/zones/{zone}/disks/{name}",
-        "zone": f"https://x/projects/proj-1/zones/{zone}",
-        "status": "READY",
-        "sizeGb": "100",
-        "type": f"https://x/projects/proj-1/zones/{zone}/diskTypes/pd-balanced",
-        "creationTimestamp": OLD_STAMP,
-        "users": [f"https://x/projects/proj-1/zones/{zone}/instances/vm-1"],
-    }
-    base.update(overrides)
-    return base
-
-
-def snapshot_of(source: dict, name: str = "snap-1", **overrides) -> dict:
-    """One `compute snapshots list` item pointing at a disk that still exists."""
-    base = {
-        "name": name,
-        "sourceDisk": source["selfLink"],
-        "creationTimestamp": OLD_STAMP,
-    }
-    base.update(overrides)
-    return base
-
-
 def node(cpus: int = 8, used_cpus: int = 0, mem: int = 32768, used_mem: int = 0) -> dict:
     """One `sole-tenancy node-groups list-nodes` item."""
     return {
@@ -300,273 +266,6 @@ class OrphanedSnapshotTest(unittest.TestCase):
         self.assertEqual(cf.active_disk_index([None, "d1"]), set())
 
 
-class UnattachedDiskTest(unittest.TestCase):
-    """§2.6. `disk()` is attached, so every flagging case has to detach it."""
-
-    DETACHED = "2026-08-01T00:00:00.000-08:00"
-
-    def idle(self, **overrides) -> dict:
-        overrides.setdefault("lastDetachTimestamp", self.DETACHED)
-        return disk(users=[], **overrides)
-
-    def test_flags_a_disk_detached_past_the_threshold(self):
-        hit = cf.check_unattached_disk(self.idle(), NOW)
-        self.assertEqual(hit["object"], "Disk/us-central1-a/disk-1")
-        self.assertIn('"users": []', hit["excerpt"])
-        self.assertIn('"lastDetachTimestamp"', hit["excerpt"])
-        self.assertIn('"idleDays": 33', hit["excerpt"])
-        self.assertIn("100 GB pd-balanced", hit["impact"])
-
-    def test_a_detached_plain_disk_carries_no_triage_marker(self):
-        """The detach timestamp settles it: this capacity was in service and is
-        not any more, and no CSI marker says a PVC might want it back."""
-        self.assertIsNone(cf.check_unattached_disk(self.idle(), NOW)["needs_triage"])
-
-    def test_a_csi_disk_is_flagged_for_triage_by_its_description(self):
-        """Detached is the resting state of a PersistentVolume whose workload is
-        not scheduled — a StatefulSet at zero replicas, a pod stuck Pending. The
-        PVC reattaches it, so deleting one destroys live data."""
-        hit = cf.check_unattached_disk(
-            self.idle(
-                description='{"kubernetes.io/created-for/pvc/name": "platform-agent-data"}'
-            ),
-            NOW,
-        )
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_CSI_MANAGED)
-
-    def test_a_csi_disk_is_flagged_for_triage_by_its_labels_alone(self):
-        """A disk restored from a snapshot of a PV keeps the GKE labels and
-        loses the CSI description; reading only the description misses it."""
-        hit = cf.check_unattached_disk(
-            self.idle(labels={"goog-k8s-cluster-name": "platform-agent-host"}), NOW
-        )
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_CSI_MANAGED)
-
-    def test_csi_outranks_never_attached(self):
-        """Both limbs apply to a freshly provisioned PV nothing has mounted yet.
-        The marker that ships is the one whose wrong answer loses data."""
-        hit = cf.check_unattached_disk(
-            disk(users=[], description='{"kubernetes.io/created-for/pvc/name": "d"}'), NOW
-        )
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_CSI_MANAGED)
-
-    def test_a_pvc_shaped_name_alone_is_not_a_csi_marker(self):
-        """The `pvc-<uuid>` name is the driver's default, not a record: a
-        StorageClass `volumeNameTemplate` or a static PV produces a CSI disk
-        under another name, and any disk can be given this one by hand."""
-        hit = cf.check_unattached_disk(
-            self.idle(name="pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34"), NOW
-        )
-        self.assertIsNone(hit["needs_triage"])
-
-    def test_non_gke_labels_do_not_make_a_disk_csi_managed(self):
-        self.assertIsNone(
-            cf.check_unattached_disk(self.idle(labels={"env": "prod"}), NOW)["needs_triage"]
-        )
-
-    # --- the cluster-existence limb ---------------------------------------- #
-
-    def gke(self, cluster: str = "platform-agent-host", **overrides) -> dict:
-        """A GKE PersistentVolume's disk, in the shape the reference install's
-        two real orphans have: a `pvc-<uuid>` name, the CSI description, and the
-        `goog-k8s-*` labels."""
-        overrides.setdefault(
-            "description",
-            '{"kubernetes.io/created-for/pvc/name": "platform-agent-data", '
-            '"kubernetes.io/created-for/pvc/namespace": "kubeagents-system"}',
-        )
-        overrides.setdefault(
-            "labels",
-            {"goog-k8s-cluster-name": cluster, "goog-k8s-node-pool-name": "gvisor-pool"},
-        )
-        overrides.setdefault("name", "pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34")
-        return self.idle(**overrides)
-
-    def test_a_disk_whose_cluster_is_gone_is_certain_not_triaged(self):
-        """Reattachment needs a PersistentVolumeClaim and a claim needs an API
-        server. A deleted cluster has neither, so nothing is left to confirm."""
-        hit = cf.check_unattached_disk(self.gke(), NOW, {"kube-agents-host"})
-        self.assertIsNone(hit["needs_triage"])
-        self.assertIn('"clusterExists": false', hit["excerpt"])
-        self.assertIn('"cluster": "platform-agent-host"', hit["excerpt"])
-        self.assertIn("no longer exists", hit["impact"])
-
-    def test_a_disk_whose_cluster_is_live_stays_triaged(self):
-        hit = cf.check_unattached_disk(self.gke(), NOW, {"platform-agent-host"})
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_CSI_MANAGED)
-        self.assertNotIn("clusterExists", hit["excerpt"])
-        self.assertIn('"cluster": "platform-agent-host"', hit["excerpt"])
-
-    def test_an_unread_cluster_list_is_not_an_empty_one(self):
-        """`None` means the read did not happen. Treating it as "no clusters
-        exist" would call every GKE volume in the project certainly orphaned on
-        the strength of a failed API call."""
-        hit = cf.check_unattached_disk(self.gke(), NOW, None)
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_CSI_MANAGED)
-        self.assertNotIn("clusterExists", hit["excerpt"])
-
-    def test_a_deleted_cluster_shortens_the_window(self):
-        """Four days idle: under the fourteen-day bar, over the three-day one.
-        The long window guards against a reattachment that cannot happen here."""
-        four_days = "2026-08-31T00:00:00.000+00:00"
-        self.assertIsNotNone(
-            cf.check_unattached_disk(
-                self.gke(lastDetachTimestamp=four_days), NOW, {"other"}
-            )
-        )
-        self.assertIsNone(
-            cf.check_unattached_disk(
-                self.gke(lastDetachTimestamp=four_days), NOW, {"platform-agent-host"}
-            )
-        )
-
-    def test_the_short_window_still_has_a_floor(self):
-        """A cluster being rebuilt under the same name is absent from the list
-        while it is being recreated, and a disk kept for that rebuild must not
-        be flagged during the window it is being kept for."""
-        yesterday = "2026-09-03T00:00:00.000+00:00"
-        self.assertIsNone(
-            cf.check_unattached_disk(
-                self.gke(lastDetachTimestamp=yesterday), NOW, {"other"}
-            )
-        )
-
-    def test_an_unlabelled_disk_is_unaffected_by_the_cluster_list(self):
-        """No `goog-k8s-cluster-name` means no cluster to have outlived, so the
-        long window and the plain disposition both stand."""
-        hit = cf.check_unattached_disk(self.idle(), NOW, set())
-        self.assertIsNone(hit["needs_triage"])
-        self.assertNotIn("clusterExists", hit["excerpt"])
-
-    def test_a_non_object_labels_field_is_not_a_crash(self):
-        self.assertIsNone(
-            cf.check_unattached_disk(self.idle(labels="goog-k8s-cluster-name"), NOW)[
-                "needs_triage"
-            ]
-        )
-
-    def test_a_never_attached_disk_is_flagged_and_marked_for_triage(self):
-        """No `lastDetachTimestamp` at all: `creationTimestamp` is the only
-        clock, and staged-on-purpose is a live possibility the collector cannot
-        rule out from the payload."""
-        hit = cf.check_unattached_disk(disk(users=[]), NOW)
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_NEVER_ATTACHED)
-        self.assertIn('"creationTimestamp"', hit["excerpt"])
-
-    def test_the_detach_stamp_wins_over_creation(self):
-        """A disk created years ago and detached yesterday has been idle for a
-        day. Measuring from creation would flag every long-lived volume the
-        moment it was unmounted."""
-        self.assertIsNone(
-            cf.check_unattached_disk(disk(users=[], lastDetachTimestamp=FRESH_STAMP), NOW)
-        )
-
-    def test_does_not_flag_an_attached_disk(self):
-        self.assertIsNone(cf.check_unattached_disk(disk(), NOW))
-
-    def test_does_not_flag_the_boot_disk_of_a_stopped_instance(self):
-        """A `TERMINATED` instance still holds its boot disk in `users`, so a
-        deliberately parked VM must not read as abandoned capacity."""
-        parked = disk(users=["https://x/projects/proj-1/zones/us-central1-a/instances/off-1"])
-        self.assertIsNone(cf.check_unattached_disk(parked, NOW))
-
-    def test_does_not_flag_a_disk_inside_the_fourteen_day_window(self):
-        self.assertIsNone(
-            cf.check_unattached_disk(disk(users=[], lastDetachTimestamp=FRESH_STAMP), NOW)
-        )
-
-    def test_does_not_flag_a_disk_that_is_not_ready(self):
-        """`CREATING`, `RESTORING` and `DELETING` all look unattached from
-        outside, because being unattached is what those states are."""
-        for status in ("CREATING", "RESTORING", "DELETING", "FAILED"):
-            with self.subTest(status=status):
-                self.assertIsNone(
-                    cf.check_unattached_disk(
-                        self.idle(status=status),
-                        NOW,
-                    )
-                )
-
-    def test_a_snapshot_schedule_is_not_an_exclusion(self):
-        """The inverse of §2.5's `resourcePolicies` rule: there a policy means
-        somebody retains the snapshot on purpose, here it means the project is
-        also paying to back up a volume nothing reads."""
-        self.assertIsNotNone(
-            cf.check_unattached_disk(self.idle(resourcePolicies=["daily"]), NOW)
-        )
-
-    def test_the_pvc_is_carried_into_the_excerpt_as_namespace_and_name(self):
-        """A `pvc-<uuid>` name identifies nothing a human recognises; the PD CSI
-        driver's `description` is the whole of what makes the finding
-        actionable, and two of its four keys are all of that."""
-        hit = cf.check_unattached_disk(
-            self.idle(
-                name="pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34",
-                description=(
-                    '{"kubernetes.io/created-for/pv/name": "pvc-d45cfdfd", '
-                    '"kubernetes.io/created-for/pvc/name": "platform-agent-data", '
-                    '"kubernetes.io/created-for/pvc/namespace": "kubeagents-system", '
-                    '"storage.gke.io/created-by": "pd.csi.storage.gke.io"}'
-                ),
-            ),
-            NOW,
-        )
-        self.assertIn('"pvc": "kubeagents-system/platform-agent-data"', hit["excerpt"])
-
-    def test_a_pvc_with_no_namespace_is_named_bare(self):
-        hit = cf.check_unattached_disk(
-            self.idle(description='{"kubernetes.io/created-for/pvc/name": "data"}'), NOW
-        )
-        self.assertIn('"pvc": "data"', hit["excerpt"])
-
-    def test_an_unparseable_description_yields_no_origin_rather_than_a_guess(self):
-        """A guessed origin on a disk somebody is about to delete is worse than
-        none. The disk still ships — it is still unattached — and still counts
-        as CSI-managed, because the marker was found."""
-        hit = cf.check_unattached_disk(
-            self.idle(description="kubernetes.io/created-for = not json"), NOW
-        )
-        self.assertNotIn('"pvc"', hit["excerpt"])
-        self.assertEqual(hit["needs_triage"], cf.TRIAGE_CSI_MANAGED)
-
-    def test_another_tools_json_description_is_not_read_as_a_pvc(self):
-        hit = cf.check_unattached_disk(self.idle(description='{"owner": "ops"}'), NOW)
-        self.assertNotIn('"pvc"', hit["excerpt"])
-        self.assertIsNone(hit["needs_triage"])
-
-    def test_the_cluster_label_is_carried_into_the_excerpt(self):
-        """`goog-k8s-cluster-name` is how a reader learns the disk outlived its
-        cluster — the two real orphans on the reference install name a cluster
-        that no longer exists."""
-        hit = cf.check_unattached_disk(
-            self.idle(labels={"goog-k8s-cluster-name": "platform-agent-host"}), NOW
-        )
-        self.assertIn('"cluster": "platform-agent-host"', hit["excerpt"])
-
-    def test_an_unparseable_timestamp_is_not_a_crash_and_not_a_finding(self):
-        self.assertIsNone(
-            cf.check_unattached_disk(self.idle(lastDetachTimestamp="whenever"), NOW)
-        )
-
-    def test_a_naive_timestamp_is_not_a_crash(self):
-        self.assertIsNone(
-            cf.check_unattached_disk(
-                self.idle(lastDetachTimestamp="2020-01-01T00:00:00"), NOW
-            )
-        )
-
-    def test_a_disk_with_no_timestamp_at_all_is_not_a_finding(self):
-        self.assertIsNone(
-            cf.check_unattached_disk(disk(users=[], creationTimestamp=""), NOW)
-        )
-
-    def test_a_disk_with_no_name_is_not_a_finding(self):
-        self.assertIsNone(cf.check_unattached_disk(self.idle(name=""), NOW))
-
-    def test_a_non_object_item_is_not_a_crash(self):
-        self.assertIsNone(cf.check_unattached_disk("disk-1", NOW))
-
-
 class CollectProjectTest(unittest.TestCase):
     def fake_run(self, responses: dict) -> cf.RunFn:
         """`responses` maps a substring of the joined argv to a `Run`. First
@@ -593,14 +292,8 @@ class CollectProjectTest(unittest.TestCase):
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
             "node-groups list": run_of(0, "[]"),
-            # One attached disk and one snapshot of it: §2.5 and §2.6 both have
-            # a subject, both examine it, and neither flags it. Stubbing both
-            # lists empty instead would put the two slugs into
-            # `checks_not_applicable`, and a test asserting no candidates would
-            # be asserting that a check nobody ran found nothing.
-            "disks list": run_of(0, json.dumps([disk()])),
-            "snapshots list": run_of(0, json.dumps([snapshot_of(disk())])),
-            "container clusters list": run_of(0, '[{"name": "cluster-1"}]'),
+            "disks list": run_of(0, "[]"),
+            "snapshots list": run_of(0, "[]"),
         }
         responses.update(overrides)
         return responses
@@ -1267,9 +960,8 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
             "node-groups list": run_of(0, "[]"),
-            "disks list": run_of(0, json.dumps([disk()])),
-            "snapshots list": run_of(0, json.dumps([snapshot_of(disk())])),
-            "container clusters list": run_of(0, '[{"name": "cluster-1"}]'),
+            "disks list": run_of(0, "[]"),
+            "snapshots list": run_of(0, "[]"),
         }
         responses.update(overrides)
 
@@ -1850,8 +1542,8 @@ class SoleTenantHeadroomTest(unittest.TestCase):
 
 
 class NewChecksInCollectProjectTest(unittest.TestCase):
-    """The checks added after the roster's first pair, wired through
-    `collect_project`, where the manifest dispositions are actually decided."""
+    """The two checks wired through `collect_project`, where the manifest
+    dispositions are actually decided."""
 
     def run_with(self, **overrides):
         base = {
@@ -1861,9 +1553,16 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
             "node-groups list": run_of(0, "[]"),
-            "disks list": run_of(0, json.dumps([disk()])),
-            "snapshots list": run_of(0, json.dumps([snapshot_of(disk())])),
-            "container clusters list": run_of(0, '[{"name": "cluster-1"}]'),
+            # One snapshot whose source disk is still there, so §2.5 runs and
+            # finds nothing. An empty list would take the check into
+            # `checks_not_applicable` instead, and these tests are about
+            # whether a failure elsewhere stops it running at all.
+            "disks list": run_of(0, '[{"name": "disk-1", "zone": "https://x/zones/z1"}]'),
+            "snapshots list": run_of(
+                0,
+                '[{"name": "snap-1", "sourceDisk": "https://x/disks/disk-1", '
+                f'"creationTimestamp": "{OLD_STAMP}"}}]',
+            ),
         }
         base.update(overrides)
 
@@ -1886,6 +1585,20 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
         entry = self.run_with()
         self.assertIn(cf.MIG_SLUG, {c["check"] for c in entry["commands"]})
         self.assertNotIn(cf.MIG_SLUG, {d["check"] for d in entry["checks_not_applicable"]})
+
+    def test_a_project_with_no_snapshots_declares_a_structural_na(self):
+        """The reference install holds zero snapshots, so §2.5 was publishing a
+        clean pass over an empty population on every run."""
+        entry = self.run_with(**{"snapshots list": run_of(0, "[]")})
+        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
+        self.assertIn(cf.SNAPSHOT_SLUG, declared)
+        self.assertFalse(declared[cf.SNAPSHOT_SLUG].startswith(cf.UNEVALUATED_MARKER))
+        self.assertNotIn(cf.SNAPSHOT_SLUG, {c["check"] for c in entry["candidates"]})
+
+    def test_a_project_with_snapshots_records_a_command_not_a_declaration(self):
+        entry = self.run_with()
+        self.assertIn(cf.SNAPSHOT_SLUG, {c["check"] for c in entry["commands"]})
+        self.assertNotIn(cf.SNAPSHOT_SLUG, {d["check"] for d in entry["checks_not_applicable"]})
 
     def test_a_churning_mig_becomes_a_candidate(self):
         entry = self.run_with(
@@ -1926,107 +1639,6 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
             cf.SOLE_TENANT_SLUG, {d["check"] for d in entry["checks_not_applicable"]}
         )
         self.assertIn(cf.SOLE_TENANT_SLUG, {c["check"] for c in entry["commands"]})
-
-    # --- 2.6, and the empty-list declarations it shares with 2.5 ----------- #
-
-    def test_a_project_with_no_disks_declares_both_disk_shaped_checks(self):
-        """One empty `disks list` settles §2.6 outright and §2.5 too: with no
-        disk anywhere, no snapshot can have a source that still exists."""
-        entry = self.run_with(
-            **{"disks list": run_of(0, "[]"), "snapshots list": run_of(0, "[]")}
-        )
-        declared = {d["check"]: d["reason"] for d in entry["checks_not_applicable"]}
-        self.assertIn(cf.DISK_SLUG, declared)
-        self.assertIn(cf.SNAPSHOT_SLUG, declared)
-        for slug in (cf.DISK_SLUG, cf.SNAPSHOT_SLUG):
-            self.assertFalse(declared[slug].startswith(cf.UNEVALUATED_MARKER), slug)
-
-    def test_a_project_with_no_snapshots_still_runs_the_disk_check(self):
-        """The reference install's shape: plenty of disks, zero snapshots. §2.5
-        published a pass over an empty list every run until this declaration
-        existed, and §2.6 must not be dragged down with it."""
-        entry = self.run_with(**{"snapshots list": run_of(0, "[]")})
-        declared = {d["check"] for d in entry["checks_not_applicable"]}
-        self.assertIn(cf.SNAPSHOT_SLUG, declared)
-        self.assertNotIn(cf.DISK_SLUG, declared)
-        self.assertIn(cf.DISK_SLUG, {c["check"] for c in entry["commands"]})
-
-    def test_the_one_disks_read_is_recorded_against_both_slugs(self):
-        """§2.6 costs no API call — it reads the enumeration §2.5 already made.
-        `cross_check_manifest` rejects a check that recorded neither a command
-        nor a declaration, so the shared read has to be filed under both."""
-        entry = self.run_with()
-        under = {
-            slug: [c["command"] for c in entry["commands"] if c["check"] == slug]
-            for slug in (cf.SNAPSHOT_SLUG, cf.DISK_SLUG)
-        }
-        self.assertIn("compute disks list", " ".join(under[cf.SNAPSHOT_SLUG]))
-        self.assertEqual(len(under[cf.DISK_SLUG]), 1)
-        self.assertIn("gcloud compute disks list --project proj-1", under[cf.DISK_SLUG][0])
-
-    def test_an_idle_disk_becomes_a_minor_candidate(self):
-        idle = disk(users=[], lastDetachTimestamp="2026-08-01T00:00:00.000-08:00")
-        entry = self.run_with(**{"disks list": run_of(0, json.dumps([idle]))})
-        hits = [c for c in entry["candidates"] if c["check"] == cf.DISK_SLUG]
-        self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0]["severity"], "minor")
-        self.assertEqual(hits[0]["object"], "Disk/us-central1-a/disk-1")
-
-    def test_a_disk_outliving_its_cluster_ships_with_no_triage(self):
-        """The reference install's own shape: two `pvc-<uuid>` volumes detached
-        from `platform-agent-host`, a cluster that is gone from the fleet."""
-        orphan = disk(
-            name="pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34",
-            users=[],
-            lastDetachTimestamp="2026-08-26T18:04:31.146-07:00",
-            labels={"goog-k8s-cluster-name": "platform-agent-host"},
-        )
-        entry = self.run_with(
-            **{
-                "disks list": run_of(0, json.dumps([orphan])),
-                "container clusters list": run_of(0, '[{"name": "kube-agents-host"}]'),
-            }
-        )
-        hits = [c for c in entry["candidates"] if c["check"] == cf.DISK_SLUG]
-        self.assertEqual(len(hits), 1)
-        self.assertIsNone(hits[0]["needs_triage"])
-        self.assertIn("platform-agent-host", hits[0]["excerpt"])
-
-    def test_an_unreadable_cluster_list_does_not_fail_the_project(self):
-        """The read is soft. §2.1 through §2.5 never needed it, and a project
-        without the Kubernetes Engine API enabled must not lose all five checks
-        to the one that would have been sharper with it."""
-        entry = self.run_with(
-            **{"container clusters list": run_of(1, "", "API not enabled")}
-        )
-        self.assertEqual(entry["outcome"], "collected")
-        self.assertNotIn(cf.DISK_SLUG, {d["check"] for d in entry["checks_not_applicable"]})
-        self.assertIn(cf.DISK_SLUG, {c["check"] for c in entry["commands"]})
-
-    def test_a_project_with_no_disks_does_not_read_the_cluster_list(self):
-        """Nothing to judge with it. The stub raises on an unexpected command,
-        so reaching for the read at all is what fails this test."""
-        entry = self.run_with(
-            **{
-                "disks list": run_of(0, "[]"),
-                "snapshots list": run_of(0, "[]"),
-                "container clusters list": run_of(
-                    0, '[{"name": "should-not-be-read"}]'
-                ),
-            }
-        )
-        recorded = " ".join(c["command"] for c in entry["commands"])
-        self.assertNotIn("container clusters list", recorded)
-
-    def test_an_unreadable_disks_list_fails_the_project_once(self):
-        """The read now backs two checks, and a gate failure on it is still one
-        failure. `gated` names the first slug because a failed read fails the
-        whole project — which slug is quoted labels the command, and does not
-        narrow the blast radius to that check."""
-        entry = self.run_with(**{"disks list": run_of(1, "", "PERMISSION_DENIED")})
-        self.assertEqual(entry["outcome"], "gate-failed")
-        self.assertIn(cf.SNAPSHOT_SLUG, entry["error"])
-        self.assertIn("PERMISSION_DENIED", entry["error"])
 
     def test_one_unreadable_node_group_does_not_cost_the_project(self):
         """A `list-nodes` that fails is not a project-level gate failure, the
