@@ -3494,6 +3494,28 @@ class TestStalledKccRemediations(HarnessTestCase):
         self.assertTrue(note.startswith("Remove the `loggingService` line."))
         self.assertLess(note.index("loggingService"), note.index("without taking"))
 
+    def test_a_note_that_already_says_it_is_not_told_twice(self):
+        # `carry_unchanged_findings` refuses to copy a file-backed remediation,
+        # so last run's caveat cannot ride into this one -- but the model reads
+        # the ledger it is updating, and one that echoed the sentence back would
+        # otherwise publish it twice, growing by a paragraph every run.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
+        }
+        findings = [self.manifest_finding()]
+        first = audit_report.disclose_stalled_kcc_remediations(
+            findings, self.workspace
+        )
+        note = findings[0]["remediation"]["note"]
+        second = audit_report.disclose_stalled_kcc_remediations(
+            findings, self.workspace
+        )
+        self.assertEqual(first, [findings[0]["id"]])
+        self.assertEqual(second, [])
+        self.assertEqual(findings[0]["remediation"]["note"], note)
+        self.assertEqual(note.count("will merge without taking effect"), 1)
+
     def test_a_reconciling_declaration_is_left_alone(self):
         self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
         self.harness.replies = {

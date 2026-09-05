@@ -496,6 +496,11 @@ KCC_READY_CONDITION = "Ready"
 # message. Rare, but "" reads as though nothing were wrong.
 _KCC_NOT_READY_UNEXPLAINED = "not ready"
 
+# The first sentence of the caveat `disclose_stalled_kcc_remediations` appends,
+# named so the same string is both what it writes and what it looks for before
+# writing again.
+_KCC_STALLED_LEDE = "**This fix will merge without taking effect.**"
+
 # What `timeout(1)` returns for a command it killed, reused so a caller reading
 # `returncode` cannot confuse a timeout with the command's own exit codes.
 _EXIT_TIMEOUT = 124
@@ -8532,13 +8537,21 @@ def disclose_stalled_kcc_remediations(findings: list[dict], root: Path) -> list[
         if not stalled:
             continue
         remediation = finding.get("remediation") or {}
+        note = str(remediation.get("note", "")).strip()
+        # A note that already says this gets nothing added. Nothing in the
+        # pipeline appends twice today -- `carry_unchanged_findings` refuses to
+        # copy a file-backed remediation at all, so last run's caveat cannot
+        # ride into this one -- but the model reads the ledger it is updating,
+        # and a run that paraphrased the sentence back would otherwise publish
+        # it twice.
+        if _KCC_STALLED_LEDE in note:
+            continue
         detail = "; ".join(
             f"`{k}/{n}` ({unhealthy[(k, n)]})" for k, n in sorted(stalled)
         )
-        note = str(remediation.get("note", "")).strip()
         remediation["note"] = (
             (note + "\n\n" if note else "")
-            + "**This fix will merge without taking effect.** Config Connector is "
+            + f"{_KCC_STALLED_LEDE} Config Connector is "
             f"not reconciling the resource it edits: {detail}. The change is "
             "correct and belongs in this file, but the cluster will not pick it "
             "up until that is resolved, and this finding will return on the next "
