@@ -487,6 +487,25 @@ _KCC_OBJECT_KINDS = {
     "NodePool": ("ContainerNodePool",),
 }
 
+# Config Connector writes its reconcile verdict into a condition of this type on
+# every resource it owns. `status.conditions` is otherwise free-form, and the
+# absence of the condition means "not reconciled yet", not "healthy".
+KCC_READY_CONDITION = "Ready"
+
+# What to say when that condition is `False` and carries neither a reason nor a
+# message. Rare, but "" reads as though nothing were wrong.
+_KCC_NOT_READY_UNEXPLAINED = "not ready"
+
+# What `timeout(1)` returns for a command it killed, reused so a caller reading
+# `returncode` cannot confuse a timeout with the command's own exit codes.
+_EXIT_TIMEOUT = 124
+
+# The cluster read behind `disclose_stalled_kcc_remediations` is an enrichment on
+# a report whose work is already done. A wedged API server must cost the run this
+# many seconds and no more -- holding the report to learn whether a note should
+# carry a caveat is a far worse trade than publishing without the caveat.
+KCC_STATUS_READ_TIMEOUT_S = 30
+
 # A gcloud format expression is parenthesised, and bash reads a bare `(` as a
 # subshell: pasting `--format=value(status)` is a syntax error, not a command
 # that prints the wrong thing. The fenced commands a collector records are
@@ -6818,6 +6837,7 @@ def run_cmd(
     check: bool = True,
     capture: bool = True,
     cwd: str | Path | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -6828,6 +6848,11 @@ def run_cmd(
     call made from whatever directory the agent happened to be in is not merely
     untidy — it is a call the sidecar refuses, or worse, one that lands in the
     wrong clone.
+
+    `timeout` defaults to None, which is what every `git`/`gh` caller wants: a
+    push is allowed to take as long as it takes. Only the cluster reads set it,
+    and a timeout surfaces as `returncode` 124 rather than an exception, so a
+    `check=False` caller handles it on the same branch as any other failure.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -6843,12 +6868,23 @@ def run_cmd(
             text=True,
             capture_output=capture,
             cwd=str(target) if target is not None else None,
+            timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {shlex.join(cmd)}")
         if exc.stderr:
             log(exc.stderr.strip())
         raise
+    except subprocess.TimeoutExpired:
+        # Reported as a result rather than raised, so a `check=False` caller
+        # treats a wedged command exactly as it treats a failed one. 124 is what
+        # `timeout(1)` returns for the same condition. A `check=True` caller
+        # still gets an exception: swallowing a timeout there would let a run
+        # continue as though a push or a clone had succeeded.
+        log(f"TIMEOUT ({timeout}s): {shlex.join(cmd)}")
+        if check:
+            raise subprocess.CalledProcessError(_EXIT_TIMEOUT, cmd) from None
+        return subprocess.CompletedProcess(cmd, _EXIT_TIMEOUT, "", "")
     # `check=False` callers used to fail in silence: the logging lived in the
     # except arm, which a non-raising call never reaches, so a `gh` outage on
     # the comment path left no trace anywhere in the run's output.
@@ -8372,6 +8408,146 @@ def degrade_reverted_gcloud_remediations(
     return degraded
 
 
+def kcc_resource_health(kinds: set[str]) -> dict[tuple[str, str], str]:
+    """`(kind, name)` -> why it is not reconciling, for the ones that are not.
+
+    Read from the hub cluster the audit pod runs on, where the Config Connector
+    resources live -- so no kubeconfig is involved and no per-cluster credential
+    is needed. Healthy resources are left out: the caller only ever asks about
+    absence.
+
+    Every failure mode returns what was learned so far rather than raising. A
+    cluster this pod cannot read, an RBAC denial, a kind whose CRD is not
+    installed, a wedged API server, malformed JSON -- each means the caller adds
+    no caveat to a note, which is exactly the behaviour that shipped before this
+    existed.
+    """
+    unhealthy: dict[tuple[str, str], str] = {}
+    for kind in sorted(kinds):
+        result = run_cmd(
+            ["kubectl", "get", kind, "--all-namespaces", "-o", "json"],
+            check=False,
+            timeout=KCC_STATUS_READ_TIMEOUT_S,
+        )
+        if result.returncode != 0:
+            continue
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            continue
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata")
+            name = str(meta.get("name") or "") if isinstance(meta, dict) else ""
+            if not name:
+                continue
+            status = item.get("status")
+            conditions = status.get("conditions") if isinstance(status, dict) else None
+            ready = None
+            for condition in conditions or []:
+                if not isinstance(condition, dict):
+                    continue
+                if condition.get("type") == KCC_READY_CONDITION:
+                    ready = condition
+                    break
+            # A resource KCC has not written a verdict onto yet is not evidence
+            # of anything. Only an explicit `False` is: reporting "no condition"
+            # as stalled would caveat every fix on a freshly-applied repo.
+            if ready is None or str(ready.get("status")) != "False":
+                continue
+            reason = str(ready.get("reason") or "").strip()
+            message = str(ready.get("message") or "").strip()
+            if reason and message:
+                why = f"{reason}: {message}"
+            else:
+                why = reason or message or _KCC_NOT_READY_UNEXPLAINED
+            unhealthy[(kind, name)] = why
+    return unhealthy
+
+
+def disclose_stalled_kcc_remediations(findings: list[dict], root: Path) -> list[str]:
+    """Say so when a manifest fix edits a declaration that is not reconciling.
+
+    The mirror of `degrade_reverted_gcloud_remediations`, and the other half of
+    the same question. That one catches a fix Config Connector *will undo*; this
+    one catches a fix Config Connector is *not applying at all*, which is the
+    quieter failure by far -- the pull request merges, the file says what it
+    should, and the cluster never changes. Every SOP in this skill warns about a
+    fix that "merges, closes the finding for one run, and changes nothing on the
+    cluster", and each warns only about the cause it can see from the clone: a
+    path nothing applies. A stalled controller is the same outcome from a cause
+    no amount of reading the repository can reveal.
+
+    Observed on 2026-09-05, which is what this is for. One `PubSubTopic` went
+    `UpdateFailed` on a missing IAM role, and because fifteen `ContainerCluster`
+    resources referenced it, all fifteen went `DependencyNotReady` behind it.
+    Every manifest remediation this skill could offer against any of those
+    clusters would have merged into a repository whose reconciler had stopped.
+    No stream reported it: the collectors read GCP, where the clusters were
+    perfectly healthy, and the audit never looks at the thing doing the applying.
+
+    Discloses, never degrades. The fix is correct and belongs in that file --
+    what is wrong is the reader's inference that merging it changes something,
+    and the `kind` is not what carries that inference. Degrading to `manual`
+    would throw away a correct pull request over a condition that is usually
+    cleared by the time anyone reads the ledger.
+
+    Returns the ids it annotated, for the caller to log.
+    """
+    if not findings:
+        return []
+    declarations = kcc_declarations(root)
+    if not declarations:
+        return []
+
+    # The clone says which resources live in which file; the finding names the
+    # file. Invert once rather than scanning the index per finding.
+    by_path: dict[str, list[tuple[str, str]]] = {}
+    for key, (relative, _) in declarations.items():
+        by_path.setdefault(relative, []).append(key)
+
+    targeted: list[tuple[dict, list[tuple[str, str]]]] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        if remediation.get("kind") != "manifest":
+            continue
+        resources: list[tuple[str, str]] = []
+        for path in remediation_paths(remediation):
+            resources.extend(by_path.get(path, []))
+        if resources:
+            targeted.append((finding, resources))
+    if not targeted:
+        return []
+
+    # One read per kind, for the kinds actually in play -- not a sweep of every
+    # CRD Config Connector installs.
+    unhealthy = kcc_resource_health({kind for _, rs in targeted for kind, _ in rs})
+    if not unhealthy:
+        return []
+
+    annotated: list[str] = []
+    for finding, resources in targeted:
+        stalled = [(k, n) for k, n in resources if (k, n) in unhealthy]
+        if not stalled:
+            continue
+        remediation = finding.get("remediation") or {}
+        detail = "; ".join(
+            f"`{k}/{n}` ({unhealthy[(k, n)]})" for k, n in sorted(stalled)
+        )
+        note = str(remediation.get("note", "")).strip()
+        remediation["note"] = (
+            (note + "\n\n" if note else "")
+            + "**This fix will merge without taking effect.** Config Connector is "
+            f"not reconciling the resource it edits: {detail}. The change is "
+            "correct and belongs in this file, but the cluster will not pick it "
+            "up until that is resolved, and this finding will return on the next "
+            "run in the meantime."
+        )
+        annotated.append(str(finding.get("id", "")))
+    return annotated
+
+
 def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     """Downgrade manifest findings whose file was never written, and report them.
 
@@ -8610,6 +8786,12 @@ def _handle_finish_dry_run(
         log(
             f"DRY RUN: {fid}'s gcloud remediation targets a field the GitOps "
             "repository declares through Config Connector; it degrades to manual."
+        )
+    for fid in disclose_stalled_kcc_remediations(findings, root):
+        log(
+            f"DRY RUN: {fid}'s manifest remediation edits a Config Connector "
+            "resource that is not reconciling; its note says the merge will not "
+            "change the cluster yet."
         )
     paths = manifest_paths(findings)
 
@@ -9177,6 +9359,15 @@ def handle_finish(args: argparse.Namespace) -> None:
             "repository declares through Config Connector, so it would be "
             "reverted on the next reconcile; it is published as manual, naming "
             "the file to change instead."
+        )
+    # After the two degradations, never before: a finding that just became
+    # `manual` no longer promises a merge, so a caveat about one would be
+    # answering a claim the report does not make.
+    for fid in disclose_stalled_kcc_remediations(findings, root):
+        log(
+            f"WARNING: {fid}'s manifest remediation edits a Config Connector "
+            "resource that is not reconciling; it is published with a note that "
+            "merging it will not change the cluster yet."
         )
 
     # "Absent from this document" only means "fixed" if the audit actually

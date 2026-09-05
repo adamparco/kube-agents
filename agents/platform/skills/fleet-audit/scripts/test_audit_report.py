@@ -322,11 +322,18 @@ class Recorder:
     subprocess would, and with `check=False` it returns the non-zero result.
     Without it every failure path in the harness is untestable, because a
     recorder that always succeeds can only ever exercise the happy path.
+
+    `timeout` is recorded rather than honoured. It has to be in the signature:
+    the cluster reads pass it, and a recorder that rejected the keyword would
+    fail those calls with a TypeError the real `run_cmd` never raises. It is
+    recorded because "this read is bounded" is a property worth asserting —
+    an unbounded read against a wedged API server holds the whole report.
     """
 
     def __init__(self, replies=None, failures=None):
         self.calls: list[list[str]] = []
         self.cwds: list[str | None] = []
+        self.timeouts: list[float | None] = []
         # Body-file contents, one entry per call, None when the call had no
         # `--body-file`. Captured here because the harness unlinks each temp
         # file the moment `gh` returns — read it later and there is nothing to
@@ -345,9 +352,10 @@ class Recorder:
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, timeout=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
+        self.timeouts.append(timeout)
         self.bodies.append(self._read_body_file(cmd))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
@@ -3364,6 +3372,361 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
             [],
         )
         self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+
+class TestStalledKccRemediations(HarnessTestCase):
+    """A manifest fix into a repository whose reconciler has stopped.
+
+    The mirror of the class above. That one is about a fix Config Connector
+    undoes; this one is about a fix it never applies -- the pull request merges,
+    the file says what it should, and the cluster never changes.
+
+    Drawn from 2026-09-05 on this install. A `PubSubTopic` went `UpdateFailed`
+    on a missing IAM role, and the fifteen `ContainerCluster` resources that
+    referenced it went `DependencyNotReady` behind it. Every manifest
+    remediation the skill could offer against any of those clusters would have
+    merged into a stopped reconciler, and no stream said so: the collectors read
+    GCP, where the clusters looked healthy.
+    """
+
+    #: What `kubectl get <kind> --all-namespaces -o json` is asked for. Used as
+    #: the `Recorder` reply key and the fragment tests count calls by.
+    READ = "get ContainerCluster"
+
+    def declare(self, relative, name, spec=None, kind="ContainerCluster"):
+        """Write a Config Connector declaration into the clone."""
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "\n".join(
+                [
+                    "apiVersion: container.cnrm.cloud.google.com/v1beta1",
+                    f"kind: {kind}",
+                    "metadata:",
+                    f"  name: {name}",
+                    "  namespace: kubeagents-system",
+                    "spec:",
+                ]
+                + [f"  {line}" for line in (spec or ["location: us-east1"])]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return target
+
+    @staticmethod
+    def cluster_list(*items):
+        """A `kubectl get -o json` payload: `(name, ready-condition-or-None)`."""
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": name},
+                        "status": {"conditions": [c] if c else []},
+                    }
+                    for name, c in items
+                ]
+            }
+        )
+
+    @staticmethod
+    def not_ready(reason="DependencyNotReady", message="waiting on PubSubTopic"):
+        return {
+            "type": "Ready",
+            "status": "False",
+            "reason": reason,
+            "message": message,
+        }
+
+    @staticmethod
+    def ready():
+        return {"type": "Ready", "status": "True", "reason": "UpToDate"}
+
+    def manifest_finding(self, path="gcp/drift-peer-std-4.yaml", note="Set it back."):
+        return make_finding(
+            obj="Cluster/drift-peer-std-4",
+            remediation={"kind": "manifest", "path": path, "note": note},
+        )
+
+    def reads(self):
+        return [c for c in self.harness.calls if c[:2] == ["kubectl", "get"]]
+
+    def test_a_stalled_declaration_is_disclosed_in_the_note(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
+        }
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [findings[0]["id"]],
+        )
+        note = findings[0]["remediation"]["note"]
+        self.assertIn("will merge without taking effect", note)
+        self.assertIn("ContainerCluster/drift-peer-std-4", note)
+        self.assertIn("DependencyNotReady", note)
+        self.assertIn("waiting on PubSubTopic", note)
+
+    def test_the_kind_is_never_degraded(self):
+        # The whole difference from `degrade_reverted_gcloud_remediations`. The
+        # fix is correct and belongs in that file, and the stall is usually
+        # cleared by the time anyone reads the ledger -- throwing away a working
+        # pull request over it is the worse trade.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
+        }
+        findings = [self.manifest_finding()]
+        audit_report.disclose_stalled_kcc_remediations(findings, self.workspace)
+        self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
+        self.assertEqual(
+            findings[0]["remediation"]["path"], "gcp/drift-peer-std-4.yaml"
+        )
+
+    def test_the_models_own_note_is_kept_above_the_caveat(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
+        }
+        findings = [self.manifest_finding(note="Remove the `loggingService` line.")]
+        audit_report.disclose_stalled_kcc_remediations(findings, self.workspace)
+        note = findings[0]["remediation"]["note"]
+        self.assertTrue(note.startswith("Remove the `loggingService` line."))
+        self.assertLess(note.index("loggingService"), note.index("without taking"))
+
+    def test_a_reconciling_declaration_is_left_alone(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.ready()))
+        }
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["note"], "Set it back.")
+
+    def test_a_resource_with_no_ready_condition_is_left_alone(self):
+        # A resource Config Connector has not written a verdict onto yet is not
+        # evidence of anything. Treating absence as a stall would caveat every
+        # fix on a freshly-applied repository.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", None))
+        }
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["note"], "Set it back.")
+
+    def test_a_stall_on_a_different_resource_is_not_this_findings_problem(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.declare("gcp/drift-peer-std-9.yaml", "drift-peer-std-9")
+        self.harness.replies = {
+            self.READ: self.cluster_list(
+                ("drift-peer-std-4", self.ready()),
+                ("drift-peer-std-9", self.not_ready()),
+            )
+        }
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+
+    def test_a_gcloud_remediation_is_never_annotated(self):
+        # `gcloud` bypasses Config Connector entirely, so a stalled controller
+        # says nothing about whether that command takes effect.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
+        }
+        findings = [
+            make_finding(
+                obj="Cluster/drift-peer-std-4",
+                remediation={
+                    "kind": "gcloud",
+                    "path": "gcp/drift-peer-std-4.yaml",
+                    "note": "gcloud container clusters update ...",
+                },
+            )
+        ]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+        self.assertEqual(self.reads(), [])
+
+    def test_a_path_no_declaration_backs_costs_no_cluster_read(self):
+        # The common case by a wide margin: most manifest fixes edit a
+        # Deployment, not a Config Connector resource. Reading the cluster for
+        # those would spend a round trip per run to learn nothing.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        findings = [self.manifest_finding(path="clusters/prod/payments-netpol.yaml")]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+        self.assertEqual(self.reads(), [])
+
+    def test_one_read_per_kind_however_many_findings(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.declare("gcp/drift-peer-std-9.yaml", "drift-peer-std-9")
+        self.declare("gcp/topic.yaml", "gke-upgrade-notifications", kind="PubSubTopic")
+        self.harness.replies = {
+            self.READ: self.cluster_list(
+                ("drift-peer-std-4", self.not_ready()),
+                ("drift-peer-std-9", self.not_ready()),
+            ),
+            "get PubSubTopic": self.cluster_list(
+                ("gke-upgrade-notifications", self.not_ready("UpdateFailed", "denied"))
+            ),
+        }
+        findings = [
+            self.manifest_finding(path="gcp/drift-peer-std-4.yaml"),
+            make_finding(
+                fid="second",
+                obj="Cluster/drift-peer-std-9",
+                remediation={"kind": "manifest", "path": "gcp/drift-peer-std-9.yaml"},
+            ),
+            make_finding(
+                fid="third",
+                obj="Topic/gke-upgrade-notifications",
+                remediation={"kind": "manifest", "path": "gcp/topic.yaml"},
+            ),
+        ]
+        annotated = audit_report.disclose_stalled_kcc_remediations(
+            findings, self.workspace
+        )
+        self.assertEqual(annotated, ["no-network-policy", "second", "third"])
+        self.assertEqual(len(self.reads()), 2)
+        self.assertIn("UpdateFailed: denied", findings[2]["remediation"]["note"])
+
+    def test_a_multi_file_fix_is_annotated_for_either_file(self):
+        # The notifications remediation writes the topic and the cluster in one
+        # commit. A stall on the file that is not first still stops the merge
+        # from changing anything.
+        self.declare("gcp/topic.yaml", "gke-upgrade-notifications", kind="PubSubTopic")
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            "get PubSubTopic": self.cluster_list(
+                ("gke-upgrade-notifications", self.not_ready("UpdateFailed", "denied"))
+            ),
+            self.READ: self.cluster_list(("drift-peer-std-4", self.ready())),
+        }
+        findings = [
+            self.manifest_finding(
+                path=["gcp/drift-peer-std-4.yaml", "gcp/topic.yaml"]
+            )
+        ]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [findings[0]["id"]],
+        )
+        self.assertIn("PubSubTopic/gke-upgrade", findings[0]["remediation"]["note"])
+
+    def test_the_read_is_bounded(self):
+        # An enrichment on a report whose work is already done. A wedged API
+        # server must cost the run seconds, not the report.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        audit_report.disclose_stalled_kcc_remediations(
+            [self.manifest_finding()], self.workspace
+        )
+        read = next(
+            i for i, c in enumerate(self.harness.calls) if c[:2] == ["kubectl", "get"]
+        )
+        self.assertEqual(
+            self.harness.timeouts[read], audit_report.KCC_STATUS_READ_TIMEOUT_S
+        )
+
+    def test_an_unreadable_cluster_adds_no_caveat(self):
+        # RBAC denial, a CRD that is not installed, a wedged API server, a
+        # timeout: each returns non-zero, and each means the note publishes
+        # exactly as it did before this check existed.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.failures = {self.READ: 1}
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["note"], "Set it back.")
+
+    def test_a_timed_out_read_adds_no_caveat(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.failures = {self.READ: 124}
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+
+    def test_malformed_json_adds_no_caveat(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {self.READ: "not json at all"}
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+
+    def test_a_stall_with_neither_reason_nor_message_still_reads(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(
+                ("drift-peer-std-4", {"type": "Ready", "status": "False"})
+            )
+        }
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [findings[0]["id"]],
+        )
+        self.assertIn("not ready", findings[0]["remediation"]["note"])
+
+    def test_a_clone_with_no_declarations_costs_nothing(self):
+        findings = [self.manifest_finding()]
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            [],
+        )
+        self.assertEqual(self.reads(), [])
+
+    def test_no_findings_costs_nothing(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations([], self.workspace), []
+        )
+        self.assertEqual(self.reads(), [])
+
+
+class TestRunCmdTimeout(BaseTestCase):
+    """A command that never returns is a result, not a hang."""
+
+    def test_a_timeout_reports_124_rather_than_raising(self):
+        result = audit_report.run_cmd(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            check=False,
+            timeout=0.25,
+        )
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_checked_caller_still_gets_an_exception(self):
+        # Swallowing a timeout for `check=True` would let a run continue as
+        # though a push or a clone had succeeded.
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            audit_report.run_cmd(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                timeout=0.25,
+            )
+        self.assertEqual(caught.exception.returncode, 124)
+
+    def test_no_timeout_is_the_default(self):
+        result = audit_report.run_cmd([sys.executable, "-c", "print('ok')"])
+        self.assertEqual(result.stdout.strip(), "ok")
 
 
 class TestCarryUnchangedFindings(unittest.TestCase):
