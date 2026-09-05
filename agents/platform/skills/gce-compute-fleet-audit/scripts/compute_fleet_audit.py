@@ -16,7 +16,7 @@ emit, so `audit_report.py finish --manifest-file` cross-checks the model's
 document instead, which no reader joins on: `adopt_collector_evidence` never
 saw it and the model's retyped excerpts shipped in place of the observed ones.
 
-All four of the SOP's checks are implemented here:
+All five of the SOP's checks are implemented here:
 
 - `gce-startup-script-status` enumerates with `compute instances list`, keeps
   the RUNNING instances that actually run a startup script — its own metadata
@@ -31,10 +31,17 @@ All four of the SOP's checks are implemented here:
   `compute disks list` — a snapshot whose `sourceDisk` names neither a live
   disk's name nor its `selfLink`, carries no `resourcePolicies`, and is older
   than ninety days.
+- `unattached-disk` re-reads the same `compute disks list` for a `READY` disk
+  with an empty `users`, idle at least fourteen days by `lastDetachTimestamp`
+  or, where it never had one, by `creationTimestamp`. A soft
+  `container clusters list` shortens that to three days for a GKE volume whose
+  cluster the same run did not find, because nothing can reattach a disk whose
+  API server is gone.
 
-The roster was five checks and three of them were declared `UNEVALUATED:` on
-every target with a reason saying no code performed them. That declaration was
-wrong in both directions at once, which is why it is gone. `UNEVALUATED:`
+An earlier roster also numbered five, but a different five: §2.6 did not exist,
+and three of the checks that did were declared `UNEVALUATED:` on every target
+with a reason saying no code performed them. That declaration was wrong in both
+directions at once, which is why it is gone. `UNEVALUATED:`
 leaves the coverage denominator, so a two-of-five run published
 `coverage_gaps: []` and `partial: false` and closed the ledger claiming
 coverage it did not have; and `unevaluated_targets` unions the target into
@@ -52,8 +59,8 @@ reachable: `gcloud monitoring` exposes no metric read the credential proxy's
 allowlist could carry, and `osconfig.googleapis.com` is not enabled on the
 reference install. Keeping it as a permanent `UNEVALUATED:` would have kept the
 whole stream's ledger open forever over one unimplementable check, so the
-stream now audits the four things it can actually establish. §2.3 of the SOP
-records the surface it would need.
+stream audits only what it can actually establish. §2.3 of the SOP records the
+surface it would need.
 
 Field contracts assumed of `gcloud ... --format=json` output:
 
@@ -70,7 +77,16 @@ Field contracts assumed of `gcloud ... --format=json` output:
   and a project where *every* RUNNING instance refused the read declares the
   slug `UNEVALUATED:` rather than reporting a clean fleet.
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
-  `sourceDisk` appears in the wild in both forms, so both are indexed.
+  `sourceDisk` appears in the wild in both forms, so both are indexed. For
+  §2.6 the same items carry `users` (the attachment list, absent rather than
+  empty when nothing is attached), `status`, `sizeGb`, a `type` selfLink, a
+  `zone` selfLink, `creationTimestamp`, and — only once the disk has been
+  attached and released — `lastDetachTimestamp`. A GKE PersistentVolume's disk
+  additionally carries the CSI driver's `description`, a JSON object naming the
+  PVC and namespace it was cut for, which is the only human-legible identity a
+  `pvc-<uuid>` disk has, and `labels.goog-k8s-cluster-name`.
+- `container clusters list` items carry `name`. The read is soft: a failure
+  leaves §2.6 on its long window rather than failing the project.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
   (RFC-3339, `Z`-suffixed) and optionally `resourcePolicies`.
 - `compute instance-groups managed list` items carry `name`, `size`,
@@ -155,6 +171,7 @@ STARTUP_SLUG = "gce-startup-script-status"
 MIG_SLUG = "mig-convergence-stalled"
 SOLE_TENANT_SLUG = "sole-tenant-headroom"
 SNAPSHOT_SLUG = "orphaned-snapshots"
+DISK_SLUG = "unattached-disk"
 
 # §2.1's condition, verbatim: the two literal substrings that mean the guest's
 # startup script exited non-zero. Case-sensitive substring match, no regex —
@@ -173,6 +190,28 @@ STARTUP_FAILURE_MARKERS = (
 # side of the difference — it flags later, never earlier.
 ORPHAN_AGE_DAYS = 90
 
+# §2.6's threshold, and deliberately a sixth of §2.5's. A snapshot is a backup,
+# so ninety days of it is a retention policy somebody may have meant; a disk
+# nothing has mounted is capacity nothing can read, and every day of it is
+# billed at the full provisioned rate. Fourteen days is past every routine
+# reattachment: a node auto-repair, a cluster upgrade, a `stop`/`start` cycle
+# (which does not detach at all -- a TERMINATED instance still holds its boot
+# disk in `users`) and a zonal migration all put the disk back within hours.
+# The comparison is `<` rather than §2.5's `<=` because this reads as "fourteen
+# days or more" where §2.5 restates its SOP's "more than ninety days".
+UNATTACHED_AGE_DAYS = 14
+
+# The threshold for the one case where nothing can reattach the disk, whatever
+# the workload does: it is a GKE volume and the cluster it was cut for is gone
+# from `container clusters list`. Reattachment needs a PersistentVolumeClaim,
+# a claim needs an API server, and a deleted cluster has none -- so the long
+# window above is protecting against a scenario that cannot happen, and every
+# day of it is a day of billing nobody can defend. Three days rather than
+# nothing, because a cluster being rebuilt under the same name is absent from
+# the list while it is being recreated, and a disk kept for that rebuild would
+# otherwise be flagged during the window it is being kept for.
+ORPHANED_CLUSTER_AGE_DAYS = 3
+
 # §2.4's threshold, as a percentage of the node group's aggregate capacity.
 SOLE_TENANT_UTILISATION_PCT = 90
 
@@ -187,6 +226,7 @@ SEVERITY = {
     MIG_SLUG: "major",
     SOLE_TENANT_SLUG: "minor",
     SNAPSHOT_SLUG: "minor",
+    DISK_SLUG: "minor",
 }
 
 # Opens the `reason` of a check that *applies* to its target and was attempted
@@ -280,6 +320,21 @@ NO_NODE_GROUPS_REASON = (
     "node-groups list` returned an empty array, so §2.4's headroom condition "
     "has no reservation to measure. Structural, not a missed read."
 )
+# The same shape one read further on, for the two checks that share the disk
+# and snapshot enumerations. A check whose subject does not exist has cleared
+# nothing, and the pair used to report an empty project as a clean one: the
+# reference install holds no snapshots at all, and §2.5 published a pass over
+# them every run.
+NO_SNAPSHOTS_REASON = (
+    "This project holds no Persistent Disk snapshots: `compute snapshots list` "
+    "returned an empty array, so §2.5 has nothing to attribute to a deleted "
+    "source disk. Structural, not a missed read."
+)
+NO_DISKS_REASON = (
+    "This project holds no Persistent Disks: `compute disks list` returned an "
+    "empty array, so §2.6 has no volume whose attachment it could read. "
+    "Structural, not a missed read."
+)
 # The genuine `UNEVALUATED:` case for §2.4, and the shape the marker was written
 # for: the groups exist and were enumerated, the per-node read ran, and not one
 # node carried the resource figures the condition needs. Nobody looked, so a
@@ -319,6 +374,35 @@ TRIAGE_GKE_NODE = "gke-managed-node"
 TRIAGE_GKE_MIG = "gke-managed-mig"
 TRIAGE_MAINTENANCE = "maintenance-window"
 TRIAGE_RETENTION_HOLD = "retention-hold"
+# §2.6's two ambiguous limbs, in the order the check applies them.
+#
+# The dangerous one first. A disk the GKE PD CSI driver provisioned is the
+# storage behind a PersistentVolume, and being detached is the normal resting
+# state of one whose pod is not currently scheduled: a StatefulSet scaled to
+# zero, a Deployment whose pod is Pending, a CronJob between firings. The PVC
+# still binds it and Kubernetes reattaches it the moment the workload comes
+# back, so deleting it destroys live data rather than reclaiming waste. Whether
+# the PVC still exists is a Kubernetes read this collector does not make -- its
+# targets are GCP projects and it holds no kubeconfig -- so the candidate ships
+# and says what has to be confirmed. It is a real finding often enough to be
+# worth the triage: a disk outliving its cluster is exactly this shape.
+TRIAGE_CSI_MANAGED = "csi-managed-volume"
+# The milder one. A disk that has been detached is spent capacity; a disk that
+# was never attached may be staged on purpose -- restored from a snapshot ahead
+# of a migration, or pre-provisioned by Terraform for a workload that has not
+# shipped. Both bill the same, so the candidate ships; which one it is comes off
+# the change that created it, which this collector cannot read.
+TRIAGE_NEVER_ATTACHED = "never-attached"
+
+# How a Persistent Disk says it is a GKE PersistentVolume rather than a plain
+# volume somebody created. The CSI driver writes the PVC's namespace and name
+# into `description` under these keys, and GKE stamps the cluster's identity
+# into the disk's labels. Either alone is enough: an in-place CSI driver upgrade
+# has changed the description's shape before, and a disk restored from a
+# snapshot of a PV keeps the labels while losing the description.
+CSI_DESCRIPTION_MARKER = "kubernetes.io/created-for"
+CLUSTER_LABEL = "goog-k8s-cluster-name"
+CSI_LABEL_KEYS = (CLUSTER_LABEL, "goog-k8s-node-pool-name")
 
 # Both GKE node-pool MIG spellings: `gke-` for Standard, `gk3-` for Autopilot.
 # Every one of the 79 groups on the reference install carries one of these.
@@ -663,14 +747,192 @@ def check_orphaned_snapshot(snapshot: dict, active_disks: set[str], now: datetim
     }
 
 
+def _is_csi_volume(disk: dict) -> bool:
+    """Whether this Persistent Disk is the storage behind a GKE PersistentVolume.
+
+    Two independent markers, either sufficient. The PD CSI driver writes the
+    PVC's namespace and name into `description`; GKE stamps the cluster and node
+    pool into the disk's labels. Reading only one loses a disk restored from a
+    snapshot of a PV, which keeps the labels and not the description.
+
+    A `pvc-<uuid>` *name* is deliberately not a third marker. It is the CSI
+    driver's default and nothing enforces it: a StorageClass carrying
+    `volumeNameTemplate`, or a statically provisioned PV, produces a
+    CSI-managed disk under any name at all, and any disk can be given that name
+    by hand. The name is a hint, and these two fields are the record.
+    """
+    description = str(disk.get("description") or "")
+    if CSI_DESCRIPTION_MARKER in description:
+        return True
+    labels = disk.get("labels")
+    if isinstance(labels, dict) and any(key in labels for key in CSI_LABEL_KEYS):
+        return True
+    return False
+
+
+def _csi_origin(disk: dict) -> str:
+    """The PersistentVolumeClaim a GKE disk was cut for, as `namespace/name`.
+
+    The CSI driver writes this into `description` as a JSON object. Copying
+    that object into the excerpt verbatim works but reads badly -- it is four
+    long keys and a `pv/name` that repeats the disk's own name -- and the
+    excerpt is what `adopt_collector_evidence` ships in place of anything the
+    model would have written. Two fields out of it are the whole of what a
+    reader needs to recognise a `pvc-<uuid>`.
+
+    Empty where the description is absent, is not JSON, or is some other tool's
+    JSON: an unparseable origin is one this function does not know, and a
+    guessed one on a disk somebody is about to delete is worse than none.
+    """
+    raw = str(disk.get("description") or "")
+    if CSI_DESCRIPTION_MARKER not in raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    pvc = str(parsed.get("kubernetes.io/created-for/pvc/name") or "")
+    if not pvc:
+        return ""
+    namespace = str(parsed.get("kubernetes.io/created-for/pvc/namespace") or "")
+    return f"{namespace}/{pvc}" if namespace else pvc
+
+
+def check_unattached_disk(
+    disk: dict, now: datetime.datetime, live_clusters: set[str] | None = None
+) -> dict | None:
+    """One item from `compute disks list`. Flags a disk nothing has mounted.
+
+    The read is free: §2.5 already enumerates every disk in the project to
+    decide whether a snapshot's source still exists, and throws away everything
+    about each disk except its name. `users` is the attachment list, and an
+    empty one on a `READY` disk means the full provisioned rate is being billed
+    for capacity no instance can reach.
+
+    Which timestamp measures the idleness depends on how the disk got here.
+    `lastDetachTimestamp` is the honest clock for a disk that was in service
+    and is not any more; a disk that has never been attached carries none, and
+    `creationTimestamp` is then the only age there is.
+
+    `live_clusters` is the project's current `container clusters list`, or
+    `None` where that read did not happen. It settles the one case this check
+    would otherwise have to hand back: a GKE volume whose `goog-k8s-cluster-name`
+    is not in the set outlived its cluster, and reattachment needs a
+    PersistentVolumeClaim, which needs an API server the cluster no longer has.
+    Those get the short `ORPHANED_CLUSTER_AGE_DAYS` window and no triage marker,
+    because there is nothing left to confirm. `None` is not an empty set: unread
+    means the disk falls back to the long window and the marker below.
+
+    Two things the payload alone cannot settle come back as `needs_triage`, and
+    a disk that is both gets the more consequential one. `csi-managed-volume`
+    means the disk is a GKE PersistentVolume whose cluster is still there, where
+    detached is the resting state of a workload that is not scheduled and the
+    PVC will reattach it; deleting one of those destroys live data.
+    `never-attached` means the disk may be staged deliberately for something
+    that has not shipped.
+
+    Not flagged: a disk with a non-empty `users`, whatever its instance is
+    doing -- a `TERMINATED` instance still holds its boot disk, so a stopped VM
+    is not an unattached disk and saying so would flag every deliberately
+    parked machine. A disk whose `status` is not `READY` is mid-`CREATING`,
+    `RESTORING`, or `DELETING`, and being unattached is what those states look
+    like from outside. A timestamp that will not parse is an age nobody could
+    compute, which is not an age over the threshold -- the same silence
+    `check_orphaned_snapshot` keeps.
+
+    A snapshot schedule attached to the disk is deliberately *not* an
+    exclusion, the way `resourcePolicies` is on §2.5. There it means somebody
+    is retaining the snapshot on purpose; here it means the project is also
+    paying to back up a volume nothing reads, which makes the finding worth
+    more rather than less.
+    """
+    if not isinstance(disk, dict):
+        return None
+    if disk.get("users"):
+        return None
+    if disk.get("status") != "READY":
+        return None
+    name = disk.get("name", "")
+    if not name:
+        return None
+    detached = str(disk.get("lastDetachTimestamp") or "")
+    created = str(disk.get("creationTimestamp") or "")
+    stamp_text = detached or created
+    if not stamp_text:
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(stamp_text.replace("Z", "+00:00"))
+        idle_days = (now - stamp).days
+    except (ValueError, TypeError):
+        return None
+    labels = disk.get("labels")
+    cluster = labels.get(CLUSTER_LABEL, "") if isinstance(labels, dict) else ""
+    cluster_gone = bool(cluster) and live_clusters is not None and cluster not in live_clusters
+    if idle_days < (ORPHANED_CLUSTER_AGE_DAYS if cluster_gone else UNATTACHED_AGE_DAYS):
+        return None
+    zone = _scope_of(disk)
+    size_gb = disk.get("sizeGb", "")
+    disk_type = _last_segment(str(disk.get("type") or ""))
+    since = "lastDetachTimestamp" if detached else "creationTimestamp"
+    # Where a `pvc-<uuid>` came from, which is the whole of what makes such a
+    # finding actionable -- the name alone identifies nothing a human
+    # recognises. These are also the two fields the triage decision above turns
+    # on, so putting them in the excerpt is what lets a reader check that
+    # decision rather than take it on trust.
+    origin = ""
+    pvc = _csi_origin(disk)
+    if pvc:
+        origin += f', "pvc": "{pvc}"'
+    if cluster:
+        origin += f', "cluster": "{cluster}"'
+    if cluster_gone:
+        triage = None
+    elif _is_csi_volume(disk):
+        triage = TRIAGE_CSI_MANAGED
+    elif detached:
+        triage = None
+    else:
+        triage = TRIAGE_NEVER_ATTACHED
+    # The deleted cluster is the whole reason this one is certain rather than a
+    # judgment handed to the model, so it belongs in both the excerpt a reader
+    # checks and the impact line that argues for the delete.
+    outlived = ', "clusterExists": false' if cluster_gone else ""
+    because = (
+        f" The GKE cluster it was provisioned for, {cluster}, no longer exists, "
+        f"so no PersistentVolumeClaim can reattach it."
+        if cluster_gone
+        else ""
+    )
+    return {
+        "object": f"Disk/{zone}/{name}",
+        # Redacted and clipped like every other excerpt this file emits: a disk
+        # `description` and a PVC name are free text somebody else wrote, and
+        # `adopt_collector_evidence` publishes this string in place of anything
+        # the model would have composed.
+        "excerpt": redact(
+            f'{{"name": "{name}", "zone": "{zone}", "sizeGb": "{size_gb}", '
+            f'"type": "{disk_type}", "users": [], "{since}": "{stamp_text}", '
+            f'"idleDays": {idle_days}{outlived}{origin}}}'
+        )[:MAX_EXCERPT_CHARS],
+        "impact": (
+            f"Disk {name} ({size_gb} GB {disk_type}) in {zone} has been "
+            f"unattached for {idle_days} days and is billed at the full "
+            f"provisioned rate for capacity no instance can reach.{because}"
+        ),
+        "needs_triage": triage,
+    }
+
+
 def _scope_of(resource: dict) -> str:
     """The zone or region a scoped Compute resource lives in.
 
-    Carried into every `object` this file derives for a MIG or a node group,
-    for the reason `check_startup_script` spells out at length: a Compute name
-    is unique per zone, not per project, so two same-named groups in different
-    zones derive one finding id and `validate_findings` refuses the whole
-    document rather than merging them.
+    Carried into every `object` this file derives for a MIG, a node group, or a
+    disk, for the reason `check_startup_script` spells out at length: a Compute
+    name is unique per zone, not per project, so two same-named groups in
+    different zones derive one finding id and `validate_findings` refuses the
+    whole document rather than merging them.
     """
     for key in ("zone", "region"):
         value = resource.get(key)
@@ -912,11 +1174,17 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
     not_applicable: list[dict] = []
     limitations: list[str] = []
 
-    def gated(argv: list[str], slug: str) -> list:
+    def gated(argv: list[str], *slugs: str) -> list:
+        # Variadic because one read can back more than one check — `disks list`
+        # serves §2.5 and §2.6 — and `commands` has to record it against each,
+        # or the slug that did not name the read reads as a check that ran on
+        # no evidence. The failure message names the first slug: a read that
+        # failed fails the whole project, so which slug is quoted is a label on
+        # the command, not a claim about scope.
         parsed, result = run_and_gate(argv, run=run)
         if parsed is None:
             raise GateFailure(
-                f"{slug}: {' '.join(argv)} failed (rc={result.rc}): "
+                f"{slugs[0]}: {' '.join(argv)} failed (rc={result.rc}): "
                 f"{result.stderr.strip()[:ERROR_CLIP_CHARS]}"
             )
         if not isinstance(parsed, list):
@@ -924,11 +1192,23 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
             # here is an error envelope or a changed contract, and reading zero
             # items off it would report an empty, healthy project.
             raise GateFailure(
-                f"{slug}: {' '.join(argv)} returned "
+                f"{slugs[0]}: {' '.join(argv)} returned "
                 f"{type(parsed).__name__}, not a JSON array"
             )
-        reads.setdefault(slug, []).append((" ".join(argv), result))
+        for slug in slugs:
+            reads.setdefault(slug, []).append((" ".join(argv), result))
         return parsed
+
+    def soft(argv: list[str], slug: str) -> list | None:
+        # A read the checks are better with and correct without, so a failure
+        # is not a `GateFailure`. `container clusters list` needs an API that a
+        # Compute-only project may not have enabled, and taking the whole
+        # project down over it would make §2.1 through §2.5 — which never
+        # needed it — collateral damage. `None` back means unread, which the
+        # caller must not confuse with an empty list.
+        parsed, result = run_and_gate(argv, run=run)
+        reads.setdefault(slug, []).append((" ".join(argv), result))
+        return parsed if isinstance(parsed, list) else None
 
     try:
         # --- 2.1 startup script failures ---------------------------------- #
@@ -1113,14 +1393,21 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
                     }
                 )
 
-        # --- 2.5 orphaned snapshots ---------------------------------------- #
+        # --- 2.5 orphaned snapshots, 2.6 unattached disks ------------------- #
         # Both reads are gated: a `disks list` that failed used to skip the
         # snapshot check silently, which left the project in scope carrying one
         # check and no sign that the other had been abandoned. It is now what
         # it is — a read that failed, and a project the run could not cover.
+        #
+        # One `disks list` backs both checks, so it is recorded against both
+        # slugs. §2.6 costs this collector no API call at all: §2.5 already
+        # enumerates every disk to decide whether a snapshot's source still
+        # exists, and until now discarded everything about each one but its
+        # name.
         disks = gated(
             ["gcloud", "compute", "disks", "list", "--project", project, "--format=json"],
             SNAPSHOT_SLUG,
+            DISK_SLUG,
         )
         snapshots = gated(
             ["gcloud", "compute", "snapshots", "list", "--project", project, "--format=json"],
@@ -1128,12 +1415,38 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict:
         )
         active = active_disk_index(disks)
         now = datetime.datetime.now(datetime.timezone.utc)
-        for snapshot in snapshots:
-            if not isinstance(snapshot, dict):
-                continue
-            hit = check_orphaned_snapshot(snapshot, active, now)
-            if hit:
-                candidates.append(_emit(SNAPSHOT_SLUG, hit))
+        if snapshots:
+            for snapshot in snapshots:
+                if not isinstance(snapshot, dict):
+                    continue
+                hit = check_orphaned_snapshot(snapshot, active, now)
+                if hit:
+                    candidates.append(_emit(SNAPSHOT_SLUG, hit))
+        else:
+            not_applicable.append(
+                {"check": SNAPSHOT_SLUG, "reason": NO_SNAPSHOTS_REASON}
+            )
+        if disks:
+            # Soft, and read only when there is a disk to judge with it: a
+            # project with no disks pays nothing for a certainty it cannot use.
+            cluster_list = soft(
+                [
+                    "gcloud", "container", "clusters", "list",
+                    "--project", project, "--format=json",
+                ],
+                DISK_SLUG,
+            )
+            live_clusters = (
+                None
+                if cluster_list is None
+                else {c.get("name", "") for c in cluster_list if isinstance(c, dict)}
+            )
+            for disk in disks:
+                hit = check_unattached_disk(disk, now, live_clusters)
+                if hit:
+                    candidates.append(_emit(DISK_SLUG, hit))
+        else:
+            not_applicable.append({"check": DISK_SLUG, "reason": NO_DISKS_REASON})
     except GateFailure as exc:
         return {
             "name": name,
