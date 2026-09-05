@@ -4166,11 +4166,16 @@ class TestStart(HarnessTestCase):
             "--json comments": json.dumps(
                 {
                     "comments": [
-                        comment("/remediate no-network-policy"),
-                        comment("/remediate nope", association="NONE"),
+                        comment("/remediate no-network-policy", login="maintainer"),
+                        comment("/remediate nope", login="drive-by"),
                     ]
                 }
             ),
+            # Both fixtures carry the same `authorAssociation`; the permission
+            # endpoint is what separates them. Keyed per login so the stub
+            # answers each lookup the way GitHub would.
+            "collaborators/maintainer/permission": "admin\n",
+            "collaborators/drive-by/permission": "none\n",
         }
         self.run_main(["start", "--audit", AUDIT])
         self.assertEqual(
@@ -5317,7 +5322,9 @@ class TestPromotion(BaseTestCase):
             "authorAssociation": "MEMBER",
             "author": {"login": "operator"},
         }
-        requests = audit_report.parse_remediate_commands([comment], findings)
+        requests = audit_report.parse_remediate_commands(
+            [comment], findings, can_write=writer_from_association([comment])
+        )
         reason = requests.refusals[0]["reasons"][0]
         self.assertIn("`real-one`", reason)
 
@@ -5332,7 +5339,9 @@ class TestPromotion(BaseTestCase):
             "authorAssociation": "MEMBER",
             "author": {"login": "operator"},
         }
-        requests = audit_report.parse_remediate_commands([comment], findings)
+        requests = audit_report.parse_remediate_commands(
+            [comment], findings, can_write=writer_from_association([comment])
+        )
         reason = requests.refusals[0]["reasons"][0]
         self.assertIn("`real-one`", reason)
 
@@ -5347,6 +5356,26 @@ class TestPromotion(BaseTestCase):
 # --------------------------------------------------------------------------- #
 # /remediate parsing (§3.1) and idempotency markers
 # --------------------------------------------------------------------------- #
+
+
+def writer_from_association(comments):
+    """A `can_write` reproducing what these fixtures' `association` field meant.
+
+    Most tests below set `association` only to say "this commenter is
+    authorized" while they exercise parsing, refusal wording, or idempotency.
+    Authorization itself is no longer that field's job — it is
+    `resolve_write_access`, tested directly in `TestRemediateWriteAccess` — so
+    this keeps the scaffolding meaning what it always did without threading a
+    resolver through every fixture.
+    """
+    by_login = {
+        str((c.get("author") or {}).get("login", "") or "").lower(): (
+            str(c.get("authorAssociation", "") or "").upper()
+            in audit_report.WRITE_ASSOCIATIONS
+        )
+        for c in comments or []
+    }
+    return lambda login: by_login.get((login or "").lower(), False)
 
 
 def comment(
@@ -5390,8 +5419,12 @@ class TestRemediateCommands(BaseTestCase):
             make_finding(fid="cluster-old", remediation={"kind": "gcloud", "note": "g"}),
         ]
 
-    def parse(self, comments):
-        return audit_report.parse_remediate_commands(comments, self.findings)
+    def parse(self, comments, can_write=None):
+        return audit_report.parse_remediate_commands(
+            comments,
+            self.findings,
+            can_write=can_write or writer_from_association(comments),
+        )
 
     def test_an_authorized_request_is_accepted(self):
         targets, refusals, _, _ = self.parse([comment("/remediate netpol-missing")])
@@ -5400,17 +5433,18 @@ class TestRemediateCommands(BaseTestCase):
 
     def test_a_commenter_without_write_access_is_refused_once(self):
         targets, refusals, _, _ = self.parse(
-            [comment("/remediate netpol-missing", association="NONE", login="drive-by")]
+            [comment("/remediate netpol-missing", login="drive-by")],
+            can_write=lambda _login: False,
         )
         self.assertEqual(targets, [])
         self.assertEqual(len(refusals), 1)
         reason = refusals[0]["reasons"][0]
-        self.assertIn("not recorded as a collaborator", reason)
-        self.assertIn("`authorAssociation: NONE`", reason)
-        # The refusal reports the association it read, not a permission it
-        # never queried. The old wording claimed the commenter "does not have
-        # write access", which was untrue of the App that tripped this path.
-        self.assertNotIn("does not have write access", reason)
+        # The refusal may now say "write access" because the harness went and
+        # asked. It no longer quotes `authorAssociation`, which reports
+        # relative to the viewer and read `CONTRIBUTOR` for a repository admin
+        # under the App token — refusing the people the command is for.
+        self.assertIn("does not have write access", reason)
+        self.assertNotIn("authorAssociation", reason)
         self.assertEqual(refusals[0]["comment_id"], "IC_1")
 
     def test_a_non_manifest_target_is_refused(self):
@@ -5629,6 +5663,7 @@ class TestRemediateCommands(BaseTestCase):
         requests = audit_report.parse_remediate_commands(
             [comment("/remediate")],
             [make_finding(fid="cluster-old", remediation={"kind": "gcloud", "note": "g"})],
+            can_write=lambda _login: True,
         )
         self.assertIn("nothing to promote", requests.refusals[0]["reasons"][0])
 
@@ -5658,14 +5693,18 @@ class TestRemediateCommands(BaseTestCase):
         for name, body in written.items():
             with self.subTest(comment=name):
                 requests = audit_report.parse_remediate_commands(
-                    [comment(body, node_id=f"IC_{name}")], findings
+                    [comment(body, node_id=f"IC_{name}")],
+                    findings,
+                    can_write=lambda _login: True,
                 )
                 self.assertEqual(requests.targets, [])
                 self.assertEqual(requests.refusals, [])
 
     def test_the_id_list_in_a_refusal_is_capped(self):
         findings = [manifest_finding(f"f-{n:03d}", f"{n}.yaml") for n in range(25)]
-        requests = audit_report.parse_remediate_commands([comment("/remediate")], findings)
+        requests = audit_report.parse_remediate_commands(
+            [comment("/remediate")], findings, can_write=lambda _login: True
+        )
         reason = requests.refusals[0]["reasons"][0]
         self.assertEqual(reason.count("`f-"), audit_report.MAX_HINT_IDS)
         self.assertIn(f"and {25 - audit_report.MAX_HINT_IDS} more", reason)
@@ -5701,8 +5740,12 @@ class TestAMachineCannotAuthorizeItself(BaseTestCase):
         super().setUp()
         self.findings = [manifest_finding("netpol-missing", "a.yaml")]
 
-    def parse(self, comments):
-        return audit_report.parse_remediate_commands(comments, self.findings)
+    def parse(self, comments, can_write=None):
+        return audit_report.parse_remediate_commands(
+            comments,
+            self.findings,
+            can_write=can_write or writer_from_association(comments),
+        )
 
     def bot(self, body="/remediate all", **kw):
         kw.setdefault("login", "kube-agents-minty[bot]")
@@ -5769,16 +5812,23 @@ class TestAMachineCannotAuthorizeItself(BaseTestCase):
         self.assertEqual(got, [])
 
     def test_a_bot_contributes_no_pending_targets_at_start(self):
-        # Belt and braces: a bot user added as a collaborator would clear the
-        # association check that stopped the App.
+        # Belt and braces: a bot granted write would clear the permission check
+        # that now guards this path, so `is_machine_author` has to stop it
+        # first. That ordering is the whole defence — see the App that read its
+        # own ledger header as an instruction.
         collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
         self.assertEqual(
-            audit_report.pending_remediate_targets([collaborator_bot]), []
+            audit_report.pending_remediate_targets(
+                [collaborator_bot], can_write=lambda _login: True
+            ),
+            [],
         )
 
     def test_a_collaborator_bot_is_still_refused_promotion(self):
         collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
-        targets, refusals, _, _ = self.parse([collaborator_bot])
+        targets, refusals, _, _ = self.parse(
+            [collaborator_bot], can_write=lambda _login: True
+        )
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
@@ -5788,6 +5838,176 @@ class TestAMachineCannotAuthorizeItself(BaseTestCase):
         )
         self.assertEqual(targets, ["netpol-missing"])
         self.assertEqual(refusals, [])
+
+
+class TestRemediateWriteAccess(BaseTestCase):
+    """Who may issue `/remediate`, and what an unanswered lookup does.
+
+    On 2026-09-05 a `/remediate` from an account holding `admin` on
+    `gke-agentic/adamparco-infra` was refused on ledger #110, reason
+    ``authorAssociation: CONTRIBUTOR``. Queried from the agent pod under the
+    same App token, `collaborators/adamparco/permission` returned ``admin``.
+    The field is relative to the authenticated viewer and an App cannot see
+    organisation membership, so the gate refused exactly the people it exists
+    to serve. `forge.py` had already moved off the field on the pull-request
+    path; the ledger path had not.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.findings = [manifest_finding("netpol-missing", "a.yaml")]
+
+    def parse(self, comments, can_write):
+        return audit_report.parse_remediate_commands(
+            comments, self.findings, can_write=can_write
+        )
+
+    def test_an_admin_reported_as_a_contributor_is_honoured(self):
+        # The exact shape of the live refusal: GitHub called them CONTRIBUTOR,
+        # the permission endpoint calls them an admin. The endpoint wins.
+        admin = comment(
+            "/remediate netpol-missing", association="CONTRIBUTOR", login="adamparco"
+        )
+        targets, refusals, _, _ = self.parse(admin and [admin], lambda _l: True)
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_an_unresolved_lookup_is_not_a_refusal(self):
+        # A refusal writes `audit-refused:<node id>`, and that marker is what
+        # stops the comment being read again. Answering a proxy fault with one
+        # would refuse a maintainer permanently for a five-second blip.
+        targets, refusals, accepted, _ = self.parse(
+            [comment("/remediate netpol-missing")], lambda _l: None
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+        self.assertEqual(accepted, {})
+
+    def test_an_unresolved_lookup_leaves_the_comment_answerable(self):
+        # The other half of the previous test: having written no marker, the
+        # next run must still see the comment as outstanding.
+        pending = comment("/remediate netpol-missing")
+        outstanding = audit_report.unanswered_remediate_comments([pending])
+        self.assertEqual(
+            [c["comment_id"] for c in outstanding], [pending["id"]]
+        )
+
+    def test_start_treats_an_unresolved_lookup_as_permissive(self):
+        # Asymmetric with `finish` on purpose: the cost here is a manifest
+        # nobody asked for, while treating it as "no" leaves no manifest on
+        # disk and makes `finish` refuse a good request for want of the file.
+        self.assertEqual(
+            audit_report.pending_remediate_targets(
+                [comment("/remediate netpol-missing")], can_write=lambda _l: None
+            ),
+            ["netpol-missing"],
+        )
+
+    def test_start_still_drops_a_definitive_no(self):
+        self.assertEqual(
+            audit_report.pending_remediate_targets(
+                [comment("/remediate netpol-missing", login="drive-by")],
+                can_write=lambda _l: False,
+            ),
+            [],
+        )
+
+
+class TestResolveWriteAccess(BaseTestCase):
+    """`resolve_write_access` against the shapes the endpoint actually returns.
+
+    Probed live from the agent pod on 2026-09-05: a non-collaborator is
+    ``200 {"permission": "none"}`` rather than a 404, and only a missing
+    *account* 404s. So the sole genuinely unknown case is transport failure.
+    """
+
+    def setUp(self):
+        super().setUp()
+        audit_report._write_access_cache.clear()
+        self.calls = []
+
+    def fake_gh(self, *, stdout="", stderr="", returncode=0):
+        def _gh(args, **kwargs):
+            self.calls.append(args)
+            return subprocess.CompletedProcess(
+                args, returncode, stdout=stdout, stderr=stderr
+            )
+
+        return _gh
+
+    def test_a_write_level_is_allowed(self):
+        for level in ("admin", "maintain", "write"):
+            with self.subTest(level=level):
+                audit_report._write_access_cache.clear()
+                with patch.object(
+                    audit_report, "gh", self.fake_gh(stdout=level + "\n")
+                ):
+                    self.assertIs(
+                        audit_report.resolve_write_access("o/r", "dev"), True
+                    )
+
+    def test_a_read_only_level_is_refused(self):
+        # `triage` and `pull` cannot merge what they would be asking for.
+        for level in ("none", "read", "triage", "pull"):
+            with self.subTest(level=level):
+                audit_report._write_access_cache.clear()
+                with patch.object(
+                    audit_report, "gh", self.fake_gh(stdout=level + "\n")
+                ):
+                    self.assertIs(
+                        audit_report.resolve_write_access("o/r", "dev"), False
+                    )
+
+    def test_a_missing_account_is_a_definitive_no(self):
+        gh = self.fake_gh(
+            returncode=1, stderr="gh: nobody-9931 is not a user (HTTP 404)"
+        )
+        with patch.object(audit_report, "gh", gh):
+            self.assertIs(
+                audit_report.resolve_write_access("o/r", "nobody-9931"), False
+            )
+
+    def test_a_transport_failure_is_unknown_not_a_no(self):
+        # Distinct from the 404 above. Collapsing the two is what turns a blip
+        # into a permanent refusal.
+        gh = self.fake_gh(returncode=1, stderr="gh: Bad gateway (HTTP 502)")
+        with patch.object(audit_report, "gh", gh):
+            self.assertIsNone(audit_report.resolve_write_access("o/r", "dev"))
+
+    def test_a_repository_404_is_unknown_not_a_no(self):
+        # A repo the token momentarily cannot see 404s too, and refusing every
+        # maintainer on it forever is the wrong reading of that status code.
+        gh = self.fake_gh(returncode=1, stderr="gh: Not Found (HTTP 404)")
+        with patch.object(audit_report, "gh", gh):
+            self.assertIsNone(audit_report.resolve_write_access("o/r", "dev"))
+
+    def test_a_bot_login_is_percent_encoded(self):
+        # `[` and `]` are not path characters. Unencoded this is a malformed
+        # URL, which fails as unknown and is re-asked every single run.
+        with patch.object(audit_report, "gh", self.fake_gh(stdout="none")):
+            audit_report.resolve_write_access("o/r", "minty[bot]")
+        self.assertIn("minty%5Bbot%5D", self.calls[0][1])
+
+    def test_one_lookup_per_account_per_run(self):
+        # A ledger with fifty comments from one maintainer is one call.
+        with patch.object(audit_report, "gh", self.fake_gh(stdout="admin")):
+            for _ in range(5):
+                audit_report.resolve_write_access("o/r", "dev")
+                audit_report.resolve_write_access("O/R", "DEV")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_an_unknown_answer_is_not_cached_as_a_no(self):
+        # The cache stores the tri-state, so a later run re-asks rather than
+        # inheriting a blip as a refusal.
+        gh = self.fake_gh(returncode=1, stderr="gh: Bad gateway (HTTP 502)")
+        with patch.object(audit_report, "gh", gh):
+            audit_report.resolve_write_access("o/r", "dev")
+        self.assertIsNone(audit_report._write_access_cache[("o/r", "dev")])
+
+    def test_an_empty_login_asks_nobody(self):
+        with patch.object(audit_report, "gh", self.fake_gh(stdout="admin")):
+            self.assertIs(audit_report.resolve_write_access("o/r", ""), False)
+        self.assertEqual(self.calls, [])
 
 
 class TestMarkers(BaseTestCase):
@@ -10793,6 +11013,7 @@ class TestNewlineNormalisation(unittest.TestCase):
                 }
             ],
             findings,
+            can_write=lambda _login: True,
         )
         self.assertEqual(parsed.targets, ["netpol"])
 
@@ -13514,6 +13735,7 @@ class TestStaleRemediateRequests(BaseTestCase):
                 comment("/remediate crit", node_id="IC_2", created_at="2026-07-20T00:00:00Z"),
             ],
             findings,
+            can_write=lambda _login: True,
         )
         self.assertEqual(parsed.requested_at, {"crit": "2026-07-20T00:00:00Z"})
         plan = audit_report.promotion_candidates(
@@ -13530,7 +13752,9 @@ class TestStaleRemediateRequests(BaseTestCase):
             manifest_finding("b", "b.yaml"),
         ]
         parsed = audit_report.parse_remediate_commands(
-            [comment("/remediate all", created_at="2026-07-20T00:00:00Z")], findings
+            [comment("/remediate all", created_at="2026-07-20T00:00:00Z")],
+            findings,
+            can_write=lambda _login: True,
         )
         self.assertEqual(
             parsed.requested_at,
@@ -13833,6 +14057,7 @@ class TestAcknowledgements(HarnessTestCase):
                 }
             ],
             [manifest_finding("netpol", "a.yaml")],
+            can_write=lambda _login: True,
         )
         self.assertEqual(parsed.accepted_by_comment, {"IC_7": ["netpol"]})
 

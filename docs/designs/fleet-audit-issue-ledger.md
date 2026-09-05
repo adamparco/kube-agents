@@ -135,8 +135,8 @@ is a different problem and gets a different treatment.
 **The human trigger is an issue comment command:** `/remediate <finding-id>`, or `/remediate all` to
 promote every eligible finding in the stream. On its next run the audit parses the ledger issue's
 comments, promotes the named findings, and replies once with the PR links. The command is honoured
-only from a commenter with write access to the repo — `authorAssociation` of `OWNER`, `MEMBER`, or
-`COLLABORATOR` (§13 Q5).
+only from a commenter with write access to the repo, read from
+`collaborators/{user}/permission` (§13 Q5).
 
 Only `manifest` remediations are promotable. `/remediate` naming a `gcloud` or `manual` finding is
 refused with a comment explaining that its remediation is a command to run, not a file to merge — a
@@ -1046,8 +1046,9 @@ unchanged. As shipped it is **346**. New cases:
   already-has-PR is a no-op in every state; the sixth eligible critical in a run is withheld and
   named in the ledger, while six explicit `/remediate` targets all open.
 - Command parsing: `/remediate <id>`, `/remediate all`, unknown id, non-manifest id, the command
-  appearing inside a fenced code block (must not match), and a command from an `authorAssociation`
-  of `NONE` or `CONTRIBUTOR` (refused, replied to once).
+  appearing inside a fenced code block (must not match), and a command from an author the permission
+  endpoint reports below `write` (refused, replied to once), and one it cannot resolve at all
+  (left unanswered, so the next run retries rather than refusing for good).
 - State derivation across all **seven** rows of the §4 table, including `pr-merged-persists` and
   `withdrawn`; that every state has a distinct label, asserted as a set equality against
   `STATE_LABELS` so a new state cannot be added without one; and that `withdrawn` and `refused` do
@@ -1236,10 +1237,28 @@ would just make them ask again.
 unqualified comment trigger is an unauthenticated write path: on a public or widely-collaborated
 repo, a comment from a stranger would open branches and PRs in the GitOps repo.
 
-_Resolved: honour the command only from an author whose `authorAssociation` is `OWNER`, `MEMBER`, or
-`COLLABORATOR`._ Anyone else gets a single reply saying the command requires write access, recorded
-by the `audit-refused` marker of §3.1 so they are not told twice. `gh issue view --json comments`
-exposes `authorAssociation` on each comment, so this costs no extra API call.
+_Resolved: honour the command only from an author that
+`repos/{repo}/collaborators/{user}/permission` reports at `admin`, `maintain`, or `write`._ Anyone
+else gets a single reply saying the command requires write access, recorded by the `audit-refused`
+marker of §3.1 so they are not told twice.
+
+This was first specified as the comment's own `authorAssociation`, on the grounds that
+`gh issue view --json comments` hands it over for free. That is wrong, and it shipped: the field is
+computed relative to the _authenticated viewer_, and an App installation token cannot see
+organisation membership, so a repository admin's comment arrives as `CONTRIBUTOR`. On 2026-09-05 a
+`/remediate` from an account holding `admin` on `gke-agentic/adamparco-infra` was refused on ledger
+#110 for exactly that reason, while the permission endpoint — queried from the agent pod under the
+same token — returned `admin`. `agents/platform/scripts/forge.py` had already hit this on the
+pull-request comment path and moved to the endpoint; the ledger path had not. The lookup is cached
+per account per run, so a ledger with fifty comments from one maintainer still costs one call.
+
+An unresolved lookup is not a refusal. A refusal writes the `audit-refused` marker, and that marker
+is what stops the comment being read again — so answering a proxy fault or a 5xx with "no" would
+refuse a maintainer permanently. Only a `200` carrying a level, and the `404` that means no such
+account, are definitive; anything else leaves the comment unmarked for the next run. `start` is
+deliberately the other way round, treating unresolved as permissive, because the worst that costs is
+a manifest nobody asked for, while a false "no" there leaves no file on disk and makes `finish`
+refuse a good request for want of it.
 
 ## 14. Accepted risks
 

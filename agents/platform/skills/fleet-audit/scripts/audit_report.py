@@ -43,7 +43,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple
+from typing import Callable, NamedTuple
+from urllib.parse import quote
 
 # The shared scripts dir holds github_token_refresh and gitops_workspace (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
@@ -755,9 +756,22 @@ MAX_PR_PAGE = 1000
 # `/remediate` bypasses it: a human asked for that one by name.
 AUTO_PROMOTION_CAP = 5
 
-# `authorAssociation` values that imply write access, and therefore the standing
-# to issue `/remediate`.
+# `authorAssociation` values that imply write access. Read by `is_machine_author`
+# and by nothing else — it is **not** the `/remediate` authorization gate, and
+# restoring it to that job re-opens the bug in `resolve_write_access`'s docstring.
 WRITE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+# Levels from `collaborators/{user}/permission` that let a person merge, and so
+# give them the standing to ask for a remediation pull request. `triage` and
+# `pull` are deliberately absent: they cannot merge what they would be asking
+# the harness to open.
+WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+
+# The 404 meaning "no such GitHub account", which is a definitive no. A 404 for
+# a repository the token cannot see is an outage wearing the same status code,
+# and must stay unknown rather than permanently refusing every maintainer on it
+# — see `resolve_write_access`.
+NOT_A_USER_RE = re.compile(r"\bis not a user\b", re.I)
 
 
 class ValidationError(ValueError):
@@ -4668,6 +4682,16 @@ def is_machine_author(comment: dict) -> bool:
     would post a comment addressed to the bot that wrote it, which is one more
     comment for that bot to read on the next run — and issue #29 already
     carries three refusals talking to nobody.
+
+    This is the one place `authorAssociation` is still read, and it stays. The
+    `/remediate` gate moved to `resolve_write_access` because the field lies
+    about *people*; here the question is whether the author is a machine, and
+    the field's blindness runs the safe way — an App never carries a write
+    association, so the third signal fires. Re-pointing this at
+    `resolve_write_access` inverts it: the App holds write on repositories it
+    merges into, `viewerDidAuthor and has_write` stops being true of the
+    harness's own comments, and the automation regains the ability to authorize
+    itself that this function exists to remove.
     """
     author = comment.get("author") or {}
     login = str(author.get("login", "") or "")
@@ -4685,9 +4709,19 @@ def is_machine_author(comment: dict) -> bool:
 
 
 def parse_remediate_commands(
-    comments: list[dict], findings: list[dict]
+    comments: list[dict],
+    findings: list[dict],
+    *,
+    can_write: Callable[[str], bool | None],
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
+
+    `can_write` answers "may this login ask for a remediation here?" and is a
+    parameter rather than a call to `resolve_write_access` so this stays a pure
+    function. It has no default on purpose: the obvious one is the comment's
+    `authorAssociation`, which is the field that made this gate refuse
+    repository admins — see `resolve_write_access`. A caller that has to supply
+    an answer cannot fall into the wrong one silently.
 
     A refusal is one entry per comment, not per bad target, because the reply is
     posted once per comment and marked with that comment's node id.
@@ -4741,10 +4775,16 @@ def parse_remediate_commands(
         node_id = str(comment.get("id", "") or "")
         created_at = str(comment.get("createdAt", "") or "")
         author = str((comment.get("author") or {}).get("login", "") or "") or "someone"
-        association = str(comment.get("authorAssociation", "") or "").upper()
         reasons: list[str] = []
 
-        if association not in WRITE_ASSOCIATIONS:
+        write_access = can_write(author)
+        if write_access is None:
+            # Not "no" — nobody answered. Falling through to a refusal would
+            # post an `audit-refused` marker, and that marker is what stops the
+            # comment being read again, so one failed lookup would refuse a
+            # maintainer for good. Leave it unmarked and re-ask next run.
+            continue
+        if not write_access:
             if mention_only or blockquote_swallowed:
                 # Prose, from somebody whose correctly-typed command would have
                 # been refused anyway. Two refusals for one comment that was
@@ -4755,16 +4795,16 @@ def parse_remediate_commands(
                     "comment_id": node_id,
                     "author": author,
                     "reasons": [
-                        # States what was observed rather than what it implies.
-                        # The old wording asserted "does not have write access",
-                        # which the harness never checks and which was flatly
-                        # untrue of the App that tripped this path — it merges
-                        # pull requests here. A gate that misreports its own
+                        # Says write access, and means it: this is now an actual
+                        # `collaborators/{user}/permission` read rather than the
+                        # `authorAssociation` field, which reports relative to
+                        # the viewer and called repository admins `CONTRIBUTOR`
+                        # under the App token. A gate that misreports its own
                         # reason teaches the reader to discount the next one.
-                        f"@{author} is not recorded as a collaborator on this "
-                        f"repository (`authorAssociation: {association or 'NONE'}`), "
-                        "so this command was not acted on. A remediation pull "
-                        "request may only be requested by someone who could merge it."
+                        f"@{author} does not have write access to this "
+                        "repository, so this command was not acted on. A "
+                        "remediation pull request may only be requested by "
+                        "someone who could merge it."
                     ],
                 }
             )
@@ -4932,7 +4972,9 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     return out
 
 
-def pending_remediate_targets(comments: list[dict]) -> list[str]:
+def pending_remediate_targets(
+    comments: list[dict], *, can_write: Callable[[str], bool | None]
+) -> list[str]:
     """Ids named by an authorized `/remediate`, before any findings exist.
 
     `start` runs before the fleet is inspected, so there is nothing to validate
@@ -4940,13 +4982,20 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
     which remediation files to write while it inspects; `finish` then applies
     the full `parse_remediate_commands` gate against the real finding set.
     `all` is not expanded here — it names no specific file to write.
+
+    An unresolved lookup is permissive here, where `finish` skips it. The two
+    differ because the costs are not symmetric: `finish` posts a public refusal
+    that permanently marks the comment, while the worst this does is have the
+    model write a manifest nobody asked for. Treating unknown as "no" would let
+    a blip at `start` leave no manifest on disk, and `finish` would then refuse
+    a perfectly good request for want of the file.
     """
     targets: set[str] = set()
     for comment in comments or []:
         if is_machine_author(comment):
             continue
-        association = str(comment.get("authorAssociation", "") or "").upper()
-        if association not in WRITE_ASSOCIATIONS:
+        author = str((comment.get("author") or {}).get("login", "") or "")
+        if can_write(author) is False:
             continue
         body = strip_block_quotes(
             strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
@@ -6763,6 +6812,85 @@ def gh(
     return run_cmd(["gh"] + args, check=check, cwd=cwd)
 
 
+# Answers already obtained this run, keyed on `(repo, login)` both case-folded
+# because GitHub logins and repository names are case-insensitive. A ledger with
+# fifty comments from one maintainer is one lookup, not fifty.
+_write_access_cache: dict[tuple[str, str], bool | None] = {}
+
+
+def resolve_write_access(repo: str, login: str) -> bool | None:
+    """May `login` ask for a remediation on `repo`? `None` when nothing answered.
+
+    Asks `collaborators/{user}/permission` rather than reading
+    `authorAssociation` off the comment. The field is reported relative to what
+    the *authenticated viewer* can see, and an App installation token cannot see
+    organisation membership — so a repository admin's comment arrives as
+    `CONTRIBUTOR` and the gate refuses the very people entitled to use it.
+
+    That is not a hypothetical. On 2026-09-05 a `/remediate` from an account
+    holding `admin` on `gke-agentic/adamparco-infra` was refused on ledger #110
+    with ``authorAssociation: CONTRIBUTOR``, while the permission endpoint —
+    queried from inside the agent pod under the same App token — returned
+    ``admin``. `agents/platform/scripts/forge.py` hit this on the pull-request
+    comment path first and moved to this endpoint; the ledger path did not
+    follow, so the two disagreed about who may direct the agent.
+
+    The tri-state is load-bearing, and collapsing it to a bool is worse than it
+    looks. A refusal posts a public comment carrying
+    ``<!-- audit-refused:… -->``, and that marker is exactly what stops the
+    request being read again on the next run. Answering a proxy fault or a 5xx
+    with `False` would refuse a maintainer *permanently* — they would have to
+    notice and re-comment. So only a definitive answer is definitive:
+
+    - **200** — believe `permission`. A non-collaborator reads `none` here
+      rather than 404ing, which is a real no.
+    - **404** — no such user. Also a real no.
+    - **anything else** — not an answer. The caller leaves the comment
+      unmarked and the next run asks again.
+
+    The login is percent-encoded: a GitHub App comments as `<name>[bot]`, and
+    `[`/`]` are not path characters. Unencoded that is a malformed URL rather
+    than a lookup, which fails as *unknown* and re-asks the same unanswerable
+    question every run.
+    """
+    if not login or not repo:
+        return False
+    key = (repo.lower(), login.lower())
+    if key in _write_access_cache:
+        return _write_access_cache[key]
+
+    result = gh(
+        [
+            "api",
+            f"repos/{repo}/collaborators/{quote(login, safe='')}/permission",
+            "--jq",
+            ".permission",
+        ],
+        check=False,
+    )
+    answer: bool | None
+    level = (result.stdout or "").strip().lower()
+    if result.returncode == 0 and level:
+        answer = level in WRITE_PERMISSIONS
+    elif result.returncode == 0:
+        # rc 0 with nothing on stdout is a malformed response, not a level of
+        # `none` — `--jq .permission` printing empty means the field was absent.
+        # Reading it as a refusal would mark the comment permanently answered on
+        # the strength of a reply that said nothing.
+        answer = None
+        log(f"empty permission for @{login} on {repo}; treating as unresolved.")
+    elif NOT_A_USER_RE.search((result.stderr or "") + (result.stdout or "")):
+        answer = False
+    else:
+        answer = None
+        log(
+            f"could not determine whether @{login} may direct a remediation on "
+            f"{repo}; leaving the request unanswered so the next run retries it."
+        )
+    _write_access_cache[key] = answer
+    return answer
+
+
 def refresh_credentials(repo: str | None = None) -> None:
     """Mint the short-lived repo-scoped GitHub App token into gh + the git credential store.
 
@@ -8238,7 +8366,10 @@ def handle_start(args: argparse.Namespace) -> None:
 
     pending: list[str] = []
     if existing_issue is not None:
-        pending = pending_remediate_targets(fetch_issue_comments(repo, existing_issue))
+        pending = pending_remediate_targets(
+            fetch_issue_comments(repo, existing_issue),
+            can_write=lambda login: resolve_write_access(repo, login),
+        )
 
     try:
         os.makedirs(SCRATCH_DIR, exist_ok=True)
@@ -9197,7 +9328,11 @@ def handle_finish(args: argparse.Namespace) -> None:
     }
 
     ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requests = parse_remediate_commands(ledger_comments, findings)
+    requests = parse_remediate_commands(
+        ledger_comments,
+        findings,
+        can_write=lambda login: resolve_write_access(repo, login),
+    )
     plan = promotion_candidates(
         findings,
         pr_by_finding,
