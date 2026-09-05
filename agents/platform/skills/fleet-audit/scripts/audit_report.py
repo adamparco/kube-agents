@@ -8277,16 +8277,34 @@ def kcc_declarations(root: Path) -> dict[tuple[str, str], tuple[str, set[str]]]:
     publishes as written, which is the behaviour that shipped before this
     existed. Failing a run over a missing parser would trade two wrong
     remediations for no report at all.
+
+    Both of those paths log. Silent was the wrong call: an empty index disables
+    this check *and* the stall disclosure, and neither leaves a trace in the
+    report -- the findings publish exactly as they would if both had run and
+    approved them. On 2026-09-05 an interpreter without PyYAML was believed for
+    the better part of an hour to be why a caveat was missing, on the strength
+    of a probe that had picked the wrong `python3`. A log line would have
+    settled it in one.
     """
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the check
     except ImportError:
+        # Loud, because returning `{}` disables two checks at once and both
+        # fail by publishing a remediation that reads correct. A run that
+        # quietly stops looking is indistinguishable in the report from a run
+        # that looked and found nothing.
+        log(
+            "KCC INDEX: PyYAML is not importable, so no Config Connector "
+            "declaration is indexed; gcloud remediations publish unchecked and "
+            "manifest ones publish without a stall caveat."
+        )
         return {}
 
     index: dict[tuple[str, str], tuple[str, set[str]]] = {}
     try:
         paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
-    except OSError:
+    except OSError as exc:
+        log(f"KCC INDEX: cannot walk {root} ({exc}); no declaration is indexed.")
         return {}
     for path in paths:
         # `.git` holds packed objects, not manifests, and rglob walks into it.
@@ -8435,10 +8453,18 @@ def kcc_resource_health(kinds: set[str]) -> dict[tuple[str, str], str]:
             timeout=KCC_STATUS_READ_TIMEOUT_S,
         )
         if result.returncode != 0:
+            log(
+                f"KCC HEALTH: cannot read {kind} (exit {result.returncode}); "
+                "findings that edit one publish without a stall caveat."
+            )
             continue
         try:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
+            log(
+                f"KCC HEALTH: {kind} returned unparseable JSON; findings that "
+                "edit one publish without a stall caveat."
+            )
             continue
         for item in payload.get("items") or []:
             if not isinstance(item, dict):
@@ -8513,15 +8539,32 @@ def disclose_stalled_kcc_remediations(findings: list[dict], root: Path) -> list[
         by_path.setdefault(relative, []).append(key)
 
     targeted: list[tuple[dict, list[tuple[str, str]]]] = []
+    unmatched: list[str] = []
     for finding in findings:
         remediation = finding.get("remediation") or {}
         if remediation.get("kind") != "manifest":
             continue
         resources: list[tuple[str, str]] = []
         for path in remediation_paths(remediation):
-            resources.extend(by_path.get(path, []))
+            found = by_path.get(path, [])
+            if not found:
+                unmatched.append(path)
+            resources.extend(found)
         if resources:
             targeted.append((finding, resources))
+    # A manifest fix whose file declares no Config Connector resource is
+    # ordinary -- plenty of files in a GitOps repo are Kubernetes manifests,
+    # Kustomize bases, or workflow YAML. What is worth a line is that *every*
+    # path missed while the index was non-empty, because the two ways that
+    # happens look identical from here: the fix genuinely targets a
+    # non-KCC file, or the paths are relative to a different root than the
+    # index is and nothing will ever match.
+    if unmatched and not targeted:
+        log(
+            "KCC STALL: no manifest remediation names a file that declares a "
+            f"Config Connector resource; {len(by_path)} file(s) do, and the "
+            f"unmatched path(s) were: {', '.join(sorted(set(unmatched)))}."
+        )
     if not targeted:
         return []
 

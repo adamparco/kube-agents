@@ -89,6 +89,18 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 USER root
 
 # 1. Install all common system utilities and dependencies
+#
+# `python3-yaml` is here rather than in the `uv pip install` below because the
+# two reach different interpreters. This image's `ENV PATH` puts
+# `/opt/hermes/.venv/bin` first, so a bare `python3` in the container
+# environment is the venv's -- but the agent's terminal tool runs a *login*
+# shell, and `/etc/profile` overwrites `PATH` wholesale with the distro default,
+# dropping the venv from it. Every `python3 ...` line in a `SKILL.md` therefore
+# runs under `/usr/bin/python3`, which sees nothing `uv` installed. The
+# fleet-audit skill's Config Connector checks parse the GitOps clone with
+# PyYAML and silently disable themselves without it; both had been inert in
+# production since they shipped, publishing remediations they were written to
+# annotate. Keep this list and the venv in step for anything a skill imports.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-transport-https \
     ca-certificates \
@@ -99,6 +111,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     nano \
     patch \
+    python3-yaml \
     vim \
     wget \
     && rm -rf /var/lib/apt/lists/*
