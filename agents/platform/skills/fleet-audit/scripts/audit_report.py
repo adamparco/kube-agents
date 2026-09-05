@@ -7213,6 +7213,90 @@ def fetch_issue_title(repo: str, number: int) -> str | None:
         return None
 
 
+def fetch_issue_body(repo: str, number: int) -> str | None:
+    res = gh(["issue", "view", str(number), "-R", repo, "--json", "body"], check=False)
+    if res.returncode != 0:
+        return None
+    try:
+        return json.loads(res.stdout or "{}").get("body")
+    except json.JSONDecodeError:
+        return None
+
+
+# Prepended to a ledger's body on the run that closes it clean, and recognised
+# on the way back in so a second clean close does not stack a second copy.
+CLEAN_CLOSE_MARKER = "<!-- audit-clean-closed -->"
+
+
+def clean_close_banner(audit_id: str, generated_at: datetime) -> str:
+    """The paragraph that goes above a closed ledger's last findings table.
+
+    Without it the body a reader lands on is the one the last *unclean* run
+    wrote: a table of findings each marked `open`, under a title counting them,
+    on an issue that is closed because none of them reproduce any more. The
+    closing comment says so, but it sits below the entire body -- including the
+    per-finding sections and the checks-run table -- so the first and largest
+    thing the page shows contradicts the state of the issue.
+
+    Prepending rather than rewriting is deliberate. Re-rendering the body from
+    a run with zero findings would produce an empty ledger, which destroys the
+    record of what this stream last found and what fixed it -- the one thing a
+    closed ledger is still good for. The findings below stay exactly as the
+    last run wrote them; this says what happened to them.
+    """
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"{CLEAN_CLOSE_MARKER}\n"
+        f"> **Closed as clean on {stamp}.** The "
+        f"`{audit_id}` audit re-ran and none of the findings below reproduce, "
+        "so every one of them is resolved regardless of the `open` state each "
+        "row still shows -- those rows are the last unclean run's text, kept as "
+        "the record of what was found and fixed. The closing comment at the "
+        "bottom of this issue lists the fleet it checked. If any of it comes "
+        "back, the next run reopens this ledger and rewrites the body in full."
+    )
+
+
+def close_ledger_reads_clean(
+    repo: str, number: int, audit_id: str, generated_at: datetime
+) -> bool:
+    """Retitle a ledger to `0 findings` and banner its body, before closing it.
+
+    Returns whether the edit landed. A failure here is not worth failing the
+    run over -- the closing comment is already posted and the issue still
+    closes -- so the caller logs it and carries on, which is the same bargain
+    `refresh_coverage_ledger` makes.
+    """
+    body = fetch_issue_body(repo, number)
+    if body is None:
+        return False
+    if CLEAN_CLOSE_MARKER in body:
+        # Already closed clean once and reopened without a rewrite. One banner
+        # is the record; two is noise.
+        banner_body = body
+    else:
+        banner_body = f"{clean_close_banner(audit_id, generated_at)}\n\n{body}"
+    body_file = _write_temp(banner_body)
+    try:
+        res = gh(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                repo,
+                "--title",
+                issue_title(audit_id, []),
+                "--body-file",
+                body_file,
+            ],
+            check=False,
+        )
+    finally:
+        _unlink(body_file)
+    return res.returncode == 0
+
+
 def refresh_coverage_ledger(
     repo: str,
     number: int,
@@ -9243,6 +9327,15 @@ def handle_finish(args: argparse.Namespace) -> None:
                 ),
                 what="all-clear comment",
             )
+            # Before closing, make the two things a reader sees first agree with
+            # the state of the issue. Left alone the title still counts the
+            # findings and the body still calls each one `open`.
+            if not close_ledger_reads_clean(repo, existing_issue, audit_id, now):
+                log(
+                    f"WARNING: could not retitle or banner issue #{existing_issue} "
+                    "before closing it; it will read as though its findings are "
+                    "still open. The all-clear comment is posted either way."
+                )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
             gh(

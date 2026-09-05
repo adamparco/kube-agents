@@ -3729,6 +3729,114 @@ class TestFinishClean(HarnessTestCase):
         self.assertTrue(self.harness.matching("issue", "close", "42"))
         self.assertIn("could not post the all-clear comment", self.err)
 
+    # The body a reader lands on when they open a closed ledger is the one the
+    # last *unclean* run wrote. Until these, nothing touched it or the title on
+    # the way out, so issue #110 on adamparco-infra closed on 2026-09-05 still
+    # titled "1 finding (0 critical)" over a table calling that finding `open`
+    # — with the comment saying otherwise below the entire body.
+    STALE_LEDGER_BODY = (
+        "## Findings\n\n1 finding: 0 critical, 1 major, 0 minor.\n\n"
+        "#### spot-pool is locked to a single zone\n\n- **State:** open\n"
+    )
+
+    def seed_ledger_body(self, body=None):
+        """Answer the body read `close_ledger_reads_clean` does before editing.
+
+        Keyed on `--json body` rather than `issue view`: the same subcommand is
+        used to fetch the title and the url, and a looser key hands those calls
+        a body payload too.
+        """
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps(
+                {"body": self.STALE_LEDGER_BODY if body is None else body}
+            ),
+        }
+
+    def test_the_closed_ledger_stops_counting_findings_in_its_title(self):
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.seed_ledger_body()
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        edits = self.harness.matching("issue", "edit", "42", "--title")
+        self.assertTrue(edits, "the ledger was closed without retitling it")
+        title = edits[0][edits[0].index("--title") + 1]
+        self.assertIn("0 findings (0 critical)", title)
+        self.assertNotIn("1 finding", title)
+
+    def test_the_closed_ledger_body_says_its_findings_are_resolved(self):
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.seed_ledger_body()
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        bodies = self.harness.bodies_for("issue", "edit")
+        self.assertTrue(bodies, "the ledger body was never rewritten")
+        body = bodies[-1]
+        self.assertIn("Closed as clean", body)
+        self.assertIn("none of the findings below reproduce", body)
+        # The record survives: re-rendering from a zero-finding run would leave
+        # an empty ledger, which is the one thing a closed one is still for.
+        self.assertIn("spot-pool is locked to a single zone", body)
+        self.assertTrue(
+            body.index("Closed as clean") < body.index("## Findings"),
+            "the banner has to precede the stale table, not trail it",
+        )
+
+    def test_the_banner_lands_before_the_issue_is_closed(self):
+        # Order matters to a webhook consumer and to anyone watching the
+        # timeline: an edit after the close reads as reopening the question.
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        self.seed_ledger_body()
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        calls = self.harness.calls
+        edit = next(
+            i
+            for i, c in enumerate(calls)
+            if c[:4] == ["gh", "issue", "edit", "42"] and "--title" in c
+        )
+        close = next(
+            i for i, c in enumerate(calls) if c[:4] == ["gh", "issue", "close", "42"]
+        )
+        self.assertLess(edit, close)
+
+    def test_a_reclosed_ledger_does_not_stack_a_second_banner(self):
+        # A ledger that closed clean, reopened, and closed clean again without
+        # an intervening full rewrite would otherwise accumulate one banner per
+        # close.
+        self.seed_store(make_doc(findings=[make_finding(fid="a")]))
+        banner = audit_report.clean_close_banner("security-rbac", NOW)
+        self.seed_ledger_body(f"{banner}\n\n{self.STALE_LEDGER_BODY}")
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        body = self.harness.bodies_for("issue", "edit")[-1]
+        self.assertEqual(body.count(audit_report.CLEAN_CLOSE_MARKER), 1)
+
+    def test_the_ledger_still_closes_when_the_banner_edit_fails(self):
+        # Same bargain the all-clear comment makes: the close is the thing that
+        # must happen, and a cosmetic edit may not hold it hostage.
+        self.seed_ledger_body()
+        self.harness.failures = {"issue edit": 1}
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertIn("could not retitle or banner issue #42", self.err)
+
+    def test_an_unreadable_ledger_body_is_never_overwritten(self):
+        # `fetch_issue_body` returning None means the read failed, not that the
+        # ledger is empty. Editing on that reading would blank the record.
+        self.harness.replies = {"issue list": self.issue_list()}
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        self.assertFalse(self.harness.bodies_for("issue", "edit"))
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+
     def test_clean_run_with_no_open_ledger_is_a_no_op(self):
         self.harness.replies = {"issue list": "[]"}
         self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
