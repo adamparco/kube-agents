@@ -2176,6 +2176,37 @@ UNATTACHED_AGE_DAYS = 30
 DEAD_CLUSTER_AGE_DAYS = 7
 #: The label GKE stamps on every PD it provisions, naming the owning cluster.
 GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
+#: The key PD-CSI writes into a provisioned disk's `description`, whose value is
+#: a JSON object naming the PersistentVolumeClaim the disk was cut for.
+CSI_DESCRIPTION_MARKER = "kubernetes.io/created-for"
+
+
+def _pvc_origin(disk: dict) -> str:
+    """`namespace/name` of the claim a GKE disk was provisioned for, or "".
+
+    A PD-CSI volume is named for its PersistentVolume's UID, so the finding
+    identifies it as `pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34` and nothing in
+    that string tells the operator what is on it. The decision the finding asks
+    for is whether to delete the disk, and "this is the platform agent's data
+    volume" is most of that decision. PD-CSI already records it: the driver
+    writes the claim's namespace and name into `description` as JSON when it
+    provisions, and GKE leaves the field alone afterwards, so it survives the
+    cluster the claim lived in.
+    """
+    raw = str(disk.get("description") or "")
+    if CSI_DESCRIPTION_MARKER not in raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    name = str(parsed.get("kubernetes.io/created-for/pvc/name") or "")
+    if not name:
+        return ""
+    namespace = str(parsed.get("kubernetes.io/created-for/pvc/namespace") or "")
+    return f"{namespace}/{name}" if namespace else name
 
 
 def _dead_cluster_of(disk: dict, known_clusters: set[str] | None) -> str:
@@ -2232,10 +2263,12 @@ def check_unattached_disk(
             if dead_cluster
             else ""
         )
+        pvc = _pvc_origin(disk)
+        pvc_note = f", held the {pvc} PersistentVolumeClaim" if pvc else ""
         hits.append(
             {
                 "object": f"Disk/{disk.get('name', '')}",
-                "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk_type} ({_scope_flag(disk)}){orphan_note}",
+                "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk_type} ({_scope_flag(disk)}){pvc_note}{orphan_note}",
                 "severity": "major" if size_gb >= 500 or "ssd" in disk_type.lower() or "extreme" in disk_type.lower() else "minor",
             }
         )

@@ -1824,6 +1824,69 @@ class DeadClusterDiskTest(unittest.TestCase):
         )
 
 
+class DiskPvcOriginTest(unittest.TestCase):
+    """A PD-CSI volume is named for a PV UID, so the finding's object is an
+    opaque handle. The claim it was cut for is what tells the operator whether
+    deleting it destroys anything they care about.
+    """
+
+    DESCRIPTION = json.dumps(
+        {
+            "kubernetes.io/created-for/pvc/name": "platform-agent-data",
+            "kubernetes.io/created-for/pvc/namespace": "kubeagents-system",
+            "kubernetes.io/created-for/pv/name": "pvc-d45cfdfd",
+        }
+    )
+
+    def disk(self, **overrides):
+        disk = {
+            "name": "pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34",
+            "sizeGb": "10",
+            "type": "pd-balanced",
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+            "zone": "us-east4-b",
+            "users": [],
+            # Past the 30-day floor on its own, so these tests exercise the
+            # excerpt rather than the dead-cluster short floor.
+            "lastDetachTimestamp": "2026-06-01T00:00:00Z",
+        }
+        disk.update(overrides)
+        return disk
+
+    def test_the_excerpt_names_the_claim_the_disk_was_cut_for(self):
+        hits = fw.check_unattached_disk([self.disk(description=self.DESCRIPTION)], set(), now=NOW)
+        self.assertIn("kubeagents-system/platform-agent-data", hits[0]["excerpt"])
+
+    def test_a_disk_no_driver_provisioned_says_nothing_about_a_claim(self):
+        hits = fw.check_unattached_disk([self.disk()], set(), now=NOW)
+        self.assertNotIn("PersistentVolumeClaim", hits[0]["excerpt"])
+
+    def test_a_description_that_is_not_json_is_not_a_crash(self):
+        """`description` is a free-text field an operator can write anything
+        into, including the marker substring."""
+        disk = self.disk(description="notes about kubernetes.io/created-for, not JSON")
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("PersistentVolumeClaim", hits[0]["excerpt"])
+
+    def test_a_claim_with_no_namespace_is_named_bare(self):
+        disk = self.disk(
+            description=json.dumps({"kubernetes.io/created-for/pvc/name": "lonely"})
+        )
+        hits = fw.check_unattached_disk([disk], set(), now=NOW)
+        self.assertIn("held the lonely PersistentVolumeClaim", hits[0]["excerpt"])
+
+    def test_the_claim_rides_alongside_the_dead_cluster_note(self):
+        disk = self.disk(
+            description=self.DESCRIPTION,
+            labels={"goog-k8s-cluster-name": "platform-agent-host"},
+        )
+        excerpt = fw.check_unattached_disk([disk], set(), now=NOW, known_clusters={"live"})[0]["excerpt"]
+        self.assertIn("kubeagents-system/platform-agent-data", excerpt)
+        self.assertIn("platform-agent-host", excerpt)
+        self.assertIn("no longer runs", excerpt)
+
+
 class IdleAddressTest(unittest.TestCase):
     def address(self, name="addr1", addr_type="EXTERNAL", status="RESERVED", purpose="", created="2026-01-01T00:00:00Z", region="us-central1"):
         return {"name": name, "address": "1.2.3.4", "addressType": addr_type, "status": status, "purpose": purpose, "creationTimestamp": created, "region": region}
