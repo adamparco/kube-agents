@@ -861,6 +861,45 @@ class OwnerKeyTest(unittest.TestCase):
         self.assertEqual(fw._owner_key(owners), fw._owner_key(list(reversed(owners))))
 
 
+class SizingOwnerTest(unittest.TestCase):
+    @staticmethod
+    def meta(kind="ReplicaSet", name="web-74d7c4f678", hash_label="74d7c4f678"):
+        labels = {"pod-template-hash": hash_label} if hash_label else {}
+        return {
+            "name": "web-74d7c4f678-abcde",
+            "labels": labels,
+            "ownerReferences": [{"kind": kind, "name": name, "controller": True}],
+        }
+
+    def test_a_replicaset_resolves_to_the_deployment_that_declares_it(self):
+        self.assertEqual(fw._sizing_owner(self.meta()), ("Deployment", "web"))
+
+    def test_a_bare_replicaset_keeps_its_own_name(self):
+        # No `pod-template-hash` means no Deployment above it, so the
+        # ReplicaSet really is the object the repo declares.
+        self.assertEqual(
+            fw._sizing_owner(self.meta(name="standalone", hash_label=None)),
+            ("ReplicaSet", "standalone"),
+        )
+
+    def test_a_hash_that_is_not_the_name_suffix_is_not_stripped(self):
+        self.assertEqual(
+            fw._sizing_owner(self.meta(name="web-abc", hash_label="74d7c4f678")),
+            ("ReplicaSet", "web-abc"),
+        )
+
+    def test_other_kinds_pass_through(self):
+        self.assertEqual(
+            fw._sizing_owner(self.meta(kind="StatefulSet", name="db", hash_label=None)),
+            ("StatefulSet", "db"),
+        )
+
+    def test_an_unowned_pod_is_its_own_object(self):
+        self.assertEqual(
+            fw._sizing_owner({"name": "debug", "ownerReferences": []}), ("Pod", "debug")
+        )
+
+
 class JobFinishedAtTest(unittest.TestCase):
     def test_picks_the_terminal_condition_not_the_first_one(self):
         status = {
@@ -1466,6 +1505,20 @@ class UnattachedDiskTest(unittest.TestCase):
         hits = fw.check_unattached_disk([self.disk(size_gb=600, disk_type="pd-ssd")], set(), now=NOW)
         self.assertEqual(hits[0]["severity"], "major")
 
+    def test_the_excerpt_shortens_the_disk_type_selflink(self):
+        """Live `disks list` returns `type` as a diskTypes URL. Printed whole it
+        put 100 characters of `googleapis.com` in the excerpt beside a `--zone`
+        flag `_scope_flag` had already shortened for being unreadable."""
+        url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-east4-b/diskTypes/pd-balanced"
+        hits = fw.check_unattached_disk([self.disk(disk_type=url)], set(), now=NOW)
+        self.assertIn("pd-balanced", hits[0]["excerpt"])
+        self.assertNotIn("googleapis", hits[0]["excerpt"])
+
+    def test_severity_still_reads_ssd_out_of_a_selflink_type(self):
+        url = "https://www.googleapis.com/compute/v1/projects/p/zones/us-east4-b/diskTypes/pd-ssd"
+        hits = fw.check_unattached_disk([self.disk(size_gb=10, disk_type=url)], set(), now=NOW)
+        self.assertEqual(hits[0]["severity"], "major")
+
     def test_a_zonal_disk_carries_its_zone_scope_flag(self):
         """The excerpt used to print `zone=` with gcloud's raw selfLink in it.
 
@@ -1485,6 +1538,89 @@ class UnattachedDiskTest(unittest.TestCase):
         hits = fw.check_unattached_disk([disk], set(), now=NOW)
         self.assertIn("--region=us-east4", hits[0]["excerpt"])
         self.assertNotIn("--zone", hits[0]["excerpt"])
+
+
+class DeadClusterDiskTest(unittest.TestCase):
+    """§3.4's short floor for a disk whose owning cluster no longer exists.
+
+    Live case this was written from: two `platform-agent-host` PDs detached on
+    2026-08-26 when that cluster was deleted, still billing ten days later, and
+    still three weeks short of the 30-day floor that assumes something will
+    reattach them.
+    """
+
+    def disk(self, name="d1", detached="2026-07-22T00:00:00Z", cluster="dead-cluster", size_gb=10):
+        disk = {
+            "name": name,
+            "sizeGb": str(size_gb),
+            "type": "pd-balanced",
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+            "zone": "us-east4-b",
+            "users": [],
+            "lastDetachTimestamp": detached,
+        }
+        if cluster is not None:
+            disk["labels"] = {"goog-k8s-cluster-name": cluster}
+        return disk
+
+    def test_ten_days_off_a_deleted_cluster_is_a_finding(self):
+        hits = fw.check_unattached_disk([self.disk()], set(), now=NOW, known_clusters={"live-one"})
+        self.assertEqual(len(hits), 1)
+
+    def test_the_same_disk_is_churn_while_its_cluster_still_runs(self):
+        self.assertEqual(
+            fw.check_unattached_disk([self.disk()], set(), now=NOW, known_clusters={"dead-cluster"}),
+            [],
+        )
+
+    def test_an_unknown_fleet_does_not_read_as_an_empty_one(self):
+        """`known_clusters=None` is the enumeration having failed. Treating it
+        as "no clusters exist" would drop every GKE disk in the project to the
+        7-day floor on the one run that could not see the fleet."""
+        self.assertEqual(fw.check_unattached_disk([self.disk()], set(), now=NOW), [])
+
+    def test_the_short_floor_still_has_a_floor(self):
+        """Six days is inside the asynchronous-teardown and same-name-recreate
+        window the seven days exist to outlive."""
+        recent = self.disk(detached="2026-07-26T00:00:00Z")
+        self.assertEqual(fw.check_unattached_disk([recent], set(), now=NOW, known_clusters={"live"}), [])
+
+    def test_an_unlabelled_disk_keeps_the_thirty_day_floor(self):
+        """No `goog-k8s-cluster-name` means no cluster was shown to be gone —
+        an unlabelled disk is not evidence of a deleted cluster."""
+        bare = self.disk(cluster=None)
+        self.assertEqual(fw.check_unattached_disk([bare], set(), now=NOW, known_clusters={"live"}), [])
+
+    def test_the_excerpt_names_the_cluster_that_is_gone(self):
+        """`adopt_collector_evidence` makes this string the only evidence a
+        reader sees, and without the cluster there is nothing in it explaining
+        why a ten-day-old disk was reported when a twenty-day-old one was not.
+        """
+        excerpt = fw.check_unattached_disk([self.disk()], set(), now=NOW, known_clusters={"live"})[0]["excerpt"]
+        self.assertIn("dead-cluster", excerpt)
+        self.assertIn("no longer runs", excerpt)
+
+    def test_a_thirty_day_disk_says_nothing_about_a_dead_cluster(self):
+        old = self.disk(detached="2026-06-01T00:00:00Z", cluster="live")
+        excerpt = fw.check_unattached_disk([old], set(), now=NOW, known_clusters={"live"})[0]["excerpt"]
+        self.assertNotIn("no longer runs", excerpt)
+
+    def test_a_live_pv_handle_still_wins(self):
+        """The claimed-but-detached exclusion is not weakened by the short
+        floor: a PV still bound to the handle is data, not waste."""
+        self.assertEqual(
+            fw.check_unattached_disk([self.disk(name="h1")], {"h1"}, now=NOW, known_clusters={"live"}),
+            [],
+        )
+
+    def test_a_degraded_cluster_still_owns_its_disks(self):
+        """`enumerate_clusters` hands DEGRADED and PROVISIONING clusters back in
+        its second list rather than its first. They exist; a disk labelled for
+        one is not orphaned."""
+        self.assertEqual(
+            fw.check_unattached_disk([self.disk(cluster="degraded-one")], set(), now=NOW, known_clusters={"live", "degraded-one"}),
+            [],
+        )
 
 
 class IdleAddressTest(unittest.TestCase):

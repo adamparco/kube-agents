@@ -1330,6 +1330,41 @@ def _owner_key(owners: list[dict]) -> tuple[str, str] | None:
     return (pick.get("kind", ""), pick.get("name", ""))
 
 
+def _sizing_owner(meta: dict) -> tuple[str, str]:
+    """The object whose manifest declares this pod's request.
+
+    `_owner_key` answers a different question -- who controls this pod -- and
+    for anything a Deployment runs the answer is a ReplicaSet. A ReplicaSet is
+    the wrong object for a sizing finding twice over. Its name carries the
+    pod-template hash, so the next edit to the pod template rolls a new one and
+    the finding's `object` moves with it: §5 reads a moved `object` as the old
+    finding resolved and a new one appearing, so a controller that is still
+    over-requested is announced fixed on the run that changes anything about
+    it. And §3.1's remediation is "the controller's complete desired manifest,
+    taken from its declaration in the GitOps repo" -- a repo declares
+    `Deployment/web`, never `ReplicaSet/web-74d7c4f678`, so the manifest the
+    remediation asks for does not exist under the name the finding gives.
+
+    The hash is the pod's own `pod-template-hash` label, which the Deployment
+    controller sets on the ReplicaSet and its pods and nothing else sets, so
+    stripping it off the end of the ReplicaSet's name gives the Deployment
+    exactly rather than by inference. A ReplicaSet created directly -- no
+    Deployment above it -- carries no such label and is left alone, which is
+    correct: there it really is the declared object.
+    """
+    owners = meta.get("ownerReferences") or []
+    key = _owner_key(owners)
+    if key is None:
+        return ("Pod", meta.get("name", ""))
+    kind, name = key
+    if kind != "ReplicaSet":
+        return key
+    suffix = str((meta.get("labels") or {}).get("pod-template-hash") or "")
+    if suffix and name.endswith("-" + suffix):
+        return ("Deployment", name[: -(len(suffix) + 1)])
+    return key
+
+
 def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]:
     """Pods whose declared request is a sizing decision somebody here can change.
 
@@ -1367,15 +1402,14 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         limits = [(c.get("resources") or {}).get("limits") or {} for c in containers]
         if not any(requests):
             continue  # obtainability-audit's `no-requests` owns this
-        # Namespaced, because `(kind, name)` is not unique within a cluster.
-        # A ReplicaSet carries a pod-template hash so two would collide only on
-        # identical pod specs, but a StatefulSet or a CronJob-less Deployment
-        # owns pods under its bare name -- so the same chart installed into two
-        # namespaces produces one merged entry, and the finding names whichever
-        # namespace sorted first while summing both namespaces' requests and
-        # usage into its numbers. No collision exists on the sixteen-cluster
-        # fleet today; this keeps one from being silently wrong later.
-        kind, owner_name = _owner_key(owners) or ("Pod", name)
+        # Namespaced, because `(kind, name)` is not unique within a cluster: a
+        # Deployment or StatefulSet owns pods under its bare name, so the same
+        # chart installed into two namespaces produces one merged entry, and
+        # the finding names whichever namespace sorted first while summing both
+        # namespaces' requests and usage into its numbers. No collision exists
+        # on the sixteen-cluster fleet today; this keeps one from being
+        # silently wrong later.
+        kind, owner_name = _sizing_owner(meta)
         entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None})
         entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits})
         # A measurement is only as long as the pod that reported it. Monitoring
@@ -1921,25 +1955,84 @@ def _idle_since(disk: dict) -> tuple[str, str]:
     return str(created), f"never attached, created {created}"
 
 
-def check_unattached_disk(disks: list[dict], live_pv_handles: set[str], *, now: datetime) -> list[dict]:
+#: §3.4's floor for a disk whose owning cluster is still there. The SOP
+#: justifies it as outliving "node upgrades, pod rescheduling, and maintenance
+#: windows" -- a full monthly GKE maintenance cycle, after which a reattach is
+#: churn nobody should be paged about.
+UNATTACHED_AGE_DAYS = 30
+#: §3.4's floor for a disk labelled for a cluster the project no longer runs.
+#: Every clause of the 30-day justification is about something reattaching the
+#: disk, and a deleted cluster reattaches nothing: there is no node pool to
+#: upgrade, no scheduler to move a pod, no maintenance window. What is left to
+#: outlive is the deletion itself -- GKE tears a cluster's PD-CSI volumes down
+#: asynchronously, and a `Delete`-policy disk can outlive its cluster by
+#: minutes -- plus the case where the same cluster is being recreated under the
+#: same name in the same sitting. A week covers both and still catches the
+#: waste three weeks before the 30-day floor would.
+DEAD_CLUSTER_AGE_DAYS = 7
+#: The label GKE stamps on every PD it provisions, naming the owning cluster.
+GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
+
+
+def _dead_cluster_of(disk: dict, known_clusters: set[str] | None) -> str:
+    """The cluster this disk was provisioned for, if that cluster is gone.
+
+    Empty string for every other case, including the one that matters most:
+    `known_clusters=None` means this project's `container clusters list` did
+    not come back, so *no* cluster can be shown absent and the short floor is
+    withheld from the whole project. Reading an unknown fleet as an empty one
+    would flag every GKE disk in it a week after any detach.
+    """
+    if known_clusters is None:
+        return ""
+    owner = ((disk.get("labels") or {}).get(GKE_CLUSTER_LABEL) or "").strip()
+    if not owner or owner in known_clusters:
+        return ""
+    return owner
+
+
+def check_unattached_disk(
+    disks: list[dict],
+    live_pv_handles: set[str],
+    *,
+    now: datetime,
+    known_clusters: set[str] | None = None,
+) -> list[dict]:
     hits = []
     for disk in disks:
         if disk.get("users"):
             continue
         idle_since, idle_phrase = _idle_since(disk)
         age = _age_days(idle_since, now=now)
-        if age is None or age < 30:
+        if age is None:
+            continue
+        dead_cluster = _dead_cluster_of(disk, known_clusters)
+        if age < (DEAD_CLUSTER_AGE_DAYS if dead_cluster else UNATTACHED_AGE_DAYS):
             continue
         if disk.get("name", "") in live_pv_handles:
             continue
         size_gb = disk.get("sizeGb")
         size_gb = float(size_gb) if size_gb else 0
-        disk_type = (disk.get("type") or "").lower()
+        # gcloud returns `type` as a full diskTypes selfLink, so the excerpt
+        # used to carry 100 characters of URL where `pd-balanced` belongs --
+        # next to a `--zone` flag `_scope_flag` shortens for the same reason.
+        # The severity test below reads the whole string either way; `pd-ssd`
+        # is a substring of its own URL.
+        disk_type = str(disk.get("type") or "").rsplit("/", 1)[-1]
+        # The excerpt has to carry the dead cluster, not just the age: it is the
+        # whole reason a 9-day-old disk is a finding when the one beside it at
+        # 20 days is not, and `adopt_collector_evidence` makes this string the
+        # only evidence a reader sees.
+        orphan_note = (
+            f", provisioned for cluster {dead_cluster} which this project no longer runs"
+            if dead_cluster
+            else ""
+        )
         hits.append(
             {
                 "object": f"Disk/{disk.get('name', '')}",
-                "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk.get('type')} ({_scope_flag(disk)})",
-                "severity": "major" if size_gb >= 500 or "ssd" in disk_type or "extreme" in disk_type else "minor",
+                "excerpt": f"{idle_phrase}{_ago(age)}, {size_gb:.0f} GB, {disk_type} ({_scope_flag(disk)}){orphan_note}",
+                "severity": "major" if size_gb >= 500 or "ssd" in disk_type.lower() or "extreme" in disk_type.lower() else "minor",
             }
         )
     return hits
@@ -2059,7 +2152,7 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
     return hits
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -2104,7 +2197,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "error": f"{len(failed)} of 5 compute list reads failed -- " + "; ".join(failed),
         }
 
-    candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now)]
+    candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters)]
     candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
@@ -2165,12 +2258,21 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
 
     clusters: list[dict] = []
     unaudited: list[dict] = []
+    # Every cluster name the project answers to, whatever its status, or `None`
+    # where the enumeration failed. §3.4's short floor for a disk whose owning
+    # cluster is gone reads this, and a DEGRADED or PROVISIONING cluster is not
+    # gone -- it is unaudited, which is why the union is taken over both halves
+    # of `enumerate_clusters` rather than over the RUNNING one this loop feeds
+    # to the workers.
+    known_by_project: dict[str, set[str] | None] = {}
     for p in projects:
         try:
             running, not_running = enumerate_clusters(p, run=run)
             clusters.extend(running)
             unaudited.extend(not_running)
+            known_by_project[p] = {c["name"] for c in running} | {c["name"] for c in not_running}
         except RuntimeError as exc:
+            known_by_project[p] = None
             # A log line is not a record. The manifest is the only account of
             # what this run managed to read, and a project whose clusters could
             # not be listed used to leave nothing in it -- its `project/<p>`
@@ -2237,7 +2339,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
-        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now)
+        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p))
         if project_entry:
             project_entries.append(project_entry)
 
