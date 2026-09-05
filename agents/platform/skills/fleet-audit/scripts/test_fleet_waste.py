@@ -1087,6 +1087,38 @@ class OverrequestTest(unittest.TestCase):
         peaks = {("default", "api-1"): (11.0, 40000.0)}
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
+    def test_an_unmeasured_controller_is_not_reported(self):
+        """Absent is not idle, and here absent reads as *maximally* idle.
+
+        Summing pods missing from the Monitoring answer as zero puts the
+        controller at 0% of its request on both dimensions at once, which
+        clears both ratio tests by the widest possible margin -- so the failure
+        mode is not a missed finding but a confident one, proposing to cut the
+        request of a workload nobody observed down to the 50m/64Mi floor. The
+        `if not usage_peaks` guard at the top of the check only catches a
+        cluster that answered nothing at all; a single namespace missing, or a
+        metrics agent down on one node, arrives here.
+        """
+        pod = self.deployment_pod()
+        populated = {("default", "somebody-else"): (4.0, 8192.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, populated, now=NOW, autopilot=False), [])
+        # Control: the same controller, same zero usage, but *present* in the
+        # answer is reported -- so it is the guard doing the silencing above
+        # and not the materiality floor or an eligibility exclusion.
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_one_measured_pod_is_enough_to_judge_a_controller(self):
+        """The guard drops the unmeasured, not the partially measured.
+
+        A controller mid-rollout has a pod the window has not seen yet.
+        Dropping it wholesale would make every over-request invisible for as
+        long as one replica stayed unmeasured, which is the opposite failure.
+        """
+        pods = [self.deployment_pod(name="api-1"), self.deployment_pod(name="api-2")]
+        peaks = {("default", "api-1"): (0.5, 1024.0)}  # api-2 absent
+        hits = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)
+        self.assertEqual([h["object"] for h in hits], ["ReplicaSet/api"])
+
     def test_does_not_flag_below_the_absolute_floor(self):
         pod = self.deployment_pod(cpu_req="50m", mem_req="64Mi")
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])

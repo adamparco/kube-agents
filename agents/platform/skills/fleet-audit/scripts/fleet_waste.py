@@ -1465,10 +1465,25 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         guaranteed = cpu_req_total == cpu_lim_total and mem_req_total == mem_lim_total and cpu_lim_total > 0
 
         peak_cpu = peak_mem = 0.0
+        measured = False
         for pod in entry["pods"]:
-            cpu, mem = usage_peaks.get((pod["ns"], pod["name"]), (0.0, 0.0))
+            key = (pod["ns"], pod["name"])
+            if key in usage_peaks:
+                measured = True
+            cpu, mem = usage_peaks.get(key, (0.0, 0.0))
             peak_cpu += cpu
             peak_mem += mem
+        # Same guard `check_underrequest` carries, and this is the direction in
+        # which getting it wrong is worse. A controller none of whose pods
+        # reported sums to zero on both dimensions, which is not "idle" but
+        # "unmeasured" -- and zero is the most idle a workload can read, so it
+        # clears both ratio tests at once and the finding proposes shrinking
+        # the request of a workload nobody observed. The `if not usage_peaks`
+        # return above only catches a cluster that answered nothing at all;
+        # one namespace missing from an otherwise-populated answer, or a
+        # metrics agent down on a single node, lands here instead.
+        if not measured:
+            continue
         # Per dimension, not across both. Requiring CPU *and* memory to be idle
         # together made the common shape invisible: a controller sized for its
         # memory footprint and given a copy-pasted CPU request uses ~all of the
