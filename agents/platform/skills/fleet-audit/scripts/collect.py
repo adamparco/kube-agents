@@ -3244,6 +3244,41 @@ _COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
 }
 
 
+# Why a target's per-workload checks had nothing to examine, per stream. Each
+# stream filters the same dump differently -- obtainability reads templates and
+# drops Pods, compliance reads resolved pod specs and keeps unowned ones,
+# ai-security keeps only what `_is_ai_workload` matches -- so "empty" means a
+# different thing in each and one sentence for all three would be false for two
+# of them.
+_EMPTY_SCOPE_REASON: dict[str, str] = {
+    "obtainability-audit": (
+        "No workload on this cluster is in scope: every Deployment, StatefulSet, "
+        "DaemonSet and Job the dump returned is in a system namespace, "
+        "addon-managed, owned by another object, opted out, or scaled to zero. "
+        "This check examined nothing here, which is not the same as finding nothing."
+    ),
+    "compliance-audit": (
+        "No workload on this cluster is in scope: every Deployment, StatefulSet, "
+        "DaemonSet, CronJob and unowned Pod the dump returned is in a system "
+        "namespace, addon-managed, or a GKE component. This check examined nothing "
+        "here, which is not the same as finding nothing."
+    ),
+}
+
+# `ai-security-audit` is deliberately absent, and the omission is the whole
+# reason this is a table rather than a constant. A model-free cluster is that
+# stream's *common* case -- most clusters in most fleets serve no models -- and
+# every one of its six checks takes an AI workload, so an empty scope would
+# leave `commands` empty. The validator refuses an empty `checks_run` unless
+# the cluster also carries a `limitations` note, and a limitations note makes
+# the run `partial`: the stream would be pinned partial on every fleet where
+# nine clusters in ten run no models, never able to close its ledger, announce
+# a finding resolved, or retire a stale remediation pull request. §1 of its SOP
+# argues that trade-off explicitly and lands the other way. Obtainability and
+# compliance keep cluster-scoped checks in `commands` on an empty cluster, so
+# neither pays that price.
+
+
 def collect_cluster(
     cluster: dict, audit_id: str, checks: tuple[CheckSpec, ...], *, run: RunFn = default_run
 ) -> dict:
@@ -3362,6 +3397,29 @@ def collect_cluster(
                 continue
             not_applicable_slugs.add(slug)
             checks_not_applicable.append({"check": slug, "reason": reason})
+
+    if not collected.workloads and audit_id in _EMPTY_SCOPE_REASON:
+        # Nothing survived S1-S5, so every per-workload check on this target
+        # examined an empty set. Reporting those as checks that ran is what
+        # the 2026-09-05 obtainability run did on 12 of 16 clusters: the
+        # document said 11 checks on 16 targets with nothing inapplicable and
+        # no limitation, which reads as fourteen healthy clusters when twelve
+        # of them were never in scope at all. A check with nothing to examine
+        # has not cleared anything, and the manifest is the only place that
+        # distinction still exists -- by publish time a clean cluster and an
+        # empty one are the same absence of candidates.
+        #
+        # `outcome` is already "collected", so the dump succeeded; this is the
+        # scope being empty, not the read failing. Cluster-scoped checks are
+        # untouched: an HPA pointing at a workload that no longer exists, a
+        # public control plane, a cluster-admin binding are all still true of
+        # a cluster running nothing.
+        reason = _EMPTY_SCOPE_REASON[audit_id]
+        for spec in checks:
+            if spec.kind != "workload" or spec.slug in not_applicable_slugs:
+                continue
+            not_applicable_slugs.add(spec.slug)
+            checks_not_applicable.append({"check": spec.slug, "reason": reason})
 
     result = {
         "name": name, "project": project, "location": location,

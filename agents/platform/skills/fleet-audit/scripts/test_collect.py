@@ -1300,6 +1300,47 @@ class TestCollectCluster(unittest.TestCase):
         result, _ = self.collect([d])
         self.assertEqual(result["candidates"], [])
 
+    def test_a_cluster_with_nothing_in_scope_declares_the_checks_inapplicable(self):
+        """A check with no workloads to examine has cleared nothing.
+
+        12 of the 16 clusters the 2026-09-05 obtainability run covered hold no
+        workload outside a system namespace. The document said 11 checks on 16
+        targets, nothing inapplicable, no limitation -- which reads as fourteen
+        clean clusters. Twelve of them were never in scope.
+        """
+        result, _ = self.collect([deployment("kube-dns", ns="kube-system")])
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual(result["candidates"], [])
+        na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
+        workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
+        self.assertEqual(set(na), workload_slugs)
+        # The cluster-scoped pair still ran: an HPA pointing at a workload that
+        # no longer exists and a PDB nothing can satisfy are both still true of
+        # a cluster running nothing.
+        cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
+        self.assertEqual(cluster_slugs, {"hpa-cannot-scale", "blocking-pdb"})
+        self.assertFalse(cluster_slugs & set(na))
+        # §6 reads `commands` as the list of checks that ran, so a slug cannot
+        # be in both.
+        self.assertEqual({c["check"] for c in result["commands"]}, cluster_slugs)
+        self.assertTrue(all("examined nothing" in r for r in na.values()))
+
+    def test_a_cluster_with_one_workload_in_scope_declares_nothing_inapplicable(self):
+        # The control for the test above: one auditable workload beside the
+        # system-namespace noise and every check is back to having run.
+        result, _ = self.collect([
+            deployment("kube-dns", ns="kube-system"),
+            with_container_resources(
+                deployment("api"),
+                {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"memory": "1Gi"}},
+            ),
+        ])
+        self.assertNotIn("checks_not_applicable", result)
+        self.assertEqual(
+            {c["check"] for c in result["commands"]},
+            {s.slug for s in collect.OBTAINABILITY_CHECKS},
+        )
+
     def test_get_credentials_failure_is_unreachable_not_a_shorter_list(self):
         result, calls = self.collect([deployment("api")], cred_rc=1)
         self.assertEqual(result["outcome"], "unreachable")
@@ -1596,7 +1637,10 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.05)
             if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
-                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+                # One in-scope workload: with none, every workload-scoped
+                # check is declared inapplicable and `checks_run` below is
+                # rightly rejected for naming checks that examined nothing.
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -3296,7 +3340,23 @@ class TestComplianceCollectCluster(unittest.TestCase):
         "message=Autopilot node pools cannot be accessed or modified."
     )
 
-    def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None):
+    # One in-scope Pod by default, hardened so it trips nothing. A cluster
+    # with nothing in scope declares every workload-scoped check inapplicable
+    # -- correct, and not what most of this class is about, so a test that
+    # wants the empty-scope path asks for it with `workload_items=[]`.
+    @staticmethod
+    def benign_pod():
+        pod = compliance_pod("app")
+        pod["spec"]["containers"][0]["securityContext"] = {
+            "runAsNonRoot": True,
+            "allowPrivilegeEscalation": False,
+            "seccompProfile": {"type": "RuntimeDefault"},
+            "capabilities": {"drop": ["ALL"]},
+        }
+        return pod
+
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None):
+        workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
         self.issued = []
@@ -4185,10 +4245,22 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
                 return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
 
     def test_a_cluster_with_no_ai_workloads_still_runs_every_check(self):
+        """The one stream where an empty scope is *not* declared inapplicable.
+
+        `collect_cluster` declares a target's workload-scoped checks
+        inapplicable when nothing survives the filters, because a check with
+        nothing to examine has cleared nothing. `_EMPTY_SCOPE_REASON` leaves
+        this stream out on purpose: all six of its checks take an AI workload,
+        so an empty scope would empty `commands`, the validator refuses an
+        empty `checks_run` without a `limitations` note, and that note would
+        pin a fleet of model-free clusters at `partial` forever. §1 of the SOP
+        argues the trade-off and lands here.
+        """
         result = self.run_with(workload_items=[deployment("web")], service_items=[])
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
         self.assertEqual(len(result["commands"]), 6)
+        self.assertNotIn("checks_not_applicable", result)
 
     def test_a_dirty_cluster_reports_across_both_sources(self):
         w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"}, container={"args": ["--trust-remote-code"], "image": "acme/vllm:latest"})
