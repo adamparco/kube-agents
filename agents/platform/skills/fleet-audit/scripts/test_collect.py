@@ -2678,14 +2678,20 @@ class TestPublicControlPlane(unittest.TestCase):
                 self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
 
     def test_enabled_with_no_cidr_blocks_stays_restrictive(self):
-        # Authorized networks on with an empty list is the strict end of the
-        # setting -- nothing outside Google's own access reaches the endpoint.
-        # Treating "no blocks" as "nothing was allowlisted, so it is open"
-        # would invert it and report the most locked-down clusters.
+        # Authorized networks on with an empty list allowlists nothing, so the
+        # endpoint is shut. Treating "no blocks" as "nothing was allowlisted,
+        # so it is open" would invert it and report the most locked-down
+        # clusters. Google Cloud access has to be off for that to hold: with
+        # it on, the empty list is the only thing between the endpoint and
+        # every VM on Google Cloud, and it is not in the way.
         ctx = context_of(
             cluster_describe={
                 "privateClusterConfig": {},
-                "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": []},
+                "masterAuthorizedNetworksConfig": {
+                    "enabled": True,
+                    "cidrBlocks": [],
+                    "gcpPublicCidrsAccessEnabled": False,
+                },
             }
         )
         self.assertEqual(collect.check_public_control_plane(ctx), [])
@@ -2769,6 +2775,7 @@ class TestPublicControlPlane(unittest.TestCase):
                     "masterAuthorizedNetworksConfig": {
                         "enabled": True,
                         "cidrBlocks": [{"displayName": "office", "cidrBlock": "203.0.113.0/24"}],
+                        "gcpPublicCidrsAccessEnabled": False,
                     },
                     "controlPlaneEndpointsConfig": {
                         "ipEndpointsConfig": {"enablePublicEndpoint": True},
@@ -2853,6 +2860,7 @@ class TestPublicControlPlane(unittest.TestCase):
                     "masterAuthorizedNetworksConfig": {
                         "enabled": True,
                         "cidrBlocks": [{"cidrBlock": "203.0.113.0/24"}],
+                        "gcpPublicCidrsAccessEnabled": False,
                     },
                     "controlPlaneEndpointsConfig": {
                         "ipEndpointsConfig": {"enablePublicEndpoint": True},
@@ -2995,10 +3003,118 @@ class TestPublicControlPlane(unittest.TestCase):
                 "masterAuthorizedNetworksConfig": {
                     "enabled": True,
                     "cidrBlocks": [{"displayName": "corp", "cidrBlock": "10.0.0.0/8"}],
+                    "gcpPublicCidrsAccessEnabled": False,
                 },
             }
         )
         self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+    def test_google_cloud_access_defeats_the_narrowest_allowlist(self):
+        """A `/32` allowlist is not a restriction while the grant is on.
+
+        `gcpPublicCidrsAccessEnabled` excepts every external address Google
+        Cloud owns -- the VMs, Cloud Run services and Cloud Functions of every
+        project, not this one's -- so an attacker starts a VM and is inside the
+        list. Suppressing on it graded that cluster clean.
+        """
+        for label, value in (("explicit", True), ("absent, and the API default is on", None)):
+            cfg = {"enabled": True, "cidrBlocks": [{"cidrBlock": "203.0.113.7/32"}]}
+            if value is not None:
+                cfg["gcpPublicCidrsAccessEnabled"] = value
+            with self.subTest(label):
+                found = collect.check_public_control_plane(
+                    context_of(
+                        cluster_describe={
+                            "privateClusterConfig": {},
+                            "masterAuthorizedNetworksConfig": cfg,
+                            "controlPlaneEndpointsConfig": {
+                                "ipEndpointsConfig": {"enablePublicEndpoint": True}
+                            },
+                        }
+                    )
+                )
+                self.assertEqual(len(found), 1)
+                self.assertIn("enablePublicEndpoint=true", found[0]["excerpt"])
+
+    def test_the_grant_is_named_in_the_excerpt_even_where_gke_returned_no_field(self):
+        # `adopt_collector_evidence` overwrites the model's excerpt with this
+        # one, so a reader who sees a tight `cidrBlocks` and no mention of the
+        # grant concludes the opposite of the truth and has no second source.
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"cidrBlock": "203.0.113.7/32"}],
+                    },
+                }
+            )
+        )
+        self.assertIn("gcpPublicCidrsAccessEnabled=absent", found[0]["excerpt"])
+        self.assertIn("admits every Google Cloud external IP", found[0]["excerpt"])
+
+    def test_the_grant_arm_does_not_claim_the_whole_internet(self):
+        """The operator here already turned authorized networks on.
+
+        Telling them the endpoint answers every address reads as a check that
+        did not notice, and points at the control they have already set rather
+        than at the flag still to set.
+        """
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"cidrBlock": "203.0.113.7/32"}],
+                        "gcpPublicCidrsAccessEnabled": True,
+                    },
+                }
+            )
+        )
+        impact = found[0]["impact"]
+        self.assertIn("gcpPublicCidrsAccessEnabled", impact)
+        self.assertNotIn("any address on the internet", impact)
+
+    def test_an_allow_all_block_keeps_the_whole_internet_arm(self):
+        # `0.0.0.0/0` beside the grant is not the grant's doing, and the
+        # narrower sentence would understate it.
+        found = collect.check_public_control_plane(
+            context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"cidrBlock": "0.0.0.0/0"}],
+                        "gcpPublicCidrsAccessEnabled": True,
+                    },
+                }
+            )
+        )
+        self.assertIn("directly exploitable", found[0]["impact"])
+
+    def test_turning_the_grant_off_is_what_clears_the_finding(self):
+        """The two states differ by one field, so the fix is verifiable.
+
+        A remediation the check cannot see the effect of is one an operator
+        applies forever. `--enable-master-authorized-networks` alone leaves the
+        cluster flagged; adding `--no-enable-google-cloud-access` clears it.
+        """
+        def described(grant):
+            return context_of(
+                cluster_describe={
+                    "privateClusterConfig": {},
+                    "masterAuthorizedNetworksConfig": {
+                        "enabled": True,
+                        "cidrBlocks": [{"cidrBlock": "203.0.113.7/32"}],
+                        "gcpPublicCidrsAccessEnabled": grant,
+                    },
+                }
+            )
+
+        self.assertEqual(len(collect.check_public_control_plane(described(True))), 1)
+        self.assertEqual(collect.check_public_control_plane(described(False)), [])
 
     def test_authorized_networks_on_the_ip_endpoints_surface_are_honoured(self):
         """Setting both surfaces is invalid, so the newer one has to be read too.
@@ -3019,6 +3135,7 @@ class TestPublicControlPlane(unittest.TestCase):
                         "authorizedNetworksConfig": {
                             "enabled": True,
                             "cidrBlocks": [{"displayName": "corp", "cidrBlock": "10.0.0.0/8"}],
+                            "gcpPublicCidrsAccessEnabled": False,
                         },
                     }
                 },

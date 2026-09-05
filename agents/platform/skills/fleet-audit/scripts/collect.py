@@ -1887,6 +1887,20 @@ def _is_default_route(cidr: str) -> bool:
         return False
 
 
+def _grants_google_cloud_access(cfg: dict) -> bool:
+    """Whether this authorized-networks config excepts Google Cloud's own public IPs.
+
+    `gcpPublicCidrsAccessEnabled` (the `--enable-google-cloud-access` flag)
+    admits every external address Google Cloud owns, on top of whatever
+    `cidrBlocks` says. Absent reads as granted, because the API default is on:
+    `gcloud container clusters update --enable-master-authorized-networks
+    --master-authorized-networks=<CIDR>` leaves the field `true` on a cluster
+    that never mentioned it, which was confirmed against a live cluster rather
+    than inferred. Reading absent as `false` would call that cluster narrowed.
+    """
+    return cfg.get("gcpPublicCidrsAccessEnabled") is not False
+
+
 def _has_restrictive_authorized_networks(describe: dict) -> bool:
     """Whether some authorized-networks surface narrows control-plane access.
 
@@ -1897,14 +1911,25 @@ def _has_restrictive_authorized_networks(describe: dict) -> bool:
     (`{displayName, cidrBlock}`), never bare strings, so the allow-all entry is
     matched on the field rather than by membership in the list.
 
-    Enabled with no blocks at all stays restrictive: that shuts the public
-    endpoint to everything but Google's own access, which is the strict end of
-    this setting rather than the open one.
+    Google Cloud access disqualifies a config however narrow its `cidrBlocks`
+    are. The addresses it admits are not Google's own infrastructure -- they are
+    the external IPs of every Compute Engine VM, Cloud Run service and Cloud
+    Function in every Google Cloud project, so an attacker rents one and is
+    inside the allowlist. That is not a narrowing worth suppressing a
+    control-plane-exposure finding over, and suppressing on it was the worse
+    half of a pair: the published remediation for that finding did not turn the
+    grant off, so acting on the finding cleared it while leaving the endpoint
+    reachable from anywhere a VM can be started.
+
+    An enabled config with no blocks at all is caught by the same rule rather
+    than by one of its own. It used to be read as the strict end of the setting
+    -- shut to everything but "Google's own access" -- which had the sense of
+    the field backwards.
     """
     ip_cfg = (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
     for cfg in (describe.get("masterAuthorizedNetworksConfig"), ip_cfg.get("authorizedNetworksConfig")):
         cfg = cfg or {}
-        if cfg.get("enabled") is not True:
+        if cfg.get("enabled") is not True or _grants_google_cloud_access(cfg):
             continue
         blocks = [b.get("cidrBlock") if isinstance(b, dict) else b for b in (cfg.get("cidrBlocks") or [])]
         if not any(_is_default_route(str(b or "")) for b in blocks):
@@ -1940,6 +1965,16 @@ def _authorized_networks_excerpt(describe: dict) -> str:
     grades identically -- it is what GKE writes into an otherwise-empty
     `masterAuthorizedNetworksConfig` on a cluster that never enabled the
     feature.
+
+    Which way that field cuts depends on `enabled`, and the excerpt says which,
+    because the reader's next move differs. With `enabled` off the grant is
+    inert: every address already reaches the endpoint, and excepting some of
+    them from an allowlist nobody is applying adds nothing. With `enabled` on
+    it is the finding -- the `cidrBlocks` beside it can be a single `/32` and
+    the endpoint still answers every Compute Engine VM on Google Cloud. That
+    case is annotated even where GKE returned no field at all, because the
+    default is on and a reader who sees a tight `cidrBlocks` with no mention of
+    the grant concludes the opposite of the truth.
     """
     ip_cfg = (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
     parts: list[str] = []
@@ -1950,18 +1985,12 @@ def _authorized_networks_excerpt(describe: dict) -> str:
         cfg = cfg or {}
         blocks = [str(b.get("cidrBlock") if isinstance(b, dict) else b) for b in (cfg.get("cidrBlocks") or [])]
         part = f"{label}.enabled={_json_scalar(cfg.get('enabled'))}, cidrBlocks=[{','.join(blocks)}]"
-        if cfg.get("gcpPublicCidrsAccessEnabled") is not None:
+        live = cfg.get("enabled") is True and _grants_google_cloud_access(cfg)
+        if cfg.get("gcpPublicCidrsAccessEnabled") is not None or live:
             part += f", gcpPublicCidrsAccessEnabled={_json_scalar(cfg.get('gcpPublicCidrsAccessEnabled'))}"
-            # Say so, because the field reads as an aggravating factor and is
-            # the opposite of one. It grants Google Cloud's own public
-            # addresses an exception to the allowlist, so it means something
-            # only while there is an allowlist to be excepted from; with
-            # `enabled` absent every address already reaches the endpoint and
-            # the grant adds nothing. Unannotated, it was the only difference
-            # between one cluster's excerpt and fifteen identical ones, which
-            # invites a reader to triage that cluster first over a field that
-            # makes it no worse than its neighbours.
-            if cfg.get("enabled") is not True:
+            if live:
+                part += " (admits every Google Cloud external IP on top of cidrBlocks)"
+            elif cfg.get("enabled") is not True:
                 part += " (inert: authorized networks not enabled)"
         parts.append(part)
     return "; ".join(parts)
@@ -2012,10 +2041,43 @@ def _external_control_plane_paths(describe: dict) -> list[str]:
     return paths
 
 
+def _allowlisted_but_for_google_cloud(describe: dict) -> bool:
+    """Whether an allowlist is configured and Google Cloud access is what defeats it.
+
+    Distinguishes the cluster that never enabled authorized networks from the
+    one that enabled them and left the grant on. Both reach the internet, but
+    only the second has an operator who believes the endpoint is closed, and
+    the sentence each needs is different.
+    """
+    ip_cfg = (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
+    for cfg in (describe.get("masterAuthorizedNetworksConfig"), ip_cfg.get("authorizedNetworksConfig")):
+        cfg = cfg or {}
+        if cfg.get("enabled") is not True or not _grants_google_cloud_access(cfg):
+            continue
+        blocks = [b.get("cidrBlock") if isinstance(b, dict) else b for b in (cfg.get("cidrBlocks") or [])]
+        if not any(_is_default_route(str(b or "")) for b in blocks):
+            return True
+    return False
+
+
 _IMPACT_PUBLIC_IP_ENDPOINT = (
     "The cluster's API server accepts connections from any address on the "
     "internet; credential compromise or an API-server CVE is directly "
     "exploitable from outside the network."
+)
+# Separated from the sentence above because the operator here has already done
+# the thing that sentence would prompt -- turned authorized networks on -- and
+# telling them the endpoint answers the whole internet reads as a check that
+# did not notice. The exposure is narrower and the remaining work is a
+# different flag, so the finding has to say which.
+_IMPACT_GOOGLE_CLOUD_ACCESS = (
+    "Authorized networks is enabled on the cluster's public IP endpoint, but "
+    "gcpPublicCidrsAccessEnabled excepts Google Cloud's external addresses "
+    "from the allowlist — those of every Compute Engine VM, Cloud Run service "
+    "and Cloud Function in every Google Cloud project, not this project's "
+    "alone. An attacker starts a VM anywhere on Google Cloud and is inside the "
+    "allowlist, so the allowlist narrows reachability to whoever can create a "
+    "Google Cloud resource rather than closing it."
 )
 # The two endpoints are not the same exposure, and saying so overstates the
 # one that is left. Reaching the DNS endpoint costs an attacker a Google
@@ -2055,6 +2117,13 @@ def check_public_control_plane(context: dict) -> list[dict]:
     still answering the internet, and returning nothing for it told the
     operator the opposite -- the one shape where this check's silence was a
     false negative rather than a pass.
+
+    An allowlist that excepts Google Cloud's own external addresses does not
+    suppress the IP endpoint either, and that is the shape the fleet's own
+    remediation used to produce: `--enable-master-authorized-networks
+    --master-authorized-networks=<CIDR>` leaves `gcpPublicCidrsAccessEnabled`
+    on, so acting on this finding closed it while the endpoint still answered
+    every VM on Google Cloud. See `_has_restrictive_authorized_networks`.
     """
     describe = context.get("cluster_describe") or {}
     paths = _external_control_plane_paths(describe)
@@ -2063,6 +2132,11 @@ def check_public_control_plane(context: dict) -> list[dict]:
     if not paths:
         return []
     dns_only = all("dnsEndpointConfig" in path for path in paths)
+    impact = _IMPACT_PUBLIC_IP_ENDPOINT
+    if dns_only:
+        impact = _IMPACT_PUBLIC_DNS_ENDPOINT
+    elif _allowlisted_but_for_google_cloud(describe):
+        impact = _IMPACT_GOOGLE_CLOUD_ACCESS
     decided = "; ".join(paths)
     # Name the fields and the values, not the conclusion. `adopt_collector_evidence`
     # overwrites the model's excerpt with this string, so it is the only evidence
@@ -2078,7 +2152,7 @@ def check_public_control_plane(context: dict) -> list[dict]:
             "namespace": "",
             "object": _cluster_object(context),
             "excerpt": excerpt,
-            "impact": _IMPACT_PUBLIC_DNS_ENDPOINT if dns_only else _IMPACT_PUBLIC_IP_ENDPOINT,
+            "impact": impact,
         }
     ]
 
