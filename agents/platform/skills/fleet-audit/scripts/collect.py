@@ -2471,6 +2471,20 @@ def _reads_as_inert(value: str) -> bool:
     return matched or referenced
 
 
+#: The inert arm's consequence. The `CheckSpec` default states a credential *is*
+#: embedded and must be rotated, which is the one sentence §3.5 of the SOP names
+#: as false here: this arm fired precisely because every value reads as a
+#: placeholder, so asserting a live credential contradicts the reason the finding
+#: is `minor` and sends the owner to rotate something that does not exist.
+_IMPACT_CREDENTIAL_INERT = (
+    "A variable named for a model-registry credential carries a literal value "
+    "rather than a `secretKeyRef`. Every value reads as a placeholder, so "
+    "probably nothing is exposed today -- but the workload is shaped so that the "
+    "day a real token is pasted in, it lands in `kubectl describe` output and in "
+    "Git with no further change."
+)
+
+
 def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict | None:
     bad, inert = [], []
     for c in _ai_containers(workload["spec"]):
@@ -2494,6 +2508,11 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
     # placeholders beside it.
     if len(inert) == len(bad):
         hit["severity"] = "minor"
+        # Both arms, or neither. Setting `severity` alone leaves `emit` falling
+        # back to `spec.impact` -- the `major` sentence -- and leaves
+        # `impact_authoritative` unset, so `adopt_arm_impact` never corrects it
+        # and `carry_unchanged_findings` republishes it forever.
+        hit["impact"] = _IMPACT_CREDENTIAL_INERT
         # What was measured, not what it proves. `adopt_collector_evidence`
         # forces this excerpt onto the finding but never copies `severity`, so
         # the sentence has to still read correctly under a `major` the model

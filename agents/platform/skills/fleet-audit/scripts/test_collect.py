@@ -3972,6 +3972,30 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
         for value in ("$(HF_TOKEN_REF)", "${HF_TOKEN}", "{{ .Values.hfToken }}"):
             self.assertEqual(self.hit([{"name": "HF_TOKEN", "value": value}])["severity"], "minor")
 
+    def test_the_downgraded_arm_states_no_credential_is_embedded(self):
+        """The `major` sentence is false on this arm, and §3.5 forbids it.
+
+        The arm fired because every value reads as a placeholder, so the spec
+        constant -- "a model-registry credential is embedded ... not rotatable
+        without a redeploy" -- contradicts the reason the finding is `minor`
+        in the same breath, and sends the owner to rotate a credential that
+        does not exist. Shipped that way on 2026-09-05.
+        """
+        hit = self.hit([{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}])
+        spec_impact = next(s for s in collect.AI_SECURITY_CHECKS if s.slug == "model-credential-plaintext-env").impact
+        self.assertNotEqual(hit["impact"], spec_impact)
+        self.assertNotIn("is embedded", hit["impact"])
+        self.assertIn("placeholder", hit["impact"])
+
+    def test_a_live_looking_token_keeps_the_default_impact(self):
+        # The `major` arm must stay unflagged so the model's object-specific
+        # rewrite of the constant survives, exactly as `no-pdb` does.
+        self.assertIsNone(self.hit([{"name": "HF_TOKEN", "value": "hf_qMBpTvKzLdWnXaHrYuEjCiSoPfGb"}]).get("impact"))
+
+    def test_the_downgraded_arms_impact_never_carries_the_value(self):
+        hit = self.hit([{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}])
+        self.assertNotIn("NOT_A_REAL_TOKEN", hit["impact"])
+
     def test_a_placeholder_beside_a_live_token_stays_major(self):
         # One real credential is not made safe by the placeholders next to it,
         # so the downgrade requires every value to be inert.
@@ -4286,6 +4310,26 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
                 result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
+
+    def test_a_downgraded_credential_candidate_is_impact_authoritative(self):
+        """End to end, because the unit arm passing is not what went wrong.
+
+        `emit` derives the flag from `hit["impact"]` alone, so a hit that set
+        only `severity` published the spec's `major` sentence on a `minor`
+        finding *and* left the flag unset -- which means `adopt_arm_impact`
+        could not correct it and `carry_unchanged_findings` would republish it
+        every run. Both halves have to hold at the candidate.
+        """
+        w = ai_workload(
+            "Deployment",
+            "vllm",
+            container={"env": [{"name": "HF_TOKEN", "value": "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"}]},
+        )
+        result = self.run_with(workload_items=[w], service_items=[])
+        cand = next(c for c in result["candidates"] if c["check"] == "model-credential-plaintext-env")
+        self.assertEqual(cand["severity"], "minor")
+        self.assertIs(cand["impact_authoritative"], True)
+        self.assertNotIn("is embedded", cand["impact"])
 
     def test_the_service_dump_backs_only_inference_endpoint_public(self):
         result = self.run_with(workload_items=[deployment("web")], service_items=[])
