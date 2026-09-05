@@ -239,6 +239,73 @@ class FetchUsagePeaksTest(unittest.TestCase):
         self.assertEqual(aligners[fw.MEM_METRIC], "ALIGN_MAX")
 
 
+class FetchMemoryMeansTest(unittest.TestCase):
+    def fetch(self, session, **kwargs):
+        return fw.fetch_memory_means("acme", "prod-usc1", session=session, now=NOW, **kwargs)
+
+    def test_the_secondary_aligner_is_the_mean_and_the_primary_is_not(self):
+        """The one line that separates this from `fetch_usage_peaks`.
+
+        Both collapse a week to one number per pod. The primary aligner buckets
+        five-minute samples and must stay ALIGN_MAX so a pod's number is its
+        real occupancy within each bucket; the secondary collapses those
+        buckets across the window, and ALIGN_MEAN there is what makes the
+        result sustained use rather than the high-water mark 3.1 reads.
+        """
+        session = FakeSession(mem=[series_of("default", "api-1", 512 * MIB)])
+        self.fetch(session)
+        self.assertEqual(len(session.calls), 1)
+        params = session.calls[0]
+        self.assertEqual(params["aggregation.perSeriesAligner"], "ALIGN_MAX")
+        self.assertEqual(params["secondaryAggregation.perSeriesAligner"], "ALIGN_MEAN")
+        self.assertEqual(params["filter"].split('"')[1], fw.MEM_METRIC)
+
+    def test_cpu_is_never_queried(self):
+        # Memory only, by design: one extra round trip per cluster, not two.
+        # CPU is compressible, so a request under actual usage throttles rather
+        # than evicts and there is no `underrequest` finding to raise.
+        session = FakeSession(mem=[series_of("default", "api-1", MIB)])
+        self.fetch(session)
+        self.assertNotIn(fw.CPU_METRIC, " ".join(c["filter"] for c in session.calls))
+
+    def test_bytes_become_mib_keyed_like_the_peaks(self):
+        session = FakeSession(mem=[series_of("default", "api-1", 1536 * MIB)])
+        means, ok, result = self.fetch(session)
+        self.assertTrue(ok)
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(means[("default", "api-1")], 1536.0)
+
+    def test_an_empty_answer_is_unavailable_rather_than_zero_usage(self):
+        # Same failure mode `fetch_usage_peaks` guards, inverted: read as "this
+        # pod averaged nothing", an empty answer suppresses every finding
+        # instead of inventing them, so the check goes quiet and looks healthy.
+        means, ok, result = self.fetch(FakeSession(mem=[]))
+        self.assertEqual(means, {})
+        self.assertFalse(ok)
+        self.assertIn("no time series", result.stderr)
+
+    def test_an_api_error_is_unavailable_and_keeps_the_status(self):
+        means, ok, result = self.fetch(FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"))
+        self.assertFalse(ok)
+        self.assertEqual(means, {})
+        self.assertEqual(result.rc, 403)
+
+    def test_no_session_degrades_instead_of_raising(self):
+        means, ok, result = self.fetch(None)
+        self.assertFalse(ok)
+        self.assertEqual(means, {})
+        self.assertIn("ADC", result.stderr)
+
+    def test_the_label_names_the_aligner_that_produced_the_number(self):
+        """`adopt_collector_evidence` overwrites the model's command with this
+        label, so it is the only description of the query a reviewer ever sees.
+        ALIGN_MEAN in it is what distinguishes the finding's evidence from
+        3.1's, which is otherwise the same metric over the same window."""
+        _, _, result = self.fetch(FakeSession(mem=[series_of("d", "p", MIB)]))
+        self.assertIn("ALIGN_MEAN", result.argv[0])
+        self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", result.argv[0])
+
+
 class OrphanPvTest(unittest.TestCase):
     def pv(self, phase, reclaim="Retain", **overrides):
         doc = obj("PersistentVolume", "pv-1", **{"spec.persistentVolumeReclaimPolicy": reclaim, "status.phase": phase, "spec.capacity": {"storage": "10Gi"}})
@@ -358,10 +425,11 @@ class IdleNodepoolTest(unittest.TestCase):
             },
         )
 
-    def pod_on(self, node, cpu_req="0", mem_req="0Mi", daemonset=False, phase="Running"):
+    def pod_on(self, node, cpu_req="0", mem_req="0Mi", daemonset=False, phase="Running",
+               ns="default", name=None):
         owners = [{"kind": "DaemonSet", "name": "ds"}] if daemonset else []
         return obj(
-            "Pod", f"p-{node}", ns="default",
+            "Pod", name or f"p-{node}", ns=ns,
             **{
                 "spec.nodeName": node,
                 "spec.containers": [{"resources": {"requests": {"cpu": cpu_req, "memory": mem_req}}}],
@@ -370,12 +438,26 @@ class IdleNodepoolTest(unittest.TestCase):
             },
         )
 
-    def pool(self, name, min_nodes=1, autoscaling_enabled=True, machine_type="e2-standard-8", accelerators=None):
+    def pool(self, name, min_nodes=1, autoscaling_enabled=True, machine_type="e2-standard-8",
+             accelerators=None, taints=None):
         return {
             "name": name,
             "autoscaling": {"enabled": autoscaling_enabled, "minNodeCount": min_nodes},
-            "config": {"machineType": machine_type, "accelerators": accelerators or []},
+            "config": {"machineType": machine_type, "accelerators": accelerators or [],
+                       "taints": taints or []},
         }
+
+    def small_node_with_addons(self, node="n1", pool="default-pool"):
+        """The `spot-capacity-test` shape measured on the fleet 2026-09-05: a
+        lone e2-small whose GKE add-ons alone book 61% CPU / 39% memory."""
+        return (
+            self.node(node, pool, cpu_alloc="940m", mem_alloc="1372Mi"),
+            [
+                self.pod_on(node, cpu_req="270m", mem_req="155Mi", ns="kube-system", name="kube-dns"),
+                self.pod_on(node, cpu_req="105m", mem_req="130Mi", ns="gke-managed-cim", name="ksm"),
+                self.pod_on(node, cpu_req="202m", mem_req="247Mi", ns="kube-system", name="rest"),
+            ],
+        )
 
     def test_flags_idle_pool_with_nonzero_floor(self):
         nodes = [self.node("n1", "idle-pool")]
@@ -479,6 +561,174 @@ class IdleNodepoolTest(unittest.TestCase):
         context = {"nodes": [new], "pods": []}
         pools = [self.pool("pool"), self.pool("other")]
         self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_system_addons_alone_do_not_make_a_pool_look_busy(self):
+        """§3.7 puts the 15% bar "below the point where DaemonSet and system
+        overhead (typically 10-25% of a small node) dominates". Measured, GKE's
+        non-DaemonSet add-ons come to ~0.57 vCPU per node, so on an e2-small
+        they are 61% on their own and the bar is unreachable. On the fleet of
+        2026-09-05 that silenced the check on every one of twelve Standard
+        pools -- including this shape, a lone untainted e2-small holding no
+        workload at all next to a pool with 1.5 vCPU free."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/default-pool"])
+        self.assertIn("no workload pods at all", hits[0]["excerpt"])
+
+    def test_one_real_workload_still_keeps_the_pool(self):
+        """The system-pod exclusion must not swallow the busy case: a pool
+        carrying an actual workload above the bar is in use, whatever the
+        add-ons around it add up to."""
+        node, addons = self.small_node_with_addons()
+        pods = addons + [self.pod_on("n1", cpu_req="500m", mem_req="100Mi", name="app")]
+        context = {"nodes": [node], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        self.assertEqual(fw.check_idle_nodepool(context, pools, now=NOW), [])
+
+    def test_a_workload_under_the_bar_is_flagged_and_quantified(self):
+        """Under 15% of allocatable is still an under-allocated pool, and the
+        excerpt has to say so rather than claiming the pool is empty."""
+        node, addons = self.small_node_with_addons()
+        pods = addons + [self.pod_on("n1", cpu_req="50m", mem_req="10Mi", name="tiny")]
+        context = {"nodes": [node], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("1 workload pod(s) requesting 5% CPU / 1% memory", hits[0]["excerpt"])
+
+    def test_the_excerpt_keeps_the_autoscaler_facing_figure(self):
+        """The add-ons are excluded from the *gate*, not from the reader: the
+        cluster autoscaler weighs them when it decides whether to drain, so the
+        all-non-DaemonSet number stays in the evidence."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("non-DS CPU is 61% / mem 39% of allocatable (0.58 vCPU / 0.5 GiB)", excerpt)
+
+    def test_the_excerpt_reports_headroom_on_the_other_pools(self):
+        """Everything on the pool has to land somewhere before a node drains,
+        add-ons included. Without the headroom figure the reader has to go and
+        work out for themselves whether kube-dns has anywhere to go."""
+        node, addons = self.small_node_with_addons()
+        busy = self.node("n2", "other", cpu_alloc="4", mem_alloc="8Gi")
+        pods = addons + [self.pod_on("n2", cpu_req="2", mem_req="4Gi", name="busy")]
+        context = {"nodes": [node, busy], "pods": pods}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        hits = fw.check_idle_nodepool(context, pools, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["NodePool/default-pool"])
+        self.assertIn("other pools have 2.00 vCPU / 4.0 GiB unrequested to absorb it",
+                      hits[0]["excerpt"])
+        self.assertIn("before taints, selectors and zonal spread", hits[0]["excerpt"])
+
+    def test_taints_are_surfaced_so_a_dedicated_pool_can_be_dismissed(self):
+        """A pool tainted for add-ons is empty of workloads by design. That is
+        a judgement for triage, not a suppression here -- §3.7 refuses to
+        suppress tainted pools outright because a stranded accelerator pool is
+        the largest item this audit can find."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        taints = [{"key": "dedicated", "value": "system", "effect": "NO_SCHEDULE"}]
+        pools = [self.pool("default-pool", machine_type="e2-small", taints=taints),
+                 self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("Nodes are tainted dedicated=system:NO_SCHEDULE", excerpt)
+        self.assertIn("dedicated on purpose", excerpt)
+
+    def test_drain_blockers_are_named_because_lowering_the_floor_would_do_nothing(self):
+        """The autoscaler skips a node holding a PDB-less `kube-system` pod or
+        an unannotated local-storage pod, and GKE does not let you turn either
+        rule off. Without this the finding reads as actionable while
+        `--min-nodes=0` sits there reclaiming nothing."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons, "pdbs": []}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("Draining will not happen on its own: 2 pod(s)", excerpt)
+        self.assertIn("kube-system/kube-dns (kube-system, no PDB)", excerpt)
+        self.assertIn("deleting the pool is the remediation that works", excerpt)
+
+    def test_a_pdb_backed_kube_system_pod_is_not_a_blocker(self):
+        node, addons = self.small_node_with_addons()
+        for pod in addons:
+            pod["metadata"]["labels"] = {"k8s-app": "kube-dns"}
+        context = {"nodes": [node], "pods": addons,
+                   "pdbs": [{"spec": {"selector": {"matchLabels": {"k8s-app": "kube-dns"}}}}]}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertNotIn("Draining will not happen", excerpt)
+
+    def test_a_mirror_pod_is_not_a_blocker(self):
+        """kube-proxy is owned by the Node, not a DaemonSet, so the DaemonSet
+        filter does not reach it -- but it is static and goes with the node."""
+        node = self.node("n1", "pool")
+        mirror = self.pod_on("n1", ns="kube-system", name="kube-proxy-n1")
+        mirror["metadata"]["ownerReferences"] = [{"kind": "Node", "name": "n1"}]
+        mirror["spec"]["volumes"] = [{"hostPath": {"path": "/var/lib"}}]
+        context = {"nodes": [node], "pods": [mirror], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertNotIn("Draining will not happen", excerpt)
+
+    def test_local_storage_outside_kube_system_still_blocks(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod["spec"]["volumes"] = [{"emptyDir": {}}]
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("gmp-system/gmp-op (local storage, not safe-to-evict)", excerpt)
+
+    def test_a_safe_to_evict_local_storage_pod_is_not_a_blocker(self):
+        node = self.node("n1", "pool")
+        pod = self.pod_on("n1", cpu_req="10m", ns="gmp-system", name="gmp-op")
+        pod["spec"]["volumes"] = [{"emptyDir": {}}]
+        pod["metadata"]["annotations"] = {fw.SAFE_TO_EVICT_ANNOTATION: "true"}
+        context = {"nodes": [node], "pods": [pod], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertNotIn("Draining will not happen",
+                         fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_an_empty_pool_gets_no_blocker_note(self):
+        context = {"nodes": [self.node("n1", "pool")], "pods": [], "pdbs": []}
+        pools = [self.pool("pool"), self.pool("other")]
+        self.assertNotIn("Draining will not happen",
+                         fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_a_context_without_pdbs_does_not_crash_the_check(self):
+        """Every existing caller builds the full dump, but the check reads
+        `pdbs` only for this note and must not start requiring it."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        self.assertEqual(len(fw.check_idle_nodepool(context, pools, now=NOW)), 1)
+
+    def test_a_fixed_size_pool_says_so_rather_than_min_none(self):
+        """`min=None` reads as missing data; it means the pool has no
+        autoscaler, and §3.7's remediation then has to create one rather than
+        lower a floor. The live `default-pool` on `spot-capacity-test` is
+        exactly this shape."""
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small", autoscaling_enabled=False),
+                 self.pool("other")]
+        excerpt = fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"]
+        self.assertIn("autoscaling disabled, so the node count is a fixed floor", excerpt)
+        self.assertNotIn("min=None", excerpt)
+
+    def test_an_autoscaled_pool_still_reports_its_floor(self):
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small", min_nodes=2), self.pool("other")]
+        self.assertIn("min=2", fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
+
+    def test_an_untainted_pool_gets_no_taint_note(self):
+        node, addons = self.small_node_with_addons()
+        context = {"nodes": [node], "pods": addons}
+        pools = [self.pool("default-pool", machine_type="e2-small"), self.pool("other")]
+        self.assertNotIn("tainted", fw.check_idle_nodepool(context, pools, now=NOW)[0]["excerpt"])
 
 
 class MachineTypeVcpusTest(unittest.TestCase):
@@ -799,8 +1049,112 @@ class OverrequestTest(unittest.TestCase):
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
     def test_does_not_flag_below_the_absolute_floor(self):
-        pod = self.deployment_pod(cpu_req="100m", mem_req="256Mi")
+        pod = self.deployment_pod(cpu_req="50m", mem_req="64Mi")
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
+
+    def test_the_floor_sits_where_the_constants_say_it_does(self):
+        """A 90m request is the sidecar the floor excludes; 110m is not.
+
+        The old floor was 2 vCPU / 4 GiB -- a node's worth of headroom inside a
+        single controller -- and on the sixteen-cluster fleet nothing ever
+        reached it, so the check published nothing while seven controllers sat
+        under 20% of their requests on both dimensions.
+        """
+        under = self.deployment_pod(name="small-1", owner_name="small", cpu_req="90m", mem_req="64Mi")
+        over = self.deployment_pod(name="big-1", owner_name="big", cpu_req="110m", mem_req="64Mi")
+        peaks = {("default", "small-1"): (0.0, 0.0), ("default", "big-1"): (0.0, 0.0)}
+        hits = fw.check_overrequest({"pods": [under, over]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual([h["object"] for h in hits], ["ReplicaSet/big"])
+        self.assertEqual(fw.OVERREQUEST_FLOOR_VCPU, 0.1)
+        self.assertEqual(fw.OVERREQUEST_FLOOR_GIB, 0.125)
+
+    def test_the_floor_tests_the_request_and_not_the_reclaimable_delta(self):
+        """The two differ by the usage, and that gap silenced real findings.
+
+        `github-token-minter` on the live fleet: 200m requested, peak 0.001
+        vCPU over a week -- half a percent -- and a 199m delta that failed a
+        250m test whose stated justification ("about the smallest request a
+        first-class service is given") describes a request. Comparing the
+        request is what makes the justification true of the code.
+        """
+        pod = self.deployment_pod(cpu_req="200m", mem_req="256Mi")
+        hits = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.001, 24.0)}, now=NOW, autopilot=False
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_a_request_exactly_on_the_floor_reports(self):
+        # The boundary is inclusive, so `hello-world`'s 100m -- the commonest
+        # request on the fleet -- is inside the check rather than one
+        # rounding-error away from it.
+        pod = self.deployment_pod(cpu_req="100m", mem_req="64Mi")
+        self.assertEqual(len(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False)), 1)
+
+    def test_a_ten_milli_sidecar_is_still_excluded(self):
+        """What the floor exists for, and the reason not to simply delete it.
+
+        `cert-manager` and its webhook on the live fleet: 10m and 32Mi each,
+        both under 20% of both requests all week, and neither shrinkable in any
+        way worth an engineer's attention.
+        """
+        for label, cpu, mem in (("cert-manager", "10m", "32Mi"), ("bad-app", "50m", "64Mi")):
+            with self.subTest(label):
+                pod = self.deployment_pod(cpu_req=cpu, mem_req=mem)
+                self.assertEqual(
+                    fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), []
+                )
+
+    def test_flags_an_idle_deployment_the_old_floor_dropped(self):
+        """`ai-inference-hardened` on the live fleet: half a vCPU and 2 GiB
+        reserved, 0.001 vCPU and 0.15 GiB ever used in a week. The percentage
+        rule caught it and the 2 vCPU / 4 GiB floor threw it away."""
+        pod = self.deployment_pod(cpu_req="500m", mem_req="2Gi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.001, 150.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_flags_a_cpu_only_overrequest(self):
+        """The commonest real shape: sized for its memory, handed a
+        copy-pasted CPU request. Requiring both dimensions to be idle at once
+        let the memory ratio veto a 6.6x CPU over-request -- which is
+        `platform-agent-gateway` on the live fleet, at 15% of its CPU request
+        and 86% of its memory one."""
+        pod = self.deployment_pod(cpu_req="1100m", mem_req="1Gi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.167, 880.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on cpu only", hits[0]["excerpt"])
+        self.assertIn("must not be resized", hits[0]["excerpt"])
+
+    def test_flags_a_memory_only_overrequest(self):
+        pod = self.deployment_pod(cpu_req="1", mem_req="8Gi")
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 400.0)}, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Over-requested on memory only", hits[0]["excerpt"])
+
+    def test_a_both_idle_finding_does_not_claim_one_dimension_is_in_use(self):
+        pod = self.deployment_pod()
+        hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
+        self.assertNotIn("only", hits[0]["excerpt"])
+
+    def test_the_dimension_in_use_contributes_nothing_to_the_reclaimable_delta(self):
+        """§3.1's remediation resizes a request to 2x the observed peak, so a
+        dimension running at 94% of its request must not be part of the finding
+        at all -- neither reaching the materiality floor for it nor raising its
+        severity. 8 GiB of nominal slack under a 128 GiB request that is in use
+        is not 8 GiB anyone can reclaim."""
+        pod = self.deployment_pod(cpu_req="1", mem_req="128Gi")
+        peaks = {("default", "api-1"): (0.05, 120 * 1024.0)}
+        hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_an_idle_dimension_under_the_floor_is_not_rescued_by_one_in_use(self):
+        # 64 GiB is far over the memory floor, but memory is the dimension in
+        # use. Only the idle dimension may satisfy the floor, and 50m does not.
+        pod = self.deployment_pod(cpu_req="50m", mem_req="64Gi")
+        peaks = {("default", "api-1"): (0.001, 60 * 1024.0)}
+        self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
     def test_does_not_flag_daemonset(self):
         pod = self.deployment_pod(owner_kind="DaemonSet", owner_name="ds")
@@ -867,6 +1221,206 @@ class OverrequestTest(unittest.TestCase):
         pod = self.deployment_pod()
         pod["status"]["phase"] = "Pending"
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, self.IDLE, now=NOW, autopilot=False), [])
+
+    def test_a_multi_replica_excerpt_gives_the_per_replica_arithmetic(self):
+        """Every total is summed across the controller's pods, but §3.1 sizes
+        one container's request at 2x the peak -- so a reader handed only the
+        total triples a three-replica Deployment's request. The excerpt is the
+        only channel that survives `adopt_collector_evidence`."""
+        pods = [self.deployment_pod(name=f"api-{i}", cpu_req="1", mem_req="2Gi") for i in (1, 2, 3)]
+        peaks = {("default", f"api-{i}"): (0.05, 100.0) for i in (1, 2, 3)}
+        excerpt = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)[0]["excerpt"]
+        self.assertIn("requests 3.00 vCPU / 6.0 GiB", excerpt)
+        self.assertIn("Totals span 3 replicas", excerpt)
+        self.assertIn("1.000 vCPU / 2.00 GiB requested", excerpt)
+        self.assertIn("0.050 vCPU / 0.10 GiB peak", excerpt)
+        self.assertIn("per replica", excerpt)
+
+    def test_a_single_replica_excerpt_says_nothing_about_replicas(self):
+        # One pod means the total *is* the per-replica figure, and a sentence
+        # restating it is noise in an excerpt a human reads on every finding.
+        excerpt = fw.check_overrequest(
+            {"pods": [self.deployment_pod()]}, {("default", "api-1"): (0.9, 3072.0)},
+            now=NOW, autopilot=False,
+        )[0]["excerpt"]
+        self.assertNotIn("replica", excerpt)
+        self.assertTrue(excerpt.endswith("."), excerpt)
+
+    def test_the_single_dimension_clause_and_the_replica_clause_compose(self):
+        pods = [self.deployment_pod(name=f"api-{i}", cpu_req="1100m", mem_req="1Gi") for i in (1, 2)]
+        peaks = {("default", f"api-{i}"): (0.167, 880.0) for i in (1, 2)}
+        excerpt = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)[0]["excerpt"]
+        self.assertIn("Over-requested on cpu only", excerpt)
+        self.assertIn("must not be resized.", excerpt)
+        self.assertIn("Totals span 2 replicas", excerpt)
+
+
+class UnderrequestTest(unittest.TestCase):
+    """§3.11 -- the other direction of the same sizing edit as `overrequest`."""
+
+    def pod(self, ns="kubeagents-system", name="litellm-1", mem_req="512Mi", mem_lim="2Gi",
+            owner_name="litellm", **kwargs):
+        return OverrequestTest().deployment_pod(
+            ns=ns, name=name, cpu_req="100m", mem_req=mem_req,
+            cpu_lim="500m", mem_lim=mem_lim, owner_name=owner_name, **kwargs
+        )
+
+    def check(self, pods, means, peaks=None):
+        peaks = peaks or {k: (0.05, v) for k, v in means.items()}
+        return fw.check_underrequest({"pods": pods}, peaks, means, now=NOW)
+
+    def test_flags_a_controller_averaging_above_its_request(self):
+        """`litellm` on the live fleet, and the finding this check was built
+        for: 512Mi requested per replica against a ~0.95 GiB sustained mean, on
+        the proxy every agent call in the install traverses."""
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        means = {("kubeagents-system", "litellm-1"): 973.0, ("kubeagents-system", "litellm-2"): 973.0}
+        hits = self.check(pods, means)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ReplicaSet/litellm")
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("190% of request", hits[0]["excerpt"])
+
+    def test_a_burst_above_the_request_is_not_a_finding(self):
+        """The distinction the whole check rests on. Burstable QoS exists so a
+        pod may exceed its request; only a *mean* above it says the request was
+        sized wrong. Reading the peak here would flag every workload that ever
+        spikes -- which is the normal, intended use of a memory limit."""
+        pod = self.pod()
+        means = {("kubeagents-system", "litellm-1"): 300.0}   # under the 512Mi request
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1900.0)}  # far over it
+        self.assertEqual(self.check([pod], means, peaks), [])
+
+    def test_the_floor_is_on_the_overage_and_not_the_request(self):
+        """`cert-manager-cainjector`: 32Mi requested, 65Mi mean -- 203% of its
+        request, and 33 MiB of under-booking that distorts no node's
+        scheduling. A ratio test alone flags every pod a megabyte over."""
+        cainjector = self.pod(ns="cert-manager", name="cainjector-1", mem_req="32Mi", mem_lim="128Mi")
+        self.assertEqual(self.check([cainjector], {("cert-manager", "cainjector-1"): 65.0}), [])
+        self.assertEqual(fw.UNDERREQUEST_FLOOR_MIB, 128.0)
+
+    def test_the_floor_boundary_separates_the_two_live_examples(self):
+        under = self.pod(ns="a", name="a-1", owner_name="a", mem_req="100Mi", mem_lim="1Gi")
+        over = self.pod(ns="b", name="b-1", owner_name="b", mem_req="100Mi", mem_lim="1Gi")
+        means = {("a", "a-1"): 100.0 + 127.0, ("b", "b-1"): 100.0 + 129.0}
+        hits = self.check([under, over], means)
+        self.assertEqual([h["namespace"] for h in hits], ["b"])
+
+    def test_two_controllers_of_one_name_in_two_namespaces_stay_apart(self):
+        """`_eligible_pods_by_owner` groups by `(namespace, kind, name)`.
+
+        Keyed on `(kind, name)` alone, the same chart installed twice merges
+        into a single entry: one finding, naming whichever namespace was seen
+        first, whose request and usage totals silently include the other's.
+        A ReplicaSet's pod-template hash hides this; a StatefulSet owns pods
+        under its bare name and does not.
+        """
+        pods = [
+            self.pod(ns="tenant-a", name="redis-0", owner_name="redis"),
+            self.pod(ns="tenant-b", name="redis-0", owner_name="redis"),
+        ]
+        means = {("tenant-a", "redis-0"): 900.0, ("tenant-b", "redis-0"): 900.0}
+        hits = self.check(pods, means)
+        self.assertEqual(sorted(h["namespace"] for h in hits), ["tenant-a", "tenant-b"])
+        # Each finding measures only its own namespace's replica: one pod at
+        # 900 MiB against one 512Mi request, not two summed to 1800.
+        for hit in hits:
+            self.assertIn("0.88 GiB", hit["excerpt"])
+
+    def test_a_mean_near_the_limit_is_critical_rather_than_major(self):
+        # Above the request is a scheduling problem; within 10% of the limit is
+        # an OOMKill waiting for one bad request, so it outranks it.
+        pod = self.pod(mem_req="512Mi", mem_lim="1Gi")
+        hits = self.check([pod], {("kubeagents-system", "litellm-1"): 950.0})
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_no_memory_limit_is_major_and_says_so(self):
+        """Without a limit there is no OOMKill to escalate for -- the pod grows
+        until the node runs out and kubelet evicts it. The excerpt has to say
+        the ceiling is absent rather than print a misleading `0.0 GiB limit`."""
+        pod = self.pod(mem_lim=None)
+        pod["spec"]["containers"][0]["resources"].pop("limits")
+        hits = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("no memory limit", hits[0]["excerpt"])
+
+    def test_a_controller_monitoring_never_measured_is_skipped(self):
+        """A pod absent from the means is unmeasured, not idle. Summing a
+        missing key as 0.0 and comparing it to the request would be harmless
+        here -- but a *partially* measured controller must not have its
+        measured replicas judged against every replica's request."""
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        self.assertEqual(self.check(pods, {}), [])
+
+    def test_no_means_at_all_flags_nothing(self):
+        # `fetch_memory_means` returns `{}` for a cluster it could not read.
+        self.assertEqual(fw.check_underrequest({"pods": [self.pod()]}, {}, {}, now=NOW), [])
+
+    def test_the_excerpt_carries_the_peak_beside_the_mean(self):
+        """Remediation sizes the new request off the peak, so the number it
+        uses has to be in the evidence -- `adopt_collector_evidence` replaces
+        whatever the model wrote with this string."""
+        pod = self.pod()
+        means = {("kubeagents-system", "litellm-1"): 973.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1004.0)}
+        excerpt = self.check([pod], means, peaks)[0]["excerpt"]
+        self.assertIn("peak 0.98 GiB", excerpt)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("Sustained, not a burst", excerpt)
+
+    def test_it_shares_overrequests_exclusions(self):
+        """Both directions of one edit must agree on which pods are eligible,
+        or a DaemonSet excluded from shrinking becomes eligible for growing.
+        `_eligible_pods_by_owner` is the shared implementation; this is the
+        test that it is actually shared."""
+        cases = {
+            "daemonset": dict(owner_kind="DaemonSet", owner_name="ds"),
+            "job": dict(owner_kind="Job", owner_name="batch"),
+            "young": dict(started="2026-07-31T23:30:00Z"),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                pod = self.pod(**kwargs)
+                self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 900.0}), [])
+
+    def test_a_system_namespace_pod_is_excluded(self):
+        pod = self.pod(ns="kube-system", name="sys-1")
+        self.assertEqual(self.check([pod], {("kube-system", "sys-1"): 900.0}), [])
+
+    def test_a_pod_with_no_memory_request_is_left_to_obtainability(self):
+        # No request at all is `no-requests` in the obtainability audit, which
+        # owns the "declare something" finding. Dividing by it here would also
+        # be a ZeroDivisionError.
+        pod = self.pod()
+        pod["spec"]["containers"][0]["resources"] = {"requests": {"cpu": "100m"}}
+        self.assertEqual(self.check([pod], {("kubeagents-system", "litellm-1"): 900.0}), [])
+
+    def test_the_window_shrinks_to_a_controller_younger_than_it(self):
+        pod = self.pod(started="2026-07-31T18:00:00Z")
+        hits = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})
+        self.assertIn("trailing 6h", hits[0]["excerpt"])
+
+    def test_a_multi_replica_excerpt_gives_the_per_replica_arithmetic(self):
+        """Inflating a request is the wrong direction to be wrong in here.
+
+        §3.11 sizes the new request at ceil(peak x 1.3) and the manifest holds
+        one replica's. `litellm`'s summed 1.96 GiB peak read as one replica's
+        would book 2.5 GiB where 1.3 GiB is right -- on a finding whose entire
+        subject is the scheduler's booking being inaccurate.
+        """
+        pods = [self.pod(name="litellm-1"), self.pod(name="litellm-2")]
+        means = {("kubeagents-system", "litellm-1"): 973.0, ("kubeagents-system", "litellm-2"): 973.0}
+        peaks = {k: (0.05, 1004.0) for k in means}
+        excerpt = self.check(pods, means, peaks)[0]["excerpt"]
+        self.assertIn("requests 1.00 GiB of memory", excerpt)
+        self.assertIn("Totals span 2 replicas", excerpt)
+        self.assertIn("0.50 GiB requested", excerpt)
+        self.assertIn("0.95 GiB mean", excerpt)
+        self.assertIn("0.98 GiB peak", excerpt)
+
+    def test_a_single_replica_excerpt_says_nothing_about_replicas(self):
+        excerpt = self.check([self.pod()], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertNotIn("replica", excerpt)
 
 
 class UnattachedDiskTest(unittest.TestCase):
@@ -1413,13 +1967,19 @@ class CollectClusterTest(unittest.TestCase):
         # lost coverage published `partial: true` over two freshly created
         # Autopilot peers on 2026-08-29 -- a gap naming a check that had no
         # object to run against.
+        #
+        # Both sizing checks take the same exemption, and for the same reason:
+        # neither an over- nor an under-sized request can exist where nothing
+        # is scheduled.
         entry = self._metrics_down()
         self.assertEqual(entry["outcome"], "collected")
         self.assertNotIn("limitations", entry)
         self.assertEqual(
-            {na["check"] for na in entry["checks_not_applicable"]}, {"overrequest"}
+            {na["check"] for na in entry["checks_not_applicable"]},
+            {"overrequest", "underrequest"},
         )
-        self.assertIn("no nodes", entry["checks_not_applicable"][0]["reason"])
+        for na in entry["checks_not_applicable"]:
+            self.assertIn("no nodes", na["reason"])
 
     def _unreadable_pools(self, cluster=None):
         def run(argv, **kwargs):

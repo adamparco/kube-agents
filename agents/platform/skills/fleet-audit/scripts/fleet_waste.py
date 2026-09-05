@@ -100,6 +100,56 @@ MONITORING_SCOPE = "https://www.googleapis.com/auth/monitoring.read"
 MONITORING_TIMEOUT_S = 120
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
+# The materiality floor `check_overrequest` applies to the *request* on an idle
+# dimension, so the check does not report a 10m sidecar whose 8m of headroom is
+# arithmetically a 5x over-request and operationally nothing.
+#
+# It was 2 vCPU / 4 GiB, which is a node's worth of headroom inside a single
+# controller, and on a fleet of ordinarily-sized services nothing ever reaches
+# it: measured against the sixteen-cluster adamparco-kage fleet on 2026-09-05,
+# seven controllers were under 20% of their requests on both dimensions --
+# including two `ai-inference` Deployments requesting 0.5 vCPU / 2 GiB each and
+# peaking at 0.001 vCPU / 0.15 GiB over a week -- and the floor dropped every
+# one of them. The stream published a single finding, for an unused IP address,
+# and an operator reading it would conclude the fleet had no rightsizing work.
+#
+# Lowering it to 250m / 512Mi fixed those two and left the shape of the bug in
+# place, because the quantity was wrong as well as the number. The floor was
+# compared against the reclaimable delta while its justification -- "about the
+# smallest request a first-class service is given" -- describes a request, and
+# the two coincide only where usage is near zero. So the clusters it kept
+# silencing were the ones whose requests sit at or just under the floor and
+# which are ~100% idle: on the same fleet, `github-token-minter` requests 200m
+# and 256Mi, peaked at 0.001 vCPU and 24 MiB over a week -- half a percent of
+# its CPU request -- and was dropped for a 199m delta, and `litellm` was
+# dropped for a 176m one at 12% of its CPU request. Eight controllers in all.
+# Comparing the request instead makes the sentence above true of what the code
+# does, and drops the 20% of slack that made a 200m request fail a 250m test.
+#
+# 100m / 128Mi is an order of magnitude above the sidecar the floor is aimed at
+# while admitting the ordinary small service. It excludes what it was written
+# for on the live fleet -- `cert-manager` and its webhook at 10m/32Mi, both
+# ~99% idle and both unshrinkable in any way worth an engineer's attention --
+# and admits every controller above that. Severity is unchanged, so the
+# newly-reachable findings arrive as `minor` and a node's worth of waste still
+# grades `major`.
+OVERREQUEST_FLOOR_VCPU = 0.1
+OVERREQUEST_FLOOR_GIB = 0.125
+
+# `check_underrequest`'s floor is on the overage -- how far sustained usage sits
+# above the request -- rather than on the request, because that overage is the
+# quantity doing the harm: it is what the scheduler failed to book on the node,
+# and it is the key kubelet sorts Burstable pods by when it picks one to evict.
+# A ratio test alone would flag every pod a megabyte over its request.
+#
+# 128 MiB is where the two live examples separate. On the sixteen-cluster
+# adamparco-kage fleet on 2026-09-05, exactly three pods held a mean above their
+# request: both `litellm` replicas, each requesting 512Mi and averaging ~0.95 GiB
+# for a ~980 MiB overage across the controller, and `cert-manager-cainjector`,
+# requesting 32Mi and averaging 65Mi. The cainjector is genuinely mis-sized and
+# genuinely not worth reporting -- 33 MiB of under-booking distorts no node's
+# scheduling, and it is an upstream chart default no operator here owns.
+UNDERREQUEST_FLOOR_MIB = 128.0
 
 SYSTEM_NAMESPACES = frozenset(
     {
@@ -317,6 +367,71 @@ def _point_value(point: dict) -> float | None:
     return None
 
 
+def _read_pod_series(
+    session: SessionFn,
+    url: str,
+    *,
+    metric: str,
+    cluster: str,
+    start: datetime,
+    now: datetime,
+    primary: str,
+    secondary: str,
+    window_hours: int,
+) -> tuple[dict[tuple[str, str], float], tuple[int, str] | None]:
+    """One metric, summed to the pod and collapsed to a single number per pod.
+
+    Returns `(series, None)` or `({}, (rc, message))`; the caller decides what a
+    failure means, because `fetch_usage_peaks` treats it as §2's metrics
+    degradation and `fetch_memory_means` treats it as one check going quiet.
+
+    `secondary` is the collapse: `ALIGN_MAX` gives the peak over the window and
+    `ALIGN_MEAN` the sustained level. The percentile aligners would be the
+    better middle ground and are not available -- both of these metrics are
+    GAUGE-valued, and `ALIGN_PERCENTILE_*` requires a DISTRIBUTION, so asking
+    for one returns HTTP 400 rather than a degraded answer.
+    """
+    sink: dict[tuple[str, str], float] = {}
+    page_token = None
+    while True:
+        params = {
+            "filter": f'metric.type="{metric}" AND resource.labels.cluster_name="{cluster}"',
+            "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
+            "aggregation.perSeriesAligner": primary,
+            "aggregation.crossSeriesReducer": "REDUCE_SUM",
+            "aggregation.groupByFields": ["resource.labels.namespace_name", "resource.labels.pod_name"],
+            "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
+            "secondaryAggregation.perSeriesAligner": secondary,
+            "pageSize": "2000",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            response = session.get(url, params=params, timeout=MONITORING_TIMEOUT_S)
+        except Exception as exc:
+            return {}, (-1, f"{metric}: {type(exc).__name__}: {exc}")
+        if response.status_code != 200:
+            return {}, (response.status_code, f"{metric}: {response.text}")
+        body = response.json()
+        for series in body.get("timeSeries") or []:
+            labels = (series.get("resource") or {}).get("labels") or {}
+            pod_key = (labels.get("namespace_name", ""), labels.get("pod_name", ""))
+            for point in series.get("points") or []:
+                value = _point_value(point)
+                if value is not None:
+                    # `max` across points, not across the window: the secondary
+                    # aggregation already collapsed the window to one point per
+                    # series, so this only folds together the several series a
+                    # pod can produce (its containers, and memory's
+                    # `memory_type` breakdown) that `REDUCE_SUM` did not.
+                    sink[pod_key] = max(sink.get(pod_key, 0.0), value)
+        page_token = body.get("nextPageToken")
+        if not page_token:
+            return sink, None
+
+
 def fetch_usage_peaks(
     project: str,
     cluster: str,
@@ -364,40 +479,13 @@ def fetch_usage_peaks(
 
     peaks: dict[str, dict[tuple[str, str], float]] = {"cpu": {}, "mem": {}}
     for metric, aligner, key in ((CPU_METRIC, "ALIGN_RATE", "cpu"), (MEM_METRIC, "ALIGN_MAX", "mem")):
-        sink = peaks[key]
-        page_token = None
-        while True:
-            params = {
-                "filter": f'metric.type="{metric}" AND resource.labels.cluster_name="{cluster}"',
-                "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
-                "aggregation.perSeriesAligner": aligner,
-                "aggregation.crossSeriesReducer": "REDUCE_SUM",
-                "aggregation.groupByFields": ["resource.labels.namespace_name", "resource.labels.pod_name"],
-                "secondaryAggregation.alignmentPeriod": f"{window_hours * 3600}s",
-                "secondaryAggregation.perSeriesAligner": "ALIGN_MAX",
-                "pageSize": "2000",
-            }
-            if page_token:
-                params["pageToken"] = page_token
-            try:
-                response = session.get(url, params=params, timeout=MONITORING_TIMEOUT_S)
-            except Exception as exc:
-                return fail(-1, f"{metric}: {type(exc).__name__}: {exc}")
-            if response.status_code != 200:
-                return fail(response.status_code, f"{metric}: {response.text}")
-            body = response.json()
-            for series in body.get("timeSeries") or []:
-                labels = (series.get("resource") or {}).get("labels") or {}
-                pod_key = (labels.get("namespace_name", ""), labels.get("pod_name", ""))
-                for point in series.get("points") or []:
-                    value = _point_value(point)
-                    if value is not None:
-                        sink[pod_key] = max(sink.get(pod_key, 0.0), value)
-            page_token = body.get("nextPageToken")
-            if not page_token:
-                break
+        sink, err = _read_pod_series(
+            session, url, metric=metric, cluster=cluster, start=start, now=now,
+            primary=aligner, secondary="ALIGN_MAX", window_hours=window_hours,
+        )
+        if err is not None:
+            return fail(*err)
+        peaks[key] = sink
 
     merged = {
         pod_key: (peaks["cpu"].get(pod_key, 0.0), peaks["mem"].get(pod_key, 0.0) / BYTES_PER_MIB)
@@ -413,6 +501,59 @@ def fetch_usage_peaks(
         sorted((ns, pod, round(cpu, 4), round(mem, 1)) for (ns, pod), (cpu, mem) in merged.items())
     )
     return merged, True, Run([label], 0, rendered, "", time.monotonic() - started)
+
+
+def fetch_memory_means(
+    project: str,
+    cluster: str,
+    *,
+    session: SessionFn,
+    now: datetime,
+    window_hours: int = USAGE_WINDOW_HOURS,
+) -> tuple[dict[tuple[str, str], float], bool, Run]:
+    """Sustained memory per pod, in MiB, keyed like `fetch_usage_peaks`.
+
+    `check_underrequest` needs the mean and not the peak, and the distinction
+    is the whole check: a *peak* above the request is what Burstable QoS exists
+    for, and a *mean* above it is a request that was sized wrong. Reading the
+    peak would flag every workload that ever bursts.
+
+    Memory only, and deliberately -- one extra Cloud Monitoring round trip per
+    cluster rather than two. CPU has no equivalent finding: it is compressible,
+    so a CPU request below actual usage costs throttling under contention,
+    while memory above the request is what kubelet ranks pods by when it needs
+    to evict one.
+
+    `available=False` reads the same way as `fetch_usage_peaks`': a failed or
+    empty answer means the check could not run, never that usage was zero.
+    """
+    started = time.monotonic()
+    start = now - timedelta(hours=window_hours)
+    url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+    label = (
+        f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+        f' filter=resource.labels.cluster_name="{cluster}"'
+        f" metric={MEM_METRIC} aligner=ALIGN_MEAN window={window_hours}h"
+    )
+
+    def fail(rc: int, message: str) -> tuple[dict, bool, Run]:
+        return {}, False, Run([label], rc, "", message[:300], time.monotonic() - started)
+
+    if session is None:
+        return fail(-1, "no Cloud Monitoring session: ADC credentials were unavailable at startup")
+
+    sink, err = _read_pod_series(
+        session, url, metric=MEM_METRIC, cluster=cluster, start=start, now=now,
+        primary="ALIGN_MAX", secondary="ALIGN_MEAN", window_hours=window_hours,
+    )
+    if err is not None:
+        return fail(*err)
+    means = {pod_key: value / BYTES_PER_MIB for pod_key, value in sink.items()}
+    if not means:
+        return fail(0, f'no time series for cluster_name="{cluster}" over the trailing {window_hours}h')
+
+    rendered = json.dumps(sorted((ns, pod, round(mem, 1)) for (ns, pod), mem in means.items()))
+    return means, True, Run([label], 0, rendered, "", time.monotonic() - started)
 
 
 # --------------------------------------------------------------------------- #
@@ -722,29 +863,61 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
         # the node holding the workload is precisely what stops it shrinking.
         # The aggregate figures are still computed, because the excerpt quotes
         # them and a reader wants the pool-level number.
+        #
+        # The 15% is measured against *workload* requests -- non-DaemonSet and
+        # non-`SYSTEM_NS` -- not against every non-DaemonSet pod. §3.7 justifies
+        # the bar as sitting "below the point where DaemonSet and system
+        # overhead (typically 10-25% of a small node) dominates", and that
+        # premise does not survive measurement: GKE's non-DaemonSet add-ons
+        # (kube-dns 270m, kube-state-metrics 105m, kube-proxy as a static pod
+        # 100m, metrics-server, konnectivity, l7-default-backend and the two
+        # autoscalers) come to ~0.57 vCPU on every node, so the bar is only
+        # reachable above ~3.8 vCPU of allocatable. On the sixteen-cluster
+        # fleet measured 2026-09-05 every Standard pool read 45-70% and the
+        # check fired on nothing at all -- including a lone untainted e2-small
+        # `default-pool` carrying zero workload pods next to a pool with 1.5
+        # vCPU free, which is exactly the finding it exists to make. Those
+        # add-ons reschedule with the node, so they are no more a reason to
+        # keep a pool than the DaemonSets already excluded above; the "only
+        # node pool" exclusion is where the SOP handles their needing a home.
+        # The all-non-DaemonSet figure stays in the excerpt -- it is what the
+        # cluster autoscaler actually weighs when deciding to drain.
         cpu_alloc_total = mem_alloc_total = cpu_req_total = mem_req_total = 0.0
+        cpu_wk_total = mem_wk_total = 0.0
+        workload_pods = 0
         every_node_idle = True
         for node in nodes:
             node_name = node.get("metadata", {}).get("name", "")
             cpu_alloc, mem_alloc = _allocatable(node)
-            cpu_req, mem_req = _sum_requests(pods_by_node.get(node_name, []))
+            on_node = pods_by_node.get(node_name, [])
+            workload = [
+                pod
+                for pod in on_node
+                if not _is_system_namespace((pod.get("metadata") or {}).get("namespace", ""))
+            ]
+            cpu_req, mem_req = _sum_requests(on_node)
+            cpu_wk, mem_wk = _sum_requests(workload)
             cpu_alloc_total += cpu_alloc
             mem_alloc_total += mem_alloc
             cpu_req_total += cpu_req
             mem_req_total += mem_req
+            cpu_wk_total += cpu_wk
+            mem_wk_total += mem_wk
+            workload_pods += len(workload)
             if cpu_alloc <= 0 or mem_alloc <= 0:
                 # A node reporting no allocatable capacity is one this check
                 # cannot judge -- NotReady, or mid-registration. Treat it as
                 # not-idle rather than divide by zero: an unreadable node is
                 # not evidence the pool is reclaimable.
                 every_node_idle = False
-            elif cpu_req / cpu_alloc > 0.15 or mem_req / mem_alloc > 0.15:
+            elif cpu_wk / cpu_alloc > 0.15 or mem_wk / mem_alloc > 0.15:
                 every_node_idle = False
         if not every_node_idle:
             continue
         if cpu_alloc_total == 0 or mem_alloc_total == 0:
             continue
         cpu_pct, mem_pct = cpu_req_total / cpu_alloc_total, mem_req_total / mem_alloc_total
+        wk_cpu_pct, wk_mem_pct = cpu_wk_total / cpu_alloc_total, mem_wk_total / mem_alloc_total
 
         autoscaling = pool.get("autoscaling") or {}
         floor_nonzero = not autoscaling.get("enabled") or (autoscaling.get("minNodeCount") or 0) >= 1
@@ -754,12 +927,81 @@ def check_idle_nodepool(context: dict, node_pools: list[dict], *, now: datetime)
         machine_type = ((pool.get("config") or {}).get("machineType") or "")
         has_accelerator = bool((pool.get("config") or {}).get("accelerators"))
         severity = "major" if len(nodes) >= 3 or _is_big_machine(machine_type) or has_accelerator else "minor"
+
+        # Everything the pool holds has to land somewhere before a node drains,
+        # and that includes the add-ons the gate above deliberately ignores. A
+        # reader handed only "0 workload pods" still has to go and work out
+        # whether kube-dns has anywhere to go, which is the difference between
+        # an actionable finding and a research task -- so state the headroom.
+        # It is pool-level arithmetic and takes no account of taints, node
+        # selectors or zonal spread, hence the hedge in the wording: it is a
+        # necessary condition for the drain, not a sufficient one.
+        pool_node_names = {n.get("metadata", {}).get("name", "") for n in nodes}
+        free_cpu = free_mem = 0.0
+        for other in context["nodes"]:
+            other_name = other.get("metadata", {}).get("name", "")
+            if other_name in pool_node_names:
+                continue
+            other_cpu, other_mem = _allocatable(other)
+            used_cpu, used_mem = _sum_requests(pods_by_node.get(other_name, []))
+            free_cpu += max(0.0, other_cpu - used_cpu)
+            free_mem += max(0.0, other_mem - used_mem)
+
+        # Whether the *graceful* path works at all. Lowering the floor to zero
+        # asks the autoscaler to drain, and it will refuse for as long as one
+        # of these sits on the node -- so the finding would read as actionable
+        # while the remediation quietly did nothing for weeks. §3.7 already
+        # offers pool deletion as the alternative; this is what tells a reader
+        # which of the two they need.
+        pool_pods = [pod for name in pool_node_names for pod in pods_by_node.get(name, [])]
+        blockers = _drain_blockers(pool_pods, _pdb_selectors(context))
+        blocker_note = (
+            f" Draining will not happen on its own: {len(blockers)} pod(s) on these nodes are ones "
+            f"the cluster autoscaler refuses to evict ({', '.join(blockers[:3])}"
+            + (", …" if len(blockers) > 3 else "")
+            + "), so lowering the floor reclaims nothing and deleting the pool is the remediation "
+            "that works."
+            if blockers
+            else ""
+        )
+
+        taints = (pool.get("config") or {}).get("taints") or []
+        taint_note = (
+            " Nodes are tainted "
+            + ", ".join(f"{t.get('key')}={t.get('value')}:{t.get('effect')}" for t in taints)
+            + " — check whether the pool is dedicated on purpose."
+            if taints
+            else ""
+        )
+        occupancy = (
+            "no workload pods at all"
+            if workload_pods == 0
+            else f"{workload_pods} workload pod(s) requesting "
+            f"{wk_cpu_pct * 100:.0f}% CPU / {wk_mem_pct * 100:.0f}% memory of allocatable"
+        )
+        # `min=None` reads as missing data when it actually means the pool has
+        # a fixed size, and the two take different remediations: §3.7's
+        # `--enable-autoscaling --min-nodes=0` has to *create* the autoscaler
+        # on a fixed pool and only lowers the floor on one that already has it.
+        floor = (
+            f"min={autoscaling.get('minNodeCount')}"
+            if autoscaling.get("enabled")
+            else "autoscaling disabled, so the node count is a fixed floor"
+        )
         hits.append(
             {
                 "object": f"NodePool/{pool_name}",
-                "excerpt": f"{len(nodes)} node(s), {machine_type}, min={autoscaling.get('minNodeCount')}, non-DS CPU {cpu_pct * 100:.0f}% / mem {mem_pct * 100:.0f}% of allocatable",
+                "excerpt": (
+                    f"{len(nodes)} node(s), {machine_type}, {floor}: "
+                    f"{occupancy} outside SYSTEM_NS. Counting the system add-ons the autoscaler "
+                    f"also weighs, non-DS CPU is {cpu_pct * 100:.0f}% / mem {mem_pct * 100:.0f}% "
+                    f"of allocatable ({cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB), "
+                    f"and the cluster's other pools have {free_cpu:.2f} vCPU / {free_mem / 1024.0:.1f} GiB "
+                    f"unrequested to absorb it — before taints, selectors and zonal spread, which "
+                    f"this figure does not model.{blocker_note}{taint_note}"
+                ),
                 "severity": severity,
-                "_node_names": {n.get("metadata", {}).get("name", "") for n in nodes},
+                "_node_names": pool_node_names,
             }
         )
     return hits
@@ -790,6 +1032,51 @@ def _safe_to_evict(annotations: dict) -> bool | None:
     return None
 
 
+def _selector_matches(selector: dict, labels: dict) -> bool:
+    return all(labels.get(k) == v for k, v in (selector.get("matchLabels") or {}).items())
+
+
+def _pdb_selectors(context: dict) -> list[dict]:
+    return [((pdb.get("spec") or {}).get("selector") or {}) for pdb in (context.get("pdbs") or [])]
+
+
+def _drain_blockers(pods: list[dict], pdb_selectors: list[dict]) -> list[str]:
+    """Pods the cluster autoscaler will refuse to evict, so a node holding one
+    never scales down.
+
+    Two of the autoscaler's default skip rules, neither of which GKE lets you
+    turn off: `--skip-nodes-with-system-pods` pins a node carrying any
+    `kube-system` pod that has no PodDisruptionBudget, and
+    `--skip-nodes-with-local-storage` pins one carrying an `emptyDir` or
+    `hostPath` pod that is not annotated `safe-to-evict: "true"`. DaemonSet and
+    mirror pods are exempt from both -- they go with the node.
+
+    §3.8 reports the workload half of this as findings of its own and skips
+    `SYSTEM_NS` deliberately, because a GKE-managed add-on is not something the
+    operator can annotate: addon-manager reverts the edit. That makes them
+    unactionable as findings but decisive as evidence -- they are the
+    difference between "lower the floor to zero" quietly doing nothing and
+    "delete the pool" actually reclaiming it.
+    """
+    blockers = []
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        owners = meta.get("ownerReferences") or []
+        if any(o.get("kind") == "Node" for o in owners):
+            continue  # mirror pod -- static, goes with the node
+        ns, name = meta.get("namespace", ""), meta.get("name", "")
+        labels = meta.get("labels") or {}
+        evictable = _safe_to_evict(meta.get("annotations") or {})
+        volumes = (pod.get("spec") or {}).get("volumes") or []
+        local = any(("emptyDir" in v or "hostPath" in v) for v in volumes)
+        has_pdb = any(_selector_matches(sel, labels) for sel in pdb_selectors)
+        if ns == "kube-system" and not has_pdb:
+            blockers.append(f"{ns}/{name} (kube-system, no PDB)")
+        elif local and evictable is not True:
+            blockers.append(f"{ns}/{name} (local storage, not safe-to-evict)")
+    return blockers
+
+
 def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[dict]:
     flagged_nodes: set[str] = set()
     for hit in idle_pool_hits:
@@ -797,10 +1084,7 @@ def check_scaledown_blocked(context: dict, idle_pool_hits: list[dict]) -> list[d
     if not flagged_nodes:
         return []
 
-    pdb_selectors = [((pdb.get("spec") or {}).get("selector") or {}) for pdb in context["pdbs"]]
-
-    def _selector_matches(selector: dict, labels: dict) -> bool:
-        return all(labels.get(k) == v for k, v in (selector.get("matchLabels") or {}).items())
+    pdb_selectors = _pdb_selectors(context)
 
     hits = []
     seen_nodes = set()
@@ -1022,18 +1306,22 @@ def _owner_key(owners: list[dict]) -> tuple[str, str] | None:
     return (pick.get("kind", ""), pick.get("name", ""))
 
 
-def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
-    """`usage_peaks` is `fetch_usage_peaks`'s `(ns, pod) -> (cores, MiB)`.
+def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]:
+    """Pods whose declared request is a sizing decision somebody here can change.
 
-    It used to be a list of three `kubectl top` samples, and the flag rule
-    used to be "every sample agrees usage is under 20% of requests, and the
-    reclaimable delta is measured against the highest of them". One peak over
-    a week is the same rule with the sampling error taken out: the max across
-    samples *is* the peak, and a run of samples all agreeing is exactly the
-    condition that the peak clears the bar.
+    Shared by both sizing checks, so that a pod excluded from one is excluded
+    from the other. The two ask opposite questions of the same number, and an
+    exclusion that applied to only one of them would let this stream tell a
+    controller to shrink a request it had already declined to judge.
+
+    The exclusions, and what each is for: `SYSTEM_NS` and DaemonSets are not
+    request values an operator owns (Google's addon manager reverts the first,
+    and the second is per-node overhead rather than a sizing choice); a pod
+    under an hour old has a cold cache and a JIT still warming; `Job`-owned
+    pods are periodic by design and whatever window catches them is the wrong
+    one; a pod with no request at all is `obtainability-audit`'s `no-requests`,
+    which owns the request's absence and defers its value to here.
     """
-    if not usage_peaks:
-        return []
     by_owner: dict[tuple, dict] = {}
     for pod in context["pods"]:
         meta, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
@@ -1055,20 +1343,44 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         limits = [(c.get("resources") or {}).get("limits") or {} for c in containers]
         if not any(requests):
             continue  # obtainability-audit's `no-requests` owns this
-        owner_key = _owner_key(owners) or ("Pod", name)
-        entry = by_owner.setdefault(owner_key, {"ns": ns, "pods": [], "oldest_h": None})
+        # Namespaced, because `(kind, name)` is not unique within a cluster.
+        # A ReplicaSet carries a pod-template hash so two would collide only on
+        # identical pod specs, but a StatefulSet or a CronJob-less Deployment
+        # owns pods under its bare name -- so the same chart installed into two
+        # namespaces produces one merged entry, and the finding names whichever
+        # namespace sorted first while summing both namespaces' requests and
+        # usage into its numbers. No collision exists on the sixteen-cluster
+        # fleet today; this keeps one from being silently wrong later.
+        kind, owner_name = _owner_key(owners) or ("Pod", name)
+        entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None})
         entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits})
-        # A peak is only as long as the pod that reported it. Monitoring keeps a
-        # week of history, but a Deployment rolled an hour ago has an hour of it,
-        # and a finding that says "over the trailing 168h" about that controller
-        # is claiming to have watched something that did not exist. Carry the
-        # longest-lived pod's age so the excerpt can state the window it really
-        # measured.
+        # A measurement is only as long as the pod that reported it. Monitoring
+        # keeps a week of history, but a Deployment rolled an hour ago has an
+        # hour of it, and a finding that says "over the trailing 168h" about
+        # that controller is claiming to have watched something that did not
+        # exist. Carry the longest-lived pod's age so the excerpt can state the
+        # window it really measured.
         if age is not None:
             entry["oldest_h"] = max(entry["oldest_h"] or 0.0, age * 24)
+    return by_owner
+
+
+def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
+    """`usage_peaks` is `fetch_usage_peaks`'s `(ns, pod) -> (cores, MiB)`.
+
+    It used to be a list of three `kubectl top` samples, and the flag rule
+    used to be "every sample agrees usage is under 20% of requests, and the
+    reclaimable delta is measured against the highest of them". One peak over
+    a week is the same rule with the sampling error taken out: the max across
+    samples *is* the peak, and a run of samples all agreeing is exactly the
+    condition that the peak clears the bar.
+    """
+    if not usage_peaks:
+        return []
+    by_owner = _eligible_pods_by_owner(context, now=now)
 
     hits = []
-    for (kind, name), entry in by_owner.items():
+    for (_ns, kind, name), entry in by_owner.items():
         cpu_req_total = mem_req_total = 0.0
         cpu_lim_total = mem_lim_total = 0.0
         for pod in entry["pods"]:
@@ -1080,6 +1392,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 mem_lim_total += parse_mem_mib(str(lim.get("memory", "0"))) or 0
         if cpu_req_total == 0 and mem_req_total == 0:
             continue
+        replicas = len(entry["pods"])
         guaranteed = cpu_req_total == cpu_lim_total and mem_req_total == mem_lim_total and cpu_lim_total > 0
 
         peak_cpu = peak_mem = 0.0
@@ -1087,14 +1400,29 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             cpu, mem = usage_peaks.get((pod["ns"], pod["name"]), (0.0, 0.0))
             peak_cpu += cpu
             peak_mem += mem
-        if cpu_req_total and peak_cpu / cpu_req_total > 0.2:
-            continue
-        if mem_req_total and peak_mem / mem_req_total > 0.2:
+        # Per dimension, not across both. Requiring CPU *and* memory to be idle
+        # together made the common shape invisible: a controller sized for its
+        # memory footprint and given a copy-pasted CPU request uses ~all of the
+        # memory and ~none of the CPU, so the memory ratio vetoed the finding
+        # and the 40x CPU over-request was never reported. Each dimension is a
+        # separate sizing decision and gets a separate verdict; only the idle
+        # one contributes to the reclaimable delta, so a finding never proposes
+        # shrinking a request the workload is actually consuming.
+        cpu_idle = bool(cpu_req_total) and peak_cpu / cpu_req_total <= 0.2
+        mem_idle = bool(mem_req_total) and peak_mem / mem_req_total <= 0.2
+        if not (cpu_idle or mem_idle):
             continue
 
-        delta_cpu = cpu_req_total - peak_cpu
-        delta_mem_gib = (mem_req_total - peak_mem) / 1024.0
-        if delta_cpu < 2 and delta_mem_gib < 4:
+        delta_cpu = (cpu_req_total - peak_cpu) if cpu_idle else 0.0
+        delta_mem_gib = ((mem_req_total - peak_mem) / 1024.0) if mem_idle else 0.0
+        # The floor is a property of the request, not of the delta, and only an
+        # idle dimension can satisfy it: a workload consuming all 8 GiB it asked
+        # for and none of its 10m of CPU must not clear a materiality test on
+        # the strength of the memory it is using.
+        material = (cpu_idle and cpu_req_total >= OVERREQUEST_FLOOR_VCPU) or (
+            mem_idle and mem_req_total / 1024.0 >= OVERREQUEST_FLOOR_GIB
+        )
+        if not material:
             continue
 
         oldest_h = entry["oldest_h"]
@@ -1103,11 +1431,45 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if autopilot and severity == "minor":
             severity = "major"
 
+        # Name the over-requested dimensions in the excerpt. The remediation
+        # resizes only these -- SOP 3.1 sizes a request at 2x the observed
+        # peak, and applying that to a dimension running at 96% of its request
+        # would halve a request the workload is using. The excerpt is the
+        # channel because `adopt_collector_evidence` overwrites whatever the
+        # model wrote with it, so this sentence is the one part of the finding
+        # guaranteed to reach the reviewer intact.
+        dimensions = [d for d, on in (("cpu", cpu_idle), ("memory", mem_idle)) if on]
+        measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB over the trailing {window_h}h (Cloud Monitoring)"
+        # Every number above is summed across the controller's pods, because
+        # that is what the fleet is actually paying for -- but the remediation
+        # edits one container's request in one manifest, and §3.1 sizes it at
+        # 2x the observed peak. A reader handed only the total sets a
+        # three-replica Deployment's request to 3x what it needs. The excerpt
+        # is the only channel -- `_emit` whitelists the keys it forwards, and
+        # `adopt_collector_evidence` overwrites the model's own wording with
+        # this string -- so the arithmetic has to be spelled out here.
+        excerpt = f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; {measured}"
+        if len(dimensions) == 1:
+            over = dimensions[0]
+            at = (peak_cpu / cpu_req_total) if over == "cpu" else (peak_mem / mem_req_total)
+            excerpt += (
+                f". Over-requested on {over} only ({at * 100:.0f}% of request); the other dimension is "
+                f"in use and must not be resized"
+            )
+        if replicas > 1:
+            excerpt += (
+                f". Totals span {replicas} replicas — per replica that is "
+                f"{cpu_req_total / replicas:.3f} vCPU / {mem_req_total / replicas / 1024.0:.2f} GiB requested "
+                f"against a {peak_cpu / replicas:.3f} vCPU / {peak_mem / replicas / 1024.0:.2f} GiB peak, "
+                f"and the manifest change is per replica"
+            )
+        excerpt += "."
+
         hits.append(
             {
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
-                "excerpt": f"requests {cpu_req_total:.2f} vCPU / {mem_req_total / 1024.0:.1f} GiB; peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB over the trailing {window_h}h (Cloud Monitoring)",
+                "excerpt": excerpt,
                 "severity": severity,
                 "_guaranteed": guaranteed,
             }
@@ -1115,8 +1477,100 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
     return hits
 
 
+def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, now: datetime) -> list[dict]:
+    """The other half of `check_overrequest`: a memory request sized too small.
+
+    `memory_means` is `fetch_memory_means`' `(ns, pod) -> mean_mem_mib`. The
+    mean is load-bearing. A pod whose *peak* memory exceeds its request is
+    doing what Burstable QoS is for; a pod whose *mean* exceeds it has a
+    request that does not describe the workload, and it stays permanently at
+    the top of kubelet's eviction ranking, which orders Burstable pods by how
+    far usage sits above the request.
+
+    Memory only. A CPU request below actual usage is throttling under
+    contention, which is a performance question and recoverable; memory is not
+    reclaimable, so the same mistake ends in an eviction or an OOMKill.
+    """
+    if not memory_means:
+        return []
+    by_owner = _eligible_pods_by_owner(context, now=now)
+
+    hits = []
+    for (_ns, kind, name), entry in by_owner.items():
+        mem_req_total = mem_lim_total = 0.0
+        for pod in entry["pods"]:
+            for req in pod["requests"]:
+                mem_req_total += parse_mem_mib(str(req.get("memory", "0"))) or 0
+            for lim in pod["limits"]:
+                mem_lim_total += parse_mem_mib(str(lim.get("memory", "0"))) or 0
+        if mem_req_total <= 0:
+            continue  # obtainability-audit's `no-requests` owns a missing request
+
+        mean_mem = peak_mem = 0.0
+        measured = False
+        for pod in entry["pods"]:
+            key = (pod["ns"], pod["name"])
+            if key in memory_means:
+                measured = True
+            mean_mem += memory_means.get(key, 0.0)
+            peak_mem += usage_peaks.get(key, (0.0, 0.0))[1]
+        # A controller none of whose pods reported is not a controller using no
+        # memory. Summing absent pods as zero would read it as comfortably
+        # under its request, which is the same vacuum-as-evidence mistake
+        # `fetch_usage_peaks` refuses at the cluster level.
+        if not measured:
+            continue
+
+        overage = mean_mem - mem_req_total
+        if overage <= 0 or overage < UNDERREQUEST_FLOOR_MIB:
+            continue
+
+        oldest_h = entry["oldest_h"]
+        window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
+        # `critical` is reserved for the case that is already failing rather
+        # than merely mis-scheduled: sustained usage within 10% of the ceiling
+        # is an OOMKill waiting for one more request. Everything else is
+        # `major`, and there is deliberately no Autopilot bump -- this stream
+        # already grades most of what it finds at the ceiling, and a severity
+        # every finding shares stops ordering any of them.
+        near_limit = mem_lim_total > 0 and mean_mem >= 0.9 * mem_lim_total
+        severity = "critical" if near_limit else "major"
+
+        replicas = len(entry["pods"])
+        ceiling = f"{mem_lim_total / 1024.0:.1f} GiB limit" if mem_lim_total > 0 else "no memory limit"
+        excerpt = (
+            f"requests {mem_req_total / 1024.0:.2f} GiB of memory ({ceiling}); mean observed "
+            f"{mean_mem / 1024.0:.2f} GiB over the trailing {window_h}h (Cloud Monitoring) — "
+            f"{mean_mem / mem_req_total * 100:.0f}% of request, {overage / 1024.0:.2f} GiB above it; "
+            f"peak {peak_mem / 1024.0:.2f} GiB. Sustained, not a burst."
+        )
+        # §3.11 sizes the new request at ceil(peak x 1.3), and the manifest it
+        # edits declares one replica's request. Handing over only the summed
+        # peak inflates a two-replica controller's request by 2x -- which is
+        # the wrong direction to be wrong in for this check, since the whole
+        # finding is about the scheduler's booking being inaccurate. Spell out
+        # the per-replica arithmetic rather than trusting it to be redone.
+        if replicas > 1:
+            excerpt += (
+                f" Totals span {replicas} replicas — per replica that is "
+                f"{mem_req_total / replicas / 1024.0:.2f} GiB requested against a "
+                f"{mean_mem / replicas / 1024.0:.2f} GiB mean and a {peak_mem / replicas / 1024.0:.2f} GiB "
+                f"peak, and the manifest change is per replica."
+            )
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"{kind}/{name}",
+                "excerpt": excerpt,
+                "severity": severity,
+            }
+        )
+    return hits
+
+
 IMPACT = {
     "overrequest": "This controller reserves far more than it uses, so the scheduler and autoscaler size the cluster for capacity nothing needs.",
+    "underrequest": "Sustained memory use above the request means the scheduler has under-booked every node this controller lands on, and kubelet ranks Burstable pods for eviction by exactly this overage — so it is the first thing evicted when any workload on that node needs memory.",
     "orphan-pv": "The backing disk still exists and no claim can bind it -- capacity paid for and unusable.",
     "unconsumed-pvc": "Provisioned storage sits bound with nothing reading or writing it.",
     "unattached-disk": "A persistent disk bills continuously whether or not anything is attached to it.",
@@ -1240,6 +1694,14 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
 
     usage_peaks, metrics_ok, usage_result = fetch_usage_peaks(project, name, session=session, now=now)
     usage_record = _record(usage_result.argv[0], usage_result)
+    # Only worth the extra round trip where the peak read already succeeded:
+    # the two fail for the same reasons, and `underrequest` has nothing to say
+    # about a cluster `overrequest` could not measure either.
+    if metrics_ok:
+        memory_means, means_ok, means_result = fetch_memory_means(project, name, session=session, now=now)
+    else:
+        memory_means, means_ok, means_result = {}, False, usage_result
+    means_record = _record(means_result.argv[0], means_result)
 
     candidates = []
     commands = {
@@ -1363,6 +1825,32 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             f"overrequest could not be measured on this cluster: the Cloud "
             f"Monitoring usage read failed (rc={usage_result.rc}) — "
             f"{usage_result.stderr.strip()[:200] or 'no detail'}"
+        )
+
+    if means_ok:
+        commands["underrequest"] = means_record
+        candidates += [_emit("underrequest", h) for h in check_underrequest(context, usage_peaks, memory_means, now=now)]
+    elif not context["nodes"]:
+        # Same vacuum as `overrequest`'s arm above, read the other way round: a
+        # cluster with no nodes has nothing scheduled, so no pod can be sitting
+        # above its request, and the empty Monitoring answer says only that
+        # nothing ran.
+        not_applicable.append(
+            {
+                "check": "underrequest",
+                "reason": (
+                    "This cluster has no nodes, so nothing is scheduled and no "
+                    "pod can be consuming more than it requested. Cloud "
+                    "Monitoring returns no container time series for it for the "
+                    "same reason -- nothing ran to report any."
+                ),
+            }
+        )
+    else:
+        limitations.append(
+            f"underrequest could not be measured on this cluster: the Cloud "
+            f"Monitoring mean-memory read failed (rc={means_result.rc}) — "
+            f"{means_result.stderr.strip()[:200] or 'no detail'}"
         )
 
     entry = {
