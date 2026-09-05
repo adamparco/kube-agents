@@ -144,7 +144,9 @@ gcloud container clusters update HUB_CLUSTER --region REGION \
   --project PROJECT_ID --update-addons ConfigConnector=ENABLED
 ```
 
-Run KCC in **namespaced** mode so its permissions are scoped to one namespace rather than the whole cluster, and bind that namespace to its own service account. The KCC controller needs `roles/container.admin`, `roles/compute.viewer`, and `roles/iam.serviceAccountUser`.
+Run KCC in **namespaced** mode so its permissions are scoped to one namespace rather than the whole cluster, and bind that namespace to its own service account. The KCC controller needs `roles/container.admin`, `roles/compute.viewer`, and `roles/iam.serviceAccountUser` — plus a role for each other kind of resource the repo declares. Grant those as you add the kinds: enabling GKE upgrade notifications, which the security-patch audit proposes as a `PubSubTopic` and a `topicRef` on each cluster, additionally needs `roles/pubsub.editor`.
+
+Grant the role before merging the manifest that needs it, because a KCC resource that cannot be created fails in a way that spreads. A `PubSubTopic` stuck at `Ready: False` puts every `ContainerCluster` whose `topicRef` names it into `DependencyNotReady`, and those clusters then stop reconciling every other field too — while `gcloud container clusters describe` still reports each one perfectly healthy, because nothing is wrong with the clusters. Check `status.conditions` on the KCC objects, not the cloud resource, when a merged manifest change does not appear.
 
 The Workload Identity member string is the part most people get wrong. In namespaced mode the Kubernetes service account is `cnrm-controller-manager-<namespace>`, **not** the cluster-mode `cnrm-controller-manager`:
 
