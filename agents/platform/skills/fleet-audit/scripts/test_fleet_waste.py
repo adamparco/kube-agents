@@ -1556,6 +1556,79 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
 
 
+class SoleNodePoolNotApplicableTest(unittest.TestCase):
+    """Autopilot's disposition reached from the other direction.
+
+    §3.7 will not flag a cluster's only node pool, so `check_idle_nodepool`
+    drops out before measuring and `scaledown-blocked` gets no idle pool to
+    read. The collector recorded both commands anyway, so issue #113 published
+    an rc=0 `node-pools list` against `idle-nodepool` for all eleven Standard
+    clusters on the fleet when ten of them have a single pool -- a denominator
+    of one presented to the reader as eleven.
+    """
+
+    CLUSTER = {"name": "sole-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    POOL = {"name": "default-pool", "config": {"machineType": "e2-standard-4"}}
+
+    def collect(self, pools):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(obj("Node", "node-1"))))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps(pools))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(
+                    self.CLUSTER, run=run, session=usage_session(), now=NOW
+                )
+        return entry
+
+    def test_a_sole_node_pool_declares_both_checks_not_applicable(self):
+        entry = self.collect([self.POOL])
+        self.assertEqual(
+            {na["check"] for na in entry["checks_not_applicable"]},
+            {"idle-nodepool", "scaledown-blocked"},
+        )
+
+    def test_neither_check_is_also_reported_as_having_run(self):
+        """The double-count that made the gap invisible: a check cannot be both
+        dispositioned and performed."""
+        entry = self.collect([self.POOL])
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertNotIn("idle-nodepool", ran)
+        self.assertNotIn("scaledown-blocked", ran)
+
+    def test_the_reason_names_the_sole_pool_rather_than_a_failure(self):
+        """A reader has to be able to tell this from the unreadable-pools
+        degradation, which is something they can go and fix."""
+        for na in self.collect([self.POOL])["checks_not_applicable"]:
+            self.assertIn("single node pool", na["reason"])
+        self.assertNotIn("limitations", self.collect([self.POOL]))
+
+    def test_two_pools_still_run_both_checks(self):
+        """The disposition is the sole pool's alone -- a cluster that owes the
+        checks must still be seen to owe them."""
+        entry = self.collect([self.POOL, {**self.POOL, "name": "second-pool"}])
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertIn("idle-nodepool", ran)
+        self.assertIn("scaledown-blocked", ran)
+        self.assertNotIn("checks_not_applicable", entry)
+
+    def test_zero_pools_stays_a_measurement(self):
+        """The boundary this fix must not cross. An empty pool list is a real
+        read over an empty set, so it keeps recording the commands; only
+        *exactly* one pool is the structural exemption."""
+        entry = self.collect([])
+        ran = {c["check"] for c in entry["commands"]}
+        self.assertIn("idle-nodepool", ran)
+        self.assertIn("scaledown-blocked", ran)
+        self.assertNotIn("checks_not_applicable", entry)
+
+
 class FleetConcurrencyTest(unittest.TestCase):
     def test_clusters_are_collected_in_parallel_up_to_the_pool_size(self):
         """Per-cluster work runs concurrently, not one cluster after another.

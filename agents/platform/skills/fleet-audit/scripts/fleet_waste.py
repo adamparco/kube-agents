@@ -1266,19 +1266,50 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # fact the collector already holds, so the disposition belongs here where it
     # is the same on every run.
     if not cluster.get("autopilot"):
-        if pools_readable:
-            commands["idle-nodepool"] = pools_record
-            commands["scaledown-blocked"] = dump_record
-            idle_pool_hits = check_idle_nodepool(context, node_pools, now=now)
-            candidates += [_emit("idle-nodepool", h) for h in idle_pool_hits]
-            candidates += [_emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
-        else:
+        if not pools_readable:
             limitations.append(
                 f"idle-nodepool and scaledown-blocked could not be measured on "
                 f"this cluster: `gcloud container node-pools list` failed "
                 f"(rc={pools_result.rc}) — "
                 f"{pools_result.stderr.strip()[:200] or 'no stderr'}"
             )
+        elif len(node_pools) == 1:
+            # The same shape as the Autopilot branch below, reached from the
+            # other direction. §3.7 will not flag a cluster's only node pool --
+            # the system pods need somewhere to land -- so `check_idle_nodepool`
+            # drops out on `len(node_pools) <= 1` before it measures anything,
+            # and `scaledown-blocked` reads the idle pools it found, so it has
+            # nothing to examine either. Recording the commands anyway published
+            # a `gcloud container node-pools list` that returned rc=0 against
+            # both slugs, which tells a reader the checks ran and came back
+            # clean. On 2026-09-05 that put `idle-nodepool` in issue #113's
+            # evidence table for all eleven Standard clusters when ten of them
+            # have a single pool: a denominator of one presented as eleven.
+            #
+            # This is not the unreadable-pools case above, which is a
+            # degradation to repair, and not the zero-pool case, which is a real
+            # measurement over an empty set. A sole pool is permanent and
+            # structural, so it is a disposition -- and like Autopilot's it
+            # names both slugs, because a check that is neither run nor
+            # dispositioned reads downstream as one nobody performed.
+            not_applicable += [
+                {
+                    "check": slug,
+                    "reason": (
+                        "This cluster has a single node pool, which §3.7 will "
+                        "not flag because the system pods need somewhere to "
+                        "land, so idle-nodepool has no pool it is permitted to "
+                        "size and scaledown-blocked has no idle pool to examine."
+                    ),
+                }
+                for slug in ("idle-nodepool", "scaledown-blocked")
+            ]
+        else:
+            commands["idle-nodepool"] = pools_record
+            commands["scaledown-blocked"] = dump_record
+            idle_pool_hits = check_idle_nodepool(context, node_pools, now=now)
+            candidates += [_emit("idle-nodepool", h) for h in idle_pool_hits]
+            candidates += [_emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
     else:
         not_applicable += [
             {
