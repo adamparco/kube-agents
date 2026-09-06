@@ -371,6 +371,7 @@ def context_of(dump=None, **overrides):
         "pdbs": {},
         "hpas": {},
         "services": {},
+        "cronjobs": [],
         "workloads": [],
         "workload_keys": set(),
         "pod_namespaces": set(),
@@ -382,6 +383,7 @@ def context_of(dump=None, **overrides):
             pdbs=collect.pdbs_by_namespace(dump),
             hpas=collect.hpas_by_namespace(dump),
             services=collect.services_by_namespace(dump),
+            cronjobs=collect.cronjobs_with_jobs(dump),
             workloads=collect.normalize_workloads(dump),
             workload_keys=collect.workload_keys(dump),
         )
@@ -1384,6 +1386,231 @@ class TestSingleReplica(unittest.TestCase):
         self.assertIsNone(collect.check_single_replica(self.wl(), context_of()))
 
 
+def cronjob(
+    name="cj",
+    ns="default",
+    schedule="0 * * * *",
+    suspend=None,
+    last_schedule="2026-09-06T21:00:00Z",
+    last_success="2026-08-27T18:18:39Z",
+    created="2026-08-01T00:00:00Z",
+    labels=None,
+    annotations=None,
+):
+    doc = {
+        "kind": "CronJob",
+        "metadata": {
+            "namespace": ns,
+            "name": name,
+            "creationTimestamp": created,
+            "labels": labels or {},
+            "annotations": annotations or {},
+        },
+        "spec": {"schedule": schedule},
+        "status": {},
+    }
+    if suspend is not None:
+        doc["spec"]["suspend"] = suspend
+    if last_schedule is not None:
+        doc["status"]["lastScheduleTime"] = last_schedule
+    if last_success is not None:
+        doc["status"]["lastSuccessfulTime"] = last_success
+    return doc
+
+
+def job(name, ns="default", owner="cj", succeeded=None, failed=None, created="2026-09-06T20:00:00Z"):
+    status = {}
+    if succeeded is not None:
+        status["succeeded"] = succeeded
+    if failed is not None:
+        status["failed"] = failed
+    if not status:
+        # Neither field set is what an in-flight Job looks like.
+        status["active"] = 1
+    return {
+        "kind": "Job",
+        "metadata": {
+            "namespace": ns,
+            "name": name,
+            "creationTimestamp": created,
+            "ownerReferences": ([{"kind": "CronJob", "name": owner}] if owner else []),
+        },
+        "status": status,
+    }
+
+
+class TestScheduleNeverSucceeds(unittest.TestCase):
+    """§3.12. The live case is `kube-agents-selfimprove` on kube-agents-host.
+
+    Hourly, not suspended, three retained Jobs all failed, and a
+    `lastSuccessfulTime` ten days behind its `lastScheduleTime`. It ships with
+    every kube-agents install, and before this check nothing in 94 of them
+    looked at a CronJob at all -- obtainability's S5 drops Jobs and CronJobs
+    from the workload set on purpose, and cost's `terminal-pods` excludes Jobs
+    owned by a CronJob by name.
+    """
+
+    def hits(self, *items):
+        return collect.check_schedule_never_succeeds(context_of(dump_of(*items)))
+
+    def test_the_live_hub_case_is_flagged(self):
+        hits = self.hits(
+            cronjob("kube-agents-selfimprove", ns="kubeagents-system"),
+            job("s-1", ns="kubeagents-system", owner="kube-agents-selfimprove", failed=1),
+            job("s-2", ns="kubeagents-system", owner="kube-agents-selfimprove", failed=1),
+            job("s-3", ns="kubeagents-system", owner="kube-agents-selfimprove", failed=1),
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "CronJob/kube-agents-selfimprove")
+        self.assertEqual(hits[0]["namespace"], "kubeagents-system")
+
+    def test_the_excerpt_carries_the_outage_length_and_the_retained_count(self):
+        # A `manual` remediation is prose the owner has to act on, so the
+        # excerpt is the whole finding: how long it has been down, and enough
+        # of the schedule to tell an hourly outage from an annual one.
+        hits = self.hits(cronjob(), job("j1", failed=1))
+        self.assertIn("'0 * * * *'", hits[0]["excerpt"])
+        self.assertIn("243h without a successful run", hits[0]["excerpt"])
+        self.assertIn("lastSuccessfulTime=2026-08-27T18:18:39Z", hits[0]["excerpt"])
+        self.assertIn("1 retained Job(s), all failed", hits[0]["excerpt"])
+
+    def test_a_suspended_cronjob_is_never_flagged(self):
+        self.assertEqual(self.hits(cronjob(suspend=True), job("j1", failed=1)), [])
+
+    def test_a_cronjob_that_has_never_fired_is_never_flagged(self):
+        # No `lastScheduleTime` and it has either not come due yet or the
+        # scheduler is not firing it -- a different fault, and one this check
+        # would misattribute to the workload.
+        self.assertEqual(self.hits(cronjob(last_schedule=None), job("j1", failed=1)), [])
+
+    def test_a_success_anywhere_in_the_retained_history_silences_it(self):
+        # What separates "failing" from "failed once". The gap is 243h and two
+        # of the three Jobs failed, and it still says nothing.
+        self.assertEqual(
+            self.hits(
+                cronjob(),
+                job("j1", failed=1),
+                job("j2", succeeded=1),
+                job("j3", failed=1),
+            ),
+            [],
+        )
+
+    def test_a_gap_under_the_threshold_is_not_yet_chronic(self):
+        self.assertEqual(
+            self.hits(
+                cronjob(last_schedule="2026-09-06T21:00:00Z", last_success="2026-09-06T02:00:00Z"),
+                job("j1", failed=1),
+            ),
+            [],
+        )
+
+    def test_the_threshold_is_a_floor_not_a_window(self):
+        # Exactly STALE_SUCCESS_GAP_HOURS fires; a minute under does not.
+        self.assertEqual(
+            len(self.hits(cronjob(last_success="2026-09-05T21:00:00Z"), job("j1", failed=1))), 1
+        )
+        self.assertEqual(
+            self.hits(cronjob(last_success="2026-09-05T21:01:00Z"), job("j1", failed=1)), []
+        )
+
+    def test_a_cronjob_that_has_never_succeeded_measures_from_its_creation(self):
+        # The worst case in the check's remit, and the one arm an implementation
+        # keyed on `lastSuccessfulTime` alone stays silent about.
+        hits = self.hits(cronjob(last_success=None, created="2026-08-01T00:00:00Z"), job("j1", failed=1))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("creationTimestamp=2026-08-01T00:00:00Z", hits[0]["excerpt"])
+
+    def test_a_never_succeeded_cronjob_created_an_hour_ago_is_not_yet_chronic(self):
+        self.assertEqual(
+            self.hits(cronjob(last_success=None, created="2026-09-06T20:00:00Z"), job("j1", failed=1)), []
+        )
+
+    def test_a_history_of_only_active_jobs_says_nothing(self):
+        # Nothing has finished, so nothing has failed.
+        self.assertEqual(self.hits(cronjob(), job("j1")), [])
+
+    def test_an_in_flight_job_does_not_veto_a_failing_history(self):
+        # An hourly schedule almost always has one in flight. Letting it count
+        # would make the check unreachable on exactly the schedules that fail
+        # most often.
+        self.assertEqual(len(self.hits(cronjob(), job("j1", failed=1), job("j2"))), 1)
+
+    def test_a_cronjob_retaining_no_jobs_at_all_says_nothing(self):
+        # `failedJobsHistoryLimit: 0` is legal, and it leaves this check with no
+        # evidence rather than with evidence of failure.
+        self.assertEqual(self.hits(cronjob()), [])
+
+    def test_the_opt_out_label_silences_it(self):
+        self.assertEqual(
+            self.hits(cronjob(labels={collect.OPT_OUT_KEY: "exempt"}), job("j1", failed=1)), []
+        )
+
+    def test_the_opt_out_annotation_silences_it(self):
+        # S4 is the only way an operator who knows the CronJob is broken can
+        # make this finding stop -- every other check in this audit reports a
+        # shape they can just fix.
+        self.assertEqual(
+            self.hits(cronjob(annotations={collect.OPT_OUT_KEY: "exempt"}), job("j1", failed=1)), []
+        )
+
+    def test_a_system_namespace_cronjob_is_excluded(self):
+        self.assertEqual(
+            self.hits(cronjob(ns="kube-system"), job("j1", ns="kube-system", failed=1)), []
+        )
+
+    def test_a_gke_prefixed_namespace_cronjob_is_excluded(self):
+        self.assertEqual(
+            self.hits(cronjob(ns="gke-managed-cim"), job("j1", ns="gke-managed-cim", failed=1)), []
+        )
+
+    def test_an_addon_managed_cronjob_is_excluded(self):
+        self.assertEqual(
+            self.hits(
+                cronjob(labels={"addonmanager.kubernetes.io/mode": "Reconcile"}), job("j1", failed=1)
+            ),
+            [],
+        )
+
+    def test_a_job_in_another_namespace_is_not_joined_to_it(self):
+        # Names are namespace-scoped, so a same-named CronJob elsewhere is a
+        # different object and its failures are not this one's evidence.
+        self.assertEqual(self.hits(cronjob(ns="a"), job("j1", ns="b", failed=1)), [])
+
+    def test_a_job_owned_by_something_else_is_not_joined_to_it(self):
+        self.assertEqual(self.hits(cronjob(), job("j1", owner=None, failed=1)), [])
+
+    def test_an_unparseable_timestamp_stays_quiet_rather_than_failing_the_cluster(self):
+        # Ten other checks are riding on this collection. A timestamp in a shape
+        # the parser does not expect costs the fleet this one CronJob, not the
+        # cluster's whole result.
+        self.assertEqual(self.hits(cronjob(last_schedule="whenever"), job("j1", failed=1)), [])
+        self.assertEqual(self.hits(cronjob(last_success="whenever"), job("j1", failed=1)), [])
+
+    def test_the_finding_names_what_reconciles_the_cronjob(self):
+        # The live one is a Helm release, so its remediation has to say the fix
+        # belongs in the chart rather than in `kubectl edit`.
+        cj = cronjob("kube-agents-selfimprove", ns="kubeagents-system")
+        cj["metadata"]["annotations"] = {
+            "meta.helm.sh/release-name": "kube-agents",
+            "meta.helm.sh/release-namespace": "kubeagents-system",
+        }
+        hits = self.hits(cj, job("j1", ns="kubeagents-system", owner="kube-agents-selfimprove", failed=1))
+        self.assertIn("kube-agents", hits[0]["reconciler"])
+
+    def test_the_shared_dump_does_not_leak_cronjobs_into_the_workload_checks(self):
+        # 3.12 is why `cronjobs,jobs` were added to DUMP_COMMAND_KINDS. The
+        # other eleven checks read `workloads`, which filters on WORKLOAD_KINDS,
+        # so neither kind can reach them -- but that is a property of a filter
+        # somewhere else, which is exactly the kind that stops being true.
+        dump = dump_of(cronjob(), job("j1", failed=1), deployment("api"))
+        self.assertEqual([wl["name"] for wl in collect.normalize_workloads(dump)], ["api"])
+
+    def test_the_dump_asks_for_the_kinds_the_check_reads(self):
+        self.assertIn("cronjobs", collect.DUMP_COMMAND_KINDS)
+        self.assertIn("jobs", collect.DUMP_COMMAND_KINDS)
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -1550,11 +1777,14 @@ class TestCollectCluster(unittest.TestCase):
         na = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
         self.assertEqual(set(na), workload_slugs)
-        # The cluster-scoped pair still ran: an HPA pointing at a workload that
-        # no longer exists and a PDB nothing can satisfy are both still true of
-        # a cluster running nothing.
+        # The cluster-scoped checks still ran: an HPA pointing at a workload
+        # that no longer exists, a PDB nothing can satisfy, and a CronJob that
+        # has stopped succeeding are all still true of a cluster whose
+        # *workload* set is empty. 3.12 in particular is only ever reachable
+        # this way -- a CronJob is not a workload, so a cluster that holds
+        # nothing else still owes the check an answer.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
-        self.assertEqual(cluster_slugs, {"hpa-cannot-scale", "blocking-pdb"})
+        self.assertEqual(cluster_slugs, {"hpa-cannot-scale", "blocking-pdb", "schedule-never-succeeds"})
         self.assertFalse(cluster_slugs & set(na))
         # §6 reads `commands` as the list of checks that ran, so a slug cannot
         # be in both.

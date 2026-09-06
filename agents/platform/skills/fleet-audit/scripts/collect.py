@@ -5,9 +5,9 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete eleven-check roster
-(§3.1–§3.11 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
-complete eleven-check roster (§2.1–§2.11 of `governance/compliance_audit_sop.md`),
+tables in full.** `obtainability-audit`'s complete twelve-check roster
+(§3.1–§3.12 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+complete twelve-check roster (§2.1–§2.12 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
 the three SOPs defines is fully mechanical (design §2, point 2: none needed a
@@ -57,6 +57,7 @@ own shell to run.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -280,10 +281,44 @@ def fetch_credentials(
     return kc, result
 
 
-DUMP_COMMAND_KINDS = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,services,limitranges"
+DUMP_COMMAND_KINDS = (
+    "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,services,limitranges"
+    # `cronjobs,jobs` serve 3.12 alone. They are safe to add to the shared dump
+    # because `normalize_workloads` filters on `WORKLOAD_KINDS`, so neither kind
+    # reaches the workload set the other ten checks read -- and this dump has
+    # exactly one caller, `_collect_obtainability`, so no other stream pays for
+    # them either.
+    ",cronjobs,jobs"
+)
+
+# How long a CronJob must have been firing without a success before 3.12 calls
+# it chronically failing, measured as `lastScheduleTime - lastSuccessfulTime`.
+#
+# Both ends come out of the dump, so this check needs no clock -- which is why
+# it is a gap between two recorded times rather than an age against `now`.
+# Nothing else in this file reads wall-clock time, the tests would have to
+# freeze it, and a collector whose verdict depends on when it ran is a
+# collector whose findings cannot be reproduced from its own manifest.
+#
+# Deliberately not scaled to the schedule's period. The instinct is that a
+# weekly CronJob should get a week of grace and an hourly one an hour, but that
+# has it backwards: the rarer the schedule, the *more* a single failure costs,
+# because the next attempt is a week away rather than sixty seconds. A flat
+# floor gives an hourly job twenty-four consecutive failures before it is worth
+# saying anything, and reports a weekly job the day after its one failure --
+# which is the right answer in both directions. It also avoids parsing cron
+# expressions, which this collector has no reason to learn.
+STALE_SUCCESS_GAP_HOURS = 24
+SECONDS_PER_HOUR = 3600
 
 
-def run_and_gate(argv: list[str], kubeconfig: Path, *, run: RunFn = default_run) -> tuple[dict | None, Run]:
+def run_and_gate(
+    argv: list[str],
+    kubeconfig: Path,
+    *,
+    run: RunFn = default_run,
+    timeout: int = DEFAULT_TIMEOUT_S,
+) -> tuple[dict | None, Run]:
     """One collection command, behind a fail-closed gate.
 
     The gate is the ai-security SOP's pattern (`ai_security_audit_sop.md:89`):
@@ -594,12 +629,64 @@ def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
     }
 
 
+def cronjobs_with_jobs(dump: dict) -> list[dict]:
+    """Every non-system CronJob paired with the Jobs it still retains.
+
+    Joined here rather than in the check because the join is the awkward part:
+    a Job names its CronJob in `ownerReferences`, so the dump has to be walked
+    once per CronJob to find them, and doing that inside the check would make
+    it quadratic on a fleet where one namespace holds hundreds of Jobs.
+
+    S1, S2 and S4 are applied here. S3 is not, because it would drop every
+    CronJob in the fleet -- a CronJob is owned by nothing. Neither is S5, which
+    exists to keep Jobs and CronJobs out of the *workload* checks and is
+    exactly the exclusion 3.12 is written to reach past; the SOP says so under
+    S5 rather than leaving a reader to infer it from this function.
+
+    S4 matters more here than anywhere else in this file. Every other check in
+    this audit reports a shape the operator can change, so an unwanted finding
+    can be answered by fixing it. This one reports that a schedule is failing,
+    and an operator who knows why and is not going to act -- a CronJob kept
+    deliberately broken, one whose fix is waiting on something else -- has no
+    way to make it stop except the opt-out label.
+    """
+    out = []
+    for item in dump.get("items", []) or []:
+        if item.get("kind") != "CronJob":
+            continue
+        meta = item.get("metadata") or {}
+        ns = meta.get("namespace", "")
+        if _is_system_namespace(ns):  # S1
+            continue
+        labels = meta.get("labels") or {}
+        annotations = meta.get("annotations") or {}
+        if "addonmanager.kubernetes.io/mode" in labels:  # S2
+            continue
+        if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
+            continue
+        name = meta.get("name", "")
+        owned = [
+            job
+            for job in dump.get("items", []) or []
+            if job.get("kind") == "Job"
+            and (job.get("metadata") or {}).get("namespace", "") == ns
+            and any(
+                ref.get("kind") == "CronJob" and ref.get("name") == name
+                for ref in ((job.get("metadata") or {}).get("ownerReferences") or [])
+            )
+        ]
+        owned.sort(key=lambda job: (job.get("metadata") or {}).get("creationTimestamp", ""))
+        out.append({"cronjob": item, "ns": ns, "name": name, "jobs": owned})
+    return out
+
+
 def build_context(dump: dict, workloads: list[dict]) -> dict:
     return {
         "limitranges": limitranges_by_namespace(dump),
         "pdbs": pdbs_by_namespace(dump),
         "hpas": hpas_by_namespace(dump),
         "services": services_by_namespace(dump),
+        "cronjobs": cronjobs_with_jobs(dump),
         "workloads": workloads,
         "workload_keys": workload_keys(dump),
     }
@@ -1274,8 +1361,91 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
     }
 
 
+def _rfc3339(stamp: str) -> float | None:
+    """Kubernetes timestamp -> epoch seconds, or `None` if it will not parse.
+
+    `None` rather than an exception because every caller here is deciding
+    whether to *report* something: a timestamp the API served in a shape this
+    does not expect is a reason to stay quiet about that object, not a reason
+    to fail the cluster's whole collection and lose the other ten checks.
+    """
+    if not stamp:
+        return None
+    try:
+        return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        ).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def check_schedule_never_succeeds(context: dict) -> list[dict]:
+    """Cluster-scoped: iterates CronJobs, which are not in `workloads` at all.
+
+    The other ten checks read pod templates and ask whether the workload is
+    configured to survive something. This one asks whether a schedule is still
+    producing anything, which is not a question a template can answer -- so it
+    reads `status` on the CronJob and on the Jobs it retains, and reports the
+    CronJob rather than any individual Job. A Job is one attempt; the finding
+    is about the run of them.
+
+    Both times come off the dump and neither is compared against `now`, for
+    the reason `STALE_SUCCESS_GAP_HOURS` gives.
+    """
+    hits = []
+    for entry in context["cronjobs"]:
+        cronjob = entry["cronjob"]
+        spec, status = cronjob.get("spec") or {}, cronjob.get("status") or {}
+        if spec.get("suspend"):
+            continue
+        last_schedule = _rfc3339(status.get("lastScheduleTime", ""))
+        if last_schedule is None:
+            # Never fired. A CronJob that has not come due yet has nothing to
+            # have failed at, and one whose schedule has passed without firing
+            # is a scheduler problem this check would misattribute.
+            continue
+        finished = [
+            job
+            for job in entry["jobs"]
+            if (job.get("status") or {}).get("succeeded") or (job.get("status") or {}).get("failed")
+        ]
+        if not finished or any((job.get("status") or {}).get("succeeded") for job in finished):
+            # An active Job counts as neither, deliberately: an hourly schedule
+            # almost always has one in flight, and letting it veto the check
+            # would make the check unreachable on the schedules it most needs
+            # to cover.
+            continue
+        last_success = status.get("lastSuccessfulTime", "")
+        # Never succeeded at all -> measure from when the CronJob was created,
+        # which is the earliest moment it could have. Without this arm the
+        # worst case in the check's remit, a schedule that has never once
+        # worked, is the one case it stays silent about.
+        baseline_field = "lastSuccessfulTime" if last_success else "creationTimestamp"
+        baseline = _rfc3339(last_success or (cronjob.get("metadata") or {}).get("creationTimestamp", ""))
+        if baseline is None:
+            continue
+        gap_hours = (last_schedule - baseline) / SECONDS_PER_HOUR
+        if gap_hours < STALE_SUCCESS_GAP_HOURS:
+            continue
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"CronJob/{entry['name']}",
+                "excerpt": (
+                    f"schedule={spec.get('schedule', '')!r} suspend=false; "
+                    f"last fired {status.get('lastScheduleTime', '')}, "
+                    f"{baseline_field}={last_success or (cronjob.get('metadata') or {}).get('creationTimestamp', '')} "
+                    f"({gap_hours:.0f}h without a successful run); "
+                    f"{len(finished)} retained Job(s), all failed"
+                ),
+                "reconciler": reconciler_of(cronjob.get("metadata") or {}),
+            }
+        )
+    return hits
+
+
 # --------------------------------------------------------------------------- #
-# compliance-audit: all eleven checks of §2.
+# compliance-audit: all twelve checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -3462,6 +3632,16 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         None,
         "Zero-downtime is impossible: every rollout, node drain, and node "
         "repair is a full outage for this service.",
+    ),
+    CheckSpec(
+        "schedule-never-succeeds",
+        "cluster",
+        check_schedule_never_succeeds,
+        "major",
+        None,
+        "Whatever this schedule exists to do has not been done since its last "
+        "successful run, and nothing reports that on its own: the CronJob is "
+        "still listed, still enabled, and still firing on time.",
     ),
 )
 
