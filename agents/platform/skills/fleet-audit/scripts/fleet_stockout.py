@@ -863,36 +863,52 @@ def spot_shapes(compute_classes: list[dict], node_pools: list[dict]) -> dict[str
 
 
 def spot_without_a_shape(
-    compute_classes: list[dict], node_pools: list[dict]
-) -> tuple[list[str], list[str]]:
+    compute_classes: list[dict], node_pools: list[dict], *, brokered: bool
+) -> tuple[list[str], list[str], list[str]]:
     """Spot requests `capacity-history` cannot be asked about, split by why.
 
-    `(unqueryable, unpinned)`, and the split is the whole point. A priority
-    naming a machine family but no machine type is a real gap: the shape exists,
-    the API takes one `--machine-type` and has no way to be asked about a
-    family. A priority pinning *neither* — GKE's own `autopilot-spot`, which
-    ships on every Autopilot cluster — has no shape to be scarce, because every
-    family is available to it; §3.8's "without alternative family fallbacks"
-    cannot be true of it by construction.
+    `(unqueryable, unpinned, inert)`, and the split is the whole point. A
+    priority naming a machine family but no machine type is a real gap: the
+    shape exists, the API takes one `--machine-type` and has no way to be asked
+    about a family. A priority pinning *neither* has no shape to be scarce,
+    because every family is available to it; §3.8's "without alternative family
+    fallbacks" cannot be true of it by construction.
 
-    One belongs in `limitations` and the other in `checks_not_applicable`, and
-    reporting both as "this cluster does not use Spot" was wrong about both.
+    `brokered` is whether this cluster can actually scale up through such a
+    priority — Autopilot, or Standard with node auto-provisioning on. It exists
+    because the third bucket was for a long time folded into the second, on the
+    belief that a pod-family Spot priority meant `autopilot-spot` and that
+    `autopilot-spot` meant an Autopilot cluster. GKE pre-installs those classes
+    on Standard clusters too, so on 2026-09-05 ten of this fleet's sixteen
+    clusters published "Every Spot request on this cluster leaves the machine
+    shape entirely to GKE" — about clusters that make no Spot request at all,
+    hold no Spot node pool, and have auto-provisioning off, so the class cannot
+    scale anything up. The honest sentence, that nothing here asks for Spot, was
+    the branch it displaced.
+
+    `unqueryable` belongs in `limitations` and the other two in
+    `checks_not_applicable`, saying different things; reporting all three as
+    "this cluster does not use Spot" was wrong about each.
     """
-    unqueryable, unpinned = [], []
+    unqueryable, unpinned, inert = [], [], []
     for cc in compute_classes:
         name = cc.get("metadata", {}).get("name", "")
         for priority in (cc.get("spec") or {}).get("priorities") or []:
             if not _priority_is_spot(priority) or priority.get("machineType"):
                 continue
             family = _priority_family(priority)
-            bucket, label = (unqueryable, f"{name}:{family}") if family else (unpinned, f"ComputeClass/{name}")
+            if family:
+                bucket, label = unqueryable, f"{name}:{family}"
+            else:
+                bucket = unpinned if brokered else inert
+                label = f"ComputeClass/{name}"
             if label not in bucket:
                 bucket.append(label)
     for pool in node_pools:
         config = pool.get("config") or {}
         if config.get("spot") and not config.get("machineType"):
             unqueryable.append(f"NodePool/{pool.get('name', '')}")
-    return unqueryable, unpinned
+    return unqueryable, unpinned, inert
 
 
 def mean_preemption_rate(advice: object) -> tuple[float | None, int]:
@@ -1314,7 +1330,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"{len(shapes)} distinct Spot machine shapes; the rest were not "
             f"measured: {', '.join(sorted(shapes)[SPOT_MAX_SHAPES:])}"
         )
-    unqueryable, unpinned = spot_without_a_shape(compute_classes, node_pools if pools_readable else [])
+    unqueryable, unpinned, inert = spot_without_a_shape(
+        compute_classes,
+        node_pools if pools_readable else [],
+        brokered=autopilot or bool(cluster.get("has_nap")),
+    )
     if unqueryable:
         limitations.append(
             f"spot-scarcity-risk could not be measured for Spot requests that "
@@ -1325,21 +1345,30 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # No command to record, so §6 would otherwise read the missing record as
         # a check nobody ran. Declared not-applicable for the same reason the
         # Autopilot branch above declares one: it is a fact already in hand.
-        not_applicable.append(
-            {
-                "check": "spot-scarcity-risk",
-                "reason": (
-                    f"Every Spot request on this cluster leaves the machine shape "
-                    f"entirely to GKE ({', '.join(unpinned)}), so no shape can be "
-                    f"scarce for it — every family is available to it, which is "
-                    f"what this check tests for."
-                    if unpinned
-                    else "No ComputeClass priority or node pool on this cluster "
-                    "requests Spot capacity, so there is no Spot machine shape "
-                    "to ask `capacity-history` about."
-                ),
-            }
-        )
+        if unpinned:
+            reason = (
+                f"Every Spot request on this cluster leaves the machine shape "
+                f"entirely to GKE ({', '.join(unpinned)}), so no shape can be "
+                f"scarce for it — every family is available to it, which is "
+                f"what this check tests for."
+            )
+        elif inert:
+            reason = (
+                f"Nothing on this cluster requests Spot capacity. The only Spot "
+                f"priority here is GKE's pre-installed {', '.join(inert)}, which "
+                f"leaves the machine shape to GKE and needs node "
+                f"auto-provisioning to create anything — this is a Standard "
+                f"cluster with auto-provisioning off, so no node can be created "
+                f"through it and there is no shape to ask `capacity-history` "
+                f"about."
+            )
+        else:
+            reason = (
+                "No ComputeClass priority or node pool on this cluster requests "
+                "Spot capacity, so there is no Spot machine shape to ask "
+                "`capacity-history` about."
+            )
+        not_applicable.append({"check": "spot-scarcity-risk", "reason": reason})
 
     entry = {
         "name": name, "project": project, "location": location, **mode,

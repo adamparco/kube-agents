@@ -1044,23 +1044,53 @@ class SpotShapeEnumerationTest(unittest.TestCase):
         cluster with no Spot at all."""
         cc = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
         self.assertEqual(fs.spot_shapes([cc], []), {})
-        self.assertEqual(fs.spot_without_a_shape([cc], []), (["cc1:c3"], []))
+        self.assertEqual(fs.spot_without_a_shape([cc], [], brokered=True), (["cc1:c3"], [], []))
 
     def test_a_priority_with_a_machine_type_is_not_also_reported_unqueryable(self):
         cc = compute_class("cc1", [{"machineType": "n2-standard-8", "spot": True}])
-        self.assertEqual(fs.spot_without_a_shape([cc], []), ([], []))
+        self.assertEqual(fs.spot_without_a_shape([cc], [], brokered=True), ([], [], []))
 
     def test_a_shape_free_spot_priority_is_unpinned_rather_than_unqueryable(self):
-        """GKE's own `autopilot-spot`, which ships on every Autopilot cluster:
-        it pins neither family nor type, so every family is available to it and
+        """GKE's own `autopilot-spot`: it pins neither family nor type, so on a
+        cluster that can scale up through it every family is available to it and
         no shape can be scarce for it. Counting it as an unmeasurable gap put a
         permanent false coverage gap on every Autopilot cluster in the fleet."""
         cc = compute_class("autopilot-spot", [{"spot": True}])
-        self.assertEqual(fs.spot_without_a_shape([cc], []), ([], ["ComputeClass/autopilot-spot"]))
+        self.assertEqual(
+            fs.spot_without_a_shape([cc], [], brokered=True),
+            ([], ["ComputeClass/autopilot-spot"], []),
+        )
+
+    def test_the_same_priority_is_inert_where_nothing_can_scale_up_through_it(self):
+        """GKE pre-installs `autopilot-spot` on Standard clusters too, and there
+        it needs node auto-provisioning to create anything. Ten of this fleet's
+        sixteen clusters are Standard with auto-provisioning off; folding them in
+        with the bucket above had every one of them publish "Every Spot request
+        on this cluster leaves the machine shape entirely to GKE" about a cluster
+        that makes no Spot request at all."""
+        cc = compute_class("autopilot-spot", [{"spot": True}])
+        self.assertEqual(
+            fs.spot_without_a_shape([cc], [], brokered=False),
+            ([], [], ["ComputeClass/autopilot-spot"]),
+        )
+
+    def test_brokering_does_not_move_a_priority_that_names_a_shape(self):
+        """`brokered` only decides where a *shape-free* priority lands. A family
+        is still unqueryable and a machine type is still measurable, whatever the
+        cluster can provision."""
+        family = compute_class("cc1", [{"machineFamily": "c3", "spot": True}])
+        typed = compute_class("cc2", [{"machineType": "n2-standard-8", "spot": True}])
+        pools = [{"name": "p1", "config": {"spot": True}}]
+        for brokered in (True, False):
+            with self.subTest(brokered=brokered):
+                self.assertEqual(
+                    fs.spot_without_a_shape([family, typed], pools, brokered=brokered),
+                    (["cc1:c3", "NodePool/p1"], [], []),
+                )
 
     def test_a_spot_pool_with_no_machine_type_is_unqueryable(self):
         pools = [{"name": "p1", "config": {"spot": True}}]
-        self.assertEqual(fs.spot_without_a_shape([], pools), (["NodePool/p1"], []))
+        self.assertEqual(fs.spot_without_a_shape([], pools, brokered=True), (["NodePool/p1"], [], []))
 
 
 class CollectClusterTest(unittest.TestCase):
@@ -1394,17 +1424,44 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
         self.assertIn("cc1:c3", entry["limitations"])
 
-    def test_a_shape_free_spot_chain_says_so_rather_than_denying_the_cluster_uses_spot(self):
-        """The live fleet is sixteen Autopilot-flavoured clusters all carrying
-        GKE's `autopilot-spot`, so the wrong reason here is the one an operator
-        reads sixteen times."""
-        cc = compute_class("autopilot-spot", [{"spot": True}])
-        entry = self.run_with(dump_items=[cc])
-        reason = next(
+    def spot_non_applicability(self, entry):
+        return next(
             e["reason"] for e in entry["checks_not_applicable"] if e["check"] == "spot-scarcity-risk"
         )
+
+    def test_a_shape_free_spot_chain_says_so_rather_than_denying_the_cluster_uses_spot(self):
+        """Every cluster that can scale up through `autopilot-spot` really does
+        leave the shape to GKE, so the wrong reason here is one an operator reads
+        once per Autopilot cluster in the fleet."""
+        cc = compute_class("autopilot-spot", [{"spot": True}])
+        entry = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, dump_items=[cc])
+        reason = self.spot_non_applicability(entry)
         self.assertIn("ComputeClass/autopilot-spot", reason)
         self.assertIn("leaves the machine shape entirely to GKE", reason)
+        self.assertNotIn("limitations", entry)
+
+    def test_node_auto_provisioning_makes_a_standard_cluster_read_the_same_way(self):
+        """`brokered` is about whether a node can be created through the class,
+        not about the cluster's mode. NAP on Standard can, so the Autopilot
+        sentence is the true one there too."""
+        cc = compute_class("autopilot-spot", [{"spot": True}])
+        entry = self.run_with(cluster={**self.CLUSTER, "has_nap": True}, dump_items=[cc])
+        self.assertIn("leaves the machine shape entirely to GKE", self.spot_non_applicability(entry))
+
+    def test_a_standard_cluster_without_nap_says_nothing_asks_for_spot(self):
+        """GKE pre-installs `autopilot-spot` on Standard clusters, where it
+        cannot create a node unless auto-provisioning is on. Ten of this fleet's
+        sixteen clusters are Standard with it off, and every one published "Every
+        Spot request on this cluster leaves the machine shape entirely to GKE" --
+        a claim about Spot requests a cluster that makes none, displacing the
+        true sentence that was already in the code below it."""
+        cc = compute_class("autopilot-spot", [{"spot": True}])
+        entry = self.run_with(dump_items=[cc])
+        reason = self.spot_non_applicability(entry)
+        self.assertIn("Nothing on this cluster requests Spot capacity", reason)
+        self.assertIn("ComputeClass/autopilot-spot", reason)
+        self.assertIn("auto-provisioning off", reason)
+        self.assertNotIn("Every Spot request", reason)
         self.assertNotIn("limitations", entry)
 
     def test_dangling_reference_reported(self):
