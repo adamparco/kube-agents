@@ -933,6 +933,11 @@ def check_blocking_pdb(context: dict) -> list[dict]:
                     "object": f"PodDisruptionBudget/{name}",
                     "excerpt": f"maxUnavailable={max_unavailable!r} minAvailable={min_available!r} "
                     f"against {matched['kind']}/{matched['name']} (replicas={replicas})",
+                    # The PDB's own reconciler, not the matched workload's. The
+                    # finding is about the PDB's shape and the fix edits the PDB,
+                    # so a note naming what holds the Deployment would send the
+                    # reader to the wrong chart.
+                    "reconciler": reconciler_of(pdb.get("metadata") or {}),
                 }
             )
     return hits
@@ -992,6 +997,7 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
             if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):  # S2
                 continue
             name = meta.get("name", "")
+            reconciler = reconciler_of(meta)
             spec = hpa.get("spec") or {}
             min_r, max_r = spec.get("minReplicas"), spec.get("maxReplicas")
             target = spec.get("scaleTargetRef") or {}
@@ -1002,6 +1008,7 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
                         "object": f"HorizontalPodAutoscaler/{name}",
                         "excerpt": f"minReplicas == maxReplicas == {min_r}; autoscaling is cosmetic",
                         "severity": "major",
+                        "reconciler": reconciler,
                     }
                 )
                 continue
@@ -1013,6 +1020,7 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
                         "object": f"HorizontalPodAutoscaler/{name}",
                         "excerpt": f"scaleTargetRef {target.get('kind')}/{target.get('name')} not found",
                         "severity": "minor",
+                        "reconciler": reconciler,
                     }
                 )
     return hits
@@ -1499,7 +1507,9 @@ def check_cluster_admin_binding(context: dict) -> list[dict]:
         role_ref = crb.get("roleRef") or {}
         if role_ref.get("name") != "cluster-admin":
             continue
-        name = (crb.get("metadata") or {}).get("name", "")
+        crb_meta = crb.get("metadata") or {}
+        name = crb_meta.get("name", "")
+        reconciler = reconciler_of(crb_meta)
         for subject in crb.get("subjects") or []:
             flagged, is_org_group = _is_non_system_subject(subject)
             if not flagged:
@@ -1511,6 +1521,7 @@ def check_cluster_admin_binding(context: dict) -> list[dict]:
                     "object": f"ClusterRoleBinding/{name}",
                     "excerpt": f"{name} -> {target}",
                     "severity": "minor" if is_org_group else "critical",
+                    "reconciler": reconciler,
                 }
             )
     return hits
@@ -1735,6 +1746,11 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
                 "excerpt": f"{json.dumps(wildcard_rules)}; bound to {principals}",
                 "severity": "critical" if role.get("kind") == "ClusterRole" else "major",
                 "impact": _wildcard_rbac_impact(verbs),
+                # The role's, not the binding's. Both appear in this check --
+                # the principals in the excerpt come from `bound_non_system` --
+                # but the remediation narrows the rule, so the reader needs
+                # whatever holds the role.
+                "reconciler": reconciler_of(meta),
             }
         )
     return hits
@@ -2014,6 +2030,12 @@ def check_default_sa_automount(context: dict) -> list[dict]:
                 "namespace": wl["ns"],
                 "object": f"{wl['kind']}/{wl['name']}",
                 "excerpt": "resolves to the default ServiceAccount with automount not disabled",
+                # A cluster check that nonetheless names a workload: it walks
+                # `context["workloads"]` itself rather than being called once
+                # per workload, because the ServiceAccount half of the test is
+                # a namespace fact. The record carries the same field the
+                # workload checks read.
+                "reconciler": wl.get("reconciler"),
             }
         )
     return hits
@@ -3093,6 +3115,12 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         hit = {
             "namespace": ns,
             "object": f"Service/{meta.get('name', '')}",
+            # §3.5 is always `manual` -- the correct caller range is a fact
+            # about intended usage this audit cannot read -- so the reader is
+            # being told to go and edit something, and on 2026-09-06 that
+            # something was a Service the Argo CD Application
+            # `workloads-adamparco-gitops` reasserts on every sync.
+            "reconciler": reconciler_of(meta),
             # The count, never the address. `ai_security_audit_sop.md`
             # (Red Lines, and again under check 3.5) forbids publishing
             # the address of a reachable model endpoint, and these
@@ -4022,11 +4050,28 @@ def collect_cluster(
             declaration = declaration_for(declarations, name, emitted["namespace"], hit["object"])
             if declaration:
                 emitted["declaration"] = declaration
-        # What reasserts this object's spec, where something does. Workload
-        # checks only: a cluster-scoped hit has no object whose spec a
-        # controller could be holding, and `workload` is None for them.
-        if workload and workload.get("reconciler"):
-            emitted["reconciler"] = workload["reconciler"]
+        # What reasserts this object's spec, where something does. A workload
+        # check gets it off the workload record; a cluster check has to put it
+        # on the hit itself, because `workload` is None there and only the
+        # check knows which of its inputs `hit["object"]` names.
+        #
+        # This used to be workload-only, on the premise that "a cluster-scoped
+        # hit has no object whose spec a controller could be holding". That is
+        # false for six of the ten cluster checks -- `inference-endpoint-public`
+        # names a Service, `blocking-pdb` a PodDisruptionBudget,
+        # `hpa-cannot-scale` an HPA, the two RBAC checks a binding or a role,
+        # and `default-sa-automount` a workload it reached without iterating
+        # `collected.workloads`. Cluster-scoped means the check runs once per
+        # cluster, not that its findings name the cluster. The one that cost:
+        # `inference-endpoint-public` on `Service/ai-inference-unsafe`, a manual
+        # finding telling the owner to choose a fix, on an object the Argo CD
+        # Application `workloads-adamparco-gitops` holds. The four checks left
+        # out name a GKE cluster, a node pool, or -- `netpol-missing` -- a
+        # Namespace whose fix is a NetworkPolicy that does not exist yet, where
+        # "a change applied by hand is reverted" would be false.
+        reconciler = (workload or {}).get("reconciler") or hit.get("reconciler")
+        if reconciler:
+            emitted["reconciler"] = reconciler
         return emitted
 
     candidates = []

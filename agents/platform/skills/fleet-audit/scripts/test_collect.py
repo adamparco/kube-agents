@@ -236,6 +236,132 @@ class TestReconcilerOf(unittest.TestCase):
         self.assertIsNone(collect.reconciler_of({"annotations": None, "labels": None}))
 
 
+ARGO_TRACKING = {"argocd.argoproj.io/tracking-id": "workloads-gitops:apps/Deployment:ai/x"}
+ARGO_PHRASE = "the Argo CD Application `workloads-gitops`"
+HELM_MARKERS = {"meta.helm.sh/release-name": "platform", "meta.helm.sh/release-namespace": "infra"}
+HELM_PHRASE = "the Helm release `platform` in infra"
+
+
+def marked(doc, annotations):
+    """`doc` with reconciler markers on it, for a check that must read them."""
+    doc["metadata"].setdefault("annotations", {}).update(annotations)
+    return doc
+
+
+class TestClusterCheckReconcilers(unittest.TestCase):
+    """A cluster-scoped check names the reconciler of the object it reports.
+
+    "Cluster-scoped" means the check runs once per cluster rather than once
+    per workload. It does not mean the finding is about the cluster: six of
+    the ten name an ordinary namespaced object, and until 2026-09-06 `emit`
+    set `reconciler` only when a workload record supplied it, so all six lost
+    the field. What that cost, live: `inference-endpoint-public` on
+    `Service/ai-inference-unsafe`, always `manual` per §3.5, telling the owner
+    to choose a caller range by hand -- on a Service the Argo CD Application
+    `workloads-adamparco-gitops` reasserts on every sync.
+
+    Each test asserts the reconciler of the object in `hit["object"]`, not of
+    whatever else the check had in hand. Two of them had both.
+    """
+
+    def test_a_public_inference_endpoint_names_the_services_reconciler(self):
+        svc = marked(ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["136.70.153.197"]), ARGO_TRACKING)
+        ctx = {"services": [svc], "ai_workloads": [{"ns": "default", "lbl": {"app": "vllm"}}]}
+        hits = collect.check_inference_endpoint_public(ctx)
+        self.assertEqual(hits[0]["object"], "Service/vllm-svc")
+        self.assertEqual(hits[0]["reconciler"], ARGO_PHRASE)
+
+    def test_a_blocking_pdb_names_its_own_reconciler_not_the_workloads(self):
+        """The discrimination that makes this worth a test rather than a
+        one-liner. The check has two objects in hand and reports one of them;
+        naming the Deployment's chart would send the reader to a file that
+        does not contain the field they have to change."""
+        d = deployment("api", **{"spec.replicas": 3})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        marked(d, ARGO_TRACKING)
+        ctx = context_of(
+            pdbs={"default": [marked(pdb("p", max_unavailable=0), HELM_MARKERS)]},
+            workloads=collect.normalize_workloads(dump_of(d)),
+        )
+        hits = collect.check_blocking_pdb(ctx)
+        self.assertEqual(hits[0]["object"], "PodDisruptionBudget/p")
+        self.assertEqual(hits[0]["reconciler"], HELM_PHRASE)
+
+    def test_a_pinned_hpa_names_its_reconciler(self):
+        ctx = context_of(hpas={"default": [marked(hpa("h", min_replicas=3, max_replicas=3), ARGO_TRACKING)]})
+        hits = collect.check_hpa_cannot_scale(ctx)
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertEqual(hits[0]["reconciler"], ARGO_PHRASE)
+
+    def test_a_dangling_hpa_names_its_reconciler(self):
+        """The second arm, separately. They append separate dicts, so the
+        field can be present on one and missing on the other."""
+        dangling = hpa("h", target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "gone"})
+        ctx = context_of(
+            hpas={"default": [marked(dangling, HELM_MARKERS)]},
+            workloads=collect.normalize_workloads(dump_of(deployment("other"))),
+        )
+        hits = collect.check_hpa_cannot_scale(ctx)
+        self.assertEqual(hits[0]["severity"], "minor")
+        self.assertEqual(hits[0]["reconciler"], HELM_PHRASE)
+
+    def test_a_cluster_admin_binding_names_its_reconciler(self):
+        binding = marked(crb("admin-binding", [subject("ServiceAccount", "app", "default")]), ARGO_TRACKING)
+        hits = collect.check_cluster_admin_binding(context_of(clusterrolebindings=[binding]))
+        self.assertEqual(hits[0]["object"], "ClusterRoleBinding/admin-binding")
+        self.assertEqual(hits[0]["reconciler"], ARGO_PHRASE)
+
+    def test_a_wildcard_role_names_the_roles_reconciler_not_the_bindings(self):
+        """The other check holding two objects. The excerpt names the bound
+        principals, which come from the binding; the remediation narrows the
+        rule, which lives on the role."""
+        role = marked(
+            cluster_role("too-broad", [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]),
+            HELM_MARKERS,
+        )
+        binding = marked(
+            role_binding("ClusterRole", "too-broad", [subject("ServiceAccount", "app", "default")]),
+            ARGO_TRACKING,
+        )
+        ctx = context_of(roles=[role], clusterrolebindings=[binding], rolebindings=[])
+        hits = collect.check_wildcard_rbac(ctx)
+        self.assertEqual(hits[0]["object"], "ClusterRole/too-broad")
+        self.assertEqual(hits[0]["reconciler"], HELM_PHRASE)
+
+    def test_default_sa_automount_names_the_workloads_reconciler(self):
+        """A cluster check that nonetheless reports a workload: it walks
+        `context["workloads"]` itself because the ServiceAccount half of the
+        test is a namespace fact, so the per-workload plumbing never reaches
+        it."""
+        d = marked(deployment("api"), ARGO_TRACKING)
+        ctx = context_of(
+            workloads=collect.normalize_workloads(dump_of(d)),
+            serviceaccounts=[{"metadata": {"namespace": "default", "name": "default"}}],
+        )
+        hits = collect.check_default_sa_automount(ctx)
+        self.assertEqual(hits[0]["object"], "Deployment/api")
+        self.assertEqual(hits[0]["reconciler"], ARGO_PHRASE)
+
+    def test_netpol_missing_names_no_reconciler_on_purpose(self):
+        """The deliberate exclusion. The object is a Namespace and the fix is
+        a NetworkPolicy that does not exist yet, so "a change applied by hand
+        is reverted" would be false -- whatever holds the Namespace does not
+        delete a policy created beside it."""
+        ns = marked(namespace("payments"), ARGO_TRACKING)
+        ctx = context_of(
+            namespaces=[ns],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(hits[0]["object"], "Namespace/payments")
+        self.assertIsNone(hits[0].get("reconciler"))
+
+    def test_an_unmarked_object_leaves_the_field_unset(self):
+        ctx = context_of(hpas={"default": [hpa("h", min_replicas=3, max_replicas=3)]})
+        self.assertIsNone(collect.check_hpa_cannot_scale(ctx)[0]["reconciler"])
+
+
 def context_of(dump=None, **overrides):
     """A build_context()-shaped dict with sensible empty defaults, so a test
     that only cares about one cross-reference does not have to construct the
@@ -5055,6 +5181,30 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         self.assertEqual(len(result["commands"]), 6)
         self.assertNotIn("checks_not_applicable", result)
+
+    def test_a_cluster_scoped_candidate_carries_the_reconciler_through_emit(self):
+        """The other half of `TestClusterCheckReconcilers`: the check puts the
+        field on its hit, and `emit` has to copy it onto the candidate. It did
+        not until 2026-09-06 -- the guard read `workload.get("reconciler")`
+        and `workload` is None on this path, so the field the check supplied
+        was dropped between the two."""
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = marked(ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["136.70.153.197"]), ARGO_TRACKING)
+        result = self.run_with(workload_items=[w], service_items=[svc])
+        endpoint = [c for c in result["candidates"] if c["check"] == "inference-endpoint-public"]
+        self.assertEqual(len(endpoint), 1)
+        self.assertEqual(endpoint[0]["reconciler"], ARGO_PHRASE)
+
+    def test_an_unreconciled_endpoint_omits_the_key_rather_than_carrying_none(self):
+        """`disclose_reconciled_manual_remediations` reads the field with a
+        truth test, but the candidate is also what `derive_finding_id` and the
+        ledger diff hash over: a `reconciler: null` key on every unmanaged
+        object is churn in the stored manifest for no reader's benefit."""
+        w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"}, ingress=["136.70.153.197"])
+        result = self.run_with(workload_items=[w], service_items=[svc])
+        endpoint = [c for c in result["candidates"] if c["check"] == "inference-endpoint-public"]
+        self.assertNotIn("reconciler", endpoint[0])
 
     def test_a_dirty_cluster_reports_across_both_sources(self):
         w = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"}, container={"args": ["--trust-remote-code"], "image": "acme/vllm:latest"})
