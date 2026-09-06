@@ -82,6 +82,22 @@ DEFAULT_TIMEOUT_S = 60
 # default connection pool.
 MAX_WORKERS = 8
 
+# Where a GitOps clone keeps the manifests applied to one cluster:
+# `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
+# Copied from `collect.py` rather than imported: every collector in this
+# directory runs standalone under `python3 <file>`, and each one that has
+# needed a constant a sibling also declares has duplicated it (`SYSTEM_NAMESPACES`
+# is the same value in three of them). Keep these three in step with
+# `collect.py`'s if the repository layout moves.
+GITOPS_CLUSTER_TREE_ROOT = "clusters"
+GITOPS_CLUSTER_TREE_DEPTH = 2
+GIT_DIR_NAME = ".git"
+# Config Connector's API group. Its objects are indexed by `audit_report.py`'s
+# `kcc_declarations`, keyed by the GCP resource name `spec.resourceID` can
+# override, so `workload_declarations` skips them rather than resolving a
+# `Cluster/<name>` finding through the wrong table.
+KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+
 # How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
 # match this stream's weekly cadence: every finding is then "this controller
 # has not needed that reservation since the last time we said so", and the
@@ -1950,8 +1966,126 @@ IMPACT = {
 }
 
 
-def _emit(slug: str, hit: dict) -> dict:
-    return {
+def workload_declarations(root: Path) -> dict[tuple[str, str, str, str], set[str]]:
+    """Index the Kubernetes objects a GitOps clone declares, by cluster tree.
+
+    Maps `(cluster, kind, namespace, metadata.name)` to the set of
+    clone-relative paths declaring it — a set, because two files claiming one
+    object is the ambiguity `declaration_for` refuses to resolve rather than
+    guessing between.
+
+    Copied from `collect.py`, which carries the full argument for why this
+    exists at all: the SOPs otherwise tell the *model* to run
+    `grep -rl "name: <object>"` once per finding, and a grep that is kind-blind
+    and unanchored does not decide consistently. What earns the copy here is
+    that this collector already disagrees with itself. In the live fleet's
+    2026-09-06 run it published three `kind: manifest` sizing findings whose
+    paths this index resolves, and two `overrequest` findings marked
+    `kind: manual` — "no pull request is possible" — on
+    `Deployment/ai-inference-hardened` and `Deployment/ai-inference-unsafe`,
+    both of which it also resolves, in the same repository, on the same run.
+    A shrunk `resources.requests` is the most mechanical manifest edit this
+    audit produces; leaving it `manual` for want of a file path costs a PR
+    that needs no fact from outside the file.
+
+    Returns `{}` when PyYAML is absent or the clone is unreadable, which leaves
+    every candidate unannotated and the SOP's grep as the only answer -- the
+    behaviour that shipped before this existed.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
+    except ImportError:
+        return {}
+
+    index: dict[tuple[str, str, str, str], set[str]] = {}
+    try:
+        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
+    except OSError:
+        return {}
+    for path in paths:
+        # `.git` holds packed objects, not manifests, and rglob walks into it.
+        if GIT_DIR_NAME in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            # A file this collector cannot parse is one it cannot make a claim
+            # about. Skipping leaves those findings unannotated.
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        parts = relative.parts
+        # Only a file under `clusters/<name>/` is applied to a known cluster.
+        # Anything else -- `gcp/`, `bootstrap/`, the repo root -- is either a
+        # Config Connector resource this index skips or hub infrastructure no
+        # per-cluster finding should resolve to, so it is indexed under no
+        # cluster and can never match: `declaration_for` requires the cluster.
+        if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
+            continue
+        cluster = parts[1]
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            api = str(doc.get("apiVersion") or "")
+            kind = str(doc.get("kind") or "")
+            if not kind or KCC_API_GROUP_SUFFIX in api:
+                continue
+            meta = doc.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            name = str(meta.get("name") or "")
+            namespace = str(meta.get("namespace") or "")
+            if not name or not namespace:
+                continue
+            index.setdefault((cluster, kind, namespace, name), set()).add(str(relative))
+    return index
+
+
+def declaration_for(
+    index: dict[tuple[str, str, str, str], set[str]],
+    cluster: str,
+    namespace: str,
+    obj: str,
+) -> dict | None:
+    """Where the GitOps repo declares one candidate's object, or `None`.
+
+    `None` means unannotated — no claim either way — and is what an absent
+    index, an object outside `Kind/name` form, or a genuine miss all return.
+    A hit carries `path` (the declaration itself, for a remediation that
+    *changes* the object, which every sizing finding here is) and `directory`
+    (its parent, for one that *creates* a sibling beside it).
+
+    The match is exact on all four of cluster, kind, namespace and name; see
+    `collect.py`'s copy for why every looser arm was measured and dropped.
+    """
+    kind, _, name = obj.partition("/")
+    if not kind or not name or not cluster or not namespace:
+        return None
+    paths = index.get((cluster, kind, namespace, name))
+    if not paths or len(paths) > 1:
+        # Two files declaring one object is a duplicate resource id that Argo
+        # and Config Sync both reject; picking one would name the wrong file
+        # half the time. Say nothing and let the SOP's `manual` branch hold.
+        return None
+    path = next(iter(paths))
+    parent = str(Path(path).parent)
+    return {"path": path, "directory": parent}
+
+
+def _emit(slug: str, hit: dict, *, cluster: str = "", declarations: dict | None = None) -> dict:
+    """One candidate. `declarations` annotates it with the file that declares
+    its object, when the run was given a `--workspace` and the index resolves
+    it; `cluster` is the tree that index is keyed by, so both are needed or
+    neither. The project-scoped compute checks pass neither: a disk, a reserved
+    address and a forwarding rule are GCP resources with no cluster tree and no
+    namespace, so there is nothing for this index to key on."""
+    candidate = {
         "check": slug,
         "namespace": hit.get("namespace", ""),
         "object": hit["object"],
@@ -1960,6 +2094,11 @@ def _emit(slug: str, hit: dict) -> dict:
         "impact": IMPACT[slug],
         "needs_triage": None,
     }
+    if declarations:
+        found = declaration_for(declarations, cluster, candidate["namespace"], candidate["object"])
+        if found:
+            candidate["declaration"] = found
+    return candidate
 
 
 def _fleet_facts(context: dict) -> dict:
@@ -2042,7 +2181,7 @@ def _metrics_gap_phrase(result: Run, read: str) -> str:
     )
 
 
-def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime) -> tuple[dict, dict]:
+def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime, declarations: dict | None = None) -> tuple[dict, dict]:
     """Returns `(manifest_entry, fleet_facts)` — the second only populated
     when the object dump succeeded; `collect_fleet` unions it across every
     cluster before running the project-scoped checks that need it."""
@@ -2051,6 +2190,13 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # every shape below: the mode does not stop being true because this run
     # failed to read inside the cluster.
     mode = {"autopilot": bool(cluster.get("autopilot"))}
+
+    def emit(slug: str, hit: dict) -> dict:
+        """`_emit` with this cluster's declaration index bound. Every candidate
+        below goes through it, so a check added later is annotated by default
+        rather than by remembering to ask."""
+        return _emit(slug, hit, cluster=name, declarations=declarations)
+
     empty_facts = empty_fleet_facts()
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
@@ -2096,10 +2242,10 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     commands = {
         "orphan-pv": dump_record, "unconsumed-pvc": dump_record, "terminal-pods": dump_record, "idle-namespace": dump_record,
     }
-    candidates += [_emit("orphan-pv", h) for h in check_orphan_pv(context, now=now)]
-    candidates += [_emit("unconsumed-pvc", h) for h in check_unconsumed_pvc(context, now=now)]
-    candidates += [_emit("terminal-pods", h) for h in check_terminal_pods(context, now=now)]
-    candidates += [_emit("idle-namespace", h) for h in check_idle_namespace(context, now=now)]
+    candidates += [emit("orphan-pv", h) for h in check_orphan_pv(context, now=now)]
+    candidates += [emit("unconsumed-pvc", h) for h in check_unconsumed_pvc(context, now=now)]
+    candidates += [emit("terminal-pods", h) for h in check_terminal_pods(context, now=now)]
+    candidates += [emit("idle-namespace", h) for h in check_idle_namespace(context, now=now)]
 
     # Autopilot owns its node pools, so 3.7/3.8 are inapplicable there. Only a
     # Standard cluster owes them, so only a Standard cluster can be short of
@@ -2159,8 +2305,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             commands["idle-nodepool"] = pools_record
             commands["scaledown-blocked"] = dump_record
             idle_pool_hits = check_idle_nodepool(context, node_pools, now=now)
-            candidates += [_emit("idle-nodepool", h) for h in idle_pool_hits]
-            candidates += [_emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
+            candidates += [emit("idle-nodepool", h) for h in idle_pool_hits]
+            candidates += [emit("scaledown-blocked", h) for h in check_scaledown_blocked(context, idle_pool_hits)]
     else:
         not_applicable += [
             {
@@ -2178,14 +2324,14 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         commands["overrequest"] = usage_record
         commands["unsized-workload"] = usage_record
         for hit in check_overrequest(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot"))):
-            emitted = _emit("overrequest", hit)
+            emitted = emit("overrequest", hit)
             if hit.get("_guaranteed"):
                 emitted["needs_triage"] = "guaranteed-qos"
             candidates.append(emitted)
         # Same peak read, the complementary population: 3.1 sizes the
         # controllers that declared a request, 3.12 the ones that did not.
         candidates += [
-            _emit("unsized-workload", h)
+            emit("unsized-workload", h)
             for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
         ]
     elif not context["nodes"] and usage_result.rc == 0:
@@ -2248,7 +2394,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
 
     if means_ok:
         commands["underrequest"] = means_record
-        candidates += [_emit("underrequest", h) for h in check_underrequest(context, usage_peaks, memory_means, now=now)]
+        candidates += [emit("underrequest", h) for h in check_underrequest(context, usage_peaks, memory_means, now=now)]
     elif not context["nodes"] and means_result.rc == 0:
         # Same vacuum as `overrequest`'s arm above, read the other way round: a
         # cluster with no nodes has nothing scheduled, so no pod can be sitting
@@ -2634,7 +2780,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     return entry
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -2688,9 +2834,14 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
                 }
             )
 
+    # Built once for the whole fleet, before the pool: every cluster's
+    # candidates resolve against the same clone, and walking it per cluster
+    # would read the same tree sixteen times to get the same answer.
+    declarations = workload_declarations(workspace) if workspace else {}
+
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
-        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now): i for i, c in enumerate(clusters)}
+        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now, declarations=declarations): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
             index = futures[future]
             try:
@@ -2752,8 +2903,27 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    parser.add_argument(
+        "--workspace",
+        help=(
+            "the GitOps clone `audit_report.py start` made, so each candidate "
+            "carries where the repository declares its object; omit and no "
+            "candidate is annotated"
+        ),
+    )
     args = parser.parse_args(argv)
-    manifest = collect_fleet(args.project)
+    workspace = Path(args.workspace) if args.workspace else None
+    if workspace is not None and not workspace.is_dir():
+        # Loud, and not fatal. A typo here would otherwise annotate nothing and
+        # read exactly like a repository that declares none of the fleet, which
+        # is the answer that sends every finding to `manual`.
+        print(
+            f"fleet_waste.py: --workspace {str(workspace)!r} is not a directory; "
+            "no candidate will carry a declaration",
+            file=sys.stderr,
+        )
+        workspace = None
+    manifest = collect_fleet(args.project, workspace=workspace)
     print(json.dumps(manifest, indent=2))
     return 0
 

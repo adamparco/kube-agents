@@ -3249,5 +3249,191 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             audit_report.cross_check_manifest(data, manifest)
 
 
+class DeclarationIndexIsACopyTest(unittest.TestCase):
+    """`workload_declarations` and `declaration_for` are duplicated from
+    `collect.py`, because every collector here runs standalone under
+    `python3 <file>` and none imports a sibling.
+
+    Duplication is the convention, and drift is what it costs: two collectors
+    resolving the same object to different files, or one of them keeping a bug
+    the other fixed, with nothing failing to say so. These tests are the guard
+    the convention does not otherwise have -- they compare the executable code
+    and ignore the docstrings, which differ on purpose because each copy argues
+    from the findings its own stream published.
+    """
+
+    def bodies(self, name):
+        """Both copies of one function, as ASTs with the docstring dropped."""
+        import ast
+        import importlib
+        import inspect
+        import textwrap
+
+        out = []
+        for module in (fw, importlib.import_module("collect")):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(module, name))))
+            fn = tree.body[0]
+            if (
+                fn.body
+                and isinstance(fn.body[0], ast.Expr)
+                and isinstance(fn.body[0].value, ast.Constant)
+                and isinstance(fn.body[0].value.value, str)
+            ):
+                fn.body = fn.body[1:]
+            out.append(ast.dump(fn))
+        return out
+
+    def test_workload_declarations_matches_collect_py(self):
+        mine, theirs = self.bodies("workload_declarations")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
+    def test_declaration_for_matches_collect_py(self):
+        mine, theirs = self.bodies("declaration_for")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
+    def test_the_constants_it_reads_match_too(self):
+        """An identical function over a different constant is a different
+        function. `GITOPS_CLUSTER_TREE_DEPTH` in particular decides which files
+        are indexed at all, so a copy that drifted here would index the whole
+        repository or none of it and still pass the two tests above.
+        """
+        import importlib
+
+        collect = importlib.import_module("collect")
+        for const in ("GITOPS_CLUSTER_TREE_ROOT", "GITOPS_CLUSTER_TREE_DEPTH", "GIT_DIR_NAME", "KCC_API_GROUP_SUFFIX"):
+            with self.subTest(const=const):
+                self.assertEqual(getattr(fw, const), getattr(collect, const))
+
+
+class CandidatesCarryTheirDeclarationTest(unittest.TestCase):
+    """The annotation has to reach the candidate, or the model never sees it.
+
+    The index itself is `collect.py`'s, and tested there. What is new here is
+    the trip to a *cost* candidate: the index is built in `collect_fleet`,
+    handed across a thread pool to `collect_cluster`, and attached in the
+    `emit` closure. A break at any of those three joints leaves the index
+    correct and every candidate unannotated -- indistinguishable, from the
+    model's side, from a fleet whose objects are genuinely undeclared, and the
+    answer that sends a shrinkable request to `kind: manual`.
+    """
+
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    DECLARED = "clusters/prod-usc1/workloads/data.yaml"
+
+    def clone(self, tmp):
+        """A GitOps tree declaring PersistentVolumeClaim/data, and nothing else.
+
+        `scratch` is deliberately absent, so one run covers both arms: a change
+        that annotates unconditionally fails here rather than passing a test
+        that only ever looks at declared objects.
+        """
+        path = Path(tmp) / "infra"
+        (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+        (path / self.DECLARED).write_text(
+            "apiVersion: v1\n"
+            "kind: PersistentVolumeClaim\n"
+            "metadata:\n"
+            "  name: data\n"
+            "  namespace: default\n"
+        )
+        return path
+
+    def pvc(self, name):
+        """Bound, unreferenced, 212 days old — one `unconsumed-pvc` candidate."""
+        return obj(
+            "PersistentVolumeClaim", name, ns="default",
+            **{"status.phase": "Bound", "status.capacity": {"storage": "10Gi"}},
+        )
+
+    def fleet(self, tmp, *, workspace):
+        """`collect_fleet` over one cluster holding two unconsumed PVCs."""
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(self.pvc("data"), self.pvc("scratch"))))
+            if argv[:2] == ["gcloud", "compute"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            return fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW, workspace=workspace)
+
+    def candidates(self, manifest):
+        return [c for cluster in manifest["clusters"] for c in cluster.get("candidates") or []]
+
+    def by_object(self, manifest, name):
+        return [c for c in self.candidates(manifest) if c["object"] == f"PersistentVolumeClaim/{name}"]
+
+    def test_a_declared_object_carries_its_path_and_directory(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, workspace=self.clone(tmp))
+
+        declared = self.by_object(manifest, "data")
+        undeclared = self.by_object(manifest, "scratch")
+        # Guard the guard: two empty lists would satisfy every assertion below.
+        self.assertTrue(declared, "no candidate for the declared object")
+        self.assertTrue(undeclared, "no candidate for the undeclared object")
+
+        for candidate in declared:
+            self.assertEqual(
+                candidate["declaration"],
+                {"path": self.DECLARED, "directory": "clusters/prod-usc1/workloads"},
+                candidate["check"],
+            )
+        # `scratch` is in the same dump, same cluster, same namespace, and
+        # differs only in being absent from the clone.
+        for candidate in undeclared:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_the_path_is_relative_to_the_clone_not_the_filesystem(self):
+        """What ships is what a PR branch has to check out. An absolute path
+        leaks the agent's scratch directory into the ledger and names a file
+        the GitOps repository does not contain."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, workspace=self.clone(tmp))
+            path = self.by_object(manifest, "data")[0]["declaration"]["path"]
+            self.assertNotIn(tmp, path)
+        self.assertFalse(Path(path).is_absolute())
+
+    def test_without_a_workspace_nothing_is_annotated(self):
+        """Omitting `--workspace` has to stay the no-op it was before this flag
+        existed, on a run that actually produces candidates."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, workspace=None)
+        candidates = self.candidates(manifest)
+        self.assertTrue(candidates, "the fixture produced no candidates to check")
+        for candidate in candidates:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_a_workspace_that_declares_nothing_annotates_nothing(self):
+        """An empty clone is not an error and must not be a wrong answer: an
+        absent annotation is not a claim that no declaration exists, so the
+        SOP's grep fallback still holds."""
+        with TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            manifest = self.fleet(tmp, workspace=empty)
+        candidates = self.candidates(manifest)
+        self.assertTrue(candidates, "the fixture produced no candidates to check")
+        for candidate in candidates:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_a_project_scoped_candidate_is_never_annotated(self):
+        """A disk, a reserved address and a forwarding rule are GCP resources
+        with no cluster tree and no namespace, so there is nothing for this
+        index to key on -- those three checks call `_emit` directly, and this
+        pins that they keep doing so. Annotating one would name a Kubernetes
+        manifest as the place to delete a persistent disk.
+        """
+        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
+        self.assertNotIn("declaration", fw._emit("unattached-disk", hit))
+        # Even handed an index that resolves it, the call signature cannot.
+        index = {("prod-usc1", "Disk", "default", "orphaned-pd"): {"clusters/prod-usc1/x.yaml"}}
+        self.assertNotIn("declaration", fw._emit("unattached-disk", hit, declarations=index))
+
+
 if __name__ == "__main__":
     unittest.main()
