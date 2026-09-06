@@ -21,7 +21,7 @@ Invoked by the `compliance-audit` watchdog.
 
 ### `obtainability_audit_sop.md`
 
-Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Fifteen checks, mostly over workload **templates** rather than live Pods: missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking PDBs, unscaled and unscalable Deployments, hostname and single-zone pinning, missing spreading, missing readiness and liveness probes, single-replica Service-backed Deployments, containers with no `preStop` hook behind a Service, and update strategies that take every replica down at once. Two read CronJob `status` instead: a schedule that has stopped succeeding, and one whose runs outlast the interval they fire on.
+Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Sixteen checks, mostly over workload **templates** rather than live Pods: missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking PDBs, unscaled and unscalable Deployments, hostname and single-zone pinning, missing spreading, missing readiness and liveness probes, single-replica Service-backed Deployments, containers with no `preStop` hook behind a Service, and update strategies that take every replica down at once. Two read CronJob `status` instead: a schedule that has stopped succeeding, and one whose runs outlast the interval they fire on. One reads EndpointSlices: a Service whose selector matches no pod, which resolves in DNS and refuses every connection while reporting nothing wrong.
 
 Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 

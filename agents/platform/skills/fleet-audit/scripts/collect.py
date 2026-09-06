@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete fifteen-check roster
-(§3.1–§3.15 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete sixteen-check roster
+(§3.1–§3.16 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete twelve-check roster (§2.1–§2.12 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -299,6 +299,13 @@ DUMP_COMMAND_KINDS = (
     # exactly one caller, `_collect_obtainability`, so no other stream pays for
     # them either.
     ",cronjobs,jobs"
+    # `endpointslices` serves 3.16 alone, and is here rather than as a second
+    # read because it is the cheapest kind in this list: the controller writes
+    # one small object per Service, so the dump grows by roughly what
+    # `services` already costs. Pods would answer the same question and are
+    # deliberately not dumped -- they are the largest kind in any cluster, and
+    # 3.16 needs the endpoint count rather than the pods behind it.
+    ",endpointslices"
 )
 
 # How long a CronJob must have been firing without a success before 3.12 calls
@@ -694,6 +701,129 @@ def cronjobs_with_jobs(dump: dict) -> list[dict]:
     return out
 
 
+# Each EndpointSlice names the Service it belongs to in this label; it is how
+# the controller groups slices, and it is the whole join.
+ENDPOINTSLICE_SERVICE_LABEL = "kubernetes.io/service-name"
+
+# A Service of one of these types has an address published outside the
+# cluster, so one that resolves to nothing is a black hole something external
+# is already pointed at rather than a broken in-cluster reference.
+EXTERNAL_SERVICE_TYPES = frozenset({"LoadBalancer", "NodePort"})
+
+# `ExternalName` is a DNS alias with no selector and no endpoints, so it is not
+# a Service that can select nothing. Headless Services (`clusterIP: None`) are
+# not excluded: they select pods and resolve to their addresses like any other,
+# and a headless Service selecting nothing breaks its clients the same way.
+EXTERNALNAME_SERVICE_TYPE = "ExternalName"
+
+# `spec.type` defaults to this and is therefore usually unstated, so an excerpt
+# that just echoed the field would read `type=None` on most Services.
+DEFAULT_SERVICE_TYPE = "ClusterIP"
+
+
+def services_with_endpoints(dump: dict) -> list[dict]:
+    """Every non-system, pod-selecting Service paired with what its
+    EndpointSlices actually resolve to.
+
+    EndpointSlice rather than the v1 Endpoints API, which is deprecated from
+    Kubernetes 1.33 — a check written against a deprecated kind acquires an
+    expiry date on the day it ships. Each slice names its Service in a label,
+    so the join is a lookup rather than a walk of `subsets`.
+
+    Joined here for the reason `cronjobs_with_jobs` is: done inside the check,
+    the dump would be walked once per Service, which is quadratic in a
+    namespace holding hundreds of them.
+
+    Terminating endpoints are not counted. A pod being drained during a rollout
+    is still listed in the slice, with `conditions.terminating` set, and
+    counting it would make this check read a routine rollout as healthy at the
+    exact moment it is not — and, worse, would let a Service that genuinely
+    resolves to nothing look fine for as long as one old pod takes to go away.
+
+    S1, S2 and S4 are applied, as for CronJobs. S3 is not: an operator-owned
+    Service black-holes traffic exactly like a hand-written one, and
+    `reconciler` is what tells the reader the fix belongs in the operator's
+    chart rather than in the cluster's tree. S5 has no meaning for a Service,
+    which has no replicas — the workload behind it does, and that is
+    `zeroed_by` below rather than an exclusion here.
+    """
+    slices_by_service: dict[tuple[str, str], list[dict]] = {}
+    for item in dump.get("items", []) or []:
+        if item.get("kind") != "EndpointSlice":
+            continue
+        meta = item.get("metadata") or {}
+        owner = (meta.get("labels") or {}).get(ENDPOINTSLICE_SERVICE_LABEL)
+        if not owner:
+            continue
+        slices_by_service.setdefault((meta.get("namespace", ""), owner), []).append(item)
+
+    out = []
+    for item in dump.get("items", []) or []:
+        if item.get("kind") != "Service":
+            continue
+        meta = item.get("metadata") or {}
+        ns = meta.get("namespace", "")
+        if _is_system_namespace(ns):  # S1
+            continue
+        labels = meta.get("labels") or {}
+        annotations = meta.get("annotations") or {}
+        if "addonmanager.kubernetes.io/mode" in labels:  # S2
+            continue
+        if labels.get(OPT_OUT_KEY) == "exempt" or annotations.get(OPT_OUT_KEY) == "exempt":  # S4
+            continue
+        spec = item.get("spec") or {}
+        selector = spec.get("selector") or {}
+        # No selector at all means the endpoints are managed by hand -- the
+        # sanctioned way to point a Service at an address outside the cluster.
+        # There is nothing to select, so nothing to select wrongly.
+        if not selector or spec.get("type") == EXTERNALNAME_SERVICE_TYPE:
+            continue
+        name = meta.get("name", "")
+        live = 0
+        for slice_ in slices_by_service.get((ns, name), []):
+            for endpoint in slice_.get("endpoints") or []:
+                conditions = endpoint.get("conditions") or {}
+                if conditions.get("terminating"):
+                    continue
+                live += 1
+        out.append(
+            {
+                "service": item,
+                "ns": ns,
+                "name": name,
+                "selector": selector,
+                "endpoints": live,
+                "zeroed_by": _selector_matches_a_zeroed_workload(dump, ns, selector),
+            }
+        )
+    return out
+
+
+def _selector_matches_a_zeroed_workload(dump: dict, ns: str, selector: dict) -> str | None:
+    """`Kind/name` of a workload this selector matches that is scaled to zero.
+
+    A Service with no endpoints because its only backend is deliberately at
+    `replicas: 0` is not broken, and this is the only way to tell that apart
+    from a selector that matches nothing at all. It reads the dump rather than
+    the audited workload set on purpose: S5 drops zeroed workloads from that
+    set, so asking it would return nothing and every scaled-down Service in
+    the fleet would be reported as a black hole.
+    """
+    for item in dump.get("items", []) or []:
+        if item.get("kind") not in WORKLOAD_KINDS:
+            continue
+        meta = item.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        spec = item.get("spec") or {}
+        if spec.get("replicas") != 0:
+            continue
+        pod_labels = ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
+        if selector_matches({"matchLabels": selector}, pod_labels):
+            return f"{item['kind']}/{meta.get('name', '')}"
+    return None
+
+
 def build_context(dump: dict, workloads: list[dict]) -> dict:
     return {
         "limitranges": limitranges_by_namespace(dump),
@@ -701,6 +831,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "hpas": hpas_by_namespace(dump),
         "services": services_by_namespace(dump),
         "cronjobs": cronjobs_with_jobs(dump),
+        "service_endpoints": services_with_endpoints(dump),
         "workloads": workloads,
         "workload_keys": workload_keys(dump),
     }
@@ -1762,6 +1893,60 @@ def check_cronjob_runs_overlap(context: dict) -> list[dict]:
                     "so a run is still going when the next one starts"
                 ),
                 "reconciler": reconciler_of(cronjob.get("metadata") or {}),
+            }
+        )
+    return hits
+
+
+def check_service_selects_nothing(context: dict) -> list[dict]:
+    """Cluster-scoped: a Service whose selector matches no running pod.
+
+    A Service is a label query, and nothing validates that the query matches
+    anything. Rename a Deployment's pod labels, move a workload to another
+    namespace, typo a value in a values file -- the Service still admits, still
+    gets a ClusterIP, still resolves in DNS, and every request to it fails with
+    a connection refused that names the Service rather than the workload that
+    is no longer behind it. There is no event, no condition, and no status
+    field that says so; the object looks identical to a healthy one.
+
+    Read off EndpointSlices, which is the controller's own answer to "what does
+    this selector currently match" -- so a hit is what the cluster resolved,
+    not what this script thinks the selector should match. Terminating
+    endpoints do not count, per `services_with_endpoints`.
+
+    A Service pointing at a workload deliberately parked at `replicas: 0` has
+    no endpoints and is not broken, so it is excluded by name rather than by
+    guess: `zeroed_by` carries the workload that explains it.
+
+    Severity splits on whether the address is published outside the cluster. A
+    LoadBalancer or NodePort with no backends is a black hole with a public
+    address on it, and whatever is pointed at that address -- DNS, a CDN
+    origin, a partner's allowlist -- is already failing. A ClusterIP with no
+    backends breaks its in-cluster callers, which is bad but bounded by who
+    knows the name.
+    """
+    hits = []
+    for entry in context["service_endpoints"]:
+        if entry["endpoints"] or entry["zeroed_by"]:
+            continue
+        service = entry["service"]
+        spec = service.get("spec") or {}
+        svc_type = spec.get("type") or DEFAULT_SERVICE_TYPE
+        selector = ",".join(f"{k}={v}" for k, v in sorted(entry["selector"].items()))
+        ports = ",".join(
+            str(p.get("port", "")) for p in spec.get("ports") or []
+        )
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"Service/{entry['name']}",
+                "severity": "critical" if svc_type in EXTERNAL_SERVICE_TYPES else "major",
+                "excerpt": (
+                    f"type={svc_type} port(s)={ports or 'none'} selector={selector!r}; "
+                    "the EndpointSlices for this Service list no ready, non-terminating "
+                    "address, so every request to it is refused"
+                ),
+                "reconciler": reconciler_of(service.get("metadata") or {}),
             }
         )
     return hits
@@ -3996,6 +4181,17 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "Runs of this schedule are piling up on each other: each period starts "
         "another copy without the last one having finished, so the load on "
         "whatever the job writes to grows until something there gives out.",
+    ),
+    CheckSpec(
+        "service-selects-nothing",
+        "cluster",
+        check_service_selects_nothing,
+        "major",
+        None,
+        "This Service resolves to no pod, so every caller that reaches it -- by "
+        "DNS name, by cluster IP, or through whatever is pointed at its "
+        "external address -- has its connection refused. The Service object "
+        "itself stays healthy, which is why nothing has reported this.",
     ),
 )
 

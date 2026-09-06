@@ -372,6 +372,7 @@ def context_of(dump=None, **overrides):
         "hpas": {},
         "services": {},
         "cronjobs": [],
+        "service_endpoints": [],
         "workloads": [],
         "workload_keys": set(),
         "pod_namespaces": set(),
@@ -384,6 +385,7 @@ def context_of(dump=None, **overrides):
             hpas=collect.hpas_by_namespace(dump),
             services=collect.services_by_namespace(dump),
             cronjobs=collect.cronjobs_with_jobs(dump),
+            service_endpoints=collect.services_with_endpoints(dump),
             workloads=collect.normalize_workloads(dump),
             workload_keys=collect.workload_keys(dump),
         )
@@ -2133,6 +2135,136 @@ class TestCronjobRunsOverlap(unittest.TestCase):
         self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
 
 
+def endpointslice(service_name, ns="default", addresses=1, terminating=0):
+    """An EndpointSlice with `addresses` ready endpoints and `terminating`
+    endpoints on their way out."""
+    endpoints = [{"addresses": [f"10.0.0.{i}"]} for i in range(addresses)]
+    endpoints += [
+        {"addresses": [f"10.0.1.{i}"], "conditions": {"terminating": True}}
+        for i in range(terminating)
+    ]
+    return {
+        "kind": "EndpointSlice",
+        "metadata": {
+            "namespace": ns,
+            "name": f"{service_name}-abcde",
+            "labels": {collect.ENDPOINTSLICE_SERVICE_LABEL: service_name},
+        },
+        "endpoints": endpoints,
+    }
+
+
+class TestServiceSelectsNothing(unittest.TestCase):
+    """§3.16. A Service is an unvalidated label query, and one that matches
+    nothing looks exactly like one that matches everything."""
+
+    def hits(self, *items):
+        return collect.check_service_selects_nothing(context_of(dump_of(*items)))
+
+    def svc(self, **kwargs):
+        kwargs.setdefault("selector", {"app": "api"})
+        return service("api", **kwargs)
+
+    def test_a_selector_matching_nothing_is_flagged(self):
+        hits = self.hits(self.svc())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Service/api")
+        self.assertEqual(hits[0]["namespace"], "default")
+
+    def test_a_service_with_endpoints_is_never_flagged(self):
+        self.assertEqual(self.hits(self.svc(), endpointslice("api")), [])
+
+    def test_only_terminating_endpoints_still_counts_as_nothing(self):
+        # A drained pod is still listed until it goes away, so counting it
+        # would let a Service that genuinely resolves to nothing read healthy
+        # for as long as the last old pod lingers.
+        self.assertEqual(len(self.hits(self.svc(), endpointslice("api", addresses=0, terminating=2))), 1)
+
+    def test_one_live_endpoint_beside_terminating_ones_is_enough(self):
+        self.assertEqual(self.hits(self.svc(), endpointslice("api", addresses=1, terminating=2)), [])
+
+    def test_slices_are_joined_by_name_and_namespace(self):
+        # Same Service name in another namespace must not answer for this one.
+        self.assertEqual(len(self.hits(self.svc(), endpointslice("api", ns="other"))), 1)
+
+    def test_a_service_with_no_selector_is_never_flagged(self):
+        # Hand-managed endpoints are the sanctioned way to point at an address
+        # outside the cluster; there is no query to be wrong.
+        self.assertEqual(self.hits(service("api")), [])
+
+    def test_an_externalname_service_is_never_flagged(self):
+        self.assertEqual(
+            self.hits(service("api", selector={"app": "api"}, svc_type="ExternalName")), []
+        )
+
+    def test_a_backend_deliberately_scaled_to_zero_excuses_it(self):
+        # Not broken, parked. S5 drops zeroed workloads from the audited set,
+        # so this has to read the dump or every scaled-down Service in the
+        # fleet is reported as a black hole.
+        parked = deployment("api", **{"spec.replicas": 0})
+        parked["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        self.assertEqual(self.hits(self.svc(), parked), [])
+
+    def test_a_running_backend_that_the_selector_misses_is_still_flagged(self):
+        # The whole failure mode: a workload is there, the labels do not match,
+        # and nothing in the cluster says so.
+        running = deployment("api", **{"spec.replicas": 2})
+        running["spec"]["template"]["metadata"] = {"labels": {"app": "api-v2"}}
+        self.assertEqual(len(self.hits(self.svc(), running)), 1)
+
+    def test_a_zeroed_workload_in_another_namespace_does_not_excuse_it(self):
+        parked = deployment("api", ns="other", **{"spec.replicas": 0})
+        parked["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        self.assertEqual(len(self.hits(self.svc(), parked)), 1)
+
+    def test_an_externally_published_service_is_critical(self):
+        for svc_type in ("LoadBalancer", "NodePort"):
+            with self.subTest(svc_type=svc_type):
+                self.assertEqual(self.hits(self.svc(svc_type=svc_type))[0]["severity"], "critical")
+
+    def test_a_clusterip_service_is_major(self):
+        self.assertEqual(self.hits(self.svc())[0]["severity"], "major")
+
+    def test_the_excerpt_carries_the_selector_the_type_and_the_ports(self):
+        # The remediation is an edit to one of those three fields, so the
+        # finding shows all of them rather than sending the reader to `kubectl`.
+        excerpt = self.hits(self.svc(svc_type="LoadBalancer", ports=[{"port": 80}]))[0]["excerpt"]
+        self.assertIn("type=LoadBalancer", excerpt)
+        self.assertIn("port(s)=80", excerpt)
+        self.assertIn("'app=api'", excerpt)
+
+    def test_an_unstated_type_reads_as_clusterip(self):
+        bare = {"kind": "Service", "metadata": {"namespace": "default", "name": "api"}, "spec": {"selector": {"app": "api"}}}
+        self.assertIn("type=ClusterIP", self.hits(bare)[0]["excerpt"])
+
+    def test_the_standard_exclusions_apply(self):
+        self.assertEqual(self.hits(self.svc(ns="kube-system")), [])
+        exempt = self.svc()
+        exempt["metadata"]["labels"] = {collect.OPT_OUT_KEY: "exempt"}
+        self.assertEqual(self.hits(exempt), [])
+        annotated = self.svc()
+        annotated["metadata"]["annotations"] = {collect.OPT_OUT_KEY: "exempt"}
+        self.assertEqual(self.hits(annotated), [])
+        addon = self.svc()
+        addon["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        self.assertEqual(self.hits(addon), [])
+
+    def test_the_finding_names_what_reconciles_the_service(self):
+        helm = self.svc()
+        helm["metadata"]["annotations"] = {
+            "meta.helm.sh/release-name": "kube-agents",
+            "meta.helm.sh/release-namespace": "kubeagents-system",
+        }
+        self.assertIn("kube-agents", self.hits(helm)[0]["reconciler"])
+
+    def test_a_headless_service_is_treated_like_any_other(self):
+        # `clusterIP: None` still selects pods and still resolves to their
+        # addresses, so one selecting nothing breaks its clients the same way.
+        headless = self.svc()
+        headless["spec"]["clusterIP"] = "None"
+        self.assertEqual(len(self.hits(headless)), 1)
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -2300,15 +2432,22 @@ class TestCollectCluster(unittest.TestCase):
         workload_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind == "workload"}
         self.assertEqual(set(na), workload_slugs)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
-        # that no longer exists, a PDB nothing can satisfy, and a CronJob that
-        # has stopped succeeding or whose runs overlap are all still true of a
-        # cluster whose *workload* set is empty. 3.12 and 3.15 in particular
-        # are only ever reachable this way -- a CronJob is not a workload, so a
-        # cluster that holds nothing else still owes both checks an answer.
+        # that no longer exists, a PDB nothing can satisfy, a CronJob that has
+        # stopped succeeding or whose runs overlap, and a Service selecting no
+        # pod are all still true of a cluster whose *workload* set is empty.
+        # 3.12, 3.15 and 3.16 in particular are only ever reachable this way --
+        # neither a CronJob nor a Service is a workload, so a cluster that
+        # holds nothing else still owes all three an answer.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
         self.assertEqual(
             cluster_slugs,
-            {"hpa-cannot-scale", "blocking-pdb", "schedule-never-succeeds", "cronjob-runs-overlap"},
+            {
+                "hpa-cannot-scale",
+                "blocking-pdb",
+                "schedule-never-succeeds",
+                "cronjob-runs-overlap",
+                "service-selects-nothing",
+            },
         )
         self.assertFalse(cluster_slugs & set(na))
         # §6 reads `commands` as the list of checks that ran, so a slug cannot
