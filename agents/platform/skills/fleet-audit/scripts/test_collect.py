@@ -4393,11 +4393,64 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("declares no GCP resources", reason)
         self.assertNotIn("not installed", reason)
 
+    def test_a_timed_out_gcp_read_is_undetermined_not_absence(self):
+        """The live defect, 2026-09-06, on the first day this check shipped.
+
+        `kubectl get gcp -A` is a *category* read: it expands to every CRD
+        Config Connector installs -- 221 on this fleet's hub -- and lists
+        against each. That makes it slow precisely where Config Connector is
+        installed and instant everywhere else, so the cluster the check exists
+        for is the only one that can time out. It did, at 60s under the
+        parallel sweep, and `rc != 0` sent it down the not-installed arm: the
+        ledger published "Config Connector is not installed on this cluster"
+        about the one cluster in the fleet running Config Connector, and cited
+        exit 124 as the API server's answer for a type it does not serve. 124
+        is this collector's own marker for having given up.
+        """
+        result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        reason = self.kcc_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("did not finish", reason)
+        self.assertIn("cleared nothing", reason)
+        self.assertNotIn("not installed", reason)
+        # The false claim's own words, so a reintroduction fails here rather
+        # than in a report.
+        self.assertNotIn("does not serve", reason)
+
+    def test_the_gcp_read_gets_the_longer_timeout_and_the_others_do_not(self):
+        """A truthful `Undetermined` still leaves the check having never run on
+        the only cluster it can apply to, so the timeout is the other half of
+        the fix. Asserted per-read, because `run_and_gate` takes a default and
+        the whole defect was one read needing something other than it."""
+        seen = {}
+
+        def record(argv, **kwargs):
+            seen["kcc"] = kwargs.get("timeout")
+            return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.05)
+
+        original = collect.run_and_gate
+        observed = []
+
+        def spy(argv, kubeconfig, **kwargs):
+            observed.append((argv[2] if argv[:2] == ["kubectl", "get"] else argv[0], kwargs.get("timeout")))
+            return original(argv, kubeconfig, **kwargs)
+
+        with patch.object(collect, "run_and_gate", spy):
+            self.run_with(kcc_items=record)
+        self.assertEqual(seen["kcc"], collect.KCC_READ_TIMEOUT_S)
+        self.assertGreater(collect.KCC_READ_TIMEOUT_S, collect.DEFAULT_TIMEOUT_S)
+        others = [t for kind, t in observed if kind != collect.KCC_CATEGORY]
+        self.assertTrue(others, "the spy saw no other reads, so it proves nothing about them")
+        self.assertTrue(
+            all(t in (None, collect.DEFAULT_TIMEOUT_S) for t in others),
+            f"a read other than the `gcp` one took a custom timeout: {observed}",
+        )
+
     def test_an_unreadable_gcp_response_never_claims_config_connector_is_absent(self):
-        """`run_and_gate` collapses four different failures into `None` -- a
-        non-zero exit, empty stdout, unparseable JSON, and a `get` whose
-        `.items` is not a list. Only the first means "no Config Connector
-        here". Reading the other three as that publishes "Config Connector is
+        """`run_and_gate` collapses five different failures into `None` -- a
+        non-zero exit, a timeout, empty stdout, unparseable JSON, and a `get`
+        whose `.items` is not a list. Only the first means "no Config Connector
+        here". Reading the others as that publishes "Config Connector is
         not installed on this cluster" in the ledger, under the audit's own
         name, on the strength of a read that failed -- a claim about the
         cluster that the collector has no evidence for and that hides a real

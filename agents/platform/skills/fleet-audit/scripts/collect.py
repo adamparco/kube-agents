@@ -90,6 +90,16 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
 
+# What `default_run` reports when *it* gave up, following the shell convention
+# for a command killed by `timeout(1)`. It is this collector's own marker and
+# never something a `kubectl` or `gcloud` actually returned, so any branch that
+# reads an exit code as a statement about the cluster has to exclude it first.
+# On 2026-09-06 `kcc-object-wedged` did not: it took `rc != 0` on `kubectl get
+# gcp -A` to mean the API server does not serve the category, and published
+# "Config Connector is not installed on this cluster" about the one cluster in
+# the fleet that runs Config Connector, on the strength of its own timeout.
+TIMEOUT_RC = 124
+
 # `workload_declarations` walks a GitOps clone. A file is applied to a known
 # cluster only when it sits at `clusters/<name>/...`, which is three path
 # components at minimum -- the root, the cluster, and the file itself.
@@ -187,7 +197,7 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFA
         )
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, 124, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
 
 
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
@@ -340,7 +350,7 @@ def run_and_gate(
     is unset; either way a 16-cluster `-A -o json` dump can reach it.
     """
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    result = run(argv, env=env, timeout=DEFAULT_TIMEOUT_S)
+    result = run(argv, env=env, timeout=timeout)
     if result.rc != 0 or not result.stdout.strip():
         return None, result
     try:
@@ -3902,6 +3912,27 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
 # ~200 `kubectl get <kind>` calls that enumerating the CRDs would cost.
 KCC_CATEGORY = "gcp"
 
+# The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because a
+# category read is not one list call. `kubectl` expands `gcp` to every CRD
+# carrying the category -- 221 of them on this fleet's hub -- and issues a list
+# against each, so the cost scales with how much of Config Connector is
+# installed rather than with how many objects exist. Measured from the agent
+# pod against an idle hub holding 19 objects: 10-14 seconds.
+#
+# That fits inside 60 comfortably, which is why the check looked fine until it
+# ran for real. The collector sweeps `MAX_WORKERS` clusters at once, and the
+# fifteen without Config Connector answer this read in about a tenth of a
+# second, so the hub is the only one that is still working when the other seven
+# in its wave are hammering the same pod -- and on 2026-09-06, the first day
+# the check was live, it went past 60 and was recorded as inapplicable. The
+# check has never once executed against the only cluster it can apply to.
+#
+# 240 is four times the default and roughly twenty times the idle read. It is
+# affordable because it is one read on one cluster: the other fifteen fail
+# fast, so the worst case adds minutes to a sweep that already runs for half an
+# hour, and only when something is genuinely wrong.
+KCC_READ_TIMEOUT_S = 240
+
 # §1's three node-facing checks Autopilot's admission controller rules out
 # for in-scope workloads, with the SOP's own canonical reasons verbatim. On
 # an Autopilot cluster these must never appear in the manifest's `commands`
@@ -4029,9 +4060,9 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # as an inapplicable check rather than as a clean one -- a cluster with no
     # Config Connector has not cleared anything.
     kcc_argv = ["kubectl", "get", KCC_CATEGORY, "-A", "-o", "json"]
-    kcc_parsed, kcc_result = run_and_gate(kcc_argv, kubeconfig, run=run)
+    kcc_parsed, kcc_result = run_and_gate(kcc_argv, kubeconfig, run=run, timeout=KCC_READ_TIMEOUT_S)
     context["kcc_objects"] = (kcc_parsed or {}).get("items") or []
-    # `run_and_gate` returns `None` for three different things, and only one of
+    # `run_and_gate` returns `None` for four different things, and only one of
     # them means "no Config Connector here". Collapsing them would publish
     # "Config Connector is not installed on this cluster" as the audit's own
     # claim about a cluster where the read timed out or came back truncated --
@@ -4043,6 +4074,20 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
             f"Config Connector is installed on this cluster -- `kubectl get "
             f"{KCC_CATEGORY} -A` was served -- but it declares no GCP "
             "resources, so there is nothing whose reconciliation could stall."
+        )
+    elif kcc_result.rc == TIMEOUT_RC:
+        # Split out ahead of the `rc != 0` arm below, which is only entitled to
+        # read an exit code as the API server's answer when the API server is
+        # the one that produced it. A timeout is this collector giving up, and
+        # the cluster it is most likely to give up on is the one where the read
+        # has the most work to do -- which is the cluster that runs Config
+        # Connector, the exact opposite of what the arm below would have said.
+        kcc_reason = (
+            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` did not finish "
+            f"within {KCC_READ_TIMEOUT_S}s and was killed, so whether Config "
+            "Connector is installed here -- and whether anything it owns is "
+            "stalled -- was not established. This check cleared nothing on "
+            "this cluster."
         )
     elif kcc_result.rc != 0:
         kcc_reason = (
