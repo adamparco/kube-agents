@@ -764,6 +764,20 @@ def _reachable_instances(rule: dict, instances: list[dict], project: str) -> lis
 
     `targetTags` and `targetServiceAccounts` are alternatives, never both, and
     a rule carrying neither applies to every instance in its network.
+
+    What comes back is a floor on the exposure, not the project's total, and the
+    excerpt has to say so. `compute instances list` does not show GKE Autopilot
+    node VMs to an identity holding project `roles/compute.viewer` -- they
+    return 404 rather than 403, with no deny policy, IAM condition or org policy
+    involved, which `compute_fleet_audit.AUTOPILOT_INVISIBLE_NOTE` establishes
+    at length for the GCE stream and cites Autopilot's architecture doc for. On
+    the reference install that hides four of eighteen nodes, every one of them
+    holding an external address, so `default-allow-ssh` reads as reaching 14.
+    Understating a critical finding's blast radius is the harmless direction;
+    the direction that costs a finding is a *target-scoped* rule whose tags
+    match only invisible nodes, which returns empty here and is dropped as
+    governing no traffic. Widening the read is not available -- the grant that
+    would show those nodes is Owner -- so §2.6 records the limit instead.
     """
     tags = {t.lower() for t in rule.get("targetTags") or []}
     accounts = {a.lower() for a in rule.get("targetServiceAccounts") or []}
@@ -839,8 +853,8 @@ def check_world_open_ingress(
                 "excerpt": (
                     f"sourceRanges {', '.join(world)} allows tcp:"
                     f"{', '.join(f'{p} ({MANAGEMENT_PORTS[p]})' for p in ports)}; "
-                    f"{_target_scope_phrase(rule)}; {len(exposed)} instance(s) hold an "
-                    f"external IP and are reachable today: "
+                    f"{_target_scope_phrase(rule)}; {len(exposed)} instance(s) visible to "
+                    f"the audit identity hold an external IP and are reachable today: "
                     f"{', '.join(exposed[:MAX_NAMED_EXPOSED_INSTANCES])}"
                     + (f", +{remainder} more" if remainder > 0 else "")
                 ),

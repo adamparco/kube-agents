@@ -626,6 +626,15 @@ class WorldOpenIngressTest(unittest.TestCase):
         self.assertIn("10 instance(s)", hits[0]["excerpt"])
         self.assertIn(f"+{10 - na.MAX_NAMED_EXPOSED_INSTANCES} more", hits[0]["excerpt"])
 
+    def test_the_excerpt_attributes_the_count_to_what_the_identity_can_see(self):
+        # The count is a floor: `compute instances list` hides GKE Autopilot
+        # node VMs from a `roles/compute.viewer` caller, four of eighteen on the
+        # reference install. Claiming it as the project's total would overstate
+        # what the read establishes, so the wording is pinned here rather than
+        # left to whoever next edits the f-string.
+        hits = na.check_world_open_ingress([world_open()], [public_node()], "p1")
+        self.assertIn("visible to the audit identity", hits[0]["excerpt"])
+
     def test_the_excerpt_says_when_nothing_narrows_the_target_scope(self):
         hits = na.check_world_open_ingress([world_open()], [public_node()], "p1")
         self.assertIn("no target restriction", hits[0]["excerpt"])
