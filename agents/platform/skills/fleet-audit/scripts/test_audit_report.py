@@ -7666,6 +7666,97 @@ class TestReconcileRemediationPrs(BaseTestCase):
         self.assertTrue(all(v is None for v in by_finding.values()))
         self.assertEqual(urls, {})
 
+    def settled(self, number, branch, ids, state="MERGED"):
+        return pr(
+            number,
+            branch,
+            state=state,
+            merged_at="2026-08-03T16:18:52Z" if state == "MERGED" else None,
+            body="Proposed fix.\n\n" + audit_report.delta_block(ids),
+        )
+
+    def test_a_merged_pr_speaks_only_for_the_findings_it_named(self):
+        # `group_branch_for` keys the branch on the file set, so a different
+        # check that later writes the same file lands on a branch whose pull
+        # request merged for something else. Live on 2026-09-06: `idle-workload`
+        # on hello-world.yaml sat behind PRs 32 and 33, which merged an
+        # `overrequest` resize a month earlier and had taken correctly.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        by_finding, urls = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [self.settled(9, branch, ["a"])]
+        )
+        self.assertEqual(by_finding["a"]["number"], 9)
+        self.assertIsNone(by_finding["b"])
+        self.assertNotIn("b", urls)
+
+    def test_an_open_pr_still_covers_its_whole_group(self):
+        # An open pull request is rewritten by every run's promotion pass, so
+        # its branch does cover whatever the group holds today — even a sibling
+        # finding that appeared after the body was last written.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [self.settled(9, branch, ["a"], state="OPEN")]
+        )
+        self.assertEqual(by_finding["a"]["number"], 9)
+        self.assertEqual(by_finding["b"]["number"], 9)
+
+    def test_an_unreadable_merge_holds_nobody(self):
+        # No scheme stamp, so the ids are unjoinable. A merge is not a verdict
+        # on anything but the fix it carried: reading it as covering nothing
+        # risks one pull request a human reads once, against a finding that is
+        # never shown at all.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        stale = pr(
+            9,
+            branch,
+            state="MERGED",
+            merged_at="2026-08-03T16:18:52Z",
+            body='<!-- audit-findings: ["a--old--scheme"] -->',
+        )
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [stale]
+        )
+        self.assertIsNone(by_finding["a"])
+        self.assertIsNone(by_finding["b"])
+
+    def test_an_unreadable_human_close_holds_the_whole_group(self):
+        # The other direction, and deliberately so: a human close is a
+        # considered rejection, and re-opening a fix on that branch every
+        # morning is the runaway `pr_closed_by_harness` exists to stop.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        rejected = pr(
+            9,
+            branch,
+            state="CLOSED",
+            body='<!-- audit-findings: ["a--old--scheme"] -->',
+        )
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [rejected]
+        )
+        self.assertEqual(by_finding["a"]["number"], 9)
+        self.assertEqual(by_finding["b"]["number"], 9)
+
+    def test_a_readable_human_close_rejects_only_what_it_named(self):
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [self.settled(9, branch, ["a"], state="CLOSED")]
+        )
+        self.assertEqual(by_finding["a"]["number"], 9)
+        self.assertIsNone(by_finding["b"])
+
+    def test_a_shadowed_finding_reaches_the_promotion_sweep(self):
+        # The defect this fixes is not the mapping, it is what the mapping
+        # costs downstream: `promotion_candidates` skips a finding carrying a
+        # pull request *before* the severity test, so a shadowed finding lands
+        # in neither `promote` nor `below_floor` and the ledger never names it.
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [self.settled(9, branch, ["a"])]
+        )
+        plan = audit_report.promotion_candidates(self.findings, by_finding)
+        self.assertNotIn("a", plan.promote + plan.below_floor)
+        self.assertIn("b", plan.promote + plan.below_floor)
+
 
 class TestOpenRemediationPr(HarnessTestCase):
     def setUp(self):

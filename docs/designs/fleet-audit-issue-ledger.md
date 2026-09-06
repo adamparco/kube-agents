@@ -79,11 +79,13 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   finding↔PR link.** It survives anyone editing the issue body, and a single
   `gh pr list --label audit:<audit-id> --label audit:remediation --state all
 --json number,headRefName,state,mergedAt,closedAt,url,body,labels` reconstructs the whole mapping in
-  one API call. No body marker is needed and none is added. Two of those fields are load-bearing
-  rather than incidental. `labels` carries §3.3's harness-close-versus-human-close discriminator,
+  one API call, with no state kept outside GitHub. Three of those fields are load-bearing rather
+  than incidental. `labels` carries §3.3's harness-close-versus-human-close discriminator,
   `audit:stale-closed`, so dropping it from the projection would silently make every close look
   final. `closedAt` is what §3.1's superseded rule compares a `/remediate` timestamp against;
   without it every stale command wins by default, which is the failure that rule exists to prevent.
+  `body` carries the `<!-- audit-findings -->` block a settled pull request wrote about itself,
+  which the next bullet joins against.
 - **The branch is keyed on the files, not on the finding ids.** An earlier draft of this section
   named the branch after the lowest-sorted member id, which does not survive contact with the way
   the model actually works: ids are regenerated from scratch every run, so the day an SOP heading is
@@ -91,6 +93,23 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   lowest id — the branch name changes, the `headRefName` lookup misses, and the harness opens a
   second pull request proposing a fix that is already sitting in review. The set of paths a fix
   touches is the stable thing, so that is what the name is derived from.
+- **A settled pull request speaks only for the findings its body names.** Keying the branch on the
+  files buys stability at a price: a different _check_ that later writes the same file lands on a
+  branch whose pull request already merged. While that pull request is open the branch join is still
+  exact, because every run's promotion pass rewrites it to whatever the group holds today. Once it
+  merges or closes it is frozen, and reading it as covering the whole group produced two wrong
+  answers at once — §3.1 skips a finding carrying a pull request before it reaches the severity test,
+  so the finding appeared in neither the promotion list nor the awaiting-`/remediate` block and the
+  ledger simply lost it; and §4's `pr-merged-persists` comment went onto that old pull request
+  claiming its fix had not taken, naming a finding it never proposed to fix. Both were live on
+  2026-09-06: `idle-workload` on `hello-world.yaml` sat behind PRs 32 and 33, which merged an
+  `overrequest` resize on 2026-08-03 and had taken correctly. So a settled pull request is joined
+  against the `<!-- audit-findings -->` block in its own body — the second reader of that marker
+  after §3.3's stale-close rule. A body written under a different `audit-id-scheme` cannot be joined
+  at all, and there the two closes go opposite ways: a **merge** covers nothing, because risking one
+  pull request a human reads once beats hiding a finding forever, while a **human close** covers the
+  whole group, because re-proposing a fix a person rejected is the daily runaway that §3.1's
+  harness-close-versus-human-close rule exists to stop.
 - **The finding id is still constrained**, to `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..`
   segment and no `.lock` suffix — even though the path digest took it out of the branch name. The
   original justification was that it was a git ref component; that is no longer true, and a rule
@@ -293,7 +312,7 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
 | `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
 | `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
-| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
+| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`     | comment once on the merged PR; never reopen it          |
 | `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
 | `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
 | `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |

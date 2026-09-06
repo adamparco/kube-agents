@@ -2885,10 +2885,13 @@ def parse_id_scheme(body: str | None) -> int:
     apart. Zero can never equal `ID_SCHEME`, so an unstamped body is always
     treated as unjoinable, which is the safe direction.
 
-    The one caller left is `close_stale_remediation_prs`, reading the block a
-    remediation pull request wrote about itself: unjoinable there means the
-    pull request stays open for a run rather than being closed on a "none of
-    these still reproduce" nobody could actually check.
+    Both callers read the block a remediation pull request wrote about itself,
+    and unjoinable sends them in opposite directions, deliberately.
+    `close_stale_remediation_prs` leaves the pull request open for a run rather
+    than closing it on a "none of these still reproduce" nobody could actually
+    check — acting there hides a fix a reviewer can see. `_pr_covers` treats it
+    as covering nothing — acting there surfaces a finding, and the failure it
+    prevents is a finding that is never shown at all.
     """
     body = normalise_newlines(body)
     if not body:
@@ -8209,6 +8212,44 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     return prs
 
 
+def _pr_covers(pr: dict | None) -> set[str] | None:
+    """Which findings a pull request speaks for; None means "the whole group".
+
+    An OPEN pull request is rewritten by every run's promotion pass, so its
+    branch really does cover whatever the group holds today and the branch join
+    is exact. A merged or closed one is frozen at what it fixed, and there the
+    branch join over-reaches: `group_branch_for` keys the branch on the *file
+    set* alone, so a different check that later writes the same file lands on
+    that same settled branch.
+
+    Left unchecked that is not a near-miss, it is two wrong answers at once.
+    `promotion_candidates` skips a finding carrying a pull request before it
+    reaches the severity test, so the finding is neither promoted nor listed as
+    below the floor — it vanishes from the ledger with nothing saying why. And
+    `comment_on_merged_but_persisting` posts on the old pull request that its
+    fix "still reproduces", naming a finding that pull request never claimed.
+    Both were live on 2026-09-06: `idle-workload` on `hello-world.yaml` was
+    held behind pull requests 32 and 33, which merged an `overrequest` resize
+    on 2026-08-03 and had taken correctly.
+
+    A body this run cannot join against splits on how the pull request settled,
+    because the two closes cost opposite mistakes. A merge is not a verdict on
+    anything but the fix it carried, so reading it as covering nothing risks one
+    pull request a human reads once — against a finding hidden forever. A close
+    a *human* made is a considered rejection, and re-opening a fix on that
+    branch every morning is the runaway `pr_closed_by_harness` exists to stop;
+    unable to read which findings the rejection named, the whole group stays
+    held. See `parse_id_scheme` for the same asymmetry stated from the other
+    side.
+    """
+    if pr is None or str(pr.get("state", "")).upper() == "OPEN":
+        return None
+    body = str(pr.get("body", "") or "")
+    if parse_id_scheme(body) != ID_SCHEME:
+        return set() if pr_is_merged(pr) else None
+    return set(parse_delta_block(body))
+
+
 def reconcile_remediation_prs(
     audit_id: str, findings: list[dict], prs: list[dict]
 ) -> tuple[dict[str, dict | None], dict[str, str]]:
@@ -8216,17 +8257,20 @@ def reconcile_remediation_prs(
 
     The branch name is the whole join key — no state is kept anywhere outside
     GitHub. Findings in one group share a branch, so they share a pull request
-    and therefore a state.
+    and therefore a state, for as long as that pull request is open. Once it
+    settles it stops speaking for findings it never named: see `_pr_covers`.
     """
     pr_by_finding: dict[str, dict | None] = {}
     url_by_finding: dict[str, str] = {}
     for group in remediation_groups(findings):
         pr = _select_pr_by_head(prs, group_branch_for(audit_id, group))
+        covers = _pr_covers(pr)
         for finding in group:
             fid = str(finding.get("id", ""))
-            pr_by_finding[fid] = pr
-            if pr and pr.get("url"):
-                url_by_finding[fid] = str(pr["url"])
+            mine = pr if covers is None or fid in covers else None
+            pr_by_finding[fid] = mine
+            if mine and mine.get("url"):
+                url_by_finding[fid] = str(mine["url"])
     return pr_by_finding, url_by_finding
 
 
