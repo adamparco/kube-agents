@@ -1160,6 +1160,68 @@ class CohortLimitationsTest(unittest.TestCase):
                       lim[K("host")])
         self.assertIn("no environment label while 3 of 4 do", lim[K("host")])
 
+    def _live_shape(self, host_labels):
+        """adamparco-kage: 5 Autopilot and 10 Standard all `test`, plus the
+        install's own Standard host cluster carrying whatever is passed."""
+        fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "test"})
+                 for i in range(5)]
+        fleet += [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(10)]
+        fleet.append(cluster("host", labels=host_labels))
+        return fleet
+
+    def test_the_advice_names_the_only_label_that_would_reach_the_floor(self):
+        # A cohort key is (mode, environment), so a label compares this cluster
+        # only if COHORT_FLOOR - 1 clusters *at its own mode* already carry it.
+        # On the live fleet that is `test` and nothing else.
+        lim = fd.cohort_limitations(self._live_shape({}), now=NOW)
+        text = lim[K("host")]
+        self.assertIn("Only `environment=test` would reach the floor here", text)
+        self.assertIn("10 other standard clusters carry `test`", text)
+        self.assertIn("Any other value opens a new cohort of one", text)
+
+    def test_a_label_that_describes_the_cluster_is_the_no_op_the_advice_warns_of(self):
+        """The reason the sentence has to name values: three of the four labels
+        an operator would reach for on an install's host cluster leave the gap
+        exactly where it was, and say less about it than before."""
+        for env in ("prod", "platform", "hub"):
+            with self.subTest(environment=env):
+                lim = fd.cohort_limitations(
+                    self._live_shape({"environment": env}), now=NOW)
+                text = lim[K("host")]
+                self.assertIn(f"cohort standard/{env} has only 1 comparable cluster",
+                              text)
+                # Not `unknown` any more, so the whole cause clause drops: the
+                # operator who did what the sentence asked is told strictly
+                # less than they were before they did it.
+                self.assertNotIn("environment label", text)
+        # ... and the one value the sentence does name compares the cluster,
+        # which is what makes naming it worth doing.
+        self.assertEqual(
+            fd.cohort_limitations(self._live_shape({"environment": "test"}), now=NOW),
+            {})
+
+    def test_a_fleet_where_no_label_would_help_says_so_instead(self):
+        """Naming values must not become naming none of them silently. Two
+        Standard clusters share `test`, so the third would reach the floor --
+        but the lone unlabelled cluster here is Autopilot, and a cohort key is
+        mode-first, so no environment value on the fleet has same-mode peers."""
+        fleet = [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(3)]
+        fleet.append(cluster("host", autopilot=True, labels={}))
+        text = fd.cohort_limitations(fleet, now=NOW)[K("host")]
+        self.assertIn("No environment value on this fleet has the 2 other"
+                      " autopilot clusters", text)
+        self.assertNotIn("would reach the floor here", text)
+
+    def test_two_joinable_values_are_both_named(self):
+        fleet = [cluster(f"p{i}", labels={"environment": "prod"}) for i in range(2)]
+        fleet += [cluster(f"t{i}", labels={"environment": "test"}) for i in range(4)]
+        fleet.append(cluster("host", labels={}))
+        text = fd.cohort_limitations(fleet, now=NOW)[K("host")]
+        # Descending peer count, so the value that needs the least explaining
+        # comes first; `prod` is floored itself at 2 but reaches 3 with this one.
+        self.assertIn("Only `environment=test` or `environment=prod` would reach"
+                      " the floor here", text)
+
     def test_a_fleet_nobody_labelled_is_not_told_to_add_a_label(self):
         # Every cluster unknown together cohorts by mode alone, so there is no
         # named cohort being kept out of and nothing to point at. Counting the

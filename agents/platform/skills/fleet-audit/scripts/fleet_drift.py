@@ -685,12 +685,12 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
             out[ckey(c)] = (
                 f"cohort {label} has only {len(members)} comparable {noun} "
                 f"(minimum {COHORT_FLOOR}), no facet compared"
-                f"{_unlabelled_cause(key, labelled, len(env_of))}"
+                f"{_unlabelled_cause(key, labelled, len(env_of), cohorts)}"
             )
     return out
 
 
-def _unlabelled_cause(key: tuple, labelled: int, total: int) -> str:
+def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple, list[dict]]) -> str:
     """Why the `unknown` cohort floored out, when the rest of the fleet did not.
 
     The floor sentence is true and gives the reader nothing to do with it. On
@@ -711,13 +711,50 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int) -> str:
     `environment` for any label at all, so a non-zero count means the key's
     last element really is an environment and not a project that happens to be
     named `unknown`.
+
+    Naming the values is the rest of it. "Label it to compare it" is true of
+    exactly one value per mode on most fleets and silently false of the rest:
+    a cohort key is `(mode, environment)`, so a label only reaches the floor
+    if `COHORT_FLOOR - 1` clusters *at the same mode* already carry it.
+    kube-agents-host is Standard on a fleet whose ten other Standard clusters
+    are all `test`, so `environment=test` compares it and `prod`, `platform`
+    and `hub` -- the three an operator would actually reach for on an install's
+    own host cluster -- each open a new cohort of one and change nothing. The
+    second run then says less than the first: `prod` is not `unknown`, so the
+    guard above drops this whole clause and the operator who did what the
+    sentence asked is told only that the cohort is too small. Advice whose
+    likeliest application is a no-op belongs with the sizing findings §3.7
+    withholds for the same reason, so the sentence names the values that work
+    and says plainly that the others do not.
     """
     if key[-1:] != ("unknown",) or not labelled:
         return ""
+    mode = key[0]
+    joinable = sorted(
+        ((k[-1], len(m)) for k, m in cohorts.items()
+         if k[0] == mode and k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1),
+        key=lambda t: (-t[1], t[0]),
+    )
+    if joinable:
+        named = " or ".join(f"`environment={v}`" for v, _ in joinable)
+        peers = ", ".join(f"{n} other {mode} cluster{'' if n == 1 else 's'} carry `{v}`"
+                          for v, n in joinable)
+        remedy = (
+            f" Only {named} would reach the floor here -- {peers}. Any other"
+            " value opens a new cohort of one and compares nothing, so a label"
+            " chosen to describe this cluster rather than to match its peers"
+            " leaves the coverage gap exactly as it is."
+        )
+    else:
+        remedy = (
+            f" No environment value on this fleet has the {COHORT_FLOOR - 1}"
+            f" other {mode} clusters a label would need to reach the floor, so"
+            " no label compares this cluster until the fleet grows."
+        )
     return (
         f"; it carries no environment label while {labelled} of {total} do,"
-        " and an unlabelled cluster never joins a named cohort -- label it"
-        " to compare it"
+        " and an unlabelled cluster never joins a named cohort."
+        + remedy
     )
 
 
