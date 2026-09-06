@@ -616,6 +616,27 @@ def _declared_note(path: str) -> str:
     return f"{_DECLARED_LEDE}`{path}`, though a manual fix opens no pull request.)_"
 
 
+# The third of the trio, and the only one about the live object rather than the
+# clone. A `manual` remediation is prose asking a reader to make a change by
+# hand; where a controller holds that object's spec, the change does not
+# survive. The two above say whether a pull request can carry the fix. This one
+# says whether *applying it another way* accomplishes anything.
+#
+# One sentence, for the reason `_UNDECLARED_NOTE` is one: it goes on 23 of this
+# fleet's 120 findings and the rendered body is already over budget on two
+# streams. The reconciler is named because "something reconciles this" sends
+# nobody anywhere, and the phrase comes from `collect.reconciler_of`, which
+# reads it off the object's own Helm, Argo CD, or managed-by markers.
+_RECONCILED_LEDE = "_(Reconciled by "
+
+
+def _reconciled_note(reconciler: str) -> str:
+    return (
+        f"{_RECONCILED_LEDE}{reconciler}, so a change applied by hand is reverted; "
+        "make it where that is configured.)_"
+    )
+
+
 # The model writing, in its own prose, the claim `_DECLARED_LEDE` disproves. It
 # is not the note above under another name: that sentence is appended by this
 # script from an index it built by parsing the clone, while this one is authored
@@ -9583,6 +9604,81 @@ def disclose_undeclared_manual_remediations(
     return annotated
 
 
+def disclose_reconciled_manual_remediations(
+    findings: list[dict], manifest: dict | None
+) -> list[str]:
+    """Say when the hand-applied fix a manual remediation asks for is reverted.
+
+    The two passes above answer "can a pull request carry this?". Neither
+    answers the question a reader who has just been told no asks next, which is
+    what to do instead — and on a reconciled object the obvious answer, patch it
+    directly, is wrong. Helm reasserts the object on the next `helm upgrade`,
+    Argo CD on the next sync, an operator within seconds. The change is gone and
+    the finding is back the following morning, with nothing in either run saying
+    why.
+
+    23 of the 67 workload-scoped findings on 2026-09-06 were manual on a
+    reconciled object: twelve under Argo CD, ten under Helm, one under the
+    harness's own operator. The compliance stream's `podsecurity-gaps` finding
+    on `Deployment/litellm` is the one worth reading — it told the reader the
+    workload was "applied out-of-band" and to patch the Deployment directly,
+    when litellm is a Helm release this very repository's chart declares. Both
+    halves wrong, and the second in the direction that wastes the reader's
+    afternoon.
+
+    Manual only. A `manifest` remediation on an Argo CD-tracked object is
+    already the right route — the pull request edits what Argo CD syncs — and
+    telling that reader their change will be reverted would be false. Ten of the
+    33 reconciled findings are that shape and get nothing from this pass.
+
+    Says the reconciler and stops, the way `disclose_declared_manual_remediations`
+    says the path and stops. Where "where that is configured" actually is —
+    a chart's values, an Application's source repo, a custom resource — is not
+    decidable from a marker on the object, and a guess here reads as verified.
+
+    Sourced from the collector, not from the model: `reconciler_of` reads Helm's
+    annotation pair, Argo CD's tracking id, and `app.kubernetes.io/managed-by`
+    off the same dump every check already runs on. A cluster-scoped finding has
+    no candidate carrying the field and is skipped by construction.
+
+    Runs after `carry_unchanged_findings` with the other two note passes, and
+    strips its own previous sentence first for the same reason: a workload that
+    leaves a Helm release has to stop being told its edits are reverted.
+
+    Returns the ids annotated, for the caller to log.
+    """
+    by_id: dict[str, str] = {}
+    for entry in (manifest or {}).get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            reconciler = str(candidate.get("reconciler") or "").strip()
+            if not reconciler:
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            by_id[derive_finding_id(keyed)] = reconciler
+
+    annotated: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        note = str(remediation.get("note") or "")
+        lede = note.find(_RECONCILED_LEDE)
+        if lede != -1:
+            note = note[:lede].rstrip()
+            remediation["note"] = note
+        if remediation.get("kind") != "manual":
+            continue
+        reconciler = by_id.get(derive_finding_id(finding))
+        if not reconciler:
+            continue
+        remediation["note"] = (f"{note} " if note else "") + _reconciled_note(reconciler)
+        annotated.append(str(finding.get("id", "")))
+    return annotated
+
+
 # --------------------------------------------------------------------------- #
 # Subcommands
 # --------------------------------------------------------------------------- #
@@ -10547,6 +10643,16 @@ def handle_finish(args: argparse.Namespace) -> None:
             f"{fid} sits on an object no file in the GitOps repository declares; "
             "its manual remediation says so, rather than reading as a fix nobody "
             "got round to automating."
+        )
+    # Last, so the caveat about applying the fix by hand sits after whichever of
+    # the pair above said whether a pull request could carry it. Both orderings
+    # read, but a reader told "no file declares this" wants the reason a manual
+    # apply is not the answer either in the sentence immediately after.
+    for fid in disclose_reconciled_manual_remediations(findings, manifest):
+        log(
+            f"{fid} is manual on an object a controller reconciles; its note "
+            "names what reverts a change applied by hand, so the fix is not "
+            "made somewhere it cannot survive."
         )
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget

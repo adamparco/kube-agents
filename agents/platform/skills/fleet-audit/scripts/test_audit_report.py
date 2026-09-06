@@ -3909,6 +3909,177 @@ class TestUndeclaredManualRemediations(HarnessTestCase):
         )
 
 
+class TestReconciledManualRemediations(unittest.TestCase):
+    """A hand-applied fix on an object something else holds the spec of.
+
+    On 2026-09-05 the fleet carried 67 workload-scoped findings; 33 sat on an
+    object a controller continuously reconciles and 23 of those were `manual` --
+    prose asking a human to patch a Deployment that Argo CD self-heal, the next
+    `helm upgrade`, or the kube-agents operator would put straight back. The
+    sharpest was compliance-audit's `podsecurity-gaps` on `Deployment/litellm`,
+    whose note called the workload "applied out-of-band and not declared in this
+    GitOps repository" and told the reader to patch it directly. litellm carries
+    `meta.helm.sh/release-name: kube-agents` and is declared in this repository's
+    own chart. This is the Kubernetes half of the defect `749f8304` fixed for
+    Config Connector.
+    """
+
+    def manifest(self, *candidates, cluster="prod-us-east"):
+        return {"clusters": [{"name": cluster, "candidates": list(candidates)}]}
+
+    def candidate(self, reconciler, obj="Deployment/litellm", **overrides):
+        entry = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": obj,
+        }
+        entry.update(overrides)
+        if reconciler:
+            entry["reconciler"] = reconciler
+        return entry
+
+    def finding(self, obj="Deployment/litellm", kind="manual", note=""):
+        remediation = {"kind": kind}
+        if note:
+            remediation["note"] = note
+        return make_finding(obj=obj, remediation=remediation)
+
+    def test_the_reconciler_is_named_in_the_note(self):
+        finding = self.finding()
+        annotated = audit_report.disclose_reconciled_manual_remediations(
+            [finding], self.manifest(self.candidate("the Helm release `kube-agents`"))
+        )
+        self.assertEqual(annotated, [finding["id"]])
+        note = finding["remediation"]["note"]
+        self.assertIn("the Helm release `kube-agents`", note)
+        self.assertIn("a change applied by hand is reverted", note)
+
+    def test_an_unreconciled_object_is_left_alone(self):
+        finding = self.finding()
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations(
+                [finding], self.manifest(self.candidate(None))
+            ),
+            [],
+        )
+        self.assertNotIn("note", finding["remediation"])
+
+    def test_a_manifest_remediation_is_untouched(self):
+        # Ten of the 33 are `manifest` on an Argo CD-tracked object. That is
+        # already the right route -- the pull request edits the source the
+        # controller reconciles from -- so the caveat would be false there.
+        finding = self.finding(kind="manifest", note="Edit clusters/app/web.yaml.")
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations(
+                [finding],
+                self.manifest(self.candidate("the Argo CD Application `apps`")),
+            ),
+            [],
+        )
+        self.assertEqual(
+            finding["remediation"]["note"], "Edit clusters/app/web.yaml."
+        )
+
+    def test_an_existing_note_is_kept_and_appended_to(self):
+        finding = self.finding(note="Probe generation is forbidden.")
+        audit_report.disclose_reconciled_manual_remediations(
+            [finding], self.manifest(self.candidate("the Helm release `kube-agents`"))
+        )
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith("Probe generation is forbidden."))
+        self.assertIn("the Helm release `kube-agents`", note)
+
+    def test_it_is_idempotent_across_runs(self):
+        # `carry_unchanged_findings` hands the next run the note this one wrote.
+        finding = self.finding()
+        manifest = self.manifest(self.candidate("the Helm release `kube-agents`"))
+        audit_report.disclose_reconciled_manual_remediations([finding], manifest)
+        first = finding["remediation"]["note"]
+        audit_report.disclose_reconciled_manual_remediations([finding], manifest)
+        self.assertEqual(finding["remediation"]["note"], first)
+
+    def test_the_note_clears_once_the_reconciler_is_gone(self):
+        # Uninstalling the release, or Argo CD dropping the object from its
+        # Application, makes yesterday's sentence false. It has to retract.
+        finding = self.finding()
+        audit_report.disclose_reconciled_manual_remediations(
+            [finding], self.manifest(self.candidate("the Helm release `kube-agents`"))
+        )
+        self.assertIn("kube-agents", finding["remediation"]["note"])
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations(
+                [finding], self.manifest(self.candidate(None))
+            ),
+            [],
+        )
+        self.assertEqual(finding["remediation"]["note"], "")
+
+    def test_the_reconciler_can_change_between_runs(self):
+        # Moving a workload from a Helm release into an Argo CD Application must
+        # replace the sentence, not stack a second one beside it.
+        finding = self.finding()
+        audit_report.disclose_reconciled_manual_remediations(
+            [finding], self.manifest(self.candidate("the Helm release `kube-agents`"))
+        )
+        audit_report.disclose_reconciled_manual_remediations(
+            [finding], self.manifest(self.candidate("the Argo CD Application `apps`"))
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn("the Argo CD Application `apps`", note)
+        self.assertNotIn("Helm release", note)
+        self.assertEqual(note.count(audit_report._RECONCILED_LEDE), 1)
+
+    def test_a_finding_with_no_candidate_is_left_alone(self):
+        # The join is `derive_finding_id`. A finding the collector never emitted
+        # a candidate for -- a model-authored one, or one from another check --
+        # has no object metadata to reason from, so it gets nothing.
+        finding = self.finding(obj="Deployment/argocd-server")
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations(
+                [finding], self.manifest(self.candidate("the Helm release `x`"))
+            ),
+            [],
+        )
+        self.assertNotIn("note", finding["remediation"])
+
+    def test_the_cluster_comes_from_the_entry_when_the_candidate_omits_it(self):
+        # Only `collect.py` writes `cluster` into the candidate itself; the
+        # other collectors leave it to the enclosing cluster entry. Keying off
+        # the candidate alone would derive `check..ns.object` and join nothing.
+        finding = self.finding()
+        candidate = self.candidate("the Helm release `kube-agents`")
+        candidate.pop("cluster")
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations(
+                [finding], self.manifest(candidate)
+            ),
+            [finding["id"]],
+        )
+
+    def test_a_missing_manifest_annotates_nothing(self):
+        finding = self.finding()
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations([finding], None),
+            [],
+        )
+        self.assertNotIn("note", finding["remediation"])
+
+    def test_malformed_entries_are_skipped(self):
+        finding = self.finding()
+        manifest = {
+            "clusters": [
+                "not-a-dict",
+                {"name": "prod-us-east", "candidates": ["also-not-a-dict"]},
+                {"name": "prod-us-east", "candidates": None},
+            ]
+        }
+        self.assertEqual(
+            audit_report.disclose_reconciled_manual_remediations([finding], manifest),
+            [],
+        )
+
+
 class TestRetractedDeclarationDenials(HarnessTestCase):
     """The model's "not declared in the GitOps repository", where it is false.
 

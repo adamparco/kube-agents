@@ -389,6 +389,66 @@ def _defers_to_owner(meta: dict) -> bool:
     return False
 
 
+# The markers a reconciling controller stamps on an object it owns, and the
+# phrase each one licenses. All three are set by the writer at apply time and
+# read here off the same dump every check already runs on, so this costs no
+# extra call.
+#
+# Helm 3 writes both halves of its pair on every object in a release, and the
+# release namespace is not the object's -- cert-manager's Deployments live in
+# `cert-manager` under a release of the same name, while the kube-agents chart
+# installs into `kubeagents-system`. Argo CD's tracking id is
+# `<application>:<group>/<Kind>:<namespace>/<name>`, so the Application name is
+# the leading segment. `app.kubernetes.io/managed-by` is the fallback, and only
+# the fallback: Helm sets it to the literal `Helm`, which names no release and
+# is strictly worse than the annotation pair beside it.
+_HELM_RELEASE_ANNOTATION = "meta.helm.sh/release-name"
+_HELM_NAMESPACE_ANNOTATION = "meta.helm.sh/release-namespace"
+_ARGOCD_TRACKING_ANNOTATION = "argocd.argoproj.io/tracking-id"
+_MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+_HELM_MANAGED_BY = "helm"
+
+
+def reconciler_of(meta: dict) -> str | None:
+    """What continuously reasserts this object's spec, named, or None.
+
+    The fact a `manual` remediation needs and never carried. A manual
+    remediation is prose telling a reader to make a change by hand, and on an
+    object some controller reconciles, the hand-made change is undone -- by the
+    next `helm upgrade`, by Argo CD's next sync, by an operator within seconds.
+    The ledger said none of that. On 2026-09-06, 23 of the fleet's 67
+    workload-scoped findings were `manual` on a reconciled object: twelve under
+    Argo CD, ten under Helm, and one -- `probes-liveness` on
+    `Deployment/platform-agent-gateway` -- under the harness's own operator.
+    Compliance's `podsecurity-gaps` finding on `Deployment/litellm` was the
+    clearest of them, telling the reader the workload was "applied out-of-band"
+    and to patch the Deployment directly, when it is a Helm release the
+    kube-agents chart declares.
+
+    Same defect 749f8304 fixed one layer down, where a `gcloud` remediation
+    proposed a change Config Connector would revert. This is its Kubernetes
+    half.
+
+    Returns a noun phrase, not a slug, because the only consumer is a sentence.
+    None means no marker was found -- an object applied with `kubectl apply -f`
+    and reconciled by nobody, where a hand-applied change is exactly as durable
+    as the finding implies.
+    """
+    annotations = meta.get("annotations") or {}
+    release = str(annotations.get(_HELM_RELEASE_ANNOTATION) or "").strip()
+    if release:
+        namespace = str(annotations.get(_HELM_NAMESPACE_ANNOTATION) or "").strip()
+        where = f" in {namespace}" if namespace else ""
+        return f"the Helm release `{release}`{where}"
+    tracking = str(annotations.get(_ARGOCD_TRACKING_ANNOTATION) or "").strip()
+    if tracking:
+        return f"the Argo CD Application `{tracking.split(':', 1)[0]}`"
+    managed_by = str((meta.get("labels") or {}).get(_MANAGED_BY_LABEL) or "").strip()
+    if managed_by and managed_by.lower() != _HELM_MANAGED_BY:
+        return f"`{managed_by}`"
+    return None
+
+
 def normalize_workloads(dump: dict) -> list[dict]:
     """Every workload template surviving S1–S5, as `{kind, ns, name, spec}`.
 
@@ -425,6 +485,7 @@ def normalize_workloads(dump: dict) -> list[dict]:
                 "spec": spec,
                 "template": template_spec,
                 "pod_labels": template_meta.get("labels") or {},
+                "reconciler": reconciler_of(meta),
             }
         )
     return out
@@ -1304,6 +1365,7 @@ def normalize_compliance_workloads(dump: dict) -> list[dict]:
             "kind": item["kind"], "ns": ns, "name": meta.get("name", ""),
             "spec": _pod_spec_of(item), "suspended": _is_suspended_cronjob(item),
             "scaled_to_zero": _is_scaled_to_zero(item),
+            "reconciler": reconciler_of(meta),
         })
     return out
 
@@ -2463,6 +2525,7 @@ def normalize_ai_workloads(dump: dict) -> list[dict]:
             "kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": spec,
             "lbl": _pod_template_labels_of(item), "suspended": _is_suspended_cronjob(item),
             "scaled_to_zero": _is_scaled_to_zero(item),
+            "reconciler": reconciler_of(meta),
         })
     return out
 
@@ -3959,6 +4022,11 @@ def collect_cluster(
             declaration = declaration_for(declarations, name, emitted["namespace"], hit["object"])
             if declaration:
                 emitted["declaration"] = declaration
+        # What reasserts this object's spec, where something does. Workload
+        # checks only: a cluster-scoped hit has no object whose spec a
+        # controller could be holding, and `workload` is None for them.
+        if workload and workload.get("reconciler"):
+            emitted["reconciler"] = workload["reconciler"]
         return emitted
 
     candidates = []

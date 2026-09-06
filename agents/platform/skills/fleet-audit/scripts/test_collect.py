@@ -126,6 +126,115 @@ class TestNormalizeWorkloads(unittest.TestCase):
         pdb = {"kind": "PodDisruptionBudget", "metadata": {"namespace": "default", "name": "x"}}
         self.assertEqual(collect.normalize_workloads(dump_of(pdb)), [])
 
+    def test_the_reconciler_travels_with_the_workload(self):
+        d = deployment("litellm", ns="kubeagents-system")
+        d["metadata"]["annotations"]["meta.helm.sh/release-name"] = "kube-agents"
+        out = collect.normalize_workloads(dump_of(d))
+        self.assertEqual(out[0]["reconciler"], "the Helm release `kube-agents`")
+
+    def test_an_unreconciled_workload_carries_none(self):
+        out = collect.normalize_workloads(dump_of(deployment("api")))
+        self.assertIsNone(out[0]["reconciler"])
+
+
+class TestReconcilerOf(unittest.TestCase):
+    """What continuously reasserts an object's spec, read off the object.
+
+    All three markers are written at apply time and sit in the dump every check
+    already runs on, so naming the reconciler costs no extra call. The phrase
+    ends up in the remediation note of any `manual` finding on the object --
+    `audit_report.disclose_reconciled_manual_remediations` -- which is why each
+    one names the release or Application rather than saying "something".
+    """
+
+    def meta(self, annotations=None, labels=None):
+        return {"annotations": annotations or {}, "labels": labels or {}}
+
+    def test_a_helm_release_is_named_with_its_namespace(self):
+        # The release namespace is not the object's: cert-manager's Deployments
+        # live in `cert-manager` under a release of the same name, while the
+        # kube-agents chart installs into `kubeagents-system`.
+        self.assertEqual(
+            collect.reconciler_of(
+                self.meta(
+                    {
+                        "meta.helm.sh/release-name": "kube-agents",
+                        "meta.helm.sh/release-namespace": "kubeagents-system",
+                    }
+                )
+            ),
+            "the Helm release `kube-agents` in kubeagents-system",
+        )
+
+    def test_a_helm_release_without_a_namespace_is_still_named(self):
+        self.assertEqual(
+            collect.reconciler_of(self.meta({"meta.helm.sh/release-name": "cert-manager"})),
+            "the Helm release `cert-manager`",
+        )
+
+    def test_an_argocd_application_is_the_leading_segment(self):
+        # `<application>:<group>/<Kind>:<namespace>/<name>`.
+        self.assertEqual(
+            collect.reconciler_of(
+                self.meta(
+                    {
+                        "argocd.argoproj.io/tracking-id": (
+                            "waste-canary:apps/Deployment:spot-capacity-test/waste-unsized"
+                        )
+                    }
+                )
+            ),
+            "the Argo CD Application `waste-canary`",
+        )
+
+    def test_helm_outranks_argocd(self):
+        # Argo CD tracks objects it installs from a chart too, and the release
+        # is the closer of the two: a `helm upgrade` reverts a hand patch
+        # whether or not an Application is also syncing it.
+        self.assertEqual(
+            collect.reconciler_of(
+                self.meta(
+                    {
+                        "meta.helm.sh/release-name": "kube-agents",
+                        "argocd.argoproj.io/tracking-id": "apps:apps/Deployment:ns/x",
+                    }
+                )
+            ),
+            "the Helm release `kube-agents`",
+        )
+
+    def test_managed_by_is_the_fallback(self):
+        self.assertEqual(
+            collect.reconciler_of(
+                self.meta(labels={"app.kubernetes.io/managed-by": "kube-agents-operator"})
+            ),
+            "`kube-agents-operator`",
+        )
+
+    def test_the_helm_literal_is_not_a_reconciler(self):
+        # Helm sets `managed-by: Helm`, which names no release. Reporting it
+        # would send a reader looking for a release called "Helm".
+        self.assertIsNone(
+            collect.reconciler_of(self.meta(labels={"app.kubernetes.io/managed-by": "Helm"}))
+        )
+
+    def test_an_unmanaged_object_has_no_reconciler(self):
+        self.assertIsNone(collect.reconciler_of(self.meta()))
+
+    def test_blank_marker_values_do_not_count(self):
+        self.assertIsNone(
+            collect.reconciler_of(
+                self.meta(
+                    {"meta.helm.sh/release-name": "  ", "argocd.argoproj.io/tracking-id": ""},
+                    {"app.kubernetes.io/managed-by": ""},
+                )
+            )
+        )
+
+    def test_absent_annotation_and_label_maps_are_tolerated(self):
+        self.assertIsNone(collect.reconciler_of({}))
+        self.assertIsNone(collect.reconciler_of({"annotations": None, "labels": None}))
+
 
 def context_of(dump=None, **overrides):
     """A build_context()-shaped dict with sensible empty defaults, so a test

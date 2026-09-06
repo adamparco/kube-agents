@@ -3995,6 +3995,14 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
         mine, theirs = self.bodies("declaration_for")
         self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
+    def test_reconciler_of_matches_collect_py(self):
+        # Under the same convention and with the same cost of drift: the phrase
+        # this returns is published verbatim in a remediation note, so two
+        # collectors naming the same Helm release differently is visible to a
+        # reader and explicable to nobody.
+        mine, theirs = self.bodies("reconciler_of")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
     def test_the_constants_it_reads_match_too(self):
         """An identical function over a different constant is a different
         function. `GITOPS_CLUSTER_TREE_DEPTH` in particular decides which files
@@ -4004,7 +4012,17 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
         import importlib
 
         collect = importlib.import_module("collect")
-        for const in ("GITOPS_CLUSTER_TREE_ROOT", "GITOPS_CLUSTER_TREE_DEPTH", "GIT_DIR_NAME", "KCC_API_GROUP_SUFFIX"):
+        for const in (
+            "GITOPS_CLUSTER_TREE_ROOT",
+            "GITOPS_CLUSTER_TREE_DEPTH",
+            "GIT_DIR_NAME",
+            "KCC_API_GROUP_SUFFIX",
+            "_HELM_RELEASE_ANNOTATION",
+            "_HELM_NAMESPACE_ANNOTATION",
+            "_ARGOCD_TRACKING_ANNOTATION",
+            "_MANAGED_BY_LABEL",
+            "_HELM_MANAGED_BY",
+        ):
             with self.subTest(const=const):
                 self.assertEqual(getattr(fw, const), getattr(collect, const))
 
@@ -4137,6 +4155,74 @@ class CandidatesCarryTheirDeclarationTest(unittest.TestCase):
         # Even handed an index that resolves it, the call signature cannot.
         index = {("prod-usc1", "Disk", "default", "orphaned-pd"): {"clusters/prod-usc1/x.yaml"}}
         self.assertNotIn("declaration", fw._emit("unattached-disk", hit, declarations=index))
+
+
+class CandidatesCarryTheirReconcilerTest(unittest.TestCase):
+    """The other annotation `_emit` attaches, over the same three joints.
+
+    `reconciler_of` is tested in `test_collect.py`; what is new here is that a
+    cost candidate carries what it returns. Without it a `manual` remediation on
+    a reconciled object reads as a fix a human can just apply, and the next sync
+    puts it back -- so a break here is invisible in exactly the way the
+    declaration one is.
+    """
+
+    def pvc(self, name, **meta):
+        return obj(
+            "PersistentVolumeClaim", name, ns="default",
+            **{"status.phase": "Bound", "status.capacity": {"storage": "10Gi"}, **meta},
+        )
+
+    def fleet(self, tmp, *objects):
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*objects)))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            return fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW, workspace=None)
+
+    def by_object(self, manifest, name):
+        return [
+            c
+            for cluster in manifest["clusters"]
+            for c in cluster.get("candidates") or []
+            if c["object"] == f"PersistentVolumeClaim/{name}"
+        ]
+
+    def test_a_reconciled_object_carries_the_phrase(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(
+                tmp,
+                self.pvc("data", **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": "apps:/PersistentVolumeClaim:default/data"}}),
+                self.pvc("scratch"),
+            )
+        reconciled = self.by_object(manifest, "data")
+        plain = self.by_object(manifest, "scratch")
+        # Guard the guard: two empty lists would satisfy every assertion below.
+        self.assertTrue(reconciled, "no candidate for the reconciled object")
+        self.assertTrue(plain, "no candidate for the unreconciled object")
+        for candidate in reconciled:
+            self.assertEqual(
+                candidate["reconciler"], "the Argo CD Application `apps`", candidate["check"]
+            )
+        for candidate in plain:
+            self.assertNotIn("reconciler", candidate, candidate["check"])
+
+    def test_a_project_scoped_candidate_is_never_annotated(self):
+        # Same argument as the declaration index: a persistent disk has no
+        # Kubernetes controller holding its spec, and those checks call `_emit`
+        # directly. Handed an index that would resolve it, the signature cannot.
+        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
+        self.assertNotIn("reconciler", fw._emit("unattached-disk", hit))
+        index = {("", "Disk/orphaned-pd"): "the Helm release `x`"}
+        self.assertNotIn("reconciler", fw._emit("unattached-disk", hit, reconcilers=index))
 
 
 if __name__ == "__main__":

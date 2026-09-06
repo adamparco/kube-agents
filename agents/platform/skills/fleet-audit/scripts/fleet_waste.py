@@ -694,8 +694,64 @@ def _by_kind(dump: dict, kind: str) -> list[dict]:
     return [i for i in dump.get("items", []) or [] if i.get("kind") == kind]
 
 
+# The markers a reconciling controller stamps on an object it owns. Duplicated
+# from `collect.reconciler_of` for the reason `declaration_for` below is: these
+# collectors are standalone scripts and none of them imports another.
+#
+# Helm 3 writes both halves of its pair on every object in a release, and the
+# release namespace is not the object's. Argo CD's tracking id is
+# `<application>:<group>/<Kind>:<namespace>/<name>`. `app.kubernetes.io/managed-by`
+# is the fallback and only the fallback: Helm sets it to the literal `Helm`,
+# which names no release.
+_HELM_RELEASE_ANNOTATION = "meta.helm.sh/release-name"
+_HELM_NAMESPACE_ANNOTATION = "meta.helm.sh/release-namespace"
+_ARGOCD_TRACKING_ANNOTATION = "argocd.argoproj.io/tracking-id"
+_MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+_HELM_MANAGED_BY = "helm"
+
+
+def reconciler_of(meta: dict) -> str | None:
+    """What continuously reasserts this object's spec, named, or None.
+
+    The fact a `manual` remediation needs: on an object a controller reconciles,
+    a change applied by hand is undone. See `collect.reconciler_of`, which holds
+    the measurement and the history.
+    """
+    annotations = meta.get("annotations") or {}
+    release = str(annotations.get(_HELM_RELEASE_ANNOTATION) or "").strip()
+    if release:
+        namespace = str(annotations.get(_HELM_NAMESPACE_ANNOTATION) or "").strip()
+        where = f" in {namespace}" if namespace else ""
+        return f"the Helm release `{release}`{where}"
+    tracking = str(annotations.get(_ARGOCD_TRACKING_ANNOTATION) or "").strip()
+    if tracking:
+        return f"the Argo CD Application `{tracking.split(':', 1)[0]}`"
+    managed_by = str((meta.get("labels") or {}).get(_MANAGED_BY_LABEL) or "").strip()
+    if managed_by and managed_by.lower() != _HELM_MANAGED_BY:
+        return f"`{managed_by}`"
+    return None
+
+
+def _reconcilers_by_object(dump: dict) -> dict[tuple[str, str], str]:
+    """`(namespace, "Kind/name") -> reconciler`, for every object in the dump.
+
+    Keyed the way `_emit` builds a candidate, so the annotation is a lookup
+    rather than a second pass over the dump per check. Objects with no marker
+    are absent, which is the same thing as a miss: both mean "say nothing".
+    """
+    index: dict[tuple[str, str], str] = {}
+    for item in dump.get("items", []) or []:
+        meta = item.get("metadata") or {}
+        reconciler = reconciler_of(meta)
+        if not reconciler:
+            continue
+        index[(meta.get("namespace", "") or "", f"{item.get('kind', '')}/{meta.get('name', '')}")] = reconciler
+    return index
+
+
 def build_context(dump: dict) -> dict:
     return {
+        "reconcilers": _reconcilers_by_object(dump),
         "nodes": _by_kind(dump, "Node"),
         "pods": _by_kind(dump, "Pod"),
         "pvcs": _by_kind(dump, "PersistentVolumeClaim"),
@@ -2605,13 +2661,24 @@ def declaration_for(
     return {"path": path, "directory": parent}
 
 
-def _emit(slug: str, hit: dict, *, cluster: str = "", declarations: dict | None = None) -> dict:
+def _emit(
+    slug: str,
+    hit: dict,
+    *,
+    cluster: str = "",
+    declarations: dict | None = None,
+    reconcilers: dict[tuple[str, str], str] | None = None,
+) -> dict:
     """One candidate. `declarations` annotates it with the file that declares
     its object, when the run was given a `--workspace` and the index resolves
     it; `cluster` is the tree that index is keyed by, so both are needed or
-    neither. The project-scoped compute checks pass neither: a disk, a reserved
-    address and a forwarding rule are GCP resources with no cluster tree and no
-    namespace, so there is nothing for this index to key on."""
+    neither. `reconcilers` says what holds the object's spec, which is what
+    decides whether a hand-applied fix survives; it is built from one cluster's
+    object dump, so it pairs with `cluster` under the same rule. The
+    project-scoped compute checks pass none of the three: a disk, a reserved
+    address and a forwarding rule are GCP resources with no cluster tree, no
+    namespace and no Kubernetes controller holding their spec, so there is
+    nothing for either index to key on."""
     candidate = {
         "check": slug,
         "namespace": hit.get("namespace", ""),
@@ -2625,6 +2692,10 @@ def _emit(slug: str, hit: dict, *, cluster: str = "", declarations: dict | None 
         found = declaration_for(declarations, cluster, candidate["namespace"], candidate["object"])
         if found:
             candidate["declaration"] = found
+    if reconcilers and cluster:
+        reconciler = reconcilers.get((candidate["namespace"], candidate["object"]))
+        if reconciler:
+            candidate["reconciler"] = reconciler
     return candidate
 
 
@@ -2718,12 +2789,6 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     # failed to read inside the cluster.
     mode = {"autopilot": bool(cluster.get("autopilot"))}
 
-    def emit(slug: str, hit: dict) -> dict:
-        """`_emit` with this cluster's declaration index bound. Every candidate
-        below goes through it, so a check added later is annotated by default
-        rather than by remembering to ask."""
-        return _emit(slug, hit, cluster=name, declarations=declarations)
-
     empty_facts = empty_fleet_facts()
     kubeconfig, cred_run = fetch_credentials(project, name, location, run=run)
     if cred_run.rc != 0:
@@ -2739,6 +2804,16 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
+
+    def emit(slug: str, hit: dict) -> dict:
+        """`_emit` with this cluster's two indexes bound. Every candidate below
+        goes through it, so a check added later is annotated by default rather
+        than by remembering to ask. Defined after the dump because one of those
+        indexes is built from it."""
+        return _emit(
+            slug, hit, cluster=name, declarations=declarations,
+            reconcilers=context["reconcilers"],
+        )
 
     node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
     # Gated, unlike the bare `run` this used to be. An unreadable node-pool
