@@ -511,6 +511,73 @@ class CollectProjectTest(unittest.TestCase):
         self.assertNotIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
         self.assertNotIn("limitations", entry)
 
+    def test_every_absence_declaration_names_the_population_it_measured(self):
+        """§2.1's three absence branches each count a fleet with holes in it.
+
+        The Compute API hides Autopilot nodes from this identity, so every
+        figure these reasons quote is the visible population rather than the
+        project's. Measured live: eighteen instances exist on the reference
+        install and the platform GSA enumerates fourteen. Only the empty-
+        enumeration branch said so; the other two quoted their counts flat.
+        """
+        cases = {
+            "no instances at all": "[]",
+            "instances, none RUNNING": json.dumps(
+                [
+                    {
+                        "name": "vm-1",
+                        "zone": "https://x/zones/us-central1-a",
+                        "status": "TERMINATED",
+                    }
+                ]
+            ),
+            "RUNNING, no startup script": one_running_instance(startup_script=False),
+        }
+        for desc, listing in cases.items():
+            with self.subTest(case=desc):
+                entry = cf.collect_project(
+                    "proj-1",
+                    run=self.fake_run(
+                        self.clean(**{"instances list": run_of(0, listing)})
+                    ),
+                )
+                reason = {
+                    d["check"]: d["reason"] for d in entry["checks_not_applicable"]
+                }[cf.STARTUP_SLUG]
+                self.assertIn("visible to the audit identity", reason, desc)
+                self.assertIn("Autopilot", reason, desc)
+
+    def test_the_no_startup_script_reason_holds_only_for_standard_nodes(self):
+        """The reason may not generalise its Standard evidence to GKE at large.
+
+        Each of the four `gk3-*` nodes on the reference install sets
+        `startup-script` — to `echo startup-script-override`, the stub Google
+        installs to neutralise the hook — while every visible `gke-*` node sets
+        `user-data` and `kube-env` and no startup-script key. The verdict is
+        unaffected, since a stub on a node Google manages is not the operator's
+        to act on, but the old wording explained the absence with a claim about
+        GKE nodes as a class that one `instances describe` disproves. A reason a
+        reader can falsify is worse than no reason: it is the only thing
+        standing between them and trusting this `not applicable`.
+        """
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(
+                self.clean(
+                    **{
+                        "instances list": run_of(
+                            0, one_running_instance(startup_script=False)
+                        )
+                    }
+                )
+            ),
+        )
+        reason = {
+            d["check"]: d["reason"] for d in entry["checks_not_applicable"]
+        }[cf.STARTUP_SLUG]
+        self.assertIn("Standard node pool", reason)
+        self.assertNotIn("a project whose only instances are GKE nodes", reason)
+
     def test_no_console_is_read_for_an_instance_that_runs_no_script(self):
         """The declaration has to stop the reads, not just relabel them.
 

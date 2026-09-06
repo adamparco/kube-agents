@@ -254,9 +254,10 @@ NO_INSTANCES_REASON = (
 # state that rules the check out is one the read positively established.
 NO_RUNNING_INSTANCES_REASON = (
     "No Compute Engine instance on this project is RUNNING: `compute instances "
-    "list` returned {total} instance(s) and none in RUNNING state, and an "
-    "instance that is not running serves no serial console output for §2.1 to "
-    "read. Structural, not a missed read."
+    "list` returned {total} instance(s) visible to the audit identity and none "
+    "in RUNNING state, and an instance that is not running serves no serial "
+    "console output for §2.1 to read. Structural, not a missed read. "
+    + AUTOPILOT_INVISIBLE_NOTE
 )
 # The metadata keys `google_metadata_script_runner` reads. It runs a startup
 # script only when one of these is set on the instance or in the project's
@@ -266,19 +267,36 @@ STARTUP_SCRIPT_KEYS = ("startup-script", "startup-script-url")
 # The third structural case for §2.1, and the one that hides best: the
 # instances are there, they are RUNNING, their consoles read fine — and not one
 # of them runs a startup script, so the marker the check greps for cannot occur
-# in any of them. Measured live on the reference install: 14 RUNNING instances,
-# 2.4 MB of console text, zero occurrences of `startup-script exit status` in
-# any form, positive or negative, and zero instances carrying either metadata
-# key. Without this branch that reads as a clean pass over the whole fleet.
+# in any of them. Measured live on the reference install: 14 RUNNING instances
+# visible to the platform GSA, 2.4 MB of console text, zero occurrences of
+# `startup-script exit status` in any form, positive or negative, and zero
+# instances carrying either metadata key. Without this branch that reads as a
+# clean pass over the whole fleet.
+#
+# "Visible to" carries the weight in that sentence, and the reason has to say so
+# for the same argument `AUTOPILOT_INVISIBLE_NOTE` makes on the two declarations
+# above. The same install runs four Autopilot nodes the identity cannot see, and
+# every one of them *does* set `startup-script` — to `echo
+# startup-script-override`, a stub Google installs to neutralise the hook. So
+# {total} is the visible population rather than the project's, and the earlier
+# wording here — that a GKE node pool bootstraps from `user-data` and `kube-env`
+# and therefore sets no startup script — held for Standard nodes and was false
+# of Autopilot ones, which set all three. Neither slip changes what the check
+# should do, because a stub on a node Google manages is not the operator's to
+# act on; both mislead the reader deciding from the ledger whether to trust a
+# `not applicable` on this slug, which is the one job the reason has.
 NO_STARTUP_SCRIPT_REASON = (
     "No Compute Engine instance on this project runs a startup script: none of "
-    "the {total} RUNNING instance(s) carries `startup-script` or "
-    "`startup-script-url` in its metadata and the project's common metadata "
-    "sets neither, so `google_metadata_script_runner` never runs and the exit "
-    "status §2.1 matches on cannot appear in any console. Structural, not a "
-    "missed read. A GKE node pool is the ordinary way to reach this branch: "
-    "its nodes bootstrap from `user-data` and `kube-env`, not from a startup "
-    "script, so a project whose only instances are GKE nodes runs none."
+    "the {total} RUNNING instance(s) visible to the audit identity carries "
+    "`startup-script` or `startup-script-url` in its metadata and the project's "
+    "common metadata sets neither, so `google_metadata_script_runner` never "
+    "runs and the exit status §2.1 matches on cannot appear in any console. "
+    "Structural, not a missed read. A GKE Standard node pool is the ordinary "
+    "way to reach this branch: its nodes bootstrap from `user-data` and "
+    "`kube-env` and set neither startup-script key, so a project whose only "
+    "visible instances are Standard nodes runs none. Autopilot nodes do set "
+    "`startup-script`, to a Google-installed stub that neutralises the hook, "
+    "but they never appear in {total}. " + AUTOPILOT_INVISIBLE_NOTE
 )
 NO_NODE_GROUPS_REASON = (
     "This project reserves no sole-tenant node groups: `compute sole-tenancy "
