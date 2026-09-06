@@ -3724,6 +3724,184 @@ class TestStalledKccRemediations(HarnessTestCase):
         self.assertEqual(self.reads(), [])
 
 
+class TestUndeclaredManualRemediations(HarnessTestCase):
+    """Why a `manual` remediation is manual, when the repository is the reason.
+
+    On 2026-09-05 the obtainability ledger carried 42 manual findings, 33 of
+    them on ArgoCD and cert-manager -- installed from upstream and declared in
+    no file of the repository the audit opens pull requests against. Each read
+    as a fix nobody had automated. The declaration rule that produced them is
+    correct; what was missing was any way for the reader to see it had fired.
+    """
+
+    def declare(self, relative, kind, name, namespace=None):
+        """Write a Kubernetes declaration into the clone."""
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "apiVersion: apps/v1",
+            f"kind: {kind}",
+            "metadata:",
+            f"  name: {name}",
+        ]
+        if namespace:
+            lines.append(f"  namespace: {namespace}")
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return target
+
+    def manual_finding(self, obj="Deployment/argocd-server", note=""):
+        remediation = {"kind": "manual"}
+        if note:
+            remediation["note"] = note
+        return make_finding(obj=obj, remediation=remediation)
+
+    def test_an_undeclared_object_is_named_in_the_note(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.manual_finding()]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [findings[0]["id"]],
+        )
+        note = findings[0]["remediation"]["note"]
+        self.assertIn("Not declared in this repository", note)
+        self.assertIn("no pull request can carry this fix", note)
+
+    def test_a_declared_object_is_left_alone(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "argocd-server")
+        findings = [self.manual_finding()]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertNotIn("note", findings[0]["remediation"])
+
+    def test_the_namespace_is_not_part_of_the_match(self):
+        # A manifest that lets Kustomize or an Argo Application supply the
+        # namespace still declares the object. Keying on namespace would call
+        # this undeclared, which is the one error this index must not make.
+        self.declare("clusters/app/web.yaml", "Deployment", "argocd-server")
+        findings = [self.manual_finding()]
+        audit_report.disclose_undeclared_manual_remediations(findings, self.workspace)
+        self.assertNotIn("note", findings[0]["remediation"])
+
+    def test_an_existing_note_is_kept_and_appended_to(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.manual_finding(note="Probe generation is forbidden.")]
+        audit_report.disclose_undeclared_manual_remediations(findings, self.workspace)
+        note = findings[0]["remediation"]["note"]
+        self.assertTrue(note.startswith("Probe generation is forbidden."))
+        self.assertIn("Not declared in this repository", note)
+
+    def test_it_is_idempotent_across_runs(self):
+        # The carry hands the next run the note this one wrote. Appending a
+        # second copy would grow the note by a sentence every morning.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.manual_finding()]
+        audit_report.disclose_undeclared_manual_remediations(findings, self.workspace)
+        first = findings[0]["remediation"]["note"]
+        audit_report.disclose_undeclared_manual_remediations(findings, self.workspace)
+        self.assertEqual(findings[0]["remediation"]["note"], first)
+
+    def test_the_note_clears_once_the_object_is_declared(self):
+        # The reason this pass runs after `carry_unchanged_findings` rather than
+        # beside the other two: it has to be able to retract yesterday's verdict.
+        findings = [self.manual_finding()]
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        audit_report.disclose_undeclared_manual_remediations(findings, self.workspace)
+        self.assertIn(
+            "Not declared in this repository", findings[0]["remediation"]["note"]
+        )
+        self.declare("clusters/app/argocd.yaml", "Deployment", "argocd-server")
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["note"], "")
+
+    def test_a_non_manual_remediation_is_untouched(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [
+            make_finding(
+                obj="Deployment/argocd-server",
+                remediation={"kind": "gcloud", "note": "gcloud container ..."},
+            )
+        ]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertEqual(
+            findings[0]["remediation"]["note"], "gcloud container ..."
+        )
+
+    def test_a_replicaset_is_never_called_undeclared(self):
+        # The repository declares the Deployment that owns it, never the
+        # generated name, so every ReplicaSet would otherwise be annotated.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.manual_finding(obj="ReplicaSet/argocd-server-7d4f")]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertNotIn("note", findings[0]["remediation"])
+
+    def test_a_gcp_resource_is_out_of_scope(self):
+        # `Cluster/x` is a GKE cluster, not something a Kubernetes manifest
+        # declares; the KCC passes own that question.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.manual_finding(obj="Cluster/drift-peer-std-4")]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+
+    def test_an_unreadable_clone_annotates_nothing(self):
+        # Empty means "could not look". Annotating off it would claim the
+        # repository declares nothing, on evidence nobody gathered.
+        findings = [self.manual_finding()]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+        self.assertNotIn("note", findings[0]["remediation"])
+
+    def test_an_unparseable_file_does_not_stop_the_index(self):
+        (self.workspace / "broken.yaml").write_text("a: [unclosed\n", encoding="utf-8")
+        self.declare("clusters/app/web.yaml", "Deployment", "argocd-server")
+        findings = [self.manual_finding()]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [],
+        )
+
+    def test_git_objects_are_not_indexed(self):
+        self.declare(".git/refs/web.yaml", "Deployment", "argocd-server")
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.manual_finding()]
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                findings, self.workspace
+            ),
+            [findings[0]["id"]],
+        )
+
+
 class TestRunCmdTimeout(BaseTestCase):
     """A command that never returns is a result, not a hang."""
 

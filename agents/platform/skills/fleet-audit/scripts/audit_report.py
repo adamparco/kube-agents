@@ -501,6 +501,44 @@ _KCC_NOT_READY_UNEXPLAINED = "not ready"
 # writing again.
 _KCC_STALLED_LEDE = "**This fix will merge without taking effect.**"
 
+# The Kubernetes kinds a GitOps repository declares as a file of its own, so
+# "no file here declares this object" is a fact about the repository rather than
+# about the kind. `ReplicaSet` is deliberately absent: the repository declares
+# the Deployment that owns it and never the generated name the audit reports, so
+# a lookup would call every one of them undeclared.
+_GITOPS_DECLARABLE_KINDS = frozenset(
+    {
+        "ClusterRole",
+        "ClusterRoleBinding",
+        "ConfigMap",
+        "CronJob",
+        "DaemonSet",
+        "Deployment",
+        "HorizontalPodAutoscaler",
+        "Ingress",
+        "Job",
+        "Namespace",
+        "NetworkPolicy",
+        "PodDisruptionBudget",
+        "Role",
+        "RoleBinding",
+        "Service",
+        "ServiceAccount",
+        "StatefulSet",
+    }
+)
+
+# The sentence `disclose_undeclared_manual_remediations` appends, and its lede
+# -- named for the reason `_KCC_STALLED_LEDE` is: the lede is both the start of
+# what that pass writes and what it strips before deciding to write it again.
+#
+# Short on purpose. It goes on up to 37 findings of one ledger here, and the
+# rendered body is already over its budget on that stream -- 24 of 42 findings
+# reach the issue. The object is named in the heading directly above, so
+# repeating it in the note buys nothing and costs a rendered finding.
+_UNDECLARED_LEDE = "_(Not declared in this repository"
+_UNDECLARED_NOTE = f"{_UNDECLARED_LEDE}, so no pull request can carry this fix.)_"
+
 # What `timeout(1)` returns for a command it killed, reused so a caller reading
 # `returncode` cannot confuse a timeout with the command's own exit codes.
 _EXIT_TIMEOUT = 124
@@ -8653,6 +8691,139 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     return degraded
 
 
+def kubernetes_declarations(root: Path) -> set[tuple[str, str]]:
+    """Index the Kubernetes objects a GitOps clone declares, as `(kind, name)`.
+
+    Namespace is deliberately not part of the key. Plenty of manifests omit
+    `metadata.namespace` and let Kustomize or an Argo `Application` supply it,
+    so keying on it would report those objects undeclared -- the one direction
+    of error this index must not make, because its only caller writes a note
+    saying the repository does not declare the object.
+
+    A name that collides across two namespaces therefore reads as declared. That
+    is the safe miss: the caller stays quiet, and the finding publishes exactly
+    as it does today.
+
+    Parsed rather than grepped, for the reason `kcc_declarations` gives at
+    length: `grep "name: <object>"` matches `app.kubernetes.io/name:` labels and
+    any name sharing a prefix, and a false hit here suppresses a true note.
+
+    Returns an empty set when PyYAML is absent or the clone is unreadable, and
+    logs either -- the caller reads empty as "unknown" and annotates nothing, so
+    without the line a run that could not look is indistinguishable from a
+    repository that declares everything.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the check
+    except ImportError:
+        log(
+            "DECLARATION INDEX: PyYAML is not importable, so no Kubernetes "
+            "declaration is indexed; manual remediations publish without the "
+            "note saying whether a pull request could carry them."
+        )
+        return set()
+
+    declared: set[tuple[str, str]] = set()
+    try:
+        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
+    except OSError as exc:
+        log(f"DECLARATION INDEX: cannot walk {root} ({exc}); nothing is indexed.")
+        return set()
+    for path in paths:
+        # `.git` holds packed objects, not manifests, and rglob walks into it.
+        if ".git" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            # A file this audit cannot parse is a file it cannot make a claim
+            # about, and the claim it would make is a negative one. Skipping
+            # leaves the finding's note unwritten, which is the safe direction.
+            continue
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            kind = str(doc.get("kind") or "")
+            meta = doc.get("metadata")
+            if not kind or not isinstance(meta, dict):
+                continue
+            name = str(meta.get("name") or "")
+            if name:
+                declared.add((kind, name))
+    return declared
+
+
+def disclose_undeclared_manual_remediations(
+    findings: list[dict], root: Path
+) -> list[str]:
+    """Say so when no pull request against this repository could carry the fix.
+
+    A `manual` remediation is the audit declining to write a file, and the
+    ledger renders it as prose the reader is expected to apply by hand. What it
+    does not say is *why* -- and on this fleet the reason is usually the same
+    one, which the reader cannot see from the finding: the object is not
+    declared in the GitOps repository at all. 33 of the 42 findings in the
+    obtainability ledger on 2026-09-05 sat on ArgoCD and cert-manager, installed
+    from upstream and declared nowhere in the repo the audit sends pull requests
+    to. Every SOP's declaration rule forces `manual` there, correctly, and then
+    the ledger reads as 33 fixes somebody forgot to automate.
+
+    So the note states the fact rather than the inference: no file here declares
+    the object. Where the check could have produced a manifest that is also the
+    reason it did not, and where the SOP forbade a manifest anyway -- a probe
+    endpoint, an invented request value -- it is still the thing the reader
+    needs, because it tells them the fix belongs in the Helm values or the
+    upstream install rather than in a pull request they are waiting for.
+
+    Runs *after* `carry_unchanged_findings`, unlike the other remediation
+    passes, and that ordering is the whole of its correctness. The carry
+    replaces an unchanged finding's whole `remediation` with the previous run's
+    when neither side is file-backed, so a note appended before it would be
+    overwritten by last run's -- pinning the first run's verdict in place and
+    republishing it every morning after the object was finally declared. Running
+    last means the note always describes the clone as it is now, at the cost of
+    having to strip its own previous output first, which is what `_UNDECLARED_LEDE`
+    is for.
+
+    Returns the ids annotated, for the caller to log.
+    """
+    declared = kubernetes_declarations(root)
+    if not declared:
+        # Empty means "could not look", not "declares nothing": both failure
+        # paths above return this, and a clone that genuinely declared no
+        # Kubernetes object would have no manifest remediations to compare
+        # against either. Annotating every manual finding off an unreadable
+        # clone is the false claim this check exists to avoid making.
+        return []
+
+    annotated: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        note = str(remediation.get("note") or "")
+        # Strip any earlier run's sentence before deciding, so the verdict below
+        # is the only one in the note and a fix that lands between runs actually
+        # clears it.
+        lede = note.find(_UNDECLARED_LEDE)
+        if lede != -1:
+            note = note[:lede].rstrip()
+            remediation["note"] = note
+        if remediation.get("kind") != "manual":
+            continue
+        obj = str(finding.get("object") or "")
+        kind, _, name = obj.partition("/")
+        if kind not in _GITOPS_DECLARABLE_KINDS or not name:
+            continue
+        if (kind, name) in declared:
+            continue
+        remediation["note"] = (f"{note} " if note else "") + _UNDECLARED_NOTE
+        annotated.append(str(finding.get("id", "")))
+    return annotated
+
+
 # --------------------------------------------------------------------------- #
 # Subcommands
 # --------------------------------------------------------------------------- #
@@ -9536,6 +9707,15 @@ def handle_finish(args: argparse.Namespace) -> None:
     # sentence would otherwise never reach a finding already in the ledger.
     for fid in adopt_arm_impact(findings, manifest):
         log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
+    # Last of the remediation passes, and after the carry rather than beside the
+    # other two: the carry overwrites a `manual` remediation wholesale, so this
+    # note has to be written against the remediation set that ships.
+    for fid in disclose_undeclared_manual_remediations(findings, root):
+        log(
+            f"{fid} sits on an object no file in the GitOps repository declares; "
+            "its manual remediation says so, rather than reading as a fix nobody "
+            "got round to automating."
+        )
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
