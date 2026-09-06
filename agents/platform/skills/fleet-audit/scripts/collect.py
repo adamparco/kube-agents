@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete twelve-check roster
-(§3.1–§3.12 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete fifteen-check roster
+(§3.1–§3.15 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete twelve-check roster (§2.1–§2.12 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -320,6 +320,10 @@ DUMP_COMMAND_KINDS = (
 # expressions, which this collector has no reason to learn.
 STALE_SUCCESS_GAP_HOURS = 24
 SECONDS_PER_HOUR = 3600
+# Minutes, not hours, for the overlap check's excerpt: the schedules it can
+# fire on are the ones whose period a run can outlast, and printing "0.1h"
+# where a reader wants "6m" hides the comparison the finding is making.
+SECONDS_PER_MINUTE = 60
 
 
 def run_and_gate(
@@ -1371,6 +1375,160 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
     }
 
 
+# Kubernetes' own default when a pod spec omits `terminationGracePeriodSeconds`.
+# Named because the excerpt has to print a number either way, and printing the
+# absent case as `0` or `None` would describe a pod that is killed instantly.
+DEFAULT_GRACE_PERIOD_S = 30
+
+
+def check_rollout_drops_traffic(workload: dict, context: dict) -> dict | None:
+    """A Service-backed workload whose containers have no `preStop` hook.
+
+    Endpoint removal and `SIGTERM` are two independent, concurrent reactions to
+    a pod being deleted: the kubelet starts terminating the container while the
+    endpoints controller is still propagating the removal out to every node's
+    kube-proxy and to every Ingress or mesh sidecar holding a connection. The
+    container almost always wins that race, so requests keep arriving at a
+    process that has already begun shutting down and are answered with a
+    connection reset. A `preStop` hook is the only thing in the pod lifecycle
+    that delays `SIGTERM`, which is why the fix is a hook that sleeps rather
+    than anything in the application.
+
+    That makes this the one rollout defect nobody sees in a rolling update: the
+    Deployment goes green, the new pods pass their probes, and the only trace
+    is a burst of 502s in whatever sits in front. It costs errors on every
+    deploy, every node drain, every autoscaler scale-down, and every
+    preemption -- which on Spot capacity is continuous.
+
+    Narrowed three ways, because unnarrowed this fires on essentially every
+    workload in a fleet and a check that flags everything has told you nothing.
+    `_SCOPE_SERVING` drops the workloads whose only Service is a metrics scrape
+    endpoint -- Prometheus retries, so a reset there costs a gap in a graph
+    rather than a user's request -- and the same qualifier is what
+    `check_probes_readiness` and `check_single_replica` already use to avoid
+    the same false claim. More than one replica, because a single-replica
+    workload has a hard outage on every rollout whatever its hooks do, and
+    `check_single_replica` is the finding that says so; adding a `preStop`
+    sleep there delays the outage rather than removing it. And only the
+    containers actually behind the Service's `targetPort`, for the reason
+    `_containers_behind_a_service` gives: a log shipper with no hook is not in
+    the request path and cannot reset anything.
+
+    DaemonSets are in scope with no replica test. One pod per node is not the
+    single-replica case -- the other nodes keep serving -- so a rolling update
+    of a Service-backed DaemonSet drops exactly the traffic this describes.
+    """
+    if workload["kind"] == "Deployment" or workload["kind"] == "StatefulSet":
+        if (workload["spec"].get("replicas", 1) or 1) <= 1:
+            return None
+    services = _selecting_services(workload, context)
+    if not services or _exposure_scope(services) != _SCOPE_SERVING:
+        return None
+    missing = [
+        c.get("name", "")
+        for c in _containers_behind_a_service(workload, services)
+        if c.get("name") not in _SELF_HEALTH_SIDECARS and not (c.get("lifecycle") or {}).get("preStop")
+    ]
+    if not missing:
+        return None
+    grace = workload["template"].get("terminationGracePeriodSeconds")
+    if grace is None:
+        grace = DEFAULT_GRACE_PERIOD_S
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": (
+            f"Service-backed, containers with no preStop hook: {', '.join(missing)}\n"
+            f"terminationGracePeriodSeconds={grace}\n"
+            f"{_exposure_line(services)}"
+        ),
+    }
+
+
+def _max_unavailable_count(strategy: dict, replicas: int) -> int | None:
+    """`maxUnavailable` resolved against a replica count, or `None` if unset.
+
+    The field is an `IntOrString`: `2` means two pods, `"25%"` means a
+    proportion, and Kubernetes rounds a percentage *down* for `maxUnavailable`
+    so that rounding can never take out more pods than asked. Reproducing that
+    rounding direction matters here -- rounding up would make `"50%"` of 3
+    resolve to 2, and this check would then call a perfectly ordinary rollout a
+    total outage.
+    """
+    raw = strategy.get("maxUnavailable")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text.endswith("%"):
+        try:
+            return int(replicas * float(text[:-1]) / 100)
+        except ValueError:
+            return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def check_strategy_causes_downtime(workload: dict, context: dict) -> dict | None:
+    """A Deployment whose own update strategy takes every replica down at once.
+
+    Two spellings of the same outage. `strategy.type: Recreate` tells the
+    Deployment controller to delete every existing pod and only then create the
+    replacements, so a workload with three replicas serves nothing from the
+    first deletion until the first new pod passes its readiness probe -- an
+    image pull plus a cold start, tens of seconds at best and minutes for
+    anything that warms a cache on boot. `RollingUpdate` with `maxUnavailable`
+    at or above the replica count is the same thing written the long way: the
+    controller is permitted to take all of them down in one step, and it does.
+
+    This is worth its own check because it is invisible in every other reading
+    of the object. The Deployment reports `Available` between rollouts, the
+    replica count is whatever the author intended, the probes are correct, and
+    there is no event to find afterwards -- the outage lasts only as long as
+    the rollout and leaves nothing behind but errors in a client's logs. It
+    surfaces only when someone reads `spec.strategy`, and until now nothing in
+    this collector did except to suppress: `check_single_replica` returns
+    `None` on `Recreate` (a single replica has an outage on any strategy, so
+    naming the strategy there would be the wrong finding), and returns `None`
+    again whenever `replicas != 1`. A `Recreate` Deployment with three replicas
+    fell through both arms and was reported by nothing.
+
+    Not a finding on a single replica, for that same reason, and not one on
+    `maxUnavailable` merely being large: `maxUnavailable: 2` of 3 is a
+    deliberate speed-over-capacity choice that still leaves a pod serving.
+    Only reaching the replica count is unambiguous, because at that point the
+    strategy permits zero surviving pods.
+    """
+    if workload["kind"] != "Deployment":
+        return None
+    replicas = workload["spec"].get("replicas", 1) or 1
+    if replicas <= 1:
+        return None
+    strategy = workload["spec"].get("strategy") or {}
+    kind = strategy.get("type") or "RollingUpdate"
+    if kind == "Recreate":
+        detail = f"strategy.type=Recreate, replicas={replicas}"
+    else:
+        unavailable = _max_unavailable_count(strategy.get("rollingUpdate") or {}, replicas)
+        if unavailable is None or unavailable < replicas:
+            return None
+        raw = (strategy.get("rollingUpdate") or {}).get("maxUnavailable")
+        detail = (
+            f"strategy.rollingUpdate.maxUnavailable={raw} resolves to {unavailable} "
+            f"of {replicas} replicas"
+        )
+    services = _selecting_services(workload, context)
+    exposure = f"\n{_exposure_line(services)}" if services else ""
+    return {
+        "object": f"Deployment/{workload['name']}",
+        "excerpt": f"{detail}{exposure}",
+        # A rollout that drops every replica of something serving user traffic
+        # is an outage; the same strategy on a workload nothing routes to is a
+        # latent one, waiting for the first Service to be pointed at it.
+        "severity": "major" if services and _exposure_scope(services) == _SCOPE_SERVING else "minor",
+    }
+
+
 def _rfc3339(stamp: str) -> float | None:
     """Kubernetes timestamp -> epoch seconds, or `None` if it will not parse.
 
@@ -1479,6 +1637,129 @@ def check_schedule_never_succeeds(context: dict) -> list[dict]:
                     f"({gap_hours:.0f}h without a successful run); "
                     f"{len(finished)} retained Job(s), all failed"
                     f"{_failure_summary(finished)}"
+                ),
+                "reconciler": reconciler_of(cronjob.get("metadata") or {}),
+            }
+        )
+    return hits
+
+
+# The CronJob controller's own default when `spec.concurrencyPolicy` is unset.
+# It is the permissive one, which is why the absent case and the explicit case
+# are the same finding.
+DEFAULT_CONCURRENCY_POLICY = "Allow"
+
+# How many retained Job creation times it takes to call a cadence observed.
+# Two timestamps make one gap, and one gap is a coincidence -- a single retry
+# would read as the schedule's period. Three give two gaps to take the wider
+# of, which is what `_observed_period_s` does.
+MIN_JOBS_FOR_PERIOD = 3
+
+
+def _observed_period_s(jobs: list[dict]) -> float | None:
+    """How often this schedule actually fires, read off the Jobs it retained.
+
+    The alternative is parsing `spec.schedule`, and the comment on
+    `STALE_SUCCESS_GAP_HOURS` already gives the reason not to: this collector
+    has no business learning cron syntax, and a verdict that depends on a
+    hand-rolled cron parser is a verdict that fails in whichever direction the
+    parser is wrong. Consecutive `creationTimestamp`s are the same fact,
+    already in the dump, in a form that needs no clock and no grammar.
+
+    The *widest* gap rather than the narrowest. Retained Jobs are a sample with
+    holes in it -- `successfulJobsHistoryLimit` evicts, and a run that was
+    skipped or suspended leaves a gap of several periods -- so the narrowest
+    gap is the closest thing to the true period and the widest is an
+    overestimate of it. Overestimating is the safe direction here: the caller
+    reports overlap when a run lasts *longer* than a period, so a period that
+    is too long makes the check quieter, never louder.
+    """
+    stamps = sorted(
+        stamp
+        for stamp in (_rfc3339((job.get("metadata") or {}).get("creationTimestamp", "")) for job in jobs)
+        if stamp is not None
+    )
+    if len(stamps) < MIN_JOBS_FOR_PERIOD:
+        return None
+    gaps = [later - earlier for earlier, later in zip(stamps, stamps[1:]) if later > earlier]
+    return max(gaps) if gaps else None
+
+
+def _longest_run_s(jobs: list[dict]) -> tuple[float | None, str]:
+    """The longest completed run among the retained Jobs, and which one it was.
+
+    Only Jobs that both started and finished. A Job still running has no
+    `completionTime`, and treating "started a long time ago and has not
+    finished" as a duration would report the one case this check must not
+    guess at: a Job that is wedged rather than slow.
+    """
+    longest, name = None, ""
+    for job in jobs:
+        status = job.get("status") or {}
+        start = _rfc3339(status.get("startTime", ""))
+        end = _rfc3339(status.get("completionTime", ""))
+        if start is None or end is None or end < start:
+            continue
+        if longest is None or (end - start) > longest:
+            longest, name = end - start, (job.get("metadata") or {}).get("name", "")
+    return longest, name
+
+
+def check_cronjob_runs_overlap(context: dict) -> list[dict]:
+    """Cluster-scoped: a CronJob that takes longer to run than it waits to rerun.
+
+    `concurrencyPolicy: Allow` -- the default, so almost always unstated -- lets
+    the controller start the next run whether or not the last one finished. That
+    is harmless until a run outlasts its own period, and then it is a pile-up:
+    every period adds a worker without removing one, so a schedule that fires
+    every five minutes and takes six accumulates runs until something in the
+    cluster runs out. The failure is not the CronJob's. It lands on whatever
+    the job talks to -- connection-pool exhaustion on a database, duplicate rows
+    from two copies of the same import, a node's memory going to N copies of a
+    batch process -- which is why the CronJob itself looks healthy the whole
+    time and every retained Job reports `succeeded`.
+
+    Measured, not predicted. The check does not read `spec.schedule` and does
+    not guess at how long a run should take: it compares the longest run the
+    cluster actually recorded against the widest gap between the runs it
+    actually started, both off timestamps already in the dump. So a hit says
+    this schedule has already overlapped, not that its policy would allow it
+    to -- which is the difference between a finding and a lint rule, given that
+    the permissive policy is the default and therefore describes most CronJobs
+    in any fleet.
+
+    `Forbid` and `Replace` are both excluded because both bound the pile-up:
+    `Forbid` skips the new run, `Replace` kills the old one. Which of the two
+    to move to is a real decision -- skipping a run loses that period's work,
+    killing one loses the work in flight -- so this reports the collision and
+    leaves the choice to whoever knows what the job does.
+    """
+    hits = []
+    for entry in context["cronjobs"]:
+        cronjob = entry["cronjob"]
+        spec = cronjob.get("spec") or {}
+        if spec.get("suspend"):
+            continue
+        policy = spec.get("concurrencyPolicy") or DEFAULT_CONCURRENCY_POLICY
+        if policy != DEFAULT_CONCURRENCY_POLICY:
+            continue
+        period = _observed_period_s(entry["jobs"])
+        if period is None:
+            continue
+        longest, slowest = _longest_run_s(entry["jobs"])
+        if longest is None or longest < period:
+            continue
+        stated = "concurrencyPolicy=Allow" if spec.get("concurrencyPolicy") else "concurrencyPolicy unset (defaults to Allow)"
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"CronJob/{entry['name']}",
+                "excerpt": (
+                    f"schedule={spec.get('schedule', '')!r} {stated}; "
+                    f"slowest retained run {slowest} took {longest / SECONDS_PER_MINUTE:.1f}m "
+                    f"against an observed period of {period / SECONDS_PER_MINUTE:.1f}m "
+                    f"across {len(entry['jobs'])} retained Job(s), "
+                    "so a run is still going when the next one starts"
                 ),
                 "reconciler": reconciler_of(cronjob.get("metadata") or {}),
             }
@@ -3684,6 +3965,37 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "Whatever this schedule exists to do has not been done since its last "
         "successful run, and nothing reports that on its own: the CronJob is "
         "still listed, still enabled, and still firing on time.",
+    ),
+    CheckSpec(
+        "rollout-drops-traffic",
+        "workload",
+        check_rollout_drops_traffic,
+        "major",
+        None,
+        "Every rollout, node drain, and preemption resets the connections in "
+        "flight to the terminating pod: the container is sent SIGTERM while "
+        "the endpoint removal is still propagating, so requests arrive at a "
+        "process that has already begun shutting down.",
+    ),
+    CheckSpec(
+        "strategy-causes-downtime",
+        "workload",
+        check_strategy_causes_downtime,
+        "major",
+        None,
+        "The update strategy permits every replica to be down at once, so a "
+        "rollout is a full outage lasting until the first replacement pod "
+        "passes its readiness probe -- an image pull plus a cold start.",
+    ),
+    CheckSpec(
+        "cronjob-runs-overlap",
+        "cluster",
+        check_cronjob_runs_overlap,
+        "major",
+        None,
+        "Runs of this schedule are piling up on each other: each period starts "
+        "another copy without the last one having finished, so the load on "
+        "whatever the job writes to grows until something there gives out.",
     ),
 )
 

@@ -1426,6 +1426,8 @@ def job(
     failed=None,
     created="2026-09-06T20:00:00Z",
     reason=None,
+    started=None,
+    completed=None,
 ):
     status = {}
     if succeeded is not None:
@@ -1437,6 +1439,12 @@ def job(
         status["active"] = 1
     if reason is not None:
         status["conditions"] = [{"type": "Failed", "status": "True", "reason": reason}]
+    # 3.15 measures a run from these two; 3.12 reads neither. Defaulting them
+    # to absent keeps every 3.12 fixture above saying exactly what it said.
+    if started is not None:
+        status["startTime"] = started
+    if completed is not None:
+        status["completionTime"] = completed
     return {
         "kind": "Job",
         "metadata": {
@@ -1656,6 +1664,475 @@ class TestScheduleNeverSucceeds(unittest.TestCase):
         self.assertIn("jobs", collect.DUMP_COMMAND_KINDS)
 
 
+class TestRolloutDropsTraffic(unittest.TestCase):
+    """§3.13. Endpoint removal and SIGTERM race, and only `preStop` delays one.
+
+    Narrowed three ways on purpose. The raw shape -- a container with no
+    `preStop` hook -- held on 24 of the ~30 non-system workloads in the fleet
+    on 2026-09-05, which is a linter rule rather than an audit finding. Behind
+    a serving Service, above one replica, and only for the containers the
+    Service actually routes to, it holds on 6.
+    """
+
+    def wl(self, kind="Deployment", replicas=2, containers=None):
+        d = deployment("api", **{"spec.replicas": replicas})
+        d["kind"] = kind
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        if containers is not None:
+            d["spec"]["template"]["spec"]["containers"] = containers
+        return collect.normalize_workloads(dump_of(d))[0]
+
+    def svc_ctx(self, ports=None):
+        return context_of(
+            services={
+                "default": [
+                    service("s", selector={"app": "api"}, **({"ports": ports} if ports else {}))
+                ]
+            }
+        )
+
+    def serving(self):
+        return self.svc_ctx([{"name": "http", "port": 80, "targetPort": 8080}])
+
+    def check(self, workload=None, context=None):
+        return collect.check_rollout_drops_traffic(workload or self.wl(), context or self.serving())
+
+    def test_a_multi_replica_serving_deployment_with_no_prestop_is_flagged(self):
+        hit = self.check()
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["object"], "Deployment/api")
+
+    def test_the_excerpt_names_the_containers_that_lack_the_hook(self):
+        # The remediation is a block per container, so a finding that says only
+        # "no preStop hook" leaves the reader to work out where it goes.
+        hit = self.check(
+            self.wl(
+                containers=[
+                    {"name": "app", "ports": [{"containerPort": 8080}]},
+                    {"name": "sidecar", "ports": [{"containerPort": 8080}]},
+                ]
+            )
+        )
+        self.assertIn("app, sidecar", hit["excerpt"])
+
+    def test_an_absent_grace_period_is_printed_as_the_kubernetes_default(self):
+        # It bounds how long a hook may sleep, so the reader needs the number
+        # that is in force -- and `None` describes no pod.
+        self.assertIn(
+            f"terminationGracePeriodSeconds={collect.DEFAULT_GRACE_PERIOD_S}", self.check()["excerpt"]
+        )
+
+    def test_a_declared_grace_period_is_printed_instead(self):
+        wl = self.wl()
+        wl["template"]["terminationGracePeriodSeconds"] = 5
+        self.assertIn("terminationGracePeriodSeconds=5", self.check(wl)["excerpt"])
+
+    def test_the_exposure_line_says_which_service_carries_the_traffic(self):
+        self.assertIn("s[http]", self.check()["excerpt"])
+        self.assertIn(collect._SCOPE_SERVING, self.check()["excerpt"])
+
+    def test_a_daemonset_is_flagged_with_no_replica_test(self):
+        # A DaemonSet has no `replicas`, and a node drain terminates its pod
+        # exactly the way a rollout does.
+        self.assertIsNotNone(self.check(self.wl(kind="DaemonSet", replicas=None)))
+
+    def test_a_statefulset_above_one_replica_is_flagged(self):
+        self.assertIsNotNone(self.check(self.wl(kind="StatefulSet")))
+
+    def test_a_single_replica_deployment_is_left_to_3_11(self):
+        # `single-replica` already publishes the whole rollout outage there, so
+        # this would be a second finding about the same seconds.
+        self.assertIsNone(self.check(self.wl(replicas=1)))
+
+    def test_a_single_replica_statefulset_is_left_to_3_11(self):
+        self.assertIsNone(self.check(self.wl(kind="StatefulSet", replicas=1)))
+
+    def test_a_workload_no_service_selects_is_never_flagged(self):
+        self.assertIsNone(self.check(context=context_of()))
+
+    def test_a_metrics_only_service_is_never_flagged(self):
+        # Prometheus retries a dropped scrape. There is no in-flight request to
+        # lose, which is the entire claim this check makes.
+        self.assertIsNone(self.check(context=self.svc_ctx([{"name": "metrics", "port": 9402}])))
+
+    def test_a_service_declaring_no_ports_is_never_flagged(self):
+        self.assertIsNone(self.check(context=self.svc_ctx()))
+
+    def test_a_hook_on_every_serving_container_silences_it(self):
+        self.assertIsNone(
+            self.check(
+                self.wl(
+                    containers=[
+                        {
+                            "name": "app",
+                            "ports": [{"containerPort": 8080}],
+                            "lifecycle": {"preStop": {"exec": {"command": ["sleep", "5"]}}},
+                        }
+                    ]
+                )
+            )
+        )
+
+    def test_a_container_the_service_does_not_route_to_is_not_named(self):
+        # Same narrowing the probe checks use: a log shipper on 9000 is not in
+        # the request path, so its missing hook drops nothing.
+        self.assertIsNone(
+            self.check(
+                self.wl(
+                    containers=[
+                        {
+                            "name": "app",
+                            "ports": [{"containerPort": 8080}],
+                            "lifecycle": {"preStop": {"httpGet": {"path": "/quit", "port": 8080}}},
+                        },
+                        {"name": "logs", "ports": [{"containerPort": 9000}]},
+                    ]
+                )
+            )
+        )
+
+    def test_a_self_healing_sidecar_is_not_named(self):
+        # `istio-proxy` drains itself on SIGTERM; the shared exemption set says
+        # so for the probe checks and means the same thing here.
+        self.assertIsNone(
+            self.check(
+                self.wl(
+                    containers=[
+                        {
+                            "name": "app",
+                            "ports": [{"containerPort": 8080}],
+                            "lifecycle": {"preStop": {"exec": {"command": ["sleep", "5"]}}},
+                        },
+                        {"name": "istio-proxy", "ports": [{"containerPort": 8080}]},
+                    ]
+                )
+            )
+        )
+
+    def test_an_empty_lifecycle_block_is_not_a_hook(self):
+        # `lifecycle: {}` with only a postStart under it is the near miss, and
+        # it delays nothing.
+        self.assertIsNotNone(
+            self.check(
+                self.wl(
+                    containers=[
+                        {
+                            "name": "app",
+                            "ports": [{"containerPort": 8080}],
+                            "lifecycle": {"postStart": {"exec": {"command": ["true"]}}},
+                        }
+                    ]
+                )
+            )
+        )
+
+
+class TestStrategyCausesDowntime(unittest.TestCase):
+    """§3.14. The gap 3.11 leaves open.
+
+    `check_single_replica` returns None on `strategy.type == Recreate` *and* on
+    any `replicas != 1`, so a three-replica Recreate Deployment -- a guaranteed
+    full outage on every deploy -- fell through both arms and nothing else in
+    the roster reads `spec.strategy` at all.
+    """
+
+    def wl(self, kind="Deployment", replicas=3, strategy=None):
+        d = deployment("api", **{"spec.replicas": replicas})
+        d["kind"] = kind
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        if strategy is not None:
+            d["spec"]["strategy"] = strategy
+        return collect.normalize_workloads(dump_of(d))[0]
+
+    def rolling(self, max_unavailable):
+        return {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": max_unavailable}}
+
+    def check(self, workload=None, context=None):
+        return collect.check_strategy_causes_downtime(workload or self.wl(), context or context_of())
+
+    def serving_ctx(self):
+        return context_of(
+            services={
+                "default": [
+                    service("s", selector={"app": "api"}, ports=[{"name": "http", "port": 80}])
+                ]
+            }
+        )
+
+    def test_recreate_above_one_replica_is_flagged(self):
+        hit = self.check(self.wl(strategy={"type": "Recreate"}))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["object"], "Deployment/api")
+        self.assertIn("strategy.type=Recreate, replicas=3", hit["excerpt"])
+
+    def test_max_unavailable_equal_to_the_replica_count_is_flagged(self):
+        hit = self.check(self.wl(strategy=self.rolling(3)))
+        self.assertIn("maxUnavailable=3 resolves to 3 of 3 replicas", hit["excerpt"])
+
+    def test_max_unavailable_above_the_replica_count_is_flagged(self):
+        # Legal, and it means the same outage as `=replicas`.
+        self.assertIsNotNone(self.check(self.wl(strategy=self.rolling(5))))
+
+    def test_a_hundred_percent_is_flagged(self):
+        hit = self.check(self.wl(strategy=self.rolling("100%")))
+        self.assertIn("maxUnavailable=100% resolves to 3 of 3 replicas", hit["excerpt"])
+
+    def test_a_percentage_rounds_down_the_way_kubernetes_does(self):
+        # 99% of 3 is 2.97 and Kubernetes floors `maxUnavailable`, so one
+        # replica stays up and there is no outage to report. Rounding the other
+        # way would invent a finding on every workload set to 99%.
+        self.assertIsNone(self.check(self.wl(strategy=self.rolling("99%"))))
+        self.assertIsNone(self.check(self.wl(replicas=2, strategy=self.rolling("50%"))))
+
+    def test_a_service_backed_workload_takes_the_higher_severity(self):
+        hit = self.check(self.wl(strategy={"type": "Recreate"}), self.serving_ctx())
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("s[http]", hit["excerpt"])
+
+    def test_a_workload_nothing_routes_to_is_downgraded(self):
+        # A batch worker behind no Service still stops working during the
+        # rollout, which is worth saying and is not an outage anyone sees.
+        hit = self.check(self.wl(strategy={"type": "Recreate"}))
+        self.assertEqual(hit["severity"], "minor")
+        self.assertNotIn("s[", hit["excerpt"])
+
+    def test_a_metrics_only_service_is_downgraded_too(self):
+        ctx = context_of(
+            services={
+                "default": [
+                    service("s", selector={"app": "api"}, ports=[{"name": "metrics", "port": 9402}])
+                ]
+            }
+        )
+        self.assertEqual(self.check(self.wl(strategy={"type": "Recreate"}), ctx)["severity"], "minor")
+
+    def test_a_single_replica_deployment_is_left_to_3_11(self):
+        self.assertIsNone(self.check(self.wl(replicas=1, strategy={"type": "Recreate"})))
+
+    def test_the_default_strategy_is_never_flagged(self):
+        # RollingUpdate with nothing under it defaults to 25%, which is the
+        # shape the overwhelming majority of the fleet has.
+        self.assertIsNone(self.check(self.wl()))
+        self.assertIsNone(self.check(self.wl(strategy={"type": "RollingUpdate"})))
+
+    def test_a_survivable_max_unavailable_is_never_flagged(self):
+        self.assertIsNone(self.check(self.wl(strategy=self.rolling(1))))
+        self.assertIsNone(self.check(self.wl(strategy=self.rolling(2))))
+
+    def test_a_statefulset_is_never_flagged(self):
+        # `spec.strategy` is a Deployment field; a StatefulSet's is
+        # `updateStrategy` and cannot express this.
+        self.assertIsNone(self.check(self.wl(kind="StatefulSet", strategy={"type": "Recreate"})))
+
+    def test_a_daemonset_is_never_flagged(self):
+        self.assertIsNone(self.check(self.wl(kind="DaemonSet", strategy={"type": "Recreate"})))
+
+    def test_an_unparseable_max_unavailable_stays_quiet(self):
+        # A templating accident leaves `{{ .Values.surge }}` in the field. It
+        # is not evidence of an outage, so it is not reported as one.
+        self.assertIsNone(self.check(self.wl(strategy=self.rolling("{{ .Values.mu }}"))))
+        self.assertIsNone(self.check(self.wl(strategy=self.rolling("many%"))))
+
+
+class TestCronjobRunsOverlap(unittest.TestCase):
+    """§3.15. Measured from the retained Jobs, never predicted from the cron.
+
+    The collector has no clock and does not parse cron expressions, so this
+    compares the longest completed run against the widest gap between retained
+    Job creations. A hit therefore says the schedule *has already* overlapped,
+    not that its policy would let it.
+    """
+
+    def hits(self, *items):
+        return collect.check_cronjob_runs_overlap(context_of(dump_of(*items)))
+
+    def runs(self, *spans, **cj):
+        """A CronJob plus one Job per (created, started, completed) triple."""
+        return [cronjob(**cj)] + [
+            job(f"j{i}", created=c, started=s, completed=e) for i, (c, s, e) in enumerate(spans)
+        ]
+
+    def overlapping(self, **cj):
+        # Fires every 10 minutes; the middle run takes 15 and is still going
+        # when the next one starts.
+        return self.runs(
+            ("2026-09-06T20:00:00Z", "2026-09-06T20:00:00Z", "2026-09-06T20:05:00Z"),
+            ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:25:00Z"),
+            ("2026-09-06T20:20:00Z", "2026-09-06T20:20:00Z", "2026-09-06T20:24:00Z"),
+            **cj,
+        )
+
+    def test_a_run_longer_than_its_period_is_flagged(self):
+        hits = self.hits(*self.overlapping())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "CronJob/cj")
+        self.assertEqual(hits[0]["namespace"], "default")
+
+    def test_the_excerpt_carries_both_measurements_and_the_job_it_read_them_from(self):
+        # The remediation is a one-field edit whose whole justification is that
+        # the run outlasts the period, so the finding has to show both numbers
+        # and name the Job a reader can go and check.
+        excerpt = self.hits(*self.overlapping())[0]["excerpt"]
+        self.assertIn("slowest retained run j1 took 15.0m", excerpt)
+        self.assertIn("observed period of 10.0m", excerpt)
+        self.assertIn("across 3 retained Job(s)", excerpt)
+        self.assertIn("'0 * * * *'", excerpt)
+
+    def test_an_unset_concurrency_policy_is_named_as_a_default(self):
+        # Almost every hit will be this one: `Allow` is what you get by writing
+        # nothing, so the finding says the field is absent rather than implying
+        # someone chose it.
+        self.assertIn("concurrencyPolicy unset (defaults to Allow)", self.hits(*self.overlapping())[0]["excerpt"])
+
+    def test_an_explicit_allow_is_named_as_a_choice(self):
+        items = self.overlapping()
+        items[0]["spec"]["concurrencyPolicy"] = "Allow"
+        excerpt = self.hits(*items)[0]["excerpt"]
+        self.assertIn("concurrencyPolicy=Allow", excerpt)
+        self.assertNotIn("unset", excerpt)
+
+    def test_a_run_exactly_as_long_as_the_period_is_flagged(self):
+        # The next run starts as this one ends; the floor is inclusive because
+        # that is already a pile-up at any jitter.
+        self.assertEqual(
+            len(
+                self.hits(
+                    *self.runs(
+                        ("2026-09-06T20:00:00Z", "2026-09-06T20:00:00Z", "2026-09-06T20:10:00Z"),
+                        ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:20:00Z"),
+                        ("2026-09-06T20:20:00Z", "2026-09-06T20:20:00Z", "2026-09-06T20:30:00Z"),
+                    )
+                )
+            ),
+            1,
+        )
+
+    def test_forbid_is_never_flagged(self):
+        items = self.overlapping()
+        items[0]["spec"]["concurrencyPolicy"] = "Forbid"
+        self.assertEqual(self.hits(*items), [])
+
+    def test_replace_is_never_flagged(self):
+        # Both bound the pile-up. Which one is right is a real decision about
+        # the workload, and this check does not have the standing to make it.
+        items = self.overlapping()
+        items[0]["spec"]["concurrencyPolicy"] = "Replace"
+        self.assertEqual(self.hits(*items), [])
+
+    def test_a_suspended_cronjob_is_never_flagged(self):
+        self.assertEqual(self.hits(*self.overlapping(suspend=True)), [])
+
+    def test_a_run_shorter_than_its_period_is_never_flagged(self):
+        self.assertEqual(
+            self.hits(
+                *self.runs(
+                    ("2026-09-06T20:00:00Z", "2026-09-06T20:00:00Z", "2026-09-06T20:01:00Z"),
+                    ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:02:00Z"),
+                    ("2026-09-06T20:20:00Z", "2026-09-06T20:20:00Z", "2026-09-06T20:21:00Z"),
+                )
+            ),
+            [],
+        )
+
+    def test_two_retained_jobs_are_too_few_to_read_a_period_from(self):
+        # One gap is not a period: `successfulJobsHistoryLimit` defaults to 3,
+        # so two Jobs usually means the schedule has only just started.
+        self.assertEqual(
+            self.hits(
+                *self.runs(
+                    ("2026-09-06T20:00:00Z", "2026-09-06T20:00:00Z", "2026-09-06T20:30:00Z"),
+                    ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:40:00Z"),
+                )
+            ),
+            [],
+        )
+
+    def test_the_widest_gap_is_the_period_not_the_narrowest(self):
+        # Retained Jobs are a sample with holes in it -- a deleted Job, a
+        # missed schedule -- and the narrowest gap would read an hourly job
+        # that once fired twice in a minute as a 1-minute schedule. Widest
+        # overestimates the period, which makes the check quieter.
+        self.assertEqual(
+            self.hits(
+                *self.runs(
+                    ("2026-09-06T20:00:00Z", "2026-09-06T20:00:00Z", "2026-09-06T20:05:00Z"),
+                    ("2026-09-06T20:01:00Z", "2026-09-06T20:01:00Z", "2026-09-06T20:06:00Z"),
+                    ("2026-09-06T21:00:00Z", "2026-09-06T21:00:00Z", "2026-09-06T21:05:00Z"),
+                )
+            ),
+            [],
+        )
+
+    def test_a_history_with_nothing_completed_says_nothing(self):
+        # A Job with a `startTime` and no `completionTime` is either wedged or
+        # slow, and guessing which is how this check would invent findings.
+        self.assertEqual(
+            self.hits(
+                cronjob(),
+                job("j0", created="2026-09-06T20:00:00Z", started="2026-09-06T20:00:00Z"),
+                job("j1", created="2026-09-06T20:10:00Z", started="2026-09-06T20:10:00Z"),
+                job("j2", created="2026-09-06T20:20:00Z", started="2026-09-06T20:20:00Z"),
+            ),
+            [],
+        )
+
+    def test_a_completion_before_its_start_is_ignored(self):
+        # Clock skew between the apiserver and a node writes these, and a
+        # negative duration is not a long run.
+        self.assertEqual(
+            self.hits(
+                *self.runs(
+                    ("2026-09-06T20:00:00Z", "2026-09-06T20:05:00Z", "2026-09-06T20:00:00Z"),
+                    ("2026-09-06T20:10:00Z", "2026-09-06T20:15:00Z", "2026-09-06T20:10:00Z"),
+                    ("2026-09-06T20:20:00Z", "2026-09-06T20:25:00Z", "2026-09-06T20:20:00Z"),
+                )
+            ),
+            [],
+        )
+
+    def test_an_unparseable_creation_timestamp_is_dropped_from_the_sample(self):
+        # Two parseable stamps left is under the floor, so the CronJob goes
+        # unreported rather than taking the cluster's whole collection down.
+        self.assertEqual(
+            self.hits(
+                *self.runs(
+                    ("whenever", "2026-09-06T20:00:00Z", "2026-09-06T20:30:00Z"),
+                    ("2026-09-06T20:10:00Z", "2026-09-06T20:10:00Z", "2026-09-06T20:40:00Z"),
+                    ("2026-09-06T20:20:00Z", "2026-09-06T20:20:00Z", "2026-09-06T20:50:00Z"),
+                )
+            ),
+            [],
+        )
+
+    def test_the_shared_joiner_still_applies_the_standard_exclusions(self):
+        # S1/S2/S4 live in `cronjobs_with_jobs`, so this check inherits them
+        # rather than restating them -- which is only true while it keeps
+        # reading `context["cronjobs"]`.
+        self.assertEqual(self.hits(*self.overlapping(ns="kube-system")), [])
+        self.assertEqual(self.hits(*self.overlapping(labels={collect.OPT_OUT_KEY: "exempt"})), [])
+        self.assertEqual(
+            self.hits(*self.overlapping(annotations={collect.OPT_OUT_KEY: "exempt"})), []
+        )
+
+    def test_the_finding_names_what_reconciles_the_cronjob(self):
+        items = self.overlapping()
+        items[0]["metadata"]["annotations"] = {
+            "meta.helm.sh/release-name": "kube-agents",
+            "meta.helm.sh/release-namespace": "kubeagents-system",
+        }
+        self.assertIn("kube-agents", self.hits(*items)[0]["reconciler"])
+
+    def test_a_failing_schedule_can_be_both_this_and_3_12(self):
+        # The two checks read different fields and name different fixes, so a
+        # CronJob whose runs overlap *and* have stopped succeeding owes both
+        # findings rather than whichever one is evaluated first.
+        items = self.overlapping()
+        for item in items[1:]:
+            item["status"]["failed"] = 1
+        self.assertEqual(len(self.hits(*items)), 1)
+        self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -1824,12 +2301,15 @@ class TestCollectCluster(unittest.TestCase):
         self.assertEqual(set(na), workload_slugs)
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, and a CronJob that
-        # has stopped succeeding are all still true of a cluster whose
-        # *workload* set is empty. 3.12 in particular is only ever reachable
-        # this way -- a CronJob is not a workload, so a cluster that holds
-        # nothing else still owes the check an answer.
+        # has stopped succeeding or whose runs overlap are all still true of a
+        # cluster whose *workload* set is empty. 3.12 and 3.15 in particular
+        # are only ever reachable this way -- a CronJob is not a workload, so a
+        # cluster that holds nothing else still owes both checks an answer.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
-        self.assertEqual(cluster_slugs, {"hpa-cannot-scale", "blocking-pdb", "schedule-never-succeeds"})
+        self.assertEqual(
+            cluster_slugs,
+            {"hpa-cannot-scale", "blocking-pdb", "schedule-never-succeeds", "cronjob-runs-overlap"},
+        )
         self.assertFalse(cluster_slugs & set(na))
         # §6 reads `commands` as the list of checks that ran, so a slug cannot
         # be in both.
