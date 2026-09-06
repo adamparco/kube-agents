@@ -179,7 +179,11 @@ own.
 
 **The Declaration Rule — where that file goes.** A remediation that changes an object the repo
 already declares goes to that declaration: locate it (`grep -rl "name: <object>" --include='*.yaml'
-.`), name that file's repo-relative path, and rewrite it as the object's complete desired manifest.
+<workspace>`), name that file's repo-relative path, and rewrite it as the object's complete desired
+manifest. **Root that grep at the `workspace` path `start` gave you, never at `.`.** Your working
+directory is not the clone, and the directory above the clone holds one clone per stream — so a bare
+`.` returns the same declaration once per stream, and the collision rule that closes this paragraph
+then reads one declared object as many and sends a perfectly declarable fix to `kind: manual`.
 Open the hits before trusting them — `grep` is kind-blind and unanchored, so it also matches
 `app.kubernetes.io/name:` label lines and objects whose names merely share a prefix, and a hit is
 not a declaration until you have opened it and confirmed it declares the object you observed, on the

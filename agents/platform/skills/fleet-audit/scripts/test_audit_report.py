@@ -16249,6 +16249,59 @@ class TestDispatchAndHandover(unittest.TestCase):
             with self.subTest(doc=doc):
                 self.assertEqual([], pattern.findall(self.read(doc)))
 
+    def test_every_declaration_grep_is_rooted_at_the_workspace_clone(self):
+        """A bare `.` here does not find nothing -- it finds the same file nine times.
+
+        The Declaration Rule decides `manifest` against `manual`, and it
+        decides it from a grep the SOP hands the model verbatim. Three SOPs and
+        SKILL.md itself rooted that grep at `.`. The session's working
+        directory is `/opt/data` -- the gateway's own cwd, which every run
+        inherits -- and `/opt/data/gitops` beneath it holds one clone of the
+        repository per stream, so `.` returns one hit per clone: on 2026-09-05
+        five copies of
+        `clusters/spot-capacity-test/workloads/fleet-waste-overrequest-fixtures.yaml`,
+        in five directories. The rule's own next sentence then fires -- "hits
+        landing in more than one directory ... and the finding is `kind:
+        manual`" -- so a guard written to stop a fix landing in the wrong
+        cluster's tree instead demoted every declarable fix in the stream.
+
+        The streams split exactly along the root. `fleet-wide-cost-analysis`,
+        rooted at `<workspace>`, published `kind: manifest` with the correct
+        path for `Deployment/waste-cpu-only`; `obtainability-audit` and
+        `ai-security-audit`, rooted at `.`, published `manual` against those
+        same objects while claiming the repository did not declare them.
+
+        Scoped to both greps, not to the Declaration Rule's own line: the
+        create case narrows by `namespace:` first and roots that one the same
+        way, so leaving it out would watch half the rule.
+        """
+        pattern = re.compile(
+            r"grep -rl \"(?:name|namespace): <[^>]+>\" --include='\*\.yaml' (\S+?)`"
+        )
+        docs = [f"governance/{audit_report.audit_sop(a)}" for a in audit_report.AUDITS]
+        docs.append("skills/fleet-audit/SKILL.md")
+        checked = 0
+        for doc in docs:
+            for root in pattern.findall(self.read(doc)):
+                checked += 1
+                with self.subTest(doc=doc, root=root):
+                    self.assertEqual(
+                        "<workspace>",
+                        root,
+                        f"{doc} roots a declaration grep at `{root}`. Only the "
+                        "`workspace` path `start` reports is the clone; any "
+                        "other root sees one clone per stream and trips the "
+                        "rule's own more-than-one-directory demotion.",
+                    )
+        # A re-spelled command would leave the regex matching nothing and this
+        # test passing on an empty sweep, which is the failure it exists to stop.
+        self.assertGreaterEqual(
+            checked,
+            10,
+            "the declaration-grep regex matched almost nothing; the SOPs have "
+            "likely re-spelled the command and this test has gone blind",
+        )
+
     def test_every_sop_passes_the_manifest_to_finish(self):
         """`--manifest-file` is optional to the parser and mandatory in practice.
 
