@@ -2383,13 +2383,114 @@ def _ai_containers(spec: dict) -> list[dict]:
     return (spec.get("containers") or []) + (spec.get("initContainers") or [])
 
 
+# Programs whose inline-code flag turns the token after it into a command line
+# (`sh`, and the shells that accept `-c`), and programs where it turns that token
+# into source in some other language (`python -c`, `node -e`). The distinction
+# decides what the tokens are worth reading as, so the two lists stay separate.
+_INLINE_CODE_SHELLS = ("sh", "bash", "ash", "dash", "zsh", "ksh")
+_INLINE_CODE_INTERPRETERS = ("python", "python2", "python3", "node", "nodejs", "perl", "ruby")
+# `-c`, and the bundles a shell is routinely invoked with: `-ec`, `-lc`, `-exc`.
+_SHELL_INLINE_FLAG_RE = re.compile(r"^-[a-z]*c$")
+_INTERPRETER_INLINE_FLAG_RE = re.compile(r"^-(c|e)$")
+
+
+def _container_argv(container: dict) -> list[str]:
+    """`command` then `args`, the order the kubelet hands them to the process.
+
+    `command` overrides the image's ENTRYPOINT and `args` its CMD, so this is the
+    process's real argv. The order is load-bearing for anything reading a flag's
+    value out of the next token: a `--model` ending `command` takes its value from
+    the first element of `args`, and the reversed concatenation this replaced
+    reported the flag with nothing beside it.
+    """
+    return [str(t) for t in (container.get("command") or [])] + [
+        str(t) for t in (container.get("args") or [])
+    ]
+
+
+class _Argv(NamedTuple):
+    """How one container's `command`/`args` resolve for the checks that read them.
+
+    `tokens` is everything worth searching for a literal; `flags` is the subset a
+    flag parser actually receives, which is empty when nothing in the container
+    parses flags at all. See `_resolve_argv`.
+    """
+
+    tokens: list[str]
+    flags: list[str]
+
+
+def _resolve_argv(container: dict) -> _Argv:
+    """The tokens a flag-parsing model loader in this container actually receives.
+
+    A check that reads `--model` out of a manifest is claiming some argument
+    parser will act on it, and `command:` is what decides whether one ever sees
+    it. Three shapes, and only the third differs from the flat token list:
+
+    * **No `command:`** -- the image's own ENTRYPOINT is the model server and
+      `args` are the flags it parses. Every workload that runs its image the way
+      the publisher shipped it, including this fleet's `ai-embeddings-tei`.
+    * **A `command:` naming a program** -- `["python3", "-m", "vllm.entrypoints.
+      openai.api_server"]`, `["text-generation-launcher"]`. The program parses the
+      rest, so the whole argv counts.
+    * **A `command:` invoking inline code** -- everything after the code string is
+      a positional argument to that inline program (`$0`, `$1`, `sys.argv[1:]`),
+      not a flag. Under `sh -c` the code string *is* a command line, so its words
+      are what a parser sees and are returned in place of the positionals -- which
+      also finds the `--model` in `sh -c "vllm serve --model foo"` that a
+      token-prefix match cannot see, because no single token starts with it. Under
+      `python -c` or `node -e` the code string is source in another language and
+      nothing here parses flags at all, so this returns nothing.
+
+    That last case is not hypothetical. On 2026-09-06 this fleet published
+    `CronJob/ai-batch-finetune` as a `major` 3.4 finding reading `--model
+    meta-llama/Llama-3.1-8B-Instruct with no --revision`, against a container whose
+    entrypoint is `python3 -c "print('fixture; never scheduled')"`. The flag lands
+    in `sys.argv` beside a print statement, no model is fetched at any point, the
+    published impact ("the bytes that arrive at the next pod restart are whatever
+    the source serves then") describes something that cannot happen, and the
+    prescribed fix -- add `--revision <sha>` beside it -- changes nothing.
+
+    3.2 deliberately does not use this. Its predicate is the textual presence of a
+    trust directive anywhere the container carries one, and `trust_remote_code=True`
+    written inside a `python -c` one-liner is a real instruction to the loader, not
+    an inert flag. Different claim, different token set -- so this returns both.
+    """
+    command = [str(t) for t in (container.get("command") or [])]
+    args = [str(t) for t in (container.get("args") or [])]
+    argv = command + args
+    if not command:
+        return _Argv(argv, args)
+    program = command[0].rsplit("/", 1)[-1]
+    shell = program in _INLINE_CODE_SHELLS
+    if not shell and program not in _INLINE_CODE_INTERPRETERS:
+        return _Argv(argv, argv)
+    flag_re = _SHELL_INLINE_FLAG_RE if shell else _INTERPRETER_INLINE_FLAG_RE
+    for i, token in enumerate(argv[1:], start=1):
+        if not flag_re.fullmatch(token) or i + 1 >= len(argv):
+            continue
+        if not shell:
+            return _Argv(argv, [])
+        try:
+            words = shlex.split(argv[i + 1])
+        except ValueError:
+            # Unbalanced quoting. Read nothing rather than guess at a split, for
+            # the same reason the interpreter arm returns nothing: a wrong token
+            # list is a finding about an argument the process never receives.
+            return _Argv(argv, [])
+        # The words replace the code string rather than joining it, so a URL
+        # inside a `sh -c` line is reported once, as itself, instead of twice --
+        # once more with the whole command line labelled "plaintext URL".
+        return _Argv(argv[: i + 1] + words + argv[i + 2 :], words)
+    return _Argv(argv, argv)
+
+
 TRUST_REMOTE_CODE_ARG_RE = re.compile(r"trust[-_]remote[-_]code(?!=(0|false|no))", re.IGNORECASE)
 TRUST_REMOTE_CODE_ENV_NAME_RE = re.compile(r"TRUST_REMOTE_CODE", re.IGNORECASE)
 
 
 def _container_trusts_remote_code(c: dict) -> bool:
-    tokens = [str(t) for t in (c.get("args") or [])] + [str(t) for t in (c.get("command") or [])]
-    if any(TRUST_REMOTE_CODE_ARG_RE.search(t) for t in tokens):
+    if any(TRUST_REMOTE_CODE_ARG_RE.search(t) for t in _resolve_argv(c).tokens):
         return True
     for e in c.get("env") or []:
         if TRUST_REMOTE_CODE_ENV_NAME_RE.search(e.get("name") or "") and str(e.get("value", "")).lower() in ("1", "true", "yes"):
@@ -2467,17 +2568,22 @@ def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict 
     bad = []
     escalate = False
     for c in _ai_containers(workload["spec"]):
-        args_cmd = [str(a) for a in (c.get("args") or [])] + [str(a) for a in (c.get("command") or [])]
+        argv = _resolve_argv(c)
         env_vals = [str(e.get("value", "")) for e in (c.get("env") or [])]
-        urls = [v for v in args_cmd + env_vals if AI_URL_RE.search(v)]
+        urls = list(dict.fromkeys(v for v in argv.tokens + env_vals if AI_URL_RE.search(v)))
+        # The flag arm reads only what a flag parser in this container would see,
+        # which is not always the whole argv -- see `_resolve_argv`. The URL arm
+        # above stays on every token, because a plaintext fetch is a plaintext
+        # fetch whoever issues it.
+        flag_argv = argv.flags
         # `--model=x` carries its value; bare `--model x` leaves it in the next
         # argument, and reporting the flag without the model name names nothing.
         models = [
-            a if "=" in a else " ".join(args_cmd[i : i + 2])
-            for i, a in enumerate(args_cmd)
+            a if "=" in a else " ".join(flag_argv[i : i + 2])
+            for i, a in enumerate(flag_argv)
             if AI_MODEL_FLAG_RE.search(a)
         ]
-        has_revision_flag = any(AI_REVISION_FLAG_RE.search(a) for a in args_cmd)
+        has_revision_flag = any(AI_REVISION_FLAG_RE.search(a) for a in flag_argv)
         # Name the value that tripped the check, not just the container it sat
         # in. The two conditions fail for different reasons and take different
         # fixes -- a plaintext URL wants a digest-addressed source, an

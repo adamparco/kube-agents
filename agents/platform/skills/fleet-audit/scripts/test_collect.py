@@ -3929,6 +3929,92 @@ class TestNormalizeAiWorkloads(unittest.TestCase):
                 self.assertFalse(collect.normalize_ai_workloads(dump_of(ai_workload(kind, "w")))[0]["suspended"])
 
 
+class TestResolveArgv(unittest.TestCase):
+    """Which tokens a flag parser in the container actually receives.
+
+    The published defect this exists for: `CronJob/ai-batch-finetune` reported
+    `--model … with no --revision` against `command: ["python3", "-c", "print(…)"]`,
+    where the flag reaches a print statement and the prescribed `--revision` fix
+    changes nothing.
+    """
+
+    def flags(self, container):
+        return collect._resolve_argv(container).flags
+
+    def tokens(self, container):
+        return collect._resolve_argv(container).tokens
+
+    def test_no_command_leaves_args_to_the_image_entrypoint(self):
+        self.assertEqual(self.flags({"args": ["--model", "x"]}), ["--model", "x"])
+
+    def test_a_plain_command_parses_the_whole_argv(self):
+        self.assertEqual(
+            self.flags({"command": ["python3", "-m", "vllm.entrypoints.api_server"], "args": ["--model", "x"]}),
+            ["python3", "-m", "vllm.entrypoints.api_server", "--model", "x"],
+        )
+
+    def test_a_non_interpreter_command_is_never_read_as_inline_code(self):
+        # `-c` means something else to most programs, so the inline-code rule
+        # only applies to a shell or an interpreter that documents the flag.
+        self.assertEqual(
+            self.flags({"command": ["tritonserver", "-c", "cfg"], "args": ["--model", "x"]}),
+            ["tritonserver", "-c", "cfg", "--model", "x"],
+        )
+
+    def test_an_interpreter_one_liner_parses_nothing(self):
+        self.assertEqual(self.flags({"command": ["python3", "-c", "print('hi')"], "args": ["--model", "x"]}), [])
+
+    def test_node_uses_the_other_inline_flag(self):
+        self.assertEqual(self.flags({"command": ["node", "-e", "console.log(1)"], "args": ["--model", "x"]}), [])
+
+    def test_an_interpreter_without_an_inline_flag_still_parses(self):
+        self.assertEqual(
+            self.flags({"command": ["python3", "serve.py"], "args": ["--model", "x"]}),
+            ["python3", "serve.py", "--model", "x"],
+        )
+
+    def test_a_shell_one_liner_is_read_as_the_command_line_it_is(self):
+        self.assertEqual(
+            self.flags({"command": ["sh", "-c", "vllm serve --model foo"]}),
+            ["vllm", "serve", "--model", "foo"],
+        )
+
+    def test_a_bundled_shell_flag_counts(self):
+        self.assertEqual(self.flags({"command": ["/bin/bash", "-lc", "vllm --model foo"]}), ["vllm", "--model", "foo"])
+
+    def test_the_shell_code_may_arrive_in_args(self):
+        # `command: ["sh", "-c"]` with the script as `args[0]` is as common as
+        # putting the whole thing in `command`.
+        self.assertEqual(self.flags({"command": ["sh", "-c"], "args": ["vllm --model foo"]}), ["vllm", "--model", "foo"])
+
+    def test_positionals_after_the_shell_code_are_not_flags(self):
+        self.assertEqual(self.flags({"command": ["sh", "-c", "echo hi"], "args": ["--model", "x"]}), ["echo", "hi"])
+
+    def test_unbalanced_quoting_reads_nothing_rather_than_guessing(self):
+        self.assertEqual(self.flags({"command": ["sh", "-c", "vllm --model 'foo"]}), [])
+
+    def test_an_empty_container_has_no_tokens(self):
+        self.assertEqual(collect._resolve_argv({}), ([], []))
+
+    def test_tokens_are_command_then_args(self):
+        # Kubernetes order, and the order a value-after-flag read depends on.
+        self.assertEqual(self.tokens({"command": ["serve", "--model"], "args": ["x"]}), ["serve", "--model", "x"])
+
+    def test_shell_words_replace_the_code_string_they_came_from(self):
+        # Replaced, not appended: keeping both reports one URL twice, the second
+        # time with the whole command line labelled as the URL.
+        self.assertEqual(
+            self.tokens({"command": ["sh", "-c", "curl http://h/m -o /w"], "args": ["extra"]}),
+            ["sh", "-c", "curl", "http://h/m", "-o", "/w", "extra"],
+        )
+
+    def test_an_interpreter_one_liner_keeps_its_source_in_the_tokens(self):
+        # 3.2 reads `tokens`, and a directive written into the source is real.
+        self.assertIn(
+            "print('hi')", self.tokens({"command": ["python3", "-c", "print('hi')"], "args": ["--model", "x"]})
+        )
+
+
 class TestModelRemoteCodeTrusted(unittest.TestCase):
     def hit(self, container):
         w = ai_workload(container=container)
@@ -3956,6 +4042,25 @@ class TestModelRemoteCodeTrusted(unittest.TestCase):
         w = collect.normalize_ai_workloads(dump_of(w))[0]
         hit = collect.check_model_remote_code_trusted(w, {})
         self.assertIn("fetch", hit["excerpt"])
+
+    def test_a_directive_inside_an_interpreter_one_liner_still_counts(self):
+        # 3.4's flag arm reads nothing here, because nothing parses flags. 3.2
+        # reads everything, because `trust_remote_code=True` written into the
+        # source *is* the instruction to the loader, not an inert argument.
+        self.assertIsNotNone(
+            self.hit(
+                {
+                    "command": [
+                        "python3",
+                        "-c",
+                        "from transformers import AutoModel; AutoModel.from_pretrained('m', trust_remote_code=True)",
+                    ]
+                }
+            )
+        )
+
+    def test_a_directive_inside_a_shell_one_liner_counts(self):
+        self.assertIsNotNone(self.hit({"command": ["sh", "-c", "vllm serve --trust-remote-code"]}))
 
 
 class TestWeightsMountWritable(unittest.TestCase):
@@ -4099,6 +4204,70 @@ class TestModelArtifactUnpinnedSource(unittest.TestCase):
         self.assertNotIn("SECRET", hit["excerpt"])
         self.assertNotIn("pw", hit["excerpt"])
         self.assertIn("example.com/m.bin", hit["excerpt"])
+
+    def test_does_not_flag_a_model_flag_no_entrypoint_parses(self):
+        # The published defect: `python3 -c "print(…)"` puts `--model` in
+        # `sys.argv` beside a print statement. No model is fetched, so there is
+        # no unpinned source, and adding `--revision` beside it fixes nothing.
+        self.assertIsNone(
+            self.hit({"command": ["python3", "-c", "print('never scheduled')"], "args": ["--model", "m"]})
+        )
+
+    def test_still_flags_a_model_flag_a_real_entrypoint_parses(self):
+        self.assertIsNotNone(
+            self.hit({"command": ["python3", "-m", "vllm.entrypoints.api_server"], "args": ["--model", "m"]})
+        )
+
+    def test_flags_a_model_reference_inside_a_shell_one_liner(self):
+        # The flag is mid-token here, so the token-prefix read that predates
+        # `_container_flag_argv` found nothing at all.
+        hit = self.hit({"command": ["sh", "-c", "vllm serve --model meta-llama/Llama-3"]})
+        self.assertIn("--model meta-llama/Llama-3", hit["excerpt"])
+
+    def test_a_revision_inside_the_same_shell_one_liner_clears_it(self):
+        self.assertIsNone(self.hit({"command": ["sh", "-c", "vllm serve --model m --revision abc123"]}))
+
+    def test_a_url_is_still_reported_when_no_entrypoint_parses_flags(self):
+        # The flag arm goes quiet; the fetch does not. Whoever issues it, a
+        # plaintext download is a plaintext download.
+        hit = self.hit(
+            {
+                "command": ["python3", "-c", "print('x')"],
+                "env": [{"name": "MODEL_URL", "value": "http://example.com/m.bin"}],
+            }
+        )
+        self.assertIn("http://example.com/m.bin", hit["excerpt"])
+        self.assertNotIn("no --revision", hit["excerpt"])
+
+    def test_a_url_in_the_argv_survives_an_entrypoint_that_parses_no_flags(self):
+        # Same point as the test above, one step further in: the URL arm reads
+        # every token, not the narrowed flag set, so it finds this one even
+        # though nothing in the container parses `--weights`.
+        hit = self.hit({"command": ["python3", "-c", "print('x')"], "args": ["--weights", "http://example.com/m.bin"]})
+        self.assertIn("http://example.com/m.bin", hit["excerpt"])
+
+    def test_a_url_in_both_an_argument_and_an_env_var_is_reported_once(self):
+        hit = self.hit(
+            {
+                "args": ["--weights", "http://example.com/m.bin"],
+                "env": [{"name": "MODEL_URL", "value": "http://example.com/m.bin"}],
+            }
+        )
+        self.assertEqual(hit["excerpt"].count("example.com/m.bin"), 1)
+
+    def test_finds_a_url_buried_mid_token_in_a_shell_one_liner(self):
+        hit = self.hit({"command": ["sh", "-c", "curl http://example.com/m.bin -o /w"]})
+        self.assertIn("http://example.com/m.bin", hit["excerpt"])
+
+    def test_reports_a_url_once_when_it_is_both_a_token_and_a_shell_word(self):
+        hit = self.hit({"command": ["sh", "-c", "http://example.com/m.bin | tee /w"]})
+        self.assertEqual(hit["excerpt"].count("example.com/m.bin"), 1)
+
+    def test_pairs_a_flag_ending_command_with_its_value_in_args(self):
+        # `command + args` is the kubelet's order; the reversed concatenation
+        # this replaced reported `--model` with nothing beside it.
+        hit = self.hit({"command": ["serve", "--model"], "args": ["meta-llama/Llama-3"]})
+        self.assertIn("--model meta-llama/Llama-3", hit["excerpt"])
 
 
 class TestModelCredentialPlaintextEnv(unittest.TestCase):
