@@ -179,6 +179,40 @@ OVERREQUEST_RESIZE_FLOOR_MIB = 64.0
 # The headroom multiplier §3.1 sizes a resized request at.
 OVERREQUEST_PEAK_MULTIPLIER = 2
 
+# `idle-workload` takes the population the two floors above drop between them:
+# a controller whose resize is a no-op on every dimension it declares. The
+# comment on the resize floors is right that no manifest edit closes such a
+# finding, and wrong that there is therefore nothing to say. A workload sitting
+# at the smallest request the platform will admit, using a twentieth of it for
+# a month, is not mis-sized -- it is unused, and the edit that reclaims it is
+# deleting the file, which is a pull request the resize never was.
+#
+# The same bar as `check_overrequest`, on purpose. What separates the two
+# checks is not how idle a workload is but whether anything can be done about
+# it: 3.1 takes the shrinkable ones, this takes the rest. A second, stricter
+# threshold here would be a number to defend with nothing deciding on it, and
+# the first attempt at one -- 5%, read off a report that quoted peaks rather
+# than ratios -- excluded all four workloads the check exists to find. Their
+# memory sits at 6.6% to 14.7% of a 64Mi request, because 64Mi is the floor
+# and a process that does nothing still maps a few MiB of libc.
+#
+# 3.1 applies it per dimension; this applies it to every dimension the
+# controller declares, which is what makes the finding "nobody is using this"
+# rather than "one dimension is oversized". On the live fleet that distinction
+# is what excludes `cert-manager` (17% CPU but 95% memory), its webhook (7%
+# and 68%) and `kube-agents-controller-manager` (44% and 55%) while admitting
+# the four `hello-world`-class Deployments.
+IDLE_WORKLOAD_UTILISATION = 0.2
+# Long enough that a staging environment idle over a release freeze, or
+# anything else with a duty cycle measured in days, has had a chance to run.
+# Measured against the controller's own `creationTimestamp`, not its pods':
+# GKE recreates a pod on every node upgrade, so the four Deployments this
+# check finds have run untouched for 28 to 35 days behind pods 4.7 to 7.8 days
+# old. Gating on the pod would have excluded all four -- and would have gone
+# on excluding them, since nothing on a managed platform keeps a pod for a
+# fortnight.
+IDLE_WORKLOAD_MIN_AGE_DAYS = 14
+
 # `check_underrequest`'s floor is on the overage -- how far sustained usage sits
 # above the request -- rather than on the request, because that overage is the
 # quantity doing the harm: it is what the scheduler failed to book on the node,
@@ -657,6 +691,7 @@ def build_context(dump: dict) -> dict:
         "namespaces": _by_kind(dump, "Namespace"),
         "resourcequotas": _by_kind(dump, "ResourceQuota"),
         "statefulsets": _by_kind(dump, "StatefulSet"),
+        "deployments": _by_kind(dump, "Deployment"),
     }
 
 
@@ -1464,8 +1499,13 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         # on the sixteen-cluster fleet today; this keeps one from being
         # silently wrong later.
         kind, owner_name = _sizing_owner(meta)
-        entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None})
+        entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None, "labels": {}})
         entry["pods"].append({"ns": ns, "name": name, "requests": requests, "limits": limits})
+        # For `check_idle_workload`'s Service join. Replicas of one controller
+        # share the selector labels by construction, so the first pod's set
+        # answers for the controller; a later pod merges in rather than
+        # replacing, so a rollout mid-flight cannot narrow it.
+        entry["labels"].update(meta.get("labels") or {})
         # A measurement is only as long as the pod that reported it. Monitoring
         # keeps a week of history, but a Deployment rolled an hour ago has an
         # hour of it, and a finding that says "over the trailing 168h" about
@@ -1699,6 +1739,169 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 "excerpt": excerpt,
                 "severity": severity,
                 "_guaranteed": guaranteed,
+            }
+        )
+    return hits
+
+
+def _controller_age_days(context: dict, kind: str, ns: str, name: str, *, now: datetime) -> float | None:
+    """How long the controller itself has existed, or `None` if it is not in
+    the dump.
+
+    Distinct from the oldest pod's age, which is all `_eligible_pods_by_owner`
+    can see. A pod's age measures the last node upgrade as often as it measures
+    the workload: the four Deployments `check_idle_workload` reports have run
+    untouched for a month behind pods under eight days old. The sizing checks
+    are right to clamp their *measurement window* to the pod, since that is how
+    much history exists -- but "has anyone used this since it was created" is a
+    question about the controller.
+    """
+    pool = {"Deployment": "deployments", "StatefulSet": "statefulsets"}.get(kind)
+    if not pool:
+        return None
+    for obj in context.get(pool) or []:
+        meta = obj.get("metadata") or {}
+        if meta.get("namespace", "") == ns and meta.get("name", "") == name:
+            return _age_days(meta.get("creationTimestamp", ""), now=now)
+    return None
+
+
+def _fronting_load_balancers(context: dict, ns: str, labels: dict) -> list[str]:
+    """LoadBalancer Services in `ns` whose selector this controller's pods match.
+
+    Kubernetes' own rule: a selector matches when every one of its pairs is
+    present on the pod, and an empty selector selects nothing here (a Service
+    with no selector is fed by hand-written Endpoints and is not this
+    controller's).
+    """
+    matched = []
+    for svc in context["services"]:
+        spec = svc.get("spec") or {}
+        if spec.get("type") != "LoadBalancer":
+            continue
+        meta = svc.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        selector = spec.get("selector") or {}
+        if selector and all(labels.get(k) == v for k, v in selector.items()):
+            matched.append(f"Service/{meta.get('name', '')}")
+    return sorted(matched)
+
+
+def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> list[dict]:
+    """A controller nothing is using, whose request no resize can lower.
+
+    The complement of `check_overrequest`, and the population `bc437731`
+    deliberately silenced. That commit stopped publishing a sizing finding
+    whose own remediation is a no-op, which was right: a Deployment already at
+    the 50m/64Mi admission floor has no resize to make, and three such findings
+    a week teach a reader to skip the section. What it left behind is the
+    reason they kept appearing -- four `hello-world`-class Deployments on the
+    2026-09-06 fleet, 28 to 35 days old, each holding 50m/64Mi per replica and
+    peaking at 0.2m to 2.1m of CPU and 3 to 6 MiB of memory. Between 0.5% and
+    4% of a reservation, for a month, on workloads whose names say what they
+    are. The audit measured all four correctly and then said nothing about any
+    of them, because the only question it knew how to ask was "what should this
+    request be" and the honest answer was "exactly what it already is".
+
+    So this check asks the other question. Its bar is not "could the request be
+    smaller" but "is anything using this at all", and where the answer is no
+    the remediation is deleting the manifest -- which, unlike the resize, is a
+    pull request somebody can merge.
+
+    The partition with §3.1 is exact and load-bearing: this fires only where
+    `_resize_shrinks_request` is false on every declared dimension, which is
+    precisely where §3.1 does not. No controller can produce both findings, so
+    the report never asks a reader to both shrink and delete the same object.
+    """
+    if not usage_peaks:
+        return []
+    hits = []
+    for (_ns, kind, name), entry in _eligible_pods_by_owner(context, now=now).items():
+        # A controller the dump does not carry -- anything but a Deployment or
+        # a StatefulSet -- has no age to test, and this check does not guess one
+        # from its pods. Skipping is the safe direction: the cost of staying
+        # quiet is another month of a 50m reservation, and the cost of being
+        # wrong is a recommendation to delete something.
+        age_days = _controller_age_days(context, kind, entry["ns"], name, now=now)
+        if age_days is None or age_days < IDLE_WORKLOAD_MIN_AGE_DAYS:
+            continue
+        cpu_req = mem_req = 0.0
+        for pod in entry["pods"]:
+            for req in pod["requests"]:
+                cpu_req += parse_cpu_cores(str(req.get("cpu", "0"))) or 0
+                mem_req += parse_mem_mib(str(req.get("memory", "0"))) or 0
+        if cpu_req == 0 and mem_req == 0:
+            continue
+        replicas = len(entry["pods"])
+
+        peak_cpu = peak_mem = 0.0
+        measured = False
+        for pod in entry["pods"]:
+            key = (pod["ns"], pod["name"])
+            if key in usage_peaks:
+                measured = True
+            cpu, mem = usage_peaks.get(key, (0.0, 0.0))
+            peak_cpu += cpu
+            peak_mem += mem
+        # Same guard as §3.1, and it matters more here. Zero is the most idle a
+        # workload can read, and an unmeasured controller reads as zero on both
+        # dimensions -- so without this, a metrics agent down on one node
+        # produces a recommendation to delete whatever was running there.
+        if not measured:
+            continue
+
+        # Every dimension the controller declares, not just one. A workload
+        # using none of its CPU and all of its memory is doing something.
+        idle = all(
+            peak / req <= IDLE_WORKLOAD_UTILISATION
+            for req, peak in ((cpu_req, peak_cpu), (mem_req, peak_mem))
+            if req
+        )
+        if not idle:
+            continue
+        # The partition with §3.1. Anything shrinkable belongs there.
+        if _resize_shrinks_request(
+            cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+        ) or _resize_shrinks_request(
+            mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+        ):
+            continue
+
+        _, measured_over = _measured_over(entry["oldest_h"])
+        excerpt = (
+            f"requests {cpu_req:.3f} vCPU / {mem_req:.0f} MiB across {replicas} "
+            f"replica{'s' if replicas != 1 else ''}; peak observed "
+            f"{peak_cpu * 1000:.1f}m vCPU / {peak_mem:.1f} MiB {measured_over}. "
+            f"Declared {age_days:.0f} days ago. Every dimension is already at "
+            f"the 50m/64Mi floor, so no resize can reclaim any of it"
+        )
+        # The reservation is the smaller half of the bill. A LoadBalancer
+        # Service in front of an unused Deployment holds a forwarding rule and
+        # an external IP, which on this fleet cost several times the pod. The
+        # 2026-09-06 report priced three of these at roughly $17/month of
+        # Autopilot pod charges while the three L4 rules fronting them ran
+        # about $66 -- and no check joined the two, so the larger number
+        # appeared in neither the finding nor its severity.
+        fronting = _fronting_load_balancers(context, entry["ns"], entry["labels"])
+        if fronting:
+            excerpt += (
+                f". {' and '.join(fronting)} still front{'s' if len(fronting) == 1 else ''} it, "
+                f"so a forwarding rule and its external IP bill for it too — usually "
+                f"several times the pod's own cost"
+            )
+        excerpt += "."
+
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"{kind}/{name}",
+                "excerpt": excerpt,
+                # A floor-bound request is small by construction, so the pod
+                # alone never justifies more than `minor`. The load balancer
+                # does: it is the larger charge, and unlike the pod it is
+                # reachable from the internet while nothing uses it.
+                "severity": "major" if fronting else "minor",
             }
         )
     return hits
@@ -1963,6 +2166,7 @@ IMPACT = {
     "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
     "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
     "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
+    "idle-workload": "Nothing has used this controller for weeks, and its request is already at the platform minimum -- the reservation, and any load balancer in front of it, bill for a workload nobody is calling."
 }
 
 
@@ -2202,7 +2406,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     if cred_run.rc != 0:
         return {"name": name, "project": project, "location": location, **mode, "outcome": "unreachable", "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}"}, empty_facts
 
-    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts"
+    dump_kinds = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy"
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     dump_argv = ["kubectl", "get", dump_kinds, "-A", "-o", "json"]
@@ -2334,6 +2538,10 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             emit("unsized-workload", h)
             for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
         ]
+        # Same peak read again, and the population 3.1 drops: a controller
+        # whose resize would change nothing because nothing is using it.
+        commands["idle-workload"] = usage_record
+        candidates += [emit("idle-workload", h) for h in check_idle_workload(context, usage_peaks, now=now)]
     elif not context["nodes"] and usage_result.rc == 0:
         # A cluster with no nodes cannot be over-requesting: there is no
         # capacity for a reservation to waste, and nothing has run for a
@@ -2372,6 +2580,16 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         )
         not_applicable.append(
             {
+                "check": "idle-workload",
+                "reason": (
+                    "This cluster has no nodes, so no controller holds a "
+                    "reservation and Cloud Monitoring has no usage history to "
+                    "call one unused: nothing ran to report any."
+                ),
+            }
+        )
+        not_applicable.append(
+            {
                 "check": "unsized-workload",
                 "reason": (
                     "This cluster has no nodes, so nothing has run and Cloud "
@@ -2388,8 +2606,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # attached -- a reader saw the check named and had nothing to tell them
         # whether it was denied, throttled, or never attempted.
         limitations.append(
-            f"overrequest and unsized-workload could not be measured on this "
-            f"cluster: {_metrics_gap_phrase(usage_result, 'usage')}"
+            f"overrequest, unsized-workload and idle-workload could not be "
+            f"measured on this cluster: {_metrics_gap_phrase(usage_result, 'usage')}"
         )
 
     if means_ok:

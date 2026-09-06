@@ -195,6 +195,7 @@ AUDITS: dict[str, AuditSpec] = {
             # cross-reference each other instead.
             "underrequest",
             "unsized-workload",
+            "idle-workload",
         ),
         # §3.4–3.6 read Compute Engine objects that belong to a project, not to
         # a cluster; the SOP's §3 project-scoped rule puts them on their own
@@ -215,6 +216,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "scaledown-blocked",
                     "terminal-pods",
                     "idle-namespace",
+                    "idle-workload",
                 ),
             ),
             ("project", ("unattached-disk", "idle-address", "orphan-lb")),

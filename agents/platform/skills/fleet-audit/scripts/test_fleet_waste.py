@@ -1510,6 +1510,240 @@ class OverrequestResizeIsANoOpTest(unittest.TestCase):
         )
 
 
+class IdleWorkloadTest(unittest.TestCase):
+    """§3.13 -- the population §3.1 measures correctly and then cannot act on.
+
+    Every fixture here is a controller `check_overrequest` sees, agrees is
+    idle, and drops because `ceil(peak x 2)` clamps up to the 50m/64Mi it
+    already declares. `test_the_partition_with_overrequest_is_exact` is the
+    load-bearing one: the two checks must never both fire on an object, or the
+    report asks a reader to shrink and delete the same Deployment.
+    """
+
+    NS = "hello-world"
+    HASH = "7d9f8c6b45"
+    POD = "hello-world-7d9f8c6b45-1"
+    # 0.2% of 50m and 9% of 64Mi -- the live shape of all four Deployments this
+    # check found on the 2026-09-06 fleet.
+    IDLE = {(NS, POD): (0.0021, 6.0)}
+
+    def pod(
+        self,
+        name=POD,
+        *,
+        ns=NS,
+        cpu_req="50m",
+        mem_req="64Mi",
+        started="2026-07-25T00:00:00Z",
+        owner_kind="ReplicaSet",
+        owner_name="hello-world-7d9f8c6b45",
+        labels=None,
+    ):
+        requests = {}
+        if cpu_req:
+            requests["cpu"] = cpu_req
+        if mem_req:
+            requests["memory"] = mem_req
+        return obj(
+            "Pod",
+            name,
+            ns=ns,
+            **{
+                "spec.containers": [{"resources": {"requests": requests}}],
+                "status.startTime": started,
+                "status.phase": "Running",
+                "metadata.labels": {"app": "hello-world", "pod-template-hash": self.HASH} if labels is None else labels,
+                "metadata.ownerReferences": [{"kind": owner_kind, "name": owner_name}],
+            },
+        )
+
+    def controller(self, kind="Deployment", name="hello-world", *, ns=NS, created="2026-07-01T00:00:00Z"):
+        return obj(kind, name, ns=ns, **{"metadata.creationTimestamp": created})
+
+    def svc(self, name="hello-world", *, ns=NS, kind="LoadBalancer", selector=None):
+        return obj(
+            "Service",
+            name,
+            ns=ns,
+            **{"spec.type": kind, "spec.selector": {"app": "hello-world"} if selector is None else selector},
+        )
+
+    def context(self, pods=None, controllers=None, services=()):
+        pods = [self.pod()] if pods is None else pods
+        controllers = [self.controller()] if controllers is None else controllers
+        return {
+            "pods": pods,
+            "services": list(services),
+            "deployments": [c for c in controllers if c["kind"] == "Deployment"],
+            "statefulsets": [c for c in controllers if c["kind"] == "StatefulSet"],
+        }
+
+    def hits(self, peaks=None, **kw):
+        return fw.check_idle_workload(self.context(**kw), self.IDLE if peaks is None else peaks, now=NOW)
+
+    def test_flags_a_floor_bound_deployment_nothing_is_using(self):
+        hits = self.hits()
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Deployment/hello-world")
+        self.assertEqual(hits[0]["namespace"], self.NS)
+        self.assertEqual(hits[0]["severity"], "minor")
+        # The three things a reader needs to act: what it holds, that nobody
+        # used it, and that no resize is the answer.
+        self.assertIn("requests 0.050 vCPU / 64 MiB", hits[0]["excerpt"])
+        self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
+        self.assertIn("no resize can reclaim", hits[0]["excerpt"])
+
+    def test_the_partition_with_overrequest_is_exact(self):
+        """Neither check may stay silent on a controller, nor both speak.
+
+        The four Deployments that motivated this check were already reported
+        by §3.1 until `bc437731` dropped them for having a no-op remediation.
+        If the two predicates ever overlap, the same object comes back with
+        one finding saying "resize it" and another saying "delete it".
+        """
+        floor_bound = self.context()
+        # Same controller, same idleness, a request with somewhere to go: 2
+        # vCPU / 4 GiB against a 100m / 100 MiB peak resizes to 200m / 200Mi.
+        shrinkable = self.context(pods=[self.pod(cpu_req="2", mem_req="4Gi")])
+        big_peak = {(self.NS, self.POD): (0.1, 100.0)}
+
+        self.assertEqual(len(fw.check_idle_workload(floor_bound, self.IDLE, now=NOW)), 1)
+        self.assertEqual(fw.check_overrequest(floor_bound, self.IDLE, now=NOW, autopilot=False), [])
+        self.assertEqual(fw.check_idle_workload(shrinkable, big_peak, now=NOW), [])
+        self.assertEqual(len(fw.check_overrequest(shrinkable, big_peak, now=NOW, autopilot=False)), 1)
+
+    def test_one_shrinkable_dimension_sends_the_whole_controller_to_overrequest(self):
+        # Either dimension having somewhere to go is enough, so both halves of
+        # the guard are checked: §3.1 reports the roomy one and says the other
+        # is already floored, and this check must not also claim the object.
+        for cpu_req, mem_req, peak in (("2", "64Mi", (0.1, 6.0)), ("50m", "4Gi", (0.0021, 100.0))):
+            with self.subTest(cpu=cpu_req, mem=mem_req):
+                pods = [self.pod(cpu_req=cpu_req, mem_req=mem_req)]
+                peaks = {(self.NS, self.POD): peak}
+                self.assertEqual(fw.check_idle_workload(self.context(pods=pods), peaks, now=NOW), [])
+                self.assertEqual(
+                    len(fw.check_overrequest(self.context(pods=pods), peaks, now=NOW, autopilot=False)), 1
+                )
+
+    def test_a_dimension_in_use_vetoes_the_finding(self):
+        """`cert-manager`'s shape: 17% of its CPU, 95% of its memory.
+
+        §3.1 is per-dimension because a copy-pasted CPU request beside a
+        carefully sized memory one is the common waste. This check is not: the
+        claim is "nothing uses this", and something using all of its memory
+        refutes it whatever the CPU says.
+        """
+        busy = {(self.NS, self.POD): (0.0085, 60.8)}
+        self.assertEqual(self.hits(peaks=busy), [])
+        # Control: the same request and the same CPU, memory idle -> reported.
+        self.assertEqual(len(self.hits(peaks={(self.NS, self.POD): (0.0085, 6.0)})), 1)
+
+    def test_a_dimension_the_controller_does_not_declare_is_skipped_not_divided(self):
+        # No CPU request at all. The ratio has no denominator, and treating the
+        # absence as a failed test would silence every memory-only controller.
+        pods = [self.pod(cpu_req=None)]
+        self.assertEqual(len(fw.check_idle_workload(self.context(pods=pods), self.IDLE, now=NOW)), 1)
+
+    def test_the_age_gate_reads_the_controller_and_not_its_pods(self):
+        """The regression that made the first live run of this check return zero.
+
+        GKE recreates a pod on every node upgrade, so the four Deployments
+        here ran untouched for a month behind pods under eight days old. A
+        fortnight gate on `status.startTime` excludes all four -- and goes on
+        excluding them, since nothing on a managed platform keeps a pod that
+        long.
+        """
+        young_pod = [self.pod(started="2026-07-30T00:00:00Z")]  # 2 days
+        self.assertEqual(len(fw.check_idle_workload(self.context(pods=young_pod), self.IDLE, now=NOW)), 1)
+        # And the converse: a month-old pod under a Deployment declared
+        # yesterday is a new workload nobody has had a chance to use yet.
+        new_controller = [self.controller(created="2026-07-31T00:00:00Z")]
+        self.assertEqual(
+            fw.check_idle_workload(self.context(controllers=new_controller), self.IDLE, now=NOW), []
+        )
+
+    def test_a_controller_the_dump_does_not_carry_is_skipped(self):
+        # No age to test, and this check does not guess one from the pods. The
+        # safe direction is silence: the cost of that is another month of a
+        # 50m reservation, the cost of a wrong guess is "delete this".
+        self.assertEqual(fw.check_idle_workload(self.context(controllers=[]), self.IDLE, now=NOW), [])
+
+    def test_a_statefulset_is_judged_the_same_way(self):
+        pods = [self.pod(owner_kind="StatefulSet", owner_name="hello-world", labels={"app": "hello-world"})]
+        controllers = [self.controller(kind="StatefulSet")]
+        hits = fw.check_idle_workload(self.context(pods=pods, controllers=controllers), self.IDLE, now=NOW)
+        self.assertEqual([h["object"] for h in hits], ["StatefulSet/hello-world"])
+
+    def test_an_unmeasured_controller_is_not_reported(self):
+        # Absent reads as zero on every dimension, which is maximally idle --
+        # so a metrics agent down on one node would otherwise produce a
+        # recommendation to delete whatever was running there.
+        self.assertEqual(self.hits(peaks={(self.NS, "somebody-else"): (4.0, 8192.0)}), [])
+        self.assertEqual(len(self.hits()), 1)
+
+    def test_no_usage_answer_at_all_reports_nothing(self):
+        self.assertEqual(self.hits(peaks={}), [])
+
+    def test_a_load_balancer_in_front_of_it_is_major(self):
+        """The forwarding rule is the larger half of the bill.
+
+        Three of these on the 2026-09-06 fleet held about $17/month of
+        Autopilot pod charges between them while their three L4 rules ran
+        about $66. No check joined the two, so the bigger number reached
+        neither the finding nor its severity.
+        """
+        hits = self.hits(services=[self.svc()])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+        self.assertIn("Service/hello-world still fronts it", hits[0]["excerpt"])
+        self.assertIn("external IP", hits[0]["excerpt"])
+
+    def test_a_load_balancer_selecting_something_else_is_not_fronting(self):
+        self.assertEqual(self.hits(services=[self.svc(selector={"app": "other"})])[0]["severity"], "minor")
+
+    def test_a_selectorless_service_is_not_fronting(self):
+        # Hand-written Endpoints feed it. Kubernetes matches nothing on an
+        # empty selector, and `all()` over no pairs is True -- so without the
+        # emptiness guard every idle workload in the namespace would inherit
+        # somebody else's load balancer and its severity.
+        self.assertEqual(self.hits(services=[self.svc(selector={})])[0]["severity"], "minor")
+
+    def test_a_cluster_ip_service_holds_no_forwarding_rule(self):
+        self.assertEqual(self.hits(services=[self.svc(kind="ClusterIP")])[0]["severity"], "minor")
+
+    def test_a_load_balancer_in_another_namespace_is_not_fronting(self):
+        self.assertEqual(self.hits(services=[self.svc(ns="elsewhere")])[0]["severity"], "minor")
+
+    def test_a_partial_selector_still_matches(self):
+        # Kubernetes' rule, not a set equality: every pair of the selector has
+        # to be on the pod, and the pod carries `pod-template-hash` besides.
+        self.assertEqual(self.hits(services=[self.svc(selector={"app": "hello-world"})])[0]["severity"], "major")
+
+    def test_replicas_are_summed_and_the_excerpt_says_how_many(self):
+        pods = [self.pod(name=f"hello-world-7d9f8c6b45-{i}") for i in range(3)]
+        peaks = {(self.NS, f"hello-world-7d9f8c6b45-{i}"): (0.0021, 6.0) for i in range(3)}
+        hits = fw.check_idle_workload(self.context(pods=pods), peaks, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("requests 0.150 vCPU / 192 MiB across 3 replicas", hits[0]["excerpt"])
+
+    def test_the_excerpt_states_the_window_it_really_measured(self):
+        """Age and window answer different questions and can disagree by weeks.
+
+        A Deployment declared 31 days ago whose pod rolled 12 hours ago has 12
+        hours of history, and the finding may not claim to have watched a
+        month of idleness it never saw.
+        """
+        pods = [self.pod(started="2026-07-31T12:00:00Z")]
+        hits = fw.check_idle_workload(self.context(pods=pods), self.IDLE, now=NOW)
+        self.assertIn("Declared 31 days ago", hits[0]["excerpt"])
+        self.assertIn("trailing 12h", hits[0]["excerpt"])
+        self.assertIn("under a full daily cycle", hits[0]["excerpt"])
+
+    def test_the_thresholds_match_the_sop(self):
+        self.assertEqual(fw.IDLE_WORKLOAD_UTILISATION, 0.2)
+        self.assertEqual(fw.IDLE_WORKLOAD_MIN_AGE_DAYS, 14)
+
+
 class UnderrequestTest(unittest.TestCase):
     """§3.11 -- the other direction of the same sizing edit as `overrequest`."""
 
@@ -2544,13 +2778,17 @@ class CollectClusterTest(unittest.TestCase):
         # where the check is not applicable rather than degraded.
         entry = self._metrics_down(obj("Node", "node-1"))
         self.assertEqual(entry["outcome"], "collected")
-        # Both checks read the same peak query, so they are lost together.
+        # All three read the same peak query, so they are lost together.
         self.assertNotIn("overrequest", {c["check"] for c in entry["commands"]})
         self.assertNotIn("unsized-workload", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("idle-workload", {c["check"] for c in entry["commands"]})
         # Dropping the check out of `commands` is only half the job: §6 raises
         # it as a gap either way, and without this the ledger named a check
         # nobody could explain.
-        self.assertIn("overrequest and unsized-workload could not be measured", entry["limitations"])
+        self.assertIn(
+            "overrequest, unsized-workload and idle-workload could not be measured",
+            entry["limitations"],
+        )
         self.assertIn("Cloud Monitoring", entry["limitations"])
 
     def test_a_denied_usage_read_says_so_rather_than_saying_no_data(self):
@@ -2571,16 +2809,17 @@ class CollectClusterTest(unittest.TestCase):
         # Autopilot peers on 2026-08-29 -- a gap naming a check that had no
         # object to run against.
         #
-        # All three sizing checks take the same exemption, and for the same
+        # All four sizing checks take the same exemption, and for the same
         # reason: neither an over- nor an under-sized request can exist where
-        # nothing is scheduled, and an absent one cannot be sized from a
-        # history that was never recorded.
+        # nothing is scheduled, an absent one cannot be sized from a history
+        # that was never recorded, and a controller that does not exist cannot
+        # be the one nobody is using.
         entry = self._metrics_down()
         self.assertEqual(entry["outcome"], "collected")
         self.assertNotIn("limitations", entry)
         self.assertEqual(
             {na["check"] for na in entry["checks_not_applicable"]},
-            {"overrequest", "underrequest", "unsized-workload"},
+            {"overrequest", "underrequest", "unsized-workload", "idle-workload"},
         )
         for na in entry["checks_not_applicable"]:
             self.assertIn("no nodes", na["reason"])
@@ -2597,7 +2836,7 @@ class CollectClusterTest(unittest.TestCase):
         )
         self.assertNotIn("checks_not_applicable", entry)
         self.assertIn("rc=403", entry["limitations"])
-        self.assertIn("overrequest and unsized-workload could not be measured",
+        self.assertIn("overrequest, unsized-workload and idle-workload could not be measured",
                       entry["limitations"])
         self.assertIn("underrequest could not be measured", entry["limitations"])
 
