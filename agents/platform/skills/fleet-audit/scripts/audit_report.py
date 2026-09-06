@@ -539,6 +539,17 @@ _GITOPS_DECLARABLE_KINDS = frozenset(
 _UNDECLARED_LEDE = "_(Not declared in this repository"
 _UNDECLARED_NOTE = f"{_UNDECLARED_LEDE}, so no pull request can carry this fix.)_"
 
+# The mirror of the pair above, for the case the ledger got wrong rather than
+# left unsaid. Naming the file is the whole point of this one -- the reader is
+# being told a pull request is possible, and "somewhere in the repository" is
+# not an answer they can act on -- so unlike `_UNDECLARED_NOTE` it costs a line
+# per finding and is written only where a path is unambiguous.
+_DECLARED_LEDE = "_(Declared in this repository at "
+
+
+def _declared_note(path: str) -> str:
+    return f"{_DECLARED_LEDE}`{path}`, so a pull request could carry this fix.)_"
+
 # What `timeout(1)` returns for a command it killed, reused so a caller reading
 # `returncode` cannot confuse a timeout with the command's own exit codes.
 _EXIT_TIMEOUT = 124
@@ -8691,13 +8702,19 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     return degraded
 
 
-def kubernetes_declarations(root: Path) -> set[tuple[str, str]]:
+def kubernetes_declarations(root: Path) -> dict[tuple[str, str], list[str]]:
     """Index the Kubernetes objects a GitOps clone declares, as `(kind, name)`.
+
+    Maps to every repository-relative path that declares the object, sorted. The
+    membership test is what the undeclared note needs; the paths are what the
+    declared note needs, and it names a file only when exactly one declares the
+    object -- see `disclose_declared_manual_remediations` for why the collision
+    case has to stay unnamed rather than pick one.
 
     Namespace is deliberately not part of the key. Plenty of manifests omit
     `metadata.namespace` and let Kustomize or an Argo `Application` supply it,
     so keying on it would report those objects undeclared -- the one direction
-    of error this index must not make, because its only caller writes a note
+    of error this index must not make, because its first caller writes a note
     saying the repository does not declare the object.
 
     A name that collides across two namespaces therefore reads as declared. That
@@ -8721,14 +8738,14 @@ def kubernetes_declarations(root: Path) -> set[tuple[str, str]]:
             "declaration is indexed; manual remediations publish without the "
             "note saying whether a pull request could carry them."
         )
-        return set()
+        return {}
 
-    declared: set[tuple[str, str]] = set()
+    declared: dict[tuple[str, str], list[str]] = {}
     try:
         paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
     except OSError as exc:
         log(f"DECLARATION INDEX: cannot walk {root} ({exc}); nothing is indexed.")
-        return set()
+        return {}
     for path in paths:
         # `.git` holds packed objects, not manifests, and rglob walks into it.
         if ".git" in path.parts:
@@ -8744,6 +8761,10 @@ def kubernetes_declarations(root: Path) -> set[tuple[str, str]]:
             # about, and the claim it would make is a negative one. Skipping
             # leaves the finding's note unwritten, which is the safe direction.
             continue
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError:
+            continue
         for doc in docs:
             if not isinstance(doc, dict):
                 continue
@@ -8752,9 +8773,94 @@ def kubernetes_declarations(root: Path) -> set[tuple[str, str]]:
             if not kind or not isinstance(meta, dict):
                 continue
             name = str(meta.get("name") or "")
-            if name:
-                declared.add((kind, name))
-    return declared
+            if not name:
+                continue
+            seen = declared.setdefault((kind, name), [])
+            # One file declaring the same object twice is a single path, not
+            # two, or the collision rule below would suppress the note over a
+            # duplicate that names one file perfectly well.
+            if relative not in seen:
+                seen.append(relative)
+    return {key: sorted(paths) for key, paths in declared.items()}
+
+
+def _strip_declaration_notes(remediation: dict) -> str:
+    """Drop whichever declaration sentence an earlier run left on the note.
+
+    Both passes below append at the end and strip from their lede onward, which
+    only composes if the note carries at most one of the two sentences by the
+    time either of them decides. Stripping both here, before either decides, is
+    what makes an object that flipped between runs -- declared to undeclared or
+    back -- come out with the sentence that is true now instead of both.
+    """
+    note = str(remediation.get("note") or "")
+    cuts = [at for at in (note.find(_DECLARED_LEDE), note.find(_UNDECLARED_LEDE)) if at != -1]
+    if cuts:
+        note = note[: min(cuts)].rstrip()
+        remediation["note"] = note
+    return note
+
+
+def disclose_declared_manual_remediations(
+    findings: list[dict], root: Path
+) -> list[str]:
+    """Name the file, when a manual fix sits on an object the repository declares.
+
+    The inverse of `disclose_undeclared_manual_remediations`, and the case that
+    was actively wrong rather than merely unsaid. A `manual` remediation has two
+    unrelated causes -- the SOP forbids a manifest for this check at all (a probe
+    endpoint, an invented request value, a pinned digest only the owner knows),
+    or §4's declaration rule degraded it because no file declares the object --
+    and the ledger renders both as the same prose. Readers, and the model on the
+    next run, cannot tell which they are looking at.
+
+    Observed on 2026-09-05: two `probes-liveness` findings published the note
+    "Probe YAML is never generated by this check; the object is also not declared
+    in the GitOps repository." The first clause is right and the second is false.
+    Both Deployments are declared in
+    `clusters/spot-capacity-test/workloads/fleet-waste-overrequest-fixtures.yaml`
+    -- the same file `fleet-wide-cost-analysis` was concurrently publishing as a
+    `manifest` remediation path against those very objects. Eleven of that day's
+    57 manual findings sat on objects the repository declares.
+
+    Discloses, never promotes. Promoting to `kind: manifest` here would be a lie
+    of a different shape: the manifest a `manifest` remediation promises is
+    authored by the model during the run, so a kind flipped afterwards would
+    describe a file change that nobody wrote. What the reader can act on is the
+    path, which is exactly what this states.
+
+    Names a file only where one file declares the object. `kubernetes_declarations`
+    keys on `(kind, name)` without the namespace, so a name reused across two
+    namespaces resolves to both paths, and picking one would send the reader to
+    the wrong object -- worse than the silence, because it reads as verified.
+
+    Runs immediately *before* `disclose_undeclared_manual_remediations`, and only
+    that order composes; `_strip_declaration_notes` says why.
+
+    Returns the ids it annotated, for the caller to log.
+    """
+    declared = kubernetes_declarations(root)
+    if not declared:
+        # Empty is "could not look", not "declares nothing" -- the same reading
+        # the undeclared pass takes, and for the same reason.
+        return []
+
+    annotated: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        note = _strip_declaration_notes(remediation)
+        if remediation.get("kind") != "manual":
+            continue
+        obj = str(finding.get("object") or "")
+        kind, _, name = obj.partition("/")
+        if kind not in _GITOPS_DECLARABLE_KINDS or not name:
+            continue
+        paths = declared.get((kind, name)) or []
+        if len(paths) != 1:
+            continue
+        remediation["note"] = (f"{note} " if note else "") + _declared_note(paths[0])
+        annotated.append(str(finding.get("id", "")))
+    return annotated
 
 
 def disclose_undeclared_manual_remediations(
@@ -9708,8 +9814,16 @@ def handle_finish(args: argparse.Namespace) -> None:
     for fid in adopt_arm_impact(findings, manifest):
         log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
     # Last of the remediation passes, and after the carry rather than beside the
-    # other two: the carry overwrites a `manual` remediation wholesale, so this
-    # note has to be written against the remediation set that ships.
+    # other two: the carry overwrites a `manual` remediation wholesale, so these
+    # notes have to be written against the remediation set that ships. The
+    # declared pass goes first of the pair, for the reason
+    # `_strip_declaration_notes` gives.
+    for fid in disclose_declared_manual_remediations(findings, root):
+        log(
+            f"{fid} is manual, but the GitOps repository does declare the object "
+            "it sits on; its note names the file, so the reason it stayed manual "
+            "reads as the check's own rule rather than a missing declaration."
+        )
     for fid in disclose_undeclared_manual_remediations(findings, root):
         log(
             f"{fid} sits on an object no file in the GitOps repository declares; "
