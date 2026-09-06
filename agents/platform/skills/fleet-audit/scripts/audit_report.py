@@ -549,10 +549,35 @@ KCC_READY_CONDITION = "Ready"
 # message. Rare, but "" reads as though nothing were wrong.
 _KCC_NOT_READY_UNEXPLAINED = "not ready"
 
+# How much of one resource's `reason: message` to keep. Controller messages run
+# long -- the 403 the live fleet is sitting on is 289 characters -- and the
+# caveat that carries them is rendered inside a bullet, then clipped whole at
+# `MAX_NOTE_CHARS`. One `DependencyNotReady` fan-out puts fifteen of them in a
+# single note, so uncapped the sentence explaining the stall is the part that
+# gets truncated away.
+MAX_KCC_REASON_CHARS = 240
+
 # The first sentence of the caveat `disclose_stalled_kcc_remediations` appends,
-# named so the same string is both what it writes and what it looks for before
-# writing again.
-_KCC_STALLED_LEDE = "**This fix will merge without taking effect.**"
+# named so the same string is both what it writes, what it looks for before
+# writing again, and what the two places that would otherwise guess at a cause
+# -- `render_finding`'s merged-but-persists line and `render_persists_comment`
+# -- read to find out that the cause is already known.
+#
+# Tense-neutral on purpose. It used to read "This fix *will* merge without
+# taking effect", which is the sentence for the run that publishes the finding
+# and the wrong sentence for every run after the pull request merges -- and the
+# merged case is the one that matters, because there the reader has already
+# spent their attention and believes the problem is solved.
+_KCC_STALLED_LEDE = "**Config Connector is not applying this file.**"
+
+# Every spelling of that lede a live ledger might still be carrying, so a run
+# that finds the model paraphrasing the old sentence back does not append the
+# new one beside it. The retired entry can go once no open ledger predates the
+# rename; it costs one substring search per annotated finding until then.
+_KCC_STALLED_LEDES = (
+    _KCC_STALLED_LEDE,
+    "**This fix will merge without taking effect.**",
+)
 
 # The Kubernetes kinds a GitOps repository declares as a file of its own, so
 # "no file here declares this object" is a fact about the repository rather than
@@ -5922,6 +5947,34 @@ def _cell(text: str, limit: int = MAX_CELL_CHARS) -> str:
     return value
 
 
+def _kcc_stall_disclosed(finding: dict) -> bool:
+    """Has this run already established why the fix did not take?
+
+    `disclose_stalled_kcc_remediations` writes that into the note. Two places
+    otherwise offer a reader the same two-cause guess -- "the remediation was
+    incomplete, or something outside this repository reverted it" -- and when
+    the stall is the cause, both halves of the guess are false and the true
+    cause is one the reader cannot reach from either.
+    """
+    note = str((finding.get("remediation") or {}).get("note") or "")
+    return any(lede in note for lede in _KCC_STALLED_LEDES)
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Free text from a controller, safe and short inside a sentence.
+
+    `_cell`'s sibling for prose rather than a table: same flattening and the
+    same backtick replacement, without the `|` escaping that only a cell needs.
+    The input is a `status.conditions` message, which is neither the model's nor
+    this repository's — a Terraform error relayed through Config Connector,
+    wrapping whatever the Google API said, at whatever length it said it.
+    """
+    value = " ".join(redact_secrets(text).replace("`", "'").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
 def _ident(value: str) -> str:
     """A Kubernetes identifier, safe and short inside an inline code span.
 
@@ -6141,10 +6194,23 @@ def render_finding(
         suffix = f" — {pr_url}" if pr_url else ""
         lines.append(f"- **State:** {label}{suffix}")
         if state == STATE_PR_MERGED_PERSISTS:
+            # Two causes, offered only while the run has not established a
+            # third. `disclose_stalled_kcc_remediations` establishes exactly
+            # that third one -- the remediation was complete and nothing
+            # reverted it, because the controller never applied it -- and
+            # writes it into the note rendered a few lines below. Printing the
+            # guess anyway would have the ledger contradict itself on one
+            # screen, and the guess is the half a reader reaches first.
             lines.append(
                 "  The proposed fix was merged and this finding still reproduces. "
-                "The remediation was incomplete, or something outside this "
-                "repository reverted it — the merged pull request is not reopened."
+                + (
+                    "See the remediation note below for why — the merged pull "
+                    "request is not reopened."
+                    if _kcc_stall_disclosed(finding)
+                    else "The remediation was incomplete, or something outside "
+                    "this repository reverted it — the merged pull request is "
+                    "not reopened."
+                )
             )
     lines.append("")
 
@@ -7298,17 +7364,32 @@ def render_stale_close_comment(
 
 
 def render_persists_comment(
-    audit_id: str, finding: dict, generated_at: datetime
+    audit_id: str, finding: dict, generated_at: datetime, stalled: str = ""
 ) -> str:
-    """Said once, on a merged pull request whose finding still reproduces."""
+    """Said once, on a merged pull request whose finding still reproduces.
+
+    `stalled` is the third cause, when the run established it: the resources
+    this pull request's files declare that Config Connector is refusing to
+    reconcile, and why. Without it the comment offers the same two guesses the
+    ledger does, and this is the worse place to guess -- it lands in the inbox
+    of the person who reviewed and merged the fix, telling them their change was
+    incomplete when it was correct and nothing ever applied it.
+    """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     evidence = finding.get("evidence") or {}
+    cause = (
+        f"Config Connector is not applying this file: it declares {stalled}. "
+        "The change is correct and nothing reverted it — the controller never "
+        "took it."
+        if stalled
+        else "Either the remediation was incomplete, or something outside this "
+        "repository reverted it."
+    )
     out = [
         f"This fix merged, but as of {stamp} the `{audit_id}` audit still "
         f"reproduces `{finding.get('id', '')}` — {_cell(finding.get('title', ''))}.",
         "",
-        "Either the remediation was incomplete, or something outside this "
-        "repository reverted it. This pull request is **not** reopened: it "
+        f"{cause} This pull request is **not** reopened: it "
         "merged, and reopening it would misrepresent history. The finding "
         "stays on the ledger, flagged, until it stops reproducing.",
         "",
@@ -8735,13 +8816,19 @@ def comment_on_merged_but_persisting(
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
     generated_at: datetime,
+    stalled_kcc: dict[str, str] | None = None,
 ) -> None:
     """Say once, on the merged pull request, that its finding still reproduces.
 
     Guarded by a marker in the pull request's own body-plus-comments rather
     than by mutating the trigger, and the pull request is never reopened: it
     merged, and reopening it would misrepresent history.
+
+    `stalled_kcc` is what `disclose_stalled_kcc_remediations` established, by
+    finding id. Where it has an entry, the comment names the controller error
+    instead of guessing at a cause — see `render_persists_comment`.
     """
+    stalled_kcc = stalled_kcc or {}
     for finding in sort_findings(findings):
         fid = str(finding.get("id", ""))
         pr = pr_by_finding.get(fid)
@@ -8761,7 +8848,9 @@ def comment_on_merged_but_persisting(
         post_pr_comment(
             repo,
             number,
-            render_persists_comment(audit_id, finding, generated_at),
+            render_persists_comment(
+                audit_id, finding, generated_at, stalled_kcc.get(fid, "")
+            ),
             what="merged-but-persists comment",
         )
 
@@ -9119,11 +9208,13 @@ def kcc_resource_health(kinds: set[str]) -> dict[tuple[str, str], str]:
                 why = f"{reason}: {message}"
             else:
                 why = reason or message or _KCC_NOT_READY_UNEXPLAINED
-            unhealthy[(kind, name)] = why
+            unhealthy[(kind, name)] = _one_line(why, MAX_KCC_REASON_CHARS)
     return unhealthy
 
 
-def disclose_stalled_kcc_remediations(findings: list[dict], root: Path) -> list[str]:
+def disclose_stalled_kcc_remediations(
+    findings: list[dict], root: Path
+) -> dict[str, str]:
     """Say so when a manifest fix edits a declaration that is not reconciling.
 
     The mirror of `degrade_reverted_gcloud_remediations`, and the other half of
@@ -9150,13 +9241,19 @@ def disclose_stalled_kcc_remediations(findings: list[dict], root: Path) -> list[
     would throw away a correct pull request over a condition that is usually
     cleared by the time anyone reads the ledger.
 
-    Returns the ids it annotated, for the caller to log.
+    Returns `finding id -> the stalled resources and why`, for the caller to
+    log and to hand to the two renderers that would otherwise guess at a cause:
+    the ledger's merged-but-persists line and the comment posted on the merged
+    pull request. Both of those say "the remediation was incomplete, or
+    something outside this repository reverted it", and when this pass fired
+    neither is true -- the remediation was complete and nothing reverted it,
+    because nothing ever applied it.
     """
     if not findings:
-        return []
+        return {}
     declarations = kcc_declarations(root)
     if not declarations:
-        return []
+        return {}
 
     # The clone says which resources live in which file; the finding names the
     # file. Invert once rather than scanning the index per finding.
@@ -9192,41 +9289,45 @@ def disclose_stalled_kcc_remediations(findings: list[dict], root: Path) -> list[
             f"unmatched path(s) were: {', '.join(sorted(set(unmatched)))}."
         )
     if not targeted:
-        return []
+        return {}
 
     # One read per kind, for the kinds actually in play -- not a sweep of every
     # CRD Config Connector installs.
     unhealthy = kcc_resource_health({kind for _, rs in targeted for kind, _ in rs})
     if not unhealthy:
-        return []
+        return {}
 
-    annotated: list[str] = []
+    annotated: dict[str, str] = {}
     for finding, resources in targeted:
         stalled = [(k, n) for k, n in resources if (k, n) in unhealthy]
         if not stalled:
             continue
         remediation = finding.get("remediation") or {}
         note = str(remediation.get("note", "")).strip()
+        detail = "; ".join(
+            f"`{k}/{n}` ({unhealthy[(k, n)]})" for k, n in sorted(stalled)
+        )
+        # Recorded whether or not the note is written below, because what the
+        # caller does with this is tell the two renderers not to guess -- and a
+        # note that already carries the sentence is the strongest case for that,
+        # not an exemption from it.
+        annotated[str(finding.get("id", ""))] = detail
         # A note that already says this gets nothing added. Nothing in the
         # pipeline appends twice today -- `carry_unchanged_findings` refuses to
         # copy a file-backed remediation at all, so last run's caveat cannot
         # ride into this one -- but the model reads the ledger it is updating,
         # and a run that paraphrased the sentence back would otherwise publish
         # it twice.
-        if _KCC_STALLED_LEDE in note:
+        if any(lede in note for lede in _KCC_STALLED_LEDES):
             continue
-        detail = "; ".join(
-            f"`{k}/{n}` ({unhealthy[(k, n)]})" for k, n in sorted(stalled)
-        )
         remediation["note"] = (
             (note + "\n\n" if note else "")
-            + f"{_KCC_STALLED_LEDE} Config Connector is "
-            f"not reconciling the resource it edits: {detail}. The change is "
-            "correct and belongs in this file, but the cluster will not pick it "
-            "up until that is resolved, and this finding will return on the next "
-            "run in the meantime."
+            + f"{_KCC_STALLED_LEDE} It declares {detail}, and Config Connector "
+            "is not reconciling that. The change is correct and belongs in this "
+            "file, but the cluster does not pick it up until the controller "
+            "does: a fix merged here has not taken effect, and this finding "
+            "keeps returning until it has."
         )
-        annotated.append(str(finding.get("id", "")))
     return annotated
 
 
@@ -9882,11 +9983,11 @@ def _handle_finish_dry_run(
             f"DRY RUN: {fid}'s gcloud remediation targets a field the GitOps "
             "repository declares through Config Connector; it degrades to manual."
         )
-    for fid in disclose_stalled_kcc_remediations(findings, root):
+    for fid, why in disclose_stalled_kcc_remediations(findings, root).items():
         log(
             f"DRY RUN: {fid}'s manifest remediation edits a Config Connector "
-            "resource that is not reconciling; its note says the merge will not "
-            "change the cluster yet."
+            f"resource that is not reconciling ({why}); its note says the "
+            "cluster does not pick the change up until that is resolved."
         )
     paths = manifest_paths(findings)
 
@@ -10480,11 +10581,17 @@ def handle_finish(args: argparse.Namespace) -> None:
     # After the two degradations, never before: a finding that just became
     # `manual` no longer promises a merge, so a caveat about one would be
     # answering a claim the report does not make.
-    for fid in disclose_stalled_kcc_remediations(findings, root):
+    # Kept, not just logged: this is the run's only answer to "why did a merged
+    # fix change nothing", and two things downstream would otherwise guess --
+    # the ledger's merged-but-persists line and the comment posted on the merged
+    # pull request itself.
+    stalled_kcc = disclose_stalled_kcc_remediations(findings, root)
+    for fid, why in stalled_kcc.items():
         log(
             f"WARNING: {fid}'s manifest remediation edits a Config Connector "
-            "resource that is not reconciling; it is published with a note that "
-            "merging it will not change the cluster yet."
+            f"resource that is not reconciling ({why}); it is published with a "
+            "note saying the cluster does not pick the change up until that is "
+            "resolved."
         )
 
     # "Absent from this document" only means "fixed" if the audit actually
@@ -11070,7 +11177,9 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # A merged fix whose finding still reproduces is said once, on the pull
     # request, and the pull request is never reopened.
-    comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now)
+    comment_on_merged_but_persisting(
+        repo, audit_id, findings, pr_by_finding, now, stalled_kcc
+    )
 
     # Retiring a pull request means asserting its finding no longer reproduces.
     # Over a target this run could not cover that assertion is unfounded, so

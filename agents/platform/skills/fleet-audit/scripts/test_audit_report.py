@@ -3464,12 +3464,18 @@ class TestStalledKccRemediations(HarnessTestCase):
             self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
         }
         findings = [self.manifest_finding()]
-        self.assertEqual(
-            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [findings[0]["id"]],
+        annotated = audit_report.disclose_stalled_kcc_remediations(
+            findings, self.workspace
         )
+        self.assertEqual(list(annotated), [findings[0]["id"]])
+        # The value is what the two renderers that would otherwise guess at a
+        # cause print instead, so it carries the resource and the controller's
+        # own words, not just the fact that something stalled.
+        detail = annotated[findings[0]["id"]]
+        self.assertIn("ContainerCluster/drift-peer-std-4", detail)
+        self.assertIn("DependencyNotReady", detail)
         note = findings[0]["remediation"]["note"]
-        self.assertIn("will merge without taking effect", note)
+        self.assertIn("Config Connector is not applying this file", note)
         self.assertIn("ContainerCluster/drift-peer-std-4", note)
         self.assertIn("DependencyNotReady", note)
         self.assertIn("waiting on PubSubTopic", note)
@@ -3499,7 +3505,9 @@ class TestStalledKccRemediations(HarnessTestCase):
         audit_report.disclose_stalled_kcc_remediations(findings, self.workspace)
         note = findings[0]["remediation"]["note"]
         self.assertTrue(note.startswith("Remove the `loggingService` line."))
-        self.assertLess(note.index("loggingService"), note.index("without taking"))
+        self.assertLess(
+            note.index("loggingService"), note.index("Config Connector is not applying")
+        )
 
     def test_a_note_that_already_says_it_is_not_told_twice(self):
         # `carry_unchanged_findings` refuses to copy a file-backed remediation,
@@ -3518,10 +3526,36 @@ class TestStalledKccRemediations(HarnessTestCase):
         second = audit_report.disclose_stalled_kcc_remediations(
             findings, self.workspace
         )
-        self.assertEqual(first, [findings[0]["id"]])
-        self.assertEqual(second, [])
+        self.assertEqual(list(first), [findings[0]["id"]])
+        # "Not told twice" is about the note, not the return value. The second
+        # call still reports the stall, because what the caller does with it is
+        # tell the two renderers not to guess at a cause -- and a note that
+        # already carries the sentence is the strongest case for that, not an
+        # exemption from it.
+        self.assertEqual(second, first)
         self.assertEqual(findings[0]["remediation"]["note"], note)
-        self.assertEqual(note.count("will merge without taking effect"), 1)
+        self.assertEqual(note.count("Config Connector is not applying this file"), 1)
+
+    def test_a_note_carrying_the_retired_wording_is_not_told_twice(self):
+        # The caveat's first sentence used to read "This fix will merge without
+        # taking effect", which is the wrong tense once the pull request has
+        # merged. A ledger written before the rename still says it, and the
+        # model echoes back what it reads -- so the old spelling has to keep
+        # suppressing the new one until no open ledger predates the change.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(("drift-peer-std-4", self.not_ready()))
+        }
+        stale = (
+            "**This fix will merge without taking effect.** It declares "
+            "`ContainerCluster/drift-peer-std-4`."
+        )
+        findings = [self.manifest_finding(note=stale)]
+        annotated = audit_report.disclose_stalled_kcc_remediations(
+            findings, self.workspace
+        )
+        self.assertEqual(list(annotated), [findings[0]["id"]])
+        self.assertEqual(findings[0]["remediation"]["note"], stale)
 
     def test_a_reconciling_declaration_is_left_alone(self):
         self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
@@ -3531,7 +3565,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
         self.assertEqual(findings[0]["remediation"]["note"], "Set it back.")
 
@@ -3546,7 +3580,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
         self.assertEqual(findings[0]["remediation"]["note"], "Set it back.")
 
@@ -3562,7 +3596,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
 
     def test_a_gcloud_remediation_is_never_annotated(self):
@@ -3584,7 +3618,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         ]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
         self.assertEqual(self.reads(), [])
 
@@ -3596,7 +3630,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding(path="clusters/prod/payments-netpol.yaml")]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
         self.assertEqual(self.reads(), [])
 
@@ -3629,7 +3663,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         annotated = audit_report.disclose_stalled_kcc_remediations(
             findings, self.workspace
         )
-        self.assertEqual(annotated, ["no-network-policy", "second", "third"])
+        self.assertEqual(list(annotated), ["no-network-policy", "second", "third"])
         self.assertEqual(len(self.reads()), 2)
         self.assertIn("UpdateFailed: denied", findings[2]["remediation"]["note"])
 
@@ -3651,7 +3685,7 @@ class TestStalledKccRemediations(HarnessTestCase):
             )
         ]
         self.assertEqual(
-            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            list(audit_report.disclose_stalled_kcc_remediations(findings, self.workspace)),
             [findings[0]["id"]],
         )
         self.assertIn("PubSubTopic/gke-upgrade", findings[0]["remediation"]["note"])
@@ -3679,7 +3713,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
         self.assertEqual(findings[0]["remediation"]["note"], "Set it back.")
 
@@ -3689,7 +3723,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
 
     def test_malformed_json_adds_no_caveat(self):
@@ -3698,7 +3732,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
 
     def test_a_stall_with_neither_reason_nor_message_still_reads(self):
@@ -3710,7 +3744,7 @@ class TestStalledKccRemediations(HarnessTestCase):
         }
         findings = [self.manifest_finding()]
         self.assertEqual(
-            audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
+            list(audit_report.disclose_stalled_kcc_remediations(findings, self.workspace)),
             [findings[0]["id"]],
         )
         self.assertIn("not ready", findings[0]["remediation"]["note"])
@@ -3719,16 +3753,107 @@ class TestStalledKccRemediations(HarnessTestCase):
         findings = [self.manifest_finding()]
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations(findings, self.workspace),
-            [],
+            {},
         )
         self.assertEqual(self.reads(), [])
 
     def test_no_findings_costs_nothing(self):
         self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
         self.assertEqual(
-            audit_report.disclose_stalled_kcc_remediations([], self.workspace), []
+            audit_report.disclose_stalled_kcc_remediations([], self.workspace), {}
         )
         self.assertEqual(self.reads(), [])
+
+    def test_a_controller_message_is_clipped_before_it_reaches_the_note(self):
+        # A `status.conditions` message is a Google API error relayed through
+        # Terraform, at whatever length the API chose. The live fleet is sitting
+        # on a 289-character one, and the note carrying it is clipped whole --
+        # so uncapped, the sentence explaining the stall is what gets cut.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.harness.replies = {
+            self.READ: self.cluster_list(
+                ("drift-peer-std-4", self.not_ready("UpdateFailed", "boom " * 200))
+            )
+        }
+        findings = [self.manifest_finding()]
+        detail = audit_report.disclose_stalled_kcc_remediations(
+            findings, self.workspace
+        )[findings[0]["id"]]
+        self.assertIn("UpdateFailed", detail)
+        self.assertTrue(detail.endswith("…)"), detail[-20:])
+        self.assertLess(len(detail), audit_report.MAX_KCC_REASON_CHARS + 80)
+
+
+class TestStalledKccIsSaidOnceNotGuessedAt(BaseTestCase):
+    """The two places that would otherwise offer a reader the wrong cause.
+
+    Both say "the remediation was incomplete, or something outside this
+    repository reverted it", and when `disclose_stalled_kcc_remediations` has
+    fired, both halves are false: the remediation was complete and nothing
+    reverted it, because the controller never applied it.
+    """
+
+    DETAIL = "`ContainerCluster/drift-peer-std-4` (UpdateFailed: denied)"
+    GUESS = "The remediation was incomplete"
+
+    def stalled_finding(self):
+        finding = manifest_finding("netpol-missing", "gcp/drift-peer-std-4.yaml")
+        finding["remediation"]["note"] = (
+            f"{audit_report._KCC_STALLED_LEDE} It declares {self.DETAIL}, and "
+            "Config Connector is not reconciling that."
+        )
+        return finding
+
+    def test_the_ledger_defers_to_the_note_instead_of_guessing(self):
+        text = "\n".join(
+            audit_report.render_finding(
+                self.stalled_finding(), state=audit_report.STATE_PR_MERGED_PERSISTS
+            )
+        )
+        self.assertIn("See the remediation note below", text)
+        self.assertNotIn(self.GUESS, text)
+        # The redirect is only worth reading because the note it points at is
+        # on the same screen.
+        self.assertIn("Config Connector is not applying this file", text)
+
+    def test_the_ledger_still_guesses_when_nothing_established_a_cause(self):
+        text = "\n".join(
+            audit_report.render_finding(
+                manifest_finding("netpol-missing", "gcp/drift-peer-std-4.yaml"),
+                state=audit_report.STATE_PR_MERGED_PERSISTS,
+            )
+        )
+        self.assertIn(self.GUESS, text)
+        self.assertNotIn("See the remediation note below", text)
+
+    def test_the_retired_wording_still_counts_as_an_established_cause(self):
+        finding = manifest_finding("netpol-missing", "gcp/drift-peer-std-4.yaml")
+        finding["remediation"]["note"] = "**This fix will merge without taking effect.**"
+        text = "\n".join(
+            audit_report.render_finding(
+                finding, state=audit_report.STATE_PR_MERGED_PERSISTS
+            )
+        )
+        self.assertNotIn(self.GUESS, text)
+
+    def test_the_comment_on_the_merged_pr_names_the_controller_error(self):
+        # The worse of the two. This lands in the inbox of whoever reviewed and
+        # merged the fix, and the guess tells them their change was incomplete
+        # when it was correct and nothing ever applied it.
+        body = audit_report.render_persists_comment(
+            AUDIT, self.stalled_finding(), NOW, self.DETAIL
+        )
+        self.assertIn("Config Connector is not applying this file", body)
+        self.assertIn(self.DETAIL, body)
+        self.assertIn("nothing reverted it", body)
+        self.assertNotIn("Either the remediation was incomplete", body)
+        # The rest of the comment's contract is unchanged by the new cause.
+        self.assertIn("not** reopened", body)
+
+    def test_the_comment_still_guesses_when_nothing_established_a_cause(self):
+        body = audit_report.render_persists_comment(AUDIT, self.stalled_finding(), NOW)
+        self.assertIn("Either the remediation was incomplete", body)
+        self.assertIn("not** reopened", body)
 
 
 class TestUndeclaredManualRemediations(HarnessTestCase):
@@ -11706,9 +11831,9 @@ class TestMergedButPersists(HarnessTestCase):
             merged_at="2026-07-01T00:00:00Z",
         )
 
-    def run_it(self, prs_by_finding):
+    def run_it(self, prs_by_finding, stalled_kcc=None):
         audit_report.comment_on_merged_but_persisting(
-            "acme/fleet", AUDIT, [self.finding], prs_by_finding, NOW
+            "acme/fleet", AUDIT, [self.finding], prs_by_finding, NOW, stalled_kcc
         )
 
     def test_comments_once_and_never_reopens(self):
@@ -11749,6 +11874,24 @@ class TestMergedButPersists(HarnessTestCase):
     def test_an_open_pr_is_not_the_persists_case(self):
         self.run_it({"a": pr(8, "platform-agent/fix-x")})
         self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+
+    def test_an_established_stall_reaches_the_comment(self):
+        # `handle_finish` keeps what `disclose_stalled_kcc_remediations` found
+        # for exactly this: the comment does not render the note, so without
+        # being handed the cause it guesses at one, in the inbox of whoever
+        # merged a fix that was correct.
+        self.harness.replies = {"--json comments": json.dumps({"comments": []})}
+        self.run_it({"a": self.merged}, {"a": "`ContainerCluster/c` (UpdateFailed)"})
+        body = "".join(self.harness.bodies_for("pr", "comment"))
+        self.assertIn("`ContainerCluster/c` (UpdateFailed)", body)
+        self.assertNotIn("Either the remediation was incomplete", body)
+
+    def test_a_stall_on_a_different_finding_does_not_leak_in(self):
+        self.harness.replies = {"--json comments": json.dumps({"comments": []})}
+        self.run_it({"a": self.merged}, {"b": "`ContainerCluster/c` (UpdateFailed)"})
+        body = "".join(self.harness.bodies_for("pr", "comment"))
+        self.assertIn("Either the remediation was incomplete", body)
+        self.assertNotIn("ContainerCluster/c", body)
 
 
 class TestReplyToRefusals(HarnessTestCase):
