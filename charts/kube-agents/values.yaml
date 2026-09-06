@@ -89,6 +89,26 @@ operator:
     # and the audit SOP this project ships rules it out at every replica count
     # (obtainability_audit_sop.md 3.3).
     enabled: true
+  # Spread this workload's pods across nodes — the canonical home for this
+  # argument; litellm.topologySpread and githubMinter.topologySpread defer here.
+  #
+  # Renders nothing at replicaCount 1, which is the operator's default, so this
+  # knob only does anything on an install that raised it. A constraint over a
+  # single pod is satisfied by construction.
+  #
+  # At two or more replicas it renders maxSkew: 1 over kubernetes.io/hostname
+  # with whenUnsatisfiable: ScheduleAnyway. A PodDisruptionBudget does not cover
+  # this: maxUnavailable: 1 stalls a *drain* that would take every replica, but
+  # a node that fails takes whatever is on it, and without a constraint nothing
+  # keeps two replicas off one node. obtainability_audit_sop.md 3.8 is the
+  # source for both the hostname key and ScheduleAnyway — DoNotSchedule leaves
+  # the second replica Pending forever on a pool that cannot satisfy the skew,
+  # which is worse than the co-location it would prevent.
+  #
+  # Set to false where the scheduler is already constrained by something the
+  # chart cannot see and the hint would fight it.
+  topologySpread:
+    enabled: true
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -260,6 +280,10 @@ litellm:
     # and the audit SOP this project ships rules it out at every replica count
     # (obtainability_audit_sop.md 3.3).
     enabled: true
+  topologySpread:
+    # Renders maxSkew: 1 over kubernetes.io/hostname at the default
+    # replicaCount of 2, same rationale as operator.topologySpread.
+    enabled: true
   resources:
     requests:
       cpu: 100m
@@ -379,6 +403,10 @@ githubMinter:
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. Deliberately not
     # configurable, same rationale as operator.podDisruptionBudget.
+    enabled: true
+  topologySpread:
+    # Renders maxSkew: 1 over kubernetes.io/hostname at the default
+    # replicaCount of 2, same rationale as operator.topologySpread.
     enabled: true
 
 # The logging sidecar the operator injects into every agent pod. The chart

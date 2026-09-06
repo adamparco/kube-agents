@@ -19,6 +19,19 @@ spec:
       labels:
         app: github-token-minter
     spec:
+      # Kept in step with charts/kube-agents/templates/_helpers.tpl's
+      # kube-agents.topologySpreadConstraints, which owns the rationale: the PDB
+      # beside this file stalls a drain that would take both replicas, but a
+      # node that fails takes whatever is on it, and nothing else keeps the two
+      # apart. ScheduleAnyway rather than DoNotSchedule so a single-node pool
+      # does not leave the second replica Pending forever.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: github-token-minter
       serviceAccountName: ${GITHUB_MINTER_KSA_NAME}
       securityContext:
         runAsNonRoot: true
