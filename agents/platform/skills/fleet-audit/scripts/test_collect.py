@@ -4638,6 +4638,147 @@ class TestPodSecurityGaps(unittest.TestCase):
         self.assertIsNone(collect.check_podsecurity_gaps(self.wl(), ctx))
 
 
+DIGEST_A = "gcr.io/acme/app@sha256:" + "a" * 64
+DIGEST_B = "gcr.io/acme/app@sha256:" + "b" * 64
+
+
+class TestImageFloatingTag(unittest.TestCase):
+    """§2.13. The image reference that does not name specific bytes, and the
+    digest that makes pinning it a no-op diff."""
+
+    def workload(self, image, kind="Deployment", name="api", init=None):
+        doc = compliance_workload(kind, name)
+        pod_spec_of(doc)["containers"][0]["image"] = image
+        if init is not None:
+            pod_spec_of(doc)["initContainers"] = [{"name": "setup", "image": init}]
+        return collect.normalize_compliance_workloads(dump_of(doc))[0]
+
+    def running(self, *digests, container="app", owner="Deployment", name="api", phase="Running"):
+        """One live pod per digest, owned by the workload under test."""
+        return [
+            {
+                "ns": "default",
+                "name": f"api-abc-{i}",
+                "labels": {},
+                "phase": phase,
+                "owners": [{"kind": owner, "name": name}],
+                "images": {container: d},
+            }
+            for i, d in enumerate(digests)
+        ]
+
+    def hit(self, image, pods=(), **kw):
+        return collect.check_image_floating_tag(
+            self.workload(image, **kw), {"pods": list(pods), "workloads": []}
+        )
+
+    def test_latest_is_flagged(self):
+        hit = self.hit("gcr.io/acme/app:latest")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["object"], "Deployment/api")
+
+    def test_the_other_moving_tags_are_flagged(self):
+        for tag in ("main", "master", "dev", "nightly", "stable", "edge"):
+            with self.subTest(tag=tag):
+                self.assertIsNotNone(self.hit(f"gcr.io/acme/app:{tag}"))
+
+    def test_no_tag_at_all_is_flagged(self):
+        # The runtime resolves it to `:latest`, so it is the same defect
+        # written more briefly.
+        self.assertIsNotNone(self.hit("gcr.io/acme/app"))
+
+    def test_a_registry_port_is_not_read_as_a_tag(self):
+        # `registry:5000/app` has a colon and no tag; the tag is only what
+        # follows the last slash.
+        self.assertIsNotNone(self.hit("registry:5000/acme/app"))
+
+    def test_a_digest_reference_is_never_flagged(self):
+        self.assertIsNone(self.hit(DIGEST_A))
+
+    def test_a_tag_pinned_by_digest_is_never_flagged(self):
+        self.assertIsNone(self.hit("gcr.io/acme/app:1.4.2@sha256:" + "c" * 64))
+
+    def test_a_version_shaped_tag_is_never_flagged(self):
+        # Out of scope on purpose: `v2` and `python3.12` are mutable in
+        # practice and indistinguishable from a pin by shape, so flagging them
+        # would fire on every container in every cluster.
+        for tag in ("1.4.2", "v2", "stable-3", "python3.12"):
+            with self.subTest(tag=tag):
+                self.assertIsNone(self.hit(f"gcr.io/acme/app:{tag}"))
+
+    def test_an_init_container_is_flagged_too(self):
+        hit = self.hit(DIGEST_A, init="busybox:latest")
+        self.assertIsNotNone(hit)
+        self.assertIn("setup: busybox:latest", hit["excerpt"])
+
+    def test_the_running_digest_is_carried_into_the_excerpt(self):
+        # The whole reason this finding is worth a pull request: the reviewer
+        # can see the pin changes no bytes.
+        hit = self.hit("gcr.io/acme/app:latest", pods=self.running(DIGEST_A))
+        self.assertIn(f"currently running {DIGEST_A}", hit["excerpt"])
+        self.assertEqual(hit["severity"], "minor")
+
+    def test_a_workload_with_no_live_pod_says_so(self):
+        hit = self.hit("gcr.io/acme/app:latest")
+        self.assertIn("no running pod to read a digest from", hit["excerpt"])
+        self.assertEqual(hit["severity"], "minor")
+
+    def test_pods_split_across_digests_are_major_and_named(self):
+        hit = self.hit("gcr.io/acme/app:latest", pods=self.running(DIGEST_A, DIGEST_B))
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("split across 2 digests", hit["excerpt"])
+        self.assertIn(DIGEST_A, hit["excerpt"])
+        self.assertIn(DIGEST_B, hit["excerpt"])
+        self.assertIn("running different builds of app", hit["impact"])
+
+    def test_a_finished_pod_does_not_contribute_a_digest(self):
+        # A Succeeded Job pod's image is not what is running.
+        hit = self.hit(
+            "gcr.io/acme/app:latest",
+            pods=self.running(DIGEST_A, phase="Succeeded") + self.running(DIGEST_B),
+        )
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn(f"currently running {DIGEST_B}", hit["excerpt"])
+
+    def test_another_workloads_pods_do_not_contribute_a_digest(self):
+        self.assertIn(
+            "no running pod",
+            self.hit("gcr.io/acme/app:latest", pods=self.running(DIGEST_A, name="other"))["excerpt"],
+        )
+
+    def test_a_pod_in_another_namespace_does_not_contribute_a_digest(self):
+        pods = self.running(DIGEST_A)
+        pods[0]["ns"] = "elsewhere"
+        self.assertIn("no running pod", self.hit("gcr.io/acme/app:latest", pods=pods)["excerpt"])
+
+
+class TestRunningDigests(unittest.TestCase):
+    """Only a real registry digest reference is a pin worth writing."""
+
+    def digests(self, image_id, name="app", init=False):
+        key = "initContainerStatuses" if init else "containerStatuses"
+        return collect._running_digests({"status": {key: [{"name": name, "imageID": image_id}]}})
+
+    def test_a_bare_digest_reference_is_taken(self):
+        self.assertEqual(self.digests(DIGEST_A), {"app": DIGEST_A})
+
+    def test_the_docker_pullable_prefix_is_stripped(self):
+        self.assertEqual(self.digests(f"docker-pullable://{DIGEST_A}"), {"app": DIGEST_A})
+
+    def test_an_init_container_status_is_read(self):
+        self.assertEqual(self.digests(DIGEST_A, name="setup", init=True), {"setup": DIGEST_A})
+
+    def test_a_locally_loaded_image_is_dropped(self):
+        # Pinning to one of these produces a manifest no other node can pull,
+        # which is worse than the floating tag it replaced.
+        for image_id in ("docker://sha256:" + "a" * 64, "sha256:" + "a" * 64, "", "app:latest"):
+            with self.subTest(image_id=image_id):
+                self.assertEqual(self.digests(image_id), {})
+
+    def test_a_truncated_digest_is_dropped(self):
+        self.assertEqual(self.digests("gcr.io/acme/app@sha256:abc123"), {})
+
+
 class TestKccObjectWedged(unittest.TestCase):
     """§2.12. The check that audits the mechanism the other eleven assume."""
 
@@ -4878,7 +5019,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 11)
+        self.assertEqual(len(result["commands"]), 12)
 
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
@@ -4994,7 +5135,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 11)
+        self.assertEqual(len(command_slugs), 12)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -5200,14 +5341,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Twelve checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is eight, each with a command
+        Thirteen checks minus the three Autopilot rules out and the one no
+        cluster without Config Connector can run is nine, each with a command
         behind it, and the four dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 8)
+        self.assertEqual(len(command_slugs), 9)
         self.assertEqual(len(na_slugs), 4)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))

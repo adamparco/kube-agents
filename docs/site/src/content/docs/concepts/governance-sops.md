@@ -15,7 +15,7 @@ Eight SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watc
 
 ### `compliance_audit_sop.md`
 
-Security & RBAC posture, daily. Twelve checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, Pod Security `restricted` gaps, and Config Connector objects stuck not-`Ready`.
+Security & RBAC posture, daily. Thirteen checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, Pod Security `restricted` gaps, Config Connector objects stuck not-`Ready`, and containers on a floating image tag — where the excerpt carries the digest those pods are running now, so the fix pins to bytes already in production.
 
 Invoked by the `compliance-audit` watchdog.
 

@@ -7,7 +7,7 @@ See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 **Scope of this file today: the collector engine, plus three streams' check
 tables in full.** `obtainability-audit`'s complete sixteen-check roster
 (§3.1–§3.16 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
-complete twelve-check roster (§2.1–§2.12 of `governance/compliance_audit_sop.md`),
+complete thirteen-check roster (§2.1–§2.13 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
 the three SOPs defines is fully mechanical (design §2, point 2: none needed a
@@ -1953,7 +1953,7 @@ def check_service_selects_nothing(context: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all twelve checks of §2.
+# compliance-audit: all thirteen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -4024,6 +4024,123 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
     return hits
 
 
+# A tag that moves. `latest` is the one everybody names; the other five are
+# the branch- and channel-shaped tags that move exactly as often and get
+# treated as though they do not. Deliberately not a general "does this tag
+# look like a version" heuristic: `v2`, `stable-3` and `python3.12` are all
+# mutable in practice and all indistinguishable from a pin by shape, so a
+# heuristic either misses them or flags every tag in the fleet. This list is
+# the set that can be asserted.
+FLOATING_TAG_RE = re.compile(r":(latest|main|master|dev|nightly|stable|edge)$")
+# An image reference with no tag at all, which the runtime resolves to
+# `:latest`. The registry host may carry a port (`registry:5000/app`), so the
+# tag is only the part after the last `/`.
+UNTAGGED_IMAGE_RE = re.compile(r":[^/]*$")
+DIGEST_RE = re.compile(r"@sha256:")
+# `status.containerStatuses[].imageID` is not always a digest reference. A
+# locally-loaded image (kind, minikube, `docker save`) records `docker://` or
+# a bare id, and pinning to one of those produces a manifest no other node can
+# pull -- worse than the floating tag it replaced.
+_IMAGE_ID_DIGEST_RE = re.compile(r"^(?:docker-pullable://)?(?P<ref>[^@]+@sha256:[0-9a-f]{64})$")
+
+_IMPACT_IMAGE_FLOATING = (
+    "The manifest does not say which bytes run here, so every restart, "
+    "rescale, node replacement and preemption re-resolves the tag and can "
+    "bring back different code with no deploy and no record. A rollback "
+    "resolves the same reference, so it does not go back."
+)
+_IMPACT_IMAGE_SPLIT = (
+    "This workload's live pods are already running different builds of "
+    "{containers} at the same time, because the tag was re-resolved partway "
+    "through a rollout or a node replacement. Which version a request gets "
+    "depends on which pod it lands on, and no deploy was made to cause it."
+)
+
+
+def _running_digests(pod: dict) -> dict[str, str]:
+    """`{container name: fully-qualified digest reference}` for this pod.
+
+    Only entries that are a real registry digest reference; see
+    `_IMAGE_ID_DIGEST_RE`. Init containers are included because they are
+    pinned by the same edit and fail the same way.
+    """
+    status = pod.get("status") or {}
+    out = {}
+    for cs in (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or []):
+        match = _IMAGE_ID_DIGEST_RE.match(str(cs.get("imageID") or ""))
+        if match:
+            out[cs.get("name", "")] = match.group("ref")
+    return out
+
+
+def _workload_running_digests(workload: dict, context: dict) -> dict[str, set[str]]:
+    """`{container name: every digest a live pod of this workload is running}`.
+
+    Joined through the same owner-reference walk `netpol-missing` uses, so a
+    Deployment's pods reach it through their ReplicaSet.
+
+    A set rather than one value because the size of it is the finding's
+    severity. One digest means the tag has resolved consistently and the pin
+    is a no-op diff; more than one means the same container is running
+    different bytes on different nodes *right now*, which is what an unpinned
+    tag does when a rollout or a node replacement re-resolves it partway.
+    """
+    ref = f"{workload['kind']}/{workload['name']}"
+    seen: dict[str, set[str]] = {}
+    for pod in context.get("pods") or []:
+        if pod.get("ns") != workload["ns"] or not _is_live_pod(pod):
+            continue
+        if _pod_workload_ref(pod, context.get("workloads") or []) != ref:
+            continue
+        for name, digest in (pod.get("images") or {}).items():
+            seen.setdefault(name, set()).add(digest)
+    return seen
+
+
+def check_image_floating_tag(workload: dict, context: dict) -> dict | None:
+    """§2.13. A container whose image reference does not name specific bytes.
+
+    Every restart, rescale, node replacement and preemption re-resolves the
+    tag, so the pod that comes back can be running different code from the one
+    that went away -- with no deploy, no change to the manifest, and nothing
+    in the cluster recording that it happened. The same reference is what a
+    rollback resolves, so rolling back does not go back either.
+
+    The excerpt carries the digest the tag currently resolves to, where the
+    live pods agree on one, because that digest is what turns this from a
+    request the reviewer has to research into a diff that changes no bytes.
+    """
+    running = _workload_running_digests(workload, context)
+    bad, split = [], []
+    for container in (workload["spec"].get("containers") or []) + (workload["spec"].get("initContainers") or []):
+        image = container.get("image") or ""
+        if not image or DIGEST_RE.search(image):
+            continue
+        if not (FLOATING_TAG_RE.search(image) or not UNTAGGED_IMAGE_RE.search(image)):
+            continue
+        name = container.get("name", "")
+        digests = sorted(running.get(name) or ())
+        if len(digests) == 1:
+            bad.append(f"{name}: {image} -> currently running {digests[0]}")
+        elif digests:
+            split.append(name)
+            bad.append(f"{name}: {image} -> live pods are split across {len(digests)} digests: {', '.join(digests)}")
+        else:
+            bad.append(f"{name}: {image} (no running pod to read a digest from)")
+    if not bad:
+        return None
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": "; ".join(bad),
+        # Severity is proven drift, not the unpinned reference itself. An
+        # unpinned tag is everywhere in every fleet, and grading all of it
+        # `major` would flood the promotion queue with hygiene while burying
+        # the workloads whose pods have *already* diverged.
+        "severity": "major" if split else "minor",
+        "impact": _IMPACT_IMAGE_SPLIT.format(containers=", ".join(split)) if split else _IMPACT_IMAGE_FLOATING,
+    }
+
+
 class CheckSpec(NamedTuple):
     slug: str
     kind: str  # "workload": run(workload, context) -> hit|None, one call per workload.
@@ -4323,6 +4440,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "including a remediation this audit proposes -- changes nothing on the "
         "cloud until the controller is unblocked.",
     ),
+    CheckSpec(
+        "image-floating-tag",
+        "workload",
+        check_image_floating_tag,
+        "minor",  # overridden per hit: major where the live pods already disagree
+        None,
+        _IMPACT_IMAGE_FLOATING,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -4542,7 +4667,10 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # NetworkPolicy" and "is this pod selected by one" are different questions,
     # and only the labels can answer the second. The owner refs answer a third:
     # which object a reader is supposed to go and fix, since a pod name is a
-    # hash away from stable and a label value names nothing at all.
+    # hash away from stable and a label value names nothing at all. `images`
+    # answers a fourth, for §2.13: the digest a floating tag resolved to at the
+    # last pull, which is the one value that turns "pin this image" from a
+    # request the reviewer has to research into a diff that changes no bytes.
     context["pods"] = [
         {
             "ns": (i.get("metadata") or {}).get("namespace", ""),
@@ -4550,6 +4678,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
             "labels": (i.get("metadata") or {}).get("labels") or {},
             "phase": (i.get("status") or {}).get("phase", ""),
             "owners": _controller_refs(i.get("metadata") or {}),
+            "images": _running_digests(i),
         }
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
