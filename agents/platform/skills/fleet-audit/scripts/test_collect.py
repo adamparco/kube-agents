@@ -13,6 +13,7 @@ import json
 import re
 import shlex
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -4663,6 +4664,391 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
         if argv[:2] == ["gcloud", "container"] and argv[2] == "node-pools":
             return Run(argv, 0, "[]", "", 0.1)
         return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
+
+
+
+class TestWorkloadDeclarations(unittest.TestCase):
+    """The index that decides whether a finding can travel in a pull request.
+
+    Every case here is a shape the live fleet actually produced on 2026-09-06,
+    when 14 findings published as `kind: manual` -- "no pull request is
+    possible" -- on objects the GitOps repository declares, and one object
+    (`Deployment/waste-unsized`) was `manifest` under one check and `manual`
+    under three others in the same run.
+    """
+
+    DEPLOYMENT = textwrap.dedent(
+        """\
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: waste-unsized
+          namespace: waste-canary
+        spec:
+          replicas: 1
+        """
+    )
+
+    def tree(self, tmp, files):
+        for relative, text in files.items():
+            path = Path(tmp) / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return Path(tmp)
+
+    def test_an_object_under_its_cluster_tree_resolves_to_its_file(self):
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                {"clusters/spot-capacity-test/workloads/fixture.yaml": self.DEPLOYMENT},
+            )
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertEqual(
+            found,
+            {
+                "path": "clusters/spot-capacity-test/workloads/fixture.yaml",
+                "directory": "clusters/spot-capacity-test/workloads",
+            },
+        )
+
+    def test_the_directory_is_where_a_new_sibling_object_would_go(self):
+        """`no-pdb` creates a PDB beside the workload rather than editing it.
+
+        The live run got this branch right on its own -- it named a new
+        `waste-unsized-pdb.yaml` next to the Deployment -- so the index must
+        hand back the parent directory as well as the file, or annotating the
+        candidate would argue the model out of a correct answer.
+        """
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                {"clusters/spot-capacity-test/workloads/fixture.yaml": self.DEPLOYMENT},
+            )
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertEqual(found["directory"], "clusters/spot-capacity-test/workloads")
+
+    def test_another_clusters_tree_is_not_a_match(self):
+        """The failure the SOPs warn `grep` has, and the reason for exact keys.
+
+        A namespaced object written into the wrong cluster's applied tree fails
+        that tree's sync, so resolving nothing is the better answer.
+        """
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {"clusters/some-other-cluster/workloads/fixture.yaml": self.DEPLOYMENT}
+            )
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertIsNone(found)
+
+    def test_the_same_name_under_a_different_kind_is_not_a_match(self):
+        """`grep -rl "name: <object>"` is kind-blind; this index is not."""
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                {
+                    "clusters/spot-capacity-test/workloads/fixture.yaml": self.DEPLOYMENT.replace(
+                        "kind: Deployment", "kind: StatefulSet"
+                    )
+                },
+            )
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertIsNone(found)
+
+    def test_a_label_line_carrying_the_name_is_not_a_match(self):
+        """The other half of the grep failure: `app.kubernetes.io/name:` lines."""
+        labelled = textwrap.dedent(
+            """\
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: something-else
+              namespace: waste-canary
+              labels:
+                app.kubernetes.io/name: waste-unsized
+            """
+        )
+        with TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {"clusters/spot-capacity-test/workloads/f.yaml": labelled})
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertIsNone(found)
+
+    def test_a_different_namespace_is_not_a_match(self):
+        with TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {"clusters/spot-capacity-test/workloads/f.yaml": self.DEPLOYMENT})
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "other-namespace", "Deployment/waste-unsized"
+            )
+        self.assertIsNone(found)
+
+    def test_two_files_declaring_one_object_resolve_to_nothing(self):
+        """A duplicate resource id Argo and Config Sync both reject.
+
+        Naming either file would be right half the time; `manual` is right
+        every time.
+        """
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                {
+                    "clusters/spot-capacity-test/workloads/a.yaml": self.DEPLOYMENT,
+                    "clusters/spot-capacity-test/workloads/b.yaml": self.DEPLOYMENT,
+                },
+            )
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertIsNone(found)
+
+    def test_a_config_connector_resource_is_left_to_the_kcc_index(self):
+        """`audit_report.kcc_declarations` owns these, keyed by `spec.resourceID`.
+
+        A `Cluster/<name>` finding must keep resolving through that table, so
+        indexing the same object here would put two answers in play for one
+        finding.
+        """
+        kcc = textwrap.dedent(
+            """\
+            apiVersion: container.cnrm.cloud.google.com/v1beta1
+            kind: ContainerCluster
+            metadata:
+              name: drift-peer-std-4
+              namespace: config-control
+            """
+        )
+        with TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {"clusters/drift-peer-std-4/cluster.yaml": kcc})
+            index = collect.workload_declarations(root)
+        self.assertEqual(index, {})
+
+    def test_a_file_outside_any_cluster_tree_is_not_indexed(self):
+        """`gcp/`, `bootstrap/` and the repo root apply to no single cluster."""
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                {
+                    "bootstrap/thing.yaml": self.DEPLOYMENT,
+                    "gcp/thing.yaml": self.DEPLOYMENT,
+                    "top.yaml": self.DEPLOYMENT,
+                },
+            )
+            index = collect.workload_declarations(root)
+        self.assertEqual(index, {})
+
+    def test_an_unparseable_file_does_not_sink_the_index(self):
+        with TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                {
+                    "clusters/spot-capacity-test/workloads/broken.yaml": "a: [unterminated\n",
+                    "clusters/spot-capacity-test/workloads/good.yaml": self.DEPLOYMENT,
+                },
+            )
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "spot-capacity-test", "waste-canary", "Deployment/waste-unsized"
+            )
+        self.assertEqual(found["path"], "clusters/spot-capacity-test/workloads/good.yaml")
+
+    def test_an_object_the_repository_does_not_declare_resolves_to_nothing(self):
+        """The 47 `kube-agents-host` findings on this fleet: argocd and
+        cert-manager are installed by Helm, and no pull request against this
+        repository can edit them."""
+        with TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {"clusters/spot-capacity-test/workloads/f.yaml": self.DEPLOYMENT})
+            index = collect.workload_declarations(root)
+            found = collect.declaration_for(
+                index, "kube-agents-host", "argocd", "Deployment/argocd-server"
+            )
+        self.assertIsNone(found)
+
+    def test_a_malformed_object_reference_resolves_to_nothing(self):
+        with TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {"clusters/spot-capacity-test/workloads/f.yaml": self.DEPLOYMENT})
+            index = collect.workload_declarations(root)
+            for obj in ("", "waste-unsized", "/waste-unsized", "Deployment/"):
+                with self.subTest(object=obj):
+                    self.assertIsNone(
+                        collect.declaration_for(
+                            index, "spot-capacity-test", "waste-canary", obj
+                        )
+                    )
+
+    def test_an_unreadable_clone_yields_an_empty_index(self):
+        """Empty means unannotated, which leaves the SOP's grep as the answer."""
+        self.assertEqual(collect.workload_declarations(Path("/nonexistent-clone")), {})
+
+
+class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
+    """The annotation has to reach the candidate, or the model never sees it.
+
+    `workload_declarations` and `declaration_for` are unit-tested above
+    against a clone on disk. What those tests cannot show is that the answer
+    survives the trip to a candidate: the index is built in `collect_fleet`,
+    handed across a thread pool to `collect_cluster`, and attached inside
+    `emit`, and a break at any of those three joints leaves the index correct
+    and every candidate unannotated -- which is indistinguishable, from the
+    model's side, from a fleet whose objects are genuinely undeclared. So
+    these drive the real `--workspace` path end to end.
+    """
+
+    CLUSTER = {"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}
+    DECLARED = "clusters/prod-usc1/workloads/api.yaml"
+
+    def clone(self, tmp):
+        """A GitOps tree declaring Deployment/api, and nothing else.
+
+        `web` is deliberately absent: one run then covers both arms, so a
+        change that annotates unconditionally fails here rather than passing
+        a test that only ever looks at declared objects.
+        """
+        path = Path(tmp) / "infra"
+        (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+        (path / self.DECLARED).write_text(
+            textwrap.dedent(
+                """
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: api
+                  namespace: default
+                """
+            ).strip()
+        )
+        return path
+
+    def fleet_run(self, *names):
+        """`gcloud container clusters list` answers one cluster; every
+        `kubectl get` answers the same workloads. Deployments with no
+        resources and no probes trip several obtainability checks, so each
+        name yields more than one candidate.
+        """
+
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, json.dumps([self.CLUSTER]), "", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(*(deployment(n) for n in names))), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        return run
+
+    def candidates(self, manifest):
+        return [c for cluster in manifest["clusters"] for c in cluster.get("candidates") or []]
+
+    def test_a_declared_object_carries_its_path_and_directory(self):
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet(
+                    "obtainability-audit", "acme",
+                    run=self.fleet_run("api", "web"), workspace=self.clone(tmp),
+                )
+
+        candidates = self.candidates(manifest)
+        api = [c for c in candidates if c["object"] == "Deployment/api"]
+        web = [c for c in candidates if c["object"] == "Deployment/web"]
+        # Guard the guard: an empty list would satisfy every assertion below.
+        self.assertTrue(api, "no candidate for the declared workload")
+        self.assertTrue(web, "no candidate for the undeclared workload")
+
+        for candidate in api:
+            self.assertEqual(
+                candidate["declaration"],
+                {"path": self.DECLARED, "directory": "clusters/prod-usc1/workloads"},
+                candidate["check"],
+            )
+        # `web` is in the same dump, same cluster, same namespace, and differs
+        # only in being absent from the clone.
+        for candidate in web:
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_the_path_is_relative_to_the_clone_not_the_filesystem(self):
+        """What ships is what a PR branch has to check out.
+
+        An absolute path leaks the agent's scratch directory into the ledger
+        and into the remediation the model writes, where it names a file the
+        GitOps repository does not contain.
+        """
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet(
+                    "obtainability-audit", "acme",
+                    run=self.fleet_run("api"), workspace=self.clone(tmp),
+                )
+
+        for candidate in self.candidates(manifest):
+            declaration = candidate.get("declaration")
+            if declaration:
+                self.assertFalse(Path(declaration["path"]).is_absolute())
+                self.assertNotIn(tmp, declaration["path"])
+
+    def test_a_workspace_that_declares_nothing_annotates_nothing(self):
+        """An empty clone is not an error, and must not be a wrong answer.
+
+        A checkout that failed, or a repository whose layout does not match
+        `clusters/<name>/`, yields an empty index -- and the SOPs say an
+        absent annotation is "not a claim that no declaration exists", so the
+        model falls back to its grep rather than being told the object is
+        undeclared.
+        """
+        with TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet(
+                    "obtainability-audit", "acme", run=self.fleet_run("api"), workspace=empty,
+                )
+
+        candidates = self.candidates(manifest)
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertNotIn("declaration", candidate)
+
+    def test_without_a_workspace_no_candidate_is_annotated(self):
+        def run(argv, **kwargs):
+            return Run(argv, 0, "[]", "", 0.01)
+
+        manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
+        for cluster in manifest["clusters"]:
+            for candidate in cluster.get("candidates") or []:
+                self.assertNotIn("declaration", candidate)
+
+    def test_without_a_workspace_a_populated_fleet_is_still_unannotated(self):
+        """The test above lists an empty fleet, so it never reaches `emit`.
+
+        Omitting `--workspace` has to stay the no-op it was before this flag
+        existed, on a run that actually produces candidates.
+        """
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet(
+                    "obtainability-audit", "acme", run=self.fleet_run("api"),
+                )
+
+        candidates = self.candidates(manifest)
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertNotIn("declaration", candidate)
 
 
 class TestChecksRevision(unittest.TestCase):

@@ -89,6 +89,16 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
 
+# `workload_declarations` walks a GitOps clone. A file is applied to a known
+# cluster only when it sits at `clusters/<name>/...`, which is three path
+# components at minimum -- the root, the cluster, and the file itself.
+GITOPS_CLUSTER_TREE_ROOT = "clusters"
+GITOPS_CLUSTER_TREE_DEPTH = 2
+GIT_DIR_NAME = ".git"
+# Spelled the same way `audit_report.KCC_API_GROUP_SUFFIX` spells it, and
+# copied rather than imported for the reason `SYSTEM_NAMESPACES` is below.
+KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+
 # The fleet-wide system-namespace set (S1), spelled identically in every SOP
 # that names it. Kept here rather than imported from audit_report.py: this
 # script ships and runs standalone (see the module docstring), and a
@@ -3468,8 +3478,133 @@ _EMPTY_SCOPE_REASON: dict[str, str] = {
 # one, and no entry in this table would catch it.
 
 
+def workload_declarations(root: Path) -> dict[tuple[str, str, str, str], set[str]]:
+    """Index the Kubernetes objects a GitOps clone declares, by cluster tree.
+
+    Maps `(cluster, kind, namespace, metadata.name)` to the set of
+    clone-relative paths declaring it — a set, because two files claiming one
+    object is the ambiguity `declaration_for` refuses to resolve rather than
+    guessing between.
+
+    This is `audit_report.kcc_declarations` for workload objects, and it exists
+    for the reason that one gives: "parsed rather than grepped, deliberately".
+    Config Connector resources got that treatment; the Kubernetes objects every
+    other stream flags did not, and their SOPs still tell the *model* to run
+    `grep -rl "name: <object>"` once per finding and decide for itself. It does
+    not decide consistently. On 2026-09-06 the live fleet carried 116 findings
+    in which `Deployment/waste-unsized` was `kind: manifest` with a correct
+    path under `unsized-workload` and `kind: manual` -- "no pull request is
+    possible" -- under `probes-liveness`, `no-requests` and `no-memory-limit`,
+    which are the same object in the same file. Fourteen findings were `manual`
+    on objects this index resolves.
+
+    Config Connector resources are skipped, not overlooked: `kcc_declarations`
+    already indexes them, keyed by the GCP resource name that `spec.resourceID`
+    can override, and a `Cluster/<name>` finding must keep resolving through
+    that table rather than through this one.
+
+    Returns `{}` when PyYAML is absent or the clone is unreadable, which leaves
+    every candidate unannotated and the SOP's grep as the only answer -- the
+    behaviour that shipped before this existed.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
+    except ImportError:
+        return {}
+
+    index: dict[tuple[str, str, str, str], set[str]] = {}
+    try:
+        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
+    except OSError:
+        return {}
+    for path in paths:
+        # `.git` holds packed objects, not manifests, and rglob walks into it.
+        if GIT_DIR_NAME in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            # A file this collector cannot parse is one it cannot make a claim
+            # about. Skipping leaves those findings unannotated.
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        parts = relative.parts
+        # Only a file under `clusters/<name>/` is applied to a known cluster.
+        # Anything else -- `gcp/`, `bootstrap/`, the repo root -- is either a
+        # Config Connector resource this index skips or hub infrastructure no
+        # per-cluster finding should resolve to, so it is indexed under no
+        # cluster and can never match: `declaration_for` requires the cluster.
+        if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
+            continue
+        cluster = parts[1]
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            api = str(doc.get("apiVersion") or "")
+            kind = str(doc.get("kind") or "")
+            if not kind or KCC_API_GROUP_SUFFIX in api:
+                continue
+            meta = doc.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            name = str(meta.get("name") or "")
+            namespace = str(meta.get("namespace") or "")
+            if not name or not namespace:
+                continue
+            index.setdefault((cluster, kind, namespace, name), set()).add(str(relative))
+    return index
+
+
+def declaration_for(
+    index: dict[tuple[str, str, str, str], set[str]],
+    cluster: str,
+    namespace: str,
+    obj: str,
+) -> dict | None:
+    """Where the GitOps repo declares one candidate's object, or `None`.
+
+    `None` means unannotated — no claim either way — and is what an absent
+    index, an object outside `Kind/name` form, or a genuine miss all return.
+    A hit carries `path` (the declaration itself, for a remediation that
+    *changes* the object) and `directory` (its parent, for one that *creates* a
+    sibling beside it, as a new PDB or NetworkPolicy does).
+
+    The match is exact on all four of cluster, kind, namespace and name. Every
+    looser arm was measured against the live fleet's 116 findings first and
+    matched nothing the exact arm had not already matched, so the fallbacks
+    that would have made this kind-blind or cluster-blind -- the two failure
+    modes every SOP warns the model's `grep` has -- buy nothing and are not
+    here. A namespaced object resolved into another cluster's tree fails that
+    tree's sync, which is worse than resolving nothing.
+    """
+    kind, _, name = obj.partition("/")
+    if not kind or not name or not cluster or not namespace:
+        return None
+    paths = index.get((cluster, kind, namespace, name))
+    if not paths or len(paths) > 1:
+        # Two files declaring one object is a duplicate resource id that Argo
+        # and Config Sync both reject; picking one would name the wrong file
+        # half the time. Say nothing and let the SOP's `manual` branch hold.
+        return None
+    path = next(iter(paths))
+    parent = str(Path(path).parent)
+    return {"path": path, "directory": parent}
+
+
 def collect_cluster(
-    cluster: dict, audit_id: str, checks: tuple[CheckSpec, ...], *, run: RunFn = default_run
+    cluster: dict,
+    audit_id: str,
+    checks: tuple[CheckSpec, ...],
+    *,
+    run: RunFn = default_run,
+    declarations: dict[tuple[str, str, str, str], set[str]] | None = None,
 ) -> dict:
     """One manifest `clusters[]` entry (§6): every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
@@ -3527,6 +3662,14 @@ def collect_cluster(
         }
         if arm_specific:
             emitted["impact_authoritative"] = True
+        # Where the GitOps repo declares this object, when it does. Absent
+        # means unannotated, never "no declaration exists": the index is empty
+        # without `--workspace`, and the SOP's own grep is still the answer
+        # then. See `workload_declarations`.
+        if declarations:
+            declaration = declaration_for(declarations, name, emitted["namespace"], hit["object"])
+            if declaration:
+                emitted["declaration"] = declaration
         return emitted
 
     candidates = []
@@ -3658,6 +3801,7 @@ def collect_fleet(
     *,
     run: RunFn = default_run,
     max_workers: int = MAX_WORKERS,
+    workspace: Path | None = None,
 ) -> dict:
     checks = CHECK_TABLES.get(audit_id)
     if not checks:
@@ -3666,10 +3810,17 @@ def collect_fleet(
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     clusters, not_running = enumerate_clusters(project, run=run)
 
+    # Built once for the whole fleet, before the pool: every cluster's
+    # candidates resolve against the same clone, and walking it per cluster
+    # would read the same tree sixteen times to get the same answer.
+    declarations = workload_declarations(workspace) if workspace else {}
+
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(collect_cluster, cluster, audit_id, checks, run=run): index
+            pool.submit(
+                collect_cluster, cluster, audit_id, checks, run=run, declarations=declarations
+            ): index
             for index, cluster in enumerate(clusters)
         }
         for future in as_completed(futures):
@@ -3727,13 +3878,32 @@ def main(argv: list[str] | None = None) -> int:
         "--project",
         help="single project to audit; omit to use GCP_PROJECT_ID/GKE_PROJECT_ID/PROJECT_ID",
     )
+    parser.add_argument(
+        "--workspace",
+        help=(
+            "the GitOps clone `audit_report.py start` made, so each candidate "
+            "carries where the repository declares its object; omit and no "
+            "candidate is annotated"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         project = resolve_project(args.project)
     except RuntimeError as exc:
         print(f"collect.py: {exc}", file=sys.stderr)
         return 2
-    manifest = collect_fleet(args.audit, project)
+    workspace = Path(args.workspace) if args.workspace else None
+    if workspace is not None and not workspace.is_dir():
+        # Loud, and not fatal. A typo here would otherwise annotate nothing and
+        # read exactly like a repository that declares none of the fleet, which
+        # is the answer that sends every finding to `manual`.
+        print(
+            f"collect.py: --workspace {str(workspace)!r} is not a directory; "
+            "no candidate will carry a declaration",
+            file=sys.stderr,
+        )
+        workspace = None
+    manifest = collect_fleet(args.audit, project, workspace=workspace)
     print(json.dumps(manifest, indent=2))
     return 0
 
