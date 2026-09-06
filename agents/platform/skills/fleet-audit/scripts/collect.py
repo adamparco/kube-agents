@@ -2314,18 +2314,57 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
 # loads a model and answers inference requests, and by being distinctive enough
 # that the `(^|/)`/`([-:@/]|$)` anchors cannot land it on something else. Two
 # rejected candidates say where the line is: `litellm` is a proxy in front of
-# model servers rather than one itself, and this fleet runs one in
-# `kubeagents-system`, so listing it would open every §3 check on a gateway
-# that holds no weights; `nim` would match `nimlang/nim:2.0` under these
-# anchors, and NVIDIA's NIM containers request a GPU anyway, so the accelerator
-# prong already has them. `tei` is left off for the same reason `nim` is --
-# three letters, no distinctiveness -- while its full name is spelled out.
+# model servers rather than one itself, so it holds no weights and belongs to
+# the credential prong below instead; `nim` would match `nimlang/nim:2.0` under
+# these anchors, and NVIDIA's NIM containers request a GPU anyway, so the
+# accelerator prong already has them. `tei` is left off for the same reason
+# `nim` is -- three letters, no distinctiveness -- while its full name is
+# spelled out.
 AI_MODEL_IMAGE_RE = re.compile(
     r"(^|/)(vllm|sglang|text-generation-inference|tgi|text-embeddings-inference|"
     r"tritonserver|torchserve|tensorflow-serving|kserve|ollama|ray|llama|mlserver|"
     r"seldon|lorax|aibrix|lmdeploy|xinference|localai|openllm)([-:@/]|$)"
 )
 AI_ACCELERATOR_KEY_RE = re.compile(r"nvidia\.com/gpu|google\.com/tpu")
+
+# The third prong, and the only one that does not depend on recognising a name.
+# An image allowlist is never finished, and the gap is not hypothetical: the
+# `_EMPTY_SCOPE_REASON` comment further down names this stream's real exposure
+# as a model server whose runtime nobody has listed, serving on CPU so no
+# accelerator gives it away, reported as a clean cluster. A container holding
+# `OPENAI_API_KEY` is talking to a model provider whatever its image is called.
+#
+# This is what puts a model gateway in scope, which the image prong deliberately
+# will not do. That prong is right that a gateway holds no weights, and wrong
+# about the consequence: of the six checks it opens, four cannot fire on a
+# weightless workload at all -- 3.3 needs a CSI or PVC volume, 3.2 a
+# `trust_remote_code` directive, 3.4 a `--model` flag or a plaintext artifact
+# URL, 3.6 a floating tag. The two that remain are the two worth asking about a
+# gateway, because a gateway is defined by holding provider credentials on
+# behalf of everything behind it: whether its endpoint is public (3.1) and
+# whether those credentials are literals (3.5). This fleet's `litellm` answers
+# no to both -- ClusterIP, three `secretKeyRef`s -- which is a verdict the
+# stream could not previously reach.
+#
+# Whole-name and named-provider only, which is stricter than §3.5's name rule
+# below and deliberately so. Admitting a workload here subjects it to all six
+# checks, including being asked whether its endpoint is a public *inference*
+# endpoint; `(MODEL|REGISTRY|INFERENCE).*KEY` is a fair heuristic once a
+# workload is known to serve models and a bad one for deciding that it does.
+# §3.5 unions the two, so a provider named only here is still read for a
+# plaintext value.
+#
+# `envFrom` is deliberately not read. The credential's name lives in the Secret
+# rather than in the pod spec, so all a pod spec can say is "this container has
+# some envFrom" -- true on this fleet of `ip-masq-agent` on five clusters and of
+# no model server anywhere.
+AI_PROVIDER_CREDENTIAL_ENV_RE = re.compile(
+    r"^(OPENAI|ANTHROPIC|GEMINI|COHERE|MISTRAL|TOGETHER|GROQ|PERPLEXITY|DEEPSEEK|"
+    r"FIREWORKS|ANYSCALE|AZURE_OPENAI|VERTEXAI|XAI|WANDB)_API_KEY$"
+    r"|^(HF|HUGGING_FACE_HUB|HUGGINGFACE)_(TOKEN|API_TOKEN)$"
+    r"|^REPLICATE_API_TOKEN$",
+    re.IGNORECASE,
+)
 
 
 def _is_ai_workload(spec: dict) -> bool:
@@ -2335,6 +2374,13 @@ def _is_ai_workload(spec: dict) -> bool:
     for c in containers:
         limits = (c.get("resources") or {}).get("limits") or {}
         if any(AI_ACCELERATOR_KEY_RE.search(key) for key in limits):
+            return True
+    for c in containers:
+        # Named, not valued: a `secretKeyRef` is the correct way to hold one of
+        # these and still means the workload holds it. Whether the value is a
+        # literal is 3.5's question, and answering it here would put exactly the
+        # workloads that got it right out of the audit's reach.
+        if any(AI_PROVIDER_CREDENTIAL_ENV_RE.search(e.get("name") or "") for e in c.get("env") or []):
             return True
     return False
 
@@ -2613,6 +2659,13 @@ def check_model_artifact_unpinned_source(workload: dict, context: dict) -> dict 
     return hit
 
 
+# Unioned with `AI_PROVIDER_CREDENTIAL_ENV_RE` at the call site rather than
+# merged into it: that one is anchored whole-name because it decides scope,
+# while the `(MODEL|REGISTRY|INFERENCE).*` heuristic here is safe only because
+# everything reaching it is already a known AI workload. Keeping both means a
+# provider that only the anchored list names -- `COHERE_API_KEY`,
+# `MISTRAL_API_KEY` -- cannot admit a workload to the audit and then go unread
+# for a plaintext value once it is in.
 AI_CREDENTIAL_ENV_NAME_RE = re.compile(
     r"HF_[A-Z_]*TOKEN|HUGGING_?FACE.*TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|WANDB_API_KEY|"
     r"(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)",
@@ -2699,7 +2752,10 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
             if (
                 value
                 and e.get("valueFrom") is None
-                and AI_CREDENTIAL_ENV_NAME_RE.search(name)
+                and (
+                    AI_CREDENTIAL_ENV_NAME_RE.search(name)
+                    or AI_PROVIDER_CREDENTIAL_ENV_RE.search(name)
+                )
                 and not AI_CREDENTIAL_ENV_NAME_SAFE_SUFFIX_RE.search(name)
             ):
                 bad.append(f"{c.get('name', '')}:{name}")
@@ -3582,6 +3638,15 @@ _EMPTY_SCOPE_REASON: dict[str, str] = {
 # accelerator limit gives it away, is invisible to this stream and reported as
 # a clean cluster. That is a discriminator false negative, not a bookkeeping
 # one, and no entry in this table would catch it.
+#
+# `AI_PROVIDER_CREDENTIAL_ENV_RE` is the answer to part of that, and only part.
+# It admits a workload on a mark no allowlist has to keep up with -- holding a
+# named provider credential -- which covers the unlisted runtime that pulls from
+# Hugging Face or calls a hosted provider, and put this fleet's `litellm` in
+# scope for the first time. What it still cannot see is a model server that
+# neither matches a listed image nor holds a credential: one serving weights
+# baked into its own image, on CPU, anonymously. Judge a "clean cluster" verdict
+# from this stream against that shape before believing it.
 
 
 def workload_declarations(root: Path) -> dict[tuple[str, str, str, str], set[str]]:

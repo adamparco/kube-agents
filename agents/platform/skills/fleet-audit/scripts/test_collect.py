@@ -3868,18 +3868,87 @@ class TestIsAiWorkload(unittest.TestCase):
             with self.subTest(image=image):
                 self.assertTrue(collect._is_ai_workload({"containers": [{"image": image}]}))
 
-    def test_a_model_proxy_and_a_language_toolchain_stay_out(self):
+    def test_a_model_proxy_and_a_language_toolchain_stay_out_of_the_image_prong(self):
         """Both would be false positives of the shape the SOP's "never widen on
         naming" rule is about. `litellm` fronts model servers without holding a
         model, and this fleet runs one in `kubeagents-system`; `nim` was left
         off the list because these anchors cannot tell NVIDIA's inference
-        containers from the Nim compiler."""
+        containers from the Nim compiler.
+
+        The image prong is what is asserted here, and litellm is still outside
+        it. The real one carries three provider credentials and so is in scope
+        through the credential prong instead -- see
+        `test_a_named_provider_credential_matches`. A name it is not is the
+        wrong reason to audit something; a credential it holds is a fact about
+        it."""
         for image in (
             "us-east4-docker.pkg.dev/adamparco-kage/kube-agents/litellm:v1.96.2",
             "nimlang/nim:2.0",
         ):
             with self.subTest(image=image):
                 self.assertFalse(collect._is_ai_workload({"containers": [{"image": image}]}))
+
+    def test_a_named_provider_credential_matches(self):
+        """The prong that does not depend on recognising a name. Every one of
+        these is a container talking to a model provider under an image no
+        allowlist has, which is the false negative that reports a cluster
+        clean."""
+        for env_name in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "COHERE_API_KEY",
+            "MISTRAL_API_KEY",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "REPLICATE_API_TOKEN",
+        ):
+            with self.subTest(env_name=env_name):
+                spec = {"containers": [{"image": "acme/app:v1", "env": [{"name": env_name, "value": "x"}]}]}
+                self.assertTrue(collect._is_ai_workload(spec))
+
+    def test_a_secret_backed_provider_credential_still_matches(self):
+        """Holding the credential is what puts a workload in scope; holding it
+        correctly is 3.5's separate question. Reading the value here would put
+        exactly the workloads that got it right out of the audit's reach --
+        including this fleet's own litellm, whose three keys are all
+        `secretKeyRef` and whose ClusterIP Service is a 3.1 verdict the stream
+        could not otherwise reach."""
+        spec = {"containers": [{
+            "image": "us-east4-docker.pkg.dev/adamparco-kage/kube-agents/litellm:v1.96.2",
+            "env": [
+                {"name": "VERTEXAI_PROJECT", "value": "adamparco-kage"},
+                {"name": "ANTHROPIC_API_KEY", "valueFrom": {"secretKeyRef": {"name": "k", "key": "k"}}},
+            ],
+        }]}
+        self.assertTrue(collect._is_ai_workload(spec))
+
+    def test_a_credential_shaped_name_that_names_no_provider_stays_out(self):
+        """The scope prong is anchored whole-name where 3.5's is a substring
+        heuristic, and this is the reason for the difference: admitting a
+        workload subjects it to all six checks, including being asked whether
+        its endpoint is a public *inference* endpoint. A CI runner holding a
+        registry password is not a model server."""
+        for env_name in (
+            "REGISTRY_PASSWORD",
+            "MODEL_REGISTRY_KEY_ID",
+            "MY_OPENAI_API_KEY_BACKUP",
+            "OPENAI_API_KEY_FILE",
+            "OPENAI_ORG",
+        ):
+            with self.subTest(env_name=env_name):
+                spec = {"containers": [{"image": "acme/ci:v1", "env": [{"name": env_name, "value": "x"}]}]}
+                self.assertFalse(collect._is_ai_workload(spec))
+
+    def test_envfrom_alone_does_not_admit_a_workload(self):
+        """A pod spec cannot say what is inside a Secret, so reading `envFrom`
+        would admit anything that has one. On this fleet that is `ip-masq-agent`
+        on five clusters and no model server anywhere."""
+        spec = {"containers": [{
+            "image": "gke.gcr.io/ip-masq-agent:v2.11",
+            "envFrom": [{"configMapRef": {"name": "netd-config"}}],
+        }]}
+        self.assertFalse(collect._is_ai_workload(spec))
 
 
 class TestNormalizeAiWorkloads(unittest.TestCase):
@@ -4292,6 +4361,21 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
     def test_never_puts_the_value_in_the_excerpt(self):
         hit = self.hit([{"name": "HF_TOKEN", "value": "hf_super_secret_value"}])
         self.assertNotIn("hf_super_secret_value", hit["excerpt"])
+
+    def test_flags_a_provider_only_the_scope_prong_names(self):
+        """`COHERE_API_KEY` matches no clause of this check's own name rule --
+        no `MODEL`/`REGISTRY`/`INFERENCE` in it, and not one of the four spelled
+        out. Without the union it would admit a workload to the audit through
+        `_is_ai_workload` and then be the one literal the audit does not read,
+        which is the worst of both."""
+        for env_name in ("COHERE_API_KEY", "MISTRAL_API_KEY", "GEMINI_API_KEY", "REPLICATE_API_TOKEN"):
+            with self.subTest(env_name=env_name):
+                self.assertIsNotNone(self.hit([{"name": env_name, "value": "sk-live-abcdef123456"}]))
+
+    def test_the_union_does_not_defeat_the_safe_suffix_rule(self):
+        """`_FILE` still names a path rather than a value, whichever of the two
+        name rules matched upstream of the suffix."""
+        self.assertIsNone(self.hit([{"name": "COHERE_API_KEY_FILE", "value": "/var/run/secrets/cohere"}]))
 
     def test_does_not_flag_the_sops_own_named_non_secret_examples(self):
         self.assertIsNone(self.hit([{"name": "HF_TOKEN_PATH", "value": "/var/run/secrets/hf/token"}]))
