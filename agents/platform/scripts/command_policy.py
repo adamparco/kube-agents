@@ -300,6 +300,18 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "backend-services", "list"),
         ("compute", "disks", "describe"),
         ("compute", "disks", "list"),
+        # The only read behind §2.6 `firewall-world-open-ingress`, and the
+        # check is inert without it: a rule's `sourceRanges`, `allowed` and
+        # `direction` have no other surface, so the collector gate-failed the
+        # whole project-scoped target on the first run after the check
+        # shipped (2026-09-06, rc=126, rule gcp.read-only). That run reported
+        # `partial: true` and named the gap rather than claiming clean, which
+        # is the machinery working -- but the two `critical` candidates the
+        # check finds on this fleet, 0.0.0.0/0 on tcp:22 and tcp:3389, went
+        # unpublished for want of one allowlist entry. Pure read; the writes
+        # one word away (`firewall-rules create`, `update`, `delete`) stay
+        # refused and the tests assert it.
+        ("compute", "firewall-rules", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
         # The daily `gce-compute-fleet-audit` cron runs

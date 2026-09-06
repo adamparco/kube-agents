@@ -1371,10 +1371,36 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
                     verb,
                 )
 
+    def test_the_world_open_ingress_firewall_read_is_allowed(self):
+        # §2.6's only data source. Unlisted, it gate-failed the collector's
+        # whole project-scoped target on the first run after the check
+        # shipped (2026-09-06, rc=126 under gcp.read-only), so the two
+        # `critical` candidates on this fleet -- 0.0.0.0/0 reaching tcp:22
+        # and tcp:3389 -- never reached the ledger. Both --project spellings,
+        # because the collector uses the space-separated one and the SOP
+        # prints the `=` one.
+        for argv, desc in (
+            (["gcloud", "compute", "firewall-rules", "list", "--project", "p",
+              "--format", "json"],
+             "collector's read, space-separated --project"),
+            (["gcloud", "compute", "firewall-rules", "list", "--project=p",
+              "--format=json"],
+             "the SOP's printed spelling"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
     def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
         # Each new entry has a mutating sibling that shares all but the last
         # word. The entries are full paths, so the siblings must still refuse.
         for argv, desc in (
+            (["gcloud", "compute", "firewall-rules", "create", "f"],
+             "firewall-rules create"),
+            (["gcloud", "compute", "firewall-rules", "update", "f"],
+             "firewall-rules update"),
+            (["gcloud", "compute", "firewall-rules", "delete", "f"],
+             "firewall-rules delete"),
             (["gcloud", "compute", "networks", "create", "n"], "networks create"),
             (["gcloud", "compute", "networks", "delete", "n"], "networks delete"),
             (["gcloud", "compute", "networks", "subnets", "create", "s"],
