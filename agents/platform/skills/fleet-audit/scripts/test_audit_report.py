@@ -6465,6 +6465,149 @@ def harness_comment(body, node_id="IC_9"):
     }
 
 
+class TestBelowFloorDisclosure(BaseTestCase):
+    """The floor refuses far more than the cap, and used to say nothing.
+
+    `_render_withheld` named what the cap held back on the stated principle
+    that a filter which silently drops work reads as "nothing more to do".
+    The severity floor drops strictly more and was exempt from that principle.
+    On the nine live streams on 2026-09-05 the cap held back nothing while the
+    floor held back all 20 manifest remediations on the fleet, 15 of them on
+    one ledger, whose reader saw fifteen declarative fixes, no pull requests,
+    and no sentence saying `/remediate` would open any of them.
+
+    These tests pin the disclosure, not the policy: what the sweep promotes is
+    unchanged, and `test_only_critical_manifest_findings_auto_promote` above
+    still owns that.
+    """
+
+    def test_a_manifest_fix_under_the_floor_is_reported_not_dropped(self):
+        plan = audit_report.promotion_candidates(
+            [
+                manifest_finding("crit", "a.yaml", severity="critical"),
+                manifest_finding("maj", "b.yaml", severity="major"),
+                manifest_finding("min", "c.yaml", severity="minor"),
+            ],
+            {},
+        )
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.withheld, [])
+        self.assertEqual(sorted(plan.below_floor), ["maj", "min"])
+
+    def test_the_floor_report_excludes_what_the_other_two_filters_refused(self):
+        """Severity is tested last, so `below_floor` holds only its own refusals.
+
+        Tested first it would also collect the findings with no manifest to
+        open and the ones whose pull request is already live, and the ledger
+        would invite `/remediate` on both -- on work that cannot be done, and
+        on work already sitting in the reader's review queue.
+        """
+        findings = [
+            make_finding(
+                fid="min-gcloud",
+                severity="minor",
+                remediation={"kind": "gcloud", "note": "g"},
+            ),
+            make_finding(
+                fid="min-manual",
+                severity="minor",
+                remediation={"kind": "manual", "note": "m"},
+            ),
+            manifest_finding("min-open-pr", "d.yaml", severity="minor"),
+            manifest_finding("min-real", "e.yaml", severity="minor"),
+        ]
+        plan = audit_report.promotion_candidates(
+            findings, {"min-open-pr": {"state": "OPEN"}}
+        )
+        self.assertEqual(plan.below_floor, ["min-real"])
+
+    def test_a_harness_withdrawn_pr_does_not_hide_a_floor_refusal(self):
+        # `withdrawn` is treated as no pull request at all everywhere else, so
+        # a finding whose fix the harness closed as stale is still awaiting a
+        # `/remediate` and still has to be named as one.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {"min": stale_closed_pr()},
+        )
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_a_requested_finding_is_promoted_rather_than_reported(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {},
+            requested=["min"],
+        )
+        self.assertEqual(plan.promote, ["min"])
+        self.assertEqual(plan.below_floor, [])
+
+    def test_the_remediate_subcommand_reports_no_floor_refusals(self):
+        # `auto_promote=False` runs no sweep, so there is nothing for the floor
+        # to have refused. Reporting one would put an "Awaiting /remediate"
+        # section on the answer to a `/remediate` that just ran.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {},
+            auto_promote=False,
+        )
+        self.assertEqual(plan.below_floor, [])
+
+    def test_the_ledger_names_the_floor_refusals_and_how_to_open_them(self):
+        doc = make_doc(
+            findings=[
+                make_finding(),
+                make_finding(fid="wide-rbac", severity="minor",
+                             title="Wildcard RBAC verb", check="wildcard-rbac"),
+            ]
+        )
+        body = render_body(doc, generated_at=NOW, below_floor=["wide-rbac"])
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn("`wide-rbac`", body)
+        self.assertIn("Wildcard RBAC verb", body)
+        self.assertIn(f"`{audit_report.AUTO_PROMOTION_FLOOR}`", body)
+        # The distinction that makes the two blocks worth separating: a reader
+        # who thinks the sweep will get to it next run does not comment.
+        self.assertIn("does not clear on its own", body)
+
+    def test_the_cap_and_the_floor_are_named_as_separate_reasons(self):
+        doc = make_doc(
+            findings=[
+                make_finding(),
+                make_finding(fid="wide-rbac", severity="minor",
+                             title="Wildcard RBAC verb", check="wildcard-rbac"),
+            ]
+        )
+        body = render_body(
+            doc,
+            generated_at=NOW,
+            withheld=["no-network-policy"],
+            below_floor=["wide-rbac"],
+        )
+        self.assertEqual(body.count("## Awaiting `/remediate`"), 1)
+        self.assertIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+        self.assertIn("first in line on the next run", body)
+        self.assertIn("does not clear on its own", body)
+        self.assertIn("2 finding(s)", body)
+
+    def test_nothing_refused_renders_no_section(self):
+        body = render_body(make_doc(), generated_at=NOW)
+        self.assertNotIn("Awaiting `/remediate`", body)
+
+    def test_the_floor_alone_still_renders_the_section(self):
+        # The section used to key off `withheld` alone, so a run the cap did
+        # not touch rendered nothing however much the floor had refused --
+        # which on a real fleet is the only case that ever happens.
+        doc = make_doc(
+            findings=[
+                make_finding(),
+                make_finding(fid="wide-rbac", severity="minor",
+                             title="Wildcard RBAC verb", check="wildcard-rbac"),
+            ]
+        )
+        body = render_body(doc, generated_at=NOW, withheld=[], below_floor=["wide-rbac"])
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+
+
 class TestRemediateCommands(BaseTestCase):
     def setUp(self):
         super().setUp()
@@ -8475,6 +8618,15 @@ class TestReportStore(HarnessTestCase):
             # drops the minor finding from *both* renders, leaving the relink
             # nothing to change and this fixture nothing to compare.
             repo="acme/fleet",
+            # Same trap, second door. The minor finding here carries a manifest
+            # remediation and is graded under the promotion floor, so the run
+            # renders an "Awaiting `/remediate`" section naming it and a probe
+            # without one measures short by exactly that section. Derived from
+            # the same call `finish` makes rather than hardcoded, so a change to
+            # what the sweep refuses moves the probe with it.
+            below_floor=audit_report.promotion_candidates(
+                doc["findings"], {}
+            ).below_floor,
         )
 
         def fitted(budget):

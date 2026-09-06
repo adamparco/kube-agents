@@ -836,6 +836,13 @@ MAX_PR_PAGE = 1000
 # `/remediate` bypasses it: a human asked for that one by name.
 AUTO_PROMOTION_CAP = 5
 
+# The severity the automatic sweep requires before it opens a pull request
+# unasked. It is the tighter of the two filters by a wide margin -- see
+# `_render_withheld`, which names what each of them held back -- so it is a
+# constant rather than a literal in the loop, to be found by anyone measuring
+# why a ledger full of manifest remediations opened nothing.
+AUTO_PROMOTION_FLOOR = "critical"
+
 # `authorAssociation` values that imply write access. Read by `is_machine_author`
 # and by nothing else — it is **not** the `/remediate` authorization gate, and
 # restoring it to that job re-opens the bug in `resolve_write_access`'s docstring.
@@ -5243,6 +5250,11 @@ class PromotionPlan(NamedTuple):
     withheld: list[str]
     already_open: list[str]
     superseded: list[str] = []
+    # Manifest findings the sweep passed over for severity alone. Not "withheld"
+    # -- the cap clears itself on the next run and this does not -- so it is
+    # reported separately rather than folded in. Empty when `auto_promote` is
+    # off, because the `remediate` subcommand runs no sweep to be blocked by.
+    below_floor: list[str] = []
 
 
 def promotion_candidates(
@@ -5280,6 +5292,12 @@ def promotion_candidates(
 
     The cap counts findings, and a group of findings sharing a path collapses to
     one pull request, so the number of PRs opened is at most `cap`.
+
+    `below_floor` is what the severity test alone refused — a manifest fix, on a
+    finding carrying no live pull request, graded under `AUTO_PROMOTION_FLOOR`.
+    It is returned so the ledger can name it, because on a real fleet it is the
+    filter that stops nearly everything and the cap is the one that stops
+    nothing: see `_render_withheld` for the measurement.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
@@ -5316,21 +5334,28 @@ def promotion_candidates(
         promote.append(fid)
 
     auto: list[str] = []
+    below_floor: list[str] = []
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
-            continue
-        if finding.get("severity") != "critical":
             continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
         pr = pr_by_finding.get(fid)
         if pr is not None and not pr_closed_by_harness(pr):
             continue
+        # Severity is tested last of the three, which is the only order that
+        # can tell the floor's refusals apart from the rest. Tested first, a
+        # finding with a live pull request or a `gcloud` fix would land in
+        # `below_floor` too, and the ledger would invite `/remediate` on work
+        # that is already open or has no manifest to open.
+        if finding.get("severity") != AUTO_PROMOTION_FLOOR:
+            below_floor.append(fid)
+            continue
         auto.append(fid)
 
     promote.extend(auto[:cap])
-    return PromotionPlan(promote, auto[cap:], already_open, superseded)
+    return PromotionPlan(promote, auto[cap:], already_open, superseded, below_floor)
 
 
 # --------------------------------------------------------------------------- #
@@ -6087,29 +6112,71 @@ def _render_footer(
     ]
 
 
-def _render_withheld(withheld: list[str], findings: list[dict]) -> list[str]:
-    """Name the findings eligible for a pull request that the cap held back.
+def _render_withheld(
+    withheld: list[str],
+    findings: list[dict],
+    below_floor: list[str] | None = None,
+) -> list[str]:
+    """Name the manifest fixes this run opened no pull request for.
 
-    A cap that silently drops work reads as "nothing more to do". Naming them,
-    with the command to ask for one, is what keeps the cap honest.
+    A filter that silently drops work reads as "nothing more to do". Naming
+    what it dropped, with the command to ask for one, is what keeps it honest.
+
+    Two filters drop work and only the cap used to be named. The cap is by far
+    the smaller of them. Measured across the nine live streams on 2026-09-05,
+    it held back nothing at all, while the `critical` floor held back every
+    manifest remediation on the fleet -- 20 of them, 15 on one ledger -- and
+    said so nowhere. The two do not overlap on a real fleet: the findings
+    graded `critical` are exposure problems closed with `gcloud`, and the ones
+    attracting a declarative fix are graded `major` and `minor`, so the sweep's
+    two conditions select disjoint sets and it opens nothing. A reader of that
+    ledger saw fifteen manifest remediations, no pull requests, and no sentence
+    telling them one comment would open any of them.
+
+    Both are named, in separate blocks, because the answer to them differs: the
+    cap clears itself on the next run, and the floor never does.
     """
-    if not withheld:
+    floor = list(below_floor or [])
+    if not withheld and not floor:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
+
+    def rows(ids: list[str]) -> list[str]:
+        return [
+            f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
+            for fid in ids
+        ]
+
     out = [
         "",
         "## Awaiting `/remediate`",
         "",
-        f"{len(withheld)} finding(s) qualify for an automatic remediation pull "
-        f"request but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-        "one bad night cannot bury this repository in generated pull requests. "
-        "Comment `/remediate <finding-id>` to open any of them now — an explicit "
-        "request is not capped.",
+        f"{len(withheld) + len(floor)} finding(s) carry a manifest remediation "
+        "this run opened no pull request for. Comment `/remediate <finding-id>` "
+        "to open any of them now — an explicit request is neither capped nor "
+        "held to the severity floor.",
         "",
     ]
-    for fid in withheld:
-        finding = by_id.get(fid) or {}
-        out.append(f"- `{fid}` — {_cell(finding.get('title', ''))}")
+    if withheld:
+        out += [
+            f"Held back by the cap of {AUTO_PROMOTION_CAP} per run, so one bad "
+            "night cannot bury this repository in generated pull requests. "
+            "These are first in line on the next run:",
+            "",
+            *rows(withheld),
+            "",
+        ]
+    if floor:
+        out += [
+            f"Graded below `{AUTO_PROMOTION_FLOOR}`, which is what the automatic "
+            "sweep requires. Unlike the cap this does not clear on its own — the "
+            "sweep will pass over these again every run until someone asks:",
+            "",
+            *rows(floor),
+            "",
+        ]
+    while out and out[-1] == "":
+        out.pop()
     return out
 
 
@@ -6308,6 +6375,7 @@ def render_issue_body(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     withheld: list[str] | None = None,
+    below_floor: list[str] | None = None,
     repo: str | None = None,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
@@ -6337,7 +6405,9 @@ def render_issue_body(
 
     fixed: list[str] = _render_header(audit_id)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id)
-    withheld_section = _render_withheld(list(withheld or []), findings)
+    withheld_section = _render_withheld(
+        list(withheld or []), findings, list(below_floor or [])
+    )
 
     # Measure the footer with an empty delta block: each finding is separately
     # charged for its own id slot inside select_rendered_findings.
@@ -9194,6 +9264,11 @@ def _handle_finish_dry_run(
     )
     if plan.withheld:
         log(f"WITHHELD BY THE CAP: {', '.join(plan.withheld)}")
+    if plan.below_floor:
+        log(
+            f"BELOW THE `{AUTO_PROMOTION_FLOOR}` FLOOR "
+            f"({len(plan.below_floor)}): {', '.join(plan.below_floor)}"
+        )
     rendered = render_issue_body(
         data,
         generated_at=now,
@@ -9201,6 +9276,7 @@ def _handle_finish_dry_run(
         gaps=gaps,
         states=states,
         withheld=plan.withheld,
+        below_floor=plan.below_floor,
         repo=repo,
     )
     if rendered.partial:
@@ -10153,6 +10229,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         states=states,
         pr_urls=pr_urls,
         withheld=plan.withheld,
+        below_floor=plan.below_floor,
         repo=repo,
     )
     if rendered.partial:
@@ -10317,6 +10394,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 states=states,
                 pr_urls=pr_urls,
                 withheld=plan.withheld,
+                below_floor=plan.below_floor,
                 repo=repo,
             )
             relink = _write_temp(relinked.body)
