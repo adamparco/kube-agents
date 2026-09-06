@@ -874,17 +874,23 @@ def spot_without_a_shape(
     because every family is available to it; §3.8's "without alternative family
     fallbacks" cannot be true of it by construction.
 
-    `brokered` is whether this cluster can actually scale up through such a
-    priority — Autopilot, or Standard with node auto-provisioning on. It exists
-    because the third bucket was for a long time folded into the second, on the
-    belief that a pod-family Spot priority meant `autopilot-spot` and that
-    `autopilot-spot` meant an Autopilot cluster. GKE pre-installs those classes
-    on Standard clusters too, so on 2026-09-05 ten of this fleet's sixteen
-    clusters published "Every Spot request on this cluster leaves the machine
-    shape entirely to GKE" — about clusters that make no Spot request at all,
-    hold no Spot node pool, and have auto-provisioning off, so the class cannot
-    scale anything up. The honest sentence, that nothing here asks for Spot, was
-    the branch it displaced.
+    `brokered` is whether GKE places this cluster's capacity — Autopilot, or
+    Standard with node auto-provisioning on — and so whether a shape-free Spot
+    priority stands behind every scheduling decision or merely sits there
+    unselected. It exists because the third bucket was for a long time folded
+    into the second, on the belief that a pod-family Spot priority meant
+    `autopilot-spot` and that `autopilot-spot` meant an Autopilot cluster. GKE
+    pre-installs those classes on Standard clusters too, so on 2026-09-05 ten of
+    this fleet's sixteen clusters published "Every Spot request on this cluster
+    leaves the machine shape entirely to GKE" — about clusters that make no Spot
+    request at all and hold no Spot node pool. The honest sentence, that nothing
+    here asks for Spot, was the branch it displaced.
+
+    It is not whether a node could be created: a ComputeClass carrying its own
+    `nodePoolAutoCreation.enabled: true` provisions independently of the
+    cluster-level flag, and the first attempt at this fix asserted otherwise in
+    published prose. See the `inert` branch below for what the fleet did to
+    disprove it.
 
     `unqueryable` belongs in `limitations` and the other two in
     `checks_not_applicable`, saying different things; reporting all three as
@@ -1353,14 +1359,23 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 f"what this check tests for."
             )
         elif inert:
+            # Says nothing about whether the class could provision, because it
+            # can: a ComputeClass's own `nodePoolAutoCreation.enabled: true`
+            # drives node creation independently of the cluster-level
+            # auto-provisioning flag. An earlier version of this string
+            # asserted the opposite -- "a Standard cluster with
+            # auto-provisioning off, so no node can be created through it" --
+            # and the fleet disproves it: `spot-capacity-test` has NAP off,
+            # and on 2026-09-05 the GKE service agent still created
+            # `nap-e2-standard-2-spot-rbu9q0zw` there to place a pod that
+            # selected `autopilot-spot`. The check does not need the claim
+            # either way; what makes it inapplicable is that no shape was
+            # named, so keep the reason to what was actually read.
             reason = (
                 f"Nothing on this cluster requests Spot capacity. The only Spot "
                 f"priority here is GKE's pre-installed {', '.join(inert)}, which "
-                f"leaves the machine shape to GKE and needs node "
-                f"auto-provisioning to create anything — this is a Standard "
-                f"cluster with auto-provisioning off, so no node can be created "
-                f"through it and there is no shape to ask `capacity-history` "
-                f"about."
+                f"names no machine shape, so there is no shape to ask "
+                f"`capacity-history` about."
             )
         else:
             reason = (

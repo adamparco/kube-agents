@@ -1061,13 +1061,19 @@ class SpotShapeEnumerationTest(unittest.TestCase):
             ([], ["ComputeClass/autopilot-spot"], []),
         )
 
-    def test_the_same_priority_is_inert_where_nothing_can_scale_up_through_it(self):
+    def test_the_same_priority_is_inert_where_gke_brokers_no_capacity(self):
         """GKE pre-installs `autopilot-spot` on Standard clusters too, and there
-        it needs node auto-provisioning to create anything. Ten of this fleet's
-        sixteen clusters are Standard with auto-provisioning off; folding them in
-        with the bucket above had every one of them publish "Every Spot request
-        on this cluster leaves the machine shape entirely to GKE" about a cluster
-        that makes no Spot request at all."""
+        it sits unselected rather than standing behind every scheduling decision.
+        Ten of this fleet's sixteen clusters are Standard; folding them in with
+        the bucket above had every one of them publish "Every Spot request on
+        this cluster leaves the machine shape entirely to GKE" about a cluster
+        that makes no Spot request at all.
+
+        `brokered` is about who places the capacity, not about whether capacity
+        can be placed: an unbrokered cluster can still grow a node through this
+        class, because the class carries its own `nodePoolAutoCreation`. That is
+        why the sentence this bucket publishes claims only that nothing requests
+        Spot here -- see the reason test below."""
         cc = compute_class("autopilot-spot", [{"spot": True}])
         self.assertEqual(
             fs.spot_without_a_shape([cc], [], brokered=False),
@@ -1449,19 +1455,29 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("leaves the machine shape entirely to GKE", self.spot_non_applicability(entry))
 
     def test_a_standard_cluster_without_nap_says_nothing_asks_for_spot(self):
-        """GKE pre-installs `autopilot-spot` on Standard clusters, where it
-        cannot create a node unless auto-provisioning is on. Ten of this fleet's
-        sixteen clusters are Standard with it off, and every one published "Every
-        Spot request on this cluster leaves the machine shape entirely to GKE" --
-        a claim about Spot requests a cluster that makes none, displacing the
-        true sentence that was already in the code below it."""
+        """GKE pre-installs `autopilot-spot` on Standard clusters. Ten of this
+        fleet's sixteen clusters are Standard with cluster-level
+        auto-provisioning off, and every one published "Every Spot request on
+        this cluster leaves the machine shape entirely to GKE" -- a claim about
+        Spot requests a cluster that makes none, displacing the true sentence
+        that was already in the code below it.
+
+        The reason says nothing about whether a node could be created, because
+        the answer is yes and the first attempt at this fix said no. A
+        ComputeClass's own `nodePoolAutoCreation.enabled: true` provisions
+        independently of the cluster flag: `spot-capacity-test` has NAP off and
+        GKE still built `nap-e2-standard-2-spot-rbu9q0zw` there to place a pod
+        that selected `autopilot-spot`. What makes the check inapplicable is
+        that no shape was named, which is true either way."""
         cc = compute_class("autopilot-spot", [{"spot": True}])
         entry = self.run_with(dump_items=[cc])
         reason = self.spot_non_applicability(entry)
         self.assertIn("Nothing on this cluster requests Spot capacity", reason)
         self.assertIn("ComputeClass/autopilot-spot", reason)
-        self.assertIn("auto-provisioning off", reason)
+        self.assertIn("names no machine shape", reason)
         self.assertNotIn("Every Spot request", reason)
+        self.assertNotIn("auto-provisioning", reason)
+        self.assertNotIn("no node can be created", reason)
         self.assertNotIn("limitations", entry)
 
     def test_dangling_reference_reported(self):
