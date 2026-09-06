@@ -2577,17 +2577,35 @@ TRUST_REMOTE_CODE_ARG_RE = re.compile(r"trust[-_]remote[-_]code(?!=(0|false|no))
 TRUST_REMOTE_CODE_ENV_NAME_RE = re.compile(r"TRUST_REMOTE_CODE", re.IGNORECASE)
 
 
-def _container_trusts_remote_code(c: dict) -> bool:
-    if any(TRUST_REMOTE_CODE_ARG_RE.search(t) for t in _resolve_argv(c).tokens):
-        return True
+# Returns which setting trusts remote code, not merely that one does. The two
+# arms take different fixes -- a token in `args` is removed from the command
+# line, an env var from the container's `env` -- so a bare container name leaves
+# the reader unable to check the recommendation against the evidence.
+# `check_podsecurity_gaps` above carries the same reasoning at length, including
+# why the collector rather than the model has to be the one holding the detail.
+#
+# The 2026-09-06 08:55Z report is the instance: evidence `containers: embeddings`
+# under a recommendation to "remove the TRUST_REMOTE_CODE=true environment
+# variable". The recommendation was right and nothing published alongside it
+# said so. `str | None` rather than a reason list because the arms are not
+# independent settings the way §2.4's five are -- either one alone is the whole
+# finding, and the first one found is enough to act on.
+def _container_trusts_remote_code(c: dict) -> str | None:
+    for t in _resolve_argv(c).tokens:
+        if TRUST_REMOTE_CODE_ARG_RE.search(t):
+            return f"arg {t}"
     for e in c.get("env") or []:
         if TRUST_REMOTE_CODE_ENV_NAME_RE.search(e.get("name") or "") and str(e.get("value", "")).lower() in ("1", "true", "yes"):
-            return True
-    return False
+            return f"env {e.get('name')}={e.get('value')}"
+    return None
 
 
 def check_model_remote_code_trusted(workload: dict, context: dict) -> dict | None:
-    bad = [c.get("name", "") for c in _ai_containers(workload["spec"]) if _container_trusts_remote_code(c)]
+    bad = []
+    for c in _ai_containers(workload["spec"]):
+        reason = _container_trusts_remote_code(c)
+        if reason:
+            bad.append(f"{c.get('name', '')} ({reason})")
     if not bad:
         return None
     return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}

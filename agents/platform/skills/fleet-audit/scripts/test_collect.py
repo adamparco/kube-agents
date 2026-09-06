@@ -4146,6 +4146,28 @@ class TestModelRemoteCodeTrusted(unittest.TestCase):
         hit = collect.check_model_remote_code_trusted(w, {})
         self.assertIn("fetch", hit["excerpt"])
 
+    def test_the_excerpt_names_which_setting_fired(self):
+        """The 2026-09-06 08:55Z report published `containers: embeddings` as
+        the evidence for a recommendation to remove an environment variable.
+        The two arms take different edits, so the container name alone does not
+        let a reader check the fix against what was found."""
+        env_hit = self.hit({"env": [{"name": "TRUST_REMOTE_CODE", "value": "true"}]})
+        self.assertIn("env TRUST_REMOTE_CODE=true", env_hit["excerpt"])
+        arg_hit = self.hit({"args": ["--trust-remote-code", "--model", "x"]})
+        self.assertIn("arg --trust-remote-code", arg_hit["excerpt"])
+        self.assertNotIn("env ", arg_hit["excerpt"])
+
+    def test_each_flagged_container_carries_its_own_reason(self):
+        w = ai_workload(container={"args": ["--trust-remote-code"]})
+        w["spec"]["template"]["spec"]["containers"][0]["name"] = "server"
+        w["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "fetch", "env": [{"name": "TRUST_REMOTE_CODE", "value": "1"}]}
+        ]
+        w = collect.normalize_ai_workloads(dump_of(w))[0]
+        excerpt = collect.check_model_remote_code_trusted(w, {})["excerpt"]
+        self.assertIn("server (arg --trust-remote-code)", excerpt)
+        self.assertIn("fetch (env TRUST_REMOTE_CODE=1)", excerpt)
+
     def test_a_directive_inside_an_interpreter_one_liner_still_counts(self):
         # 3.4's flag arm reads nothing here, because nothing parses flags. 3.2
         # reads everything, because `trust_remote_code=True` written into the
