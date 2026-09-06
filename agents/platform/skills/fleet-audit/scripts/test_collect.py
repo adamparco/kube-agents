@@ -3850,6 +3850,36 @@ class TestIsAiWorkload(unittest.TestCase):
         spec = {"containers": [{"image": "acme/x", "resources": {"limits": {}}}]}
         self.assertFalse(collect._is_ai_workload(spec))
 
+    def test_the_cpu_served_serving_runtimes_match(self):
+        """The image prong exists for the model server that requests no
+        accelerator, so a runtime missing from it is invisible to the whole
+        stream -- the cluster is reported clean because nothing was found to
+        audit. `text-embeddings-inference` is the one that mattered: HuggingFace
+        ships it alongside `text-generation-inference`, which was already
+        listed, and it is routinely served on CPU."""
+        for image in (
+            "ghcr.io/huggingface/text-embeddings-inference:cpu-1.5",
+            "openmmlab/lmdeploy:v0.6.1",
+            "xprobe/xinference:v0.16.3",
+            "quay.io/go-skynet/localai:v2.20.1",
+            "bentoml/openllm@sha256:" + "0" * 64,
+        ):
+            with self.subTest(image=image):
+                self.assertTrue(collect._is_ai_workload({"containers": [{"image": image}]}))
+
+    def test_a_model_proxy_and_a_language_toolchain_stay_out(self):
+        """Both would be false positives of the shape the SOP's "never widen on
+        naming" rule is about. `litellm` fronts model servers without holding a
+        model, and this fleet runs one in `kubeagents-system`; `nim` was left
+        off the list because these anchors cannot tell NVIDIA's inference
+        containers from the Nim compiler."""
+        for image in (
+            "us-east4-docker.pkg.dev/adamparco-kage/kube-agents/litellm:v1.96.2",
+            "nimlang/nim:2.0",
+        ):
+            with self.subTest(image=image):
+                self.assertFalse(collect._is_ai_workload({"containers": [{"image": image}]}))
+
 
 class TestNormalizeAiWorkloads(unittest.TestCase):
     def test_a_deployment_carries_its_pod_template_labels(self):

@@ -2300,9 +2300,20 @@ def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
 # the way `$PRE`'s last `select` narrows the SOP's own pipeline.
 # --------------------------------------------------------------------------- #
 
+# Serving runtimes only. A name earns a place here by being a process that
+# loads a model and answers inference requests, and by being distinctive enough
+# that the `(^|/)`/`([-:@/]|$)` anchors cannot land it on something else. Two
+# rejected candidates say where the line is: `litellm` is a proxy in front of
+# model servers rather than one itself, and this fleet runs one in
+# `kubeagents-system`, so listing it would open every §3 check on a gateway
+# that holds no weights; `nim` would match `nimlang/nim:2.0` under these
+# anchors, and NVIDIA's NIM containers request a GPU anyway, so the accelerator
+# prong already has them. `tei` is left off for the same reason `nim` is --
+# three letters, no distinctiveness -- while its full name is spelled out.
 AI_MODEL_IMAGE_RE = re.compile(
-    r"(^|/)(vllm|sglang|text-generation-inference|tgi|tritonserver|torchserve|tensorflow-serving|"
-    r"kserve|ollama|ray|llama|mlserver|seldon|lorax|aibrix)([-:@/]|$)"
+    r"(^|/)(vllm|sglang|text-generation-inference|tgi|text-embeddings-inference|"
+    r"tritonserver|torchserve|tensorflow-serving|kserve|ollama|ray|llama|mlserver|"
+    r"seldon|lorax|aibrix|lmdeploy|xinference|localai|openllm)([-:@/]|$)"
 )
 AI_ACCELERATOR_KEY_RE = re.compile(r"nvidia\.com/gpu|google\.com/tpu")
 
@@ -3428,17 +3439,33 @@ _EMPTY_SCOPE_REASON: dict[str, str] = {
 }
 
 # `ai-security-audit` is deliberately absent, and the omission is the whole
-# reason this is a table rather than a constant. A model-free cluster is that
-# stream's *common* case -- most clusters in most fleets serve no models -- and
-# every one of its six checks takes an AI workload, so an empty scope would
-# leave `commands` empty. The validator refuses an empty `checks_run` unless
-# the cluster also carries a `limitations` note, and a limitations note makes
-# the run `partial`: the stream would be pinned partial on every fleet where
-# nine clusters in ten run no models, never able to close its ledger, announce
-# a finding resolved, or retire a stale remediation pull request. §1 of its SOP
-# argues that trade-off explicitly and lands the other way. Obtainability and
-# compliance keep cluster-scoped checks in `commands` on an empty cluster, so
-# neither pays that price.
+# reason this is a table rather than a constant. What separates it from the two
+# above is *what the empty set is empty of*. Obtainability and compliance drop
+# workloads that exist and could carry the defect -- a system namespace, an
+# addon, an owned Pod, one scaled to zero -- so "no finding" there is an
+# unexamined absence and the reason says so. ai-security's filter is the
+# subject definition itself: with no AI workload on the cluster there is no
+# object a public inference endpoint or a writable weights mount could be true
+# of. "Six checks ran and matched nothing" is a verdict about the cluster, not
+# a gap in the audit, and §1 of the SOP says the same in the instruction it
+# calls the most important in that section.
+#
+# An earlier version of this comment argued the omission mechanically instead,
+# and every step of it was wrong: it claimed all six checks take an AI workload
+# so an empty scope leaves `commands` empty, forcing a `limitations` note and
+# pinning the stream `partial` forever. `inference-endpoint-public` is
+# `"cluster"`-kind, so `commands` keeps an entry and `checks_run` is never
+# empty; the arm below writes `checks_not_applicable`, which is not
+# `limitations`; and `checks_not_applicable` leaves the coverage denominator
+# without producing a gap (`audit_report.checks_unevaluated`), so it could not
+# make a run `partial` even if it did fire. Do not re-derive the omission from
+# that chain -- it does not hold, and the argument above does not need it.
+#
+# The real exposure is upstream, in `_is_ai_workload`: a model server under an
+# image name `AI_MODEL_IMAGE_RE` does not list, serving on CPU so no
+# accelerator limit gives it away, is invisible to this stream and reported as
+# a clean cluster. That is a discriminator false negative, not a bookkeeping
+# one, and no entry in this table would catch it.
 
 
 def collect_cluster(
