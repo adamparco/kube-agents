@@ -4240,23 +4240,77 @@ class TestInferenceEndpointPublic(unittest.TestCase):
         # allowlist bounds who reaches the endpoint, it does not make it
         # unreachable, so this downgrades where the private-address branch
         # drops outright.
-        hit = self.restricted(["203.0.113.0/24"])
+        hit = self.restricted(["35.191.0.0/16"])
         self.assertEqual(hit["severity"], "major")
         self.assertIn("admits 1 CIDR, not the whole internet", hit["excerpt"])
+
+    def test_the_downgraded_arm_carries_its_own_impact(self):
+        # `emit` derives `impact_authoritative` from the hit's own `impact`, so
+        # an arm that moves the severity and leaves the impact ships the
+        # unrestricted `critical` sentence on a `major` finding and gives
+        # `adopt_arm_impact` nothing to hold the model to.
+        hit = self.restricted(["35.191.0.0/16"])
+        self.assertIn("bounded by the CIDR allowlist", hit["impact"])
+        self.assertNotIn("anyone who finds the address", hit["impact"].lower())
 
     def test_the_allowed_ranges_are_counted_never_printed(self):
         # Which networks are trusted is the other half of the target, and
         # these findings are filed as issues on a public repository.
-        hit = self.restricted(["203.0.113.0/24", "198.51.100.7/32"])
-        self.assertNotIn("203.0.113", hit["excerpt"])
-        self.assertNotIn("198.51.100", hit["excerpt"])
+        hit = self.restricted(["35.191.0.0/16", "130.211.0.7/32"])
+        self.assertNotIn("35.191", hit["excerpt"])
+        self.assertNotIn("130.211", hit["excerpt"])
         self.assertIn("admits 2 CIDRs", hit["excerpt"])
+
+    def test_an_allowlist_of_only_documentation_prefixes_admits_nobody(self):
+        """`192.0.2.0/24` is RFC 5737 TEST-NET-1: no host anywhere is assigned
+        one, so the allowlist lets nothing through. The 2026-09-05 report
+        published `major` on exactly this Service and told the operator that
+        "anyone connecting from within that allowed range can send it inference
+        traffic, consume its accelerator capacity, and probe whatever the model
+        can reach"."""
+        hit = self.restricted(["192.0.2.0/24"])
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn("reserved documentation prefix", hit["excerpt"])
+        self.assertIn("admits no caller at all", hit["excerpt"])
+        self.assertIn("no caller can reach", hit["impact"])
+        # Still published: a public address and forwarding rule serving nobody
+        # is a misconfiguration, even though it is not an exposure.
+        self.assertIn("admits 1 CIDR", hit["excerpt"])
+
+    def test_every_documentation_block_counts_and_a_subnet_of_one_does(self):
+        for ranges in (
+            ["192.0.2.0/24"], ["198.51.100.0/24"], ["203.0.113.0/24"],
+            ["203.0.113.64/26"], ["198.51.100.7/32"],
+            ["2001:db8::/32"], ["2001:db8:1::/48"], ["100::/64"],
+            ["192.0.2.0/24", "203.0.113.0/24"],
+        ):
+            with self.subTest(ranges=ranges):
+                self.assertEqual(self.restricted(ranges)["severity"], "minor")
+
+    def test_one_real_range_beside_a_documentation_one_stays_major(self):
+        # The claim is that the allowlist admits nobody. One routable entry
+        # falsifies it, whatever else is in the list.
+        hit = self.restricted(["192.0.2.0/24", "35.191.0.0/16"])
+        self.assertEqual(hit["severity"], "major")
+        self.assertNotIn("documentation prefix", hit["excerpt"])
+
+    def test_a_private_range_is_not_a_documentation_range(self):
+        # RFC 1918 addresses real hosts, and one allowlisted on an external
+        # load balancer may be admitting traffic that arrives over Interconnect
+        # or a VPN with its source intact. `ipaddress.is_private` is true of
+        # both these and the documentation blocks, which is why this check does
+        # not use it.
+        for ranges in (["10.0.0.0/8"], ["192.168.1.0/24"], ["172.16.0.0/12"]):
+            with self.subTest(ranges=ranges):
+                hit = self.restricted(ranges)
+                self.assertEqual(hit["severity"], "major")
+                self.assertNotIn("documentation prefix", hit["excerpt"])
 
     def test_a_default_route_is_not_a_restriction(self):
         # `0.0.0.0/0` is the whole internet written as an allowlist. Reading
         # the field's presence rather than its contents would downgrade every
         # one of these to `major`.
-        for ranges in (["0.0.0.0/0"], ["::/0"], ["203.0.113.0/24", "0.0.0.0/0"]):
+        for ranges in (["0.0.0.0/0"], ["::/0"], ["35.191.0.0/16", "0.0.0.0/0"]):
             with self.subTest(ranges=ranges):
                 hit = self.restricted(ranges)
                 self.assertIsNone(hit.get("severity"))
@@ -4265,14 +4319,14 @@ class TestInferenceEndpointPublic(unittest.TestCase):
     def test_an_unreadable_range_leaves_the_severity_alone(self):
         # An allowlist the collector cannot parse is one it cannot vouch for,
         # and guessing in the other direction downgrades a live exposure.
-        for ranges in (["not-a-cidr"], ["203.0.113.0/24", "10.0.0.0/8/8"]):
+        for ranges in (["not-a-cidr"], ["35.191.0.0/16", "10.0.0.0/8/8"]):
             with self.subTest(ranges=ranges):
                 self.assertIsNone(self.restricted(ranges).get("severity"))
 
     def test_blank_entries_do_not_defeat_the_allowlist(self):
         # A blank string is not a CIDR and widens nothing, so the ranges
         # beside it still restrict. Counting it would also misreport the total.
-        hit = self.restricted(["203.0.113.0/24", "", "  "])
+        hit = self.restricted(["35.191.0.0/16", "", "  "])
         self.assertEqual(hit["severity"], "major")
         self.assertIn("admits 1 CIDR,", hit["excerpt"])
 

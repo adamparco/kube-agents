@@ -2615,6 +2615,26 @@ def _restricting_source_ranges(spec: dict) -> list[str]:
     return ranges
 
 
+# Prefixes reserved for documentation and examples, which no host anywhere is
+# ever assigned: RFC 5737's three IPv4 blocks, RFC 3849's IPv6 block, and RFC
+# 6666's discard prefix. Deliberately *not* the RFC 1918 ranges -- those address
+# real hosts, and an operator who allowlists one on an external load balancer may
+# be admitting traffic that arrives over Interconnect or a VPN with its source
+# intact. Only these can be asserted to admit nobody.
+_DOCUMENTATION_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32", "100::/64")
+)
+
+
+def _is_documentation_range(cidr: str) -> bool:
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+    return any(net.version == doc.version and net.subnet_of(doc) for doc in _DOCUMENTATION_NETWORKS)
+
+
 def check_inference_endpoint_public(context: dict) -> list[dict]:
     hits = []
     for svc in context.get("services") or []:
@@ -2693,9 +2713,50 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
         ranges = _restricting_source_ranges(spec)
         if ranges:
             hit["severity"] = "major"
+            # Set alongside the severity, never without it. `emit` derives
+            # `impact_authoritative` from `hit["impact"]` alone, so an arm that
+            # moved the severity and left the impact published the unrestricted
+            # `critical` sentence -- "anyone who finds the address" -- on a
+            # `major` finding, with nothing to stop the model rewriting it and
+            # nothing for `adopt_arm_impact` to hold it to afterwards. That is
+            # the flaw `test_a_downgraded_credential_candidate_is_impact_authoritative`
+            # was written for on 3.5; this arm had it too.
+            hit["impact"] = (
+                "This model server is reachable from outside the cluster, bounded by the CIDR "
+                "allowlist in spec.loadBalancerSourceRanges. Any caller inside an allowlisted "
+                "range can send it inference traffic, consume its accelerator capacity, and probe "
+                "whatever the model can reach."
+            )
             hit["excerpt"] += (
                 f"; loadBalancerSourceRanges admits {len(ranges)} CIDR{'s' if len(ranges) > 1 else ''}, not the whole internet"
             )
+            # One more step down, for the same reason `major` is a step down
+            # from `critical`: the severity should not claim an exposure the
+            # allowlist rules out. Where every entry is a documentation prefix
+            # no host is ever assigned, the allowlist admits nobody, and the
+            # 2026-09-05 report nevertheless told an operator that "anyone
+            # connecting from within that allowed range can send it inference
+            # traffic, consume its accelerator capacity, and probe whatever the
+            # model can reach" about `192.0.2.0/24`. Not dropped, unlike the
+            # all-private-address branch above: that one settles reachability
+            # from what the platform assigned, while this one is a Service
+            # holding a public address and forwarding rule for callers who
+            # cannot exist -- a real misconfiguration, just not an exposure.
+            if all(_is_documentation_range(r) for r in ranges):
+                hit["severity"] = "minor"
+                hit["impact"] = (
+                    "This Service holds a public load-balancer address and forwarding rule that no "
+                    "caller can reach: every CIDR in its allowlist is a prefix reserved for "
+                    "documentation, so no host is ever assigned one. Nothing is exposed. What is "
+                    "wrong is the allowlist -- an example value left in place -- which means the "
+                    "endpoint costs a public address and serves no one, and whoever set it "
+                    "intended some real range."
+                )
+                hit["excerpt"] += (
+                    "; every one of them is a reserved documentation prefix (RFC 5737/RFC 3849), "
+                    "which no host is ever assigned -- the allowlist admits no caller at all, so "
+                    "this endpoint holds a public address and reaches nobody"
+                )
         hits.append(hit)
     return hits
 
