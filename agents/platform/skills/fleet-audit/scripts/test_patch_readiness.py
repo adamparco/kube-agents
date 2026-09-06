@@ -492,6 +492,119 @@ class NoNotificationsTest(unittest.TestCase):
         self.assertIsNone(pr.check_no_notifications(c))
 
 
+class IncumbentTopicTest(unittest.TestCase):
+    """`attach_incumbent_topic` -- the fleet fact behind §3.10's topic bullet.
+
+    The cluster that fires this check has an empty `notificationConfig`, so the
+    only place the agent can learn which topic the fleet already uses is from a
+    cluster that is not the finding's subject. That is what this pass carries.
+    """
+
+    TOPIC = "projects/acme/topics/gke-upgrade-notifications"
+    OTHER = "projects/acme/topics/somewhere-else"
+
+    def entry(self, name, topic, *, checks=("no-notifications",), outcome="collected"):
+        return {
+            "name": name,
+            "outcome": outcome,
+            "_notification_topic": topic,
+            "candidates": [
+                {"check": check, "object": f"Cluster/{name}", "excerpt": "notificationConfig.pubsub.enabled absent"}
+                for check in checks
+            ],
+        }
+
+    def excerpt(self, entry, index=0):
+        return entry["candidates"][index]["excerpt"]
+
+    def test_the_enrolled_cluster_names_the_topic_for_the_one_that_is_not(self):
+        entries = [self.entry("enrolled", self.TOPIC, checks=()), self.entry("bare", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertIn(self.TOPIC, self.excerpt(entries[1]))
+
+    def test_the_original_excerpt_survives_the_append(self):
+        entries = [self.entry("enrolled", self.TOPIC, checks=()), self.entry("bare", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertTrue(self.excerpt(entries[1]).startswith("notificationConfig.pubsub.enabled absent"))
+
+    def test_a_fleet_nobody_has_enrolled_gets_no_invented_topic(self):
+        """§3.10's naming rule owns the green-field case. A topic appended here
+        would be one no cluster publishes to -- a guess wearing the collector's
+        authority, which the agent has no way to tell from a measurement."""
+        entries = [self.entry("a", ""), self.entry("b", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertNotIn("publish upgrade notifications", self.excerpt(entries[0]))
+
+    def test_a_fleet_split_across_two_topics_gets_no_hint(self):
+        entries = [self.entry("a", self.TOPIC, checks=()), self.entry("b", self.OTHER, checks=()), self.entry("c", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertNotIn("publish upgrade notifications", self.excerpt(entries[2]))
+
+    def test_two_clusters_on_one_topic_still_count_as_one(self):
+        entries = [self.entry("a", self.TOPIC, checks=()), self.entry("b", self.TOPIC, checks=()), self.entry("c", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertIn(self.TOPIC, self.excerpt(entries[2]))
+
+    def test_only_the_no_notifications_candidate_is_touched(self):
+        entries = [self.entry("enrolled", self.TOPIC, checks=()), self.entry("bare", "", checks=("no-notifications", "master-behind"))]
+        pr.attach_incumbent_topic(entries)
+        self.assertIn(self.TOPIC, self.excerpt(entries[1], 0))
+        self.assertNotIn(self.TOPIC, self.excerpt(entries[1], 1))
+
+    def test_the_private_key_never_reaches_the_manifest(self):
+        entries = [self.entry("enrolled", self.TOPIC, checks=()), self.entry("bare", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertNotIn("_notification_topic", entries[0])
+        self.assertNotIn("_notification_topic", entries[1])
+
+    def test_the_key_is_dropped_even_when_no_topic_is_attached(self):
+        """The pass returns early on a split fleet, and the key has to go
+        anyway -- a leaked underscore key is an unknown manifest field."""
+        entries = [self.entry("a", self.TOPIC, checks=()), self.entry("b", self.OTHER, checks=())]
+        pr.attach_incumbent_topic(entries)
+        self.assertNotIn("_notification_topic", entries[0])
+
+    def test_an_unreadable_cluster_neither_supplies_nor_receives_a_topic(self):
+        entries = [self.entry("gone", self.TOPIC, checks=(), outcome="gate-failed"), self.entry("bare", "")]
+        pr.attach_incumbent_topic(entries)
+        self.assertNotIn("publish upgrade notifications", self.excerpt(entries[1]))
+
+    def test_a_disabled_block_carrying_a_stale_topic_is_not_an_incumbent(self):
+        """`notificationConfig.pubsub.topic` outlives `enabled: false` in the
+        API response, and a topic nothing publishes to is not evidence."""
+        c = cluster(**{"notificationConfig": {"pubsub": {"enabled": False, "topic": self.TOPIC}}})
+        self.assertEqual(pr.notification_topic(c), "")
+
+    def test_an_enrolled_cluster_reports_its_topic(self):
+        c = cluster(**{"notificationConfig": {"pubsub": {"enabled": True, "topic": self.TOPIC}}})
+        self.assertEqual(pr.notification_topic(c), self.TOPIC)
+
+    def test_the_fleet_pass_reads_what_the_collector_recorded(self):
+        """End to end through `collect_fleet`, so the two halves cannot drift:
+        the worker writes `_notification_topic`, the fleet pass reads it."""
+        clusters = [
+            cluster(name="enrolled", **{"notificationConfig": {"pubsub": {"enabled": True, "topic": self.TOPIC}}}),
+            cluster(name="bare", **{"notificationConfig": {}}),
+        ]
+        responses = {
+            "projects list": run_of(0, json.dumps([{"projectId": "acme"}])),
+            "clusters list": run_of(0, json.dumps(clusters)),
+            "get-server-config": run_of(0, json.dumps(server_config())),
+        }
+
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            for needle, result in responses.items():
+                if needle in joined:
+                    return result
+            return run_of(1, stderr="unexpected")
+
+        manifest = pr.collect_fleet("acme", run=run, now=NOW)
+        bare = next(e for e in manifest["clusters"] if e["name"] == "bare")
+        hit = next(c for c in bare["candidates"] if c["check"] == "no-notifications")
+        self.assertIn(self.TOPIC, hit["excerpt"])
+
+
 class CollectProjectTest(unittest.TestCase):
     def fake_run(self, responses):
         def run(argv, **kwargs):

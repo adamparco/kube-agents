@@ -493,6 +493,12 @@ def check_stale_image_type(cluster: dict, baseline: dict | None) -> list[dict]:
     return hits
 
 
+def notification_topic(cluster: dict) -> str:
+    """The topic this cluster already publishes upgrade notifications to."""
+    pubsub = ((cluster.get("notificationConfig") or {}).get("pubsub") or {})
+    return str(pubsub.get("topic") or "") if pubsub.get("enabled") else ""
+
+
 def check_no_notifications(cluster: dict) -> dict | None:
     pubsub = ((cluster.get("notificationConfig") or {}).get("pubsub") or {})
     if not pubsub.get("enabled"):
@@ -715,6 +721,54 @@ def attach_fleet_spread(entries: list[dict]) -> None:
         entry.pop("_status", None)
 
 
+def attach_incumbent_topic(entries: list[dict]) -> None:
+    """Name the topic the rest of the fleet already publishes to, in place.
+
+    §3.10 tells the agent to write one fleet-scoped topic across every
+    `no-notifications` finding, so the harness groups them into a single pull
+    request. What it cannot tell the agent is which topic that is on a fleet
+    where one already exists -- and the agent sees each cluster's own
+    `notificationConfig`, which on a hit is empty by definition. Left to infer
+    it, the agent infers there is none.
+
+    That is not hypothetical. On 2026-09-05 fifteen of sixteen clusters got a
+    `manifest` remediation naming `gke-upgrade-notifications`; the sixteenth,
+    `kube-agents-host`, is the one cluster the GitOps repo does not declare, so
+    §3.10 routes it to `gcloud` -- which needs a topic path. The agent wrote
+    `kind: manual` instead, with a note saying no topic for this exists "in this
+    repository or the project's declared resources", while the other fifteen
+    findings of the same document were declaring exactly that topic. One
+    cluster in sixteen came out of the run with no fix and a reason that its own
+    report contradicted, and it would have come out that way every week.
+
+    So the collector states the fact it holds and the agent does not: some
+    cluster in this fleet already publishes to `<topic>`. Only from a cluster
+    that is genuinely enrolled -- an incumbent is evidence, and a topic nobody
+    publishes to yet is a guess. Where no cluster is enrolled, nothing is
+    appended and §3.10's "give the topic a fleet-scoped name" stands unaltered:
+    the first run on a green-field fleet names the topic, and every run after it
+    reads the name back off the fleet rather than inventing it again.
+    """
+    readable = [e for e in entries if e.get("outcome") == "collected"]
+    topics = sorted({t for e in readable if (t := e.get("_notification_topic"))})
+    for entry in entries:
+        entry.pop("_notification_topic", None)
+    # Two topics is a fleet mid-migration, and picking one would send half the
+    # findings at the wrong one. The agent gets no hint and falls back to
+    # §3.10's naming rule, which is the honest answer to a fleet that does not
+    # agree with itself.
+    if len(topics) != 1:
+        return
+    for entry in readable:
+        for candidate in entry.get("candidates") or []:
+            if candidate.get("check") != "no-notifications":
+                continue
+            candidate["excerpt"] = (
+                f"{candidate.get('excerpt', '')}; other clusters in this fleet "
+                f"publish upgrade notifications to {topics[0]}"
+            )
+
+
 def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
     argv = ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json"]
     parsed, result = run_and_gate(argv, run=run)
@@ -809,6 +863,10 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             # rather than as plausible data.
             "_master_version": c.get("currentMasterVersion") or "",
             "_status": c.get("status") or "",
+            # Consumed and removed by `attach_incumbent_topic`, for the same
+            # reason `_master_version` is: the fact is fleet-wide and this
+            # worker only ever sees one project.
+            "_notification_topic": notification_topic(c),
         }
         if not_applicable:
             entry["checks_not_applicable"] = not_applicable
@@ -833,6 +891,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
     entries = [entry for group in results for entry in group]
     attach_fleet_spread(entries)
+    attach_incumbent_topic(entries)
 
     return {
         "version": MANIFEST_VERSION,
