@@ -584,15 +584,27 @@ _UNDECLARED_LEDE = "_(Not declared in this repository"
 _UNDECLARED_NOTE = f"{_UNDECLARED_LEDE}, so no pull request can carry this fix.)_"
 
 # The mirror of the pair above, for the case the ledger got wrong rather than
-# left unsaid. Naming the file is the whole point of this one -- the reader is
-# being told a pull request is possible, and "somewhere in the repository" is
-# not an answer they can act on -- so unlike `_UNDECLARED_NOTE` it costs a line
-# per finding and is written only where a path is unambiguous.
+# left unsaid. Naming the file is the whole point of this one -- "somewhere in
+# the repository" is not an answer a reader can act on -- so unlike
+# `_UNDECLARED_NOTE` it costs a line per finding and is written only where a
+# path is unambiguous.
+#
+# It states the declaration and the consequence, and asserts nothing about
+# *why* the finding stayed manual, because this pass cannot know. Two causes
+# reach it and they call for opposite reactions: a check whose SOP bars a
+# manifest outright (obtainability §3.10 forbids generating probe YAML, §3.11
+# calls going HA guidance only) is working correctly, while a check that simply
+# failed to find the declaration this pass just found is a manifest that should
+# have been written. Until 2026-09-06 the sentence read "so a pull request
+# could carry this fix", which picks the second reading and is refused by the
+# system that hears it: `parse_remediate_commands` promotes `manifest` and
+# nothing else, so a reader who believed the note and typed `/remediate` got a
+# public "`<id>` has a `manual` remediation, not a `manifest` one".
 _DECLARED_LEDE = "_(Declared in this repository at "
 
 
 def _declared_note(path: str) -> str:
-    return f"{_DECLARED_LEDE}`{path}`, so a pull request could carry this fix.)_"
+    return f"{_DECLARED_LEDE}`{path}`, though a manual fix opens no pull request.)_"
 
 # What `timeout(1)` returns for a command it killed, reused so a caller reading
 # `returncode` cannot confuse a timeout with the command's own exit codes.
@@ -9243,6 +9255,10 @@ def disclose_declared_manual_remediations(
     describe a file change that nobody wrote. What the reader can act on is the
     path, which is exactly what this states.
 
+    States the path and stops. Whether the finding stayed manual because its
+    check bars a manifest or because the check missed this very declaration is
+    not decidable here, and `_DECLARED_LEDE` records what it cost to guess.
+
     Names a file only where one file declares the object. `kubernetes_declarations`
     keys on `(kind, name)` without the namespace, so a name reused across two
     namespaces resolves to both paths, and picking one would send the reader to
@@ -10289,8 +10305,9 @@ def handle_finish(args: argparse.Namespace) -> None:
     for fid in disclose_declared_manual_remediations(findings, root):
         log(
             f"{fid} is manual, but the GitOps repository does declare the object "
-            "it sits on; its note names the file, so the reason it stayed manual "
-            "reads as the check's own rule rather than a missing declaration."
+            "it sits on; its note names the file. Worth a look where the fix is "
+            "mechanical -- a check that bars manifests is working, a check that "
+            "missed this declaration owed a manifest."
         )
     for fid in disclose_undeclared_manual_remediations(findings, root):
         log(

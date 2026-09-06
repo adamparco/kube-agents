@@ -3951,7 +3951,30 @@ class TestDeclaredManualRemediations(HarnessTestCase):
         note = findings[0]["remediation"]["note"]
         self.assertIn("Declared in this repository at", note)
         self.assertIn("`clusters/app/web.yaml`", note)
-        self.assertIn("a pull request could carry this fix", note)
+        self.assertIn("a manual fix opens no pull request", note)
+
+    def test_the_note_does_not_promise_a_pull_request(self):
+        # `parse_remediate_commands` promotes `manifest` and nothing else, so a
+        # note telling the reader a PR could carry a `manual` fix is refused by
+        # the command it invites: "`<id>` has a `manual` remediation, not a
+        # `manifest` one". Pinned because the wording is the whole fix.
+        self.declare("clusters/app/web.yaml", "Deployment", "argocd-server")
+        findings = [self.manual_finding()]
+        audit_report.disclose_declared_manual_remediations(findings, self.workspace)
+        note = findings[0]["remediation"]["note"]
+        self.assertNotIn("could carry this fix", note)
+        promotable = audit_report.parse_remediate_commands(
+            [
+                {
+                    "id": "c1",
+                    "author": {"login": "someone"},
+                    "body": f"/remediate {findings[0]['id']}",
+                }
+            ],
+            findings,
+            can_write=lambda _login: True,
+        )
+        self.assertEqual(list(promotable.targets), [])
 
     def test_an_undeclared_object_is_left_alone(self):
         self.declare("clusters/app/web.yaml", "Deployment", "web")
@@ -4078,7 +4101,7 @@ class TestDeclarationNotesCompose(HarnessTestCase):
         findings = [
             self.finding(
                 "Base. _(Declared in this repository at `clusters/app/web.yaml`, "
-                "so a pull request could carry this fix.)_"
+                "though a manual fix opens no pull request.)_"
             )
         ]
         note = self.run_both(findings)
@@ -4105,7 +4128,7 @@ class TestDeclarationNotesCompose(HarnessTestCase):
         findings = [
             self.finding(
                 "Base. _(Declared in this repository at `clusters/app/web.yaml`, "
-                "so a pull request could carry this fix.)_"
+                "though a manual fix opens no pull request.)_"
             )
         ]
         note = self.run_both(findings)
