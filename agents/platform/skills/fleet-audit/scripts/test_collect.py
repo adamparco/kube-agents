@@ -1827,6 +1827,30 @@ class TestComplianceNormalize(unittest.TestCase):
         out = collect.normalize_compliance_workloads(dump_of(compliance_workload("CronJob", "job")))
         self.assertEqual(out[0]["spec"]["containers"][0]["name"], "app")
 
+    def test_a_suspended_cronjob_is_kept_and_marked(self):
+        """Kept, because the template is what runs the moment someone resumes
+        it; marked, because the impact a suspended CronJob's finding is written
+        from is in the present tense."""
+        c = compliance_workload("CronJob", "job")
+        c["spec"]["suspend"] = True
+        out = collect.normalize_compliance_workloads(dump_of(c))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["suspended"])
+
+    def test_an_unsuspended_cronjob_and_a_deployment_are_not_marked(self):
+        for doc in (
+            compliance_workload("CronJob", "job"),
+            compliance_workload("Deployment", "api"),
+            compliance_pod("standalone"),
+        ):
+            with self.subTest(kind=doc["kind"]):
+                self.assertFalse(collect.normalize_compliance_workloads(dump_of(doc))[0]["suspended"])
+
+    def test_suspend_false_reads_as_not_suspended(self):
+        c = compliance_workload("CronJob", "job")
+        c["spec"]["suspend"] = False
+        self.assertFalse(collect.normalize_compliance_workloads(dump_of(c))[0]["suspended"])
+
     def test_system_namespace_is_excluded(self):
         self.assertEqual(
             collect.normalize_compliance_workloads(dump_of(compliance_pod("x", ns="kube-system"))), []
@@ -3755,6 +3779,18 @@ class TestNormalizeAiWorkloads(unittest.TestCase):
         d["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
         self.assertEqual(collect.normalize_ai_workloads(dump_of(d)), [])
 
+    def test_a_suspended_cronjob_is_kept_and_marked(self):
+        c = ai_workload("CronJob", "batch-embed")
+        c["spec"]["suspend"] = True
+        out = collect.normalize_ai_workloads(dump_of(c))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["suspended"])
+
+    def test_a_running_workload_is_not_marked(self):
+        for kind in ("Deployment", "CronJob", "Pod"):
+            with self.subTest(kind=kind):
+                self.assertFalse(collect.normalize_ai_workloads(dump_of(ai_workload(kind, "w")))[0]["suspended"])
+
 
 class TestModelRemoteCodeTrusted(unittest.TestCase):
     def hit(self, container):
@@ -4294,6 +4330,42 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertIn("model-remote-code-trusted", slugs)
         self.assertIn("model-image-floating-tag", slugs)
         self.assertIn("inference-endpoint-public", slugs)
+
+    def test_a_suspended_cronjobs_candidate_says_so_in_its_excerpt(self):
+        """The 2026-09-05 report told an operator that
+        `CronJob/ai-batch-finetune` pulls an unpinned model and that "the bytes
+        that arrive at the next pod restart are whatever the source serves
+        then". That CronJob has `spec.suspend: true`, an empty
+        `status.lastScheduleTime`, and has never produced a Job. The detection
+        was right; the tense was not, and the excerpt is what the impact gets
+        written from."""
+        c = ai_workload("CronJob", "ai-batch-finetune", container={"args": ["--model", "meta-llama/Llama-3.1-8B-Instruct"]})
+        c["spec"]["suspend"] = True
+        result = self.run_with(workload_items=[c])
+        hits = [x for x in result["candidates"] if x["check"] == "model-artifact-unpinned-source"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("spec.suspend=true", hits[0]["excerpt"])
+        self.assertIn("still what runs when it is", hits[0]["excerpt"])
+
+    def test_an_unsuspended_workloads_candidate_gains_nothing(self):
+        w = ai_workload("Deployment", "vllm", container={"image": "acme/vllm:latest"})
+        result = self.run_with(workload_items=[w])
+        hits = [x for x in result["candidates"] if x["check"] == "model-image-floating-tag"]
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("suspend", hits[0]["excerpt"])
+
+    def test_a_service_candidate_never_gains_it(self):
+        """`inference-endpoint-public` emits on a Service, which has no
+        `suspend` field and no workload to read one from -- the cluster-kind
+        arm of `emit` must not reach for one."""
+        c = ai_workload("CronJob", "batch", pod_labels={"app": "vllm"})
+        c["spec"]["suspend"] = True
+        d = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        result = self.run_with(workload_items=[c, d], service_items=[svc])
+        hits = [x for x in result["candidates"] if x["check"] == "inference-endpoint-public"]
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("suspend", hits[0]["excerpt"])
 
     def test_a_gate_failure_on_the_service_dump_fails_the_whole_cluster(self):
         def run(argv, **kwargs):

@@ -1197,6 +1197,34 @@ def _pod_spec_of(item: dict) -> dict:
     return (spec.get("template") or {}).get("spec") or {}
 
 
+# What every excerpt on a suspended CronJob gains, and why one is not enough to
+# drop the finding. `spec.suspend: true` stops the controller creating Jobs, so
+# nothing in the template is running now and nothing will start on a schedule --
+# but the template is still what runs the moment someone unsuspends it, which is
+# the shape both compliance and ai-security exist to audit, and suspension is a
+# field one `kubectl patch` undoes.
+#
+# What it does change is the tense a reader should give the impact. The
+# 2026-09-05 ai-security report told an operator that `CronJob/ai-batch-finetune`
+# pulls an unpinned model and that "the bytes that arrive at the next pod restart
+# are whatever the source serves then" -- about a CronJob suspended since it was
+# created, whose `status.lastScheduleTime` is empty and which has never produced
+# a Job. Every word of the detection was right and the sentence built on it
+# described something that cannot currently happen.
+#
+# Stated here rather than left to the model because `adopt_collector_evidence`
+# overwrites the model's excerpt with this one: prose in an SOP would not reach
+# the reader, and the excerpt is what the impact gets written from.
+_SUSPENDED_CRONJOB_NOTE = (
+    " (CronJob is suspended: spec.suspend=true, so no Job runs on the schedule "
+    "until it is resumed -- the template below is still what runs when it is)"
+)
+
+
+def _is_suspended_cronjob(item: dict) -> bool:
+    return item.get("kind") == "CronJob" and (item.get("spec") or {}).get("suspend") is True
+
+
 def normalize_compliance_workloads(dump: dict) -> list[dict]:
     """Every object surviving compliance's universal suppressions, as
     `{kind, ns, name, spec}` where `spec` is the resolved **pod** spec —
@@ -1222,7 +1250,10 @@ def normalize_compliance_workloads(dump: dict) -> list[dict]:
             continue
         if item.get("kind") == "Pod" and meta.get("ownerReferences"):
             continue
-        out.append({"kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": _pod_spec_of(item)})
+        out.append({
+            "kind": item["kind"], "ns": ns, "name": meta.get("name", ""),
+            "spec": _pod_spec_of(item), "suspended": _is_suspended_cronjob(item),
+        })
     return out
 
 
@@ -2275,7 +2306,10 @@ def normalize_ai_workloads(dump: dict) -> list[dict]:
         spec = _pod_spec_of(item)
         if not _is_ai_workload(spec):
             continue
-        out.append({"kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": spec, "lbl": _pod_template_labels_of(item)})
+        out.append({
+            "kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": spec,
+            "lbl": _pod_template_labels_of(item), "suspended": _is_suspended_cronjob(item),
+        })
     return out
 
 
@@ -3325,7 +3359,7 @@ def collect_cluster(
             "error": str(exc),
         }
 
-    def emit(spec: CheckSpec, hit: dict, default_namespace: str) -> dict:
+    def emit(spec: CheckSpec, hit: dict, default_namespace: str, workload: dict | None = None) -> dict:
         severity = hit.get("severity") or spec.severity
         # Same override `severity` already has, for the same reason: a check
         # whose arms differ in what they prove cannot state one consequence for
@@ -3342,13 +3376,16 @@ def collect_cluster(
         if severity == spec.severity and cluster.get("autopilot") and spec.autopilot_severity:
             severity = spec.autopilot_severity
             impact = f"{impact} (Autopilot: severity downgraded — the platform injects requests at admission.)"
+        excerpt = hit["excerpt"]
+        if workload and workload.get("suspended"):
+            excerpt += _SUSPENDED_CRONJOB_NOTE
         emitted = {
             "check": spec.slug,
             "cluster": name,
             "namespace": hit.get("namespace", default_namespace),
             "object": hit["object"],
             "severity": severity,
-            "excerpt": hit["excerpt"],
+            "excerpt": excerpt,
             "impact": impact,
             "needs_triage": None,
         }
@@ -3362,7 +3399,7 @@ def collect_cluster(
             for workload in collected.workloads:
                 hit = spec.run(workload, collected.context)
                 if hit is not None:
-                    candidates.append(emit(spec, hit, workload["ns"]))
+                    candidates.append(emit(spec, hit, workload["ns"], workload))
         else:
             for hit in spec.run(collected.context):
                 candidates.append(emit(spec, hit, hit.get("namespace", "")))
