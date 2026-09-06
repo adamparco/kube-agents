@@ -1418,7 +1418,15 @@ def cronjob(
     return doc
 
 
-def job(name, ns="default", owner="cj", succeeded=None, failed=None, created="2026-09-06T20:00:00Z"):
+def job(
+    name,
+    ns="default",
+    owner="cj",
+    succeeded=None,
+    failed=None,
+    created="2026-09-06T20:00:00Z",
+    reason=None,
+):
     status = {}
     if succeeded is not None:
         status["succeeded"] = succeeded
@@ -1427,6 +1435,8 @@ def job(name, ns="default", owner="cj", succeeded=None, failed=None, created="20
     if not status:
         # Neither field set is what an in-flight Job looks like.
         status["active"] = 1
+    if reason is not None:
+        status["conditions"] = [{"type": "Failed", "status": "True", "reason": reason}]
     return {
         "kind": "Job",
         "metadata": {
@@ -1473,6 +1483,41 @@ class TestScheduleNeverSucceeds(unittest.TestCase):
         self.assertIn("243h without a successful run", hits[0]["excerpt"])
         self.assertIn("lastSuccessfulTime=2026-08-27T18:18:39Z", hits[0]["excerpt"])
         self.assertIn("1 retained Job(s), all failed", hits[0]["excerpt"])
+
+    def test_the_excerpt_names_the_newest_jobs_failure_reason(self):
+        # BackoffLimitExceeded and DeadlineExceeded take different fixes, and
+        # the Job already says which one applies -- so the finding does too,
+        # rather than sending the reader to `kubectl describe` for it.
+        hits = self.hits(
+            cronjob(),
+            job("j1", failed=1, created="2026-09-06T19:00:00Z", reason="DeadlineExceeded"),
+            job("j2", failed=1, created="2026-09-06T20:00:00Z", reason="BackoffLimitExceeded"),
+        )
+        self.assertIn("(most recent: BackoffLimitExceeded)", hits[0]["excerpt"])
+        self.assertNotIn("DeadlineExceeded", hits[0]["excerpt"])
+
+    def test_a_failed_job_with_no_conditions_adds_no_clause(self):
+        # Nothing to say is said as nothing, not as an empty parenthesis.
+        excerpt = self.hits(cronjob(), job("j1", failed=1))[0]["excerpt"]
+        self.assertIn("1 retained Job(s), all failed", excerpt)
+        self.assertNotIn("most recent", excerpt)
+
+    def test_a_blank_reason_adds_no_clause(self):
+        blank = job("j1", failed=1)
+        blank["status"]["conditions"] = [{"type": "Failed", "status": "True", "reason": ""}]
+        self.assertNotIn("most recent", self.hits(cronjob(), blank)[0]["excerpt"])
+
+    def test_a_condition_that_is_not_a_true_failed_is_ignored(self):
+        # `Failed` with status False, and `SuccessCriteriaMet`, are both things
+        # a Job carries; neither is the reason this Job failed.
+        noisy = job("j1", failed=1)
+        noisy["status"]["conditions"] = [
+            {"type": "Failed", "status": "False", "reason": "NotThisOne"},
+            {"type": "SuccessCriteriaMet", "status": "True", "reason": "NorThis"},
+        ]
+        excerpt = self.hits(cronjob(), noisy)[0]["excerpt"]
+        self.assertNotIn("NotThisOne", excerpt)
+        self.assertNotIn("NorThis", excerpt)
 
     def test_a_suspended_cronjob_is_never_flagged(self):
         self.assertEqual(self.hits(cronjob(suspend=True), job("j1", failed=1)), [])

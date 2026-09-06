@@ -1389,6 +1389,37 @@ def _rfc3339(stamp: str) -> float | None:
         return None
 
 
+def _failure_summary(finished: list[dict]) -> str:
+    """The `Failed` condition's reason on the most recent Job, as a clause.
+
+    Empty string when there is nothing to add, so the caller can concatenate it
+    unconditionally.
+
+    Without this the finding says a schedule has stopped succeeding and stops
+    there, which sends the reader to `kubectl describe` to learn the one thing
+    that decides what to do about it. `BackoffLimitExceeded` means the
+    container is exiting non-zero and the fix is in the image or its
+    arguments; `DeadlineExceeded` means it is running out of
+    `activeDeadlineSeconds`, and the fix is usually the deadline or the
+    schedule's period rather than the code. Those are different remediations
+    and the Job already carries which one applies.
+
+    Only the newest Job, not all of them: the retained set is at most
+    `failedJobsHistoryLimit` deep and consecutive failures of one schedule
+    almost always share a reason, so listing three of them pads the excerpt
+    without adding a fact. `finished` arrives sorted by `creationTimestamp`
+    because `cronjobs_with_jobs` sorts it.
+    """
+    if not finished:
+        return ""
+    conditions = (finished[-1].get("status") or {}).get("conditions") or []
+    for condition in conditions:
+        if condition.get("type") == "Failed" and str(condition.get("status")) == "True":
+            reason = str(condition.get("reason") or "").strip()
+            return f" (most recent: {reason})" if reason else ""
+    return ""
+
+
 def check_schedule_never_succeeds(context: dict) -> list[dict]:
     """Cluster-scoped: iterates CronJobs, which are not in `workloads` at all.
 
@@ -1447,6 +1478,7 @@ def check_schedule_never_succeeds(context: dict) -> list[dict]:
                     f"{baseline_field}={last_success or (cronjob.get('metadata') or {}).get('creationTimestamp', '')} "
                     f"({gap_hours:.0f}h without a successful run); "
                     f"{len(finished)} retained Job(s), all failed"
+                    f"{_failure_summary(finished)}"
                 ),
                 "reconciler": reconciler_of(cronjob.get("metadata") or {}),
             }
