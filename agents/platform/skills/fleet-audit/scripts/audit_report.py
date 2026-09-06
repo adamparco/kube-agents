@@ -962,7 +962,19 @@ _URL_CREDENTIAL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+:)[^\s@/]
 # OpenAI or Anthropic key, an NVIDIA NGC key. Their lengths are set well above
 # the real minimum so that a Kubernetes object named `sk-something` has to be
 # implausibly long before it is mistaken for a key.
+#
+# The lookbehind is what makes that length argument true. Without it the prefix
+# only has to appear *inside* a word, and `sk-` is the tail of `disk-`: the cost
+# audit's own finding id
+# `unattached-disk.project-adamparco-kage._.disk-pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34`
+# published as `...._.di[redacted by audit_report.py]` on 2026-09-06, and so did
+# the id for the second disk -- two findings, one id, a ledger row nobody could
+# `/remediate` and a delta that would call one of them fixed the next morning.
+# Every prefix here is a real token's opening characters, so requiring one to
+# start a word costs nothing: a token is preceded by a space, a quote, an `=`,
+# or the start of the line, never by an identifier character.
 _TOKEN_SHAPE_RE = re.compile(
+    r"(?<![A-Za-z0-9_\-])"
     r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|ya29\.[A-Za-z0-9._\-]{20,}"

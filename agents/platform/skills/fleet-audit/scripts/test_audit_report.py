@@ -11556,6 +11556,43 @@ class TestRedaction(unittest.TestCase):
             with self.subTest(secret=secret):
                 self.assertRedacted(f"log line before {secret} and after", secret)
 
+    def test_a_token_prefix_buried_inside_a_word_is_not_a_token(self):
+        """`disk-` ends in `sk-`, and the cost stream's ids are full of them.
+
+        Both unattached-disk findings of 2026-09-06 published as
+        `unattached-disk.project-adamparco-kage._.di[redacted...]` — the same
+        id for two different disks. That collapses `current_ids`, so the next
+        morning's delta reports one of them resolved, and neither row can be
+        handed to `/remediate`.
+
+        The other prefixes are here because the same lookbehind guards them and
+        each has an ordinary word that ends the same way.
+        """
+        for benign in (
+            "unattached-disk.project-adamparco-kage._."
+            "disk-pvc-d45cfdfd-f194-4bda-9d53-f83a67d8ac34",
+            "boot-disk-pvc-0123456789abcdef0123456789abcdef0123",
+            # `...ghp_` inside a longer identifier, and a name ending `hf_`.
+            "checksum-ghp_0123456789abcdefghij",
+            "modelshf_notARealTokenNotARealTokenNot",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_a_token_still_goes_when_a_delimiter_precedes_it(self):
+        # The lookbehind must not exempt the shapes a real token arrives in:
+        # after a quote, an `=`, a `:`, a space, or at the very start.
+        secret = "sk-notARealKeyNotARealKeyNotARealKey"
+        for excerpt in (
+            f'{{"OPENAI_API_KEY":"{secret}"}}',
+            f"OPENAI_API_KEY={secret}",
+            f"  api-key: {secret}",
+            f"{secret} leads the line",
+            f"--api-key={secret}",
+        ):
+            with self.subTest(excerpt=excerpt):
+                self.assertRedacted(excerpt, secret)
+
     def test_a_bearer_header_is_redacted(self):
         self.assertRedacted(
             "Authorization: Bearer abcdefghijklmnopqrstuv", "abcdefghijklmnopqrstuv"
