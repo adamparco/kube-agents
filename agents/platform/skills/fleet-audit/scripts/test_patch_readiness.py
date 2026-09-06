@@ -84,6 +84,75 @@ class MasterBehindTest(unittest.TestCase):
         hit = pr.check_master_behind(c, BASELINE)
         self.assertEqual(hit["severity"], "critical")
 
+    def test_off_the_channel_roster_but_still_offered_is_not_critical(self):
+        """A staggered rollout is not an end of support.
+
+        `validVersions` is per channel and moves the moment that channel
+        promotes a new build, so a cluster the wave has not reached yet is
+        absent from its own channel's roster while GKE goes on patching it.
+        `critical` used to fire on exactly that, ahead of the branches that
+        grade it, and its impact told the operator the cluster "receives no
+        further patches".
+
+        Both arms below are the live 2026-09-06 fleet. Six clusters ran
+        `1.35.7-gke.1027000`, which us-east4 still lists in
+        `validMasterVersions` while REGULAR had moved to `1150000`;
+        `drift-peer-std-9` ran `1.36.3-gke.1640000` on RAPID, which RAPID had
+        left behind and REGULAR and EXTENDED still listed. GKE auto-upgraded
+        five of the seven control planes unattended in the same 48 hours.
+        """
+        current, default = "1.35.7-gke.1027000", "1.35.7-gke.1150000"
+        arms = {
+            "in validMasterVersions": {
+                "channels": [{"channel": "REGULAR", "defaultVersion": default, "validVersions": [default]}],
+                "validMasterVersions": [current, default],
+            },
+            "in another channel's validVersions": {
+                "channels": [
+                    {"channel": "RAPID", "defaultVersion": default, "validVersions": [default]},
+                    {"channel": "EXTENDED", "defaultVersion": current, "validVersions": [current]},
+                ],
+                "validMasterVersions": [],
+            },
+        }
+        for label, raw in arms.items():
+            with self.subTest(offered=label):
+                channel = "REGULAR" if label.startswith("in valid") else "RAPID"
+                hit = pr.check_master_behind(
+                    cluster(channel=channel, master=current), pr.normalize_server_config(raw)
+                )
+                self.assertEqual(hit["severity"], "minor")
+                # Not silence either: the reader still needs to know it is
+                # behind, and that its own channel has moved past it.
+                self.assertIn(default, hit["excerpt"])
+                self.assertIn("no longer on that channel's roster", hit["excerpt"])
+
+    def test_a_version_no_route_offers_is_still_critical(self):
+        """The fix must not cost the check its real case. Same shape as the
+        test above, with the version absent from every roster the location
+        publishes — nothing will upgrade this control plane, which is what
+        `critical` claims."""
+        raw = {
+            "channels": [
+                {"channel": "REGULAR", "defaultVersion": "1.35.7-gke.1150000", "validVersions": ["1.35.7-gke.1150000"]},
+                {"channel": "EXTENDED", "defaultVersion": "1.34.0-gke.1", "validVersions": ["1.34.0-gke.1"]},
+            ],
+            "validMasterVersions": ["1.35.7-gke.1150000", "1.34.0-gke.1"],
+        }
+        hit = pr.check_master_behind(
+            cluster(master="1.28.0-gke.1"), pr.normalize_server_config(raw)
+        )
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_the_roster_clause_is_absent_when_the_channel_still_lists_it(self):
+        """The clause is evidence, not decoration: a cluster inside its own
+        channel's roster must not carry it, or it says nothing."""
+        baseline = pr.normalize_server_config(
+            server_config(default="1.30.9-gke.1", valid_versions=["1.30.5-gke.100", "1.30.9-gke.1"])
+        )
+        hit = pr.check_master_behind(cluster(master="1.30.5-gke.100"), baseline)
+        self.assertNotIn("roster", hit["excerpt"])
+
     def test_a_minor_behind_default_is_major(self):
         baseline = pr.normalize_server_config(server_config(default="1.31.0-gke.1", valid_versions=["1.30.5-gke.100", "1.31.0-gke.1"]))
         hit = pr.check_master_behind(cluster(master="1.30.5-gke.100"), baseline)

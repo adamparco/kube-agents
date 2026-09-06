@@ -225,6 +225,33 @@ def _upgrade_in_progress(cluster: dict) -> bool:
     return (cluster.get("status") or "") == "RECONCILING"
 
 
+def _still_offered(baseline: dict, version: str) -> bool:
+    """Whether GKE still serves `version` at this location, by any route.
+
+    `validVersions` is per channel and it moves the moment a channel promotes
+    a new build, so a version's absence from one channel's roster says the
+    rollout has passed this cluster by -- not that the version is unsupported.
+    Two other rosters in the same `get-server-config` response answer the
+    support question directly: `validMasterVersions`, which is the
+    channel-independent list of everything the location will still create or
+    upgrade a control plane to, and any *other* channel's `validVersions`.
+    A hit in either is decisive.
+
+    Measured on 2026-09-06, against the seven `master-behind` criticals that
+    day's run published. `1.35.7-gke.1027000` and `1.36.3-gke.1640000` are
+    both in `validMasterVersions` at us-east4 and us-east4-c; the second is
+    also in REGULAR's and EXTENDED's `validVersions` there, absent only from
+    RAPID. Neither is out of support, and GKE proved it in the same window by
+    auto-upgrading five of those clusters' control planes unattended.
+    """
+    if version in (baseline.get("validMasterVersions") or []):
+        return True
+    return any(
+        version in (info.get("validVersions") or [])
+        for info in (baseline.get("channels") or {}).values()
+    )
+
+
 def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
     if baseline is None:
         return None
@@ -253,17 +280,33 @@ def check_master_behind(cluster: dict, baseline: dict | None) -> dict | None:
     # says nothing is to say nothing.
     if not valid:
         return None
-    if current not in valid:
-        return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} absent from validVersions", "severity": "critical"}
+    # Absent from this channel's roster, and from every other route the
+    # location offers: nothing will upgrade this control plane, which is what
+    # `critical` claims. Absent from this channel's roster *alone* is the
+    # ordinary staggered rollout, and it falls through to the same-minor and
+    # behind-default branches below, which grade it honestly. Ordering matters
+    # and this branch used to come first: on 2026-09-06 it swallowed all seven
+    # cases that belonged to those branches and published them as `critical`
+    # with an impact -- "receives no further patches" -- that the same API
+    # response contradicted.
+    off_roster = current not in valid
+    if off_roster and not _still_offered(baseline, current):
+        return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} offered by no channel at this location", "severity": "critical", "impact": UNSUPPORTED_MASTER_IMPACT}
     if not default:
         return None
     default_t = parse_version(default)
     if default_t is None:
         return None
+    # Said only where it is true, and it is the difference between a cluster
+    # the channel has not reached yet and one it has already moved past. Both
+    # still take automatic patches -- `_still_offered` established that -- so
+    # neither raises the severity; it is context for the reader deciding
+    # whether to wait for the rollout or ask for the upgrade.
+    roster = " and no longer on that channel's roster" if off_roster else ""
     if current_t[:2] < default_t[:2]:
-        return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} is a minor behind channel default {default}", "severity": "major"}
+        return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} is a minor behind channel default {default}{roster}", "severity": "major"}
     if current_t[:2] == default_t[:2] and current_t < default_t:
-        return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} is behind channel default {default} on the same minor", "severity": "minor"}
+        return {"object": f"Cluster/{cluster['name']}", "excerpt": f"currentMasterVersion={current} is behind channel default {default} on the same minor{roster}", "severity": "minor"}
     return None
 
 
@@ -480,8 +523,14 @@ SEVERITY = {
     "no-notifications": "minor",
 }
 
+# `master-behind`'s only severity whose impact is a different claim rather than a
+# stronger one: (a) says nothing patches this control plane, (b) and (c) say it is
+# behind while still being patched. `IMPACT` is per-check, so the branch that
+# earns this one carries it on the hit and `_emit` prefers it.
+UNSUPPORTED_MASTER_IMPACT = "Control plane runs a version no channel at this location offers; it is outside the supported window and receives no further patches."
+
 IMPACT = {
-    "master-behind": "Control plane is outside the supported window and receives no further patches until it moves.",
+    "master-behind": "Control plane is behind its release channel's default and carries whatever the intervening builds fixed until it moves.",
     "pool-skew": "This node pool's version skew against the control plane risks or already blocks the cluster's next control-plane upgrade.",
     "fleet-spread": "API-compatibility testing and rollout playbooks must cover every minor version this fleet spans.",
     "no-channel": "This cluster is on a static version with no release channel; it receives no automatic control-plane security patches.",
@@ -501,7 +550,7 @@ def _emit(slug: str, hit: dict) -> dict:
         "object": hit["object"],
         "severity": hit.get("severity") or SEVERITY[slug],
         "excerpt": hit["excerpt"],
-        "impact": IMPACT[slug],
+        "impact": hit.get("impact") or IMPACT[slug],
         "needs_triage": None,
     }
 
