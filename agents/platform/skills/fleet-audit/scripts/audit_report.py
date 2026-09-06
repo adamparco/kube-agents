@@ -314,9 +314,10 @@ AUDITS: dict[str, AuditSpec] = {
             "psc-routing-deadlock",
             "mtu-packet-fragmentation",
             "cloud-armor-false-positive",
+            "firewall-world-open-ingress",
         ),
         # §2's target rule: one entry per subnet for the IPAM check, one
-        # `project/<id>` entry for the other four. This stream enumerates no
+        # `project/<id>` entry for the other five. This stream enumerates no
         # clusters at all.
         scopes=(
             ("subnet", ("subnet-ip-exhaustion",)),
@@ -327,6 +328,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "psc-routing-deadlock",
                     "mtu-packet-fragmentation",
                     "cloud-armor-false-positive",
+                    "firewall-world-open-ingress",
                 ),
             ),
         ),

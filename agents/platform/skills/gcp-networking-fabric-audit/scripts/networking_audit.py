@@ -196,12 +196,57 @@ DEFAULT_NETWORK_MTU = 1460
 # way round, as the prefix it synthesises the missing qualification onto.
 NETWORK_URL_PROJECT_MARKER = "projects/"
 
+# The two source ranges that mean "every host on the internet". Anything
+# narrower is somebody's deliberate allowlist, and this check does not
+# second-guess whose addresses belong in it.
+WORLD_SOURCE_RANGES = ("0.0.0.0/0", "::/0")
+
+# `IPProtocol` values that carry TCP. `all` is a real value meaning every
+# protocol, and the API accepts the IANA number in place of the name, so a rule
+# written `6` is the same rule as one written `tcp`.
+TCP_PROTOCOL_TOKENS = ("tcp", "6", "all")
+
+# GCP's `priority` when a rule does not set one. Needed as a default on both
+# sides of the precedence comparison in `_shadowed_ports`: reading an absent
+# priority as 0 would make every stock rule outrank everything.
+DEFAULT_FIREWALL_PRIORITY = 1000
+
+# Ports whose service authenticates a caller rather than serving the public:
+# remote access, the control plane's own ports, and the datastores. Each is
+# reachable only by someone holding a credential, so opening one to 0.0.0.0/0
+# makes that credential the entire perimeter.
+#
+# Deliberately not 80 or 443. A world-open web port is what a LoadBalancer
+# Service is *for*, and GKE writes one `k8s-fw-<hash>` rule per Service that
+# says exactly that -- five of them on this fleet. Including the web ports
+# would report every LoadBalancer in the fleet as a critical finding, daily,
+# and the flood would bury the two rules that are genuinely wrong.
+MANAGEMENT_PORTS = {
+    22: "SSH",
+    1433: "MSSQL",
+    2379: "etcd",
+    2380: "etcd-peer",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    6379: "Redis",
+    9200: "Elasticsearch",
+    10250: "kubelet",
+    27017: "MongoDB",
+}
+
+# How many reachable instances an excerpt names before it summarises the rest.
+# The excerpt has to prove the reach is real, which one named address does; the
+# count carries the scale, and eighteen node names carry neither.
+MAX_NAMED_EXPOSED_INSTANCES = 3
+
 SEVERITY = {
     "subnet-ip-exhaustion": "critical",
     "cloud-nat-exhaustion": "critical",
     "psc-routing-deadlock": "major",
     "mtu-packet-fragmentation": "major",
     "cloud-armor-false-positive": "minor",
+    "firewall-world-open-ingress": "critical",
 }
 IMPACT = {
     "subnet-ip-exhaustion": (
@@ -224,6 +269,10 @@ IMPACT = {
         "A preview-mode rule on a production backend logs matches without enforcing them, so the "
         "WAF looks like it is protecting traffic it is only observing; conflicting priorities make "
         "the effective policy unpredictable."
+    ),
+    "firewall-world-open-ingress": (
+        "Any host on the internet can open a TCP connection to these ports on the instances named, "
+        "so whatever authenticates on the far side of the port is the entire perimeter."
     ),
 }
 
@@ -635,6 +684,168 @@ def check_cloud_armor(policies: list[dict], backend_services: list[dict]) -> lis
         if not problems:
             continue
         hits.append({"object": f"SecurityPolicy/{name}", "excerpt": "; ".join(problems)})
+    return hits
+
+
+def _tcp_management_ports(block: list[dict]) -> set[int]:
+    """Which `MANAGEMENT_PORTS` an `allowed[]` or `denied[]` block covers over TCP.
+
+    Both keys hold the same shape, which is why one reader serves the allow
+    side and the shadowing deny side alike.
+
+    An entry with no `ports` key covers *every* port for its protocol. That is
+    the API's encoding rather than an omission -- it is how `default-allow-
+    internal` and every `gke-<hash>-all` rule are written -- so reading it as
+    "names no ports, therefore opens none" would let the rule that opens all
+    65535 of them read cleaner than the one that names 22.
+    """
+    covered: set[int] = set()
+    for entry in block or []:
+        if str(entry.get("IPProtocol", "")).lower() not in TCP_PROTOCOL_TOKENS:
+            continue
+        specs = entry.get("ports")
+        if not specs:
+            covered.update(MANAGEMENT_PORTS)
+            continue
+        for spec in specs:
+            low_text, _, high_text = str(spec).partition("-")
+            try:
+                low, high = int(low_text), int(high_text or low_text)
+            except ValueError:
+                continue
+            covered.update(port for port in MANAGEMENT_PORTS if low <= port <= high)
+    return covered
+
+
+def _shadowed_ports(rule: dict, firewalls: list[dict], project: str) -> set[int]:
+    """Ports an unconditional higher-priority DENY already blocks on this rule.
+
+    GCP evaluates firewall rules by `priority`, lowest number first, so a DENY
+    above an ALLOW makes the ALLOW unreachable for the traffic both describe.
+    A hardened VPC is routinely written that way -- a blanket deny-all ingress
+    over narrow allows -- and reporting the allows underneath it as live
+    exposure would be wrong about every one of them.
+
+    Only the decidable shape is subtracted: a DENY on the same network, from a
+    world source range, carrying no target restriction at all, and therefore
+    covering every instance the ALLOW could have reached whatever its own
+    targeting. A DENY scoped to some tags may or may not cover the instances
+    found reachable below, and guessing that it does hides a live exposure --
+    so those are left in and the rule is reported.
+    """
+    network = _network_key(rule.get("network", ""), project)
+    priority = rule.get("priority", DEFAULT_FIREWALL_PRIORITY)
+    blocked: set[int] = set()
+    for other in firewalls or []:
+        if other.get("disabled") or (other.get("direction") or "INGRESS").upper() != "INGRESS":
+            continue
+        if other.get("targetTags") or other.get("targetServiceAccounts"):
+            continue
+        if _network_key(other.get("network", ""), project) != network:
+            continue
+        if other.get("priority", DEFAULT_FIREWALL_PRIORITY) >= priority:
+            continue
+        if not any(r in WORLD_SOURCE_RANGES for r in other.get("sourceRanges") or []):
+            continue
+        blocked |= _tcp_management_ports(other.get("denied") or [])
+    return blocked
+
+
+def _reachable_instances(rule: dict, instances: list[dict], project: str) -> list[str]:
+    """The instances this rule actually admits internet traffic to: on its
+    network, holding an external IP, and inside its target scope.
+
+    The external-IP condition is what keeps the check from reporting a rule
+    that grants no reach. A firewall opens a port on the instances it targets,
+    and an instance with no external address is not dialable from `0.0.0.0/0`
+    at all -- the rule is then a latent misconfiguration, which is a different
+    claim from the one this check's impact makes. §2.5 already settled how this
+    stream treats a control governing no traffic: it does not publish it.
+
+    `targetTags` and `targetServiceAccounts` are alternatives, never both, and
+    a rule carrying neither applies to every instance in its network.
+    """
+    tags = {t.lower() for t in rule.get("targetTags") or []}
+    accounts = {a.lower() for a in rule.get("targetServiceAccounts") or []}
+    wanted = _network_key(rule.get("network", ""), project)
+    exposed = []
+    for inst in instances or []:
+        addresses = [
+            access.get("natIP")
+            for nic in inst.get("networkInterfaces") or []
+            if _network_key(nic.get("network", ""), project) == wanted
+            for access in nic.get("accessConfigs") or []
+            if access.get("natIP")
+        ]
+        if not addresses:
+            continue
+        if tags and not tags & {
+            t.lower() for t in (inst.get("tags") or {}).get("items") or []
+        }:
+            continue
+        if accounts and not accounts & {
+            (sa.get("email") or "").lower() for sa in inst.get("serviceAccounts") or []
+        }:
+            continue
+        exposed.append(f"{inst.get('name', '')} ({addresses[0]})")
+    return sorted(exposed)
+
+
+def _target_scope_phrase(rule: dict) -> str:
+    if rule.get("targetTags"):
+        return f"targetTags {sorted(rule['targetTags'])}"
+    if rule.get("targetServiceAccounts"):
+        return f"targetServiceAccounts {sorted(rule['targetServiceAccounts'])}"
+    return "no target restriction, so every instance on the network"
+
+
+def check_world_open_ingress(
+    firewalls: list[dict], instances: list[dict], project: str
+) -> list[dict]:
+    """One finding per enabled INGRESS rule opening a `MANAGEMENT_PORTS` port to
+    a world source range on at least one instance that holds an external IP.
+
+    Aggregated per rule rather than per port. A rule written `0-65535` opens
+    every port in the table, and eleven findings naming one firewall rule are
+    eleven copies of one fix -- the object a reader has to go change is the
+    rule, not the port.
+
+    The excerpt names the addresses because the claim is reachability, and a
+    rule name alone does not let anyone check it. On this fleet the finding is
+    `default-allow-ssh`, an auto-mode network's stock rule, against eighteen
+    GKE nodes that each hold a public address: `nc <node-ip> 22` returns an
+    OpenSSH banner from any host on the internet.
+    """
+    hits = []
+    for rule in firewalls or []:
+        if rule.get("disabled") or (rule.get("direction") or "INGRESS").upper() != "INGRESS":
+            continue
+        world = [r for r in rule.get("sourceRanges") or [] if r in WORLD_SOURCE_RANGES]
+        if not world:
+            continue
+        ports = sorted(
+            _tcp_management_ports(rule.get("allowed") or [])
+            - _shadowed_ports(rule, firewalls, project)
+        )
+        if not ports:
+            continue
+        exposed = _reachable_instances(rule, instances, project)
+        if not exposed:
+            continue
+        remainder = len(exposed) - MAX_NAMED_EXPOSED_INSTANCES
+        hits.append(
+            {
+                "object": f"FirewallRule/{rule.get('name', '')}",
+                "excerpt": (
+                    f"sourceRanges {', '.join(world)} allows tcp:"
+                    f"{', '.join(f'{p} ({MANAGEMENT_PORTS[p]})' for p in ports)}; "
+                    f"{_target_scope_phrase(rule)}; {len(exposed)} instance(s) hold an "
+                    f"external IP and are reachable today: "
+                    f"{', '.join(exposed[:MAX_NAMED_EXPOSED_INSTANCES])}"
+                    + (f", +{remainder} more" if remainder > 0 else "")
+                ),
+            }
+        )
     return hits
 
 
@@ -1198,6 +1409,24 @@ def _collect_project_target(project: str, *, run: RunFn) -> dict:
             "cloud-armor-false-positive",
         )
         candidates += [_emit("cloud-armor-false-positive", hit) for hit in check_cloud_armor(policies, backends)]
+
+        firewalls = gated(
+            ["gcloud", "compute", "firewall-rules", "list", "--project", project, "--format", "json"],
+            "firewall-world-open-ingress",
+        )
+        # Read for the same reason `check_cloud_armor` reads backend services:
+        # the rule is half the fact. A firewall grants reach only to instances
+        # the source range can dial, and this listing is what says which --
+        # see `_reachable_instances` for why the check refuses to publish
+        # without it.
+        instances = gated(
+            ["gcloud", "compute", "instances", "list", "--project", project, "--format", "json"],
+            "firewall-world-open-ingress",
+        )
+        candidates += [
+            _emit("firewall-world-open-ingress", hit)
+            for hit in check_world_open_ingress(firewalls, instances, project)
+        ]
     except GateFailure as exc:
         return {"name": name, "project": project, "location": "global", "outcome": "gate-failed", "error": str(exc)}
 

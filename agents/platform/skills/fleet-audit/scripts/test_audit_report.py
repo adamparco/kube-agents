@@ -13903,12 +13903,14 @@ class TestScopedCoverage(unittest.TestCase):
         )
         self.assertEqual(owed, ("subnet-ip-exhaustion",))
 
-    def test_networkings_project_target_owes_the_other_four(self):
+    def test_networkings_project_target_owes_every_check_but_the_subnet_one(self):
         owed = audit_report.audit_target_checks(
             "gcp-networking-fabric-audit", "project/acme-prod"
         )
         self.assertNotIn("subnet-ip-exhaustion", owed)
-        self.assertEqual(len(owed), 4)
+        self.assertEqual(
+            len(owed), len(audit_report.audit_checks("gcp-networking-fabric-audit")) - 1
+        )
 
     def test_an_unpartitioned_stream_still_owes_its_whole_roster(self):
         """The streams that enumerate only clusters must be untouched by this."""
@@ -13952,6 +13954,7 @@ class TestScopedCoverage(unittest.TestCase):
                             "psc-routing-deadlock",
                             "mtu-packet-fragmentation",
                             "cloud-armor-false-positive",
+                            "firewall-world-open-ingress",
                         ],
                     }
                 ],
@@ -13976,6 +13979,7 @@ class TestScopedCoverage(unittest.TestCase):
                             "psc-routing-deadlock",
                             "mtu-packet-fragmentation",
                             "cloud-armor-false-positive",
+                            "firewall-world-open-ingress",
                         ],
                     },
                     {

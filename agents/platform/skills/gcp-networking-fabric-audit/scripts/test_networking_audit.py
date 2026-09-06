@@ -446,15 +446,232 @@ class CloudArmorTest(unittest.TestCase):
         self.assertEqual(na.check_cloud_armor(policies, []), [])
 
 
+NETWORK = "https://www.googleapis.com/compute/v1/projects/p1/global/networks/default"
+OTHER_NETWORK = "https://www.googleapis.com/compute/v1/projects/p1/global/networks/isolated"
+
+
+def public_node(name="node-1", ip="203.0.113.7", network=NETWORK, **extra):
+    return {
+        "name": name,
+        "networkInterfaces": [{"network": network, "accessConfigs": [{"natIP": ip}]}],
+        **extra,
+    }
+
+
+def world_open(name="allow-ssh", ports=("22",), **extra):
+    return {
+        "name": name,
+        "network": NETWORK,
+        "direction": "INGRESS",
+        "sourceRanges": ["0.0.0.0/0"],
+        "allowed": [{"IPProtocol": "tcp", "ports": list(ports)}],
+        **extra,
+    }
+
+
+class WorldOpenIngressTest(unittest.TestCase):
+    def test_flags_a_world_open_management_port_reaching_a_public_instance(self):
+        hits = na.check_world_open_ingress([world_open()], [public_node()], "p1")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "FirewallRule/allow-ssh")
+        self.assertIn("22 (SSH)", hits[0]["excerpt"])
+        self.assertIn("node-1 (203.0.113.7)", hits[0]["excerpt"])
+
+    def test_a_web_port_is_never_a_finding(self):
+        """GKE writes one `k8s-fw-<hash>` rule per LoadBalancer Service, each
+        opening 80 or 443 to 0.0.0.0/0 because that is what the Service asked
+        for. Five of them sit on this fleet; admitting the web ports would
+        report every one as critical, daily."""
+        for port in ("80", "443", "8080"):
+            with self.subTest(port):
+                rule = world_open(name=f"k8s-fw-{port}", ports=(port,))
+                self.assertEqual(na.check_world_open_ingress([rule], [public_node()], "p1"), [])
+
+    def test_a_private_source_range_is_never_a_finding(self):
+        rule = world_open(**{"sourceRanges": ["10.128.0.0/9"]})
+        self.assertEqual(na.check_world_open_ingress([rule], [public_node()], "p1"), [])
+
+    def test_a_non_tcp_protocol_is_never_a_finding(self):
+        rule = dict(world_open(), allowed=[{"IPProtocol": "icmp"}])
+        self.assertEqual(na.check_world_open_ingress([rule], [public_node()], "p1"), [])
+
+    def test_a_disabled_or_egress_rule_is_never_a_finding(self):
+        for label, overrides in (
+            ("disabled", {"disabled": True}),
+            ("egress", {"direction": "EGRESS"}),
+        ):
+            with self.subTest(label):
+                self.assertEqual(
+                    na.check_world_open_ingress([world_open(**overrides)], [public_node()], "p1"), []
+                )
+
+    def test_no_instance_holds_an_external_ip_so_nothing_is_reachable(self):
+        """A firewall grants reach only to instances the source range can dial.
+        The rule is a latent misconfiguration then, not the exposure this
+        check's impact describes -- the same reading §2.5 gives a Cloud Armor
+        policy attached to no backend."""
+        private = {"name": "node-1", "networkInterfaces": [{"network": NETWORK, "accessConfigs": []}]}
+        self.assertEqual(na.check_world_open_ingress([world_open()], [private], "p1"), [])
+
+    def test_a_public_instance_on_another_network_does_not_count(self):
+        elsewhere = public_node(network=OTHER_NETWORK)
+        self.assertEqual(na.check_world_open_ingress([world_open()], [elsewhere], "p1"), [])
+
+    def test_target_tags_scope_the_rule_to_the_instances_carrying_them(self):
+        rule = world_open(targetTags=["bastion"])
+        untagged = public_node(name="node-1")
+        tagged = public_node(name="bastion-1", ip="203.0.113.9", tags={"items": ["bastion"]})
+        self.assertEqual(na.check_world_open_ingress([rule], [untagged], "p1"), [])
+        hits = na.check_world_open_ingress([rule], [untagged, tagged], "p1")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("bastion-1 (203.0.113.9)", hits[0]["excerpt"])
+        self.assertNotIn("node-1 (", hits[0]["excerpt"])
+
+    def test_target_service_accounts_scope_the_rule_the_same_way(self):
+        rule = world_open(targetServiceAccounts=["ops@p1.iam.gserviceaccount.com"])
+        other = public_node(name="node-1", serviceAccounts=[{"email": "apps@p1.iam.gserviceaccount.com"}])
+        match = public_node(name="ops-1", ip="203.0.113.9", serviceAccounts=[{"email": "ops@p1.iam.gserviceaccount.com"}])
+        self.assertEqual(na.check_world_open_ingress([rule], [other], "p1"), [])
+        hits = na.check_world_open_ingress([rule], [other, match], "p1")
+        self.assertIn("ops-1", hits[0]["excerpt"])
+
+    def test_an_absent_ports_key_opens_every_management_port(self):
+        """`{"IPProtocol": "tcp"}` with no `ports` is the API's encoding for
+        every port, not an omission. Reading it as "names none, opens none"
+        would let the rule that opens all 65535 read cleaner than one naming
+        22."""
+        rule = dict(world_open(), allowed=[{"IPProtocol": "tcp"}])
+        hits = na.check_world_open_ingress([rule], [public_node()], "p1")
+        self.assertEqual(len(hits), 1)
+        for port, label in na.MANAGEMENT_PORTS.items():
+            self.assertIn(f"{port} ({label})", hits[0]["excerpt"])
+
+    def test_a_port_range_is_expanded_and_a_protocol_of_all_carries_tcp(self):
+        for label, allowed in (
+            ("range", [{"IPProtocol": "tcp", "ports": ["20-30"]}]),
+            ("protocol all", [{"IPProtocol": "all", "ports": ["22"]}]),
+            ("protocol number", [{"IPProtocol": "6", "ports": ["22"]}]),
+        ):
+            with self.subTest(label):
+                rule = dict(world_open(), allowed=allowed)
+                hits = na.check_world_open_ingress([rule], [public_node()], "p1")
+                self.assertIn("22 (SSH)", hits[0]["excerpt"])
+
+    def test_one_finding_per_rule_however_many_ports_it_opens(self):
+        rule = world_open(ports=("22", "3389", "5432"))
+        hits = na.check_world_open_ingress([rule], [public_node()], "p1")
+        self.assertEqual(len(hits), 1)
+        for fragment in ("22 (SSH)", "3389 (RDP)", "5432 (PostgreSQL)"):
+            self.assertIn(fragment, hits[0]["excerpt"])
+
+    def test_a_blanket_higher_priority_deny_shadows_the_rule(self):
+        """A hardened VPC is routinely a deny-all ingress over narrow allows.
+        Reporting the allows underneath it would be wrong about every one."""
+        allow = world_open(priority=1000)
+        deny = {
+            "name": "deny-all",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": 100,
+            "sourceRanges": ["0.0.0.0/0"],
+            "denied": [{"IPProtocol": "tcp"}],
+        }
+        self.assertEqual(na.check_world_open_ingress([allow, deny], [public_node()], "p1"), [])
+
+    def test_a_deny_that_does_not_outrank_the_allow_shadows_nothing(self):
+        allow = world_open(priority=100)
+        deny = {
+            "name": "deny-all",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": 1000,
+            "sourceRanges": ["0.0.0.0/0"],
+            "denied": [{"IPProtocol": "tcp"}],
+        }
+        self.assertEqual(len(na.check_world_open_ingress([allow, deny], [public_node()], "p1")), 1)
+
+    def test_a_target_scoped_deny_is_not_treated_as_blanket(self):
+        """Whether it covers the instances found reachable is undecidable here,
+        and assuming it does hides a live exposure."""
+        allow = world_open(priority=1000)
+        deny = {
+            "name": "deny-bastion",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": 100,
+            "targetTags": ["bastion"],
+            "sourceRanges": ["0.0.0.0/0"],
+            "denied": [{"IPProtocol": "tcp"}],
+        }
+        self.assertEqual(len(na.check_world_open_ingress([allow, deny], [public_node()], "p1")), 1)
+
+    def test_a_deny_covering_only_some_ports_leaves_the_rest_reported(self):
+        allow = world_open(ports=("22", "3389"), priority=1000)
+        deny = {
+            "name": "deny-ssh",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": 100,
+            "sourceRanges": ["0.0.0.0/0"],
+            "denied": [{"IPProtocol": "tcp", "ports": ["22"]}],
+        }
+        hits = na.check_world_open_ingress([allow, deny], [public_node()], "p1")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("3389 (RDP)", hits[0]["excerpt"])
+        self.assertNotIn("22 (SSH)", hits[0]["excerpt"])
+
+    def test_the_excerpt_caps_the_names_and_counts_the_rest(self):
+        nodes = [public_node(name=f"node-{i}", ip=f"203.0.113.{i}") for i in range(10)]
+        hits = na.check_world_open_ingress([world_open()], nodes, "p1")
+        self.assertIn("10 instance(s)", hits[0]["excerpt"])
+        self.assertIn(f"+{10 - na.MAX_NAMED_EXPOSED_INSTANCES} more", hits[0]["excerpt"])
+
+    def test_the_excerpt_says_when_nothing_narrows_the_target_scope(self):
+        hits = na.check_world_open_ingress([world_open()], [public_node()], "p1")
+        self.assertIn("no target restriction", hits[0]["excerpt"])
+
+    def test_an_unparseable_port_spec_is_skipped_rather_than_crashing(self):
+        rule = dict(world_open(), allowed=[{"IPProtocol": "tcp", "ports": ["not-a-port"]}])
+        self.assertEqual(na.check_world_open_ingress([rule], [public_node()], "p1"), [])
+
+    def test_severity_and_impact_are_registered_for_the_slug(self):
+        emitted = na._emit("firewall-world-open-ingress", {"object": "FirewallRule/x", "excerpt": "y"})
+        self.assertEqual(emitted["severity"], "critical")
+        self.assertTrue(emitted["impact"])
+
+
+# Every read `_collect_project_target` makes, answered with an empty listing.
+# A test's own `responses` are consulted first, so this changes no existing
+# expectation -- what it buys is that adding a read to one check does not
+# re-stub the reads of the other five in all twenty-seven tests here, which is
+# what adding `firewall-world-open-ingress` otherwise cost.
+QUIET_PROJECT_READS = (
+    "routers list",
+    "forwarding-rules list",
+    "networks list",
+    "security-policies list",
+    "backend-services list",
+    "firewall-rules list",
+    "instances list",
+)
+
+
 class CollectProjectTest(unittest.TestCase):
     def fake_run(self, responses: dict) -> na.RunFn:
         """`responses` maps a substring of the joined argv to a `Run`. First
         match wins, in insertion order, so a test can stub only the calls it
-        cares about."""
+        cares about; the project-scoped reads it says nothing about fall
+        through to `QUIET_PROJECT_READS` and return nothing. A command neither
+        names is still an error -- that guard is what catches a read whose argv
+        drifted away from the substring a test is matching on."""
+        # The test's own entries are consulted before the defaults, not merged
+        # with them: a default keyed on a substring of what a test stubbed
+        # would otherwise shadow it and answer the empty listing instead.
+        fallbacks = [(needle, run_of(0, "[]")) for needle in QUIET_PROJECT_READS]
 
         def run(argv, **kwargs):
             joined = " ".join(argv)
-            for needle, result in responses.items():
+            for needle, result in list(responses.items()) + fallbacks:
                 if needle in joined:
                     return result
             raise AssertionError(f"unstubbed command: {joined}")
@@ -482,7 +699,8 @@ class CollectProjectTest(unittest.TestCase):
         project_entry = next(e for e in entries if e["name"] == "project/proj-1")
         self.assertEqual(project_entry["outcome"], "collected")
         self.assertEqual({c["check"] for c in project_entry["commands"]}, {
-            "cloud-nat-exhaustion", "psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
+            "cloud-nat-exhaustion", "psc-routing-deadlock", "mtu-packet-fragmentation",
+            "cloud-armor-false-positive", "firewall-world-open-ingress",
         })
 
     def test_the_psc_read_carries_no_server_side_filter(self):
