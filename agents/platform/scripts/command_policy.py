@@ -318,6 +318,18 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # `delete`, `reset`, `add-metadata` -- stay refused, including the
         # `instances reset` the stream emits as a *proposed* remediation, and
         # the tests assert it.
+        # `instances describe` is the object-scoped counterpart of the
+        # `disks describe` and `forwarding-rules describe` already in this set,
+        # and the omission bites on exactly the judgment §2.1 hands back: a
+        # candidate tagged `needs_triage: gke-managed-node` asks the model to
+        # decide whether one instance is a Google-managed node or an
+        # operator-owned VM, which is a question about that instance's metadata
+        # keys and labels. Confirming it against the object was refused under
+        # gcp.read-only while the project-wide `instances list` beside it
+        # returned the same fields for every instance at once -- so the gate
+        # forced the broader read, not the narrower one. Pure read; the
+        # mutations one word away stay refused and the tests assert it.
+        ("compute", "instances", "describe"),
         ("compute", "instances", "get-serial-port-output"),
         ("compute", "instances", "list"),
         # The other two reads that same collector opens, added when §2.2 and

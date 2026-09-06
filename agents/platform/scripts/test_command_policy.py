@@ -1350,6 +1350,9 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             (["gcloud", "compute", "instances", "get-serial-port-output",
               "vm-1", "--zone=us-east4-a", "--project=p"],
              "startup-script-failures evidence read"),
+            (["gcloud", "compute", "instances", "describe", "vm-1",
+              "--zone=us-east4-a", "--project=p", "--format=json"],
+             "object-scoped confirm read for a gke-managed-node triage"),
         ):
             with self.subTest(desc=desc):
                 decision = evaluate(argv)
