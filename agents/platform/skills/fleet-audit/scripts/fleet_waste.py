@@ -1680,6 +1680,21 @@ def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = 
     return best
 
 
+def _resize_target(
+    peak_total: float, replicas: int, *, floor: float, unit: float
+) -> float:
+    """The per-replica request §3.1's resize would write: `ceil(peak x 2)`,
+    clamped up to `50m` / `64Mi`.
+
+    Split out of `_resize_shrinks_request`, which computed this number to
+    answer a yes/no question and then discarded it. The excerpt needs the
+    number itself: left to infer it, the model reports one it worked out from
+    the rounded peak the excerpt quotes, and the 2026-09-06 cost report asked
+    for `about 10m` on a dimension whose floor is `50m`.
+    """
+    return max(floor, math.ceil(peak_total / replicas * OVERREQUEST_PEAK_MULTIPLIER / unit) * unit)
+
+
 def _resize_shrinks_request(
     request_total: float, peak_total: float, replicas: int, *, floor: float, unit: float
 ) -> bool:
@@ -1713,9 +1728,7 @@ def _resize_shrinks_request(
     if replicas <= 0:
         return False
     request_per_replica = request_total / replicas
-    peak_per_replica = peak_total / replicas
-    rounded = math.ceil(peak_per_replica * OVERREQUEST_PEAK_MULTIPLIER / unit) * unit
-    target = max(floor, rounded)
+    target = _resize_target(peak_total, replicas, floor=floor, unit=unit)
     # A relative tolerance, because the request is a per-replica quotient of a
     # sum: three pods of `50m` total 0.15000000000000002, and a third of that
     # is a hair over 0.05. An exact `>` would call that hair a reclaimable
@@ -1928,6 +1941,19 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # model wrote with it, so this sentence is the one part of the finding
         # guaranteed to reach the reviewer intact.
         dimensions = [d for d, on in (("cpu", cpu_idle), ("memory", mem_idle)) if on]
+        # The per-replica request each idle dimension has to end up at. Stated
+        # rather than left to the reader for two reasons. The model cannot
+        # recompute it from this excerpt -- the peaks above are rounded to two
+        # decimals of a vCPU and one of a GiB, which is `0.00 vCPU / 0.0 GiB`
+        # for anything small -- and the 2026-09-06 report duly asked for
+        # `about 10m` on a dimension whose floor is `50m`. And `ceil(peak x 2)`
+        # is not the whole rule: the clamp is what decides the number on every
+        # near-idle workload, and a rule quoted without its clamp reads as
+        # though the answer were `1m`.
+        targets = {
+            "cpu": f"{_resize_target(peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001) * 1000:.0f}m",
+            "memory": f"{_resize_target(peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0):.0f}Mi",
+        }
         measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB {measured_over}"
         # Every number above is summed across the controller's pods, because
         # that is what the fleet is actually paying for -- but the remediation
@@ -1956,7 +1982,29 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
                 else "in use and must not be resized"
             )
             excerpt += f". Over-requested on {over} only ({at * 100:.0f}% of request); {other} is {why}"
+        # Both dimensions idle used to say nothing at all: the branch above
+        # fires only at `len(dimensions) == 1`, so the finding that most needs
+        # the instruction was the one that went without it. A resize of one
+        # dimension leaves the other satisfying the check on its own and the
+        # finding republishes next week, against a repository whose manifest
+        # now shows the merged PR -- which reads as the audit ignoring a fix.
+        # `github-token-minter` on 2026-09-06 was exactly this: idle on both,
+        # remediated on CPU alone, and still over-requested on the 0.12 GiB the
+        # recommendation called "close enough to in-use to leave alone" at 9%
+        # of request.
+        elif len(dimensions) > 1:
+            excerpt += (
+                ". Over-requested on both dimensions"
+                f" (cpu at {peak_cpu / cpu_req_total * 100:.0f}% of request,"
+                f" memory at {peak_mem / mem_req_total * 100:.0f}%);"
+                " resizing one alone does not clear this finding"
+            )
+        # "per replica" only where there is more than one, which is the same
+        # rule the sentence below follows: on a single-replica controller the
+        # qualifier distinguishes nothing and reads as though it did.
+        excerpt += ". Resize to " + " and ".join(f"{d} {targets[d]}" for d in dimensions)
         if replicas > 1:
+            excerpt += " per replica"
             excerpt += (
                 f". Totals span {replicas} replicas — per replica that is "
                 f"{cpu_req_total / replicas:.3f} vCPU / {mem_req_total / replicas / 1024.0:.2f} GiB requested "

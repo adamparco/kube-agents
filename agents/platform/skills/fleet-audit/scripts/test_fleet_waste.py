@@ -1367,6 +1367,83 @@ class OverrequestTest(unittest.TestCase):
         self.assertIn("Totals span 2 replicas", excerpt)
 
 
+class OverrequestPrescribesTheResizeTest(unittest.TestCase):
+    """The excerpt names the request each idle dimension must end up at.
+
+    Left to infer it, the model works the number out of the peaks the excerpt
+    quotes -- which are rounded to two decimals of a vCPU and one of a GiB, so
+    a small workload reads as `0.00 vCPU / 0.0 GiB` -- and it does not know
+    about the `50m`/`64Mi` clamp at all, because `ceil(peak x 2)` is the only
+    half of the rule the SOP states. The 2026-09-06 cost report asked for
+    `about 10m` on a dimension whose floor is `50m`.
+    """
+
+    pod = OverrequestTest().deployment_pod
+
+    def excerpt(self, pods, peaks):
+        hits = fw.check_overrequest({"pods": pods}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1, hits)
+        return hits[0]["excerpt"]
+
+    def minter(self, cpu_req, mem_req):
+        """`github-token-minter` as the live fleet runs it: two replicas, and a
+        7-day peak of 0.4 millicores and 11.2 MiB per replica."""
+        pods = [
+            self.pod(name=f"gtm-{i}", owner_name="github-token-minter", cpu_req=cpu_req, mem_req=mem_req)
+            for i in (1, 2)
+        ]
+        return pods, {("default", f"gtm-{i}"): (0.0004, 11.2) for i in (1, 2)}
+
+    def test_names_both_dimensions_when_both_are_over_requested(self):
+        # The branch that names dimensions used to fire only at exactly one, so
+        # the finding that most needs the instruction went without it.
+        excerpt = self.excerpt(*self.minter("100m", "128Mi"))
+        self.assertIn("Over-requested on both dimensions", excerpt)
+        self.assertIn("resizing one alone does not clear this finding", excerpt)
+
+    def test_prescribes_the_floor_rather_than_twice_the_peak(self):
+        # 2 x 0.4m is 1m on CPU and 23Mi on memory; both clamp up.
+        excerpt = self.excerpt(*self.minter("100m", "128Mi"))
+        self.assertIn(
+            f"Resize to cpu {fw.OVERREQUEST_RESIZE_FLOOR_VCPU * 1000:.0f}m "
+            f"and memory {fw.OVERREQUEST_RESIZE_FLOOR_MIB:.0f}Mi per replica",
+            excerpt,
+        )
+
+    def test_the_prescribed_resize_actually_clears_the_finding(self):
+        # The property the wording exists to guarantee, asserted against the
+        # check rather than against the sentence: applying what the excerpt
+        # prescribes must leave nothing to report. A remediation that resizes
+        # CPU alone -- what the 2026-09-06 report proposed -- must not.
+        floor_cpu = f"{fw.OVERREQUEST_RESIZE_FLOOR_VCPU * 1000:.0f}m"
+        floor_mem = f"{fw.OVERREQUEST_RESIZE_FLOOR_MIB:.0f}Mi"
+        self.assertEqual(fw.check_overrequest({"pods": self.minter(floor_cpu, floor_mem)[0]},
+                                              self.minter(floor_cpu, floor_mem)[1],
+                                              now=NOW, autopilot=False), [])
+        still_open = fw.check_overrequest({"pods": self.minter(floor_cpu, "128Mi")[0]},
+                                          self.minter(floor_cpu, "128Mi")[1],
+                                          now=NOW, autopilot=False)
+        self.assertEqual(len(still_open), 1)
+        self.assertIn("Over-requested on memory only", still_open[0]["excerpt"])
+
+    def test_twice_the_peak_wins_where_it_clears_the_floor(self):
+        # The clamp is a floor, not the answer: a controller peaking well above
+        # it gets `ceil(peak x 2)`.
+        pods = [self.pod(cpu_req="12", mem_req="48Gi")]
+        excerpt = self.excerpt(pods, {("default", "api-1"): (0.9, 3072.0)})
+        self.assertIn("Resize to cpu 1800m and memory 6144Mi", excerpt)
+
+    def test_names_only_the_idle_dimension_where_the_other_is_in_use(self):
+        pods = [self.pod(name=f"api-{i}", cpu_req="1100m", mem_req="1Gi") for i in (1, 2)]
+        excerpt = self.excerpt(pods, {("default", f"api-{i}"): (0.167, 880.0) for i in (1, 2)})
+        self.assertIn("Resize to cpu ", excerpt)
+        self.assertNotIn("and memory", excerpt)
+
+    def test_a_single_replica_is_not_told_the_figure_is_per_replica(self):
+        excerpt = self.excerpt([self.pod()], {("default", "api-1"): (0.9, 3072.0)})
+        self.assertIn("Resize to cpu 1800m and memory 6144Mi.", excerpt)
+
+
 class OverrequestResizeIsANoOpTest(unittest.TestCase):
     """A finding whose own remediation changes nothing is not reported.
 
