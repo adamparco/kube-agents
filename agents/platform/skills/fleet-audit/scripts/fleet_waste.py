@@ -2405,9 +2405,20 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # Autopilot bills on requests and injects its own defaults where a
         # manifest declares none, so an unsized workload there is not merely
         # unbooked -- it is being charged for a number nobody chose. Same
-        # one-level bump §3.1 takes, and it stops at `major` for §3's reason:
-        # a `critical` manifest remediation opens a merge-ready pull request,
-        # and a right-size patch is never that urgent.
+        # one-level bump §3.1 takes, and it stops at `major` because §3's
+        # severity ceiling reserves `critical` for a drain blocker or a
+        # last-copy deletion, neither of which a missing request is.
+        #
+        # That ceiling used to double as a promotion guard: `major` was below
+        # `AUTO_PROMOTION_FLOOR`, so a bumped finding could not open a pull
+        # request unasked. The floor is `major` now, so it can, and this bump
+        # is the one place in the audit where a *platform* attribute rather
+        # than a magnitude decides that. Left as is deliberately -- a
+        # right-size is a one-screen diff a reviewer can decline, and
+        # `AUTO_PROMOTION_CAP` bounds a bad night at five. Worth revisiting if
+        # an Autopilot fleet ever makes this the bulk of the sweep, which on
+        # the 2026-09-06 fleet it was not: every overrequest and unsized
+        # finding was `minor`, all of them on one Standard cluster.
         severity = "major" if autopilot else "minor"
         # §3.1's units are vCPU and GiB, and this check does not use them. The
         # workloads it finds are small by construction -- nobody forgets a
