@@ -1192,6 +1192,10 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 COMPLIANCE_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob", "Pod")
+# The subset carrying `spec.replicas`, so a zero there means "no pod". A
+# DaemonSet has no such field (its count is the node count), and a bare Pod
+# either exists or does not.
+_SCALABLE_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 COMPLIANCE_DUMP_KINDS = "deploy,sts,ds,cronjob,pod"
 _SYSTEM_SA_NAMESPACE_RE_PARTS = (
     "kube-system", "gmp-system", "cnrm-system", "configconnector-operator-system", "krmapihosting-system",
@@ -1235,6 +1239,42 @@ def _is_suspended_cronjob(item: dict) -> bool:
     return item.get("kind") == "CronJob" and (item.get("spec") or {}).get("suspend") is True
 
 
+# The same defect in the other direction, for the kinds that cannot suspend. A
+# Deployment or StatefulSet at `spec.replicas: 0` has no pod, so every present
+# tense in an impact is wrong for the same reason, and it is undone by the same
+# one-field patch -- audit the template, correct the tense.
+#
+# The instance: the 2026-09-06 08:55Z ai-security report told an operator that
+# `Deployment/ai-embeddings-tei` "executes arbitrary code shipped inside the
+# model repository, with this pod's ServiceAccount, network access, and mounted
+# volumes". That Deployment has sat at `replicas: 0` throughout -- there is no
+# pod, so there is no ServiceAccount in use and nothing is mounted. The same
+# finding then told them to confirm the fix with `kubectl logs
+# deploy/ai-embeddings-tei --tail=50`, which returns nothing at zero replicas.
+# That is the sharper half of the cost: a wrong tense misleads, but a
+# verification step that cannot produce output sends the operator looking for a
+# broken cluster.
+#
+# Not folded into `_SUSPENDED_CRONJOB_NOTE`: the two are disjoint by kind, and
+# the field a reader has to go look at differs. The note names the kind because,
+# unlike suspension, this reaches two of them.
+def _scaled_to_zero_note(kind: str) -> str:
+    return (
+        f" ({kind} is scaled to zero: spec.replicas=0, so no pod is running from "
+        "this template and commands that read one return nothing until it is "
+        "scaled back up -- the template below is still what runs when it is)"
+    )
+
+
+# Explicit `0` only. An absent `replicas` means one, not none, and a `None` from
+# a partial object is unknown rather than zero -- both are the running case.
+def _is_scaled_to_zero(item: dict) -> bool:
+    return (
+        item.get("kind") in _SCALABLE_WORKLOAD_KINDS
+        and (item.get("spec") or {}).get("replicas") == 0
+    )
+
+
 def normalize_compliance_workloads(dump: dict) -> list[dict]:
     """Every object surviving compliance's universal suppressions, as
     `{kind, ns, name, spec}` where `spec` is the resolved **pod** spec —
@@ -1263,6 +1303,7 @@ def normalize_compliance_workloads(dump: dict) -> list[dict]:
         out.append({
             "kind": item["kind"], "ns": ns, "name": meta.get("name", ""),
             "spec": _pod_spec_of(item), "suspended": _is_suspended_cronjob(item),
+            "scaled_to_zero": _is_scaled_to_zero(item),
         })
     return out
 
@@ -2421,6 +2462,7 @@ def normalize_ai_workloads(dump: dict) -> list[dict]:
         out.append({
             "kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": spec,
             "lbl": _pod_template_labels_of(item), "suspended": _is_suspended_cronjob(item),
+            "scaled_to_zero": _is_scaled_to_zero(item),
         })
     return out
 
@@ -3821,6 +3863,8 @@ def collect_cluster(
         excerpt = hit["excerpt"]
         if workload and workload.get("suspended"):
             excerpt += _SUSPENDED_CRONJOB_NOTE
+        if workload and workload.get("scaled_to_zero"):
+            excerpt += _scaled_to_zero_note(workload["kind"])
         emitted = {
             "check": spec.slug,
             "cluster": name,

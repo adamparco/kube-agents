@@ -1856,6 +1856,40 @@ class TestComplianceNormalize(unittest.TestCase):
         c["spec"]["suspend"] = False
         self.assertFalse(collect.normalize_compliance_workloads(dump_of(c))[0]["suspended"])
 
+    def test_a_scaled_to_zero_workload_is_kept_and_marked(self):
+        """Suspension's counterpart for the kinds that cannot suspend: kept
+        because the template is what runs on the next scale-up, marked because
+        the impact is written in the present tense."""
+        for kind in ("Deployment", "StatefulSet"):
+            with self.subTest(kind=kind):
+                d = compliance_workload(kind, "api")
+                d["spec"]["replicas"] = 0
+                out = collect.normalize_compliance_workloads(dump_of(d))
+                self.assertEqual(len(out), 1)
+                self.assertTrue(out[0]["scaled_to_zero"])
+
+    def test_a_running_replica_count_is_not_marked(self):
+        """Absent means one, not none — the commonest spec in the fleet omits
+        `replicas` entirely, and reading that as zero would caveat everything."""
+        for replicas in (1, 3, None):
+            with self.subTest(replicas=replicas):
+                d = compliance_workload("Deployment", "api")
+                if replicas is None:
+                    d["spec"].pop("replicas", None)
+                else:
+                    d["spec"]["replicas"] = replicas
+                self.assertFalse(collect.normalize_compliance_workloads(dump_of(d))[0]["scaled_to_zero"])
+
+    def test_kinds_without_a_replica_field_are_never_marked(self):
+        """A DaemonSet's count is the node count and a bare Pod either exists or
+        does not; neither has a `replicas: 0` to read, and a stray one on a
+        DaemonSet spec is not a scale-to-zero."""
+        ds = compliance_workload("DaemonSet", "agent")
+        ds["spec"]["replicas"] = 0
+        for doc in (ds, compliance_pod("standalone"), compliance_workload("CronJob", "job")):
+            with self.subTest(kind=doc["kind"]):
+                self.assertFalse(collect.normalize_compliance_workloads(dump_of(doc))[0]["scaled_to_zero"])
+
     def test_system_namespace_is_excluded(self):
         self.assertEqual(
             collect.normalize_compliance_workloads(dump_of(compliance_pod("x", ns="kube-system"))), []
@@ -4797,6 +4831,45 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         hits = [x for x in result["candidates"] if x["check"] == "model-image-floating-tag"]
         self.assertEqual(len(hits), 1)
         self.assertNotIn("suspend", hits[0]["excerpt"])
+        self.assertNotIn("scaled to zero", hits[0]["excerpt"])
+
+    def test_a_scaled_to_zero_workloads_candidate_says_so_in_its_excerpt(self):
+        """The 2026-09-06 08:55Z report told an operator that
+        `Deployment/ai-embeddings-tei` "executes arbitrary code shipped inside
+        the model repository, with this pod's ServiceAccount, network access,
+        and mounted volumes", and to confirm the fix with `kubectl logs
+        deploy/ai-embeddings-tei`. That Deployment is at `replicas: 0`: there is
+        no pod, nothing is mounted, and the verification command returns
+        nothing."""
+        w = ai_workload("Deployment", "ai-embeddings-tei", container={"env": [{"name": "TRUST_REMOTE_CODE", "value": "true"}]})
+        w["spec"]["replicas"] = 0
+        result = self.run_with(workload_items=[w])
+        hits = [x for x in result["candidates"] if x["check"] == "model-remote-code-trusted"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("spec.replicas=0", hits[0]["excerpt"])
+        self.assertIn("Deployment is scaled to zero", hits[0]["excerpt"])
+        self.assertIn("commands that read one return nothing", hits[0]["excerpt"])
+
+    def test_the_scaled_to_zero_note_names_the_kind_it_found(self):
+        """Unlike suspension, this reaches two kinds, so a hardcoded noun would
+        be wrong half the time."""
+        w = ai_workload("StatefulSet", "vllm", container={"image": "acme/vllm:latest"})
+        w["spec"]["replicas"] = 0
+        result = self.run_with(workload_items=[w])
+        hits = [x for x in result["candidates"] if x["check"] == "model-image-floating-tag"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("StatefulSet is scaled to zero", hits[0]["excerpt"])
+
+    def test_a_scaled_to_zero_service_candidate_never_gains_it(self):
+        """`inference-endpoint-public` emits on a Service, which has no
+        `replicas` and no workload to read one from."""
+        d = ai_workload("Deployment", "vllm", pod_labels={"app": "vllm"})
+        d["spec"]["replicas"] = 0
+        svc = ai_service("vllm-svc", selector={"app": "vllm"})
+        result = self.run_with(workload_items=[d], service_items=[svc])
+        hits = [x for x in result["candidates"] if x["check"] == "inference-endpoint-public"]
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("scaled to zero", hits[0]["excerpt"])
 
     def test_a_service_candidate_never_gains_it(self):
         """`inference-endpoint-public` emits on a Service, which has no
