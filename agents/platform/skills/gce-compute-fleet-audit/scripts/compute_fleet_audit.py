@@ -758,6 +758,10 @@ def check_mig_convergence(mig: dict) -> dict | None:
             "pays a full instance boot and the capacity actually serving "
             "traffic oscillates underneath it."
         )
+        # §2.2's Do-NOT-flag limb excuses GKE node pools undergoing pod-driven
+        # scale events. The prefix is mechanical, but whether a given churn is
+        # pod-driven is not, so the judgment goes back to the model.
+        triage = TRIAGE_GKE_MIG if name.startswith(GKE_MIG_PREFIXES) else None
     elif without_retries > 0:
         detail = f"creatingWithoutRetries={without_retries}"
         impact = (
@@ -765,6 +769,18 @@ def check_mig_convergence(mig: dict) -> dict | None:
             "stays below its target size until someone intervenes. Capacity "
             "planning that assumes the target is met is wrong by that margin."
         )
+        # No triage on this limb, on either prefix, and the asymmetry is the
+        # point. `creatingWithoutRetries` means the group asked for an instance,
+        # was refused, and gave up -- there is no pod-driven reading of that to
+        # excuse, so the Do-NOT-flag clause the marker stands for cannot be true
+        # of it. Marking it anyway is not a neutral hedge: on a fleet whose every
+        # visible group is a GKE node pool -- 16 of 16 on the reference install
+        # -- it routes the one condition this stream can still find through an
+        # instruction to consider dropping it, and a zonal stockout or an
+        # instance template that no longer resolves reads back to the model as
+        # possible autoscaler noise. Those are the operator's to fix on a node
+        # pool exactly as on any other group.
+        triage = None
     else:
         return None
 
@@ -778,10 +794,7 @@ def check_mig_convergence(mig: dict) -> dict | None:
             f"isStable={status.get('isStable')} currentActions {detail}"
         )[:MAX_EXCERPT_CHARS],
         "impact": impact,
-        # §2.2's Do-NOT-flag limb excuses GKE node pools undergoing pod-driven
-        # scale events. The prefix is mechanical, but whether a given churn is
-        # pod-driven is not, so the judgment goes back to the model.
-        "needs_triage": TRIAGE_GKE_MIG if name.startswith(GKE_MIG_PREFIXES) else None,
+        "needs_triage": triage,
     }
 
 

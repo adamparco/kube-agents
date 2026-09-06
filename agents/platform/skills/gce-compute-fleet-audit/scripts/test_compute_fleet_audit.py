@@ -1478,6 +1478,32 @@ class MigConvergenceTest(unittest.TestCase):
         hit = cf.check_mig_convergence(mig(name="batch-workers", creating=1, deleting=1))
         self.assertIsNone(hit["needs_triage"])
 
+    def test_a_stuck_gke_group_is_not_handed_back(self):
+        """The exclusion is about pod-driven churn, and a group that gave up
+        creating is not churning. Marking it would put the only condition this
+        stream can find on a fleet of node pools -- every visible group on the
+        reference install is one -- behind an instruction to consider dropping
+        it."""
+        for name in ("gke-prod-default-pool-1234-grp", "gk3-auto-pool-1-abcd-grp"):
+            hit = cf.check_mig_convergence(mig(name=name, creatingWithoutRetries=2))
+            self.assertIsNone(hit["needs_triage"], name)
+
+    def test_a_stuck_group_still_fires_on_a_gke_name(self):
+        """Dropping the marker must not drop the candidate with it."""
+        hit = cf.check_mig_convergence(mig(name="gke-prod-default-pool-1234-grp", creatingWithoutRetries=2))
+        self.assertEqual(hit["object"], "ManagedInstanceGroup/us-central1-a/gke-prod-default-pool-1234-grp")
+        self.assertIn("creatingWithoutRetries=2", hit["excerpt"])
+
+    def test_both_limbs_at_once_takes_the_resize_loop_and_its_marker(self):
+        """A group can report both. The resize-loop limb is checked first, so
+        the marker follows the limb that actually fired rather than the other
+        one silently clearing it."""
+        hit = cf.check_mig_convergence(
+            mig(name="gke-prod-default-pool-1234-grp", creating=1, deleting=1, creatingWithoutRetries=2)
+        )
+        self.assertIn("creating=1", hit["excerpt"])
+        self.assertEqual(hit["needs_triage"], cf.TRIAGE_GKE_MIG)
+
     def test_a_regional_group_is_scoped_by_region(self):
         """A MIG list mixes zonal and regional groups, and only one of the two
         keys is present on any given item."""
