@@ -1877,6 +1877,12 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # check is declared inapplicable and `checks_run` below is
                 # rightly rejected for naming checks that examined nothing.
                 return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
+            if argv[:3] == ["kubectl", "get", collect.KCC_CATEGORY]:
+                # One healthy Config Connector object. An empty list here is
+                # not the same thing: it declares `kcc-object-wedged`
+                # inapplicable, and the full roster this test asserts against
+                # would then rightly be rejected for naming a check nothing ran.
+                return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -1960,6 +1966,23 @@ def compliance_pod(name, ns="default", **meta_overrides):
         "spec": {"containers": [{"name": "app", "securityContext": {}}]},
     }
     doc["metadata"].update(meta_overrides)
+    return doc
+
+
+def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDate", message="The resource is up to date"):
+    """A Config Connector object as `kubectl get gcp -A -o json` returns it.
+
+    `ready=None` omits the condition entirely, which is what KCC has written
+    in the seconds between an apply and its first reconcile.
+    """
+    doc = {"kind": kind, "metadata": {"namespace": ns, "name": name}, "status": {}}
+    if ready is not None:
+        condition = {"type": "Ready", "status": ready}
+        if reason is not None:
+            condition["reason"] = reason
+        if message is not None:
+            condition["message"] = message
+        doc["status"]["conditions"] = [condition]
     return doc
 
 
@@ -3721,6 +3744,151 @@ class TestPodSecurityGaps(unittest.TestCase):
         self.assertIsNone(collect.check_podsecurity_gaps(self.wl(), ctx))
 
 
+class TestKccObjectWedged(unittest.TestCase):
+    """§2.12. The check that audits the mechanism the other eleven assume."""
+
+    # The message KCC wrote on both ComputeFirewalls for the four hours the
+    # controller's service account was short of `compute.securityAdmin`.
+    FORBIDDEN = (
+        "Update call failed: error applying desired state: Error updating Firewall: "
+        "googleapi: Error 403: Required 'compute.firewalls.update' permission for "
+        "'projects/adamparco-kage/global/firewalls/default-allow-ssh', forbidden"
+    )
+
+    def run_on(self, *objects):
+        return collect.check_kcc_object_wedged({"kcc_objects": list(objects)})
+
+    def test_a_healthy_fleet_of_objects_reports_nothing(self):
+        self.assertEqual(
+            self.run_on(
+                kcc_object("ComputeFirewall", "allow-ssh"),
+                kcc_object("ContainerCluster", "prod-usc1"),
+            ),
+            [],
+        )
+
+    def test_no_ready_condition_is_not_a_finding(self):
+        """The state KCC leaves an object in between the apply and its first
+        reconcile. Reading it as wedged fires on every fresh commit, which is
+        the fastest way to teach a reader to skip this check."""
+        self.assertEqual(self.run_on(kcc_object("ComputeFirewall", "new", ready=None)), [])
+
+    def test_a_denied_permission_is_one_critical_naming_the_object(self):
+        hits = self.run_on(
+            kcc_object("ComputeFirewall", "default-allow-ssh", ready="False",
+                       reason="UpdateFailed", message=self.FORBIDDEN)
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ComputeFirewall/default-allow-ssh")
+        self.assertEqual(hits[0]["namespace"], "kubeagents-system")
+        # The permission and the resource survive into the excerpt: they are
+        # what tells the reader which role to grant, and the SOP's remediation
+        # says to read the role off the permission rather than the kind.
+        self.assertIn("compute.firewalls.update", hits[0]["excerpt"])
+        self.assertIn("403", hits[0]["excerpt"])
+        # Default severity -- no per-hit override on the cause arm.
+        self.assertNotIn("severity", hits[0])
+
+    def test_dependents_are_counted_onto_the_cause_not_emitted_alone(self):
+        """The 2026-09-05 shape: one PubSubTopic short of `roles/pubsub.editor`,
+        fifteen ContainerClusters stalled behind it. One finding, not sixteen."""
+        clusters = [
+            kcc_object("ContainerCluster", f"spoke-{i}", ready="False",
+                       reason="DependencyNotReady",
+                       message="reference PubSubTopic gke-upgrade-notifications is not ready")
+            for i in range(15)
+        ]
+        hits = self.run_on(
+            kcc_object("PubSubTopic", "gke-upgrade-notifications", ready="False",
+                       reason="UpdateFailed", message="Error 403: permission denied on pubsub.topics.update"),
+            *clusters,
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "PubSubTopic/gke-upgrade-notifications")
+        self.assertIn("15 other Config Connector object(s)", hits[0]["excerpt"])
+        # Named, but not all fifteen: a wall of names is not more informative
+        # than three and a count.
+        self.assertIn("+12 more", hits[0]["excerpt"])
+
+    def test_a_missing_referent_is_a_cause_not_a_dependent(self):
+        """`DependencyNotFound` is not `DependencyNotReady`.
+
+        Both strings name a reference and both are set on the object holding
+        it, so the two are easy to conflate -- and conflating them loses the
+        finding. A dependent is folded into a count because repairing the
+        object it waits on clears it; nothing clears a reference to something
+        that does not exist except editing this object. Both messages here are
+        verbatim from a live probe against the hub on 2026-09-06: the same
+        `ComputeFirewall`, pointed first at an absent network and then at one
+        that existed and had failed to create.
+        """
+        absent = self.run_on(
+            kcc_object("ComputeFirewall", "kcc-wedge-probe", ready="False",
+                       reason="DependencyNotFound",
+                       message="reference ComputeNetwork kubeagents-system/"
+                               "this-network-does-not-exist is not found"),
+        )
+        self.assertEqual([h["object"] for h in absent], ["ComputeFirewall/kcc-wedge-probe"])
+        self.assertNotIn("other Config Connector object(s)", absent[0]["excerpt"])
+        self.assertNotIn("severity", absent[0])
+
+        # The same object one character of KCC vocabulary away, and now it is
+        # the symptom it looks like: folded onto the network that is the cause.
+        unready = self.run_on(
+            kcc_object("ComputeNetwork", "kcc-wedge-probe-net", ready="False",
+                       reason="UpdateFailed",
+                       message="Update call failed: error applying desired state: "
+                               "summary: Error creating Network: googleapi: Error 404"),
+            kcc_object("ComputeFirewall", "kcc-wedge-probe", ready="False",
+                       reason="DependencyNotReady",
+                       message="reference ComputeNetwork kubeagents-system/"
+                               "kcc-wedge-probe-net is not ready"),
+        )
+        self.assertEqual([h["object"] for h in unready], ["ComputeNetwork/kcc-wedge-probe-net"])
+        self.assertIn("1 other Config Connector object(s)", unready[0]["excerpt"])
+
+    def test_two_causes_each_get_their_own_finding(self):
+        hits = self.run_on(
+            kcc_object("ComputeFirewall", "allow-rdp", ready="False", reason="UpdateFailed", message="403"),
+            kcc_object("ComputeFirewall", "allow-ssh", ready="False", reason="UpdateFailed", message="403"),
+        )
+        self.assertEqual(
+            [h["object"] for h in hits],
+            ["ComputeFirewall/allow-rdp", "ComputeFirewall/allow-ssh"],
+        )
+        # Neither counts the other as a dependent: both are causes.
+        self.assertNotIn("other Config Connector object(s)", hits[0]["excerpt"])
+
+    def test_dependents_with_no_cause_are_each_reported_at_minor(self):
+        """Every unready object blaming a dependency, and no unready dependency
+        on the cluster: the cause is a reference to something Config Connector
+        does not own here, so there is nothing else to name and folding these
+        into a count would report the problem to nobody."""
+        hits = self.run_on(
+            kcc_object("ComputeFirewall", "a", ready="False", reason="DependencyNotReady", message="waiting"),
+            kcc_object("ComputeFirewall", "b", ready="False", reason="DependencyNotReady", message="waiting"),
+        )
+        self.assertEqual(len(hits), 2)
+        for hit in hits:
+            self.assertEqual(hit["severity"], "minor")
+            self.assertIn("waiting on a dependency", hit["impact"])
+
+    def test_a_long_upstream_error_is_truncated_not_pasted_whole(self):
+        hits = self.run_on(
+            kcc_object("ComputeFirewall", "x", ready="False", reason="UpdateFailed", message="E" * 4000)
+        )
+        self.assertLess(len(hits[0]["excerpt"]), 500)
+
+    def test_ready_true_is_never_a_finding_whatever_else_it_says(self):
+        """The inverse of the `kcc-does-not-revert-spec-absent-fields` error:
+        `Ready=True` with a stale-looking reason is still an object KCC is
+        applying, and flagging it would republish a fix that landed."""
+        self.assertEqual(
+            self.run_on(kcc_object("ComputeFirewall", "x", ready="True", reason="UpToDate")),
+            [],
+        )
+
+
 class TestComplianceCollectCluster(unittest.TestCase):
     """One end-to-end pass over compliance-audit's real collection plan --
     five distinct kubectl/gcloud commands, gated and cross-referenced --
@@ -3755,7 +3923,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -3777,6 +3945,18 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
                 if kinds == "ccnp" and ccnp_run is not None:
                     return ccnp_run
+                if kinds == collect.KCC_CATEGORY:
+                    if kcc_items is None:
+                        # A cluster not running Config Connector, which is
+                        # every cluster in a fleet but the one hosting it, and
+                        # so the default here.
+                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "gcp"', 0.05)
+                    # A callable answers the read itself -- for the malformed
+                    # responses `run_and_gate` cannot distinguish from an
+                    # absent CRD, which no list of objects can express.
+                    if callable(kcc_items):
+                        return kcc_items(argv, **kwargs)
+                    return Run(argv, 0, json.dumps(dump_of(*kcc_items)), "", 0.05)
                 if kinds.startswith("workloadallowlists"):
                     if allowlist_items is None:
                         # What a cluster without the CRDs answers, which is
@@ -3866,12 +4046,19 @@ class TestComplianceCollectCluster(unittest.TestCase):
         not_applicable_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(
             not_applicable_slugs,
-            {"privileged-container", "host-namespace", "hostpath-mount"},
+            # `kcc-object-wedged` rides along on every cluster in this fixture:
+            # the fake answers `kubectl get gcp` the way a cluster without
+            # Config Connector does. It is declared by the collector rather
+            # than by the Autopilot table, so it is not part of what this test
+            # is about -- see `test_a_cluster_without_config_connector_...`.
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
+            if entry["check"] == "kcc-object-wedged":
+                continue
             self.assertIn("Autopilot", entry["reason"])
 
     def test_no_reason_claims_the_object_cannot_exist_on_the_cluster(self):
@@ -3884,9 +4071,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
         ledger under _Not applicable_ as a statement about the cluster."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         for entry in result["checks_not_applicable"]:
+            # This half binds every reason on the manifest, whichever cause
+            # wrote it: an unfalsifiable claim is the defect, not Autopilot's
+            # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
+            if entry["check"] == "kcc-object-wedged":
+                continue
             # Scoped to the workloads the audit can see, and to the admission
-            # policy holding -- both halves, on every reason.
+            # policy holding -- both halves, on every Autopilot reason.
             self.assertIn("in-scope workloads", entry["reason"])
             self.assertIn("WorkloadAllowlist", entry["reason"])
 
@@ -3900,7 +4092,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
             cluster={**self.CLUSTER, "autopilot": True},
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
-        self.assertNotIn("checks_not_applicable", result)
+        self.assertEqual(
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+        )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertLessEqual(
@@ -3916,7 +4110,10 @@ class TestComplianceCollectCluster(unittest.TestCase):
         exemptions."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=None)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual(len(result["checks_not_applicable"]), 3)
+        self.assertEqual(
+            {e["check"] for e in result["checks_not_applicable"]},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+        )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
         """The CRDs only exist on Autopilot and the table only applies there,
@@ -3924,9 +4121,72 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.run_with()
         self.assertEqual([a for a in self.issued if a[:2] == ["kubectl", "get"] and a[2].startswith("workloadallowlists")], [])
 
-    def test_standard_cluster_carries_no_checks_not_applicable_key(self):
+    def test_standard_cluster_declares_only_the_config_connector_check(self):
+        """A Standard cluster with in-scope workloads rules out nothing the
+        Autopilot table or the empty-scope rule would rule out. What it does
+        rule out is `kcc-object-wedged`: the API server there does not serve
+        the `gcp` category at all. Without that entry the check would count
+        against the cluster's coverage denominator on every cluster in the
+        fleet but the one hosting Config Connector -- a permanent 11/12 on
+        fifteen clusters, which is the reverse failure of a false all-clear
+        and just as good at teaching a reader to ignore the column."""
         result = self.run_with()
-        self.assertNotIn("checks_not_applicable", result)
+        self.assertEqual(
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+        )
+
+    def kcc_reason(self, result):
+        for entry in result.get("checks_not_applicable") or []:
+            if entry["check"] == "kcc-object-wedged":
+                return entry["reason"]
+        return None
+
+    def test_a_cluster_without_config_connector_says_so_and_says_why(self):
+        result = self.run_with()
+        reason = self.kcc_reason(result)
+        self.assertIn("not installed on this cluster", reason)
+        self.assertNotIn("kcc-object-wedged", {c["check"] for c in result["commands"]})
+
+    def test_a_cluster_running_config_connector_runs_the_check(self):
+        result = self.run_with(kcc_items=[kcc_object("ComputeFirewall", "allow-ssh")])
+        self.assertIsNone(self.kcc_reason(result))
+        entry = next(c for c in result["commands"] if c["check"] == "kcc-object-wedged")
+        self.assertIn("get gcp -A", entry["command"])
+        self.assertEqual(entry["rc"], 0)
+
+    def test_config_connector_installed_but_declaring_nothing_is_its_own_reason(self):
+        """Distinct from "not installed": the controller is here and the check
+        genuinely ran out of subjects, which is a different statement about the
+        cluster and the one a reviewer can check."""
+        result = self.run_with(kcc_items=[])
+        reason = self.kcc_reason(result)
+        self.assertIn("declares no GCP resources", reason)
+        self.assertNotIn("not installed", reason)
+
+    def test_an_unreadable_gcp_response_never_claims_config_connector_is_absent(self):
+        """`run_and_gate` collapses four different failures into `None` -- a
+        non-zero exit, empty stdout, unparseable JSON, and a `get` whose
+        `.items` is not a list. Only the first means "no Config Connector
+        here". Reading the other three as that publishes "Config Connector is
+        not installed on this cluster" in the ledger, under the audit's own
+        name, on the strength of a read that failed -- a claim about the
+        cluster that the collector has no evidence for and that hides a real
+        wedge behind a clean-looking exclusion."""
+
+        def truncated(argv, **kwargs):
+            return Run(argv, 0, '{"items": [{"kind": "Compute', "", 0.05)
+
+        for label, fake in (
+            ("unparseable", truncated),
+            ("empty stdout", lambda argv, **kw: Run(argv, 0, "", "", 0.05)),
+            ("items not a list", lambda argv, **kw: Run(argv, 0, '{"items": {}}', "", 0.05)),
+        ):
+            with self.subTest(case=label):
+                result = self.run_with(kcc_items=fake)
+                reason = self.kcc_reason(result)
+                self.assertIn("Undetermined", reason)
+                self.assertNotIn("not installed", reason)
+                self.assertIn("cleared nothing", reason)
 
     def test_a_check_that_found_something_is_not_also_declared_inapplicable(self):
         """The filter reached `commands` and not `candidates`, so a privileged
@@ -3944,7 +4204,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("privileged-container", {c["check"] for c in result["commands"]})
         # The other two still are: they found nothing, so nothing falsifies
         # the claim that they cannot apply here.
-        self.assertEqual(not_applicable, {"host-namespace", "hostpath-mount"})
+        self.assertEqual(
+            not_applicable, {"host-namespace", "hostpath-mount", "kcc-object-wedged"}
+        )
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
         """The live regression: `node-pools list` 400s on Autopilot, and it was
@@ -3991,14 +4253,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Eleven checks minus the three Autopilot rules out is eight, each with a
-        command behind it, and the three dispositioned rather than silently
-        absent -- absent is what §6 reads as a coverage gap."""
+        Twelve checks minus the three Autopilot rules out and the one no
+        cluster without Config Connector can run is eight, each with a command
+        behind it, and the four dispositioned rather than silently absent --
+        absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 8)
-        self.assertEqual(len(na_slugs), 3)
+        self.assertEqual(len(na_slugs), 4)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 

@@ -14412,9 +14412,10 @@ class TestCoverageGaps(unittest.TestCase):
                 ]
             )
         )
+        roster = len(audit_report.audit_checks(AUDIT))
         self.assertEqual(len(gaps), 1)
         self.assertIn("prod-us-east", gaps[0])
-        self.assertIn("9 of 11 applicable checks did not run", gaps[0])
+        self.assertIn(f"{roster - 2} of {roster} applicable checks did not run", gaps[0])
         self.assertIn("netpol-missing", gaps[0])
 
     def test_a_cluster_reports_one_gap_line_not_two(self):
@@ -14437,7 +14438,8 @@ class TestCoverageGaps(unittest.TestCase):
             )
         )
         self.assertEqual(len(gaps), 1)
-        self.assertIn("1 of 11 applicable checks did not run", gaps[0])
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"1 of {roster} applicable checks did not run", gaps[0])
         self.assertIn("Autopilot", gaps[0])
 
 
@@ -15445,8 +15447,9 @@ class TestChecksRun(unittest.TestCase):
         body = render_body(
             make_doc(findings=[], clusters=[self._cluster()]), generated_at=NOW
         )
+        roster = len(audit_report.audit_checks(AUDIT))
         self.assertIn("| Checks |", body)
-        self.assertIn("11/11", body)
+        self.assertIn(f"{roster}/{roster}", body)
         self.assertNotIn("⚠", body)
 
     def test_an_incomplete_cluster_is_flagged_in_the_scope_table(self):
@@ -15457,7 +15460,7 @@ class TestChecksRun(unittest.TestCase):
             ),
             generated_at=NOW,
         )
-        self.assertIn("1/11 ⚠", body)
+        self.assertIn(f"1/{len(audit_report.audit_checks(AUDIT))} ⚠", body)
 
     def test_every_stream_requires_its_own_roster(self):
         """A compliance check named by the cost audit is still a typo."""

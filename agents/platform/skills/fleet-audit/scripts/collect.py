@@ -98,6 +98,31 @@ GIT_DIR_NAME = ".git"
 # Spelled the same way `audit_report.KCC_API_GROUP_SUFFIX` spells it, and
 # copied rather than imported for the reason `SYSTEM_NAMESPACES` is below.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+# `check_kcc_object_wedged`. `Ready` is the one condition every Config
+# Connector kind carries; `audit_report.KCC_READY_CONDITION` spells it the
+# same way, copied for the reason above.
+KCC_READY_CONDITION = "Ready"
+# The `Ready=False` reason KCC sets on an object that is fine in itself and is
+# only waiting on another object. It is what separates a cause from a symptom,
+# and the whole reason this check does not emit one finding per unready object:
+# on 2026-09-05 a single `PubSubTopic` failing on a missing IAM role put
+# fifteen `ContainerCluster`s into this state behind it.
+#
+# Only this one. `DependencyNotFound` is a different reason with a different
+# meaning -- the referent does not exist at all, so no other object's repair
+# will ever clear it -- and it is deliberately not listed here, which leaves it
+# a cause. A live probe on 2026-09-06 confirmed KCC writes the two distinctly:
+# a `ComputeFirewall` pointed at an absent `networkRef` got
+# `DependencyNotFound`, and the same firewall pointed at a network that existed
+# but had failed to create got `DependencyNotReady`.
+KCC_DEPENDENCY_NOT_READY_REASON = "DependencyNotReady"
+# How much of a controller message survives into the excerpt. KCC pastes the
+# whole upstream API error in, which for a 403 runs to several hundred
+# characters of URL and quota-project boilerplate after the part that matters.
+MAX_KCC_WEDGE_MESSAGE_CHARS = 240
+# How many blocked objects an excerpt names before it stops and counts. Naming
+# all fifteen is not more informative than naming three and saying fifteen.
+MAX_KCC_BLOCKED_NAMED = 3
 
 # The fleet-wide system-namespace set (S1), spelled identically in every SOP
 # that names it. Kept here rather than imported from audit_report.py: this
@@ -3196,6 +3221,131 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
     return hits
 
 
+def _kcc_ready_condition(item: dict) -> dict | None:
+    """The `Ready` condition off a Config Connector object, if it has one."""
+    status = item.get("status")
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    for condition in conditions or []:
+        if isinstance(condition, dict) and condition.get("type") == KCC_READY_CONDITION:
+            return condition
+    return None
+
+
+def check_kcc_object_wedged(context: dict) -> list[dict]:
+    """Cluster-scoped: Config Connector objects stuck `Ready=False`.
+
+    The audit reads GCP and reads the cluster. It never reads the thing that
+    turns the GitOps repository into either of them, so a Config Connector that
+    has stopped applying is invisible to every other check in this skill --
+    while being the one condition that makes every `manifest` remediation the
+    skill produces a no-op. `audit_report.disclose_stalled_kcc_remediations`
+    covers the half where some finding's fix edits the stalled object's file.
+    This covers the rest, which is most of it: nothing in the ledger has to
+    point at an object for it to be wedged.
+
+    Twice in two days on this fleet, and neither showed up anywhere a person
+    was looking. On 2026-09-05 a `PubSubTopic` failed on a missing
+    `roles/pubsub.editor` and took fifteen `ContainerCluster`s down with it. On
+    2026-09-06 two `ComputeFirewall`s -- the merged remediation for a
+    `firewall-world-open-ingress` critical -- retried a 403 every two minutes
+    from 17:33 to 19:41 because the controller's service account had
+    `compute.networkAdmin`, which grants the firewall read, and not
+    `compute.securityAdmin`, which is where `compute.firewalls.update` lives.
+    The rules stayed open to `0.0.0.0/0` on tcp:22 and tcp:3389 across fourteen
+    nodes holding an external IP for four hours after the fix merged. Nothing
+    crash-loops, no event lands outside the object, and the audit went on
+    republishing the finding with no way to say why it was not clearing.
+
+    One hit per *cause*. An object reporting `DependencyNotReady` is fine in
+    itself and waiting on another object, so emitting one finding each would
+    have turned that first incident into sixteen findings with one fix -- the
+    flood this skill's `60k` body budget then spends on symptoms instead of
+    causes. They are counted onto every cause's excerpt instead. The exception
+    is a cluster where *every* unready object is a dependent: the cause is then
+    not a Config Connector object at all (an external reference, or one deleted
+    out from under its dependents), there is nothing else to name, and a
+    `minor` hit each is the only way the reader hears about it.
+
+    A dependent is only ever `DependencyNotReady`. `DependencyNotFound` reads
+    like its neighbour and means the opposite thing for this check: the
+    referent does not exist, so no other object here is going to be repaired
+    into clearing it, and the object naming the missing reference *is* the
+    cause. It stays a cause, and folding it in with the symptoms would drop the
+    one object anybody can act on.
+    """
+    items = [i for i in context.get("kcc_objects") or [] if isinstance(i, dict)]
+    causes: list[tuple[str, str, str, str]] = []  # kind, namespace, name, why
+    blocked: list[tuple[str, str, str, str]] = []
+    for item in items:
+        ready = _kcc_ready_condition(item)
+        # No condition yet means KCC has not reached the object, which is the
+        # normal state for seconds after an apply and is not evidence of
+        # anything. Only an explicit `False` is -- the same bar
+        # `audit_report.kcc_resource_health` sets, for the same reason.
+        if ready is None or str(ready.get("status")) != "False":
+            continue
+        meta = item.get("metadata") or {}
+        kind = str(item.get("kind") or "")
+        name = str(meta.get("name") or "")
+        if not kind or not name:
+            continue
+        namespace = str(meta.get("namespace") or "")
+        reason = str(ready.get("reason") or "").strip()
+        message = str(ready.get("message") or "").strip()
+        if reason and message:
+            why = f"{reason}: {message}"
+        else:
+            why = reason or message or "no reason given"
+        why = " ".join(why.split())[:MAX_KCC_WEDGE_MESSAGE_CHARS]
+        entry = (kind, namespace, name, why)
+        if reason == KCC_DEPENDENCY_NOT_READY_REASON:
+            blocked.append(entry)
+        else:
+            causes.append(entry)
+
+    if not causes and not blocked:
+        return []
+
+    def _tail(exclude: tuple[str, str, str, str] | None) -> str:
+        others = [b for b in blocked if b != exclude]
+        if not others:
+            return ""
+        named = ", ".join(f"{k}/{n}" for k, _, n, _ in sorted(others)[:MAX_KCC_BLOCKED_NAMED])
+        if len(others) > MAX_KCC_BLOCKED_NAMED:
+            named += f", +{len(others) - MAX_KCC_BLOCKED_NAMED} more"
+        return (
+            f"; {len(others)} other Config Connector object(s) here report "
+            f"{KCC_DEPENDENCY_NOT_READY_REASON} behind an unready dependency ({named})"
+        )
+
+    symptoms_only = not causes
+    hits = []
+    for entry in sorted(causes if causes else blocked):
+        kind, namespace, name, why = entry
+        hit = {
+            "namespace": namespace,
+            "object": f"{kind}/{name}",
+            "excerpt": (
+                f"Config Connector reports {KCC_READY_CONDITION}=False on "
+                f"{kind}/{name}: {why}" + _tail(entry)
+            ),
+        }
+        if symptoms_only:
+            # Symptom-only: see the docstring. Rated below a cause because the
+            # object itself is correct and the fix is somewhere this read
+            # cannot see, so the reader's first move is to find the dependency
+            # rather than to edit this file.
+            hit["severity"] = "minor"
+            hit["impact"] = (
+                "This Config Connector object is waiting on a dependency that is not itself a "
+                "Config Connector object on this cluster, so nothing here declares the thing it "
+                "needs. Its GCP resource holds whatever state it had when the reference broke, "
+                "and any change merged to its manifest is not applied."
+            )
+        hits.append(hit)
+    return hits
+
+
 class CheckSpec(NamedTuple):
     slug: str
     kind: str  # "workload": run(workload, context) -> hit|None, one call per workload.
@@ -3430,6 +3580,19 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "enabled. A runtime escape starts with capabilities to use rather "
         "than having to acquire them.",
     ),
+    CheckSpec(
+        "kcc-object-wedged",
+        "cluster",
+        check_kcc_object_wedged,
+        "critical",
+        None,
+        # Overridden on the symptom-only arm; see check_kcc_object_wedged.
+        "Config Connector has stopped applying this declaration. The GCP "
+        "resource holds whatever state it drifted to, the repository says "
+        "something else, and every pull request merged against this object -- "
+        "including a remediation this audit proposes -- changes nothing on the "
+        "cloud until the controller is unblocked.",
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -3551,7 +3714,13 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "workload-identity-off": ("describe",),
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
+    "kcc-object-wedged": ("kcc",),
 }
+
+# `kubectl get gcp` is the category Config Connector registers across every CRD
+# it installs, so one read returns every object it owns -- rather than the
+# ~200 `kubectl get <kind>` calls that enumerating the CRDs would cost.
+KCC_CATEGORY = "gcp"
 
 # §1's three node-facing checks Autopilot's admission controller rules out
 # for in-scope workloads, with the SOP's own canonical reasons verbatim. On
@@ -3671,6 +3840,52 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     ccnp_argv = ["kubectl", "get", "ccnp", "-A", "-o", "json"]
     ccnp_parsed, ccnp_result = run_and_gate(ccnp_argv, kubeconfig, run=run)
     context["cluster_network_policies"] = [i for i in (ccnp_parsed or {}).get("items", [])] if ccnp_parsed else []
+
+    # Ungated for the reason `ccnp` above is: Config Connector is installed on
+    # the hub that reconciles the fleet's GCP resources and on nothing else, so
+    # a failure here means "this cluster does not run KCC" on fifteen of this
+    # fleet's sixteen clusters. Gating would fail every one of them closed on
+    # the absence of a CRD they are not supposed to have. Absence is reported
+    # as an inapplicable check rather than as a clean one -- a cluster with no
+    # Config Connector has not cleared anything.
+    kcc_argv = ["kubectl", "get", KCC_CATEGORY, "-A", "-o", "json"]
+    kcc_parsed, kcc_result = run_and_gate(kcc_argv, kubeconfig, run=run)
+    context["kcc_objects"] = (kcc_parsed or {}).get("items") or []
+    # `run_and_gate` returns `None` for three different things, and only one of
+    # them means "no Config Connector here". Collapsing them would publish
+    # "Config Connector is not installed on this cluster" as the audit's own
+    # claim about a cluster where the read timed out or came back truncated --
+    # a statement the collector cannot support, on the strength of a read that
+    # failed. Each gets the reason that is true of it.
+    kcc_reason = ""
+    if kcc_parsed is not None and not context["kcc_objects"]:
+        kcc_reason = (
+            f"Config Connector is installed on this cluster -- `kubectl get "
+            f"{KCC_CATEGORY} -A` was served -- but it declares no GCP "
+            "resources, so there is nothing whose reconciliation could stall."
+        )
+    elif kcc_result.rc != 0:
+        kcc_reason = (
+            f"Config Connector is not installed on this cluster: `kubectl get "
+            f"{KCC_CATEGORY} -A` exited {kcc_result.rc}, which is what the API "
+            "server answers for a resource type it does not serve. Nothing "
+            "here declares a GCP resource. This fleet runs one Config "
+            "Connector, on the hub cluster."
+        )
+    elif kcc_parsed is None:
+        kcc_reason = (
+            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` exited 0 but "
+            "returned output this collector could not read as a list of "
+            "objects, so whether Config Connector is installed here -- and "
+            "whether anything it owns is stalled -- was not established. This "
+            "check cleared nothing on this cluster."
+        )
+    if kcc_reason:
+        context.setdefault("not_applicable", {})["kcc-object-wedged"] = kcc_reason
+    else:
+        commands["kcc-object-wedged"] = _record(
+            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_argv)}", kcc_result
+        )
 
     sa_argv = ["kubectl", "get", "sa", "-A", "--field-selector", "metadata.name=default", "-o", "json"]
     parsed, result = gated(sa_argv)
@@ -4157,6 +4372,28 @@ def collect_cluster(
                 continue
             not_applicable_slugs.add(spec.slug)
             checks_not_applicable.append({"check": spec.slug, "reason": reason})
+
+    # A check the collector itself established has nothing to examine here,
+    # from a read it made. The two blocks above infer inapplicability from a
+    # property of the cluster (Autopilot) or of the scope (no workloads); this
+    # one carries a fact only the read knows -- that the CRD is absent, or
+    # installed and empty. Same coherence guard as the Autopilot block, and for
+    # the same reason: a manifest must never both declare a check inapplicable
+    # and carry its candidates.
+    found = {c["check"] for c in candidates}
+    applicable = {spec.slug for spec in checks}
+    for slug, reason in sorted((collected.context.get("not_applicable") or {}).items()):
+        if slug not in applicable or slug in not_applicable_slugs:
+            continue
+        if slug in found:
+            print(
+                f"[collect] {project}/{name}: {slug} was declared inapplicable by the "
+                f"collector but produced candidates here; reporting it as a check that ran",
+                file=sys.stderr,
+            )
+            continue
+        not_applicable_slugs.add(slug)
+        checks_not_applicable.append({"check": slug, "reason": reason})
 
     result = {
         "name": name, "project": project, "location": location,

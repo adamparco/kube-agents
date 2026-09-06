@@ -138,6 +138,7 @@ AUDITS: dict[str, AuditSpec] = {
             "legacy-metadata",
             "public-control-plane",
             "podsecurity-gaps",
+            "kcc-object-wedged",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
