@@ -111,6 +111,22 @@ USAGE_WINDOW_HOURS = 168
 # stream re-runs -- but the excerpt says so, because what follows it is an
 # instruction to shrink a request.
 SHORT_OBSERVATION_HOURS = 24
+# How a controller names the pods it owns, so `_observed_pod_keys` can find, in
+# the Monitoring answer, the pods a controller has since replaced. The answer
+# covers the whole window and is keyed by pod name, so those series are already
+# in hand -- joining them to the *live* pod list is what threw them away, and
+# with them most of the history the window claims to have read.
+#
+# Anchored at both ends and namespaced by the caller. The two-segment tail is
+# what keeps a sibling out: `argocd-repo-server-5fcf7766cd-vjp6f` does not match
+# `argocd`'s pattern, because `[a-z0-9]+` cannot span the hyphen that `repo` and
+# `server` are separated by. A kind absent from this table is not widened, which
+# costs the old, narrow answer rather than a wrong one.
+REPLACED_POD_PATTERNS = {
+    "Deployment": r"^{name}-[a-z0-9]+-[a-z0-9]{{5}}$",
+    "StatefulSet": r"^{name}-[0-9]+$",
+    "ReplicaSet": r"^{name}-[a-z0-9]{{5}}$",
+}
 # Alignment happens twice. The primary period buckets each container's raw
 # points before they are summed across the containers of a pod -- it has to
 # be short enough that a spike stays a spike, since a wide bucket averages
@@ -1517,25 +1533,52 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
     return by_owner
 
 
-def _measured_over(oldest_h: float | None) -> tuple[int, str]:
+def _measured_over(
+    oldest_h: float | None, *, replaced: int = 0, controller_h: float | None = None
+) -> tuple[int, str]:
     """The window a controller was really measured over, and how to say it.
 
-    `USAGE_WINDOW_HOURS` is what the Monitoring read asks for. A controller
-    whose pods all started later than that has less, and every sizing check
-    clamps to the age of its longest-lived pod so the finding does not claim to
-    have watched something that did not exist.
+    `USAGE_WINDOW_HOURS` is what the Monitoring read asks for. What bounds the
+    answer is how far back a pod of this controller reported, and there are two
+    of those bounds because there are two pod populations.
 
-    Both numbers then reach the reader, from different directions, and until
-    now neither said anything about the other. `evidence.command` records the
-    read verbatim and so carries `window=168h`; the excerpt carried "over the
-    trailing 12h". The 2026-09-06 cost report published three findings that way
-    -- a reader checking the evidence had the query in one hand, a different
+    Without `replaced`, the only series in hand are the live pods', so the bound
+    is the longest-lived one's age and a finding may not claim more.
+
+    With `replaced`, `_observed_pod_keys` found series from pods this controller
+    has since rolled away, so the read reaches back past every live pod -- as
+    far as the controller itself, which is where this clamps instead. The
+    distinction is not cosmetic: on 2026-09-06 nine of the twenty-two cost
+    findings claimed a 6h window because Argo CD's pods had rolled that morning,
+    while the controllers were weeks old and the earlier pods' series were
+    sitting unread in the same response.
+
+    Both numbers reach the reader, from different directions, and until this
+    existed neither said anything about the other. `evidence.command` records
+    the read verbatim and so carries `window=168h`; the excerpt carried "over
+    the trailing 12h". The 2026-09-06 cost report published three findings that
+    way -- a reader checking the evidence had the query in one hand, a different
     number in the other, and no way to reconcile them but to guess which was
     wrong.
 
     Returns `(window_h, phrase)`. The phrase is the shared clause of all three
     sizing excerpts, so a check appends its own punctuation.
     """
+    if replaced and controller_h is not None:
+        window_h = max(1, min(USAGE_WINDOW_HOURS, round(controller_h)))
+        pods = f"{replaced} pod{'s' if replaced != 1 else ''} it has replaced since"
+        # Say which bound stopped it. A controller younger than the read is a
+        # different claim from one the read simply could not see further back
+        # than, and only the first is a caveat on the finding.
+        short = (
+            ""
+            if window_h >= USAGE_WINDOW_HOURS
+            else f", which is this controller's whole life -- the read covers {USAGE_WINDOW_HOURS}h"
+        )
+        return window_h, (
+            f"over the trailing {window_h}h (Cloud Monitoring, across this "
+            f"controller's live pods and the {pods}{short})"
+        )
     window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
     if window_h >= USAGE_WINDOW_HOURS:
         return window_h, f"over the trailing {window_h}h (Cloud Monitoring)"
@@ -1545,6 +1588,96 @@ def _measured_over(oldest_h: float | None) -> tuple[int, str]:
         f"{USAGE_WINDOW_HOURS}h, and this controller's oldest pod started "
         f"{window_h}h ago{cycle})"
     )
+
+
+def _controller_hours(context: dict, kind: str, ns: str, name: str, now: datetime) -> float | None:
+    """`_controller_age_days` in the unit `_measured_over` bounds a window in."""
+    age_days = _controller_age_days(context, kind, ns, name, now=now)
+    return None if age_days is None else age_days * 24
+
+
+def _live_pod_owners(context: dict) -> dict[tuple[str, str], tuple[str, str]]:
+    """Every pod in the dump and the controller that owns it, unfiltered.
+
+    Deliberately not `_eligible_pods_by_owner`: this is the exclusion list
+    `_observed_pod_keys` checks a name-pattern match against, so it has to cover
+    the pods the sizing checks skip -- a DaemonSet's, a Job's, a system
+    namespace's. A pattern that reaches one of those must lose to the live
+    dump's answer rather than to an absence in a filtered copy of it.
+    """
+    owners: dict[tuple[str, str], tuple[str, str]] = {}
+    for pod in context.get("pods") or []:
+        meta = pod.get("metadata") or {}
+        owners[(meta.get("namespace", ""), meta.get("name", ""))] = _sizing_owner(meta)
+    return owners
+
+
+def _observed_pod_keys(
+    entry: dict, kind: str, name: str, metric_keys: Any, live_owners: dict
+) -> tuple[list[tuple[str, str]], int]:
+    """Every pod of this controller the metric read saw, live or since replaced.
+
+    Returns `(keys, replaced_count)`, `keys` always starting with the live pods
+    so a caller that only wants those can still find them.
+
+    The join this widens was the quiet half of the measurement bug. The read
+    asks Cloud Monitoring for a week and gets a week -- keyed by pod name, so a
+    controller rolled this morning has its earlier pods' series right there in
+    the response, under names no longer in the cluster. Matching only the live
+    names discarded them and then reported the remainder as the week's peak.
+    Measured on `kube-agents-host` on 2026-09-06: `litellm`'s live pods topped
+    out at 1101 and 1164 MiB, while a pod they had replaced reached 1656 MiB,
+    and `argocd-dex-server` read 0.3m of CPU against a predecessor's 3.6m.
+
+    Two guards keep a pattern from claiming someone else's pod. It must not be
+    a live pod some other controller owns -- `live_owners` is the cluster's own
+    answer and outranks any inference from a name. And a controller kind absent
+    from `REPLACED_POD_PATTERNS` is not widened at all, because a bare `Pod` and
+    the kinds this does not model name their pods by rules this does not know.
+    """
+    live = [(pod["ns"], pod["name"]) for pod in entry["pods"]]
+    template = REPLACED_POD_PATTERNS.get(kind)
+    if template is None:
+        return live, 0
+    ns = entry["ns"]
+    seen = set(live)
+    pattern = re.compile(template.format(name=re.escape(name)))
+    extra = [
+        key
+        for key in metric_keys
+        if key not in seen
+        and key[0] == ns
+        and pattern.match(key[1])
+        and live_owners.get(key, (kind, name)) == (kind, name)
+    ]
+    return live + sorted(extra), len(extra)
+
+
+def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = None) -> float:
+    """The worst single replica's figure, across every pod that occupied a slot.
+
+    `max`, not the mean, and not the sum. Sum is what the join produced before
+    it was widened and it cannot survive the widening: seven pod names for a
+    one-replica Deployment would total seven replicas of usage. Mean understates
+    the hot replica, which is the one a request has to cover -- the checks that
+    divide by `replicas` to size a manifest are asking exactly this question.
+
+    Widening therefore forces the aggregation change; they are not separable.
+    Both directions the totals move are the safe ones: a higher peak makes
+    §3.1 and §3.13 propose fewer shrinks and §3.12 propose larger requests.
+
+    `index` picks a field out of a `(cpu, mem)` tuple; `None` reads the value
+    whole, which is `fetch_memory_means`' shape. CPU and memory are maximised
+    independently, and may well come from different pods -- the same choice
+    `_read_pod_series` already makes when folding a pod's containers together.
+    """
+    best = 0.0
+    for key in keys:
+        value = series.get(key)
+        if value is None:
+            continue
+        best = max(best, value if index is None else value[index])
+    return best
 
 
 def _resize_shrinks_request(
@@ -1693,6 +1826,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
     if not usage_peaks:
         return []
     by_owner = _eligible_pods_by_owner(context, now=now)
+    live_owners = _live_pod_owners(context)
 
     hits = []
     for (_ns, kind, name), entry in by_owner.items():
@@ -1706,25 +1840,19 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         replicas = len(entry["pods"])
         guaranteed = _is_guaranteed(entry)
 
-        peak_cpu = peak_mem = 0.0
-        measured = False
-        for pod in entry["pods"]:
-            key = (pod["ns"], pod["name"])
-            if key in usage_peaks:
-                measured = True
-            cpu, mem = usage_peaks.get(key, (0.0, 0.0))
-            peak_cpu += cpu
-            peak_mem += mem
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        peak_cpu = _per_replica(keys, usage_peaks, 0) * replicas
+        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # Same guard `check_underrequest` carries, and this is the direction in
         # which getting it wrong is worse. A controller none of whose pods
-        # reported sums to zero on both dimensions, which is not "idle" but
+        # reported reads as zero on both dimensions, which is not "idle" but
         # "unmeasured" -- and zero is the most idle a workload can read, so it
         # clears both ratio tests at once and the finding proposes shrinking
         # the request of a workload nobody observed. The `if not usage_peaks`
         # return above only catches a cluster that answered nothing at all;
         # one namespace missing from an otherwise-populated answer, or a
         # metrics agent down on a single node, lands here instead.
-        if not measured:
+        if not any(key in usage_peaks for key in keys):
             continue
         # The one case this check yields to §3.13. A `Guaranteed` controller
         # idle on every dimension gets a stand-down there rather than the
@@ -1785,7 +1913,9 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if not material:
             continue
 
-        _, measured_over = _measured_over(entry["oldest_h"])
+        _, measured_over = _measured_over(
+            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
+        )
         severity = "major" if delta_cpu >= 8 or delta_mem_gib >= 32 else "minor"
         if autopilot and severity == "minor":
             severity = "major"
@@ -1924,6 +2054,7 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
     """
     if not usage_peaks:
         return []
+    live_owners = _live_pod_owners(context)
     hits = []
     for (_ns, kind, name), entry in _eligible_pods_by_owner(context, now=now).items():
         # A controller the dump does not carry -- anything but a Deployment or
@@ -1943,20 +2074,14 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
             continue
         replicas = len(entry["pods"])
 
-        peak_cpu = peak_mem = 0.0
-        measured = False
-        for pod in entry["pods"]:
-            key = (pod["ns"], pod["name"])
-            if key in usage_peaks:
-                measured = True
-            cpu, mem = usage_peaks.get(key, (0.0, 0.0))
-            peak_cpu += cpu
-            peak_mem += mem
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        peak_cpu = _per_replica(keys, usage_peaks, 0) * replicas
+        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # Same guard as §3.1, and it matters more here. Zero is the most idle a
         # workload can read, and an unmeasured controller reads as zero on both
         # dimensions -- so without this, a metrics agent down on one node
         # produces a recommendation to delete whatever was running there.
-        if not measured:
+        if not any(key in usage_peaks for key in keys):
             continue
 
         if not _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem):
@@ -1974,7 +2099,9 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
         ):
             continue
 
-        _, measured_over = _measured_over(entry["oldest_h"])
+        _, measured_over = _measured_over(
+            entry["oldest_h"], replaced=replaced, controller_h=age_days * 24
+        )
         # Why no resize is on the table, which is the reader's first question
         # and now has two answers. Naming the wrong one would send them to
         # check a floor the manifest is nowhere near.
@@ -2054,6 +2181,7 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
     if not memory_means:
         return []
     by_owner = _eligible_pods_by_owner(context, now=now)
+    live_owners = _live_pod_owners(context)
 
     hits = []
     for (_ns, kind, name), entry in by_owner.items():
@@ -2066,26 +2194,30 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         if mem_req_total <= 0:
             continue  # obtainability-audit's `no-requests` owns a missing request
 
-        mean_mem = peak_mem = 0.0
-        measured = False
-        for pod in entry["pods"]:
-            key = (pod["ns"], pod["name"])
-            if key in memory_means:
-                measured = True
-            mean_mem += memory_means.get(key, 0.0)
-            peak_mem += usage_peaks.get(key, (0.0, 0.0))[1]
+        replicas = len(entry["pods"])
+        keys, replaced = _observed_pod_keys(entry, kind, name, memory_means, live_owners)
+        # `max` over the pods, per `_per_replica`, and the mean wants it as much
+        # as the peak does: the question is whether *a* replica sustains more
+        # than the request it was given, and the worst one answers it. A pod
+        # that lived a tenth of the window carries its mean while alive, not a
+        # tenth of it -- `ALIGN_MEAN` averages the points that exist rather than
+        # padding the gaps with zeroes.
+        mean_mem = _per_replica(keys, memory_means) * replicas
+        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # A controller none of whose pods reported is not a controller using no
-        # memory. Summing absent pods as zero would read it as comfortably
+        # memory. Reading absent pods as zero would read it as comfortably
         # under its request, which is the same vacuum-as-evidence mistake
         # `fetch_usage_peaks` refuses at the cluster level.
-        if not measured:
+        if not any(key in memory_means for key in keys):
             continue
 
         overage = mean_mem - mem_req_total
         if overage <= 0 or overage < UNDERREQUEST_FLOOR_MIB:
             continue
 
-        _, measured_over = _measured_over(entry["oldest_h"])
+        _, measured_over = _measured_over(
+            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
+        )
         # `critical` is reserved for the case that is already failing rather
         # than merely mis-scheduled: sustained usage within 10% of the ceiling
         # is an OOMKill waiting for one more request. Everything else is
@@ -2095,7 +2227,6 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         near_limit = mem_lim_total > 0 and mean_mem >= 0.9 * mem_lim_total
         severity = "critical" if near_limit else "major"
 
-        replicas = len(entry["pods"])
         ceiling = f"{mem_lim_total / 1024.0:.1f} GiB limit" if mem_lim_total > 0 else "no memory limit"
         excerpt = (
             f"requests {mem_req_total / 1024.0:.2f} GiB of memory ({ceiling}); mean observed "
@@ -2194,26 +2325,28 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
     if not usage_peaks:
         return []
     by_owner = _unsized_pods_by_owner(context, now=now)
+    live_owners = _live_pod_owners(context)
 
     hits = []
     for (_ns, kind, name), entry in by_owner.items():
-        peak_cpu = peak_mem = 0.0
-        measured = False
-        for pod in entry["pods"]:
-            key = (pod["ns"], pod["name"])
-            if key in usage_peaks:
-                measured = True
-            cpu, mem = usage_peaks.get(key, (0.0, 0.0))
-            peak_cpu += cpu
-            peak_mem += mem
+        replicas = len(entry["pods"])
+        # This check has the most to lose from the narrow join and the least
+        # margin for it: it writes a *request* into a manifest, so a peak read
+        # off pods that rolled in this morning becomes a reservation the
+        # workload outgrows by tonight. On 2026-09-06 every Argo CD component
+        # on the hub was sized off a 6h window for exactly that reason.
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        peak_cpu = _per_replica(keys, usage_peaks, 0) * replicas
+        peak_mem = _per_replica(keys, usage_peaks, 1) * replicas
         # The whole finding is the measurement, so an unmeasured controller has
         # nothing to say. Reporting it anyway would recommend requesting zero,
         # which is the state being complained about.
-        if not measured:
+        if not any(key in usage_peaks for key in keys):
             continue
 
-        replicas = len(entry["pods"])
-        _, measured_over = _measured_over(entry["oldest_h"])
+        _, measured_over = _measured_over(
+            entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now)
+        )
         # §3.1's 2x, per replica, because the manifest declares one replica's
         # request. Floored at the smallest values worth writing into a manifest
         # so a near-silent sidecar is not handed a `1m`/`1Mi` request that no

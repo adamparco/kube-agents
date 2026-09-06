@@ -2008,6 +2008,153 @@ class UnderrequestTest(unittest.TestCase):
         self.assertNotIn("replica", excerpt)
 
 
+class ReplacedPodPeaksTest(unittest.TestCase):
+    """The pods a controller has rolled away, and the peaks that went with them.
+
+    Cloud Monitoring answers for the whole window keyed by pod name. Joining
+    that answer to the *live* pod list threw away every series belonging to a
+    pod the controller had since replaced, and then reported the remainder as
+    the week's peak -- so a Deployment rolled this morning was sized off this
+    morning, under an excerpt claiming a week. On `kube-agents-host` on
+    2026-09-06 that was nine of twenty-two findings, `litellm` reading 1164 MiB
+    against a replaced pod's 1656, and `argocd-dex-server` 0.3m against 3.6m.
+    """
+
+    NS = "shop"
+    DEP = "web"
+    LIVE = f"{DEP}-aaaaaaaaaa-11111"
+    GONE = f"{DEP}-bbbbbbbbbb-22222"
+
+    def pod(self, name=LIVE, *, ns=NS, owner="web-aaaaaaaaaa", sized=True, kind="ReplicaSet"):
+        resources = {"requests": {"cpu": "12", "memory": "48Gi"}} if sized else {}
+        return obj(
+            "Pod", name, ns=ns,
+            **{
+                "spec.containers": [{"name": "web", "resources": resources}],
+                "status.startTime": "2026-07-31T15:00:00Z",
+                "status.phase": "Running",
+                "metadata.labels": {"pod-template-hash": "aaaaaaaaaa"},
+                "metadata.ownerReferences": [{"kind": kind, "name": owner}],
+            },
+        )
+
+    def context(self, pods, *, created="2026-07-01T00:00:00Z", name=DEP):
+        return {
+            "pods": pods,
+            "deployments": [obj("Deployment", name, ns=self.NS, **{"metadata.creationTimestamp": created})],
+        }
+
+    def over(self, ctx, peaks):
+        return fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)
+
+    # -- the peak the join used to discard -------------------------------- #
+
+    def test_a_replaced_pods_peak_suppresses_the_overrequest_finding(self):
+        """The whole defect in one assertion: the workload reached 11 vCPU this
+        week, on a pod that is no longer running, and was about to be told to
+        give 11 of its 12 back."""
+        ctx = self.context([self.pod()])
+        narrow = {(self.NS, self.LIVE): (0.9, 3072.0)}
+        self.assertEqual(len(self.over(ctx, narrow)), 1)
+        widened = {**narrow, (self.NS, self.GONE): (11.0, 40000.0)}
+        self.assertEqual(self.over(ctx, widened), [])
+
+    def test_the_excerpt_names_the_pods_it_reached_back_through(self):
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, self.GONE): (1.1, 4000.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertIn("1 pod it has replaced since", excerpt)
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        # The peak reported is the replaced pod's, not the live one's.
+        self.assertIn("1.10 vCPU", excerpt)
+
+    def test_the_window_clamps_to_the_controller_not_the_read(self):
+        """A controller younger than the read cannot have been watched for a
+        week however many pods it has been through."""
+        ctx = self.context([self.pod()], created="2026-07-30T00:00:00Z")
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, self.GONE): (1.1, 4000.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertIn("trailing 48h", excerpt)
+        self.assertIn("this controller's whole life", excerpt)
+
+    def test_without_a_replaced_pod_the_old_clamp_still_applies(self):
+        """The live pod started 9h before `NOW`, and nothing widens that."""
+        ctx = self.context([self.pod()])
+        excerpt = self.over(ctx, {(self.NS, self.LIVE): (0.9, 3072.0)})[0]["excerpt"]
+        self.assertIn("oldest pod started", excerpt)
+        self.assertNotIn("replaced since", excerpt)
+
+    # -- what the pattern must not claim ---------------------------------- #
+
+    def test_a_siblings_pods_are_not_this_controllers(self):
+        """`web` and `web-api` in one namespace. The two-segment tail is what
+        keeps them apart -- `[a-z0-9]+` cannot span `api`'s hyphen."""
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, "web-api-cccccccc-33333"): (11.0, 40000.0)}
+        hits = self.over(ctx, peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+
+    def test_a_live_pod_another_controller_owns_is_not_claimed(self):
+        """The name matches and the cluster says otherwise. The cluster wins."""
+        intruder = self.pod(name=f"{self.DEP}-cccccccccc-33333", owner="logger", kind="DaemonSet")
+        ctx = self.context([self.pod(), intruder])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), (self.NS, f"{self.DEP}-cccccccccc-33333"): (11.0, 40000.0)}
+        hits = self.over(ctx, peaks)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+
+    def test_another_namespace_is_not_this_controller(self):
+        ctx = self.context([self.pod()])
+        peaks = {(self.NS, self.LIVE): (0.9, 3072.0), ("other", self.GONE): (11.0, 40000.0)}
+        self.assertEqual(len(self.over(ctx, peaks)), 1)
+
+    def test_a_kind_with_no_pattern_is_not_widened(self):
+        """A bare Pod names nothing after itself, so there is no rule to apply
+        and the narrow answer is the honest one."""
+        pod = self.pod(name="standalone", owner="")
+        pod["metadata"]["ownerReferences"] = []
+        ctx = self.context([pod])
+        peaks = {(self.NS, "standalone"): (0.9, 3072.0), (self.NS, "standalone-bbbbb"): (11.0, 40000.0)}
+        self.assertEqual(len(self.over(ctx, peaks)), 1)
+
+    def test_a_statefulset_ordinal_is_matched(self):
+        """A StatefulSet keeps its pod names across a roll, so what this finds
+        is a replica the controller has scaled away -- whose peak is still a
+        replica's peak."""
+        pod = self.pod(name="db-0", owner="db", kind="StatefulSet")
+        ctx = {"pods": [pod], "statefulsets": [obj("StatefulSet", "db", ns=self.NS)]}
+        narrow = {(self.NS, "db-0"): (0.9, 3072.0)}
+        self.assertEqual(len(self.over(ctx, narrow)), 1)
+        self.assertEqual(self.over(ctx, {**narrow, (self.NS, "db-2"): (11.0, 40000.0)}), [])
+
+    # -- max per replica, never the sum ----------------------------------- #
+
+    def test_the_controller_total_is_the_worst_replica_times_replicas(self):
+        """Summing would be nonsense once replaced pods are in the set -- seven
+        pod names for a one-replica Deployment would total seven replicas of
+        usage. `max x replicas` is the rule, and it holds for the live pods too:
+        the hot replica is the one a request has to cover."""
+        pods = [self.pod(), self.pod(name=f"{self.DEP}-aaaaaaaaaa-99999")]
+        ctx = self.context(pods)
+        # 0.2 and 1.0: sum is 1.2 vCPU, max x 2 replicas is 2.0.
+        peaks = {(self.NS, self.LIVE): (0.2, 100.0), (self.NS, f"{self.DEP}-aaaaaaaaaa-99999"): (1.0, 100.0)}
+        excerpt = self.over(ctx, peaks)[0]["excerpt"]
+        self.assertIn("2.00 vCPU", excerpt)
+
+    def test_unsized_sizes_off_the_replaced_pods_peak(self):
+        """§3.12 writes a number into a manifest, so this is the check with the
+        least margin for a short window: every Argo CD component on the live
+        hub was sized off six hours on 2026-09-06."""
+        pod = self.pod(sized=False)
+        ctx = self.context([pod])
+        peaks = {(self.NS, self.LIVE): (0.010, 40.0), (self.NS, self.GONE): (0.050, 200.0)}
+        hits = fw.check_unsized(ctx, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(hits), 1)
+        # 2x the replaced pod's peak, not 2x the live one's 10m/40Mi.
+        self.assertIn("100m / 400Mi per replica", hits[0]["excerpt"])
+
+
 class UnsizedWorkloadTest(unittest.TestCase):
     """§3.12 -- the population §3.1 and §3.11 both skip.
 
