@@ -1779,7 +1779,7 @@ def check_netpol_missing(context: dict) -> list[dict]:
             # would resolve and re-raise this finding on every rollout. The
             # workload names go in the excerpt, where churn costs nothing.
             live = sum(1 for p in context.get("pods") or [] if p.get("ns") == ns and _is_live_pod(p))
-            names = sorted({_pod_workload_name(p) for p in uncovered})
+            names = sorted({_pod_workload_ref(p, context.get("workloads") or []) for p in uncovered})
             hits.append(
                 {
                     "namespace": ns,
@@ -1801,14 +1801,59 @@ def _is_live_pod(pod: dict) -> bool:
     return str(pod.get("phase") or "") not in ("Succeeded", "Failed")
 
 
-def _pod_workload_name(pod: dict) -> str:
-    """The pod's own name is a ReplicaSet hash away from stable, so prefer
-    whichever conventional label names the workload behind it."""
-    labels = pod.get("labels") or {}
-    for key in ("app.kubernetes.io/name", "app", "k8s-app"):
-        if labels.get(key):
-            return str(labels[key])
-    return str(pod.get("name") or "")
+# A ReplicaSet is always named `<deployment>-<pod-template-hash>` and a
+# CronJob's Job `<cronjob>-<timestamp>`. Neither intermediate object is in
+# `COMPLIANCE_DUMP_KINDS`, so the parent is derived by dropping that last
+# segment and then confirmed against the dump rather than assumed.
+_OWNER_PARENT_KIND = {"ReplicaSet": "Deployment", "Job": "CronJob"}
+
+
+def _controller_refs(meta: dict) -> list[dict]:
+    """Owner references, the controlling one first.
+
+    A pod may carry several; at most one is the controller, and that is the
+    object that recreates it and the object whose template a fix has to edit.
+    The rest are kept behind it rather than dropped, because an owner set with
+    no `controller: true` at all is legal and still names something better than
+    the pod.
+    """
+    refs = (meta.get("ownerReferences") or [])
+    return [
+        {"kind": o.get("kind", ""), "name": o.get("name", "")}
+        for o in sorted(refs, key=lambda o: not o.get("controller"))
+    ]
+
+
+def _pod_workload_ref(pod: dict, workloads: list[dict]) -> str:
+    """`Kind/name` of an object the reader can actually `kubectl get`.
+
+    Not the `app.kubernetes.io/name` label, which this used to return. A label
+    value is not a name and nothing requires it to match one: on this fleet
+    `Deployment/kube-agents-controller-manager` carries
+    `app.kubernetes.io/name: kube-agents-operator`, and the 2026-09-05
+    compliance report named `kube-agents-operator` as the uncovered workload in
+    `kubeagents-system`. No object anywhere in the cluster has that name, so
+    the one actionable string in the finding resolved to `NotFound`.
+
+    Nor the pod's own name, which the label was reached for to avoid -- it
+    carries a ReplicaSet hash and a random suffix, and this excerpt is
+    rewritten on every rollout if it moves. `ownerReferences` gives both
+    properties at once: the controller behind the pod is a real object and its
+    name is stable across restarts. Where the walk cannot land on something the
+    dump confirms, it degrades to the pod, which is at least a thing that
+    exists.
+    """
+    ns = pod.get("ns", "")
+    declared = {(w.get("kind"), w.get("ns"), w.get("name")) for w in workloads}
+    for owner in pod.get("owners") or []:
+        kind, name = owner.get("kind", ""), owner.get("name", "")
+        if not kind or not name:
+            continue
+        parent = _OWNER_PARENT_KIND.get(kind)
+        if parent and (parent, ns, name.rpartition("-")[0]) in declared:
+            return f"{parent}/{name.rpartition('-')[0]}"
+        return f"{kind}/{name}"
+    return f"Pod/{pod.get('name') or ''}"
 
 
 def _enforces_ingress(policy: dict) -> bool:
@@ -3185,13 +3230,16 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     }
     # The same pods again, with the labels kept. "Does this namespace hold a
     # NetworkPolicy" and "is this pod selected by one" are different questions,
-    # and only the labels can answer the second.
+    # and only the labels can answer the second. The owner refs answer a third:
+    # which object a reader is supposed to go and fix, since a pod name is a
+    # hash away from stable and a label value names nothing at all.
     context["pods"] = [
         {
             "ns": (i.get("metadata") or {}).get("namespace", ""),
             "name": (i.get("metadata") or {}).get("name", ""),
             "labels": (i.get("metadata") or {}).get("labels") or {},
             "phase": (i.get("status") or {}).get("phase", ""),
+            "owners": _controller_refs(i.get("metadata") or {}),
         }
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"

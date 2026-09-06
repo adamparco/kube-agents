@@ -1786,10 +1786,14 @@ def namespace(name, labels=None):
     return {"kind": "Namespace", "metadata": {"name": name, "labels": labels or {}}}
 
 
-def netpol_pod(name, ns="default", labels=None, phase="Running"):
+def netpol_pod(name, ns="default", labels=None, phase="Running", owners=None):
     """A `context["pods"]` entry -- the pod-label view §2.6 needs to ask which
     pods a namespace's policies actually select."""
-    return {"ns": ns, "name": name, "labels": labels or {}, "phase": phase}
+    return {"ns": ns, "name": name, "labels": labels or {}, "phase": phase, "owners": owners or []}
+
+
+def owner(kind, name):
+    return {"kind": kind, "name": name}
 
 
 def ccnp(name, selector=None, ingress=None):
@@ -2270,6 +2274,89 @@ class TestWildcardRbac(unittest.TestCase):
         self.assertEqual(hits[0]["excerpt"].count("system:serviceaccount:default:app"), 1)
 
 
+class TestPodWorkloadRef(unittest.TestCase):
+    """The excerpt of a partial-coverage `netpol-missing` finding names the
+    workloads no policy selects. That name is the only actionable string in
+    the finding, so it has to be an object the reader can fetch."""
+
+    DEPLOY = {"kind": "Deployment", "ns": "kubeagents-system", "name": "kube-agents-controller-manager"}
+
+    def ref(self, pod, workloads=None):
+        return collect._pod_workload_ref(pod, workloads if workloads is not None else [self.DEPLOY])
+
+    def test_a_deployment_pod_resolves_through_its_replicaset(self):
+        pod = netpol_pod(
+            "kube-agents-controller-manager-674ffccc57-drmjx",
+            ns="kubeagents-system",
+            labels={"app.kubernetes.io/name": "kube-agents-operator"},
+            owners=[owner("ReplicaSet", "kube-agents-controller-manager-674ffccc57")],
+        )
+        self.assertEqual(self.ref(pod), "Deployment/kube-agents-controller-manager")
+
+    def test_the_label_value_is_not_used_even_when_it_is_the_only_name_present(self):
+        """`app.kubernetes.io/name: kube-agents-operator` on this fleet names
+        no object at all -- `kubectl get deploy kube-agents-operator` is
+        `NotFound` -- and the 2026-09-05 compliance report published it as the
+        uncovered workload in `kubeagents-system`."""
+        pod = netpol_pod(
+            "kube-agents-controller-manager-674ffccc57-drmjx",
+            ns="kubeagents-system",
+            labels={"app.kubernetes.io/name": "kube-agents-operator", "app": "operator", "k8s-app": "op"},
+            owners=[owner("ReplicaSet", "kube-agents-controller-manager-674ffccc57")],
+        )
+        self.assertNotIn("kube-agents-operator", self.ref(pod))
+        self.assertNotIn("k8s-app", self.ref(pod))
+
+    def test_a_replicaset_whose_deployment_is_not_in_the_dump_stays_a_replicaset(self):
+        # A bare ReplicaSet is a real object with that exact name. Guessing a
+        # Deployment behind it would invent one.
+        pod = netpol_pod("rs-abc123-x", ns="kubeagents-system", owners=[owner("ReplicaSet", "rs-abc123")])
+        self.assertEqual(self.ref(pod), "ReplicaSet/rs-abc123")
+
+    def test_a_cronjob_pod_resolves_two_levels_up_and_a_bare_job_does_not(self):
+        cj = {"kind": "CronJob", "ns": "kubeagents-system", "name": "kube-agents-selfimprove"}
+        pod = netpol_pod(
+            "kube-agents-selfimprove-29810760-g8wtm",
+            ns="kubeagents-system",
+            owners=[owner("Job", "kube-agents-selfimprove-29810760")],
+        )
+        self.assertEqual(self.ref(pod, [cj]), "CronJob/kube-agents-selfimprove")
+        self.assertEqual(self.ref(pod, []), "Job/kube-agents-selfimprove-29810760")
+
+    def test_a_statefulset_or_daemonset_owner_is_used_as_is(self):
+        for kind in ("StatefulSet", "DaemonSet"):
+            with self.subTest(kind=kind):
+                pod = netpol_pod("db-0", ns="kubeagents-system", owners=[owner(kind, "db")])
+                self.assertEqual(self.ref(pod), f"{kind}/db")
+
+    def test_an_unowned_pod_is_named_as_a_pod(self):
+        # A bare pod is its own object: the name is exact and nothing recreates
+        # it under a different one.
+        pod = netpol_pod("debug-shell", ns="kubeagents-system", labels={"app": "debug"})
+        self.assertEqual(self.ref(pod), "Pod/debug-shell")
+
+    def test_the_controlling_owner_wins_over_the_others(self):
+        pod = {
+            "ns": "kubeagents-system", "name": "p-1", "labels": {}, "phase": "Running",
+            "owners": [owner("StatefulSet", "sts-a")],
+        }
+        meta = {"ownerReferences": [
+            {"kind": "ConfigMap", "name": "cm-a"},
+            {"kind": "StatefulSet", "name": "sts-a", "controller": True},
+        ]}
+        pod["owners"] = collect._controller_refs(meta)
+        self.assertEqual(self.ref(pod), "StatefulSet/sts-a")
+
+    def test_an_owner_set_with_no_controller_still_names_something(self):
+        meta = {"ownerReferences": [{"kind": "StatefulSet", "name": "sts-a"}]}
+        self.assertEqual(collect._controller_refs(meta), [{"kind": "StatefulSet", "name": "sts-a"}])
+
+    def test_a_same_named_workload_in_another_namespace_does_not_satisfy_the_lookup(self):
+        elsewhere = {"kind": "Deployment", "ns": "other", "name": "api"}
+        pod = netpol_pod("api-abc123-x", ns="kubeagents-system", owners=[owner("ReplicaSet", "api-abc123")])
+        self.assertEqual(self.ref(pod, [elsewhere]), "ReplicaSet/api-abc123")
+
+
 class TestNetpolMissing(unittest.TestCase):
     def test_zero_policies_with_workloads_is_major(self):
         ctx = context_of(
@@ -2437,8 +2524,14 @@ class TestNetpolMissing(unittest.TestCase):
             networkpolicies=[netpol("litellm", ns="kubeagents-system", pod_selector={"matchLabels": {"app": "litellm"}}, policy_types=["Ingress"])],
             pods=[
                 netpol_pod("litellm-7bcc-9rjvl", ns="kubeagents-system", labels={"app": "litellm"}),
-                netpol_pod("kube-agents-controller-manager-764d-46gl4", ns="kubeagents-system", labels={"app.kubernetes.io/name": "kube-agents-operator"}),
+                netpol_pod(
+                    "kube-agents-controller-manager-764d-46gl4",
+                    ns="kubeagents-system",
+                    labels={"app.kubernetes.io/name": "kube-agents-operator"},
+                    owners=[owner("ReplicaSet", "kube-agents-controller-manager-764d")],
+                ),
             ],
+            workloads=[{"kind": "Deployment", "ns": "kubeagents-system", "name": "kube-agents-controller-manager"}],
             pod_namespaces={"kubeagents-system"},
         )
         hits = collect.check_netpol_missing(ctx)
@@ -2446,6 +2539,10 @@ class TestNetpolMissing(unittest.TestCase):
         self.assertEqual(hits[0]["severity"], "major")
         self.assertEqual(hits[0]["object"], "Namespace/kubeagents-system")
         self.assertIn("1 of 2 pods", hits[0]["excerpt"])
+        # The object a reader can `kubectl get`, not the label value the
+        # 2026-09-05 report published in its place.
+        self.assertIn("Deployment/kube-agents-controller-manager", hits[0]["excerpt"])
+        self.assertNotIn("kube-agents-operator", hits[0]["excerpt"])
 
     def test_the_partial_arm_carries_its_own_impact_and_the_other_two_do_not(self):
         """§2.6 forbids arm 1's sentence on arm 3 by name -- "the other m - n
@@ -2489,16 +2586,25 @@ class TestNetpolMissing(unittest.TestCase):
         """A pod name carries a ReplicaSet hash and a random suffix. The ledger
         keys on the object, so a pod-scoped finding would resolve and re-raise
         on every rollout; the volatile name belongs in the excerpt, and even
-        there the conventional label is the better identifier."""
+        there it is the controller behind the pod that the reader has to go and
+        edit."""
         ctx = context_of(
             namespaces=[namespace("payments")],
             networkpolicies=[netpol("api", ns="payments", pod_selector={"matchLabels": {"app": "api"}}, policy_types=["Ingress"])],
-            pods=[netpol_pod("web-6f8d9c4b5-xk2mn", ns="payments", labels={"app.kubernetes.io/name": "web"})],
+            pods=[
+                netpol_pod(
+                    "web-6f8d9c4b5-xk2mn",
+                    ns="payments",
+                    labels={"app.kubernetes.io/name": "web"},
+                    owners=[owner("ReplicaSet", "web-6f8d9c4b5")],
+                )
+            ],
+            workloads=[{"kind": "Deployment", "ns": "payments", "name": "web"}],
             pod_namespaces={"payments"},
         )
         hits = collect.check_netpol_missing(ctx)
         self.assertEqual(hits[0]["object"], "Namespace/payments")
-        self.assertIn("web", hits[0]["excerpt"])
+        self.assertIn("Deployment/web", hits[0]["excerpt"])
         self.assertNotIn("6f8d9c4b5", hits[0]["excerpt"])
 
     def test_a_namespace_whose_every_pod_is_selected_is_left_alone(self):
