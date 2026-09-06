@@ -55,10 +55,15 @@ spec:
           # disagree about which LiteLLM version to copy.
           image: ${LITELLM_IMAGE}
           args: ["--config", "/app/config.yaml", "--port", "8080"]
+          # Kept in step with charts/kube-agents/values.yaml, which owns the
+          # rationale: a week of this gateway's own history puts it at ~870Mi
+          # p50 and 1098Mi peak per replica, so a 512Mi request under-booked
+          # every node it landed on and made it the first pod evicted under
+          # memory pressure.
           resources:
             requests:
               cpu: "100m"
-              memory: "512Mi"
+              memory: "1536Mi"
             limits:
               cpu: "500m"
               memory: "2Gi"

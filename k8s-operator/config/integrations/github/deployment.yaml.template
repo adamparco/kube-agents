@@ -84,10 +84,14 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Kept in step with charts/kube-agents/values.yaml, which owns the
+          # rationale: a week at 5-minute resolution puts this minter at 0.71m
+          # of CPU and 12.17Mi of memory per replica, and 50m/64Mi is the
+          # smallest request the cost audit's resize rule will write.
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
+              cpu: "50m"
+              memory: "64Mi"
             limits:
               cpu: "500m"
               memory: "256Mi"

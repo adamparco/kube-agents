@@ -284,10 +284,23 @@ litellm:
     # Renders maxSkew: 1 over kubernetes.io/hostname at the default
     # replicaCount of 2, same rationale as operator.topologySpread.
     enabled: true
+  # The memory request is sized from a week of this gateway's own Cloud
+  # Monitoring history on the reference install, not from a round number: p50
+  # 870Mi, p95 978Mi, peak 1098Mi per replica across six pod generations. At
+  # the 512Mi it used to ask for, steady-state use was ~1.9x the request, which
+  # is not a burst Burstable QoS absorbs — the scheduler under-books every node
+  # the gateway lands on, and kubelet ranks Burstable pods for eviction by
+  # exactly that overage, so the model gateway was first out under any node
+  # pressure. 1536Mi is the audit's ceil(peak x 1.3), rounded to a whole
+  # multiple of 512Mi.
+  #
+  # CPU stays at 100m: the same week puts this gateway's 5-minute peak at 118m,
+  # above its request rather than below it, so it is sized correctly and the
+  # 500m limit is what absorbs the spike.
   resources:
     requests:
       cpu: 100m
-      memory: 512Mi
+      memory: 1536Mi
     limits:
       cpu: 500m
       memory: 2Gi
@@ -392,10 +405,21 @@ githubMinter:
     tag: v2.7.1-amd64
     pullPolicy: IfNotPresent
   replicaCount: 2
+  # Sized from a week of the reference install's Cloud Monitoring history at
+  # 5-minute resolution: this minter peaks at 0.71m of CPU and 12.17Mi of
+  # memory per replica. It is a Go binary that wakes to sign a token and goes
+  # back to sleep, so the old 100m/128Mi reserved roughly 140x the CPU and 10x
+  # the memory it has ever used, on every node both replicas land on.
+  #
+  # 50m/64Mi is the smallest request the cost audit's own resize rule will
+  # write (`ceil(peak x 2)` clamped up to that floor), and both dimensions have
+  # to move: the audit reports a controller over-requested on either dimension,
+  # so shrinking CPU alone would have left the finding open on memory at 9% of
+  # request. The limits are untouched, so a burst still has 500m to reach into.
   resources:
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 50m
+      memory: 64Mi
     limits:
       cpu: 500m
       memory: 256Mi
