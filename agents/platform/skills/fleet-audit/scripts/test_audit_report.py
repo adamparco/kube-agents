@@ -12788,6 +12788,481 @@ class TestGcloudEnumCasing(unittest.TestCase):
         )
 
 
+class TestPublicControlPlaneRepair(unittest.TestCase):
+    """A `public-control-plane` fix has to clear `public-control-plane`.
+
+    The 2026-09-06 compliance run published 16 of these and all 16 said
+    `--enable-master-authorized-networks` and stopped, which GKE applies while
+    leaving `gcpPublicCidrsAccessEnabled: true` -- the state the check fires
+    on. A reader who pastes it does the work and watches the finding come back.
+    `kube-agents-host` was worse: both endpoints open, one command published,
+    so acting on it leaves the DNS endpoint answering from anywhere.
+
+    Every note here is that run's text, taken from the stored report.
+    """
+
+    NOTE = (
+        "# CIDR list must come from a human -- an incomplete list locks every "
+        "operator out of the API server.\n"
+        "gcloud container clusters update kube-agents-host --location us-east4 "
+        "--project adamparco-kage --enable-master-authorized-networks "
+        "--master-authorized-networks=<CIDR[,CIDR...]>"
+    )
+    DNS_EXCERPT = (
+        "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true; "
+        "controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic=true "
+        "(DNS endpoint, not gated by authorized networks)"
+    )
+    IP_EXCERPT = "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true"
+
+    def finding(self, note=None, excerpt=None, check=None, **overrides):
+        return make_finding(
+            fid="pcp",
+            check=audit_report.PUBLIC_CONTROL_PLANE_CHECK if check is None else check,
+            cluster="kube-agents-host",
+            obj="Cluster/kube-agents-host",
+            excerpt=self.IP_EXCERPT if excerpt is None else excerpt,
+            remediation={"kind": "gcloud", "note": self.NOTE if note is None else note},
+            **overrides,
+        )
+
+    def repaired(self, **kwargs):
+        finding = self.finding(**kwargs)
+        audit_report.repair_public_control_plane_commands(finding)
+        return finding
+
+    # -- append_gcloud_flag ------------------------------------------------
+
+    def test_the_live_defect_is_corrected(self):
+        note = self.repaired()["remediation"]["note"]
+        self.assertTrue(
+            note.endswith(
+                "--master-authorized-networks=<CIDR[,CIDR...]> "
+                "--no-enable-google-cloud-access"
+            ),
+            note,
+        )
+
+    def test_a_note_already_carrying_the_flag_gains_nothing(self):
+        already = self.NOTE + " --no-enable-google-cloud-access"
+        self.assertEqual(self.repaired(note=already)["remediation"]["note"], already)
+
+    def test_repairing_twice_is_repairing_once(self):
+        # The finish pipeline runs the repair at four points on purpose, so a
+        # second pass appending a second copy would be the defect, not a
+        # cosmetic one: two `--no-enable-google-cloud-access` on one line is a
+        # command gcloud rejects.
+        finding = self.repaired()
+        once = copy.deepcopy(finding)
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertEqual(finding, once)
+
+    def test_a_longer_flag_sharing_the_prefix_does_not_read_as_the_anchor(self):
+        # `--enable-master-authorized-networks-on-private-endpoint` is a real
+        # gcloud flag and a different one. Without the token boundary this note
+        # would be "repaired" with a flag that contradicts it.
+        other = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks-on-private-endpoint"
+        )
+        self.assertEqual(self.repaired(note=other)["remediation"]["note"], other)
+
+    def test_a_wrapped_command_is_repaired_at_its_last_line(self):
+        wrapped = (
+            "gcloud container clusters update c \\\n"
+            "  --location=us-east4 --project=p \\\n"
+            "  --enable-master-authorized-networks \\\n"
+            "  --master-authorized-networks=<CIDR>"
+        )
+        self.assertEqual(
+            self.repaired(note=wrapped)["remediation"]["note"],
+            wrapped + " --no-enable-google-cloud-access",
+        )
+
+    def test_only_the_command_carrying_the_anchor_is_touched(self):
+        note = (
+            "gcloud container clusters describe c --location=us-east4 --project=p\n"
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+        )
+        out = self.repaired(note=note)["remediation"]["note"].split("\n")
+        self.assertNotIn("--no-enable-google-cloud-access", out[0])
+        self.assertTrue(out[1].endswith("--no-enable-google-cloud-access"), out[1])
+
+    def test_prose_that_never_names_the_anchor_is_left_alone(self):
+        prose = "Ask the platform owner which admin ranges are legitimate."
+        self.assertEqual(self.repaired(note=prose)["remediation"]["note"], prose)
+
+    # -- the DNS arm -------------------------------------------------------
+
+    def test_a_both_endpoints_open_finding_gains_the_second_command(self):
+        note = self.repaired(excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --no-enable-dns-access",
+            note,
+        )
+        # And it names the address a reader can check the finding against.
+        self.assertIn("gke-<hash>.us-east4.gke.goog", note)
+
+    def test_the_ip_only_arm_gains_no_dns_command(self):
+        # The check fires on either endpoint. Closing the DNS one on a cluster
+        # that never opened it is a change the finding does not justify.
+        self.assertNotIn(
+            audit_report.DNS_ACCESS_FLAG, self.repaired()["remediation"]["note"]
+        )
+
+    def test_the_second_command_is_named_off_the_first(self):
+        # Built from the command the model already wrote rather than from the
+        # finding's fields, so the two invocations cannot name different
+        # clusters however the model spelled the first one.
+        note = self.repaired(
+            note=(
+                "gcloud container clusters update other-cluster --location europe-west1 "
+                "--project other-project --enable-master-authorized-networks "
+                "--master-authorized-networks=<CIDR>"
+            ),
+            excerpt=self.DNS_EXCERPT,
+        )["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update other-cluster --location=europe-west1 "
+            "--project=other-project --no-enable-dns-access",
+            note,
+        )
+
+    def test_the_anchored_command_is_the_one_the_second_is_named_off(self):
+        # A note that touches two clusters -- the finding's, and one named as an
+        # aside. Closing the DNS endpoint on the wrong one is a change nobody
+        # asked for on a cluster the finding is not about.
+        note = (
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --enable-master-authorized-networks "
+            "--master-authorized-networks=<CIDR>\n"
+            "# For reference, the peer that already has this:\n"
+            "gcloud container clusters update drift-peer-std-9 --location=us-east4-c "
+            "--project=adamparco-kage --enable-private-endpoint"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        added = [line for line in out.split("\n") if audit_report.DNS_ACCESS_FLAG in line]
+        self.assertEqual(
+            added,
+            [
+                "gcloud container clusters update kube-agents-host --location=us-east4 "
+                "--project=adamparco-kage --no-enable-dns-access"
+            ],
+        )
+
+    def test_an_unanchored_update_command_still_names_the_cluster(self):
+        # The DNS endpoint can be the only open path, in which case the model
+        # writes no authorized-networks command to anchor to. The note's own
+        # last word on which cluster it is about beats publishing nothing.
+        note = (
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --enable-private-endpoint"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --no-enable-dns-access",
+            out,
+        )
+
+    def test_an_unparseable_command_is_skipped_rather_than_ending_the_search(self):
+        # `shlex` raises on an unbalanced quote. The command below it is still
+        # the finding's, and giving up on the whole note loses the DNS half.
+        note = (
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --enable-master-authorized-networks "
+            "--master-authorized-networks=<CIDR>\n"
+            "gcloud container clusters update c --location=us-east4 --project='unclosed"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "kube-agents-host --location=us-east4 --project=adamparco-kage "
+            "--no-enable-dns-access",
+            out,
+        )
+
+    def test_a_note_already_closing_the_dns_endpoint_gains_nothing(self):
+        note = self.NOTE + "\ngcloud container clusters update c --no-enable-dns-access"
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertEqual(out.count(audit_report.DNS_ACCESS_FLAG), 1)
+
+    def test_a_note_with_no_update_command_gets_no_invented_one(self):
+        # An incomplete repair a reader can see beats a command whose arguments
+        # this module guessed.
+        note = "Ask the owner to close the DNS endpoint via --enable-master-authorized-networks."
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
+
+    def test_an_update_command_missing_the_project_yields_no_second_command(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
+
+    def test_both_flag_spellings_are_read(self):
+        for form in ("--location=us-east4 --project=p", "--location us-east4 --project p"):
+            with self.subTest(form=form):
+                note = (
+                    f"gcloud container clusters update c {form} "
+                    "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+                )
+                out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+                self.assertIn(
+                    "gcloud container clusters update c --location=us-east4 "
+                    "--project=p --no-enable-dns-access",
+                    out,
+                )
+
+    def test_the_dns_marker_is_the_string_the_collector_writes(self):
+        # The excerpt is the collector's own text by the time the repair runs
+        # (`adopt_collector_evidence` sees to that), so this constant is a
+        # contract between two files. Renaming the field on one side without
+        # the other silently stops the DNS arm firing, and nothing else here
+        # would notice: every test above would still pass.
+        import collect  # noqa: PLC0415 — the coupling is the point of this test
+
+        paths = collect._external_control_plane_paths(
+            {
+                "controlPlaneEndpointsConfig": {
+                    "ipEndpointsConfig": {"enablePublicEndpoint": True},
+                    "dnsEndpointConfig": {"allowExternalTraffic": True},
+                }
+            }
+        )
+        self.assertTrue(
+            any(audit_report.DNS_ENDPOINT_MARKER in path for path in paths), paths
+        )
+
+    # -- which fields, and which findings ----------------------------------
+
+    def test_the_recommendation_action_and_risk_are_repaired_too(self):
+        finding = self.repaired(
+            recommendation={
+                "action": "Run `gcloud container clusters update c --location=us-east4 "
+                "--project=p --enable-master-authorized-networks "
+                "--master-authorized-networks=<CIDR>`.",
+                "rationale": "r",
+                "risk": "Confirm with the same --enable-master-authorized-networks run.",
+            }
+        )
+        for field in ("action", "risk"):
+            with self.subTest(field=field):
+                self.assertIn(
+                    "--no-enable-google-cloud-access", finding["recommendation"][field]
+                )
+
+    def test_the_second_command_goes_only_into_the_note(self):
+        # `recommendation.action` is prose about intent and the issue body
+        # renders it as a sentence; a bare second invocation pasted mid-sentence
+        # is not one. `/remediate` reads the note.
+        # The action spells the whole command out, which is what the live ones
+        # do -- so nothing but the field it is written into keeps the second
+        # invocation from landing here as well.
+        finding = self.repaired(
+            excerpt=self.DNS_EXCERPT,
+            recommendation={
+                "action": "Restrict the API server to known admin ranges:\n"
+                "gcloud container clusters update kube-agents-host "
+                "--location=us-east4 --project=adamparco-kage "
+                "--enable-master-authorized-networks "
+                "--master-authorized-networks=<CIDR>",
+                "rationale": "r",
+                "risk": "k",
+            },
+        )
+        self.assertIn(
+            "--no-enable-google-cloud-access", finding["recommendation"]["action"]
+        )
+        self.assertNotIn(
+            audit_report.DNS_ACCESS_FLAG, finding["recommendation"]["action"]
+        )
+        self.assertIn(audit_report.DNS_ACCESS_FLAG, finding["remediation"]["note"])
+
+    def test_another_check_is_not_touched(self):
+        # The anchor flag appears in other compliance findings' prose, and this
+        # repair is an argument about one check's predicate, not about the flag.
+        finding = self.finding(check="netpol-missing")
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertEqual(finding["remediation"]["note"], self.NOTE)
+
+    def test_the_older_stored_evidence_shape_does_not_crash_the_pass(self):
+        # `validate_findings` requires the object form, so this is what a
+        # document written before that requirement carries -- and the carry
+        # reads those. Read as an attribute on a list it raised, which fails the
+        # whole finish pass rather than one finding.
+        finding = self.finding()
+        finding["evidence"] = [
+            {"command": "gcloud container clusters describe kube-agents-host",
+             "excerpt": self.DNS_EXCERPT},
+        ]
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertIn(audit_report.DNS_ACCESS_FLAG, finding["remediation"]["note"])
+
+    def test_the_sweep_names_the_ids_it_changed(self):
+        touched, clean = self.finding(), self.finding(check="netpol-missing")
+        touched["id"] = "pcp-1"
+        findings = [touched, clean]
+        self.assertEqual(audit_report.repair_remediation_commands(findings), ["pcp-1"])
+        self.assertEqual(audit_report.repair_remediation_commands(findings), [])
+
+    # -- the four points it has to run at ----------------------------------
+
+    def test_validation_writes_the_repair_back_into_the_document(self):
+        # A repair nothing calls repairs nothing; this is the path a finding new
+        # this run takes on the way in.
+        finding = self.finding()
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertIn(
+            "--no-enable-google-cloud-access", finding["remediation"]["note"]
+        )
+
+    def test_a_carried_note_is_repaired_on_the_way_through(self):
+        # Sixteen of these are already stored. The carry republishes last run's
+        # words whenever the evidence holds still, so without this the fleet
+        # would keep publishing the broken command for as long as the clusters
+        # stay public -- which is to say, until someone runs the command.
+        stale = self.finding()
+        stale["evidence"] = [{"command": "gcloud x", "excerpt": self.IP_EXCERPT}]
+        now = copy.deepcopy(stale)
+        now["title"] = "a rewrite, so the carry engages"
+        findings = [now]
+        audit_report.carry_unchanged_findings(
+            findings, {"document": {"findings": [stale]}}, exclude=set()
+        )
+        self.assertIn(
+            "--no-enable-google-cloud-access", findings[0]["remediation"]["note"]
+        )
+
+
+class TestPublicControlPlaneRepairInThePipeline(HarnessTestCase):
+    """The repair has to run again after the collector's excerpt lands.
+
+    The DNS arm keys on a string only `collect.py` writes, and
+    `adopt_collector_evidence` is what puts it on the finding. Until then
+    `evidence.excerpt` is the model's prose. So a finding published for the
+    first time passes `validate_findings` -- the repair's other entry point --
+    before the string the arm reads exists, and the carry, which is the third,
+    only touches findings a previous run already published. Without a pass of
+    its own after the adoption, the first publication of a both-endpoints-open
+    cluster ships one command and the DNS endpoint stays open.
+    """
+
+    CHECK = "public-control-plane"
+    CLUSTER = "prod-us-east"
+    OBJ = "Cluster/prod-us-east"
+    COMMAND = "gcloud container clusters describe prod-us-east --location us-east1"
+    COLLECTOR_EXCERPT = (
+        "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true; "
+        "controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic=true "
+        "(DNS endpoint, not gated by authorized networks)"
+    )
+    NOTE = (
+        "gcloud container clusters update prod-us-east --location=us-east1 "
+        "--project=acme-prod --enable-master-authorized-networks "
+        "--master-authorized-networks=<CIDR>"
+    )
+
+    def doc(self):
+        # One cluster running one check, so the manifest below can account for
+        # every check `checks_run` names — `cross_check_manifest` rejects the
+        # document otherwise, and the roster is not what this test is about.
+        return make_doc(
+            clusters=[
+                {
+                    "name": self.CLUSTER,
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": [{"check": self.CHECK, "command": self.COMMAND}],
+                }
+            ],
+            findings=[
+                make_finding(
+                    fid="pcp",
+                    check=self.CHECK,
+                    cluster=self.CLUSTER,
+                    # Cluster-scoped, as the live ones are — and the namespace
+                    # is part of the id the collector's candidate joins on.
+                    namespace="",
+                    obj=self.OBJ,
+                    command=self.COMMAND,
+                    # The model's own words, and they carry no marker: this is
+                    # the state the repair sees at validation time.
+                    excerpt="The control plane is reachable from the internet.",
+                    remediation={"kind": "gcloud", "note": self.NOTE},
+                )
+            ]
+        )
+
+    def manifest_file(self):
+        path = self.tmp_path / "collector-manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "clusters": [
+                        {
+                            "name": self.CLUSTER,
+                            "outcome": "collected",
+                            "commands": [
+                                {"check": self.CHECK, "command": self.COMMAND, "rc": 0}
+                            ],
+                            "candidates": [
+                                {
+                                    "check": self.CHECK,
+                                    "cluster": self.CLUSTER,
+                                    "namespace": "",
+                                    "object": self.OBJ,
+                                    "severity": "critical",
+                                    "excerpt": self.COLLECTOR_EXCERPT,
+                                    "impact": "Reachable from any address.",
+                                    "needs_triage": None,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_the_preview_shows_the_command_the_real_run_would_publish(self):
+        # A preview that omits the second command is a preview of a different
+        # document, which is the one thing a preview must not be.
+        self.patch_attr("run_cmd", Recorder())
+        rc = self.run_finish(
+            self.doc(),
+            argv_extra=("--dry-run", "--manifest-file", self.manifest_file()),
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("--no-enable-google-cloud-access", self.out)
+        self.assertIn(
+            "gcloud container clusters update prod-us-east --location=us-east1 "
+            "--project=acme-prod --no-enable-dns-access",
+            self.out,
+        )
+
+    def test_a_first_publication_carries_both_commands(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        rc = self.run_finish(
+            self.doc(), argv_extra=("--manifest-file", self.manifest_file())
+        )
+        self.assertEqual(rc, 0, self.err)
+        note = self.stored_envelope()["document"]["findings"][0]["remediation"]["note"]
+        self.assertIn("--no-enable-google-cloud-access", note)
+        self.assertIn(
+            "gcloud container clusters update prod-us-east --location=us-east1 "
+            "--project=acme-prod --no-enable-dns-access",
+            note,
+        )
+
+
 class TestManifestRemediationLink(unittest.TestCase):
     """A `kind: manifest` path must not render as a bare relative link.
 

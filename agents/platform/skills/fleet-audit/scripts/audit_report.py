@@ -439,6 +439,46 @@ _GCLOUD_ENUM_FLAG_RE = re.compile(
     r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>[A-Za-z0-9_-]+)"
 )
 
+# A flag is present when it stands as its own token: the boundary stops
+# `--enable-master-authorized-networks` from reading as present because
+# `--enable-master-authorized-networks-on-private-endpoint` is. The negated
+# spellings need no guard in the other direction -- `--no-enable-x` does not
+# contain `--enable-x`, the second hyphen breaks it.
+_GCLOUD_FLAG_BOUNDARY = r"(?![A-Za-z0-9-])"
+
+# `public-control-plane`'s remediation and the flags without which it does not
+# clear `public-control-plane`.
+#
+# `--enable-master-authorized-networks` narrows nothing on its own. GKE leaves
+# `gcpPublicCidrsAccessEnabled` on -- confirmed against a live cluster that had
+# never mentioned the field -- and the check fires on exactly that state, so a
+# reader who pastes the command watches the finding come back next week having
+# done the work. Compliance SOP 2.10 has said the flag "is not optional and is
+# not a no-op on a public cluster" since the arm was written, and the
+# 2026-09-06 report shipped 16 commands out of 16 without it. That is the same
+# lesson `normalise_gcloud_enum_values` learned about `--release-channel=REGULAR`:
+# the SOP describes the command, and only code produces it.
+#
+# The DNS endpoint is a second path with a second command, because authorized
+# networks do not gate it. `kube-agents-host` has both open and its published
+# note carried one command, so acting on that finding would have left the
+# cluster answering `gke-<hash>.us-east4.gke.goog` from anywhere. They stay two
+# invocations rather than one: gcloud parses all four flags together, but SOP
+# 2.10 prescribes a command per path and the second one closes an endpoint for
+# every caller, which is a decision a reader should be able to decline by not
+# running that line.
+PUBLIC_CONTROL_PLANE_CHECK = "public-control-plane"
+AUTHORIZED_NETWORKS_FLAG = "--enable-master-authorized-networks"
+GOOGLE_CLOUD_ACCESS_FLAG = "--no-enable-google-cloud-access"
+DNS_ACCESS_FLAG = "--no-enable-dns-access"
+CLUSTERS_UPDATE_PREFIX = "gcloud container clusters update"
+# What `collect._external_control_plane_paths` writes into the excerpt when the
+# DNS endpoint answers external traffic, and the only way this module can tell
+# that arm fired: the excerpt is the collector's own string by the time the
+# repair runs, so the marker is a contract between the two files rather than a
+# guess at the model's prose. `test_audit_report` pins it against `collect.py`.
+DNS_ENDPOINT_MARKER = "dnsEndpointConfig.allowExternalTraffic=true"
+
 # The Config Connector spec field each gcloud flag writes. A fleet whose clusters
 # are declared as KCC `ContainerCluster`/`ContainerNodePool` resources reconciles
 # its spec continuously, so a `kind: gcloud` remediation against a field the
@@ -3348,6 +3388,197 @@ def quote_gcloud_format_projections(text: str) -> str:
     )
 
 
+def _evidence_excerpt(finding: dict) -> str:
+    """Every excerpt on `finding`, whatever shape its evidence is in.
+
+    `validate_findings` requires one `{command, excerpt}` object, so that is
+    what a finding published today carries. The list form is the older stored
+    shape, and `carry_unchanged_findings` reads documents this install wrote
+    before the requirement existed -- so a reader that assumes the object
+    crashes the finish pass on a run whose only fault is being old.
+    """
+    evidence = finding.get("evidence")
+    if isinstance(evidence, dict):
+        return str(evidence.get("excerpt") or "")
+    if isinstance(evidence, list):
+        return "\n".join(
+            str(entry.get("excerpt") or "")
+            for entry in evidence
+            if isinstance(entry, dict)
+        )
+    return ""
+
+
+def _mentions_flag(text: str, flag: str) -> bool:
+    return re.search(re.escape(flag) + _GCLOUD_FLAG_BOUNDARY, text) is not None
+
+
+def _logical_command_spans(lines: list[str]) -> list[tuple[int, int, str]]:
+    """`(first, last, joined)` for each backslash-continued run of `lines`.
+
+    A `remediation.note` is prose and shell together and a command in it may be
+    wrapped, so "does this command carry the flag" is a question about the
+    logical line. `last` is where an appended flag belongs -- the end of the
+    final physical line, after the continuations.
+    """
+    spans, start = [], 0
+    while start < len(lines):
+        end = start
+        while end + 1 < len(lines) and lines[end].rstrip().endswith("\\"):
+            end += 1
+        joined = " ".join(line.rstrip().removesuffix("\\").strip() for line in lines[start : end + 1])
+        spans.append((start, end, joined))
+        start = end + 1
+    return spans
+
+
+def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
+    """Put `flag` on every command in `text` that carries `anchor` and not it.
+
+    Appended rather than inserted at a fixed position, because gcloud does not
+    care and a reader diffing the note against last week's should see one token
+    arrive rather than the whole line reflow.
+
+    Text carrying no command at all falls through the loop untouched, so prose
+    needs no guard ahead of it.
+    """
+    lines = text.split("\n")
+    for _first, last, joined in _logical_command_spans(lines):
+        if _mentions_flag(joined, anchor) and not _mentions_flag(joined, flag):
+            lines[last] = lines[last].rstrip() + " " + flag
+    return "\n".join(lines)
+
+
+def _parse_update_target(command: str) -> tuple[str, str, str] | None:
+    """`(name, location, project)` off one `clusters update` invocation.
+
+    `None` where any of the three is absent: this builds a command out of what
+    is there and never invents an argument. Both flag spellings are read
+    because the model writes both -- the 2026-09-06 run published
+    `--location us-east4` on one cluster and `--location=us-east4` on the next.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    rest, flags = argv[len(CLUSTERS_UPDATE_PREFIX.split()) :], {}
+    positional = ""
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token.startswith("--"):
+            key, sep, value = token.partition("=")
+            if not sep and index + 1 < len(rest) and not rest[index + 1].startswith("--"):
+                value, index = rest[index + 1], index + 1
+            flags[key] = value
+        elif not positional:
+            positional = token
+        index += 1
+    location, project = flags.get("--location", ""), flags.get("--project", "")
+    return (positional, location, project) if positional and location and project else None
+
+
+def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] | None:
+    """`(name, location, project)` from a `clusters update` command in `text`.
+
+    Read off the command the model already wrote rather than passed in, so a
+    second command built from it names the same cluster by construction,
+    however the model spelled the first one.
+
+    The one carrying `prefer` when there is one, because that is the command
+    this repair is extending and the two invocations have to agree. Otherwise
+    the last, which is the note's final word on which cluster it is about.
+    """
+    fallback = None
+    for _first, _last, joined in reversed(_logical_command_spans(text.split("\n"))):
+        if not joined.startswith(CLUSTERS_UPDATE_PREFIX):
+            continue
+        target = _parse_update_target(joined)
+        if target is None:
+            continue
+        if prefer and _mentions_flag(joined, prefer):
+            return target
+        fallback = fallback or target
+    return fallback
+
+
+def add_dns_access_command(text: str) -> str:
+    """Give a both-endpoints-open finding the second command SOP 2.10 requires.
+
+    Only when the note already carries a `clusters update` to take the cluster's
+    identity from. A note the model wrote some other way is left alone: an
+    incomplete repair a reader can see beats a command this module guessed the
+    arguments for.
+    """
+    if not text or _mentions_flag(text, DNS_ACCESS_FLAG):
+        return text
+    target = _cluster_update_target(text, prefer=AUTHORIZED_NETWORKS_FLAG)
+    if target is None:
+        return text
+    name, location, project = target
+    return text.rstrip("\n") + (
+        f"\n# The DNS endpoint is a second path and authorized networks do not gate it. "
+        f"This closes it for everyone, including anyone reaching the cluster over "
+        f"gke-<hash>.{location}.gke.goog today.\n"
+        f"{CLUSTERS_UPDATE_PREFIX} {name} --location={location} --project={project} {DNS_ACCESS_FLAG}"
+    )
+
+
+def repair_public_control_plane_commands(finding: dict) -> None:
+    """Make `public-control-plane`'s own remediation clear `public-control-plane`.
+
+    Two repairs, one per arm, and both are the difference between a command
+    that fixes the finding and one that reads as though it does. See
+    `GOOGLE_CLOUD_ACCESS_FLAG` for what each was published without.
+
+    The flag goes into all three command-bearing fields, for the reason
+    `normalise_finding_commands` gives: the model writes the same command into
+    the note, the Recommendation line and the confirm-it-worked line, and a
+    note that closes the endpoint above a Recommendation line that does not
+    tells a reader the audit disagrees with itself. The second *command* goes
+    only into the note, which is what `/remediate` reads and what SOP 2.10's
+    Remediation section governs; `recommendation.action` is prose about intent
+    and a bare second invocation pasted into it is not.
+    """
+    if str(finding.get("check") or "") != PUBLIC_CONTROL_PLANE_CHECK:
+        return
+    dns_open = DNS_ENDPOINT_MARKER in _evidence_excerpt(finding)
+
+    def fix(text: str) -> str:
+        return append_gcloud_flag(text, AUTHORIZED_NETWORKS_FLAG, GOOGLE_CLOUD_ACCESS_FLAG)
+
+    recommendation = finding.get("recommendation")
+    if isinstance(recommendation, dict):
+        for field in ("action", "risk"):
+            if isinstance(recommendation.get(field), str):
+                recommendation[field] = fix(recommendation[field])
+    remediation = finding.get("remediation")
+    if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
+        note = fix(remediation["note"])
+        if dns_open:
+            note = add_dns_access_command(note)
+        remediation["note"] = note
+
+
+def repair_remediation_commands(findings: list[dict]) -> list[str]:
+    """`repair_public_control_plane_commands` over `findings`; the ids changed.
+
+    A pass of its own in the finish pipeline as well as inside
+    `normalise_finding_commands`, and it needs both. The DNS half reads
+    `evidence.excerpt`, which is the model's until `adopt_collector_evidence`
+    replaces it, and a finding new this run reaches no other repair point
+    afterwards. Running twice costs nothing: appending a flag that is already
+    there is what the presence test refuses to do.
+    """
+    changed = []
+    for finding in findings:
+        before = copy.deepcopy(finding.get("remediation")), copy.deepcopy(finding.get("recommendation"))
+        repair_public_control_plane_commands(finding)
+        if (finding.get("remediation"), finding.get("recommendation")) != before:
+            changed.append(str(finding.get("id") or ""))
+    return changed
+
+
 def normalise_finding_commands(finding: dict) -> None:
     """Make every gcloud command `finding` publishes one a reader can paste.
 
@@ -3381,6 +3612,11 @@ def normalise_finding_commands(finding: dict) -> None:
     remediation = finding.get("remediation")
     if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
         remediation["note"] = fix(remediation["note"])
+    # Last, so the flag it adds is one this function has already had its say
+    # about, and so a carried note is repaired at the same three points a
+    # mis-cased enum value is. Whether the command *runs* and whether it
+    # *works* are the same question to a reader pasting it.
+    repair_public_control_plane_commands(finding)
 
 
 def severity_counts(findings: list[dict]) -> dict[str, int]:
@@ -9871,6 +10107,14 @@ def handle_finish(args: argparse.Namespace) -> None:
         # line a reviewer reads the preview to check.
         for fid in adopt_arm_impact(data["findings"], manifest):
             log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
+        # Same argument for the preview: the repair below reads the excerpt the
+        # adoption above just wrote, and a preview showing a command the real
+        # run will change is a preview of the wrong document.
+        for fid in repair_remediation_commands(data["findings"]):
+            log(
+                f"{fid}: its remediation was missing a flag without which the "
+                "command does not clear the finding it is published under."
+            )
         _handle_finish_dry_run(
             audit_id, data, now, waiver, repo=opt_repo, manifest=manifest
         )
@@ -10026,6 +10270,15 @@ def handle_finish(args: argparse.Namespace) -> None:
     # sentence would otherwise never reach a finding already in the ledger.
     for fid in adopt_arm_impact(findings, manifest):
         log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
+    # Here rather than only inside `normalise_finding_commands`, and after the
+    # adoption above for the same reason it is: the DNS arm is read off
+    # `evidence.excerpt`, and until the collector's excerpt is in place that
+    # field is the model's prose.
+    for fid in repair_remediation_commands(findings):
+        log(
+            f"{fid}: its remediation was missing a flag without which the "
+            "command does not clear the finding it is published under."
+        )
     # Last of the remediation passes, and after the carry rather than beside the
     # other two: the carry overwrites a `manual` remediation wholesale, so these
     # notes have to be written against the remediation set that ships. The
