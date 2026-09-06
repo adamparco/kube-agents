@@ -2804,6 +2804,40 @@ _IMPACT_CREDENTIAL_INERT = (
 )
 
 
+# What a literal credential can be replaced with, read off a live object instead
+# of invented: `<variable name>` -> `(secret name, secret key)`, for the
+# variables some container in `namespace` already sources from a `secretKeyRef`.
+#
+# `optional: true` is required, and it is the whole safety argument. This audit
+# cannot read Secrets -- RBAC denies `secrets.get` and `secrets.list` fleet-wide,
+# which is what makes §5's "never paste a credential into an excerpt" true by
+# construction rather than by instruction -- so it can never confirm that the
+# Secret behind a reference exists. Under `optional: true` it does not have to: a
+# missing Secret leaves the variable unset, which is exactly as harmless as the
+# placeholder being replaced. Under `optional: false` a missing Secret is
+# `CreateContainerConfigError`, and the audit would have stopped a running
+# workload to fix a `minor` finding about a value that was never a credential.
+#
+# One namespace, because a Secret is namespaced and a reference across namespaces
+# does not resolve. Disagreement is dropped rather than arbitrated: two containers
+# naming different Secrets for one variable means the namespace has no single
+# answer, and choosing between them would be this collector inventing the Secret
+# name the SOP's §4 forbids it to invent.
+def _namespace_secret_refs(namespace: str, workloads: list[dict]) -> dict[str, tuple[str, str]]:
+    seen: dict[str, set[tuple[str, str]]] = {}
+    for other in workloads:
+        if other.get("ns") != namespace:
+            continue
+        for c in _ai_containers(other.get("spec") or {}):
+            for e in c.get("env") or []:
+                ref = ((e.get("valueFrom") or {}).get("secretKeyRef")) or {}
+                name, key, var = ref.get("name"), ref.get("key"), e.get("name") or ""
+                if not (ref.get("optional") and name and key and var):
+                    continue
+                seen.setdefault(var, set()).add((str(name), str(key)))
+    return {var: refs.pop() for var, refs in seen.items() if len(refs) == 1}
+
+
 def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict | None:
     bad, inert = [], []
     for c in _ai_containers(workload["spec"]):
@@ -2841,6 +2875,28 @@ def check_model_credential_plaintext_env(workload: dict, context: dict) -> dict 
         # kept -- and "not a live secret" beside `major` reads as the report
         # contradicting itself.
         hit["excerpt"] += "; every value matches this check's placeholder or unexpanded-reference patterns"
+        # Named here so the model can promote the remediation to `manifest`.
+        # Only on the inert arm: on the `major` arm a value may be a live token,
+        # and swapping it for a reference to a Secret whose contents this audit
+        # cannot read would silently change which credential the workload uses
+        # -- or drop it. The placeholder this arm fired on has no such value to
+        # preserve, so the swap can only improve the declaration.
+        #
+        # All or nothing across `bad`. A partial rewrite leaves the finding open
+        # against the variables it did not reach, and §3.1's suppression of a
+        # resize that leaves its own finding standing is the same rule.
+        refs = _namespace_secret_refs(workload.get("ns") or "", context.get("ai_workloads") or [])
+        wanted = {entry.split(":", 1)[1] for entry in bad}
+        if wanted and wanted <= refs.keys():
+            shape = ", ".join(
+                f"{var} -> secretKeyRef name={refs[var][0]} key={refs[var][1]} optional=true"
+                for var in sorted(wanted)
+            )
+            hit["excerpt"] += (
+                f"; a container in namespace {workload.get('ns') or ''} already sources every one "
+                f"of them from a Secret ({shape}), so copying that reference over these literals "
+                f"fixes the finding without this audit creating a Secret or reading a value"
+            )
     return hit
 
 

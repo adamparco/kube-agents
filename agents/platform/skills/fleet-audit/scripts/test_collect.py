@@ -4541,6 +4541,131 @@ class TestModelCredentialPlaintextEnv(unittest.TestCase):
         self.assertIn("matches this check's placeholder or unexpanded-reference patterns", hit["excerpt"])
 
 
+PLACEHOLDER = "hf_EXAMPLE_PLACEHOLDER_NOT_A_REAL_TOKEN"
+
+
+def secret_ref(name="ai-inference-model-credentials", key="hf-token", optional=True, var="HF_TOKEN"):
+    ref = {"name": name, "key": key}
+    if optional is not None:
+        ref["optional"] = optional
+    return {"name": var, "valueFrom": {"secretKeyRef": ref}}
+
+
+class TestNamespaceSecretRefReplacement(unittest.TestCase):
+    """The one path on which §3.5's `kind: manual, always` gives way.
+
+    The replacement has to be read off a live object, never invented: this
+    audit cannot read Secrets at all, so an `optional: true` reference some
+    container in the same namespace is already running is the only evidence it
+    can have that the swap is safe. `adopt_collector_evidence` overwrites the
+    model's excerpt with this one, so the coordinates have to travel in the
+    excerpt or they never reach the finding.
+    """
+
+    def hit(self, env, *, siblings=(), ns="ai-inference"):
+        w = ai_workload(name="ai-inference-unsafe", ns=ns, container={"env": env})
+        workloads = collect.normalize_ai_workloads(dump_of(w, *siblings))
+        mine = next(x for x in workloads if x["name"] == "ai-inference-unsafe")
+        return collect.check_model_credential_plaintext_env(mine, {"ai_workloads": workloads})
+
+    def sibling(self, env, *, name="ai-inference-hardened", ns="ai-inference"):
+        return ai_workload(name=name, ns=ns, container={"env": env})
+
+    def test_a_sibling_reference_is_named_in_the_excerpt(self):
+        hit = self.hit(
+            [{"name": "HF_TOKEN", "value": PLACEHOLDER}],
+            siblings=[self.sibling([secret_ref()])],
+        )
+        self.assertEqual(hit["severity"], "minor")
+        self.assertIn("HF_TOKEN -> secretKeyRef name=ai-inference-model-credentials key=hf-token", hit["excerpt"])
+        self.assertIn("optional=true", hit["excerpt"])
+        self.assertNotIn(PLACEHOLDER, hit["excerpt"])
+
+    def test_no_sibling_leaves_the_finding_manual(self):
+        hit = self.hit([{"name": "HF_TOKEN", "value": PLACEHOLDER}])
+        self.assertEqual(hit["severity"], "minor")
+        self.assertNotIn("secretKeyRef", hit["excerpt"])
+
+    def test_a_live_looking_value_is_never_offered_a_replacement(self):
+        """The `major` arm, where the swap could discard a real credential.
+
+        The reference points at a Secret whose contents this audit cannot read,
+        so pointing a workload holding a live token at it either changes which
+        credential is used or drops it. Only the arm that has already
+        established every value is a placeholder has nothing to lose.
+        """
+        hit = self.hit(
+            [{"name": "HF_TOKEN", "value": "hf_qMBpTvKzLdWnXaHrYuEjCiSoPfGb"}],
+            siblings=[self.sibling([secret_ref()])],
+        )
+        self.assertIsNone(hit.get("severity"))
+        self.assertNotIn("secretKeyRef", hit["excerpt"])
+
+    def test_a_non_optional_reference_is_not_copied(self):
+        """Without `optional: true` a Secret that does not exist is
+        `CreateContainerConfigError`, and this audit cannot check whether it
+        exists -- so it would be trading a `minor` finding about a placeholder
+        for a stopped workload."""
+        for optional in (False, None):
+            with self.subTest(optional=optional):
+                hit = self.hit(
+                    [{"name": "HF_TOKEN", "value": PLACEHOLDER}],
+                    siblings=[self.sibling([secret_ref(optional=optional)])],
+                )
+                self.assertNotIn("secretKeyRef", hit["excerpt"])
+
+    def test_a_reference_in_another_namespace_is_not_copied(self):
+        """A Secret is namespaced, so the reference would not resolve."""
+        hit = self.hit(
+            [{"name": "HF_TOKEN", "value": PLACEHOLDER}],
+            siblings=[self.sibling([secret_ref()], ns="other")],
+        )
+        self.assertNotIn("secretKeyRef", hit["excerpt"])
+
+    def test_two_siblings_disagreeing_name_nothing(self):
+        """Choosing between them would be inventing the Secret name §4 forbids."""
+        hit = self.hit(
+            [{"name": "HF_TOKEN", "value": PLACEHOLDER}],
+            siblings=[
+                self.sibling([secret_ref(name="creds-a")], name="a"),
+                self.sibling([secret_ref(name="creds-b")], name="b"),
+            ],
+        )
+        self.assertNotIn("secretKeyRef", hit["excerpt"])
+
+    def test_two_siblings_agreeing_still_name_the_reference(self):
+        hit = self.hit(
+            [{"name": "HF_TOKEN", "value": PLACEHOLDER}],
+            siblings=[self.sibling([secret_ref()], name="a"), self.sibling([secret_ref()], name="b")],
+        )
+        self.assertIn("secretKeyRef name=ai-inference-model-credentials", hit["excerpt"])
+
+    def test_one_variable_short_offers_nothing(self):
+        """All or nothing: a rewrite covering `HF_TOKEN` and not `OPENAI_API_KEY`
+        leaves this same finding standing on the variable it missed."""
+        hit = self.hit(
+            [
+                {"name": "HF_TOKEN", "value": PLACEHOLDER},
+                {"name": "OPENAI_API_KEY", "value": "${OPENAI_KEY}"},
+            ],
+            siblings=[self.sibling([secret_ref()])],
+        )
+        self.assertNotIn("secretKeyRef", hit["excerpt"])
+
+    def test_every_variable_covered_names_them_all(self):
+        hit = self.hit(
+            [
+                {"name": "HF_TOKEN", "value": PLACEHOLDER},
+                {"name": "OPENAI_API_KEY", "value": "${OPENAI_KEY}"},
+            ],
+            siblings=[
+                self.sibling([secret_ref(), secret_ref(var="OPENAI_API_KEY", name="openai", key="api-key")])
+            ],
+        )
+        self.assertIn("HF_TOKEN -> secretKeyRef name=ai-inference-model-credentials key=hf-token", hit["excerpt"])
+        self.assertIn("OPENAI_API_KEY -> secretKeyRef name=openai key=api-key", hit["excerpt"])
+
+
 class TestModelImageFloatingTag(unittest.TestCase):
     def hit(self, image):
         # The discriminator is independent of the image under test here, so
