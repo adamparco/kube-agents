@@ -606,6 +606,44 @@ _DECLARED_LEDE = "_(Declared in this repository at "
 def _declared_note(path: str) -> str:
     return f"{_DECLARED_LEDE}`{path}`, though a manual fix opens no pull request.)_"
 
+
+# The model writing, in its own prose, the claim `_DECLARED_LEDE` disproves. It
+# is not the note above under another name: that sentence is appended by this
+# script from an index it built by parsing the clone, while this one is authored
+# during the run by a model that grepped and missed. Both ship in the same
+# finding and say opposite things, and the reader has no way to tell which was
+# measured. Three shapes, each seen or invited by an SOP; the first is the one
+# observed on 2026-09-05, in both `remediation.note` and
+# `recommendation.rationale` of the same two findings.
+_DECLARATION_DENIAL_RE = re.compile(
+    r"\b(?:not|never)\b[^.;]{0,60}\bdeclared\b[^.;]{0,60}\b(?:repo|repository|GitOps)\b"
+    r"|\bdeclared\s+nowhere\b"
+    r"|\bno\s+(?:file|manifest)\b[^.;]{0,60}\bdeclares\b",
+    re.I,
+)
+
+# What the retraction deletes: one sentence, or one semicolon-joined clause. Not
+# a comma, deliberately. "not declared in the repository, so a fix could not
+# travel as a PR" is a claim and its consequence, and cutting at the comma
+# strands the consequence -- "so a fix could not travel as a PR regardless" --
+# reading as though something else in the finding had established it.
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[.;])\s+")
+
+# Every field a denial has been seen in. `recommendation` matters as much as
+# `remediation`: the ledger renders the rationale, and the 2026-09-05 pair
+# carried the false clause in both, so repairing only the note leaves the
+# contradiction on the page.
+_DECLARATION_DENIAL_FIELDS = (
+    ("remediation", "note"),
+    ("recommendation", "rationale"),
+    ("recommendation", "summary"),
+)
+
+# What a kept clause is re-terminated with when the clause it handed off to is
+# the one dropped.
+_SENTENCE_END = "."
+_DANGLING_PUNCTUATION = (";", ",")
+
 # What `timeout(1)` returns for a command it killed, reused so a caller reading
 # `returncode` cannot confuse a timeout with the command's own exit codes.
 _EXIT_TIMEOUT = 124
@@ -9227,6 +9265,111 @@ def _strip_declaration_notes(remediation: dict) -> str:
     return note
 
 
+def _drop_declaration_denials(text: str) -> str:
+    """Return `text` with every clause denying the declaration removed.
+
+    Leaves the machine-authored sentences alone. Both ledes match
+    `_DECLARATION_DENIAL_RE` -- `_UNDECLARED_NOTE` opens "Not declared in this
+    repository" -- and deleting them here would fight `_strip_declaration_notes`
+    for the same characters. Those two are appended and stripped by this script
+    from an index; only the model's prose is in question.
+
+    Returns `text` unchanged when every clause is a denial. A rationale reduced
+    to the empty string renders as a finding with no reason at all, which is a
+    worse page than one carrying a sentence the note beneath it contradicts.
+    """
+    if not text or not _DECLARATION_DENIAL_RE.search(text):
+        return text
+    kept: list[str] = []
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if _DECLARED_LEDE in clause or _UNDECLARED_LEDE in clause:
+            kept.append(clause)
+            continue
+        if _DECLARATION_DENIAL_RE.search(clause):
+            if kept and kept[-1].endswith(_DANGLING_PUNCTUATION):
+                kept[-1] = kept[-1][:-1] + _SENTENCE_END
+            continue
+        kept.append(clause)
+    return " ".join(kept) if kept else text
+
+
+def retract_contradicted_declaration_denials(
+    findings: list[dict], root: Path
+) -> list[str]:
+    """Delete the model's "not declared in the GitOps repository" where it is false.
+
+    `disclose_declared_manual_remediations` below appends the truth; this pass
+    deletes the lie it would otherwise sit next to. On 2026-09-05 two
+    `probes-liveness` findings shipped both sentences at once -- the model's
+    "the object is also not declared in the GitOps repository" and the index's
+    "Declared in this repository at
+    `clusters/spot-capacity-test/workloads/fleet-waste-overrequest-fixtures.yaml`"
+    -- in the same `remediation.note`, and a third copy of the denial in
+    `recommendation.rationale` where no note reaches. Appending alone leaves the
+    reader arbitrating between two sentences of equal apparent authority.
+
+    Python rather than SOP prose, because prose was tried. The gcloud flag-casing
+    rule is the precedent: the instruction was written, the model kept writing
+    the flag the old way, and the fix that held was the one in this file. A
+    declaration is a fact about the clone on disk, which this script can read
+    and the model can only grep for.
+
+    Deletes, never rewrites. Substituting "the object *is* declared at `<path>`"
+    would be this pass authoring a claim into a field the model owns, and the
+    same claim is about to arrive in the note from the index that can prove it.
+
+    Gated on exactly one declaring path, the same bar
+    `disclose_declared_manual_remediations` sets and for a stronger reason here.
+    `kubernetes_declarations` keys on `(kind, name)` without the namespace, so a
+    name reused across two namespaces resolves to two paths and the model's
+    denial may well be true of the object the finding means. Deleting a true
+    sentence is the one failure this pass must not have.
+
+    Runs on every finding, not just the manual ones. A `manifest` remediation
+    whose rationale says the object is undeclared is wrong in the same way and
+    reads worse, since the path it is about to patch is right there.
+
+    Costs a second walk of the clone rather than sharing the index with the two
+    passes below. Kept separate because the retraction is a deletion from the
+    model's fields and the disclosures are appends to ours, and a reader tracing
+    a vanished sentence should find one function that removes them.
+
+    Returns the ids it edited, for the caller to log. Every retraction is a
+    place the model and the repository disagreed, which is worth seeing even
+    when the repository was right.
+    """
+    declared = kubernetes_declarations(root)
+    if not declared:
+        # Empty is "could not look", not "declares nothing" -- and reading it
+        # the other way here would delete true sentences wholesale.
+        return []
+
+    retracted: list[str] = []
+    for finding in findings:
+        obj = str(finding.get("object") or "")
+        kind, _, name = obj.partition("/")
+        if kind not in _GITOPS_DECLARABLE_KINDS or not name:
+            continue
+        if len(declared.get((kind, name)) or []) != 1:
+            continue
+        edited = False
+        for section, field in _DECLARATION_DENIAL_FIELDS:
+            block = finding.get(section)
+            if not isinstance(block, dict):
+                continue
+            before = str(block.get(field) or "")
+            after = _drop_declaration_denials(before)
+            if after != before:
+                block[field] = after
+                edited = True
+        if edited:
+            retracted.append(str(finding.get("id", "")))
+    return retracted
+
+
 def disclose_declared_manual_remediations(
     findings: list[dict], root: Path
 ) -> list[str]:
@@ -10302,6 +10445,16 @@ def handle_finish(args: argparse.Namespace) -> None:
     # notes have to be written against the remediation set that ships. The
     # declared pass goes first of the pair, for the reason
     # `_strip_declaration_notes` gives.
+    # Before the disclosure, not after: the disclosure appends the sentence that
+    # proves the retracted one false, and a pass that ran afterwards would have
+    # to read past its own output to find the model's.
+    for fid in retract_contradicted_declaration_denials(findings, root):
+        log(
+            f"{fid} claimed in its own prose that the object is not declared in "
+            "the GitOps repository, and the repository declares it in exactly "
+            "one file; the sentence was dropped rather than published beside "
+            "the note that contradicts it."
+        )
     for fid in disclose_declared_manual_remediations(findings, root):
         log(
             f"{fid} is manual, but the GitOps repository does declare the object "
