@@ -2066,6 +2066,14 @@ def report_envelope(
         "issue_url": payload.get("issue_url"),
         "partial": payload.get("partial"),
         "coverage_gaps": payload.get("coverage_gaps") or [],
+        # What the collector flagged and the document never mentioned. Stored
+        # because it is the only record that the drop happened: the check still
+        # reports as run, `coverage_gaps` is still empty, and `partial` is still
+        # false. `unpublished_candidates` gives the run that made this necessary.
+        "unpublished_candidates": list(payload.get("unpublished_candidates") or []),
+        "wholly_unpublished_checks": list(
+            payload.get("wholly_unpublished_checks") or []
+        ),
         "collect_s": payload.get("collect_s"),
         "inspect_s": payload.get("inspect_s"),
         "publish_s": payload.get("publish_s"),
@@ -4223,6 +4231,102 @@ def collector_flagged_ids(manifest: dict | None) -> set[str]:
             keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
             flagged.add(derive_finding_id(keyed))
     return flagged
+
+
+def _candidate_rows(manifest: dict | None) -> list[dict]:
+    """Every collector candidate, keyed and labelled the way a finding is.
+
+    Cluster name comes from the enclosing entry, not the candidate, for the
+    reason `adopt_collector_evidence` gives at length: four of the five
+    collectors build the name into `object` and never write a `cluster` key,
+    so an id derived from the candidate alone matches nothing.
+    """
+    if not manifest:
+        return []
+    rows = []
+    for entry in manifest.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            cluster = str(candidate.get("cluster") or cluster_name)
+            keyed = {**candidate, "cluster": cluster}
+            rows.append(
+                {
+                    "id": derive_finding_id(keyed),
+                    "check": str(candidate.get("check") or ""),
+                    "cluster": cluster,
+                    "object": str(candidate.get("object") or ""),
+                }
+            )
+    return rows
+
+
+def unpublished_candidates(findings: list[dict], manifest: dict | None) -> list[dict]:
+    """Every collector candidate this run's document never accounted for.
+
+    A candidate is not a finding, and `collector_flagged_ids` says at length
+    why it must not become one by force: the model is *supposed* to be able to
+    look at what the collector flagged and reject it, so a candidate that does
+    not reach the document is an ordinary outcome rather than an error. What it
+    is not entitled to be is invisible, and until this function it was. The run
+    went on recording the check as having run against the cluster,
+    `coverage_gaps` stayed empty and `partial` stayed false, so a check whose
+    entire output the model dropped published as a check that ran and found
+    nothing. That is the one failure the envelope cannot distinguish from
+    health.
+
+    `fleet-wide-cost-analysis` did exactly that on 2026-09-06. The collector
+    emitted nineteen candidates; the document carried twelve. The seven missing
+    were every `unsized-workload` on `kube-agents-host` — the whole Argo CD
+    install, including an application controller that peaks at 0.18 vCPU and
+    1.6 GiB against no request at all — and §3.12 of that stream's SOP exists
+    to put a number on those seven and on nothing else. The report named the
+    check as run, claimed no gap, and was not partial. Nothing anywhere counted
+    the drop, so the only way to find it was to run the collector by hand and
+    diff it against the published document.
+
+    Disclosed, never forced. These rows say what the collector saw and the
+    document did not repeat, and leave the judgement where the SOP puts it.
+    """
+    published = {derive_finding_id(f) for f in findings}
+    seen: set[str] = set()
+    rows = []
+    for row in _candidate_rows(manifest):
+        if row["id"] in published or row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        rows.append(row)
+    return sorted(rows, key=lambda r: r["id"])
+
+
+def wholly_unpublished_checks(findings: list[dict], manifest: dict | None) -> list[dict]:
+    """The (cluster, check) pairs whose *every* candidate went unpublished.
+
+    `unpublished_candidates` is the honest total and is too blunt to act on: a
+    model rejecting one candidate of six as a false positive is the mechanism
+    working, and a reader who has to sort those out by hand every morning stops
+    reading. A check that emitted candidates on a cluster and published not one
+    of them is the narrower thing — the shape a systematic drop makes, and the
+    shape the Argo CD seven made. It is still not proof of a mistake; a check
+    with a single candidate that deserved rejecting lands here too. It is the
+    subset worth a human's attention.
+    """
+    published = {derive_finding_id(f) for f in findings}
+    totals: dict[tuple[str, str], int] = {}
+    dropped: dict[tuple[str, str], list[str]] = {}
+    for row in _candidate_rows(manifest):
+        key = (row["cluster"], row["check"])
+        totals[key] = totals.get(key, 0) + 1
+        if row["id"] not in published:
+            dropped.setdefault(key, []).append(row["object"])
+    return [
+        {"cluster": cluster, "check": check, "objects": sorted(set(dropped[(cluster, check)]))}
+        for cluster, check in sorted(dropped)
+        if len(dropped[(cluster, check)]) == totals[(cluster, check)]
+    ]
 
 
 class ContainmentError(ValidationError):
@@ -9180,6 +9284,7 @@ def _handle_finish_dry_run(
     now: datetime,
     waiver: str = "",
     repo: str | None = None,
+    manifest: dict | None = None,
 ) -> None:
     findings = list(data["findings"])
 
@@ -9220,6 +9325,12 @@ def _handle_finish_dry_run(
         gaps.append(waiver_gap(waiver))
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
+    for group in wholly_unpublished_checks(findings, manifest):
+        log(
+            f"DRY RUN: every candidate for check '{group['check']}' on cluster "
+            f"'{group['cluster']}' is absent from this document "
+            f"({len(group['objects'])} object(s)). {', '.join(group['objects'])}"
+        )
 
     if not findings:
         if gaps:
@@ -9758,7 +9869,9 @@ def handle_finish(args: argparse.Namespace) -> None:
         # line a reviewer reads the preview to check.
         for fid in adopt_arm_impact(data["findings"], manifest):
             log(f"{fid}: impact taken from the collector, which knows which arm of the check fired.")
-        _handle_finish_dry_run(audit_id, data, now, waiver, repo=opt_repo)
+        _handle_finish_dry_run(
+            audit_id, data, now, waiver, repo=opt_repo, manifest=manifest
+        )
         return
 
     repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
@@ -9805,6 +9918,28 @@ def handle_finish(args: argparse.Namespace) -> None:
         gaps.append(waiver_gap(waiver))
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
+    # Computed here rather than beside the other collector cross-checks further
+    # down, because the CLEAN branch returns before reaching them and CLEAN is
+    # the case that most needs this: a run that published nothing while the
+    # collector was still emitting candidates is a false clean, and every other
+    # field in the envelope agrees the fleet is healthy. Derived from the
+    # document's findings rather than the rendered body's, so a finding held
+    # back for space still counts as accounted for.
+    unpublished = unpublished_candidates(findings, manifest)
+    wholly_dropped = wholly_unpublished_checks(findings, manifest)
+    if unpublished:
+        log(
+            f"NOTE: {len(unpublished)} collector candidate(s) are absent from this "
+            "run's document. Rejecting a candidate is the model's to do, so this "
+            f"is recorded, not corrected. {', '.join(r['id'] for r in unpublished)}"
+        )
+    for group in wholly_dropped:
+        log(
+            f"WARNING: every candidate for check '{group['check']}' on cluster "
+            f"'{group['cluster']}' is absent from this run's document "
+            f"({len(group['objects'])} object(s)), yet the check is reported as "
+            f"having run. {', '.join(group['objects'])}"
+        )
 
     existing_issue, existing_url = find_existing_issue(repo, audit_id)
     # The previous run's ids come from the store this harness wrote (§4.8),
@@ -10121,6 +10256,8 @@ def handle_finish(args: argparse.Namespace) -> None:
             and delta_known,
             "partial": bool(gaps),
             "coverage_gaps": gaps,
+            "unpublished_candidates": unpublished,
+            "wholly_unpublished_checks": wholly_dropped,
             "inspect_s": inspect_s,
             "publish_s": round(time.monotonic() - entry_mono, 1),
             "collect_s": collect_s,
@@ -10518,6 +10655,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # WARNING in the run log.
                 "partial": bool(gaps),
                 "coverage_gaps": gaps,
+                "unpublished_candidates": unpublished,
+                "wholly_unpublished_checks": wholly_dropped,
                 "inspect_s": inspect_s,
                 "publish_s": round(time.monotonic() - entry_mono, 1),
                 "collect_s": collect_s,

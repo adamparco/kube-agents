@@ -536,6 +536,8 @@ class BaseTestCase(unittest.TestCase):
                 "issue_url": f"https://github.com/acme/fleet/issues/{issue_number}",
                 "partial": False,
                 "coverage_gaps": [],
+                "unpublished_candidates": [],
+                "wholly_unpublished_checks": [],
             },
             doc,
             NOW,
@@ -2982,6 +2984,8 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "unpublished_candidates": [],
+                "wholly_unpublished_checks": [],
                 "chat_summary": (
                     "Security & RBAC Posture Audit: 1 critical, 0 major, 0 minor "
                     "(1 new) — https://github.com/acme/fleet/issues/7"
@@ -3040,6 +3044,8 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "unpublished_candidates": [],
+                "wholly_unpublished_checks": [],
                 "chat_summary": (
                     "Security & RBAC Posture Audit: 2 critical, 0 major, 0 minor "
                     "(1 new, 1 resolved) — https://github.com/acme/fleet/issues/42"
@@ -4491,6 +4497,8 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "unpublished_candidates": [],
+                "wholly_unpublished_checks": [],
                 "chat_summary": (
                     "Security & RBAC Posture Audit: clean, ledger closed "
                     "(2 resolved) — https://github.com/acme/fleet/issues/42"
@@ -4634,6 +4642,8 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
+                "unpublished_candidates": [],
+                "wholly_unpublished_checks": [],
                 "chat_summary": "[SILENT]",
             },
         )
@@ -6463,6 +6473,151 @@ def harness_comment(body, node_id="IC_9"):
         "createdAt": "2026-07-01T00:00:00Z",
         "viewerDidAuthor": True,
     }
+
+
+def _cand(check, cluster, obj, namespace=""):
+    return {"check": check, "cluster": cluster, "object": obj, "namespace": namespace}
+
+
+def _manifest(*clusters):
+    return {"clusters": [{"name": n, "candidates": c} for n, c in clusters]}
+
+
+class TestUnpublishedCandidates(BaseTestCase):
+    """A candidate the document never mentions used to leave no trace at all.
+
+    `fleet-wide-cost-analysis` published twelve findings from nineteen
+    candidates on 2026-09-06 and reported the check as run, with no gap and
+    `partial: false`. The seven it dropped were every `unsized-workload` on
+    `kube-agents-host`.
+    """
+
+    def test_published_candidate_is_not_reported(self):
+        m = _manifest(("c1", [_cand("unsized-workload", "c1", "deploy/a")]))
+        findings = [_cand("unsized-workload", "c1", "deploy/a")]
+        self.assertEqual(audit_report.unpublished_candidates(findings, m), [])
+
+    def test_dropped_candidate_is_reported(self):
+        m = _manifest(("c1", [_cand("unsized-workload", "c1", "deploy/a")]))
+        rows = audit_report.unpublished_candidates([], m)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["check"], "unsized-workload")
+        self.assertEqual(rows[0]["cluster"], "c1")
+        self.assertEqual(rows[0]["object"], "deploy/a")
+
+    def test_cluster_comes_from_the_enclosing_entry(self):
+        """Four of the five collectors never write a `cluster` key."""
+        bare = {"check": "unsized-workload", "object": "deploy/a", "namespace": ""}
+        m = {"clusters": [{"name": "c1", "candidates": [bare]}]}
+        rows = audit_report.unpublished_candidates([], m)
+        self.assertEqual(rows[0]["cluster"], "c1")
+        # And the id it derives matches a finding on that cluster, so the
+        # finding is recognised as published rather than reported as dropped.
+        published = [_cand("unsized-workload", "c1", "deploy/a")]
+        self.assertEqual(audit_report.unpublished_candidates(published, m), [])
+
+    def test_no_manifest_reports_nothing(self):
+        self.assertEqual(audit_report.unpublished_candidates([], None), [])
+        self.assertEqual(audit_report.wholly_unpublished_checks([], None), [])
+
+    def test_duplicate_candidates_report_once(self):
+        c = _cand("unsized-workload", "c1", "deploy/a")
+        m = _manifest(("c1", [c, dict(c)]))
+        self.assertEqual(len(audit_report.unpublished_candidates([], m)), 1)
+
+    def test_rows_are_sorted_by_id(self):
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/z"),
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                ],
+            )
+        )
+        rows = audit_report.unpublished_candidates([], m)
+        self.assertEqual([r["id"] for r in rows], sorted(r["id"] for r in rows))
+
+
+class TestWhollyUnpublishedChecks(BaseTestCase):
+    """The narrower signal: a check that published none of what it flagged."""
+
+    def test_partial_drop_is_not_wholly_unpublished(self):
+        """One rejection out of two is the mechanism working, not a drop."""
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                    _cand("unsized-workload", "c1", "deploy/b"),
+                ],
+            )
+        )
+        findings = [_cand("unsized-workload", "c1", "deploy/a")]
+        self.assertEqual(len(audit_report.unpublished_candidates(findings, m)), 1)
+        self.assertEqual(audit_report.wholly_unpublished_checks(findings, m), [])
+
+    def test_total_drop_is_reported(self):
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                    _cand("unsized-workload", "c1", "deploy/b"),
+                ],
+            )
+        )
+        groups = audit_report.wholly_unpublished_checks([], m)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["cluster"], "c1")
+        self.assertEqual(groups[0]["check"], "unsized-workload")
+        self.assertEqual(groups[0]["objects"], ["deploy/a", "deploy/b"])
+
+    def test_one_check_dropped_beside_one_published(self):
+        """The drop is per (cluster, check), not per cluster."""
+        m = _manifest(
+            (
+                "c1",
+                [
+                    _cand("unsized-workload", "c1", "deploy/a"),
+                    _cand("overrequest", "c1", "deploy/b"),
+                ],
+            )
+        )
+        findings = [_cand("overrequest", "c1", "deploy/b")]
+        groups = audit_report.wholly_unpublished_checks(findings, m)
+        self.assertEqual([g["check"] for g in groups], ["unsized-workload"])
+
+    def test_same_check_dropped_on_one_cluster_only(self):
+        m = _manifest(
+            ("c1", [_cand("unsized-workload", "c1", "deploy/a")]),
+            ("c2", [_cand("unsized-workload", "c2", "deploy/b")]),
+        )
+        findings = [_cand("unsized-workload", "c2", "deploy/b")]
+        groups = audit_report.wholly_unpublished_checks(findings, m)
+        self.assertEqual([(g["cluster"], g["check"]) for g in groups], [("c1", "unsized-workload")])
+
+    def test_the_argo_cd_seven(self):
+        """The run that made this necessary, reduced to its shape."""
+        argo = [
+            "statefulset/argocd-application-controller",
+            "deployment/argocd-applicationset-controller",
+            "deployment/argocd-dex-server",
+            "deployment/argocd-notifications-controller",
+            "deployment/argocd-redis",
+            "deployment/argocd-repo-server",
+            "deployment/argocd-server",
+        ]
+        m = _manifest(
+            (
+                "kube-agents-host",
+                [_cand("unsized-workload", "kube-agents-host", o, "argocd") for o in argo],
+            )
+        )
+        self.assertEqual(len(audit_report.unpublished_candidates([], m)), 7)
+        groups = audit_report.wholly_unpublished_checks([], m)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]["objects"]), 7)
 
 
 class TestBelowFloorDisclosure(BaseTestCase):
@@ -8560,6 +8715,12 @@ class TestReportStore(HarnessTestCase):
                 "resolved_ids",
                 "silent_ok",
                 "status",
+                # What the collector flagged and the document never mentioned.
+                # Nothing else in this envelope records that a drop happened:
+                # the check still reports as run, `coverage_gaps` is still
+                # empty, and `partial` is still false.
+                "unpublished_candidates",
+                "wholly_unpublished_checks",
             ],
         )
 
