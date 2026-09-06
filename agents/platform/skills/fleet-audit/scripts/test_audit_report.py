@@ -2914,13 +2914,14 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.touch("clusters/stage-eu/psp.yaml")
         # Nothing here is auto-promotable — the manifest findings are below
-        # `critical` and the one critical is a `gcloud` remediation, which has
-        # no file to put in a pull request. That isolates the reporting path,
-        # which is what this test is about; auto-promotion has its own.
+        # `AUTO_PROMOTION_FLOOR` and the one critical is a `gcloud` remediation,
+        # which has no file to put in a pull request. That isolates the
+        # reporting path, which is what this test is about; auto-promotion has
+        # its own.
         doc = make_doc(
             findings=[
-                make_finding(fid="a", severity="major"),
-                make_finding(fid="b", severity="major"),  # duplicate path
+                make_finding(fid="a", severity="minor"),
+                make_finding(fid="b", severity="minor"),  # duplicate path
                 make_finding(
                     fid="c",
                     severity="minor",
@@ -6506,10 +6507,11 @@ class TestFindingState(BaseTestCase):
 
 
 class TestPromotion(BaseTestCase):
-    def test_only_critical_manifest_findings_auto_promote(self):
+    def test_only_manifest_findings_at_or_above_the_floor_auto_promote(self):
         findings = [
             manifest_finding("crit", "a.yaml", severity="critical"),
             manifest_finding("maj", "b.yaml", severity="major"),
+            manifest_finding("min", "c.yaml", severity="minor"),
             make_finding(
                 fid="crit-gcloud",
                 severity="critical",
@@ -6517,8 +6519,42 @@ class TestPromotion(BaseTestCase):
             ),
         ]
         plan = audit_report.promotion_candidates(findings, {})
-        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
+
+    def test_the_floor_is_a_rank_not_an_equality(self):
+        """A `!=` test reads identically while the floor is the top severity
+        and inverts underneath it: at a `major` floor it files every `critical`
+        under "below the floor" and stops opening the most important pull
+        requests on the fleet. Pin it at each severity the floor could take."""
+        findings = [
+            manifest_finding("crit", "a.yaml", severity="critical"),
+            manifest_finding("maj", "b.yaml", severity="major"),
+            manifest_finding("min", "c.yaml", severity="minor"),
+        ]
+        for floor, promoted in [
+            ("critical", ["crit"]),
+            ("major", ["crit", "maj"]),
+            ("minor", ["crit", "maj", "min"]),
+        ]:
+            with self.subTest(floor=floor):
+                with patch.object(audit_report, "AUTO_PROMOTION_FLOOR", floor):
+                    plan = audit_report.promotion_candidates(findings, {})
+                self.assertEqual(plan.promote, promoted)
+                self.assertEqual(
+                    sorted(plan.below_floor),
+                    sorted(f["id"] for f in findings if f["id"] not in promoted),
+                )
+
+    def test_an_unrecognised_severity_sits_below_every_floor(self):
+        # It sorts last in `sort_findings` too. Promoting on a grade no rung of
+        # the ladder recognises is how a typo in one finding opens a pull
+        # request the severity filter was meant to hold.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("odd", "a.yaml", severity="moderate")], {}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.below_floor, ["odd"])
 
     def test_a_finding_with_an_existing_pr_is_not_promoted_again(self):
         # Every PR state, because "already has a PR" is not one condition. Only
@@ -6833,8 +6869,8 @@ class TestBelowFloorDisclosure(BaseTestCase):
     and no sentence saying `/remediate` would open any of them.
 
     These tests pin the disclosure, not the policy: what the sweep promotes is
-    unchanged, and `test_only_critical_manifest_findings_auto_promote` above
-    still owns that.
+    owned by `test_only_manifest_findings_at_or_above_the_floor_auto_promote`
+    and `test_the_floor_is_a_rank_not_an_equality` above.
     """
 
     def test_a_manifest_fix_under_the_floor_is_reported_not_dropped(self):
@@ -6846,9 +6882,9 @@ class TestBelowFloorDisclosure(BaseTestCase):
             ],
             {},
         )
-        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
-        self.assertEqual(sorted(plan.below_floor), ["maj", "min"])
+        self.assertEqual(plan.below_floor, ["min"])
 
     def test_the_floor_report_excludes_what_the_other_two_filters_refused(self):
         """Severity is tested last, so `below_floor` holds only its own refusals.

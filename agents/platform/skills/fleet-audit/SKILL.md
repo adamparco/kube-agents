@@ -656,11 +656,12 @@ there. Either the remediation was incomplete or something outside this repositor
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
 to put in a diff otherwise. Three paths lead there:
 
-- **Auto-promotion.** A finding that is `critical`, is a `manifest`, and has no live pull request on
-  its branch is promoted automatically by `finish` — **at most five per run**. The surplus is named
-  in the ledger as awaiting `/remediate`, so nothing is silently dropped. "Live" excludes a pull
-  request the harness itself closed as stale (that one is re-openable) and includes one a human
-  closed or merged (those are not).
+- **Auto-promotion.** A finding graded `critical` or `major`, whose remediation is a `manifest`, and
+  which has no live pull request on its branch is promoted automatically by `finish` — **at most
+  five per run**. The surplus is named in the ledger as awaiting `/remediate`, so nothing is
+  silently dropped, and so is every `minor` one, which sits below the severity floor and stays there
+  until someone asks. "Live" excludes a pull request the harness itself closed as stale (that one is
+  re-openable) and includes one a human closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
   access to the repository. This path is uncapped: a human asked for that one by name.
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
@@ -726,7 +727,7 @@ python3 ./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id
 
 **It opens exactly what you name, and nothing else.** The auto-promotion sweep does not ride along:
 one `--finding` produces one pull request (or one, shared, for the group that path belongs to), never
-five more for critical findings the requester never mentioned and cannot tell apart from the one they
+five more for findings the requester never mentioned and cannot tell apart from the one they
 did. Auto-promotion happens in `finish`, where the whole fleet is being reported on anyway.
 
 It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, `refused`, and

@@ -939,12 +939,26 @@ MAX_PR_PAGE = 1000
 # `/remediate` bypasses it: a human asked for that one by name.
 AUTO_PROMOTION_CAP = 5
 
-# The severity the automatic sweep requires before it opens a pull request
-# unasked. It is the tighter of the two filters by a wide margin -- see
-# `_render_withheld`, which names what each of them held back -- so it is a
-# constant rather than a literal in the loop, to be found by anyone measuring
-# why a ledger full of manifest remediations opened nothing.
-AUTO_PROMOTION_FLOOR = "critical"
+# The least-severe grade the automatic sweep will open a pull request for
+# unasked. Inclusive: a finding *at* the floor promotes. Compare it by rank
+# through `SEVERITY_RANK`, never by equality -- an `==` test is indistinguishable
+# from this one only while the floor is the top severity, and silently stops
+# promoting `critical` the moment it is not.
+#
+# It was `critical`, which on a real fleet selected the empty set: the findings
+# graded `critical` were exposure problems closed with `gcloud`, and the ones
+# attracting a declarative fix were graded `major` and `minor`, so the sweep's
+# two conditions were disjoint and it opened nothing. That is no longer quite
+# true -- 2026-09-06 measured 3 `critical` manifest remediations across the nine
+# streams, and all three did open -- but it left 26 more permanently withheld
+# behind a filter that never clears, 5 of them `major`.
+#
+# `major` rather than `minor` because the 21 remaining are `minor`, 15 on
+# `security-patch-orchestrator` alone, which would sit at `AUTO_PROMOTION_CAP`
+# for three consecutive runs; a `minor` is defence-in-depth the ledger can go on
+# offering to `/remediate`. At `major` every stream's sweep fits inside the cap
+# in one run.
+AUTO_PROMOTION_FLOOR = "major"
 
 # `authorAssociation` values that imply write access. Read by `is_machine_author`
 # and by nothing else — it is **not** the `/remediate` authorization gate, and
@@ -5673,10 +5687,10 @@ def promotion_candidates(
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
-    Auto-promotion is deliberately narrow — `critical`, `manifest`, and no
-    live pull request on its branch — and capped, so one bad night cannot bury
-    the repository in generated pull requests. An explicit `/remediate` bypasses
-    the cap: a human asked for that one by name.
+    Auto-promotion is deliberately narrow — at or above `AUTO_PROMOTION_FLOOR`,
+    `manifest`, and no live pull request on its branch — and capped, so one bad
+    night cannot bury the repository in generated pull requests. An explicit
+    `/remediate` bypasses both: a human asked for that one by name.
 
     `auto_promote=False` turns the sweep off entirely and is what the `remediate`
     subcommand passes. That command is a person naming ids, and a person who
@@ -5755,7 +5769,16 @@ def promotion_candidates(
         # finding with a live pull request or a `gcloud` fix would land in
         # `below_floor` too, and the ledger would invite `/remediate` on work
         # that is already open or has no manifest to open.
-        if finding.get("severity") != AUTO_PROMOTION_FLOOR:
+        #
+        # By rank, not by equality. `!= AUTO_PROMOTION_FLOOR` reads the same
+        # while the floor is the top severity and inverts underneath it: at a
+        # `major` floor it would file every `critical` under "below the floor"
+        # and stop opening the pull requests that matter most. An unrecognised
+        # severity sorts below every real one, as it does in `sort_findings`.
+        severity = str(finding.get("severity", ""))
+        if SEVERITY_RANK.get(severity, len(SEVERITIES)) > SEVERITY_RANK[
+            AUTO_PROMOTION_FLOOR
+        ]:
             below_floor.append(fid)
             continue
         auto.append(fid)
@@ -6530,14 +6553,18 @@ def _render_withheld(
 
     Two filters drop work and only the cap used to be named. The cap is by far
     the smaller of them. Measured across the nine live streams on 2026-09-05,
-    it held back nothing at all, while the `critical` floor held back every
-    manifest remediation on the fleet -- 20 of them, 15 on one ledger -- and
-    said so nowhere. The two do not overlap on a real fleet: the findings
-    graded `critical` are exposure problems closed with `gcloud`, and the ones
-    attracting a declarative fix are graded `major` and `minor`, so the sweep's
-    two conditions select disjoint sets and it opens nothing. A reader of that
-    ledger saw fifteen manifest remediations, no pull requests, and no sentence
-    telling them one comment would open any of them.
+    it held back nothing at all, while the floor -- then `critical` -- held back
+    every manifest remediation on the fleet, 20 of them, 15 on one ledger, and
+    said so nowhere. A reader of that ledger saw fifteen manifest remediations,
+    no pull requests, and no sentence telling them one comment would open any
+    of them. Naming them here is what answered that; lowering the floor to
+    `major` is what stopped most of them being withheld in the first place.
+
+    The floor is still the larger filter. Re-measured 2026-09-06: 3 `critical`
+    and 5 `major` manifest remediations promote, 21 `minor` are withheld, and
+    the cap again held back nothing. So this block is now mostly `minor` work
+    -- defence-in-depth a reader may reasonably never ask for -- rather than
+    the whole declarative output of the fleet.
 
     Both are named, in separate blocks, because the answer to them differs: the
     cap clears itself on the next run, and the floor never does.
