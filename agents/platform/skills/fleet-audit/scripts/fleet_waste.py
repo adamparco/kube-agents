@@ -2166,7 +2166,8 @@ IMPACT = {
     "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
     "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
     "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
-    "idle-workload": "Nothing has used this controller for weeks, and its request is already at the platform minimum -- the reservation, and any load balancer in front of it, bill for a workload nobody is calling."
+    "idle-workload": "Nothing has used this controller for weeks, and its request is already at the platform minimum -- the reservation, and any load balancer in front of it, bill for a workload nobody is calling.",
+    "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
 
@@ -2879,6 +2880,108 @@ def check_idle_address(addresses: list[dict], referenced_addresses: set[str], *,
     return hits
 
 
+#: Below this, a repository is not worth a finding whatever its policy. A
+#: registry is one of the few GCP resources whose cost is *only* size, so the
+#: threshold is the bill: 50 GiB is about $5/month of Artifact Registry storage,
+#: which is the order §3.5 already treats as `minor`, and a finding that
+#: recommends work costing more than it saves is noise. Nothing is lost
+#: permanently by setting it here rather than lower -- a repository with no
+#: policy only grows, so a smaller one crosses the floor and reports later.
+REGISTRY_SIZE_FLOOR_BYTES = 50 * 1024**3
+
+#: A repository is billed for what it holds, so the size that matters is what it
+#: will hold, not what it holds now. `major` needs a repository already large
+#: enough that a cleanup pass returns real money.
+REGISTRY_SIZE_MAJOR_BYTES = 500 * 1024**3
+
+#: Or growing fast enough to get there. Average daily growth is `sizeBytes` over
+#: the repository's age -- the only growth figure a single `list` can produce,
+#: and enough to separate a repository that filled up once from one a CI job is
+#: still pushing to. 2 GiB/day is 730 GiB a year.
+REGISTRY_GROWTH_MAJOR_BYTES_PER_DAY = 2 * 1024**3
+
+#: A repository younger than this has no history to clean. Its average-growth
+#: figure is also noise -- one day of pushes divided by one day of age reads as
+#: a runaway.
+REGISTRY_MIN_AGE_DAYS = 30
+
+#: Only a repository that stores its own artifacts. A `REMOTE_REPOSITORY` is a
+#: pull-through cache whose contents GCP evicts on its own schedule, and a
+#: `VIRTUAL_REPOSITORY` stores nothing at all -- it is a view over others, and
+#: `sizeBytes` on one double-counts the upstreams this check already reads.
+REGISTRY_BILLED_MODE = "STANDARD_REPOSITORY"
+
+BYTES_PER_GIB = 1024**3
+
+
+def check_registry_no_cleanup(repositories: list[dict], *, project: str, now: datetime) -> list[dict]:
+    """§3.14 -- Artifact Registry repositories nothing ever deletes from.
+
+    The one waste class in this SOP that grows without anybody doing anything.
+    Every other check finds a resource somebody provisioned and stopped using;
+    this one finds the absence of a policy, and the bill climbs on every CI push
+    until one is written. On the reference install the single repository reached
+    91.9 GB in 44 days -- 2.1 GB/day, from image builds nothing prunes.
+
+    A dry-run policy counts as no policy, deliberately. `cleanupPolicyDryRun`
+    makes Artifact Registry log what it would delete and delete nothing, which
+    is how a policy is supposed to be introduced -- and how one is forgotten. It
+    reads as configured in the console and in `gcloud ... list`, so a check that
+    tested only for the presence of `cleanupPolicies` would call the forgotten
+    case clean.
+    """
+    hits = []
+    for repo in repositories:
+        if repo.get("mode") != REGISTRY_BILLED_MODE:
+            continue
+        # `sizeBytes` is a string in the API's JSON -- int64 over the wire -- and
+        # is absent entirely on an empty repository.
+        try:
+            size = int(repo.get("sizeBytes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if size < REGISTRY_SIZE_FLOOR_BYTES:
+            continue
+        age = _age_days(repo.get("createTime", ""), now=now)
+        if age is None or age < REGISTRY_MIN_AGE_DAYS:
+            continue
+        policies = repo.get("cleanupPolicies") or {}
+        dry_run = bool(repo.get("cleanupPolicyDryRun"))
+        if policies and not dry_run:
+            continue
+        # `name` is the full resource path; the location is what the remediation
+        # has to carry, and it is only available here.
+        parts = str(repo.get("name") or "").split("/")
+        short = parts[-1] if parts else ""
+        location = parts[3] if len(parts) > 4 else ""
+        per_day = size / age
+        severity = (
+            "major"
+            if size >= REGISTRY_SIZE_MAJOR_BYTES
+            or per_day >= REGISTRY_GROWTH_MAJOR_BYTES_PER_DAY
+            else "minor"
+        )
+        why = (
+            f"{len(policies)} cleanup polic{'y' if len(policies) == 1 else 'ies'} "
+            "configured, all in dry-run, so nothing is deleted"
+            if policies
+            else "no cleanup policy"
+        )
+        hits.append(
+            {
+                "object": f"ArtifactRegistryRepository/{short}",
+                "excerpt": (
+                    f"{repo.get('format', 'unknown')} repository in {location}: "
+                    f"{size / BYTES_PER_GIB:.1f} GiB, {why}, created "
+                    f"{repo.get('createTime')}{_ago(age)} "
+                    f"(--location={location})"
+                ),
+                "severity": severity,
+            }
+        )
+    return hits
+
+
 def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], backend_services: list[dict], known_services: set[str], *, now: datetime) -> list[dict]:
     hits = []
     # The GKE service controller writes this description as a JSON object --
@@ -2957,10 +3060,23 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "error": f"{len(failed)} of 5 compute list reads failed -- " + "; ".join(failed),
         }
 
+    # Outside the five-read gate above, on purpose. Those five gate as one
+    # because §3.4-§3.6 cross-reference each other's objects; §3.14 shares
+    # nothing with them, so a project without the Artifact Registry API enabled
+    # -- or without the allowlist entry for this read -- must not take
+    # `unattached-disk` and `idle-address` down with it. That is not a
+    # hypothetical: the disks filter bug above did exactly that to this whole
+    # target for every run until it was found. No `--location`: unset lists
+    # every location in one read, and the banner it prints goes to stderr.
+    reg_argv = ["gcloud", "artifacts", "repositories", "list", "--project", project, "--format", "json"]
+    reg_parsed, reg_result = run_and_gate(reg_argv, run=run)
+
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters)]
     candidates += [_emit("idle-address", h) for h in check_idle_address(addr_parsed, fleet_facts["referenced_addresses"], project=project, now=now)]
     if all_reachable:
         candidates += [_emit("orphan-lb", h) for h in check_orphan_lb(fwd_parsed, tp_parsed, bs_parsed, fleet_facts["service_names"], now=now)]
+    if reg_parsed is not None:
+        candidates += [_emit("registry-no-cleanup", h) for h in check_registry_no_cleanup(reg_parsed, project=project, now=now)]
 
     entry = {
         "name": f"project/{project}",
@@ -2971,7 +3087,12 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             {"check": "unattached-disk", **_record(shlex.join(disks_argv), disks_result)},
             {"check": "idle-address", **_record(shlex.join(addr_argv), addr_result)},
         ]
-        + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else []),
+        + ([{"check": "orphan-lb", **_record(shlex.join(fwd_argv), fwd_result)}] if all_reachable else [])
+        # Recorded only when the read succeeded, which is what puts
+        # `registry-no-cleanup` into §6's `coverage_gaps` when it did not. A
+        # command entry carrying a non-zero rc would instead read as a check
+        # that ran and found nothing.
+        + ([{"check": "registry-no-cleanup", **_record(shlex.join(reg_argv), reg_result)}] if reg_parsed is not None else []),
         "candidates": candidates,
     }
     if not all_reachable:
@@ -2994,6 +3115,30 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             "contributed no readable cluster at all -- so a rule its Services "
             "reference would read as orphaned. See this project's cluster "
             "entries in this manifest for the reason each one failed."
+        )
+    # After the block above, not before it: that one assigns `limitations`
+    # outright rather than appending, so a registry gap written first would be
+    # overwritten on any project with an unreadable cluster -- which is most of
+    # them on a fleet this size.
+    if reg_parsed is None:
+        # `run_and_gate` returns None three ways, and only one of them is a
+        # non-zero exit. A gap that said "exited 0" over an empty or unparseable
+        # answer would send a reader to look for an error gcloud never reported.
+        why = (
+            f"exited {reg_result.rc} ({reg_result.stderr.strip()[:200] or 'no stderr'})"
+            if reg_result.rc != 0
+            else "exited 0 and returned no parseable JSON"
+        )
+        registry_gap = (
+            "registry-no-cleanup was not evaluated for this project: "
+            f"`{shlex.join(reg_argv)}` {why}. The compute "
+            "checks in this entry are unaffected -- §3.14 shares no data with "
+            "them and is gated separately."
+        )
+        entry["limitations"] = (
+            f"{entry['limitations']} {registry_gap}"
+            if entry.get("limitations")
+            else registry_gap
         )
     return entry
 

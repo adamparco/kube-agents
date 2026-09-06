@@ -1422,6 +1422,46 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
 
+    def test_the_registry_cleanup_policy_read_is_allowed(self):
+        # §3.14's only data source, and the same failure the firewall read
+        # above had: unlisted, the check is inert -- it reports nothing and
+        # says nothing, because a gate-failed read degrades to a coverage gap
+        # rather than an error. Both --project spellings, for the same reason.
+        for argv, desc in (
+            (["gcloud", "artifacts", "repositories", "list", "--project", "p",
+              "--format", "json"],
+             "collector's read, space-separated --project"),
+            (["gcloud", "artifacts", "repositories", "list", "--project=p",
+              "--format=json"],
+             "the SOP's printed spelling"),
+            (["gcloud", "artifacts", "repositories", "describe", "images",
+              "--location=us-east4", "--project=p"],
+             "the remediation's confirming read"),
+        ):
+            with self.subTest(desc=desc):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{desc}: {decision.message}")
+
+    def test_writing_a_cleanup_policy_stays_refused(self):
+        # §3.14's remediation is `kind: gcloud` precisely because a cleanup
+        # policy deletes container images, and a `keep` rule that misses a tag
+        # some cluster still deploys breaks the next pod schedule in the fleet.
+        # The agent prints those commands for a human; it must not run them.
+        for argv, desc in (
+            (["gcloud", "artifacts", "repositories", "set-cleanup-policies",
+              "images", "--location=us-east4", "--policy=policy.json"],
+             "set-cleanup-policies"),
+            (["gcloud", "artifacts", "repositories", "delete", "images",
+              "--location=us-east4"], "repositories delete"),
+            (["gcloud", "artifacts", "repositories", "create", "images",
+              "--repository-format=docker", "--location=us-east4"],
+             "repositories create"),
+            (["gcloud", "artifacts", "repositories", "update", "images",
+              "--location=us-east4"], "repositories update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
     def test_the_inference_skills_can_generate_a_manifest(self):
         # `manifests create` renders YAML and mutates nothing in the cloud, and
         # four skills document it as the step after `profiles list` with no MCP

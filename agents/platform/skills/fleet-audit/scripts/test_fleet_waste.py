@@ -2414,6 +2414,115 @@ class IdleAddressTest(unittest.TestCase):
         self.assertIn(f"and {40 - fw.ROLLUP_EXCERPT_MEMBERS} more", hits[0]["excerpt"])
 
 
+GIB = 1024**3
+
+
+class RegistryNoCleanupTest(unittest.TestCase):
+    """§3.14 -- the one waste class that grows while nobody touches it."""
+
+    def repo(
+        self,
+        name="projects/acme/locations/us-east4/repositories/images",
+        mode="STANDARD_REPOSITORY",
+        size=90 * GIB,
+        created="2026-06-02T00:00:00Z",
+        policies=None,
+        dry_run=None,
+    ):
+        r = {"name": name, "mode": mode, "format": "DOCKER", "createTime": created}
+        if size is not None:
+            # The API sends int64 as a JSON string; the collector has to cope.
+            r["sizeBytes"] = str(size)
+        if policies is not None:
+            r["cleanupPolicies"] = policies
+        if dry_run is not None:
+            r["cleanupPolicyDryRun"] = dry_run
+        return r
+
+    def check(self, *repos):
+        return fw.check_registry_no_cleanup(list(repos), project="acme", now=NOW)
+
+    def test_flags_a_large_old_repository_with_no_policy(self):
+        hits = self.check(self.repo())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ArtifactRegistryRepository/images")
+        self.assertIn("no cleanup policy", hits[0]["excerpt"])
+
+    def test_the_object_is_the_short_name_not_the_resource_path(self):
+        """`object` is half the finding's identity, and a resource path carries
+        the project and location -- move the repository and the ledger announces
+        the same leak as resolved and then as new."""
+        self.assertNotIn("projects/", self.check(self.repo())[0]["object"])
+
+    def test_a_live_policy_is_not_flagged(self):
+        self.assertEqual(self.check(self.repo(policies={"keep-recent": {}})), [])
+
+    def test_a_dry_run_policy_counts_as_no_policy(self):
+        """The forgotten case. `cleanupPolicyDryRun` deletes nothing, and both
+        the console and `gcloud ... list` render it as a configured policy, so a
+        check that tested only for the key's presence would call it clean."""
+        hits = self.check(self.repo(policies={"keep-recent": {}}, dry_run=True))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("dry-run", hits[0]["excerpt"])
+        self.assertIn("1 cleanup policy", hits[0]["excerpt"])
+
+    def test_the_dry_run_count_is_pluralised(self):
+        hits = self.check(self.repo(policies={"a": {}, "b": {}}, dry_run=True))
+        self.assertIn("2 cleanup policies", hits[0]["excerpt"])
+
+    def test_below_the_size_floor_is_not_flagged(self):
+        self.assertEqual(self.check(self.repo(size=fw.REGISTRY_SIZE_FLOOR_BYTES - 1)), [])
+
+    def test_below_the_age_floor_is_not_flagged(self):
+        """One day of pushes over one day of age reads as a runaway, and a
+        repository that new has no history to clean."""
+        self.assertEqual(self.check(self.repo(created="2026-07-25T00:00:00Z")), [])
+
+    def test_a_remote_repository_is_not_flagged(self):
+        self.assertEqual(self.check(self.repo(mode="REMOTE_REPOSITORY")), [])
+
+    def test_a_virtual_repository_is_not_flagged(self):
+        """It stores nothing; its `sizeBytes` double-counts the repositories
+        behind it, which this check reads on their own."""
+        self.assertEqual(self.check(self.repo(mode="VIRTUAL_REPOSITORY")), [])
+
+    def test_an_empty_repository_is_not_flagged(self):
+        """`sizeBytes` is absent, not zero, on a repository holding nothing."""
+        self.assertEqual(self.check(self.repo(size=None)), [])
+
+    def test_an_unparseable_size_is_skipped_rather_than_raising(self):
+        r = self.repo()
+        r["sizeBytes"] = "not-a-number"
+        self.assertEqual(self.check(r), [])
+
+    def test_a_repository_with_no_create_time_is_skipped(self):
+        self.assertEqual(self.check(self.repo(created="")), [])
+
+    def test_size_alone_reaches_major(self):
+        hits = self.check(self.repo(size=fw.REGISTRY_SIZE_MAJOR_BYTES, created="2025-01-01T00:00:00Z"))
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_growth_alone_reaches_major(self):
+        """100 GiB in 40 days is 2.5 GiB/day -- well under the size bar and
+        still worth a `major`, because the bill only goes one way."""
+        hits = self.check(self.repo(size=100 * GIB, created="2026-06-22T00:00:00Z"))
+        self.assertLess(100 * GIB, fw.REGISTRY_SIZE_MAJOR_BYTES)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_large_but_slow_stays_minor(self):
+        hits = self.check(self.repo(size=60 * GIB, created="2025-06-02T00:00:00Z"))
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_the_excerpt_carries_the_location_scope_flag(self):
+        """§3.5's lesson in a different API. An Artifact Registry verb with no
+        `--location` resolves against gcloud's configured default and answers
+        `NOT_FOUND`, which reads as a repository somebody already cleaned up."""
+        self.assertIn("--location=us-east4", self.check(self.repo())[0]["excerpt"])
+
+    def test_the_excerpt_names_the_age_rather_than_only_the_timestamp(self):
+        self.assertIn("(60d ago)", self.check(self.repo())[0]["excerpt"])
+
+
 class OrphanLbTest(unittest.TestCase):
     def test_flags_forwarding_rule_targeting_deleted_service(self):
         rule = {"name": "fr1", "description": "kubernetes.io/service-name: staging/checkout", "creationTimestamp": "2026-01-01T00:00:00Z"}
@@ -2577,7 +2686,10 @@ class AgeInExcerptTest(unittest.TestCase):
 
 
 class CollectProjectComputeTest(unittest.TestCase):
-    """The five project-scope reads, and what happens when one of them fails.
+    """The five gated project-scope reads, and what happens when one fails.
+
+    Six reads happen here, not five: §3.14's Artifact Registry list is gated by
+    itself, so it is deliberately absent from the "N of 5" arithmetic below.
 
     The `run` here emulates gcloud's *argument parser*, not just its API, which
     is the whole point: the disks read spent its entire life failing on a filter
@@ -2664,6 +2776,44 @@ class CollectProjectComputeTest(unittest.TestCase):
         target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
         self.assertIn("orphan-lb", [c["check"] for c in target["commands"]])
         self.assertNotIn("limitations", target)
+
+    def test_the_registry_read_is_recorded_alongside_the_compute_ones(self):
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW)
+        entry = next(c for c in target["commands"] if c["check"] == "registry-no-cleanup")
+        self.assertIn("gcloud artifacts repositories list", entry["command"])
+
+    def test_a_failed_registry_read_does_not_gate_the_compute_checks(self):
+        """The whole reason §3.14 is outside the five-read gate. The Artifact
+        Registry API is enabled per project and the read needs its own IAM
+        permission, so on a project that has neither this must cost one check
+        rather than `unattached-disk` and `idle-address` as well."""
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"repositories": "PERMISSION_DENIED"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "collected")
+        self.assertIn("unattached-disk", [c["check"] for c in target["commands"]])
+        self.assertNotIn("registry-no-cleanup", [c["check"] for c in target["commands"]])
+        self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
+        self.assertIn("PERMISSION_DENIED", target["limitations"])
+
+    def test_a_failed_compute_read_still_gates_everything(self):
+        """The other direction. Splitting the registry read out must not have
+        loosened the five that cross-reference each other."""
+        target = fw.collect_project_compute(
+            "acme", True, self.FACTS, run=self.run_with(fail={"disks": "denied"}), now=NOW
+        )
+        self.assertEqual(target["outcome"], "gate-failed")
+        self.assertIn("1 of 5", target["error"])
+
+    def test_a_withheld_orphan_lb_and_a_failed_registry_read_are_both_reported(self):
+        """`limitations` is one string and the orphan-lb branch assigns it
+        outright. Written in the other order the registry gap would vanish on
+        any project holding an unreadable cluster, which is most of them."""
+        target = fw.collect_project_compute(
+            "acme", False, self.FACTS, run=self.run_with(fail={"repositories": "denied-r"}), now=NOW
+        )
+        self.assertIn("orphan-lb was not evaluated", target["limitations"])
+        self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
 
 
 class CollectClusterTest(unittest.TestCase):
@@ -3114,7 +3264,7 @@ class FleetConcurrencyTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3148,7 +3298,7 @@ class CrashIsolationTest(unittest.TestCase):
                 if any("boom" in str(v) for v in kwargs.get("env", {}).values()):
                     raise TypeError("unsupported operand type(s) for /: 'str' and 'str'")
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3209,7 +3359,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3252,7 +3402,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                     disk = {"name": "shared-disk-id", "creationTimestamp": "2020-01-01T00:00:00Z", "sizeGb": "10", "type": "pd-standard", "zone": "z"}
                     return run_of(0, json.dumps([disk]))
                 return run_of(0, "[]")
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3283,7 +3433,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3312,7 +3462,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3347,7 +3497,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3376,7 +3526,7 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 return run_of(0, json.dumps(dump_of()))
             if argv[:4] == ["gcloud", "compute", "forwarding-rules", "list"]:
                 return run_of(0, json.dumps([rule] if orphan_rule else []))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3407,14 +3557,17 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
         self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
         self.assertNotIn("orphan-lb", {c["check"] for c in project["candidates"]})
         self.assertIn("orphan-lb was not evaluated", project["limitations"])
-        # The other two project checks still run: only 3.6 needs the union.
-        self.assertEqual({c["check"] for c in project["commands"]}, {"unattached-disk", "idle-address"})
+        # The other project checks still run: only 3.6 needs the union.
+        self.assertEqual(
+            {c["check"] for c in project["commands"]},
+            {"unattached-disk", "idle-address", "registry-no-cleanup"},
+        )
 
     def test_an_unlistable_project_also_closes_the_gate(self):
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
                 return run_of(1, "", "PERMISSION_DENIED")
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3438,7 +3591,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3472,7 +3625,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of()))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 
@@ -3593,7 +3746,7 @@ class CandidatesCarryTheirDeclarationTest(unittest.TestCase):
                 return run_of(0)
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of(self.pvc("data"), self.pvc("scratch"))))
-            if argv[:2] == ["gcloud", "compute"]:
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
                 return run_of(0, "[]")
             return run_of(0, "")
 

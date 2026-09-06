@@ -196,8 +196,9 @@ AUDITS: dict[str, AuditSpec] = {
             "underrequest",
             "unsized-workload",
             "idle-workload",
+            "registry-no-cleanup",
         ),
-        # §3.4–3.6 read Compute Engine objects that belong to a project, not to
+        # §3.4–3.6 and §3.14 read GCP objects that belong to a project, not to
         # a cluster; the SOP's §3 project-scoped rule puts them on their own
         # `project/<id>` entry.
         scopes=(
@@ -219,7 +220,15 @@ AUDITS: dict[str, AuditSpec] = {
                     "idle-workload",
                 ),
             ),
-            ("project", ("unattached-disk", "idle-address", "orphan-lb")),
+            (
+                "project",
+                (
+                    "unattached-disk",
+                    "idle-address",
+                    "orphan-lb",
+                    "registry-no-cleanup",
+                ),
+            ),
         ),
     ),
     "fleet-consistency-drift": AuditSpec(

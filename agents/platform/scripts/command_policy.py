@@ -280,6 +280,20 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # before proposing a manifest. `images delete` shares three of the
         # four words and stays refused -- the tests hold the door.
         ("artifacts", "docker", "images", "describe"),
+        # The only read behind §3.14 `registry-no-cleanup`, and the check is
+        # inert without it: a repository's `sizeBytes`, `cleanupPolicies`,
+        # `cleanupPolicyDryRun` and `mode` have no other surface, and
+        # `images describe` above is per-image, so reconstructing a repository's
+        # size from it would need one call per version -- 250 for the reference
+        # install's largest. `describe` is here for the same reason
+        # `compute disks describe` is: the remediation names it as the
+        # confirm-before-you-change read, and refusing the object-scoped read
+        # while allowing the project-wide list forces the broader one. Both are
+        # pure reads; `repositories create`, `delete`, and
+        # `set-cleanup-policies` -- the last of which is the remediation this
+        # check *proposes* -- stay refused, and the tests assert it.
+        ("artifacts", "repositories", "describe"),
+        ("artifacts", "repositories", "list"),
         ("auth", "list"),
         ("config", "get"),
         ("config", "get-value"),
