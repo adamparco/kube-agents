@@ -1276,6 +1276,47 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False)
         self.assertIn("trailing 6h", hits[0]["excerpt"])
 
+    def test_a_short_window_says_why_it_disagrees_with_the_command(self):
+        # `evidence.command` records the Monitoring read verbatim, so it says
+        # `window=168h` however young the controller is. Three findings of the
+        # 2026-09-06 cost report shipped that number beside an excerpt reading
+        # "trailing 12h", with nothing to reconcile them.
+        pod = self.deployment_pod(started="2026-07-31T18:00:00Z")
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("oldest pod started 6h ago", excerpt)
+
+    def test_a_window_under_a_day_says_it_has_not_seen_one(self):
+        # Six hours cannot distinguish an idle workload from one whose traffic
+        # arrives overnight, and what follows the excerpt is an instruction to
+        # shrink a request.
+        pod = self.deployment_pod(started="2026-07-31T18:00:00Z")
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn("under a full daily cycle", excerpt)
+
+    def test_a_window_over_a_day_but_under_the_read_omits_the_cycle_clause(self):
+        pod = self.deployment_pod(started="2026-07-29T00:00:00Z")
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn("trailing 72h", excerpt)
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertNotIn("daily cycle", excerpt)
+
+    def test_a_full_window_says_nothing_about_the_read(self):
+        # The two numbers agree, so there is nothing to reconcile and the
+        # sentence stays the short one it has always been.
+        pod = self.deployment_pod()
+        excerpt = fw.check_overrequest(
+            {"pods": [pod]}, {("default", "api-1"): (0.9, 3072.0)}, now=NOW, autopilot=False
+        )[0]["excerpt"]
+        self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h (Cloud Monitoring)", excerpt)
+        self.assertNotIn("the read covers", excerpt)
+
     def test_the_window_follows_the_longest_lived_pod_of_the_controller(self):
         old = self.deployment_pod(name="api-1", started="2026-07-01T00:00:00Z")
         fresh = self.deployment_pod(name="api-2", started="2026-07-31T18:00:00Z")
@@ -1614,6 +1655,14 @@ class UnderrequestTest(unittest.TestCase):
         hits = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})
         self.assertIn("trailing 6h", hits[0]["excerpt"])
 
+    def test_a_short_window_says_why_it_disagrees_with_the_command(self):
+        # Same clause as the over-request check: all three sizing checks share
+        # one helper, so a fix to the sentence reaches every one of them.
+        pod = self.pod(started="2026-07-31T18:00:00Z")
+        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("under a full daily cycle", excerpt)
+
     def test_a_multi_replica_excerpt_gives_the_per_replica_arithmetic(self):
         """Inflating a request is the wrong direction to be wrong in here.
 
@@ -1686,6 +1735,15 @@ class UnsizedWorkloadTest(unittest.TestCase):
         self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
         self.assertIn("14m / 133Mi per replica", excerpt)
         self.assertNotIn("floor", excerpt)
+
+    def test_a_short_window_says_why_it_disagrees_with_the_command(self):
+        # The third of the three sizing checks sharing the helper. On the live
+        # fleet this is the one that fired at 7h.
+        pod = self.pod(started="2026-07-31T18:00:00Z")
+        excerpt = self.check([pod], {("argocd", "argocd-repo-server-1"): (0.0071, 66.6)})[0]["excerpt"]
+        self.assertIn("trailing 6h", excerpt)
+        self.assertIn(f"the read covers {fw.USAGE_WINDOW_HOURS}h", excerpt)
+        self.assertIn("under a full daily cycle", excerpt)
 
     def test_the_excerpt_is_written_in_the_units_of_the_manifest_edit(self):
         """§3.1's vCPU and GiB round this population to zero -- nobody forgets

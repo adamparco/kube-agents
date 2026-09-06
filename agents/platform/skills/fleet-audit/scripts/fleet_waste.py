@@ -89,6 +89,12 @@ MAX_WORKERS = 8
 # ten-minute sample was blind to. Monitoring retains these metrics well past
 # this, so the bound is a judgement about relevance, not availability.
 USAGE_WINDOW_HOURS = 168
+# Under this much observation the measurement has not seen a full daily cycle,
+# so a workload with any diurnal shape can read as idle for want of having been
+# watched overnight. The finding still publishes -- it is usually right, and the
+# stream re-runs -- but the excerpt says so, because what follows it is an
+# instruction to shrink a request.
+SHORT_OBSERVATION_HOURS = 24
 # Alignment happens twice. The primary period buckets each container's raw
 # points before they are summed across the containers of a pod -- it has to
 # be short enough that a spike stays a spike, since a wide bucket averages
@@ -1455,6 +1461,36 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
     return by_owner
 
 
+def _measured_over(oldest_h: float | None) -> tuple[int, str]:
+    """The window a controller was really measured over, and how to say it.
+
+    `USAGE_WINDOW_HOURS` is what the Monitoring read asks for. A controller
+    whose pods all started later than that has less, and every sizing check
+    clamps to the age of its longest-lived pod so the finding does not claim to
+    have watched something that did not exist.
+
+    Both numbers then reach the reader, from different directions, and until
+    now neither said anything about the other. `evidence.command` records the
+    read verbatim and so carries `window=168h`; the excerpt carried "over the
+    trailing 12h". The 2026-09-06 cost report published three findings that way
+    -- a reader checking the evidence had the query in one hand, a different
+    number in the other, and no way to reconcile them but to guess which was
+    wrong.
+
+    Returns `(window_h, phrase)`. The phrase is the shared clause of all three
+    sizing excerpts, so a check appends its own punctuation.
+    """
+    window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
+    if window_h >= USAGE_WINDOW_HOURS:
+        return window_h, f"over the trailing {window_h}h (Cloud Monitoring)"
+    cycle = ", under a full daily cycle" if window_h < SHORT_OBSERVATION_HOURS else ""
+    return window_h, (
+        f"over the trailing {window_h}h (Cloud Monitoring: the read covers "
+        f"{USAGE_WINDOW_HOURS}h, and this controller's oldest pod started "
+        f"{window_h}h ago{cycle})"
+    )
+
+
 def _resize_shrinks_request(
     request_total: float, peak_total: float, replicas: int, *, floor: float, unit: float
 ) -> bool:
@@ -1590,8 +1626,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         if not material:
             continue
 
-        oldest_h = entry["oldest_h"]
-        window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
+        _, measured_over = _measured_over(entry["oldest_h"])
         severity = "major" if delta_cpu >= 8 or delta_mem_gib >= 32 else "minor"
         if autopilot and severity == "minor":
             severity = "major"
@@ -1604,7 +1639,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # model wrote with it, so this sentence is the one part of the finding
         # guaranteed to reach the reviewer intact.
         dimensions = [d for d, on in (("cpu", cpu_idle), ("memory", mem_idle)) if on]
-        measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB over the trailing {window_h}h (Cloud Monitoring)"
+        measured = f"peak observed {peak_cpu:.2f} vCPU / {peak_mem / 1024.0:.1f} GiB {measured_over}"
         # Every number above is summed across the controller's pods, because
         # that is what the fleet is actually paying for -- but the remediation
         # edits one container's request in one manifest, and §3.1 sizes it at
@@ -1701,8 +1736,7 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         if overage <= 0 or overage < UNDERREQUEST_FLOOR_MIB:
             continue
 
-        oldest_h = entry["oldest_h"]
-        window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
+        _, measured_over = _measured_over(entry["oldest_h"])
         # `critical` is reserved for the case that is already failing rather
         # than merely mis-scheduled: sustained usage within 10% of the ceiling
         # is an OOMKill waiting for one more request. Everything else is
@@ -1716,7 +1750,7 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         ceiling = f"{mem_lim_total / 1024.0:.1f} GiB limit" if mem_lim_total > 0 else "no memory limit"
         excerpt = (
             f"requests {mem_req_total / 1024.0:.2f} GiB of memory ({ceiling}); mean observed "
-            f"{mean_mem / 1024.0:.2f} GiB over the trailing {window_h}h (Cloud Monitoring) — "
+            f"{mean_mem / 1024.0:.2f} GiB {measured_over} — "
             f"{mean_mem / mem_req_total * 100:.0f}% of request, {overage / 1024.0:.2f} GiB above it; "
             f"peak {peak_mem / 1024.0:.2f} GiB. Sustained, not a burst."
         )
@@ -1830,8 +1864,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             continue
 
         replicas = len(entry["pods"])
-        oldest_h = entry["oldest_h"]
-        window_h = USAGE_WINDOW_HOURS if oldest_h is None else min(USAGE_WINDOW_HOURS, round(oldest_h))
+        _, measured_over = _measured_over(entry["oldest_h"])
         # §3.1's 2x, per replica, because the manifest declares one replica's
         # request. Floored at the smallest values worth writing into a manifest
         # so a near-silent sidecar is not handed a `1m`/`1Mi` request that no
@@ -1860,7 +1893,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             f"declares no CPU or memory request on "
             f"{'container' if len(entry['containers']) == 1 else 'containers'} "
             f"{', '.join(entry['containers'])}; peak observed {peak_cpu_m:.1f}m vCPU / "
-            f"{peak_mem:.0f}Mi over the trailing {window_h}h (Cloud Monitoring). "
+            f"{peak_mem:.0f}Mi {measured_over}. "
             f"Sized at 2x the peak that is {want_cpu_m:.0f}m / {want_mem_mib:.0f}Mi per replica"
         )
         if replicas > 1:
