@@ -2585,6 +2585,42 @@ class CollectClusterTest(unittest.TestCase):
         for na in entry["checks_not_applicable"]:
             self.assertIn("no nodes", na["reason"])
 
+    def test_an_empty_cluster_whose_read_failed_is_a_gap_not_an_exemption(self):
+        """The exemption above rests on the read having come back — empty, but
+        come back. A read that never completed says nothing about the cluster,
+        and the same run says so out loud for every cluster that has nodes: a
+        403 that produces "no metrics because nothing ran on it" here and
+        "read failed (rc=403)" three clusters down is one report making two
+        claims about one failure."""
+        entry = self._metrics_down(
+            session=FakeSession(status=403, text="caller lacks monitoring.timeSeries.list"),
+        )
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("rc=403", entry["limitations"])
+        self.assertIn("overrequest and unsized-workload could not be measured",
+                      entry["limitations"])
+        self.assertIn("underrequest could not be measured", entry["limitations"])
+
+    def test_a_transport_failure_does_not_exempt_an_empty_cluster(self):
+        # rc -1: the arm a credential fault at startup or a dropped connection
+        # takes. It fails every cluster's read at once, so this is where one
+        # fault would have become a fleet of structural verdicts.
+        entry = self._metrics_down(
+            session=FakeSession(raises=ConnectionError("connection reset")),
+        )
+        self.assertNotIn("checks_not_applicable", entry)
+        self.assertIn("rc=-1", entry["limitations"])
+        self.assertIn("connection reset", entry["limitations"])
+
+    def test_an_empty_answer_is_not_described_as_a_failure(self):
+        """rc 0 is a 200 that carried no series — the cluster is not shipping
+        system metrics. Reporting that as `failed (rc=0)` asked the reader to
+        reconcile a failure with the exit status that means success."""
+        entry = self._metrics_down(obj("Node", "node-1"))
+        self.assertIn("not shipping system metrics", entry["limitations"])
+        self.assertNotIn("rc=0", entry["limitations"])
+        self.assertNotIn("failed", entry["limitations"])
+
     def _unreadable_pools(self, cluster=None):
         def run(argv, **kwargs):
             if "get-credentials" in argv:

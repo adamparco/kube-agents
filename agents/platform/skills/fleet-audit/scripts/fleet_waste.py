@@ -2020,6 +2020,28 @@ def crashed_entry(cluster: dict, exc: BaseException) -> dict:
     }
 
 
+def _metrics_gap_phrase(result: Run, read: str) -> str:
+    """How a §2 metrics limitation should describe the read behind it.
+
+    `fetch_usage_peaks` and `fetch_memory_means` both fold two outcomes into
+    `available=False`, and only one of them is a failure: rc 0 is a 200 that
+    carried no time series, which says the cluster is not shipping system
+    metrics, and every other rc is a read that did not complete. Calling the
+    first one "failed (rc=0)" gave the reader a contradiction to resolve
+    before they could act on it -- an rc of zero is the one value that
+    normally means nothing went wrong.
+    """
+    if result.rc == 0:
+        return (
+            f"the Cloud Monitoring {read} read returned no container time"
+            " series, so this cluster is not shipping system metrics"
+        )
+    return (
+        f"the Cloud Monitoring {read} read failed (rc={result.rc}) — "
+        f"{result.stderr.strip()[:200] or 'no detail'}"
+    )
+
+
 def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime) -> tuple[dict, dict]:
     """Returns `(manifest_entry, fleet_facts)` — the second only populated
     when the object dump succeeded; `collect_fleet` unions it across every
@@ -2166,7 +2188,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             _emit("unsized-workload", h)
             for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
         ]
-    elif not context["nodes"]:
+    elif not context["nodes"] and usage_result.rc == 0:
         # A cluster with no nodes cannot be over-requesting: there is no
         # capacity for a reservation to waste, and nothing has run for a
         # request to be measured against. The usage read comes back empty
@@ -2178,6 +2200,18 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # 7301c594's failure again from the other side. A `partial` that fires
         # on every empty cluster is one operators learn to scroll past, and the
         # gap it hides next time will be a real one.
+        #
+        # `rc == 0` is what earns the word "returns" in the reason below.
+        # `metrics_ok` is False for a read that came back empty *and* for one
+        # that never came back at all -- `fetch_usage_peaks` returns rc 0 only
+        # for the empty answer, -1 for a missing ADC session or a transport
+        # error, and the HTTP status for anything else. Without the guard, a
+        # credential failure at startup fails every cluster's read and this
+        # arm tells the operator that each empty one has no metrics because
+        # nothing ran on it -- a structural verdict drawn from a measurement
+        # that was never taken, and one the same report contradicts a few
+        # lines down, where every cluster that does have nodes carries the
+        # honest "read failed" limitation for the identical failure.
         not_applicable.append(
             {
                 "check": "overrequest",
@@ -2209,19 +2243,20 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # whether it was denied, throttled, or never attempted.
         limitations.append(
             f"overrequest and unsized-workload could not be measured on this "
-            f"cluster: the Cloud Monitoring usage read failed "
-            f"(rc={usage_result.rc}) — "
-            f"{usage_result.stderr.strip()[:200] or 'no detail'}"
+            f"cluster: {_metrics_gap_phrase(usage_result, 'usage')}"
         )
 
     if means_ok:
         commands["underrequest"] = means_record
         candidates += [_emit("underrequest", h) for h in check_underrequest(context, usage_peaks, memory_means, now=now)]
-    elif not context["nodes"]:
+    elif not context["nodes"] and means_result.rc == 0:
         # Same vacuum as `overrequest`'s arm above, read the other way round: a
         # cluster with no nodes has nothing scheduled, so no pod can be sitting
         # above its request, and the empty Monitoring answer says only that
-        # nothing ran.
+        # nothing ran. Same `rc == 0` guard, for the same reason, and it
+        # carries here even when the usage read is what failed: line 2070
+        # hands `means_result` the very same `Run`, so its rc is the usage
+        # read's rc and a failure there does not become a verdict here.
         not_applicable.append(
             {
                 "check": "underrequest",
@@ -2235,9 +2270,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         )
     else:
         limitations.append(
-            f"underrequest could not be measured on this cluster: the Cloud "
-            f"Monitoring mean-memory read failed (rc={means_result.rc}) — "
-            f"{means_result.stderr.strip()[:200] or 'no detail'}"
+            f"underrequest could not be measured on this cluster: "
+            f"{_metrics_gap_phrase(means_result, 'mean-memory')}"
         )
 
     entry = {
