@@ -1591,6 +1591,95 @@ def _resize_shrinks_request(
     return request_per_replica - target > max(request_per_replica, target) * 1e-9
 
 
+def _is_guaranteed(entry: dict) -> bool:
+    """Whether this controller's pods are `Guaranteed` QoS: requests == limits.
+
+    Aggregated across the controller's pods, which is safe for this question
+    because equality is preserved by summation in the only direction that
+    matters: pods that each declare `requests == limits` sum to equal totals,
+    and it takes an implausible coincidence -- one pod over on CPU by exactly
+    what another is under -- for unequal pods to sum to equal ones. Both checks
+    that read this then say `Guaranteed` about a controller kubelet would agree
+    with.
+
+    Read by `check_overrequest`, which refuses to propose a resize here, and by
+    `check_idle_workload`, which needs the same verdict because that refusal is
+    what hands it the finding. Spelt once so the two cannot drift into either
+    reporting one controller twice or dropping it between them.
+    """
+    cpu_req = mem_req = cpu_lim = mem_lim = 0.0
+    for pod in entry["pods"]:
+        for req in pod["requests"]:
+            cpu_req += parse_cpu_cores(str(req.get("cpu", "0"))) or 0
+            mem_req += parse_mem_mib(str(req.get("memory", "0"))) or 0
+        for lim in pod["limits"]:
+            cpu_lim += parse_cpu_cores(str(lim.get("cpu", "0"))) or 0
+            mem_lim += parse_mem_mib(str(lim.get("memory", "0"))) or 0
+    return cpu_req == cpu_lim and mem_req == mem_lim and cpu_lim > 0
+
+
+def _idle_on_every_dimension(
+    cpu_req: float, peak_cpu: float, mem_req: float, peak_mem: float
+) -> bool:
+    """§3.13's idleness bar: under the ratio on every dimension declared.
+
+    Every, not either. A workload using none of its CPU and all of its memory
+    is doing something, and §3.1 is the check that owns one oversized
+    dimension. A dimension the controller does not declare is not a vote.
+    """
+    return all(
+        peak / req <= IDLE_WORKLOAD_UTILISATION
+        for req, peak in ((cpu_req, peak_cpu), (mem_req, peak_mem))
+        if req
+    )
+
+
+def _stands_down_instead_of_resizing(
+    context: dict,
+    kind: str,
+    ns: str,
+    name: str,
+    *,
+    guaranteed: bool,
+    cpu_req: float,
+    peak_cpu: float,
+    mem_req: float,
+    peak_mem: float,
+    now: datetime,
+) -> bool:
+    """Whether §3.13 takes this controller off §3.1's hands.
+
+    §3.1 declines to resize a `Guaranteed` controller at all -- on such a pod
+    the request *is* the limit, so a number derived from a week of observed
+    idleness becomes an enforcement ceiling, and the SOP has it emit `manual`
+    with the reason. That refusal was leaving the fully idle ones with nowhere
+    to go. §3.13 would not take them either, because its partition asks whether
+    a resize is *arithmetically* available rather than whether §3.1 will make
+    one, and above the 50m/64Mi floor the arithmetic says yes. The result was a
+    controller idle for a fortnight getting prose from one check and silence
+    from the other, when the edit §3.13 proposes -- `spec.replicas: 0` -- is
+    both available and free of the hazard §3.1 is avoiding: standing a workload
+    down sets no ceiling, because there is no pod left for a ceiling to bind.
+
+    Observed on 2026-09-06: `ai-inference-hardened` and `ai-inference-unsafe`
+    on `adamparco-gitops`, each `Guaranteed` at 0.50 vCPU / 2.0 GiB and each
+    peaking at 0.00 vCPU over the trailing week, both declared in the GitOps
+    repo and both published `kind: manual`.
+
+    So this is the one case where §3.1 yields. It is deliberately the narrow
+    one: idle on *every* dimension, past §3.13's age bar, and `Guaranteed`. A
+    `Guaranteed` controller idle on one dimension only stays §3.1's, where the
+    `manual` note is the right answer -- nothing is unused, one number is
+    wrong, and no stand-down is warranted.
+    """
+    if not guaranteed:
+        return False
+    age_days = _controller_age_days(context, kind, ns, name, now=now)
+    if age_days is None or age_days < IDLE_WORKLOAD_MIN_AGE_DAYS:
+        return False
+    return _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem)
+
+
 def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopilot: bool) -> list[dict]:
     """`usage_peaks` is `fetch_usage_peaks`'s `(ns, pod) -> (cores, MiB)`.
 
@@ -1608,18 +1697,14 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
     hits = []
     for (_ns, kind, name), entry in by_owner.items():
         cpu_req_total = mem_req_total = 0.0
-        cpu_lim_total = mem_lim_total = 0.0
         for pod in entry["pods"]:
             for req in pod["requests"]:
                 cpu_req_total += parse_cpu_cores(str(req.get("cpu", "0"))) or 0
                 mem_req_total += parse_mem_mib(str(req.get("memory", "0"))) or 0
-            for lim in pod["limits"]:
-                cpu_lim_total += parse_cpu_cores(str(lim.get("cpu", "0"))) or 0
-                mem_lim_total += parse_mem_mib(str(lim.get("memory", "0"))) or 0
         if cpu_req_total == 0 and mem_req_total == 0:
             continue
         replicas = len(entry["pods"])
-        guaranteed = cpu_req_total == cpu_lim_total and mem_req_total == mem_lim_total and cpu_lim_total > 0
+        guaranteed = _is_guaranteed(entry)
 
         peak_cpu = peak_mem = 0.0
         measured = False
@@ -1640,6 +1725,24 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         # one namespace missing from an otherwise-populated answer, or a
         # metrics agent down on a single node, lands here instead.
         if not measured:
+            continue
+        # The one case this check yields to §3.13. A `Guaranteed` controller
+        # idle on every dimension gets a stand-down there rather than the
+        # `manual` note here, because the note is all this check can offer it
+        # and a pull request is available. `_stands_down_instead_of_resizing`
+        # holds the argument and both halves of the partition.
+        if _stands_down_instead_of_resizing(
+            context,
+            kind,
+            entry["ns"],
+            name,
+            guaranteed=guaranteed,
+            cpu_req=cpu_req_total,
+            peak_cpu=peak_cpu,
+            mem_req=mem_req_total,
+            peak_mem=peak_mem,
+            now=now,
+        ):
             continue
         # Per dimension, not across both. Requiring CPU *and* memory to be idle
         # together made the common shape invisible: a controller sized for its
@@ -1809,10 +1912,15 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
     the remediation is deleting the manifest -- which, unlike the resize, is a
     pull request somebody can merge.
 
-    The partition with §3.1 is exact and load-bearing: this fires only where
-    `_resize_shrinks_request` is false on every declared dimension, which is
-    precisely where §3.1 does not. No controller can produce both findings, so
-    the report never asks a reader to both shrink and delete the same object.
+    The partition with §3.1 is exact and load-bearing, and it turns on whether
+    §3.1 *will* propose a resize rather than on whether one is arithmetically
+    available. Usually those are the same thing and this fires only where
+    `_resize_shrinks_request` is false on every declared dimension. The
+    exception is a `Guaranteed` controller, where §3.1 declines the resize it
+    could compute, because on such a pod the request is also the limit;
+    `_stands_down_instead_of_resizing` carries that argument and §3.1 skips
+    exactly what this admits. Either way no controller produces both findings,
+    so the report never asks a reader to both shrink and stand down one object.
     """
     if not usage_peaks:
         return []
@@ -1851,30 +1959,38 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
         if not measured:
             continue
 
-        # Every dimension the controller declares, not just one. A workload
-        # using none of its CPU and all of its memory is doing something.
-        idle = all(
-            peak / req <= IDLE_WORKLOAD_UTILISATION
-            for req, peak in ((cpu_req, peak_cpu), (mem_req, peak_mem))
-            if req
-        )
-        if not idle:
+        if not _idle_on_every_dimension(cpu_req, peak_cpu, mem_req, peak_mem):
             continue
-        # The partition with §3.1. Anything shrinkable belongs there.
-        if _resize_shrinks_request(
-            cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
-        ) or _resize_shrinks_request(
-            mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+        # The partition with §3.1. Anything shrinkable belongs there -- unless
+        # §3.1 refuses to shrink it, which is what `Guaranteed` means here.
+        guaranteed = _is_guaranteed(entry)
+        if not guaranteed and (
+            _resize_shrinks_request(
+                cpu_req, peak_cpu, replicas, floor=OVERREQUEST_RESIZE_FLOOR_VCPU, unit=0.001
+            )
+            or _resize_shrinks_request(
+                mem_req, peak_mem, replicas, floor=OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0
+            )
         ):
             continue
 
         _, measured_over = _measured_over(entry["oldest_h"])
+        # Why no resize is on the table, which is the reader's first question
+        # and now has two answers. Naming the wrong one would send them to
+        # check a floor the manifest is nowhere near.
+        no_resize = (
+            "Requests and limits are equal, so any resize would lower the "
+            "enforcement ceiling with them -- a sizing observation is not a "
+            "safe limit, which is why no resize is offered"
+            if guaranteed
+            else "Every dimension is already at the 50m/64Mi floor, so no "
+            "resize can reclaim any of it"
+        )
         excerpt = (
             f"requests {cpu_req:.3f} vCPU / {mem_req:.0f} MiB across {replicas} "
             f"replica{'s' if replicas != 1 else ''}; peak observed "
             f"{peak_cpu * 1000:.1f}m vCPU / {peak_mem:.1f} MiB {measured_over}. "
-            f"Declared {age_days:.0f} days ago. Every dimension is already at "
-            f"the 50m/64Mi floor, so no resize can reclaim any of it"
+            f"Declared {age_days:.0f} days ago. {no_resize}"
         )
         # The reservation is the smaller half of the bill. A LoadBalancer
         # Service in front of an unused Deployment holds a forwarding rule and
@@ -1897,11 +2013,25 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
                 "excerpt": excerpt,
-                # A floor-bound request is small by construction, so the pod
-                # alone never justifies more than `minor`. The load balancer
-                # does: it is the larger charge, and unlike the pod it is
-                # reachable from the internet while nothing uses it.
-                "severity": "major" if fronting else "minor",
+                # A floor-bound request is small by construction, so on that
+                # arm the pod alone never justifies more than `minor`. The load
+                # balancer does: it is the larger charge, and unlike the pod it
+                # is reachable from the internet while nothing uses it. The
+                # `Guaranteed` arm has no such construction -- those requests
+                # are whatever the author wrote, and the two on the live fleet
+                # hold 0.50 vCPU / 2.0 GiB each -- so it is graded on the size
+                # of the reservation, against the same floors §3.1 uses to
+                # decide a request is worth reporting at all.
+                "severity": "major"
+                if fronting
+                or (
+                    guaranteed
+                    and (
+                        cpu_req >= OVERREQUEST_FLOOR_VCPU
+                        or mem_req / 1024.0 >= OVERREQUEST_FLOOR_GIB
+                    )
+                )
+                else "minor",
             }
         )
     return hits
@@ -2166,7 +2296,7 @@ IMPACT = {
     "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
     "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
     "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
-    "idle-workload": "Nothing has used this controller for weeks, and its request is already at the platform minimum -- the reservation, and any load balancer in front of it, bill for a workload nobody is calling.",
+    "idle-workload": "Nothing has used this controller for weeks, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a workload nobody is calling. The excerpt says which of the two reasons applies.",
     "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
@@ -2540,7 +2670,8 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
             for h in check_unsized(context, usage_peaks, now=now, autopilot=bool(cluster.get("autopilot")))
         ]
         # Same peak read again, and the population 3.1 drops: a controller
-        # whose resize would change nothing because nothing is using it.
+        # whose resize would change nothing because nothing is using it, or
+        # one whose resize 3.1 refuses to make because it is `Guaranteed`.
         commands["idle-workload"] = usage_record
         candidates += [emit("idle-workload", h) for h in check_idle_workload(context, usage_peaks, now=now)]
     elif not context["nodes"] and usage_result.rc == 0:

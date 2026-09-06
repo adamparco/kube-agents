@@ -1534,6 +1534,8 @@ class IdleWorkloadTest(unittest.TestCase):
         ns=NS,
         cpu_req="50m",
         mem_req="64Mi",
+        cpu_lim=None,
+        mem_lim=None,
         started="2026-07-25T00:00:00Z",
         owner_kind="ReplicaSet",
         owner_name="hello-world-7d9f8c6b45",
@@ -1544,18 +1546,33 @@ class IdleWorkloadTest(unittest.TestCase):
             requests["cpu"] = cpu_req
         if mem_req:
             requests["memory"] = mem_req
+        # Omitted entirely rather than empty: a pod with no `limits` key is
+        # Burstable, which is what every fixture predating the Guaranteed arm
+        # is and must stay.
+        resources = {"requests": requests}
+        limits = {}
+        if cpu_lim:
+            limits["cpu"] = cpu_lim
+        if mem_lim:
+            limits["memory"] = mem_lim
+        if limits:
+            resources["limits"] = limits
         return obj(
             "Pod",
             name,
             ns=ns,
             **{
-                "spec.containers": [{"resources": {"requests": requests}}],
+                "spec.containers": [{"resources": resources}],
                 "status.startTime": started,
                 "status.phase": "Running",
                 "metadata.labels": {"app": "hello-world", "pod-template-hash": self.HASH} if labels is None else labels,
                 "metadata.ownerReferences": [{"kind": owner_kind, "name": owner_name}],
             },
         )
+
+    def guaranteed_pod(self, *, cpu="500m", mem="2Gi", **kw):
+        """The live shape: `ai-inference-hardened`, requests == limits."""
+        return self.pod(cpu_req=cpu, mem_req=mem, cpu_lim=cpu, mem_lim=mem, **kw)
 
     def controller(self, kind="Deployment", name="hello-world", *, ns=NS, created="2026-07-01T00:00:00Z"):
         return obj(kind, name, ns=ns, **{"metadata.creationTimestamp": created})
@@ -1611,6 +1628,77 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertEqual(fw.check_overrequest(floor_bound, self.IDLE, now=NOW, autopilot=False), [])
         self.assertEqual(fw.check_idle_workload(shrinkable, big_peak, now=NOW), [])
         self.assertEqual(len(fw.check_overrequest(shrinkable, big_peak, now=NOW, autopilot=False)), 1)
+
+    def test_a_fully_idle_guaranteed_controller_stands_down_instead_of_resizing(self):
+        """The `ai-inference` shape: §3.1 can resize it and refuses to.
+
+        Requests equal limits at 0.50 vCPU / 2.0 GiB against a peak of nothing.
+        `_resize_shrinks_request` is true on both dimensions -- 2 x nothing
+        clamps to 50m/64Mi, well under what it declares -- so before this arm
+        existed §3.1 took it and published `kind: manual`, and §3.13 stayed
+        silent. Neither offered the pull request that `spec.replicas: 0` is.
+        """
+        ctx = self.context(pods=[self.guaranteed_pod()])
+        peaks = {(self.NS, self.POD): (0.0, 0.0)}
+
+        hits = fw.check_idle_workload(ctx, peaks, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Deployment/hello-world")
+        # Graded on the reservation, not on the floor argument that grades the
+        # other arm: half a vCPU idle for a month is not `minor`.
+        self.assertEqual(hits[0]["severity"], "major")
+        # And §3.1 must have let go of it, or the object reports twice.
+        self.assertEqual(fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False), [])
+
+    def test_the_guaranteed_excerpt_names_the_ceiling_not_the_floor(self):
+        # Both arms answer "why is no resize offered", and they answer it
+        # differently. Naming the 50m/64Mi floor on a controller declaring
+        # 0.50 vCPU sends the reader to check something that is not true.
+        hits = fw.check_idle_workload(
+            self.context(pods=[self.guaranteed_pod()]), {(self.NS, self.POD): (0.0, 0.0)}, now=NOW
+        )
+        self.assertIn("enforcement ceiling", hits[0]["excerpt"])
+        self.assertNotIn("50m/64Mi floor", hits[0]["excerpt"])
+
+    def test_a_guaranteed_controller_idle_on_one_dimension_stays_overrequests(self):
+        """The narrow case is idle on *every* dimension, and only that.
+
+        A `Guaranteed` controller using all its memory and none of its CPU is
+        not unused -- one number is wrong. §3.1's `manual` note is the right
+        answer there and a stand-down would be destructive.
+        """
+        ctx = self.context(pods=[self.guaranteed_pod()])
+        # 0% of the CPU, 95% of the 2 GiB.
+        peaks = {(self.NS, self.POD): (0.0, 1945.6)}
+        self.assertEqual(fw.check_idle_workload(ctx, peaks, now=NOW), [])
+        over = fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)
+        self.assertEqual(len(over), 1)
+        self.assertTrue(over[0]["_guaranteed"])
+
+    def test_a_guaranteed_controller_under_the_age_bar_stays_overrequests(self):
+        """§3.13's fortnight is not waived by the Guaranteed arm.
+
+        The two live findings were six days old when this was written. A
+        stand-down proposed against a workload somebody deployed on Monday is
+        the recommendation this age bar exists to refuse, so §3.1 keeps it and
+        the `manual` note stands until it has been idle long enough.
+        """
+        ctx = self.context(
+            pods=[self.guaranteed_pod()],
+            controllers=[self.controller(created="2026-07-27T00:00:00Z")],
+        )
+        peaks = {(self.NS, self.POD): (0.0, 0.0)}
+        self.assertEqual(fw.check_idle_workload(ctx, peaks, now=NOW), [])
+        self.assertEqual(len(fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)), 1)
+
+    def test_a_small_guaranteed_reservation_is_still_minor(self):
+        # The severity split is on the size of what is held, not on the QoS
+        # class: a Guaranteed controller sitting on 50m/64Mi has given up as
+        # little as the floor-bound one beside it.
+        ctx = self.context(pods=[self.guaranteed_pod(cpu="50m", mem="64Mi")])
+        hits = fw.check_idle_workload(ctx, self.IDLE, now=NOW)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
 
     def test_one_shrinkable_dimension_sends_the_whole_controller_to_overrequest(self):
         # Either dimension having somewhere to go is enough, so both halves of
