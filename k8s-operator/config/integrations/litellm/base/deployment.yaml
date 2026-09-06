@@ -27,6 +27,14 @@ spec:
         # the pod template itself change, which is what triggers the rollout.
         kubeagents.x-k8s.io/model-config: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
     spec:
+      # Kept in step with charts/kube-agents/templates/litellm.yaml, which
+      # explains why 65532 is the right uid for this image.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: litellm-container
           # Substituted by the deploy-litellm target; the pin lives in
@@ -41,6 +49,12 @@ spec:
             limits:
               cpu: "500m"
               memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
           env:
             - name: GEMINI_API_KEY
               valueFrom:
