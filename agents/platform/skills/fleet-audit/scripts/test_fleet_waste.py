@@ -4003,6 +4003,17 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
         mine, theirs = self.bodies("reconciler_of")
         self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
+    def test_the_release_resolver_matches_collect_py(self):
+        # The four halves of the Helm branch, under the same convention. Drift
+        # here is worse than in the pair above, because what these resolve to
+        # is a file a pull request rewrites: two collectors disagreeing about
+        # which Application declares a release means one of them opens a PR
+        # against the wrong chart.
+        for name in ("release_of", "_argocd_chart_source", "_argocd_values_field", "release_declarations", "release_declaration_for"):
+            with self.subTest(function=name):
+                mine, theirs = self.bodies(name)
+                self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+
     def test_the_constants_it_reads_match_too(self):
         """An identical function over a different constant is a different
         function. `GITOPS_CLUSTER_TREE_DEPTH` in particular decides which files
@@ -4022,6 +4033,17 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             "_ARGOCD_TRACKING_ANNOTATION",
             "_MANAGED_BY_LABEL",
             "_HELM_MANAGED_BY",
+            "ARGOCD_APPLICATION_KIND",
+            "ARGOCD_CLUSTER_SECRET_LABEL",
+            "ARGOCD_CLUSTER_SECRET_VALUE",
+            "ARGOCD_IN_CLUSTER_SERVER",
+            "FLUX_HELM_RELEASE_KIND",
+            "FLUX_HELM_REPOSITORY_KIND",
+            "RELEASE_KEY_APPLICATION",
+            "RELEASE_KEY_RELEASE",
+            "ARGOCD_VALUES_OBJECT_FIELD",
+            "ARGOCD_VALUES_STRING_FIELD",
+            "FLUX_VALUES_FIELD",
         ):
             with self.subTest(const=const):
                 self.assertEqual(getattr(fw, const), getattr(collect, const))
@@ -4223,6 +4245,175 @@ class CandidatesCarryTheirReconcilerTest(unittest.TestCase):
         self.assertNotIn("reconciler", fw._emit("unattached-disk", hit))
         index = {("", "Disk/orphaned-pd"): "the Helm release `x`"}
         self.assertNotIn("reconciler", fw._emit("unattached-disk", hit, reconcilers=index))
+
+
+class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
+    """The third annotation, over the same three joints, on the arm that
+    matters most to this stream.
+
+    A right-size is the fix a pull request carries best, and `resources` is the
+    key nearly every chart publishes -- so a chart-rendered workload resolving
+    to the file declaring its release is the difference between a diff and a
+    paragraph. `release_declarations` itself is `collect.py`'s and tested
+    there; what is new here is the trip from `collect_fleet` through the thread
+    pool, into the per-cluster index `_releases_by_object` builds off the dump,
+    and out through the `emit` closure.
+    """
+
+    APPLICATION = "argocd/apps/data.yaml"
+    DECLARED = "clusters/prod-usc1/workloads/data.yaml"
+    ENTRY = {
+        "path": APPLICATION,
+        "kind": "Application",
+        "chart": "data-chart",
+        "repo": "https://charts.example.com",
+        "version": "1.2.3",
+        "values_field": "spec.source.helm.valuesObject",
+    }
+
+    def clone(self, tmp, *, declare_object=False):
+        """A GitOps tree declaring the chart release, and optionally the
+        object itself, so one fixture covers the precedence rule."""
+        path = Path(tmp) / "infra"
+        (path / "argocd/apps").mkdir(parents=True)
+        (path / self.APPLICATION).write_text(
+            "apiVersion: argoproj.io/v1alpha1\n"
+            "kind: Application\n"
+            "metadata:\n"
+            "  name: data-app\n"
+            "spec:\n"
+            "  source:\n"
+            "    repoURL: https://charts.example.com\n"
+            "    chart: data-chart\n"
+            "    targetRevision: 1.2.3\n"
+            "    helm:\n"
+            "      releaseName: data\n"
+            "  destination:\n"
+            "    name: prod-usc1\n"
+            "    namespace: default\n"
+        )
+        if declare_object:
+            (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+            (path / self.DECLARED).write_text(
+                "apiVersion: v1\n"
+                "kind: PersistentVolumeClaim\n"
+                "metadata:\n"
+                "  name: data\n"
+                "  namespace: default\n"
+            )
+        return path
+
+    def pvc(self, name, **meta):
+        """Bound, unreferenced — one `unconsumed-pvc` candidate."""
+        return obj(
+            "PersistentVolumeClaim", name, ns="default",
+            **{"status.phase": "Bound", "status.capacity": {"storage": "10Gi"}, **meta},
+        )
+
+    def tracked(self, name):
+        """The marker Argo CD leaves: it renders with `helm template`, so there
+        is no `meta.helm.sh` pair to read."""
+        return self.pvc(
+            name,
+            **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": f"data-app:/PersistentVolumeClaim:default/{name}"}},
+        )
+
+    def released(self, name):
+        """The marker `helm install` leaves, which Flux also produces."""
+        return self.pvc(
+            name,
+            **{"metadata.annotations": {"meta.helm.sh/release-name": "data", "meta.helm.sh/release-namespace": "default"}},
+        )
+
+    def fleet(self, tmp, *objects, workspace):
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return run_of(0, json.dumps([{"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*objects)))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+            return fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW, workspace=workspace)
+
+    def by_object(self, manifest, name):
+        return [
+            c
+            for cluster in manifest["clusters"]
+            for c in cluster.get("candidates") or []
+            if c["object"] == f"PersistentVolumeClaim/{name}"
+        ]
+
+    def test_a_chart_rendered_object_carries_the_release_it_came_from(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.tracked("data"), self.pvc("scratch"), workspace=self.clone(tmp))
+        rendered = self.by_object(manifest, "data")
+        plain = self.by_object(manifest, "scratch")
+        # Guard the guard: two empty lists would satisfy every assertion below.
+        self.assertTrue(rendered, "no candidate for the chart-rendered object")
+        self.assertTrue(plain, "no candidate for the unrendered object")
+        for candidate in rendered:
+            self.assertEqual(candidate["release_declaration"], self.ENTRY, candidate["check"])
+        for candidate in plain:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_the_helm_annotation_pair_resolves_to_the_same_file(self):
+        """One Application is indexed under both key shapes, so a fleet where
+        Argo drives Helm through a plugin -- or where Flux installed the same
+        release -- resolves through the release coordinates too."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.released("data"), workspace=self.clone(tmp))
+        rendered = self.by_object(manifest, "data")
+        self.assertTrue(rendered, "no candidate for the chart-rendered object")
+        for candidate in rendered:
+            self.assertEqual(candidate["release_declaration"], self.ENTRY, candidate["check"])
+
+    def test_an_object_the_repo_declares_outright_is_not_given_a_values_override(self):
+        """Precedence, and the reason for it: a workload with its own manifest
+        is edited there. Offering a values override beside it would give one
+        fix two files, and the values one would not even be applied on a
+        cluster where the object is not actually chart-rendered."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.tracked("data"), workspace=self.clone(tmp, declare_object=True))
+        rendered = self.by_object(manifest, "data")
+        self.assertTrue(rendered, "no candidate for the declared object")
+        for candidate in rendered:
+            self.assertEqual(candidate["declaration"]["path"], self.DECLARED, candidate["check"])
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_a_release_the_clone_does_not_declare_is_not_annotated(self):
+        """`helm install` run by hand, or an ApplicationSet this deliberately
+        does not index. Absent is the `manual` verdict that shipped before."""
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(
+                tmp,
+                self.pvc("data", **{"metadata.annotations": {"argocd.argoproj.io/tracking-id": "other-app:/PersistentVolumeClaim:default/data"}}),
+                workspace=self.clone(tmp),
+            )
+        rendered = self.by_object(manifest, "data")
+        self.assertTrue(rendered, "no candidate for the object")
+        for candidate in rendered:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_without_a_workspace_nothing_is_annotated(self):
+        with TemporaryDirectory() as tmp:
+            manifest = self.fleet(tmp, self.tracked("data"), workspace=None)
+        candidates = self.by_object(manifest, "data")
+        self.assertTrue(candidates, "the fixture produced no candidates to check")
+        for candidate in candidates:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+    def test_a_project_scoped_candidate_is_never_annotated(self):
+        # Same argument as the other two indexes: a persistent disk is not
+        # rendered by a chart, and those checks call `_emit` directly.
+        hit = {"object": "Disk/orphaned-pd", "severity": "major", "excerpt": "x"}
+        self.assertNotIn("release_declaration", fw._emit("unattached-disk", hit))
+        index = {("", "Disk/orphaned-pd"): dict(self.ENTRY)}
+        self.assertNotIn("release_declaration", fw._emit("unattached-disk", hit, releases=index))
 
 
 if __name__ == "__main__":

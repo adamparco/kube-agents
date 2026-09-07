@@ -97,6 +97,30 @@ GIT_DIR_NAME = ".git"
 # override, so `workload_declarations` skips them rather than resolving a
 # `Cluster/<name>` finding through the wrong table.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+# `release_declarations` indexes the two objects that install a Helm chart from
+# a GitOps repo, and the two it needs to resolve them: Argo CD's cluster
+# registration Secret (which is how `spec.destination.server` becomes a cluster
+# name) and Flux's `HelmRepository` (which is how a `HelmRelease`'s chart
+# reference becomes a URL `helm show values` can read). Copied from `collect.py`
+# under the same standalone-collector rule as the three above.
+ARGOCD_APPLICATION_KIND = "Application"
+ARGOCD_CLUSTER_SECRET_LABEL = "argocd.argoproj.io/secret-type"
+ARGOCD_CLUSTER_SECRET_VALUE = "cluster"
+ARGOCD_IN_CLUSTER_SERVER = "https://kubernetes.default.svc"
+FLUX_HELM_RELEASE_KIND = "HelmRelease"
+FLUX_HELM_REPOSITORY_KIND = "HelmRepository"
+# The two shapes a key in that index takes. An Argo CD chart Application is
+# found by the Application name its tracking id carries; a Helm release proper
+# -- `helm install`, or Flux driving it -- by release namespace and name.
+RELEASE_KEY_APPLICATION = "application"
+RELEASE_KEY_RELEASE = "release"
+# Where a values override goes, per reconciler. Argo CD accepts both a YAML
+# string (`values`) and a structured block (`valuesObject`); this names the one
+# already in the file, and `valuesObject` when neither is, because a structured
+# block is what a programmatic edit can extend without reindenting a string.
+ARGOCD_VALUES_OBJECT_FIELD = "valuesObject"
+ARGOCD_VALUES_STRING_FIELD = "values"
+FLUX_VALUES_FIELD = "values"
 
 # How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
 # match this stream's weekly cadence: every finding is then "this controller
@@ -732,6 +756,24 @@ def reconciler_of(meta: dict) -> str | None:
     return None
 
 
+def release_of(meta: dict) -> dict | None:
+    """The chart release holding this object, as data, or None.
+
+    `reconciler_of` above answers the same question in prose, for a sentence in
+    the finding. This answers it in the form `release_declaration_for` can look
+    up: `{"namespace", "name", "application"}`, any of which may be `""`. See
+    `collect.release_of`, which holds the reasoning about the two markers.
+    """
+    annotations = meta.get("annotations") or {}
+    name = str(annotations.get(_HELM_RELEASE_ANNOTATION) or "").strip()
+    namespace = str(annotations.get(_HELM_NAMESPACE_ANNOTATION) or "").strip()
+    tracking = str(annotations.get(_ARGOCD_TRACKING_ANNOTATION) or "").strip()
+    application = tracking.split(":", 1)[0].strip() if tracking else ""
+    if not name and not application:
+        return None
+    return {"namespace": namespace, "name": name, "application": application}
+
+
 def _reconcilers_by_object(dump: dict) -> dict[tuple[str, str], str]:
     """`(namespace, "Kind/name") -> reconciler`, for every object in the dump.
 
@@ -746,6 +788,28 @@ def _reconcilers_by_object(dump: dict) -> dict[tuple[str, str], str]:
         if not reconciler:
             continue
         index[(meta.get("namespace", "") or "", f"{item.get('kind', '')}/{meta.get('name', '')}")] = reconciler
+    return index
+
+
+def _releases_by_object(dump: dict, declarations: dict[tuple, dict] | None, cluster: str) -> dict[tuple[str, str], dict]:
+    """`(namespace, "Kind/name") -> release declaration`, for the objects a
+    chart this repository declares renders.
+
+    Keyed the way `_emit` builds a candidate, for the same reason
+    `_reconcilers_by_object` is: one pass over the dump rather than one per
+    check. An object with no release marker, or one whose release nothing in
+    the clone declares, is absent -- and absent is a miss, which is the
+    `manual` verdict this stream published before the index existed.
+    """
+    if not declarations or not cluster:
+        return {}
+    index: dict[tuple[str, str], dict] = {}
+    for item in dump.get("items", []) or []:
+        meta = item.get("metadata") or {}
+        found = release_declaration_for(declarations, cluster, release_of(meta))
+        if not found:
+            continue
+        index[(meta.get("namespace", "") or "", f"{item.get('kind', '')}/{meta.get('name', '')}")] = found
     return index
 
 
@@ -2661,6 +2725,217 @@ def declaration_for(
     return {"path": path, "directory": parent}
 
 
+def _argocd_chart_source(spec: dict) -> dict | None:
+    """The one chart source on an Argo CD Application, with its field path.
+
+    `spec.source.chart` absent is the discriminator that keeps this off the
+    plain-manifest Applications a GitOps repo is mostly made of. Two chart
+    entries under `spec.sources` is an ambiguity with no right answer and
+    returns None, the way `declaration_for` treats two declaring files. See
+    `collect._argocd_chart_source`.
+    """
+    single = spec.get("source")
+    if isinstance(single, dict) and single.get("chart"):
+        return {"source": single, "field": "spec.source"}
+    sources = spec.get("sources")
+    if not isinstance(sources, list):
+        return None
+    charts = [
+        {"source": entry, "field": f"spec.sources[{position}]"}
+        for position, entry in enumerate(sources)
+        if isinstance(entry, dict) and entry.get("chart")
+    ]
+    return charts[0] if len(charts) == 1 else None
+
+
+def _argocd_values_field(source: dict, field: str) -> str:
+    """Where a values override belongs on one Argo CD chart source.
+
+    Names the block already in the file when there is one, so an override joins
+    it rather than sitting beside a second block Argo CD would ignore --
+    `values` and `valuesObject` are mutually exclusive and Argo rejects an
+    Application carrying both.
+    """
+    helm = source.get("helm")
+    if isinstance(helm, dict) and isinstance(helm.get(ARGOCD_VALUES_STRING_FIELD), str):
+        return f"{field}.helm.{ARGOCD_VALUES_STRING_FIELD}"
+    return f"{field}.helm.{ARGOCD_VALUES_OBJECT_FIELD}"
+
+
+def release_declarations(root: Path) -> dict[tuple, dict]:
+    """Index the Helm releases a GitOps clone installs, by destination cluster.
+
+    `workload_declarations` above resolves a workload to the file declaring
+    *that object*. A workload a chart renders has no such file: the repo
+    declares the release, and the object exists only after Helm expands the
+    chart. That is what sends a right-sizing finding to `manual` -- and
+    right-sizing is the fix a pull request carries best, because `resources` is
+    the one key nearly every chart publishes. See `collect.release_declarations`,
+    which holds the full reasoning, the two key shapes, and why `ApplicationSet`
+    is deliberately not indexed.
+
+    Returns `{}` when PyYAML is absent or the clone is unreadable.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
+    except ImportError:
+        return {}
+
+    try:
+        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
+    except OSError:
+        return {}
+
+    documents: list[tuple[str, tuple[str, ...], dict]] = []
+    for path in paths:
+        if GIT_DIR_NAME in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        for doc in docs:
+            if isinstance(doc, dict) and doc.get("kind"):
+                documents.append((str(relative), relative.parts, doc))
+
+    # Pass 1: the two lookups an Application or a HelmRelease resolves through.
+    servers: dict[str, str] = {}
+    repositories: dict[tuple[str, str], str] = {}
+    for _, _, doc in documents:
+        kind = str(doc.get("kind") or "")
+        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        if kind == "Secret":
+            labels = meta.get("labels") or {}
+            if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
+                continue
+            # `stringData` is what a committed registration uses; `data` is
+            # base64 and a committed one would be a leaked credential, so only
+            # the plaintext form is read.
+            entry = doc.get("stringData")
+            if not isinstance(entry, dict):
+                continue
+            server = str(entry.get("server") or "").strip()
+            cluster = str(entry.get("name") or "").strip()
+            if server and cluster:
+                servers[server] = cluster
+        elif kind == FLUX_HELM_REPOSITORY_KIND:
+            url = str((doc.get("spec") or {}).get("url") or "").strip()
+            name = str(meta.get("name") or "")
+            namespace = str(meta.get("namespace") or "")
+            if url and name:
+                repositories[(namespace, name)] = url
+
+    index: dict[tuple, dict] = {}
+    ambiguous: set[tuple] = set()
+
+    def record(key: tuple, entry: dict) -> None:
+        existing = index.get(key)
+        if existing is not None and existing != entry:
+            # Two declarations for one release. Same reasoning as
+            # `declaration_for`: naming one would name the wrong file half the
+            # time, so name neither.
+            ambiguous.add(key)
+            return
+        index[key] = entry
+
+    # Pass 2: the declarations themselves.
+    for relative, parts, doc in documents:
+        kind = str(doc.get("kind") or "")
+        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+        name = str(meta.get("name") or "")
+        if not name:
+            continue
+        if kind == ARGOCD_APPLICATION_KIND:
+            chart = _argocd_chart_source(spec)
+            if chart is None:
+                continue
+            source, field = chart["source"], chart["field"]
+            destination = spec.get("destination") if isinstance(spec.get("destination"), dict) else {}
+            cluster = str(destination.get("name") or "").strip()
+            if not cluster:
+                server = str(destination.get("server") or "").strip()
+                # The in-cluster destination is whichever cluster Argo CD runs
+                # on, which this index has no way to name. Skip rather than
+                # resolve a finding into the wrong tree.
+                if server and server != ARGOCD_IN_CLUSTER_SERVER:
+                    cluster = servers.get(server, "")
+            if not cluster:
+                continue
+            release_namespace = str(destination.get("namespace") or "").strip()
+            helm = source.get("helm") if isinstance(source.get("helm"), dict) else {}
+            entry = {
+                "path": relative,
+                "kind": ARGOCD_APPLICATION_KIND,
+                "chart": str(source.get("chart") or ""),
+                "repo": str(source.get("repoURL") or ""),
+                "version": str(source.get("targetRevision") or ""),
+                "values_field": _argocd_values_field(source, field),
+            }
+            record((cluster, RELEASE_KEY_APPLICATION, name), entry)
+            release_name = str(helm.get("releaseName") or "").strip() or name
+            if release_namespace:
+                record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
+        elif kind == FLUX_HELM_RELEASE_KIND:
+            # Flux is installed per-cluster, so the path convention is the only
+            # cluster signal a HelmRelease carries.
+            if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
+                continue
+            cluster = parts[1]
+            namespace = str(meta.get("namespace") or "")
+            chart_spec = ((spec.get("chart") or {}).get("spec") or {}) if isinstance(spec.get("chart"), dict) else {}
+            source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
+            repo_namespace = str(source_ref.get("namespace") or namespace)
+            repo_name = str(source_ref.get("name") or "")
+            release_namespace = str(spec.get("targetNamespace") or namespace)
+            release_name = str(spec.get("releaseName") or "").strip() or name
+            if not release_namespace:
+                continue
+            entry = {
+                "path": relative,
+                "kind": FLUX_HELM_RELEASE_KIND,
+                "chart": str(chart_spec.get("chart") or ""),
+                "repo": repositories.get((repo_namespace, repo_name), ""),
+                "version": str(chart_spec.get("version") or ""),
+                "values_field": f"spec.{FLUX_VALUES_FIELD}",
+            }
+            record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
+
+    for key in ambiguous:
+        index.pop(key, None)
+    return index
+
+
+def release_declaration_for(index: dict[tuple, dict], cluster: str, release: dict | None) -> dict | None:
+    """Where the GitOps repo declares one candidate's chart release, or `None`.
+
+    `None` is no claim either way, exactly as in `declaration_for`. The Argo CD
+    Application name is tried first, being the more specific of the two keys.
+    """
+    if not index or not cluster or not release:
+        return None
+    application = str(release.get("application") or "")
+    if application:
+        entry = index.get((cluster, RELEASE_KEY_APPLICATION, application))
+        if entry:
+            return entry
+    name = str(release.get("name") or "")
+    namespace = str(release.get("namespace") or "")
+    if name and namespace:
+        entry = index.get((cluster, RELEASE_KEY_RELEASE, namespace, name))
+        if entry:
+            return entry
+    return None
+
+
 def _emit(
     slug: str,
     hit: dict,
@@ -2668,17 +2943,21 @@ def _emit(
     cluster: str = "",
     declarations: dict | None = None,
     reconcilers: dict[tuple[str, str], str] | None = None,
+    releases: dict[tuple[str, str], dict] | None = None,
 ) -> dict:
     """One candidate. `declarations` annotates it with the file that declares
     its object, when the run was given a `--workspace` and the index resolves
     it; `cluster` is the tree that index is keyed by, so both are needed or
     neither. `reconcilers` says what holds the object's spec, which is what
     decides whether a hand-applied fix survives; it is built from one cluster's
-    object dump, so it pairs with `cluster` under the same rule. The
-    project-scoped compute checks pass none of the three: a disk, a reserved
-    address and a forwarding rule are GCP resources with no cluster tree, no
-    namespace and no Kubernetes controller holding their spec, so there is
-    nothing for either index to key on."""
+    object dump, so it pairs with `cluster` under the same rule. `releases`
+    covers the case `declarations` cannot: a workload no file declares because
+    a chart renders it, annotated with the file declaring that chart release,
+    so the fix is a values override rather than a refusal. The project-scoped
+    compute checks pass none of the four: a disk, a reserved address and a
+    forwarding rule are GCP resources with no cluster tree, no namespace and no
+    Kubernetes controller holding their spec, so there is nothing for any of
+    the indexes to key on."""
     candidate = {
         "check": slug,
         "namespace": hit.get("namespace", ""),
@@ -2696,6 +2975,13 @@ def _emit(
         reconciler = reconcilers.get((candidate["namespace"], candidate["object"]))
         if reconciler:
             candidate["reconciler"] = reconciler
+    # Only where nothing declares the object itself. A workload with its own
+    # manifest in the repo is fixed by editing that manifest, and naming a
+    # values override beside it would offer two files for one fix.
+    if releases and cluster and "declaration" not in candidate:
+        release = releases.get((candidate["namespace"], candidate["object"]))
+        if release:
+            candidate["release_declaration"] = release
     return candidate
 
 
@@ -2779,7 +3065,7 @@ def _metrics_gap_phrase(result: Run, read: str) -> str:
     )
 
 
-def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime, declarations: dict | None = None) -> tuple[dict, dict]:
+def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime, declarations: dict | None = None, releases: dict[tuple, dict] | None = None) -> tuple[dict, dict]:
     """Returns `(manifest_entry, fleet_facts)` — the second only populated
     when the object dump succeeded; `collect_fleet` unions it across every
     cluster before running the project-scoped checks that need it."""
@@ -2804,15 +3090,16 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
+    release_index = _releases_by_object(parsed, releases, name)
 
     def emit(slug: str, hit: dict) -> dict:
-        """`_emit` with this cluster's two indexes bound. Every candidate below
-        goes through it, so a check added later is annotated by default rather
-        than by remembering to ask. Defined after the dump because one of those
-        indexes is built from it."""
+        """`_emit` with this cluster's three indexes bound. Every candidate
+        below goes through it, so a check added later is annotated by default
+        rather than by remembering to ask. Defined after the dump because two
+        of those indexes are built from it."""
         return _emit(
             slug, hit, cluster=name, declarations=declarations,
-            reconcilers=context["reconcilers"],
+            reconcilers=context["reconcilers"], releases=release_index,
         )
 
     node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
@@ -3599,10 +3886,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     # candidates resolve against the same clone, and walking it per cluster
     # would read the same tree sixteen times to get the same answer.
     declarations = workload_declarations(workspace) if workspace else {}
+    releases = release_declarations(workspace) if workspace else {}
 
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
-        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now, declarations=declarations): i for i, c in enumerate(clusters)}
+        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now, declarations=declarations, releases=releases): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
             index = futures[future]
             try:
@@ -3668,8 +3956,9 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace",
         help=(
             "the GitOps clone `audit_report.py start` made, so each candidate "
-            "carries where the repository declares its object; omit and no "
-            "candidate is annotated"
+            "carries where the repository declares its object -- or, for a "
+            "workload a chart renders, where it declares that chart release; "
+            "omit and no candidate is annotated"
         ),
     )
     args = parser.parse_args(argv)
