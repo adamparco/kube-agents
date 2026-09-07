@@ -2194,6 +2194,159 @@ class TestRolloutDropsTraffic(unittest.TestCase):
         )
 
 
+class TestPrestopOutlivesGrace(unittest.TestCase):
+    """§3.20. The hook that is present and does nothing.
+
+    §3.13 stops at "a `preStop` exists", so the shape where one exists and the
+    grace period cuts it short is reported by nothing -- and it is §3.13's own
+    remediation written without the second half of its instruction.
+    """
+
+    GRACE = 30
+
+    def wl(self, containers, grace=GRACE, kind="Deployment"):
+        d = deployment("api", **{"spec.replicas": 2})
+        d["kind"] = kind
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        d["spec"]["template"]["spec"]["containers"] = containers
+        if grace is not None:
+            d["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = grace
+        return collect.normalize_workloads(dump_of(d))[0]
+
+    def container(self, hook, name="app"):
+        c = {"name": name, "ports": [{"containerPort": 8080}]}
+        if hook is not None:
+            c["lifecycle"] = {"preStop": hook}
+        return c
+
+    def check(self, containers, grace=GRACE):
+        return collect.check_prestop_outlives_grace(self.wl(containers, grace), context_of())
+
+    def test_a_native_sleep_equal_to_the_grace_period_is_flagged(self):
+        # Equal, not merely greater: at `wait == grace` the kubelet SIGKILLs
+        # with the hook still sleeping, so it is provably truncated.
+        hit = self.check([self.container({"sleep": {"seconds": 30}})])
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["object"], "Deployment/api")
+
+    def test_a_native_sleep_longer_than_the_grace_period_is_flagged(self):
+        self.assertIsNotNone(self.check([self.container({"sleep": {"seconds": 45}})]))
+
+    def test_one_second_of_headroom_is_not_a_finding(self):
+        # The check claims only what the kubelet guarantees. "Too little room
+        # left for the process to shut down" needs a number this audit has not
+        # got, so the predicate stops at the ceiling.
+        self.assertIsNone(self.check([self.container({"sleep": {"seconds": 29}})]))
+
+    def test_an_absent_grace_period_is_read_as_the_kubernetes_default(self):
+        self.assertIsNotNone(
+            self.check([self.container({"sleep": {"seconds": collect.DEFAULT_GRACE_PERIOD_S}})], grace=None)
+        )
+        self.assertIsNone(
+            self.check(
+                [self.container({"sleep": {"seconds": collect.DEFAULT_GRACE_PERIOD_S - 1}})], grace=None
+            )
+        )
+
+    def test_a_shell_sleep_is_read_out_of_the_exec_command(self):
+        hit = self.check([self.container({"exec": {"command": ["/bin/sh", "-c", "sleep 45"]}})])
+        self.assertIsNotNone(hit)
+        self.assertIn("sleep 45", hit["excerpt"])
+
+    def test_the_longest_sleep_in_a_compound_command_is_the_one_read(self):
+        # A hook that sleeps 60s somewhere in it cannot finish in less than
+        # 60s whatever else the command does.
+        self.assertIsNotNone(
+            self.check(
+                [self.container({"exec": {"command": ["/bin/sh", "-c", "sleep 5; drain; sleep 60"]}})]
+            )
+        )
+
+    def test_a_fractional_sleep_is_not_read(self):
+        # `sleep 0.5` is coreutils-only, so a duration parsed out of it would
+        # be a guess about which shell the image ships.
+        self.assertIsNone(
+            self.check([self.container({"exec": {"command": ["/bin/sh", "-c", "sleep 0.5"]}})], grace=0)
+        )
+
+    def test_a_unit_suffixed_sleep_is_not_read(self):
+        self.assertIsNone(
+            self.check([self.container({"exec": {"command": ["/bin/sh", "-c", "sleep 1m"]}})])
+        )
+
+    def test_a_word_ending_in_sleep_is_not_a_sleep(self):
+        self.assertIsNone(
+            self.check([self.container({"exec": {"command": ["/bin/sh", "-c", "nosleep 60"]}})])
+        )
+
+    def test_an_httpget_handler_has_no_readable_duration(self):
+        self.assertIsNone(self.check([self.container({"httpGet": {"path": "/quit", "port": 8080}})]))
+
+    def test_a_tcpsocket_handler_has_no_readable_duration(self):
+        self.assertIsNone(self.check([self.container({"tcpSocket": {"port": 8080}})]))
+
+    def test_no_hook_at_all_is_left_to_313(self):
+        self.assertIsNone(self.check([self.container(None)]))
+
+    def test_an_exec_with_no_sleep_is_not_read(self):
+        self.assertIsNone(
+            self.check([self.container({"exec": {"command": ["/bin/sh", "-c", "curl -X POST /quit"]}})])
+        )
+
+    def test_the_excerpt_names_every_truncated_container_and_the_ceiling(self):
+        hit = self.check(
+            [
+                self.container({"sleep": {"seconds": 40}}, name="app"),
+                self.container({"sleep": {"seconds": 5}}, name="fine"),
+                self.container({"sleep": {"seconds": 30}}, name="edge"),
+            ]
+        )
+        self.assertIn("terminationGracePeriodSeconds=30", hit["excerpt"])
+        self.assertIn("app waits 40s", hit["excerpt"])
+        self.assertIn("edge waits 30s", hit["excerpt"])
+        self.assertNotIn("fine", hit["excerpt"])
+
+    def test_the_excerpt_names_which_spelling_carried_the_wait(self):
+        # The remediation edits one of two fields and the reader has to know
+        # which one is there.
+        self.assertIn(
+            "lifecycle.preStop.sleep.seconds", self.check([self.container({"sleep": {"seconds": 30}})])["excerpt"]
+        )
+
+    def test_a_native_sidecar_is_in_scope(self):
+        # `_effective_containers` folds in `initContainers` with
+        # `restartPolicy: Always`, and one of those terminates on the same
+        # grace period as everything else in the pod.
+        wl = self.wl([self.container(None)])
+        wl["template"]["initContainers"] = [
+            {"name": "proxy", "restartPolicy": "Always", "lifecycle": {"preStop": {"sleep": {"seconds": 30}}}}
+        ]
+        self.assertIsNotNone(collect.check_prestop_outlives_grace(wl, context_of()))
+
+    def test_a_plain_init_container_is_not(self):
+        wl = self.wl([self.container(None)])
+        wl["template"]["initContainers"] = [
+            {"name": "setup", "lifecycle": {"preStop": {"sleep": {"seconds": 30}}}}
+        ]
+        self.assertIsNone(collect.check_prestop_outlives_grace(wl, context_of()))
+
+    def test_no_service_is_required_unlike_313(self):
+        # An empty context has no Services in it at all. §3.13 needs one
+        # because "has no preStop" is true of nearly every workload; this
+        # predicate is already narrow enough to stand without one.
+        self.assertIsNotNone(self.check([self.container({"sleep": {"seconds": 30}})]))
+
+    def test_a_daemonset_is_in_scope(self):
+        self.assertIsNotNone(
+            collect.check_prestop_outlives_grace(
+                self.wl([self.container({"sleep": {"seconds": 30}})], kind="DaemonSet"), context_of()
+            )
+        )
+
+    def test_a_zero_grace_period_truncates_any_hook(self):
+        self.assertIsNotNone(self.check([self.container({"sleep": {"seconds": 1}})], grace=0))
+
+
 class TestStrategyCausesDowntime(unittest.TestCase):
     """§3.14. The gap 3.11 leaves open.
 

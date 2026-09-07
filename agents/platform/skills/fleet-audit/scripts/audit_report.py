@@ -181,6 +181,7 @@ AUDITS: dict[str, AuditSpec] = {
             "service-port-unresolved",
             "liveness-preempts-readiness",
             "spread-not-achieved",
+            "prestop-outlives-grace",
         ),
     ),
     "fleet-wide-cost-analysis": AuditSpec(

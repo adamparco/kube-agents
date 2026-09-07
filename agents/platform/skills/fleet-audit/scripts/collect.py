@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete nineteen-check roster
-(§3.1–§3.19 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete twenty-check roster
+(§3.1–§3.20 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete thirteen-check roster (§2.1–§2.13 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -1903,6 +1903,102 @@ def check_rollout_drops_traffic(workload: dict, context: dict) -> dict | None:
             f"Service-backed, containers with no preStop hook: {', '.join(missing)}\n"
             f"terminationGracePeriodSeconds={grace}\n"
             f"{_exposure_line(services)}"
+        ),
+    }
+
+
+# A bare integer `sleep` in a shell `preStop`. Only whole seconds are read:
+# `sleep 0.5` and `sleep 1m` are both accepted by GNU coreutils and only one of
+# them by busybox, so a duration parsed out of either would be a guess about
+# which shell the image ships. An unparsed hook produces no finding, which is
+# the direction that costs a report rather than inventing one.
+#
+# The trailing lookahead is what rejects them, and `\b` will not do it: in
+# `sleep 0.5` there is a word boundary between the `0` and the `.`, so `\b`
+# reads a fractional wait as a whole `0` -- which then reaches any grace period
+# and reports a hook that sleeps for half a second as truncated.
+_PRESTOP_SLEEP_RE = re.compile(r"\bsleep\s+(\d+)(?![\w.])")
+
+_IMPACT_PRESTOP_TRUNCATED = (
+    "This container declares a preStop hook that cannot finish. The grace "
+    "period is the ceiling the hook runs inside, and it expires while the hook "
+    "is still sleeping, so the kubelet sends SIGKILL: the wait never completes "
+    "and the process is never given the SIGTERM it was supposed to delay. "
+    "Every rollout, node drain, and preemption therefore resets the connections "
+    "in flight, which is the failure the hook was added to prevent -- and 3.13 "
+    "is silent on this workload because a preStop hook does exist."
+)
+
+
+def _prestop_wait_seconds(container: dict) -> tuple[int | None, str]:
+    """The seconds a container's `preStop` hook waits, and how it spells it.
+
+    Two spellings are readable. `sleep.seconds` is the native handler the
+    kubelet runs itself, and its duration is the field. An `exec` is a shell
+    command, so the duration has to be read out of the text; the largest
+    integer `sleep` in it is taken, because a hook that sleeps that long
+    cannot finish in less time whatever else the command does.
+
+    `httpGet` and `tcpSocket` handlers return `None`. Their duration is a
+    property of whatever answers the request, which is not in this dump.
+    """
+    hook = (container.get("lifecycle") or {}).get("preStop") or {}
+    native = hook.get("sleep") or {}
+    if isinstance(native.get("seconds"), int):
+        return native["seconds"], "lifecycle.preStop.sleep.seconds"
+    command = " ".join((hook.get("exec") or {}).get("command") or [])
+    found = [int(m) for m in _PRESTOP_SLEEP_RE.findall(command)]
+    if found:
+        return max(found), f"lifecycle.preStop.exec.command ({command})"
+    return None, ""
+
+
+def check_prestop_outlives_grace(workload: dict, context: dict) -> dict | None:
+    """3.20 -- a `preStop` hook the grace period cuts short.
+
+    3.13 stops firing the moment a `preStop` exists, whatever it says: its own
+    "do NOT flag" list ends with "any container that already declares a
+    `preStop`, whatever it runs -- this check does not grade the hook's
+    contents". That is the right scope for 3.13 and it leaves one shape
+    unreported, the shape where the hook is present and does nothing.
+
+    `terminationGracePeriodSeconds` is the ceiling the whole termination runs
+    inside, hook included. When the hook's wait reaches that ceiling the
+    kubelet sends SIGKILL with the hook still sleeping, so the delay never
+    happens and the container never even receives the SIGTERM the delay was
+    protecting. The workload is in exactly the state 3.13 describes while
+    carrying the fix for it in its manifest -- and 3.13 is quiet, so the ledger
+    says nothing at all.
+
+    This is 3.13's own remediation getting written wrong, which is why it is
+    worth a check rather than a sentence. That remediation already says to
+    raise the grace period "above that wait if it is not already"; a check is
+    what notices when someone did not, whether that someone was a previous run
+    of this audit or the hundred blog posts that print `sleep 30` next to a
+    grace period nobody mentioned.
+
+    Only the two readable spellings of a wait are considered, and only whole
+    seconds -- see `_prestop_wait_seconds`. Reaching the ceiling is the
+    predicate, not merely approaching it: at `wait == grace` the hook is
+    provably truncated, while "the hook leaves too little room for the
+    application to shut down" needs a number for how much room an application
+    needs, which this audit cannot know.
+    """
+    grace = workload["template"].get("terminationGracePeriodSeconds")
+    if grace is None:
+        grace = DEFAULT_GRACE_PERIOD_S
+    truncated = []
+    for container in _effective_containers(workload):
+        wait, spelling = _prestop_wait_seconds(container)
+        if wait is None or wait < grace:
+            continue
+        truncated.append(f"{container.get('name', '')} waits {wait}s via {spelling}")
+    if not truncated:
+        return None
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": (
+            f"terminationGracePeriodSeconds={grace}, and the hook reaches it:\n" + "\n".join(truncated)
         ),
     }
 
@@ -4738,6 +4834,19 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "major",
         None,
         _IMPACT_SPREAD_NOT_ACHIEVED,
+    ),
+    CheckSpec(
+        "prestop-outlives-grace",
+        "workload",
+        check_prestop_outlives_grace,
+        # `major`, matching §3.13, because the workload is in the state §3.13
+        # describes -- the hook does not run, so nothing it was added to
+        # prevent is prevented. Rated no lower for having a fix already in the
+        # manifest: a defect with its own remediation applied and inert is
+        # harder to find, not less costly, and §3.13 is not reporting it.
+        "major",
+        None,
+        _IMPACT_PRESTOP_TRUNCATED,
     ),
 )
 
