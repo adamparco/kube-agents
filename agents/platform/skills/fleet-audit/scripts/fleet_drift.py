@@ -5,8 +5,9 @@ Audit (`fleet-consistency-drift`).
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §10 phase 4, and
 governance/fleet_consistency_drift_sop.md.
 
-This stream's own collector: every one of its nineteen facets reads GKE
-control-plane and node-pool metadata through `gcloud container`, no
+This stream's own collector: every one of its twenty checks -- nineteen
+comparative facets and §4.14's cohort-independent `no-environment-label` --
+reads GKE control-plane and node-pool metadata through `gcloud container`, no
 `kubectl` and no kubeconfig, so it needs neither `collect.py`'s per-cluster
 credential fetch nor `patch_readiness.py`'s per-location baseline —
 `clusters list` alone, once per project, returns every field every facet
@@ -59,6 +60,19 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 DEFAULT_TIMEOUT_S = 60
 MAX_WORKERS = 8
 COHORT_FLOOR = 3
+
+# The one check here that is not a facet. Every `Facet` is comparative and so
+# runs only inside a cohort that reached `COHORT_FLOOR`; this one asks why a
+# cluster reached no cohort, which is a question the cohort cannot be a
+# precondition for. Named rather than inlined because it appears in `IMPACT`,
+# in the candidate, and in the `checks_run` roster, and the three must agree.
+UNLABELLED_SLUG = "no-environment-label"
+
+# `minor`, matching `label-keys` -- the facet this stands in for on a cluster
+# no facet reaches. It is a governance and cost-attribution gap, not an outage,
+# and the SOP's ladder has nothing to downgrade it with: there is no cohort, so
+# no ratio and no `k`.
+UNLABELLED_SEVERITY = "minor"
 SEVERITY_LEVELS = ("critical", "major", "minor")
 ENV_SYNONYMS = {
     "prod": "prod", "prd": "prod", "production": "prod",
@@ -582,6 +596,12 @@ IMPACT = {
     "intra-node-visibility": "This cluster emits different flow telemetry than its cohort.",
     "datapath-provider": "This cluster enforces network policy through a different engine than its cohort.",
     "label-keys": "This cluster drops out of cost attribution and label-scoped queries its peers appear in.",
+    UNLABELLED_SLUG: (
+        "This cluster is absent from every environment-scoped cost report, policy binding and "
+        "alert route its peers appear in -- and, because every other check here compares a cluster "
+        "against a cohort it cannot join, it is also the one cluster in the fleet whose "
+        "configuration this audit never examines, on this run or any future one."
+    ),
     "image-type": "This cluster's nodes carry a different patch cadence and hardening baseline than its peers.",
     "database-encryption": "Secrets in this cluster's etcd are not wrapped with the customer-managed key every peer uses.",
     "uncohorted": "This cluster diverges from its cohort on so many facets that its cohort labelling, not each facet, is likely wrong.",
@@ -690,6 +710,28 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
     return out
 
 
+def joinable_environments(mode: str, cohorts: dict[tuple, list[dict]]) -> list[tuple[str, int]]:
+    """The environment values that would actually put a cluster of this mode
+    into a cohort that reaches the floor, commonest first.
+
+    Shared by the coverage-gap sentence and by `no-environment-label`'s
+    finding, which is the whole point of it being a function. The gap says
+    "only `environment=test` would reach the floor here" and the finding
+    prescribes a label; computing that value twice is how the audit ends up
+    telling an operator to apply a label its own gap sentence says will not
+    work.
+
+    `COHORT_FLOOR - 1` and not `COHORT_FLOOR`, because the cluster being
+    advised is the one that would join: a value held by two peers reaches
+    three with it.
+    """
+    return sorted(
+        ((k[-1], len(m)) for k, m in cohorts.items()
+         if k[0] == mode and k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1),
+        key=lambda t: (-t[1], t[0]),
+    )
+
+
 def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple, list[dict]]) -> str:
     """Why the `unknown` cohort floored out, when the rest of the fleet did not.
 
@@ -730,11 +772,7 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
     if key[-1:] != ("unknown",) or not labelled:
         return ""
     mode = key[0]
-    joinable = sorted(
-        ((k[-1], len(m)) for k, m in cohorts.items()
-         if k[0] == mode and k[-1:] != ("unknown",) and len(m) >= COHORT_FLOOR - 1),
-        key=lambda t: (-t[1], t[0]),
-    )
+    joinable = joinable_environments(mode, cohorts)
     if joinable:
         named = " or ".join(f"`environment={v}`" for v, _ in joinable)
         peers = ", ".join(f"{n} other {mode} cluster{'' if n == 1 else 's'} carry `{v}`"
@@ -758,6 +796,106 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, cohorts: dict[tuple
     )
 
 
+def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, list[str]], dict[tuple, list[dict]], dict[tuple, list[dict]]]:
+    """§4.14's `no-environment-label`, as `(checks_run, candidates,
+    not_applicable)` keyed by `ckey` -- the one check here that is not a
+    `Facet`.
+
+    Every `Facet` is comparative, so `compute_drift` only evaluates one inside
+    a cohort that reached `COHORT_FLOOR`, and under the `environment` strategy
+    a cohort key is `(mode, environment)` -- which an unlabelled cluster cannot
+    match, because §2.3 keeps `unknown` out of every named cohort. The cluster
+    with the fleet's one divergent label set is therefore the one cluster
+    `label-keys` structurally cannot see, and the same holds for the other
+    eighteen facets. `cohort_limitations` already says so in a sentence, and a
+    sentence in `limitations` opens no pull request; this publishes the same
+    conclusion as a finding with the label to set in it.
+
+    Three conditions, each of which the finding's own claims rest on:
+
+    - **The fleet cohorts by environment.** Under `project` or `mode-only` no
+      cohort key holds an environment at all, so the cluster is already being
+      compared and a label would change nothing about that. The check does not
+      apply -- and says so in `checks_not_applicable` for every cluster on the
+      fleet rather than staying silent, because a slug missing from
+      `checks_run` is indistinguishable from a check nobody got to, which is
+      the coverage gap `autopilot_not_applicable` exists to prevent.
+    - **This cluster resolves to `unknown`.** An `inferred` cluster joins a
+      cohort on a name token; that membership is a guess and §3.5 downgrades
+      what rests on it, but it is not this defect and "joins no cohort" would
+      be false of it.
+    - **Its cohort is under the floor.** Enough unlabelled clusters at one mode
+      pile into `(mode, unknown)` to reach three and they compare each other,
+      which is the coverage this finding claims is missing.
+
+    And it publishes only where `joinable_environments` names a value that
+    reaches the floor. Where none does, no label closes the gap, so the
+    finding's remediation would be a no-op -- the same reason §3.7 withholds a
+    sizing finding whose own prescription changes nothing. The check still ran
+    and still counts toward §6's denominator; `limitations` keeps the sentence.
+    """
+    checks_run: dict[tuple, list[str]] = {}
+    candidates: dict[tuple, list[dict]] = {}
+    not_applicable: dict[tuple, list[dict]] = {}
+
+    _ineligible, cohorts, env_of, strategy = cohort_layout(clusters, now=now)
+    if strategy != "environment":
+        reason = (
+            f"§2.3 cohorts this fleet by `{strategy}`, not by environment, so no cohort key holds "
+            "an environment and every cluster is compared regardless of its labels -- an "
+            "environment label would not change which clusters this one is measured against."
+        )
+        for c in clusters:
+            not_applicable[ckey(c)] = [{"check": UNLABELLED_SLUG, "reason": reason}]
+        return checks_run, candidates, not_applicable
+
+    labelled = sum(1 for _, source in env_of.values() if source == "label")
+    for c in clusters:
+        key = ckey(c)
+        if key not in env_of:
+            continue
+        mode = cluster_mode(c)
+        checks_run[key] = [UNLABELLED_SLUG]
+        _env, source = env_of[key]
+        if source != "unknown":
+            continue
+        cohort = cohorts.get(cohort_key(c, strategy, "unknown")) or []
+        if len(cohort) >= COHORT_FLOOR:
+            continue
+        joinable = joinable_environments(mode, cohorts)
+        if not joinable:
+            continue
+        value, peers = joinable[0]
+        # Every facet minus the ones Autopilot withholds, which is the same
+        # filter `compute_drift` applies and the same denominator
+        # `autopilot_not_applicable` leaves behind. Counted rather than
+        # written down, so a facet added to `FACETS` is in this sentence
+        # without anyone remembering to change it.
+        abstaining = sum(1 for f in FACETS if not (f.standard_only and mode == "autopilot"))
+        alternatives = (
+            ""
+            if len(joinable) == 1
+            else " ("
+            + ", ".join(f"`{v}` would also reach it, on {n}" for v, n in joinable[1:])
+            + ")"
+        )
+        excerpt = (
+            f"carries no environment label -- `resourceLabels` sets none of "
+            f"`environment`, `env`, `stage` or `tier` -- while {labelled} of "
+            f"{len(env_of)} eligible clusters on this fleet do. Cohorts are keyed "
+            f"`(mode, environment)` and an unlabelled cluster never joins a named "
+            f"cohort, so this one cohorts alone as `{mode}/unknown` against a "
+            f"minimum of {COHORT_FLOOR}, and all {abstaining} comparative checks in "
+            f"this audit abstain for it -- on this run and on every future run until "
+            f"it is labelled. Set `resourceLabels.environment` to `{value}`: "
+            f"{peers} other {mode} cluster{'' if peers == 1 else 's'} carry it, which "
+            f"reaches the floor with this one{alternatives}. Any value no peer holds "
+            f"opens a new cohort of one and leaves the gap exactly as it is."
+        )
+        candidates[key] = [_emit(UNLABELLED_SLUG, c.get("name", ""), excerpt, UNLABELLED_SEVERITY)]
+    return checks_run, candidates, not_applicable
+
+
 def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     """§6's `checks_not_applicable` for the facets `compute_drift` refuses to
     compute on Autopilot.
@@ -776,8 +914,9 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     wherever line 565 fires — an Autopilot cohort's members are all Autopilot —
     but the roster arithmetic in §6 is per-cluster, so an Autopilot cluster
     whose cohort floored out has the same five inapplicable checks and should
-    have the same fourteen in its denominator. Its `limitations` sentence then
-    accounts for those fourteen instead of overstating nineteen.
+    have the same five in its `checks_not_applicable`. Its `limitations`
+    sentence then accounts for the checks that remain instead of overstating
+    the full roster.
 
     `datapath-provider` is deliberately absent. It carries `autopilot_excluded`
     rather than `standard_only`: the facet is computed and recorded in
@@ -964,8 +1103,20 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 failed_projects[futures[future]] = error
 
     checks_run, candidates = compute_drift(all_clusters, now=now)
+    # Merged rather than returned by `compute_drift`, because this check is the
+    # one that has to run *outside* the cohort loop -- see
+    # `unlabelled_environment_candidates`. Extending both dicts is what turns a
+    # cluster no facet reached from "0 of 19 applicable checks ran", which §6
+    # reads as a total coverage gap, into "1 of 20", which is the truth.
+    unlabelled_run, unlabelled_candidates, unlabelled_na = unlabelled_environment_candidates(all_clusters, now=now)
+    for cluster_key, slugs in unlabelled_run.items():
+        checks_run.setdefault(cluster_key, []).extend(slugs)
+    for cluster_key, found in unlabelled_candidates.items():
+        candidates.setdefault(cluster_key, []).extend(found)
     limitations = cohort_limitations(all_clusters, now=now)
     not_applicable = autopilot_not_applicable(all_clusters)
+    for cluster_key, skipped in unlabelled_na.items():
+        not_applicable.setdefault(cluster_key, []).extend(skipped)
 
     entries = []
     for c in all_clusters:

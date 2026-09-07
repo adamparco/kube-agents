@@ -1082,12 +1082,16 @@ class AutopilotNotApplicableTest(unittest.TestCase):
 
     def test_an_undersized_autopilot_cohort_still_declares_them(self):
         """The live fleet's shape: two Autopilot clusters in one cohort against
-        a floor of three, so no facet compared and every slug is missing from
-        `commands`. The `limitations` sentence covers the ones that could have
-        run; these five could not have, cohort or no cohort, and belong out of
-        the denominator rather than inside the sentence."""
+        a floor of three, so no facet compared and every facet slug is missing
+        from `commands`. The `limitations` sentence covers the ones that could
+        have run; these five could not have, cohort or no cohort, and belong
+        out of the denominator rather than inside the sentence.
+
+        `no-environment-label` is the one slug still in `commands`, because it
+        is the one check that does not need a cohort -- these clusters are
+        labelled, so it ran and passed."""
         entry = self.manifest(self.autopilot_cohort(n=2))["clusters"][0]
-        self.assertEqual(entry["commands"], [])
+        self.assertEqual([c["check"] for c in entry["commands"]], [fd.UNLABELLED_SLUG])
         self.assertIn("no facet compared", entry["limitations"])
         self.assertEqual(sorted(n["check"] for n in entry["checks_not_applicable"]), sorted(self.NA))
 
@@ -1103,7 +1107,8 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         entry = self.manifest(self.autopilot_cohort())["clusters"][0]
         ran = {c["check"] for c in entry["commands"]}
         declared = {n["check"] for n in entry["checks_not_applicable"]}
-        self.assertEqual({f.slug for f in fd.FACETS} - ran - declared, set())
+        roster = {f.slug for f in fd.FACETS} | {fd.UNLABELLED_SLUG}
+        self.assertEqual(roster - ran - declared, set())
         self.assertEqual(ran & declared, set())
 
 
@@ -1259,7 +1264,9 @@ class CohortLimitationsTest(unittest.TestCase):
         manifest = fd.collect_fleet("acme", run=run, now=NOW)
         self.assertEqual(len(manifest["clusters"]), 4)
         for entry in manifest["clusters"]:
-            self.assertEqual(entry["commands"], [])
+            # `no-environment-label` is the one check that runs without a
+            # cohort, so it is in `commands` even here; every facet abstained.
+            self.assertEqual([c["check"] for c in entry["commands"]], [fd.UNLABELLED_SLUG])
             self.assertIn("no facet compared", entry["limitations"])
 
     def test_a_compared_fleet_gets_no_limitations_key_at_all(self):
@@ -1303,6 +1310,168 @@ class CohortLimitationsTest(unittest.TestCase):
         gaps = audit_report.coverage_gaps(doc)
         self.assertEqual(len(gaps), 4)
         self.assertTrue(all("no facet compared" in g for g in gaps))
+
+
+class NoEnvironmentLabelTest(unittest.TestCase):
+    """§4.14 — the one check that fires outside a cohort.
+
+    Every facet is a majority vote, so §2.4's floor silences all nineteen for a
+    cluster with too few peers, and §2.3 gives an unlabelled cluster no peers at
+    all. The cluster whose labelling diverges most from the fleet was therefore
+    the one cluster `label-keys` could never see: `cohort_limitations` said so
+    in a sentence, and a sentence in `limitations` opens no pull request.
+    """
+
+    def _live_shape(self, host_labels, *, host_autopilot=False):
+        """adamparco-kage: 5 Autopilot and 10 Standard all `test`, plus the
+        install's own host cluster carrying whatever is passed."""
+        fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "test"})
+                 for i in range(5)]
+        fleet += [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(10)]
+        fleet.append(cluster("host", autopilot=host_autopilot, labels=host_labels))
+        return fleet
+
+    def check(self, fleet):
+        return fd.unlabelled_environment_candidates(fleet, now=NOW)
+
+    def test_the_lone_unlabelled_cluster_gets_a_finding(self):
+        _run, candidates, _na = self.check(self._live_shape({}))
+        self.assertEqual(list(candidates), [K("host")])
+        found = candidates[K("host")][0]
+        self.assertEqual(found["check"], fd.UNLABELLED_SLUG)
+        self.assertEqual(found["object"], "Cluster/host")
+        self.assertEqual(found["severity"], "minor")
+        self.assertEqual(found["namespace"], "")
+
+    def test_the_finding_names_the_label_to_set_and_the_peers_that_hold_it(self):
+        _run, candidates, _na = self.check(self._live_shape({}))
+        excerpt = candidates[K("host")][0]["excerpt"]
+        self.assertIn("Set `resourceLabels.environment` to `test`", excerpt)
+        self.assertIn("10 other standard clusters carry it", excerpt)
+
+    def test_the_finding_and_the_coverage_gap_prescribe_the_same_value(self):
+        """The reason `joinable_environments` is a function. The gap sentence
+        and the finding are read by the same person minutes apart, and an audit
+        that prescribes a label its own gap sentence says will not work has
+        told them to do nothing twice."""
+        fleet = self._live_shape({})
+        _run, candidates, _na = self.check(fleet)
+        gap = fd.cohort_limitations(fleet, now=NOW)[K("host")]
+        self.assertIn("Only `environment=test` would reach the floor here", gap)
+        self.assertIn("to `test`", candidates[K("host")][0]["excerpt"])
+
+    def test_a_labelled_cluster_runs_the_check_and_passes_it(self):
+        run, candidates, na = self.check(self._live_shape({"environment": "test"}))
+        self.assertEqual(candidates, {})
+        self.assertEqual(na, {})
+        # Every eligible cluster, not just the one that could have failed:
+        # a slug missing from `checks_run` is how a check nobody ran looks.
+        self.assertEqual(len(run), 16)
+        self.assertEqual(run[K("host")], [fd.UNLABELLED_SLUG])
+
+    def test_an_inferred_environment_is_not_this_defect(self):
+        """A name token cohorts the cluster, on a guess §3.5 already charges a
+        severity step for. `joins no cohort` would be false of it."""
+        fleet = self._live_shape({})
+        fleet[-1] = cluster("host-test", labels={})
+        _run, candidates, _na = self.check(fleet)
+        self.assertEqual(candidates, {})
+
+    def test_unlabelled_clusters_that_reach_the_floor_together_are_compared(self):
+        """Three unlabelled Standard clusters cohort as `standard/unknown` and
+        compare each other, which is the coverage this finding claims is
+        missing. Publishing it anyway would be false about its own impact."""
+        fleet = [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(4)]
+        fleet += [cluster(f"bare-{i}", labels={}) for i in range(3)]
+        run, candidates, _na = self.check(fleet)
+        self.assertEqual(candidates, {})
+        self.assertEqual(len(run), 7)
+
+    def test_no_finding_where_no_label_would_close_the_gap(self):
+        """The §3.7 rule: withhold a finding whose own remediation is a no-op.
+        Here the unlabelled cluster is Autopilot and every labelled peer is
+        Standard, so mode-first cohorting means no value has same-mode peers.
+        The check still ran -- the gap is real, a label just is not the fix."""
+        fleet = [cluster(f"std-{i}", labels={"environment": "test"}) for i in range(3)]
+        fleet.append(cluster("host", autopilot=True, labels={}))
+        run, candidates, na = self.check(fleet)
+        self.assertEqual(candidates, {})
+        self.assertEqual(na, {})
+        self.assertEqual(run[K("host")], [fd.UNLABELLED_SLUG])
+
+    def test_a_second_joinable_value_is_offered_but_not_prescribed(self):
+        fleet = [cluster(f"p{i}", labels={"environment": "prod"}) for i in range(2)]
+        fleet += [cluster(f"t{i}", labels={"environment": "test"}) for i in range(4)]
+        fleet.append(cluster("host", labels={}))
+        _run, candidates, _na = self.check(fleet)
+        excerpt = candidates[K("host")][0]["excerpt"]
+        self.assertIn("Set `resourceLabels.environment` to `test`", excerpt)
+        self.assertIn("(`prod` would also reach it, on 2)", excerpt)
+
+    def test_the_abstaining_count_is_the_clusters_own_roster(self):
+        """An Autopilot cluster owes fourteen facets, not nineteen — the five
+        `standard_only` ones are declared inapplicable elsewhere and counting
+        them here would overstate what the label buys."""
+        fleet = [cluster(f"ap-{i}", autopilot=True, labels={"environment": "test"})
+                 for i in range(3)]
+        fleet.append(cluster("host", autopilot=True, labels={}))
+        _run, candidates, _na = self.check(fleet)
+        standard_only = sum(1 for f in fd.FACETS if f.standard_only)
+        self.assertIn(f"all {len(fd.FACETS) - standard_only} comparative checks",
+                      candidates[K("host")][0]["excerpt"])
+        _run, standard, _na = self.check(self._live_shape({}))
+        self.assertIn(f"all {len(fd.FACETS)} comparative checks",
+                      standard[K("host")][0]["excerpt"])
+
+    def test_a_fleet_that_does_not_cohort_by_environment_declares_it_na(self):
+        """Under `project` or `mode-only` no cohort key holds an environment,
+        so a label changes nothing about who this cluster is compared against.
+        Silence would read as a check nobody ran, on every cluster, forever."""
+        fleet = [cluster(f"c{i}", project=p, labels={})
+                 for p in ("acme", "other") for i in range(2)]
+        run, candidates, na = self.check(fleet)
+        self.assertEqual(run, {})
+        self.assertEqual(candidates, {})
+        self.assertEqual(len(na), 4)
+        reason = next(iter(na.values()))[0]["reason"]
+        self.assertEqual(next(iter(na.values()))[0]["check"], fd.UNLABELLED_SLUG)
+        self.assertIn("cohorts this fleet by `project`", reason)
+
+    def test_an_ineligible_cluster_neither_runs_it_nor_declares_it(self):
+        """§1 already excluded it for a reason a label cannot fix, and its
+        `limitations` string covers the whole roster."""
+        fleet = self._live_shape({})
+        fleet[-1] = cluster("host", labels={}, status="PROVISIONING")
+        run, candidates, na = self.check(fleet)
+        self.assertNotIn(K("host"), run)
+        self.assertEqual(candidates, {})
+        self.assertEqual(na, {})
+
+    def test_the_finding_reaches_the_manifest(self):
+        clusters_json = json.dumps(self._live_shape({}))
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            return run_of(0)
+
+        manifest = fd.collect_fleet("acme", run=run, now=NOW)
+        host = next(e for e in manifest["clusters"] if e["name"] == "host")
+        self.assertEqual([c["check"] for c in host["candidates"]], [fd.UNLABELLED_SLUG])
+        self.assertIn(fd.UNLABELLED_SLUG, [c["check"] for c in host["commands"]])
+        # The compared clusters ran it too, and none of them failed it.
+        peer = next(e for e in manifest["clusters"] if e["name"] == "std-0")
+        self.assertIn(fd.UNLABELLED_SLUG, [c["check"] for c in peer["commands"]])
+        self.assertEqual(peer["candidates"], [])
+
+    def test_the_slug_is_on_the_audit_report_roster(self):
+        """A finding whose slug the roster does not carry is rejected at
+        `finish`, so the collector would publish nothing."""
+        import audit_report
+
+        spec = audit_report.AUDITS["fleet-consistency-drift"]
+        self.assertIn(fd.UNLABELLED_SLUG, spec.checks)
+        self.assertEqual(len(spec.checks), len(fd.FACETS) + 1)
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

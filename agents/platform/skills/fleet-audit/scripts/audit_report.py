@@ -271,6 +271,7 @@ AUDITS: dict[str, AuditSpec] = {
             "label-keys",
             "image-type",
             "database-encryption",
+            "no-environment-label",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
