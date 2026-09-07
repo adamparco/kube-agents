@@ -367,6 +367,7 @@ def context_of(dump=None, **overrides):
     that only cares about one cross-reference does not have to construct the
     other three."""
     base = {
+        "claims": {},
         "limitranges": {},
         "pdbs": {},
         "hpas": {},
@@ -380,6 +381,7 @@ def context_of(dump=None, **overrides):
     }
     if dump is not None:
         base.update(
+            claims=collect.claims_by_key(dump),
             limitranges=collect.limitranges_by_namespace(dump),
             pdbs=collect.pdbs_by_namespace(dump),
             hpas=collect.hpas_by_namespace(dump),
@@ -2419,6 +2421,254 @@ class TestPrestopOutlivesGrace(unittest.TestCase):
 
     def test_a_zero_grace_period_truncates_any_hook(self):
         self.assertIsNotNone(self.check([self.container({"sleep": {"seconds": 1}})], grace=0))
+
+
+class TestMaxSurgeCount(unittest.TestCase):
+    """`maxSurge` resolves the opposite way to `maxUnavailable`, and §3.21
+    rests on that. Rounding a percentage down instead would clear every
+    single-replica Deployment, which is every one this check is for."""
+
+    def test_the_default_of_twenty_five_percent_of_one_replica_rounds_up_to_one(self):
+        self.assertEqual(collect._max_surge_count({}, 1), 1)
+
+    def test_twenty_five_percent_of_four_replicas_is_one(self):
+        self.assertEqual(collect._max_surge_count({"maxSurge": "25%"}, 4), 1)
+
+    def test_fifty_percent_of_three_replicas_rounds_up_to_two(self):
+        self.assertEqual(collect._max_surge_count({"maxSurge": "50%"}, 3), 2)
+
+    def test_an_absolute_zero_is_zero_rather_than_the_default(self):
+        self.assertEqual(collect._max_surge_count({"maxSurge": 0}, 1), 0)
+
+    def test_an_absolute_count_is_read_verbatim(self):
+        self.assertEqual(collect._max_surge_count({"maxSurge": 3}, 1), 3)
+
+    def test_an_unparseable_value_falls_back_to_the_kubernetes_default(self):
+        # Not to nought. A field this collector cannot read is a field it
+        # knows nothing about, and reading it as "no surge" would clear the
+        # workload on the strength of a parse failure.
+        self.assertEqual(collect._max_surge_count({"maxSurge": "lots"}, 1), 1)
+        self.assertEqual(collect._max_surge_count({"maxSurge": "1x%"}, 4), 1)
+
+
+def pvc(name, ns="default", modes=("ReadWriteOnce",), storage_class="standard-rwo", status_modes=None):
+    doc = {
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"namespace": ns, "name": name},
+        "spec": {"accessModes": list(modes), "storageClassName": storage_class},
+    }
+    if status_modes is not None:
+        doc["status"] = {"accessModes": list(status_modes)}
+    return doc
+
+
+class TestRwoClaimContended(unittest.TestCase):
+    """§3.21. Two pods sent to a volume one node holds.
+
+    The rollout arm is the one worth the check: a Deployment, a claim, and the
+    strategy Kubernetes supplies when none is written are the whole recipe, and
+    the result is a workload that reports `Available` throughout while silently
+    refusing every update it is given.
+    """
+
+    def wl(self, *, replicas=1, strategy=None, volumes=None, kind="Deployment"):
+        d = deployment("grafana", **{"spec.replicas": replicas})
+        d["kind"] = kind
+        if strategy is not None:
+            d["spec"]["strategy"] = strategy
+        d["spec"]["template"]["spec"]["volumes"] = list(volumes or [])
+        return collect.normalize_workloads(dump_of(d))[0]
+
+    def claim_volume(self, claim_name="grafana-data"):
+        return {"name": "data", "persistentVolumeClaim": {"claimName": claim_name}}
+
+    def ctx(self, *claims):
+        return context_of(claims=collect.claims_by_key(dump_of(*claims)))
+
+    def check(self, workload, *claims):
+        return collect.check_rwo_claim_contended(workload, self.ctx(*claims))
+
+    def test_one_replica_under_the_default_strategy_is_flagged(self):
+        # No `strategy` key at all, which is what most Deployments carry. The
+        # controller supplies RollingUpdate with maxSurge 25%, that rounds up
+        # to one extra pod, and the two contend.
+        hit = self.check(self.wl(volumes=[self.claim_volume()]), pvc("grafana-data"))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["object"], "Deployment/grafana")
+        self.assertIn("maxSurge resolving to 1", hit["excerpt"])
+        self.assertIn("grafana-data", hit["excerpt"])
+        self.assertIs(hit["impact"], collect._IMPACT_RWO_ROLLOUT_DEADLOCK)
+
+    def test_the_excerpt_names_the_access_modes_and_the_storage_class(self):
+        # Both feed the remediation. The modes are the claim this finding
+        # makes, and the class is what tells an owner whether moving to
+        # ReadWriteMany is cheap on their cluster.
+        hit = self.check(
+            self.wl(volumes=[self.claim_volume()]), pvc("grafana-data", storage_class="premium-rwo")
+        )
+        self.assertIn("ReadWriteOnce", hit["excerpt"])
+        self.assertIn("storageClass premium-rwo", hit["excerpt"])
+
+    def test_a_claim_with_no_storage_class_says_so_rather_than_printing_nothing(self):
+        hit = self.check(
+            self.wl(volumes=[self.claim_volume()]), pvc("grafana-data", storage_class=None)
+        )
+        self.assertIn("(cluster default)", hit["excerpt"])
+
+    def test_recreate_is_the_fix_already_applied_and_is_not_flagged(self):
+        self.assertIsNone(
+            self.check(
+                self.wl(strategy={"type": "Recreate"}, volumes=[self.claim_volume()]),
+                pvc("grafana-data"),
+            )
+        )
+
+    def test_one_replica_with_max_surge_zero_is_not_flagged(self):
+        # The old pod is removed before the replacement starts, so the volume
+        # is free by the time anything asks for it.
+        self.assertIsNone(
+            self.check(
+                self.wl(
+                    strategy={"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0}},
+                    volumes=[self.claim_volume()],
+                ),
+                pvc("grafana-data"),
+            )
+        )
+
+    def test_more_than_one_replica_is_the_other_arm_and_carries_its_own_impact(self):
+        hit = self.check(self.wl(replicas=3, volumes=[self.claim_volume()]), pvc("grafana-data"))
+        self.assertIsNotNone(hit)
+        self.assertIn("replicas=3", hit["excerpt"])
+        self.assertIs(hit["impact"], collect._IMPACT_RWO_REPLICAS_PINNED)
+
+    def test_more_than_one_replica_is_flagged_even_where_nothing_surges(self):
+        # Above one replica the pods coexist by definition rather than during
+        # a rollout, so `maxSurge: 0` changes nothing about the contention.
+        hit = self.check(
+            self.wl(
+                replicas=3,
+                strategy={"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0}},
+                volumes=[self.claim_volume()],
+            ),
+            pvc("grafana-data"),
+        )
+        self.assertIsNotNone(hit)
+        self.assertIs(hit["impact"], collect._IMPACT_RWO_REPLICAS_PINNED)
+
+    def test_read_write_once_pod_is_the_stricter_mode_and_is_flagged(self):
+        self.assertIsNotNone(
+            self.check(
+                self.wl(volumes=[self.claim_volume()]),
+                pvc("grafana-data", modes=("ReadWriteOncePod",)),
+            )
+        )
+
+    def test_read_write_many_is_not_flagged(self):
+        self.assertIsNone(
+            self.check(
+                self.wl(volumes=[self.claim_volume()]),
+                pvc("grafana-data", modes=("ReadWriteMany",)),
+            )
+        )
+
+    def test_a_claim_listing_read_write_many_alongside_once_is_not_flagged(self):
+        # Every mode has to be exclusive. A second node can attach this one,
+        # so nothing deadlocks and there is no finding.
+        self.assertIsNone(
+            self.check(
+                self.wl(volumes=[self.claim_volume()]),
+                pvc("grafana-data", modes=("ReadWriteOnce", "ReadWriteMany")),
+            )
+        )
+
+    def test_the_bound_volumes_status_modes_win_over_the_request(self):
+        # `spec.accessModes` is what was asked for; `status.accessModes` is
+        # what the bound volume supports. Reading the request here would
+        # report a Filestore-backed claim as exclusive.
+        self.assertIsNone(
+            self.check(
+                self.wl(volumes=[self.claim_volume()]),
+                pvc("grafana-data", modes=("ReadWriteOnce",), status_modes=("ReadWriteMany",)),
+            )
+        )
+
+    def test_an_unbound_claim_with_no_status_falls_back_to_the_request(self):
+        self.assertIsNotNone(
+            self.check(self.wl(volumes=[self.claim_volume()]), pvc("grafana-data"))
+        )
+
+    def test_a_claim_the_dump_does_not_hold_is_skipped_rather_than_assumed(self):
+        # Guessing ReadWriteOnce because it is the common default would send a
+        # pull request to change a rollout strategy over a volume that may
+        # well be shared.
+        self.assertIsNone(self.check(self.wl(volumes=[self.claim_volume("elsewhere")]), pvc("grafana-data")))
+
+    def test_a_claim_of_the_same_name_in_another_namespace_is_not_read(self):
+        self.assertIsNone(
+            self.check(self.wl(volumes=[self.claim_volume()]), pvc("grafana-data", ns="other"))
+        )
+
+    def test_a_generic_ephemeral_volume_is_not_flagged(self):
+        # The controller creates one claim per pod, so two pods never contend.
+        # Reading only `persistentVolumeClaim.claimName` excludes these for
+        # free, and this test is what keeps that true.
+        volume = {"name": "scratch", "ephemeral": {"volumeClaimTemplate": {"spec": {"accessModes": ["ReadWriteOnce"]}}}}
+        self.assertIsNone(self.check(self.wl(volumes=[volume]), pvc("grafana-data")))
+
+    def test_a_workload_with_no_volumes_is_not_flagged(self):
+        self.assertIsNone(self.check(self.wl(volumes=[]), pvc("grafana-data")))
+
+    def test_a_deployment_scaled_to_zero_is_dropped_by_s5_before_the_check_runs(self):
+        scaled_to_zero = deployment("grafana", **{"spec.replicas": 0})
+        scaled_to_zero["spec"]["template"]["spec"]["volumes"] = [self.claim_volume()]
+        self.assertEqual(collect.normalize_workloads(dump_of(scaled_to_zero)), [])
+
+    def test_a_zero_replica_workload_reaching_the_check_anyway_is_not_flagged(self):
+        # The guard inside the check, exercised directly because S5 above means
+        # nothing assembled by `normalize_workloads` can reach it. Without it
+        # the two arms would have to reason about nought replicas.
+        hand_built = {
+            "kind": "Deployment",
+            "ns": "default",
+            "name": "grafana",
+            "spec": {"replicas": 0},
+            "template": {"volumes": [self.claim_volume()]},
+        }
+        self.assertIsNone(self.check(hand_built, pvc("grafana-data")))
+
+    def test_a_statefulset_is_not_flagged(self):
+        # `volumeClaimTemplates` give each replica its own claim, and the
+        # update strategy replaces one member at a time rather than surging.
+        self.assertIsNone(
+            self.check(
+                self.wl(kind="StatefulSet", volumes=[self.claim_volume()]), pvc("grafana-data")
+            )
+        )
+
+    def test_it_never_fires_on_the_same_object_as_strategy_causes_downtime(self):
+        # 3.14 reports `Recreate` above one replica as a full outage, so the
+        # single-replica remediation this check writes must not be reachable
+        # where 3.14 would then pick the object up. The two exclusions are
+        # complementary by construction and this is the test that says so.
+        ctx = self.ctx(pvc("grafana-data"))
+        one = self.wl(replicas=1, volumes=[self.claim_volume()])
+        self.assertIsNotNone(collect.check_rwo_claim_contended(one, ctx))
+        self.assertIsNone(collect.check_strategy_causes_downtime(one, ctx))
+        many = self.wl(replicas=3, strategy={"type": "Recreate"}, volumes=[self.claim_volume()])
+        self.assertIsNone(collect.check_rwo_claim_contended(many, ctx))
+        self.assertIsNotNone(collect.check_strategy_causes_downtime(many, ctx))
+
+    def test_the_roster_entry_matches_what_the_sop_promises(self):
+        spec = next(c for c in collect.OBTAINABILITY_CHECKS if c.slug == "rwo-claim-contended")
+        self.assertEqual(spec.kind, "workload")
+        self.assertEqual(spec.severity, "major")
+        self.assertIsNone(spec.autopilot_severity)
+
+    def test_the_dump_asks_for_the_claims_this_check_reads(self):
+        # A check reading a kind the dump does not collect finds nothing and
+        # reports a clean cluster, which is the failure mode this line guards.
+        self.assertIn("persistentvolumeclaims", collect.DUMP_COMMAND_KINDS)
 
 
 class TestStrategyCausesDowntime(unittest.TestCase):

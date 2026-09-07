@@ -183,6 +183,7 @@ AUDITS: dict[str, AuditSpec] = {
             "liveness-preempts-readiness",
             "spread-not-achieved",
             "prestop-outlives-grace",
+            "rwo-claim-contended",
         ),
     ),
     "fleet-wide-cost-analysis": AuditSpec(

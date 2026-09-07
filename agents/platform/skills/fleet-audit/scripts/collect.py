@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete twenty-check roster
-(§3.1–§3.20 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete twenty-one-check roster
+(§3.1–§3.21 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete fourteen-check roster (§2.1–§2.14 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -61,6 +61,7 @@ import datetime
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shlex
@@ -306,6 +307,13 @@ DUMP_COMMAND_KINDS = (
     # deliberately not dumped -- they are the largest kind in any cluster, and
     # 3.16 needs the endpoint count rather than the pods behind it.
     ",endpointslices"
+    # `persistentvolumeclaims` serves 3.21 alone, and is the cheapest kind
+    # here after `endpointslices`: a claim is a few hundred bytes of spec --
+    # access modes, a storage class, a size -- and a cluster holds one per
+    # volume rather than one per pod. It carries nothing from inside the
+    # volume and no credential of any kind; a claim is a request for storage,
+    # not the storage.
+    ",persistentvolumeclaims"
 )
 
 # How long a CronJob must have been firing without a success before 3.12 calls
@@ -938,8 +946,28 @@ def _container_ports_behind(dump: dict, ns: str, selector: dict) -> tuple[str | 
     return None, []
 
 
+def claims_by_key(dump: dict) -> dict[tuple[str, str], dict]:
+    """Every PersistentVolumeClaim in the dump, keyed `(namespace, name)`.
+
+    Keyed rather than grouped by namespace, which is how every other kind here
+    is indexed, because §3.21's read is always one exact claim: a pod names it
+    in `volumes[].persistentVolumeClaim.claimName` and that name is
+    namespace-local, so grouping would only make each read walk a list to find
+    the single entry it already knows the name of.
+    """
+    return {
+        (
+            (item.get("metadata") or {}).get("namespace", ""),
+            (item.get("metadata") or {}).get("name", ""),
+        ): item
+        for item in dump.get("items", []) or []
+        if item.get("kind") == "PersistentVolumeClaim"
+    }
+
+
 def build_context(dump: dict, workloads: list[dict]) -> dict:
     return {
+        "claims": claims_by_key(dump),
         "limitranges": limitranges_by_namespace(dump),
         "pdbs": pdbs_by_namespace(dump),
         "hpas": hpas_by_namespace(dump),
@@ -2048,6 +2076,196 @@ def check_prestop_outlives_grace(workload: dict, context: dict) -> dict | None:
         "excerpt": (
             f"terminationGracePeriodSeconds={grace}, and the hook reaches it:\n" + "\n".join(truncated)
         ),
+    }
+
+
+# The access modes under which a volume can be held by one node at a time --
+# or, for `ReadWriteOncePod`, by one pod. `ReadWriteMany` and `ReadOnlyMany`
+# are the two that let a second pod attach, so a claim carrying either is out
+# of §3.21's scope however the workload rolls. GKE's default StorageClass
+# (`pd.csi.storage.gke.io`) provisions `ReadWriteOnce`, which is why this is
+# the common case rather than an exotic one.
+_EXCLUSIVE_ACCESS_MODES = frozenset({"ReadWriteOnce", "ReadWriteOncePod"})
+
+# Kubernetes' own `maxSurge` when a RollingUpdate strategy omits it. Named
+# because the default *is* the finding: a Deployment that never mentions a
+# strategy still surges, and 25% of one replica rounds up to one extra pod.
+DEFAULT_MAX_SURGE = "25%"
+
+_IMPACT_RWO_ROLLOUT_DEADLOCK = (
+    "Every rollout of this workload deadlocks and it silently stops taking "
+    "updates. The default strategy starts a replacement pod before the old one "
+    "is gone, both pods claim the same ReadWriteOnce volume, and the scheduler "
+    "has no reason to place the new pod on the node holding it -- so the "
+    "replacement sits in ContainerCreating with a Multi-Attach error until the "
+    "progress deadline expires. The old pod is never deleted, so nothing goes "
+    "down and no alert fires: the Deployment keeps serving the image it was "
+    "already running, and every later change, security patch included, is "
+    "accepted by the API server and never reaches a container."
+)
+
+_IMPACT_RWO_REPLICAS_PINNED = (
+    "This workload cannot reach the replica count it declares. Its replicas "
+    "all claim one ReadWriteOnce volume, which one node holds at a time, so "
+    "every pod the scheduler places elsewhere stays in ContainerCreating with "
+    "a Multi-Attach error. What runs is one pod, and the capacity and "
+    "redundancy the manifest asks for are not there -- while the Deployment's "
+    "own replica field, and every dashboard reading it, says they are."
+)
+
+
+def _max_surge_count(strategy: dict, replicas: int) -> int:
+    """`maxSurge` resolved against a replica count.
+
+    The mirror of `_max_unavailable_count`, rounding the other way. Kubernetes
+    rounds a `maxSurge` percentage **up**, so that a proportion can never
+    resolve to nought and stall a rollout that `maxUnavailable: 0` has already
+    forbidden to remove a pod first. That direction is the whole reason §3.21
+    fires on ordinary single-replica Deployments: 25% of one replica is one
+    extra pod, not none.
+
+    Returns an `int` where `_max_unavailable_count` returns `None`, because
+    unset means something different for the two fields. `maxUnavailable`
+    absent is a genuinely unknown state this collector will not invent a
+    number for; `maxSurge` absent is `"25%"` written by omission, and reading
+    it as nought would clear every Deployment that does not mention a strategy
+    -- which is nearly all of them, and all of the ones this check is for.
+    """
+    raw = strategy.get("maxSurge")
+    if raw is None:
+        raw = DEFAULT_MAX_SURGE
+    text = str(raw).strip()
+    if not text.endswith("%"):
+        try:
+            return int(text)
+        except ValueError:
+            text = DEFAULT_MAX_SURGE
+    try:
+        percent = float(text[:-1])
+    except ValueError:
+        percent = float(DEFAULT_MAX_SURGE[:-1])
+    return math.ceil(replicas * percent / 100)
+
+
+def _exclusive_claims(workload: dict, context: dict) -> list[str]:
+    """The workload's PVC-backed volumes that only one node can hold.
+
+    Reads `volumes[].persistentVolumeClaim.claimName` and nothing else, which
+    excludes generic ephemeral volumes for free: those declare a
+    `volumeClaimTemplate` inline and the controller creates one claim per pod,
+    so two pods never contend for the same object and there is no finding.
+
+    A claim the dump does not contain is skipped rather than assumed. It means
+    the object was created after the dump or lives outside it, and guessing
+    `ReadWriteOnce` because that is the common default would send a pull
+    request to change a rollout strategy over a volume that may well be
+    `ReadWriteMany`.
+    """
+    described = []
+    for volume in workload["template"].get("volumes") or []:
+        name = ((volume.get("persistentVolumeClaim") or {}).get("claimName") or "").strip()
+        if not name:
+            continue
+        claim = context.get("claims", {}).get((workload["ns"], name))
+        if claim is None:
+            continue
+        spec = claim.get("spec") or {}
+        # `status.accessModes` is what the bound volume actually supports and
+        # `spec.accessModes` is only what was asked for, so the status wins
+        # where it exists. An unbound claim has no status yet, and there the
+        # request is the best evidence available.
+        modes = (claim.get("status") or {}).get("accessModes") or spec.get("accessModes") or []
+        # Every mode must be exclusive, not merely one of them. A claim listing
+        # `ReadWriteMany` alongside `ReadWriteOnce` can be attached to a second
+        # node, so nothing here deadlocks and there is no finding to make.
+        if not modes or any(mode not in _EXCLUSIVE_ACCESS_MODES for mode in modes):
+            continue
+        storage_class = spec.get("storageClassName") or "(cluster default)"
+        described.append(f"{name} [{', '.join(modes)}, storageClass {storage_class}]")
+    return described
+
+
+def check_rwo_claim_contended(workload: dict, context: dict) -> dict | None:
+    """3.21 -- two pods sent to one volume only one node can hold.
+
+    A `ReadWriteOnce` claim is attached to a single node at a time. Put two
+    pods that can coexist behind one, and whichever the scheduler places on
+    the other node never starts: the volume cannot be attached twice, and the
+    kubelet reports `Multi-Attach error for volume` until something gives.
+
+    Two shapes reach that state and this check reports both, because they are
+    the same cause and take different fixes.
+
+    The first is a rollout. `RollingUpdate` -- the default, and the strategy of
+    a Deployment that never mentions one -- creates the replacement before
+    removing the original, so the two overlap by design. **The failure this
+    produces is silence.** No pod goes down, because the old one is not
+    permitted to leave until the new one is ready and the new one never will
+    be; the Deployment reports `Available` throughout, the rollout eventually
+    records `ProgressDeadlineExceeded`, and the workload carries on serving
+    the image it was already running. Every subsequent change is accepted by
+    the API server and lands nowhere, which is how a workload with a fully
+    reconciled GitOps repository behind it can sit on a year-old image.
+
+    The second is a replica count. Above one replica the pods coexist by
+    definition rather than during a rollout, so all but one stay pending
+    forever and the declared capacity is fiction.
+
+    That first shape is very common and it is the one worth a check, because
+    every other reading of the object says the workload is fine. It needs no
+    unusual manifest: a Deployment, a claim, and the default strategy are
+    enough, which describes most of the single-instance datastores and
+    dashboards that get run as Deployments rather than StatefulSets.
+
+    3.14 comes at `spec.strategy` from the opposite side and names this
+    situation without being able to detect it -- its remediation says to
+    "check first whether `Recreate` was chosen on purpose", because a workload
+    holding a `ReadWriteOnce` volume needs it. This is the check that knows.
+    The two cannot both fire on one object: 3.14 excludes single-replica
+    Deployments, and this one recommends `Recreate` only there.
+
+    Returns `None` on `Recreate`, which is the fix already applied, and on
+    StatefulSets, whose `volumeClaimTemplates` give each replica a claim of
+    its own and whose update strategy replaces one member at a time rather
+    than surging.
+    """
+    if workload["kind"] != "Deployment":
+        return None
+    strategy = workload["spec"].get("strategy") or {}
+    if strategy.get("type") == "Recreate":
+        return None
+    replicas = workload["spec"].get("replicas", 1)
+    if replicas is None:
+        replicas = 1
+    # Scaled to nought there is no pod, so there is no contention and no
+    # rollout to deadlock. S5 already drops these before `normalize_workloads`
+    # returns, so this is belt and braces rather than the working exclusion --
+    # it is here so the two arms below never have to reason about nought, and
+    # so a caller that assembles workloads some other way gets the same answer.
+    if replicas < 1:
+        return None
+    surge = _max_surge_count((strategy.get("rollingUpdate") or {}), replicas)
+    if replicas == 1 and surge < 1:
+        return None
+    claims = _exclusive_claims(workload, context)
+    if not claims:
+        return None
+    joined = "; ".join(claims)
+    if replicas > 1:
+        return {
+            "object": f"Deployment/{workload['name']}",
+            "excerpt": (
+                f"replicas={replicas}, all of them mounting one exclusively-attachable claim: {joined}"
+            ),
+            "impact": _IMPACT_RWO_REPLICAS_PINNED,
+        }
+    return {
+        "object": f"Deployment/{workload['name']}",
+        "excerpt": (
+            f"replicas=1, strategy RollingUpdate with maxSurge resolving to {surge}, "
+            f"mounting an exclusively-attachable claim: {joined}"
+        ),
+        "impact": _IMPACT_RWO_ROLLOUT_DEADLOCK,
     }
 
 
@@ -5032,6 +5250,22 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "major",
         None,
         _IMPACT_PRESTOP_TRUNCATED,
+    ),
+    CheckSpec(
+        "rwo-claim-contended",
+        "workload",
+        check_rwo_claim_contended,
+        # `major` on both arms, and the hit carries the Impact that says which
+        # one. Not `critical`: nothing is down. The rollout arm leaves the old
+        # pod serving indefinitely and the replica arm leaves one pod serving,
+        # so in both the workload answers requests while being unable to change
+        # or to grow. Not `minor` either -- a Deployment that cannot take an
+        # update is one no patch reaches, and it says nothing about it.
+        "major",
+        None,
+        # Overridden per hit; kept here because `CheckSpec` requires one and a
+        # placeholder would ship if an arm ever forgot its own.
+        _IMPACT_RWO_ROLLOUT_DEADLOCK,
     ),
 )
 
