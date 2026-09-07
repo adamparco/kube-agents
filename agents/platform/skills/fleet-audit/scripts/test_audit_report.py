@@ -4034,6 +4034,195 @@ class TestUndeclaredManualRemediations(HarnessTestCase):
         )
 
 
+class TestReleaseDeclaredManualRemediations(HarnessTestCase):
+    """The undeclared note, on a workload whose *release* the repository declares.
+
+    A chart's workloads are undeclared by construction -- the object exists only
+    once Helm expands the chart -- so "no pull request can carry this fix" fires
+    on every one of them, and on 2026-09-05 that was 33 of the obtainability
+    ledger's 42 manual findings. It is false wherever the repository declares
+    the Argo CD `Application` or Flux `HelmRelease` that installs the chart: a
+    values override in that file is exactly such a pull request. `collect.py`
+    resolves the release and hands the path over on the candidate, and this pass
+    swaps the sentence for one naming it.
+    """
+
+    def declare(self, relative, kind, name):
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            f"apiVersion: apps/v1\nkind: {kind}\nmetadata:\n  name: {name}\n",
+            encoding="utf-8",
+        )
+
+    def manifest(self, path, obj="Deployment/cert-manager", cluster="prod-us-east"):
+        candidate = {
+            "check": "netpol-missing",
+            "cluster": cluster,
+            "namespace": "payments",
+            "object": obj,
+        }
+        if path:
+            candidate["release_declaration"] = {
+                "path": path,
+                "kind": "Application",
+                "chart": "cert-manager",
+                "repo": "https://charts.jetstack.io",
+                "version": "v1.14.4",
+                "values_field": "spec.source.helm.valuesObject",
+            }
+        return {"clusters": [{"name": cluster, "candidates": [candidate]}]}
+
+    def finding(self, obj="Deployment/cert-manager", note=""):
+        remediation = {"kind": "manual"}
+        if note:
+            remediation["note"] = note
+        return make_finding(obj=obj, remediation=remediation)
+
+    APPLICATION = "clusters/prod-us-east/apps/cert-manager.yaml"
+
+    def test_the_release_file_is_named_instead_of_the_refusal(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                [finding], self.workspace, self.manifest(self.APPLICATION)
+            ),
+            [finding["id"]],
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn("Not declared in this repository", note)
+        self.assertIn(f"chart release declared at `{self.APPLICATION}`", note)
+        self.assertNotIn("no pull request can carry this fix", note)
+
+    def test_an_unresolved_release_still_gets_the_refusal(self):
+        # The common case and the one that must not regress: nothing in this
+        # repository installs the workload, so there is no file to point at.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(None)
+        )
+        self.assertIn(
+            "no pull request can carry this fix", finding["remediation"]["note"]
+        )
+
+    def test_a_missing_manifest_falls_back_to_the_refusal(self):
+        # `manifest` is optional, so a caller that never passed one -- or a
+        # collector run that emitted no candidates -- keeps the old sentence.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations([finding], self.workspace)
+        self.assertIn(
+            "no pull request can carry this fix", finding["remediation"]["note"]
+        )
+
+    def test_it_is_idempotent_across_runs(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        manifest = self.manifest(self.APPLICATION)
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, manifest
+        )
+        first = finding["remediation"]["note"]
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, manifest
+        )
+        self.assertEqual(finding["remediation"]["note"], first)
+
+    def test_the_two_sentences_replace_each_other(self):
+        # Sharing `_UNDECLARED_LEDE` is what makes one strip clear either. A
+        # chart adopted -- or dropped -- between runs must swap the sentence
+        # rather than stack the second beside the first.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(None)
+        )
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(self.APPLICATION)
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn(self.APPLICATION, note)
+        self.assertNotIn("no pull request can carry this fix", note)
+        self.assertEqual(note.count(audit_report._UNDECLARED_LEDE), 1)
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(None)
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn("no pull request can carry this fix", note)
+        self.assertNotIn(self.APPLICATION, note)
+        self.assertEqual(note.count(audit_report._UNDECLARED_LEDE), 1)
+
+    def test_an_existing_note_is_kept_and_appended_to(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding(note="Probe generation is forbidden.")
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(self.APPLICATION)
+        )
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith("Probe generation is forbidden."))
+        self.assertIn(self.APPLICATION, note)
+
+    def test_a_declared_object_is_still_left_alone(self):
+        # `declaration` and `release_declaration` never co-occur on a candidate,
+        # but the index this pass reads is built from the clone rather than from
+        # the candidate, so the two could disagree. The clone wins: an object
+        # with its own file is edited there.
+        self.declare("clusters/app/cm.yaml", "Deployment", "cert-manager")
+        finding = self.finding()
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                [finding], self.workspace, self.manifest(self.APPLICATION)
+            ),
+            [],
+        )
+        self.assertNotIn("note", finding["remediation"])
+
+    def test_a_finding_with_no_candidate_gets_the_refusal(self):
+        # The join is `derive_finding_id`; a finding no candidate matches has no
+        # resolved release, and guessing one from another finding's would name
+        # the wrong file.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding(obj="Deployment/argocd-server")
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(self.APPLICATION)
+        )
+        self.assertIn(
+            "no pull request can carry this fix", finding["remediation"]["note"]
+        )
+
+    def test_the_cluster_comes_from_the_entry_when_the_candidate_omits_it(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        manifest = self.manifest(self.APPLICATION)
+        manifest["clusters"][0]["candidates"][0].pop("cluster")
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                [finding], self.workspace, manifest
+            ),
+            [finding["id"]],
+        )
+        self.assertIn(self.APPLICATION, finding["remediation"]["note"])
+
+    def test_malformed_entries_are_skipped(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        manifest = {
+            "clusters": [
+                "not-a-dict",
+                {"name": "prod-us-east", "candidates": ["also-not-a-dict"]},
+                {"name": "prod-us-east", "candidates": None},
+            ]
+        }
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, manifest
+        )
+        self.assertIn(
+            "no pull request can carry this fix", finding["remediation"]["note"]
+        )
+
+
 class TestReconciledManualRemediations(unittest.TestCase):
     """A hand-applied fix on an object something else holds the spec of.
 

@@ -630,6 +630,21 @@ _GITOPS_DECLARABLE_KINDS = frozenset(
 _UNDECLARED_LEDE = "_(Not declared in this repository"
 _UNDECLARED_NOTE = f"{_UNDECLARED_LEDE}, so no pull request can carry this fix.)_"
 
+
+# The variant for a workload no file declares because a chart renders it, where
+# the repository does declare the *release*. Saying "no pull request can carry
+# this fix" there is false in the direction that stops a reader looking: the
+# Application or HelmRelease is a file in this repo, and a values override is a
+# pull request against it. Shares `_UNDECLARED_LEDE` so one strip clears either.
+#
+# States the file and stops, on `_DECLARED_LEDE`'s discipline: this pass cannot
+# know *why* the finding stayed manual. The likely reason -- the chart exposes
+# no values key reaching the field -- is the model's to say in
+# `recommendation.action`, and asserting it here would read as verified.
+def _release_declared_note(path: str) -> str:
+    return f"{_UNDECLARED_LEDE}; it is rendered by the chart release declared at `{path}`.)_"
+
+
 # The mirror of the pair above, for the case the ledger got wrong rather than
 # left unsaid. Naming the file is the whole point of this one -- "somewhere in
 # the repository" is not an answer a reader can act on -- so unlike
@@ -9652,7 +9667,7 @@ def disclose_declared_manual_remediations(
 
 
 def disclose_undeclared_manual_remediations(
-    findings: list[dict], root: Path
+    findings: list[dict], root: Path, manifest: dict | None = None
 ) -> list[str]:
     """Say so when no pull request against this repository could carry the fix.
 
@@ -9683,8 +9698,29 @@ def disclose_undeclared_manual_remediations(
     having to strip its own previous output first, which is what `_UNDECLARED_LEDE`
     is for.
 
+    A workload a chart renders is undeclared by this index and always will be:
+    the object exists only after Helm expands the chart. Where the collector
+    resolved its release to an Application or a HelmRelease in this repository,
+    the note names that file instead of claiming no pull request can carry the
+    fix -- which is false there, a values override being exactly such a request.
+
     Returns the ids annotated, for the caller to log.
     """
+    releases: dict[str, str] = {}
+    for entry in (manifest or {}).get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            release = candidate.get("release_declaration")
+            path = str((release or {}).get("path") or "").strip()
+            if not path:
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            releases[derive_finding_id(keyed)] = path
+
     declared = kubernetes_declarations(root)
     if not declared:
         # Empty means "could not look", not "declares nothing": both failure
@@ -9713,7 +9749,9 @@ def disclose_undeclared_manual_remediations(
             continue
         if (kind, name) in declared:
             continue
-        remediation["note"] = (f"{note} " if note else "") + _UNDECLARED_NOTE
+        release_path = releases.get(derive_finding_id(finding))
+        sentence = _release_declared_note(release_path) if release_path else _UNDECLARED_NOTE
+        remediation["note"] = (f"{note} " if note else "") + sentence
         annotated.append(str(finding.get("id", "")))
     return annotated
 
@@ -10758,7 +10796,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             "mechanical -- a check that bars manifests is working, a check that "
             "missed this declaration owed a manifest."
         )
-    for fid in disclose_undeclared_manual_remediations(findings, root):
+    for fid in disclose_undeclared_manual_remediations(findings, root, manifest):
         log(
             f"{fid} sits on an object no file in the GitOps repository declares; "
             "its manual remediation says so, rather than reading as a fix nobody "

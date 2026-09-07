@@ -8318,6 +8318,630 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
             self.assertNotIn("declaration", candidate)
 
 
+class TestReleaseOf(unittest.TestCase):
+    """The structured half of `reconciler_of`, which is what the index needs."""
+
+    def test_the_helm_annotation_pair_becomes_release_coordinates(self):
+        release = collect.release_of(
+            {
+                "annotations": {
+                    "meta.helm.sh/release-name": "cert-manager",
+                    "meta.helm.sh/release-namespace": "cert-manager",
+                }
+            }
+        )
+        self.assertEqual(
+            release, {"namespace": "cert-manager", "name": "cert-manager", "application": ""}
+        )
+
+    def test_an_argocd_tracking_id_yields_the_application_name(self):
+        """The id is `<app>:<group>/<Kind>:<ns>/<name>`; only the head is the app."""
+        release = collect.release_of(
+            {
+                "annotations": {
+                    "argocd.argoproj.io/tracking-id": "cert-manager:apps/Deployment:cert-manager/cert-manager"
+                }
+            }
+        )
+        self.assertEqual(release, {"namespace": "", "name": "", "application": "cert-manager"})
+
+    def test_both_markers_are_kept_rather_than_chosen_between(self):
+        release = collect.release_of(
+            {
+                "annotations": {
+                    "meta.helm.sh/release-name": "redis",
+                    "meta.helm.sh/release-namespace": "data",
+                    "argocd.argoproj.io/tracking-id": "redis-app:apps/StatefulSet:data/redis",
+                }
+            }
+        )
+        self.assertEqual(
+            release, {"namespace": "data", "name": "redis", "application": "redis-app"}
+        )
+
+    def test_an_object_no_chart_installs_has_no_release(self):
+        self.assertIsNone(collect.release_of({"annotations": {}}))
+        self.assertIsNone(collect.release_of({}))
+
+    def test_the_managed_by_label_alone_is_not_a_release(self):
+        """`app.kubernetes.io/managed-by: Helm` names no release to look up.
+
+        `reconciler_of` can still say something useful with it; this cannot,
+        and a key built from it would be `("", "")`.
+        """
+        self.assertIsNone(collect.release_of({"labels": {"app.kubernetes.io/managed-by": "Helm"}}))
+
+
+class TestReleaseDeclarations(unittest.TestCase):
+    """Resolving a chart-rendered workload to the release its repo declares.
+
+    `workload_declarations` above finds the file declaring an object. A
+    workload a chart renders has no such file, which is why 48 of the 53
+    findings in the 2026-09-07 obtainability run were `manual`. These cover the
+    declaration shapes that carry a values override instead.
+    """
+
+    APPLICATION = textwrap.dedent(
+        """\
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: cert-manager
+          namespace: argocd
+        spec:
+          source:
+            repoURL: https://charts.jetstack.io
+            chart: cert-manager
+            targetRevision: v1.14.4
+          destination:
+            name: prod-usc1
+            namespace: cert-manager
+        """
+    )
+
+    def tree(self, tmp, files):
+        for relative, text in files.items():
+            path = Path(tmp) / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return Path(tmp)
+
+    def resolve(self, files, cluster, release):
+        with TemporaryDirectory() as tmp:
+            index = collect.release_declarations(self.tree(tmp, files))
+        return collect.release_declaration_for(index, cluster, release)
+
+    def test_an_argocd_chart_application_resolves_from_its_tracking_id(self):
+        found = self.resolve(
+            {"apps/cert-manager.yaml": self.APPLICATION},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertEqual(
+            found,
+            {
+                "path": "apps/cert-manager.yaml",
+                "kind": "Application",
+                "chart": "cert-manager",
+                "repo": "https://charts.jetstack.io",
+                "version": "v1.14.4",
+                "values_field": "spec.source.helm.valuesObject",
+            },
+        )
+
+    def test_the_same_application_resolves_from_the_release_coordinates(self):
+        """Argo CD driving Helm through a plugin leaves the `meta.helm.sh` pair.
+
+        The Application is registered under both keys, so either marker on the
+        workload finds it.
+        """
+        found = self.resolve(
+            {"apps/cert-manager.yaml": self.APPLICATION},
+            "prod-usc1",
+            {"application": "", "name": "cert-manager", "namespace": "cert-manager"},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["path"], "apps/cert-manager.yaml")
+
+    def test_an_application_outside_any_cluster_tree_still_resolves(self):
+        """The reason this cannot reuse `workload_declarations`' path rule.
+
+        An Application names its own destination, and repositories keep them in
+        `apps/`, `bootstrap/`, or the root -- none of which is
+        `clusters/<name>/`. Keying off the path would index none of them.
+        """
+        found = self.resolve(
+            {"cert-manager-app.yaml": self.APPLICATION},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["path"], "cert-manager-app.yaml")
+
+    def test_a_destination_server_resolves_through_the_cluster_registration(self):
+        application = self.APPLICATION.replace(
+            "    name: prod-usc1\n", "    server: https://34.21.99.255\n"
+        )
+        secret = textwrap.dedent(
+            """\
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: cluster-prod-usc1
+              namespace: argocd
+              labels:
+                argocd.argoproj.io/secret-type: cluster
+            stringData:
+              name: prod-usc1
+              server: https://34.21.99.255
+            """
+        )
+        found = self.resolve(
+            {"apps/cert-manager.yaml": application, "argocd/clusters/prod-usc1.yaml": secret},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["chart"], "cert-manager")
+
+    def test_a_server_no_registration_names_resolves_to_nothing(self):
+        """Better unannotated than resolved into another cluster's tree."""
+        application = self.APPLICATION.replace(
+            "    name: prod-usc1\n", "    server: https://34.21.99.255\n"
+        )
+        found = self.resolve(
+            {"apps/cert-manager.yaml": application},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_the_in_cluster_destination_is_not_resolved(self):
+        """`https://kubernetes.default.svc` is whichever cluster Argo runs on.
+
+        Nothing in the repository says which that is, so a finding on any
+        cluster would otherwise match it.
+        """
+        application = self.APPLICATION.replace(
+            "    name: prod-usc1\n", "    server: https://kubernetes.default.svc\n"
+        )
+        found = self.resolve(
+            {"apps/cert-manager.yaml": application},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_a_git_sourced_application_is_not_a_release(self):
+        """The discriminator that keeps this off ordinary GitOps Applications.
+
+        `workloads-<cluster>` syncs a directory of plain manifests, and its
+        objects resolve through `workload_declarations` to their own files. A
+        values override for one would be nonsense.
+        """
+        application = textwrap.dedent(
+            """\
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: workloads-prod-usc1
+            spec:
+              source:
+                repoURL: https://github.com/acme/infra.git
+                targetRevision: main
+                path: clusters/prod-usc1/workloads
+              destination:
+                name: prod-usc1
+                namespace: default
+            """
+        )
+        found = self.resolve(
+            {"bootstrap/app.yaml": application},
+            "prod-usc1",
+            {"application": "workloads-prod-usc1", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_an_existing_values_string_is_named_over_the_object_form(self):
+        """Argo rejects an Application carrying both, so the override joins the
+        block already there rather than opening a second one."""
+        application = textwrap.dedent(
+            """\
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: cert-manager
+            spec:
+              source:
+                repoURL: https://charts.jetstack.io
+                chart: cert-manager
+                targetRevision: v1.14.4
+                helm:
+                  values: |
+                    replicaCount: 2
+              destination:
+                name: prod-usc1
+                namespace: cert-manager
+            """
+        )
+        found = self.resolve(
+            {"apps/cert-manager.yaml": application},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["values_field"], "spec.source.helm.values")
+
+    def test_a_multi_source_application_names_the_chart_entry_it_found(self):
+        application = textwrap.dedent(
+            """\
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: redis
+            spec:
+              sources:
+                - repoURL: https://github.com/acme/values.git
+                  targetRevision: main
+                  ref: values
+                - repoURL: https://charts.bitnami.com/bitnami
+                  chart: redis
+                  targetRevision: 19.0.0
+              destination:
+                name: prod-usc1
+                namespace: data
+            """
+        )
+        found = self.resolve(
+            {"apps/redis.yaml": application},
+            "prod-usc1",
+            {"application": "redis", "name": "", "namespace": ""},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found["values_field"], "spec.sources[1].helm.valuesObject")
+        self.assertEqual(found["repo"], "https://charts.bitnami.com/bitnami")
+
+    def test_two_chart_sources_on_one_application_resolve_to_nothing(self):
+        application = textwrap.dedent(
+            """\
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: pair
+            spec:
+              sources:
+                - repoURL: https://charts.example.com
+                  chart: one
+                  targetRevision: "1.0.0"
+                - repoURL: https://charts.example.com
+                  chart: two
+                  targetRevision: "2.0.0"
+              destination:
+                name: prod-usc1
+                namespace: data
+            """
+        )
+        found = self.resolve(
+            {"apps/pair.yaml": application},
+            "prod-usc1",
+            {"application": "pair", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_a_flux_helmrelease_resolves_through_its_repository(self):
+        helmrelease = textwrap.dedent(
+            """\
+            apiVersion: helm.toolkit.fluxcd.io/v2
+            kind: HelmRelease
+            metadata:
+              name: podinfo
+              namespace: apps
+            spec:
+              chart:
+                spec:
+                  chart: podinfo
+                  version: 6.5.4
+                  sourceRef:
+                    kind: HelmRepository
+                    name: podinfo
+                    namespace: flux-system
+              values:
+                replicaCount: 1
+            """
+        )
+        repository = textwrap.dedent(
+            """\
+            apiVersion: source.toolkit.fluxcd.io/v1
+            kind: HelmRepository
+            metadata:
+              name: podinfo
+              namespace: flux-system
+            spec:
+              url: https://stefanprodan.github.io/podinfo
+            """
+        )
+        found = self.resolve(
+            {
+                "clusters/prod-usc1/apps/podinfo.yaml": helmrelease,
+                "clusters/prod-usc1/flux/repos.yaml": repository,
+            },
+            "prod-usc1",
+            {"application": "", "name": "podinfo", "namespace": "apps"},
+        )
+        self.assertEqual(
+            found,
+            {
+                "path": "clusters/prod-usc1/apps/podinfo.yaml",
+                "kind": "HelmRelease",
+                "chart": "podinfo",
+                "repo": "https://stefanprodan.github.io/podinfo",
+                "version": "6.5.4",
+                "values_field": "spec.values",
+            },
+        )
+
+    def test_a_helmrelease_target_namespace_overrides_its_own(self):
+        helmrelease = textwrap.dedent(
+            """\
+            apiVersion: helm.toolkit.fluxcd.io/v2
+            kind: HelmRelease
+            metadata:
+              name: podinfo
+              namespace: flux-system
+            spec:
+              targetNamespace: apps
+              releaseName: podinfo-prod
+              chart:
+                spec:
+                  chart: podinfo
+                  version: 6.5.4
+            """
+        )
+        files = {"clusters/prod-usc1/apps/podinfo.yaml": helmrelease}
+        self.assertIsNotNone(
+            self.resolve(
+                files, "prod-usc1", {"application": "", "name": "podinfo-prod", "namespace": "apps"}
+            )
+        )
+        # The HelmRelease's own namespace is where the object lives, not where
+        # the release installs, so it must not be the key.
+        self.assertIsNone(
+            self.resolve(
+                files,
+                "prod-usc1",
+                {"application": "", "name": "podinfo-prod", "namespace": "flux-system"},
+            )
+        )
+
+    def test_a_helmrelease_outside_a_cluster_tree_resolves_to_nothing(self):
+        """Flux is per-cluster and a HelmRelease names no destination, so the
+        path convention is the only cluster signal it carries."""
+        helmrelease = textwrap.dedent(
+            """\
+            apiVersion: helm.toolkit.fluxcd.io/v2
+            kind: HelmRelease
+            metadata:
+              name: podinfo
+              namespace: apps
+            spec:
+              chart:
+                spec:
+                  chart: podinfo
+                  version: 6.5.4
+            """
+        )
+        found = self.resolve(
+            {"apps/podinfo.yaml": helmrelease},
+            "prod-usc1",
+            {"application": "", "name": "podinfo", "namespace": "apps"},
+        )
+        self.assertIsNone(found)
+
+    def test_two_declarations_of_one_release_resolve_to_nothing(self):
+        duplicate = self.APPLICATION.replace("targetRevision: v1.14.4", "targetRevision: v1.15.0")
+        found = self.resolve(
+            {"apps/a.yaml": self.APPLICATION, "apps/b.yaml": duplicate},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_an_applicationset_is_not_indexed(self):
+        """Its generated names and destinations are templates this cannot
+        evaluate, and guessing the cluster is the failure mode the exact match
+        exists to avoid."""
+        appset = textwrap.dedent(
+            """\
+            apiVersion: argoproj.io/v1alpha1
+            kind: ApplicationSet
+            metadata:
+              name: charts
+            spec:
+              generators:
+                - clusters: {}
+              template:
+                metadata:
+                  name: "cert-manager-{{.name}}"
+                spec:
+                  source:
+                    repoURL: https://charts.jetstack.io
+                    chart: cert-manager
+                    targetRevision: v1.14.4
+                  destination:
+                    server: "{{.server}}"
+                    namespace: cert-manager
+            """
+        )
+        found = self.resolve(
+            {"apps/appset.yaml": appset},
+            "prod-usc1",
+            {"application": "cert-manager-prod-usc1", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_a_release_on_another_cluster_never_matches(self):
+        found = self.resolve(
+            {"apps/cert-manager.yaml": self.APPLICATION},
+            "staging-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+    def test_a_workload_no_chart_installs_resolves_to_nothing(self):
+        with TemporaryDirectory() as tmp:
+            index = collect.release_declarations(
+                self.tree(tmp, {"apps/cert-manager.yaml": self.APPLICATION})
+            )
+        self.assertIsNone(collect.release_declaration_for(index, "prod-usc1", None))
+
+    def test_an_empty_index_makes_no_claim(self):
+        self.assertIsNone(
+            collect.release_declaration_for({}, "prod-usc1", {"application": "cert-manager"})
+        )
+
+    def test_an_unreadable_clone_yields_an_empty_index(self):
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "nope"
+            self.assertEqual(collect.release_declarations(missing), {})
+
+    def test_a_base64_cluster_secret_is_not_read(self):
+        """A committed `data:` block would be a leaked kubeconfig, so only the
+        plaintext `stringData` registration is trusted."""
+        application = self.APPLICATION.replace(
+            "    name: prod-usc1\n", "    server: https://34.21.99.255\n"
+        )
+        secret = textwrap.dedent(
+            """\
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: cluster-prod-usc1
+              labels:
+                argocd.argoproj.io/secret-type: cluster
+            data:
+              name: cHJvZC11c2Mx
+              server: aHR0cHM6Ly8zNC4yMS45OS4yNTU=
+            """
+        )
+        found = self.resolve(
+            {"apps/cert-manager.yaml": application, "argocd/clusters/prod-usc1.yaml": secret},
+            "prod-usc1",
+            {"application": "cert-manager", "name": "", "namespace": ""},
+        )
+        self.assertIsNone(found)
+
+
+class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
+    """The release annotation has to survive the trip to a candidate too.
+
+    Same joints as `TestCandidatesCarryTheirDeclaration`, same failure mode: a
+    correct index that never reaches `emit` is indistinguishable from a fleet
+    that installs no charts.
+    """
+
+    CLUSTER = {"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}
+    APPLICATION = textwrap.dedent(
+        """\
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: charted
+        spec:
+          source:
+            repoURL: https://charts.example.com
+            chart: charted
+            targetRevision: 1.2.3
+          destination:
+            name: prod-usc1
+            namespace: default
+        """
+    )
+    DECLARED_WORKLOAD = textwrap.dedent(
+        """\
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: both
+          namespace: default
+        """
+    )
+
+    def clone(self, tmp):
+        path = Path(tmp) / "infra"
+        (path / "apps").mkdir(parents=True)
+        (path / "apps/charted.yaml").write_text(self.APPLICATION)
+        (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+        (path / "clusters/prod-usc1/workloads/both.yaml").write_text(self.DECLARED_WORKLOAD)
+        return path
+
+    def fleet_run(self, *items):
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, json.dumps([self.CLUSTER]), "", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        return run
+
+    def candidates(self, *items):
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet(
+                    "obtainability-audit", "acme",
+                    run=self.fleet_run(*items), workspace=self.clone(tmp),
+                )
+        return [c for cluster in manifest["clusters"] for c in cluster.get("candidates") or []]
+
+    def tracked(self, name, **overrides):
+        return deployment(
+            name,
+            **{
+                "metadata.annotations": {
+                    "argocd.argoproj.io/tracking-id": f"charted:apps/Deployment:default/{name}"
+                },
+                **overrides,
+            },
+        )
+
+    def test_a_chart_rendered_workload_carries_its_release_declaration(self):
+        candidates = self.candidates(self.tracked("rendered"))
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertEqual(
+                candidate["release_declaration"],
+                {
+                    "path": "apps/charted.yaml",
+                    "kind": "Application",
+                    "chart": "charted",
+                    "repo": "https://charts.example.com",
+                    "version": "1.2.3",
+                    "values_field": "spec.source.helm.valuesObject",
+                },
+                candidate["check"],
+            )
+
+    def test_an_unmanaged_workload_carries_neither_annotation(self):
+        candidates = self.candidates(deployment("plain"))
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+            self.assertNotIn("declaration", candidate, candidate["check"])
+
+    def test_an_object_with_its_own_manifest_is_edited_there_instead(self):
+        """A workload that is both declared and chart-tracked takes the direct
+        path. Editing the object's own file is the stronger fix; a values
+        override beside it would be a second expression of the same change,
+        and only one of them can win the next sync.
+        """
+        candidates = self.candidates(self.tracked("both"))
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertIn("declaration", candidate, candidate["check"])
+            self.assertNotIn("release_declaration", candidate, candidate["check"])
+
+
 class TestChecksRevision(unittest.TestCase):
     """Every collector tells the harness which version of itself ran.
 
