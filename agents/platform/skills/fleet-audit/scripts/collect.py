@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete sixteen-check roster
-(§3.1–§3.16 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete seventeen-check roster
+(§3.1–§3.17 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete thirteen-check roster (§2.1–§2.13 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -740,6 +740,15 @@ def services_with_endpoints(dump: dict) -> list[dict]:
     exact moment it is not — and, worse, would let a Service that genuinely
     resolves to nothing look fine for as long as one old pod takes to go away.
 
+    `resolved_ports` and `named_targets` serve §3.17 and answer a second
+    question off the same join: which of this Service's ports the controller
+    could actually resolve. A `targetPort` given as a name is resolved against
+    the pod's declared `containerPort`s, and when no container declares that
+    name the endpoint-slice controller drops the port from the slice entirely
+    rather than writing it with a null number — so a service-port name missing
+    from `resolved_ports` is the controller saying it could not resolve it. A
+    numeric `targetPort` always resolves and is therefore not collected.
+
     S1, S2 and S4 are applied, as for CronJobs. S3 is not: an operator-owned
     Service black-holes traffic exactly like a hand-written one, and
     `reconciler` is what tells the reader the fix belongs in the operator's
@@ -780,12 +789,27 @@ def services_with_endpoints(dump: dict) -> list[dict]:
             continue
         name = meta.get("name", "")
         live = 0
+        resolved: set[str] = set()
         for slice_ in slices_by_service.get((ns, name), []):
             for endpoint in slice_.get("endpoints") or []:
                 conditions = endpoint.get("conditions") or {}
                 if conditions.get("terminating"):
                     continue
                 live += 1
+            for port in slice_.get("ports") or []:
+                if port.get("port") is not None:
+                    resolved.add(port.get("name") or "")
+        named_targets = [
+            (p.get("name") or "", p["targetPort"])
+            for p in spec.get("ports") or []
+            if isinstance(p.get("targetPort"), str)
+        ]
+        # Only walked where a named target went unresolved, which is rare —
+        # otherwise every Service in the dump would pay for a second pass over
+        # every workload in it.
+        backend, declared = None, []
+        if live and any(port not in resolved for port, _ in named_targets):
+            backend, declared = _container_ports_behind(dump, ns, selector)
         out.append(
             {
                 "service": item,
@@ -794,6 +818,10 @@ def services_with_endpoints(dump: dict) -> list[dict]:
                 "selector": selector,
                 "endpoints": live,
                 "zeroed_by": _selector_matches_a_zeroed_workload(dump, ns, selector),
+                "resolved_ports": resolved,
+                "named_targets": named_targets,
+                "backend": backend,
+                "declared_ports": declared,
             }
         )
     return out
@@ -822,6 +850,37 @@ def _selector_matches_a_zeroed_workload(dump: dict, ns: str, selector: dict) -> 
         if selector_matches({"matchLabels": selector}, pod_labels):
             return f"{item['kind']}/{meta.get('name', '')}"
     return None
+
+
+def _container_ports_behind(dump: dict, ns: str, selector: dict) -> tuple[str | None, list[str]]:
+    """The first workload this selector matches, and every container port it names.
+
+    What the remediation needs: a Service asking for a `targetPort` no
+    container declares is fixed by naming one that is declared, and this is
+    where the candidate names come from. Unnamed ports are rendered as their
+    number, because `targetPort: 8080` is as valid an answer as `targetPort:
+    http` and a reader given only the named ones would think there were none.
+
+    Reads the dump rather than the audited workload set for the reason
+    `_selector_matches_a_zeroed_workload` does — the exclusions are about what
+    is worth auditing, not about what is behind a Service.
+    """
+    for item in dump.get("items", []) or []:
+        if item.get("kind") not in WORKLOAD_KINDS:
+            continue
+        meta = item.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        template = (item.get("spec") or {}).get("template") or {}
+        pod_labels = (template.get("metadata") or {}).get("labels") or {}
+        if not selector_matches({"matchLabels": selector}, pod_labels):
+            continue
+        declared = []
+        for container in (template.get("spec") or {}).get("containers") or []:
+            for port in container.get("ports") or []:
+                declared.append(port.get("name") or str(port.get("containerPort", "")))
+        return f"{item['kind']}/{meta.get('name', '')}", declared
+    return None, []
 
 
 def build_context(dump: dict, workloads: list[dict]) -> dict:
@@ -1945,6 +2004,72 @@ def check_service_selects_nothing(context: dict) -> list[dict]:
                     f"type={svc_type} port(s)={ports or 'none'} selector={selector!r}; "
                     "the EndpointSlices for this Service list no ready, non-terminating "
                     "address, so every request to it is refused"
+                ),
+                "reconciler": reconciler_of(service.get("metadata") or {}),
+            }
+        )
+    return hits
+
+
+def check_service_port_unresolved(context: dict) -> list[dict]:
+    """Cluster-scoped: a Service whose `targetPort` names a port no container declares.
+
+    The near miss of §3.16, and the one that survives review more easily. The
+    selector is right, the pods are up, the EndpointSlices list them, and
+    `kubectl get endpoints` prints addresses — so every check anyone would
+    think to run says the Service is healthy. But a `targetPort` given as a
+    name is resolved against the pod's `containerPort` names, and when no
+    container declares that name the controller drops the port from the slice
+    rather than guessing. kube-proxy programs nothing, and the Service refuses
+    on that port while looking entirely fine.
+
+    It is a rename that does it: a container port renamed `web` to `http`, a
+    chart whose Service and Deployment templates take the name from two
+    different values, a port declaration deleted as tidying. The Service is
+    usually not the file that changed.
+
+    Numeric `targetPort`s cannot fail this way — `containerPort` is
+    informational and traffic goes to the number regardless — so only named
+    ones are collected, and a Service with no ports at all has nothing to
+    resolve.
+
+    Endpoints are required, which is what keeps this from double-reporting
+    §3.16: a Service with no backends is that finding, not this one.
+
+    Under-reports one case on purpose. The controller groups pods by the ports
+    they resolve, so a Deployment mid-rename with old and new pods both up
+    produces two slices, one carrying the port and one not; the union reads as
+    resolved and this stays quiet. Half the callers are failing, but a check
+    that fires during every rolling update of every renamed port would be
+    turned off within a week.
+    """
+    hits = []
+    for entry in context["service_endpoints"]:
+        if not entry["endpoints"]:
+            continue
+        broken = [
+            (port, target)
+            for port, target in entry["named_targets"]
+            if port not in entry["resolved_ports"]
+        ]
+        if not broken:
+            continue
+        service = entry["service"]
+        svc_type = (service.get("spec") or {}).get("type") or DEFAULT_SERVICE_TYPE
+        asked = "; ".join(
+            f"port {port or '(unnamed)'} wants targetPort {target!r}" for port, target in broken
+        )
+        declared = ", ".join(entry["declared_ports"]) or "no ports at all"
+        backend = entry["backend"] or "the workload behind it"
+        hits.append(
+            {
+                "namespace": entry["ns"],
+                "object": f"Service/{entry['name']}",
+                "severity": "critical" if svc_type in EXTERNAL_SERVICE_TYPES else "major",
+                "excerpt": (
+                    f"type={svc_type} {asked}; the EndpointSlices carry "
+                    f"{entry['endpoints']} ready address(es) and no entry for that "
+                    f"port, because {backend} declares {declared}"
                 ),
                 "reconciler": reconciler_of(service.get("metadata") or {}),
             }
@@ -4309,6 +4434,18 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "DNS name, by cluster IP, or through whatever is pointed at its "
         "external address -- has its connection refused. The Service object "
         "itself stays healthy, which is why nothing has reported this.",
+    ),
+    CheckSpec(
+        "service-port-unresolved",
+        "cluster",
+        check_service_port_unresolved,
+        "major",
+        None,
+        "This Service asks for a port by a name none of its pods declare, so "
+        "the endpoint controller left that port out and kube-proxy programmed "
+        "nothing for it. The pods are up and the Service lists their "
+        "addresses, so every check anyone would run says it is healthy while "
+        "the port refuses.",
     ),
 )
 

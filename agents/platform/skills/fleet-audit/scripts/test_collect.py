@@ -2135,15 +2135,19 @@ class TestCronjobRunsOverlap(unittest.TestCase):
         self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
 
 
-def endpointslice(service_name, ns="default", addresses=1, terminating=0):
+def endpointslice(service_name, ns="default", addresses=1, terminating=0, ports=None):
     """An EndpointSlice with `addresses` ready endpoints and `terminating`
-    endpoints on their way out."""
+    endpoints on their way out.
+
+    `ports` is the list of service-port names the controller managed to
+    resolve, which is what it writes: a name it could not find on the pod is
+    left out of the slice entirely rather than written with a null number."""
     endpoints = [{"addresses": [f"10.0.0.{i}"]} for i in range(addresses)]
     endpoints += [
         {"addresses": [f"10.0.1.{i}"], "conditions": {"terminating": True}}
         for i in range(terminating)
     ]
-    return {
+    slice_ = {
         "kind": "EndpointSlice",
         "metadata": {
             "namespace": ns,
@@ -2152,6 +2156,9 @@ def endpointslice(service_name, ns="default", addresses=1, terminating=0):
         },
         "endpoints": endpoints,
     }
+    if ports is not None:
+        slice_["ports"] = [{"name": p, "port": 8080, "protocol": "TCP"} for p in ports]
+    return slice_
 
 
 class TestServiceSelectsNothing(unittest.TestCase):
@@ -2263,6 +2270,158 @@ class TestServiceSelectsNothing(unittest.TestCase):
         headless = self.svc()
         headless["spec"]["clusterIP"] = "None"
         self.assertEqual(len(self.hits(headless)), 1)
+
+
+class TestServicePortUnresolved(unittest.TestCase):
+    """§3.17. The selector matches, the pods are up, the slices list their
+    addresses -- and the port the Service asked for by name is not in them."""
+
+    def hits(self, *items):
+        return collect.check_service_port_unresolved(context_of(dump_of(*items)))
+
+    def svc(self, target="http", port_name="web", **kwargs):
+        kwargs.setdefault("selector", {"app": "api"})
+        kwargs.setdefault("ports", [{"name": port_name, "port": 80, "targetPort": target}])
+        return service("api", **kwargs)
+
+    def backend(self, *port_names):
+        dep = deployment("api")
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        dep["spec"]["template"]["spec"]["containers"][0]["ports"] = [
+            {"name": n, "containerPort": 8080} for n in port_names
+        ]
+        return dep
+
+    def test_a_named_target_missing_from_the_slice_is_flagged(self):
+        hits = self.hits(self.svc(), endpointslice("api", ports=[]), self.backend("grpc"))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Service/api")
+
+    def test_a_resolved_name_is_never_flagged(self):
+        self.assertEqual(self.hits(self.svc(), endpointslice("api", ports=["web"])), [])
+
+    def test_a_numeric_target_cannot_fail_this_way(self):
+        # `containerPort` is informational -- traffic goes to the number
+        # whether or not a container declares it -- so flagging one would
+        # report every Service that omits a redundant declaration.
+        self.assertEqual(self.hits(self.svc(target=8080), endpointslice("api", ports=[])), [])
+
+    def test_a_service_with_no_endpoints_belongs_to_3_16(self):
+        self.assertEqual(self.hits(self.svc(), endpointslice("api", addresses=0, ports=[])), [])
+
+    def test_terminating_endpoints_alone_do_not_open_this_check(self):
+        self.assertEqual(
+            self.hits(self.svc(), endpointslice("api", addresses=0, terminating=2, ports=[])), []
+        )
+
+    def test_a_slice_with_no_ports_key_at_all_still_flags(self):
+        # A headless Service with no `spec.ports` gets an empty list; one that
+        # declares a port the controller could not resolve gets the same, so
+        # the absent key has to read as unresolved rather than as unknown.
+        self.assertEqual(len(self.hits(self.svc(), endpointslice("api"))), 1)
+
+    def test_the_wire_shape_of_an_empty_port_list_is_null(self):
+        # What the apiserver actually serves for a slice whose every port went
+        # unresolved, observed on GKE 1.35: the key is present and `null`, not
+        # `[]` and not absent. Reading it as unknown would silence the check on
+        # exactly the case it exists for.
+        slice_ = endpointslice("api", ports=[])
+        slice_["ports"] = None
+        self.assertEqual(len(self.hits(self.svc(), slice_)), 1)
+
+    def test_a_port_entry_with_no_number_does_not_resolve_it(self):
+        slice_ = endpointslice("api", ports=["web"])
+        slice_["ports"][0]["port"] = None
+        self.assertEqual(len(self.hits(self.svc(), slice_)), 1)
+
+    def test_an_unnamed_service_port_matches_the_unnamed_slice_entry(self):
+        # The single-port shape: neither side carries a name, and an absent
+        # name must not read as a different name from an empty one.
+        svc = self.svc(port_name=None)
+        del svc["spec"]["ports"][0]["name"]
+        self.assertEqual(self.hits(svc, endpointslice("api", ports=[""])), [])
+        self.assertEqual(len(self.hits(svc, endpointslice("api", ports=[]))), 1)
+
+    def test_only_the_broken_port_of_a_multi_port_service_is_named(self):
+        svc = service(
+            "api",
+            selector={"app": "api"},
+            ports=[
+                {"name": "web", "port": 80, "targetPort": "http"},
+                {"name": "grpc", "port": 90, "targetPort": "grpc"},
+            ],
+        )
+        hits = self.hits(svc, endpointslice("api", ports=["grpc"]), self.backend("grpc"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("'http'", hits[0]["excerpt"])
+        self.assertNotIn("wants targetPort 'grpc'", hits[0]["excerpt"])
+
+    def test_the_excerpt_names_what_the_workload_declares(self):
+        # This is the whole remediation: the reader is choosing between the
+        # names actually on the pod, and sending them to `kubectl` to find
+        # them is what makes a finding unactionable.
+        excerpt = self.hits(self.svc(), endpointslice("api", ports=[]), self.backend("grpc", "web"))[
+            0
+        ]["excerpt"]
+        self.assertIn("Deployment/api", excerpt)
+        self.assertIn("grpc, web", excerpt)
+
+    def test_a_backend_declaring_no_ports_says_so(self):
+        dep = deployment("api")
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        excerpt = self.hits(self.svc(), endpointslice("api", ports=[]), dep)[0]["excerpt"]
+        self.assertIn("no ports at all", excerpt)
+
+    def test_an_unnamed_container_port_is_offered_as_its_number(self):
+        # `targetPort: 8080` is as valid an answer as `targetPort: http`, and a
+        # reader shown only the named ones would think there were none.
+        dep = deployment("api")
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        dep["spec"]["template"]["spec"]["containers"][0]["ports"] = [{"containerPort": 8080}]
+        self.assertIn("8080", self.hits(self.svc(), endpointslice("api", ports=[]), dep)[0]["excerpt"])
+
+    def test_no_backend_found_still_produces_a_finding(self):
+        excerpt = self.hits(self.svc(), endpointslice("api", ports=[]))[0]["excerpt"]
+        self.assertIn("the workload behind it", excerpt)
+
+    def test_an_externally_published_service_is_critical(self):
+        for svc_type in ("LoadBalancer", "NodePort"):
+            with self.subTest(svc_type=svc_type):
+                hits = self.hits(self.svc(svc_type=svc_type), endpointslice("api", ports=[]))
+                self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_a_clusterip_service_is_major(self):
+        self.assertEqual(
+            self.hits(self.svc(), endpointslice("api", ports=[]))[0]["severity"], "major"
+        )
+
+    def test_the_standard_exclusions_apply(self):
+        self.assertEqual(
+            self.hits(self.svc(ns="kube-system"), endpointslice("api", ns="kube-system", ports=[])),
+            [],
+        )
+        exempt = self.svc()
+        exempt["metadata"]["labels"] = {collect.OPT_OUT_KEY: "exempt"}
+        self.assertEqual(self.hits(exempt, endpointslice("api", ports=[])), [])
+
+    def test_the_finding_names_what_reconciles_the_service(self):
+        helm = self.svc()
+        helm["metadata"]["annotations"] = {
+            "meta.helm.sh/release-name": "kube-agents",
+            "meta.helm.sh/release-namespace": "kubeagents-system",
+        }
+        self.assertIn("kube-agents", self.hits(helm, endpointslice("api", ports=[]))[0]["reconciler"])
+
+    def test_one_service_never_carries_both_this_and_3_16(self):
+        # 3.16 needs no ready endpoints and this needs some, so the two are
+        # mutually exclusive on one Service by construction. This is the test
+        # that keeps them that way, because a reader handed both findings on
+        # one object would have no way to tell which one to act on.
+        for slices in ([], [endpointslice("api", addresses=0, ports=[])], [endpointslice("api", ports=[])]):
+            with self.subTest(slices=len(slices)):
+                items = [self.svc(), *slices]
+                orphaned = collect.check_service_selects_nothing(context_of(dump_of(*items)))
+                self.assertEqual(len(orphaned) + len(self.hits(*items)), 1)
 
 
 def fake_run(replies, calls):
@@ -2434,10 +2593,11 @@ class TestCollectCluster(unittest.TestCase):
         # The cluster-scoped checks still ran: an HPA pointing at a workload
         # that no longer exists, a PDB nothing can satisfy, a CronJob that has
         # stopped succeeding or whose runs overlap, and a Service selecting no
-        # pod are all still true of a cluster whose *workload* set is empty.
-        # 3.12, 3.15 and 3.16 in particular are only ever reachable this way --
-        # neither a CronJob nor a Service is a workload, so a cluster that
-        # holds nothing else still owes all three an answer.
+        # pod or asking for a port name none of them declares are all still
+        # true of a cluster whose *workload* set is empty. 3.12, 3.15, 3.16 and
+        # 3.17 in particular are only ever reachable this way -- neither a
+        # CronJob nor a Service is a workload, so a cluster that holds nothing
+        # else still owes all four an answer.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
         self.assertEqual(
             cluster_slugs,
@@ -2447,6 +2607,7 @@ class TestCollectCluster(unittest.TestCase):
                 "schedule-never-succeeds",
                 "cronjob-runs-overlap",
                 "service-selects-nothing",
+                "service-port-unresolved",
             },
         )
         self.assertFalse(cluster_slugs & set(na))

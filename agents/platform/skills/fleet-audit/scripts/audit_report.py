@@ -178,6 +178,7 @@ AUDITS: dict[str, AuditSpec] = {
             "strategy-causes-downtime",
             "cronjob-runs-overlap",
             "service-selects-nothing",
+        "service-port-unresolved",
         ),
     ),
     "fleet-wide-cost-analysis": AuditSpec(
