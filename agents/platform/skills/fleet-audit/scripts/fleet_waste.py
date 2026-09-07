@@ -97,12 +97,14 @@ GIT_DIR_NAME = ".git"
 # override, so `workload_declarations` skips them rather than resolving a
 # `Cluster/<name>` finding through the wrong table.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
-# `release_declarations` indexes the two objects that install a Helm chart from
-# a GitOps repo, and the two it needs to resolve them: Argo CD's cluster
-# registration Secret (which is how `spec.destination.server` becomes a cluster
-# name) and Flux's `HelmRepository` (which is how a `HelmRelease`'s chart
-# reference becomes a URL `helm show values` can read). Copied from `collect.py`
-# under the same standalone-collector rule as the three above.
+# `release_declarations` indexes the objects that render a workload a GitOps
+# repo holds no manifest for -- an Argo CD `Application`, from either a chart
+# or a Kustomize overlay, and a Flux `HelmRelease` -- plus the two it needs to
+# resolve them: Argo CD's cluster registration Secret (which is how
+# `spec.destination.server` becomes a cluster name) and Flux's `HelmRepository`
+# (which is how a `HelmRelease`'s chart reference becomes a URL `helm show
+# values` can read). Copied from `collect.py` under the same
+# standalone-collector rule as the three above.
 ARGOCD_APPLICATION_KIND = "Application"
 ARGOCD_CLUSTER_SECRET_LABEL = "argocd.argoproj.io/secret-type"
 ARGOCD_CLUSTER_SECRET_VALUE = "cluster"
@@ -121,6 +123,18 @@ RELEASE_KEY_RELEASE = "release"
 ARGOCD_VALUES_OBJECT_FIELD = "valuesObject"
 ARGOCD_VALUES_STRING_FIELD = "values"
 FLUX_VALUES_FIELD = "values"
+ARGOCD_KUSTOMIZE_PATCHES_FIELD = "patches"
+# Which of those two overrides a declaration takes, since they are written
+# differently: a values mapping the chart reads by key, or a list of patches
+# Kustomize applies to a matched object. Carried on the entry so the SOP can
+# branch on it rather than inferring one from the shape of `values_field`.
+RENDERER_HELM = "helm"
+RENDERER_KUSTOMIZE = "kustomize"
+# What marks a directory as a Kustomize root. `kustomization.yaml` is what
+# `kustomize create` writes; the other two are the legacy spellings `kustomize
+# build` still accepts, and a repo that uses one is exactly as unresolvable
+# without this as one that uses the first.
+KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 
 # How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
 # match this stream's weekly cadence: every finding is then "this controller
@@ -2748,6 +2762,53 @@ def _argocd_chart_source(spec: dict) -> dict | None:
     return charts[0] if len(charts) == 1 else None
 
 
+def _argocd_kustomize_source(spec: dict, root: Path) -> dict | None:
+    """The one Kustomize source on an Argo CD Application, with its field path.
+
+    Reached only where `_argocd_chart_source` found no chart, and answers the
+    case its docstring sets aside. A plain directory of manifests is resolved
+    by `workload_declarations`, which finds the object's own YAML -- but an
+    overlay over a *remote* base renders objects no file in the repo declares,
+    so that lookup finds nothing and the finding falls to `manual`. It is the
+    same hole a chart put a workload in, and as common: `resources:` pointing
+    at a tagged base in another repository is an ordinary way to run a fleet.
+
+    A `kustomization.yaml` at `spec.source.path` is the discriminator, checked
+    against the clone rather than against `spec.source.kustomize`, which Argo
+    CD infers from that same file and most Applications therefore omit. Where
+    the base *is* local, the object has its own manifest, and the
+    `"declaration" not in candidate` guard in `_emit` keeps that direct edit
+    ahead of a patch here.
+
+    Multi-source and two-source ambiguity follow `_argocd_chart_source`.
+    """
+
+    def rooted(entry: object) -> bool:
+        if not isinstance(entry, dict) or entry.get("chart"):
+            return False
+        path = str(entry.get("path") or "").strip()
+        if not path or path.startswith("/") or ".." in Path(path).parts:
+            return False
+        try:
+            directory = root / path
+            return any((directory / name).is_file() for name in KUSTOMIZATION_FILE_NAMES)
+        except OSError:
+            return False
+
+    single = spec.get("source")
+    if rooted(single):
+        return {"source": single, "field": "spec.source"}
+    sources = spec.get("sources")
+    if not isinstance(sources, list):
+        return None
+    overlays = [
+        {"source": entry, "field": f"spec.sources[{position}]"}
+        for position, entry in enumerate(sources)
+        if rooted(entry)
+    ]
+    return overlays[0] if len(overlays) == 1 else None
+
+
 def _argocd_values_field(source: dict, field: str) -> str:
     """Where a values override belongs on one Argo CD chart source.
 
@@ -2856,9 +2917,11 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             continue
         if kind == ARGOCD_APPLICATION_KIND:
             chart = _argocd_chart_source(spec)
-            if chart is None:
+            overlay = _argocd_kustomize_source(spec, root) if chart is None else None
+            if chart is None and overlay is None:
                 continue
-            source, field = chart["source"], chart["field"]
+            found = chart or overlay
+            source, field = found["source"], found["field"]
             destination = spec.get("destination") if isinstance(spec.get("destination"), dict) else {}
             cluster = str(destination.get("name") or "").strip()
             if not cluster:
@@ -2875,14 +2938,23 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             entry = {
                 "path": relative,
                 "kind": ARGOCD_APPLICATION_KIND,
-                "chart": str(source.get("chart") or ""),
+                "renderer": RENDERER_HELM if chart else RENDERER_KUSTOMIZE,
+                "chart": str(source.get("chart") or source.get("path") or ""),
                 "repo": str(source.get("repoURL") or ""),
                 "version": str(source.get("targetRevision") or ""),
-                "values_field": _argocd_values_field(source, field),
+                "values_field": (
+                    _argocd_values_field(source, field)
+                    if chart
+                    else f"{field}.{RENDERER_KUSTOMIZE}.{ARGOCD_KUSTOMIZE_PATCHES_FIELD}"
+                ),
             }
             record((cluster, RELEASE_KEY_APPLICATION, name), entry)
             release_name = str(helm.get("releaseName") or "").strip() or name
-            if release_namespace:
+            # Only a chart install leaves the `meta.helm.sh` pair behind, so
+            # only a chart is worth the second key. Kustomize output carries
+            # the tracking id alone, which the Application key above already
+            # answers.
+            if chart and release_namespace:
                 record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
         elif kind == FLUX_HELM_RELEASE_KIND:
             # Flux is installed per-cluster, so the path convention is the only
@@ -2902,6 +2974,7 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             entry = {
                 "path": relative,
                 "kind": FLUX_HELM_RELEASE_KIND,
+                "renderer": RENDERER_HELM,
                 "chart": str(chart_spec.get("chart") or ""),
                 "repo": repositories.get((repo_namespace, repo_name), ""),
                 "version": str(chart_spec.get("version") or ""),

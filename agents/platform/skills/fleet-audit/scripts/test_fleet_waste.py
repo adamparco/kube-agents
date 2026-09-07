@@ -4004,12 +4004,12 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
         self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
     def test_the_release_resolver_matches_collect_py(self):
-        # The four halves of the Helm branch, under the same convention. Drift
-        # here is worse than in the pair above, because what these resolve to
-        # is a file a pull request rewrites: two collectors disagreeing about
-        # which Application declares a release means one of them opens a PR
-        # against the wrong chart.
-        for name in ("release_of", "_argocd_chart_source", "_argocd_values_field", "release_declarations", "release_declaration_for"):
+        # Every half of the branch that resolves a rendered workload, under the
+        # same convention. Drift here is worse than in the pair above, because
+        # what these resolve to is a file a pull request rewrites: two
+        # collectors disagreeing about which Application declares a release
+        # means one of them opens a PR against the wrong chart.
+        for name in ("release_of", "_argocd_chart_source", "_argocd_kustomize_source", "_argocd_values_field", "release_declarations", "release_declaration_for"):
             with self.subTest(function=name):
                 mine, theirs = self.bodies(name)
                 self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
@@ -4044,6 +4044,10 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             "ARGOCD_VALUES_OBJECT_FIELD",
             "ARGOCD_VALUES_STRING_FIELD",
             "FLUX_VALUES_FIELD",
+            "ARGOCD_KUSTOMIZE_PATCHES_FIELD",
+            "RENDERER_HELM",
+            "RENDERER_KUSTOMIZE",
+            "KUSTOMIZATION_FILE_NAMES",
         ):
             with self.subTest(const=const):
                 self.assertEqual(getattr(fw, const), getattr(collect, const))
@@ -4265,6 +4269,7 @@ class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
     ENTRY = {
         "path": APPLICATION,
         "kind": "Application",
+        "renderer": "helm",
         "chart": "data-chart",
         "repo": "https://charts.example.com",
         "version": "1.2.3",

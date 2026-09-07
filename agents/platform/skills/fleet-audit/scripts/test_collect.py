@@ -8422,6 +8422,7 @@ class TestReleaseDeclarations(unittest.TestCase):
             {
                 "path": "apps/cert-manager.yaml",
                 "kind": "Application",
+                "renderer": "helm",
                 "chart": "cert-manager",
                 "repo": "https://charts.jetstack.io",
                 "version": "v1.14.4",
@@ -8673,6 +8674,7 @@ class TestReleaseDeclarations(unittest.TestCase):
             {
                 "path": "clusters/prod-usc1/apps/podinfo.yaml",
                 "kind": "HelmRelease",
+                "renderer": "helm",
                 "chart": "podinfo",
                 "repo": "https://stefanprodan.github.io/podinfo",
                 "version": "6.5.4",
@@ -8831,6 +8833,180 @@ class TestReleaseDeclarations(unittest.TestCase):
         self.assertIsNone(found)
 
 
+class TestKustomizeOverlayDeclarations(unittest.TestCase):
+    """The other way a workload ends up with no manifest of its own.
+
+    An overlay over a base in another repository renders objects
+    `workload_declarations` cannot find, exactly as a chart does. The override
+    is a patch rather than a values key, so `renderer` says which.
+    """
+
+    OVERLAY = textwrap.dedent(
+        """\
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: podinfo-overlay
+          namespace: argocd
+        spec:
+          source:
+            repoURL: https://github.com/example/fleet
+            path: overlays/prod-usc1/podinfo
+            targetRevision: main
+          destination:
+            name: prod-usc1
+            namespace: podinfo
+        """
+    )
+    KUSTOMIZATION = textwrap.dedent(
+        """\
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: Kustomization
+        resources:
+          - https://github.com/stefanprodan/podinfo//kustomize?ref=6.9.2
+        """
+    )
+    EXPECTED = {
+        "path": "apps/podinfo.yaml",
+        "kind": "Application",
+        "renderer": "kustomize",
+        "chart": "overlays/prod-usc1/podinfo",
+        "repo": "https://github.com/example/fleet",
+        "version": "main",
+        "values_field": "spec.source.kustomize.patches",
+    }
+    TRACKED = {"application": "podinfo-overlay", "name": "", "namespace": ""}
+
+    def resolve(self, files, cluster, release):
+        with TemporaryDirectory() as tmp:
+            for relative, text in files.items():
+                path = Path(tmp) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            index = collect.release_declarations(Path(tmp))
+        return collect.release_declaration_for(index, cluster, release)
+
+    def test_an_overlay_resolves_to_the_application_declaring_it(self):
+        found = self.resolve(
+            {
+                "apps/podinfo.yaml": self.OVERLAY,
+                "overlays/prod-usc1/podinfo/kustomization.yaml": self.KUSTOMIZATION,
+            },
+            "prod-usc1",
+            self.TRACKED,
+        )
+        self.assertEqual(found, self.EXPECTED)
+
+    def test_the_legacy_kustomization_spellings_resolve_too(self):
+        """`kustomize build` still accepts both, and a repo using one is as
+        unresolvable without this as a repo using `kustomization.yaml`."""
+        for filename in ("kustomization.yml", "Kustomization"):
+            with self.subTest(filename=filename):
+                found = self.resolve(
+                    {
+                        "apps/podinfo.yaml": self.OVERLAY,
+                        f"overlays/prod-usc1/podinfo/{filename}": self.KUSTOMIZATION,
+                    },
+                    "prod-usc1",
+                    self.TRACKED,
+                )
+                self.assertEqual(found, self.EXPECTED)
+
+    def test_a_path_with_no_kustomization_file_is_not_an_overlay(self):
+        """The plain directory of manifests `_argocd_chart_source` set aside.
+        Its objects have their own YAML, which `workload_declarations` finds."""
+        found = self.resolve(
+            {
+                "apps/podinfo.yaml": self.OVERLAY,
+                "overlays/prod-usc1/podinfo/deployment.yaml": "kind: Deployment\n",
+            },
+            "prod-usc1",
+            self.TRACKED,
+        )
+        self.assertIsNone(found)
+
+    def sourced(self, entries):
+        """`OVERLAY` with its single source replaced by a `sources` list."""
+        body = "".join(
+            "  - " + textwrap.indent(entry, "    ").lstrip() for entry in entries
+        )
+        return self.OVERLAY.replace(
+            "  source:\n"
+            "    repoURL: https://github.com/example/fleet\n"
+            "    path: overlays/prod-usc1/podinfo\n"
+            "    targetRevision: main\n",
+            "  sources:\n" + body,
+        )
+
+    def test_a_chart_source_still_wins_over_a_path(self):
+        """A multi-source Application can carry both. The chart is the release,
+        and its values block is the override that reaches the workload."""
+        both = self.sourced(
+            [
+                "repoURL: https://charts.example.com\nchart: podinfo\ntargetRevision: 6.9.2\n",
+                "repoURL: https://github.com/example/fleet\npath: overlays/prod-usc1/podinfo\n",
+            ]
+        )
+        found = self.resolve(
+            {
+                "apps/podinfo.yaml": both,
+                "overlays/prod-usc1/podinfo/kustomization.yaml": self.KUSTOMIZATION,
+            },
+            "prod-usc1",
+            self.TRACKED,
+        )
+        self.assertEqual(found["renderer"], "helm")
+        self.assertEqual(found["values_field"], "spec.sources[0].helm.valuesObject")
+
+    def test_two_overlays_are_an_ambiguity_with_no_right_answer(self):
+        two = self.sourced(
+            [
+                "repoURL: https://github.com/example/fleet\npath: overlays/prod-usc1/other\n",
+                "repoURL: https://github.com/example/fleet\npath: overlays/prod-usc1/podinfo\n",
+            ]
+        )
+        found = self.resolve(
+            {
+                "apps/podinfo.yaml": two,
+                "overlays/prod-usc1/podinfo/kustomization.yaml": self.KUSTOMIZATION,
+                "overlays/prod-usc1/other/kustomization.yaml": self.KUSTOMIZATION,
+            },
+            "prod-usc1",
+            self.TRACKED,
+        )
+        self.assertIsNone(found)
+
+    def test_a_path_escaping_the_clone_is_refused(self):
+        """`..` would resolve a finding against whatever sits beside the clone
+        on the agent's filesystem, so it never reads as an overlay."""
+        escaping = self.OVERLAY.replace(
+            "    path: overlays/prod-usc1/podinfo\n",
+            "    path: ../../etc\n",
+        )
+        found = self.resolve(
+            {
+                "apps/podinfo.yaml": escaping,
+                "overlays/prod-usc1/podinfo/kustomization.yaml": self.KUSTOMIZATION,
+            },
+            "prod-usc1",
+            self.TRACKED,
+        )
+        self.assertIsNone(found)
+
+    def test_an_overlay_gets_no_helm_release_key(self):
+        """Kustomize output carries a tracking id and no `meta.helm.sh` pair,
+        so a lookup by release coordinates must not find it."""
+        found = self.resolve(
+            {
+                "apps/podinfo.yaml": self.OVERLAY,
+                "overlays/prod-usc1/podinfo/kustomization.yaml": self.KUSTOMIZATION,
+            },
+            "prod-usc1",
+            {"application": "", "name": "podinfo-overlay", "namespace": "podinfo"},
+        )
+        self.assertIsNone(found)
+
+
 class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
     """The release annotation has to survive the trip to a candidate too.
 
@@ -8914,6 +9090,7 @@ class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
                 {
                     "path": "apps/charted.yaml",
                     "kind": "Application",
+                    "renderer": "helm",
                     "chart": "charted",
                     "repo": "https://charts.example.com",
                     "version": "1.2.3",
