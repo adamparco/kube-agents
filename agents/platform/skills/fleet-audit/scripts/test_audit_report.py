@@ -3163,6 +3163,233 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
 
+class TestKustomizeWiring(HarnessTestCase):
+    """A manifest a Kustomize root does not list is a file the cluster never sees.
+
+    PR #181 on gke-agentic/adamparco-infra is the case. Obtainability's `no-pdb`
+    fix for `spot-capacity-test/podinfo-kustomize/Deployment/podinfo` added
+    `pdb.yaml` to the overlay directory and stopped there. It merged, Argo CD
+    reported Synced because the rendered desired state had not changed, and the
+    namespace has no PodDisruptionBudget. Every signal was green and nothing was
+    fixed — which is why the wiring is enforced rather than asked for.
+    """
+
+    REMEDIATION = "clusters/prod-us-east/overlay/payments-netpol.yaml"
+
+    def overlay(self, body="resources:\n  - deployment.yaml\n"):
+        """A Kustomize root at the remediation's directory, holding `body`."""
+        kustomization = self.workspace / "clusters/prod-us-east/overlay/kustomization.yaml"
+        kustomization.parent.mkdir(parents=True, exist_ok=True)
+        kustomization.write_text(body, encoding="utf-8")
+        return kustomization
+
+    def doc(self):
+        return make_doc(
+            findings=[
+                make_finding(
+                    remediation={
+                        "kind": "manifest",
+                        "path": self.REMEDIATION,
+                        "note": "New NetworkPolicy.",
+                    }
+                )
+            ]
+        )
+
+    def test_a_new_manifest_is_added_to_the_resources_list(self):
+        kustomization = self.overlay()
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        wired, unwirable = audit_report.wire_kustomize_additions(
+            findings, self.workspace
+        )
+
+        self.assertEqual(list(wired), [findings[0]["id"]])
+        self.assertEqual(unwirable, [])
+        self.assertIn("- payments-netpol.yaml", kustomization.read_text())
+
+    def test_the_kustomization_is_staged_with_the_manifest(self):
+        # The edit is worthless if the pull request does not carry it: the
+        # `git add` pathspec is built from `remediation.path` and nothing else.
+        self.overlay()
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        audit_report.wire_kustomize_additions(findings, self.workspace)
+
+        self.assertEqual(
+            findings[0]["remediation"]["path"],
+            [self.REMEDIATION, "clusters/prod-us-east/overlay/kustomization.yaml"],
+        )
+
+    def test_the_note_says_the_second_file_is_there_and_why(self):
+        self.overlay()
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        audit_report.wire_kustomize_additions(findings, self.workspace)
+
+        note = findings[0]["remediation"]["note"]
+        self.assertIn("New NetworkPolicy.", note)
+        self.assertIn("kustomization.yaml", note)
+        self.assertIn("renders only what the kustomization lists", note)
+
+    def test_a_manifest_the_kustomization_already_names_is_left_alone(self):
+        kustomization = self.overlay(
+            "resources:\n  - deployment.yaml\n  - payments-netpol.yaml\n"
+        )
+        before = kustomization.read_text()
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        wired, unwirable = audit_report.wire_kustomize_additions(
+            findings, self.workspace
+        )
+
+        self.assertEqual((wired, unwirable), ({}, []))
+        self.assertEqual(kustomization.read_text(), before)
+        self.assertEqual(findings[0]["remediation"]["path"], self.REMEDIATION)
+
+    def test_a_file_referenced_as_a_patch_is_left_alone(self):
+        # Loose on purpose: `resources:` is not the only way a kustomization
+        # reaches a file, and listing one twice is worse than listing it once.
+        kustomization = self.overlay(
+            "resources:\n  - deployment.yaml\npatches:\n"
+            "  - path: payments-netpol.yaml\n"
+        )
+        before = kustomization.read_text()
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        self.assertEqual(
+            audit_report.wire_kustomize_additions(findings, self.workspace), ({}, [])
+        )
+        self.assertEqual(kustomization.read_text(), before)
+
+    def test_a_remediation_outside_a_kustomize_root_is_untouched(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        findings = list(make_doc()["findings"])
+
+        self.assertEqual(
+            audit_report.wire_kustomize_additions(findings, self.workspace), ({}, [])
+        )
+        self.assertEqual(
+            findings[0]["remediation"]["path"],
+            "clusters/prod-us-east/payments-netpol.yaml",
+        )
+
+    def test_editing_the_kustomization_itself_wires_nothing(self):
+        self.overlay()
+        findings = list(
+            make_doc(
+                findings=[
+                    make_finding(
+                        remediation={
+                            "kind": "manifest",
+                            "path": "clusters/prod-us-east/overlay/kustomization.yaml",
+                            "note": "Repoint the base.",
+                        }
+                    )
+                ]
+            )["findings"]
+        )
+
+        self.assertEqual(
+            audit_report.wire_kustomize_additions(findings, self.workspace), ({}, [])
+        )
+
+    def test_an_uneditable_kustomization_degrades_the_finding(self):
+        # `resources: []` is a flow sequence whose extent a line-oriented edit
+        # cannot see, so the answer is a manual remediation, never a guess.
+        self.overlay("resources: []\n")
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        wired, unwirable = audit_report.wire_kustomize_additions(
+            findings, self.workspace
+        )
+
+        self.assertEqual((wired, unwirable), ({}, [findings[0]["id"]]))
+        self.assertEqual(findings[0]["remediation"]["kind"], "manual")
+        self.assertEqual(findings[0]["remediation"]["path"], "")
+        self.assertIn("would merge and change nothing", findings[0]["remediation"]["note"])
+
+    def test_a_kustomization_with_no_resources_key_gets_one(self):
+        kustomization = self.overlay("namespace: payments\n")
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        audit_report.wire_kustomize_additions(findings, self.workspace)
+
+        self.assertEqual(
+            kustomization.read_text(),
+            "namespace: payments\nresources:\n  - payments-netpol.yaml\n",
+        )
+
+    def test_a_dry_run_previews_the_wiring_without_writing_it(self):
+        kustomization = self.overlay()
+        before = kustomization.read_text()
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        wired, _ = audit_report.wire_kustomize_additions(
+            findings, self.workspace, apply=False
+        )
+
+        self.assertEqual(list(wired), [findings[0]["id"]])
+        self.assertEqual(kustomization.read_text(), before)
+        self.assertEqual(len(findings[0]["remediation"]["path"]), 2)
+
+    def test_comments_and_key_order_survive_the_edit(self):
+        # A kustomization is a file people read. Round-tripping it through
+        # PyYAML would return the same manifests and a different file.
+        original = (
+            "# Overlay over a base in another repository.\n"
+            "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+            "kind: Kustomization\n"
+            "namespace: payments\n"
+            "resources:\n"
+            "  # the upstream base, pinned\n"
+            "  - https://github.com/acme/base//kustomize?ref=1.2.3\n"
+            "patches:\n"
+            "  - target:\n"
+            "      kind: Deployment\n"
+        )
+        kustomization = self.overlay(original)
+        self.touch(self.REMEDIATION)
+        findings = list(self.doc()["findings"])
+
+        audit_report.wire_kustomize_additions(findings, self.workspace)
+
+        self.assertEqual(
+            kustomization.read_text(),
+            original.replace(
+                "  - https://github.com/acme/base//kustomize?ref=1.2.3\n",
+                "  - https://github.com/acme/base//kustomize?ref=1.2.3\n"
+                "  - payments-netpol.yaml\n",
+            ),
+        )
+
+    def test_the_pull_request_carries_both_files(self):
+        self.overlay()
+        self.touch(self.REMEDIATION)
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/9\n",
+            "pr create": "https://github.com/acme/fleet/pull/1\n",
+        }
+
+        self.assertEqual(self.run_finish(self.doc()), 0)
+
+        staged = self.git_add_calls(self.harness)
+        self.assertTrue(staged, "nothing was staged")
+        self.assertIn(
+            "clusters/prod-us-east/overlay/kustomization.yaml",
+            [arg for call in staged for arg in call],
+        )
+
+
 class TestRevertedGcloudRemediations(HarnessTestCase):
     """A `gcloud` fix Config Connector will undo is not a fix.
 

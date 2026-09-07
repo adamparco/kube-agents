@@ -398,6 +398,16 @@ REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 # reviewer of its pull request is the person who pays for that.
 MAX_REMEDIATION_PATHS = 8
 
+# What marks a directory as a Kustomize root, and how a file in it is rendered.
+# Kustomize builds only what the kustomization lists, so a manifest dropped into
+# such a directory and named nowhere in it is a file the cluster never sees --
+# see `wire_kustomize_additions`. The names match `collect.py`'s
+# `KUSTOMIZATION_FILE_NAMES`; the indent is what a two-space repository writes
+# and is used only when this has to create the block from nothing.
+KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+KUSTOMIZE_RESOURCES_KEY = "resources"
+KUSTOMIZE_LIST_INDENT = "  "
+
 # Every finding must carry all three. The hint is quoted back in the rejection,
 # because "recommendation.rationale is required" does not tell the model what
 # distinguishes a rationale from a restated action.
@@ -9462,6 +9472,245 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
     return degraded
 
 
+def kustomization_in(directory: Path) -> Path | None:
+    """The kustomization file governing `directory`, or None if it is not a root."""
+    for name in KUSTOMIZATION_FILE_NAMES:
+        candidate = directory / name
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            return None
+    return None
+
+
+def append_kustomize_resource(text: str, entry: str) -> str | None:
+    """`text` with `entry` appended to its `resources:` list, or None if unsafe.
+
+    Textual rather than a load-and-dump, because a kustomization is a file
+    people read. Round-tripping it through PyYAML would return the same
+    manifests and a different file: comments gone, key order alphabetised,
+    quoting normalised. The overlay this was written for opens with a
+    seventeen-line header explaining which upstream base it patches and why,
+    and a remediation that deleted that to add one list item would be a worse
+    pull request than the one it fixes.
+
+    Textual editing of YAML is only safe if something proves it, so the result
+    is parsed before it is returned and rejected unless the parse says exactly
+    one thing changed: `resources` grew by `entry` at the end, and no other key
+    moved. Every shape this cannot edit that way -- a flow sequence, a
+    `resources:` holding nothing to align an indent against, a document that is
+    not a mapping -- returns None rather than a guess, and the caller degrades
+    the finding instead of committing a file it cannot vouch for.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the wiring
+    except ImportError:
+        return None
+    try:
+        before = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if before is None:
+        before = {}
+    if not isinstance(before, dict):
+        return None
+    existing = before.get(KUSTOMIZE_RESOURCES_KEY, [])
+    if not isinstance(existing, list) or any(
+        not isinstance(item, str) for item in existing
+    ):
+        return None
+
+    lines = text.splitlines()
+    block = re.compile(rf"^{re.escape(KUSTOMIZE_RESOURCES_KEY)}:\s*(#.*)?$")
+    head = next((i for i, line in enumerate(lines) if block.match(line)), None)
+    if head is None:
+        # No block-form `resources:`. Either the key is absent, which is a file
+        # this can append a block to, or it is written inline -- `resources: []`,
+        # a flow sequence -- which is a shape whose extent this cannot see.
+        if KUSTOMIZE_RESOURCES_KEY in before:
+            return None
+        rebuilt = (
+            text.rstrip("\n")
+            + f"\n{KUSTOMIZE_RESOURCES_KEY}:\n{KUSTOMIZE_LIST_INDENT}- {entry}\n"
+        )
+    else:
+        item = re.compile(r"^(\s+)-\s")
+        last, indent = head, KUSTOMIZE_LIST_INDENT
+        for i in range(head + 1, len(lines)):
+            matched = item.match(lines[i])
+            if matched:
+                last, indent = i, matched.group(1)
+                continue
+            # Comments and blank lines sit between list items often enough that
+            # stopping at one would insert into the middle of the list.
+            if not lines[i].strip() or lines[i].lstrip().startswith("#"):
+                continue
+            break
+        if last == head:
+            return None
+        rebuilt = "\n".join(
+            lines[: last + 1] + [f"{indent}- {entry}"] + lines[last + 1 :]
+        )
+        if text.endswith("\n"):
+            rebuilt += "\n"
+
+    try:
+        after = yaml.safe_load(rebuilt)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(after, dict):
+        return None
+    if after.get(KUSTOMIZE_RESOURCES_KEY) != [*existing, entry]:
+        return None
+    others = {k: v for k, v in after.items() if k != KUSTOMIZE_RESOURCES_KEY}
+    if others != {k: v for k, v in before.items() if k != KUSTOMIZE_RESOURCES_KEY}:
+        return None
+    return rebuilt
+
+
+def wire_kustomize_additions(
+    findings: list[dict], root: Path, *, apply: bool = True
+) -> tuple[dict[str, str], list[str]]:
+    """Register a remediation's new manifest with the kustomization that renders it.
+
+    Kustomize builds the files a kustomization *lists*. A manifest written into
+    an overlay directory and named nowhere in it is not part of the overlay, so
+    the pull request merges, Argo CD reports Synced because the desired state
+    never changed, and the finding reappears on the next run with every signal
+    green. That is the worst shape a remediation can fail in, and it is not
+    hypothetical: obtainability's `no-pdb` fix for
+    `spot-capacity-test/podinfo-kustomize/Deployment/podinfo` merged as PR #181
+    on 2026-09-07 adding `pdb.yaml` and nothing else, and the cluster has no
+    PodDisruptionBudget to this day. The model knew -- that finding's own
+    remediation note reads "wired in via kustomization.yaml resources list" --
+    and still shipped one file, which is why this is enforced here rather than
+    asked for in prose.
+
+    Runs after `degrade_missing_remediations`, which has already proven every
+    remaining manifest path is a readable file inside `root`, and before the
+    snapshot: the kustomization is edited in the working tree and added to the
+    finding's `path` list, so it is staged, committed and restored exactly like
+    a file the model wrote itself.
+
+    Only the file's own directory is consulted. A kustomization an ancestor
+    holds may well reach the file, through a `resources:` entry naming this
+    directory or a component, and appending a bare filename to that ancestor
+    would be wrong. Bounding it here means a manifest written into a
+    subdirectory of an overlay is not wired -- a narrower miss than the one
+    being fixed, and one the reviewer of a two-file pull request can see.
+
+    A file already named anywhere in the kustomization is left alone. It may be
+    a `patches:` target or a generator input rather than a `resources:` entry,
+    and the substring test is deliberately loose in the direction of doing
+    nothing: a false "already referenced" republishes today's behaviour, while a
+    false "needs wiring" would list the same file twice.
+
+    `apply=False` is the dry run: the findings are rewritten so the preview
+    shows the body the real run publishes, and no kustomization is written.
+
+    Returns the ids wired, mapped to the kustomization path, and the ids
+    degraded to `manual` because the wiring was needed and could not be done
+    safely.
+    """
+    wired: dict[str, str] = {}
+    degraded: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        if remediation.get("kind") != "manifest":
+            continue
+        paths = remediation_paths(remediation)
+        fid = str(finding.get("id", ""))
+        unwired = _unwired_kustomize_files(paths, root, fid)
+        if not unwired:
+            continue
+
+        joined = ", ".join(f"`{relative}`" for relative, _, _ in unwired)
+        additions = sorted({r for r, _, _ in unwired if r not in paths})
+        rewritten = (
+            _kustomizations_with(unwired)
+            if len(paths) + len(additions) <= MAX_REMEDIATION_PATHS
+            else None
+        )
+        note = str(remediation.get("note", "")).strip()
+        if rewritten is None:
+            # The fix is real but cannot be rendered, and a pull request that
+            # merges without changing the cluster is worse than none.
+            degraded.append(fid)
+            remediation["kind"] = "manual"
+            remediation["path"] = ""
+            remediation["note"] = (f"{note} " if note else "") + (
+                f"_(The audit could not add the new file to {joined}, and "
+                "Kustomize renders only what the kustomization lists, so a pull "
+                "request carrying the manifest alone would merge and change "
+                "nothing. Add both by hand.)_"
+            )
+            continue
+
+        if apply:
+            for kustomization, grown in rewritten:
+                kustomization.write_text(grown, encoding="utf-8")
+        remediation["path"] = paths + additions
+        remediation["note"] = (f"{note} " if note else "") + (
+            f"_(The audit added the new file to {joined}; Kustomize renders only "
+            "what the kustomization lists, so without that entry the merge would "
+            "change nothing.)_"
+        )
+        wired[fid] = joined
+    return wired, degraded
+
+
+def _unwired_kustomize_files(
+    paths: list[str], root: Path, where: str
+) -> list[tuple[str, Path, str]]:
+    """The remediation files a kustomization governs but does not name.
+
+    Each entry is the kustomization's repo-relative path, its absolute path, and
+    the filename to add. A kustomization that cannot be read is listed rather
+    than skipped: unreadable is not evidence that the file is already named, and
+    `_kustomizations_with` fails on the same read, so the finding degrades.
+    """
+    unwired: list[tuple[str, Path, str]] = []
+    for path in paths:
+        try:
+            resolved = resolve_inside_repo(root, path, f"{where}.remediation.path")
+        except ValidationError:
+            continue
+        kustomization = kustomization_in(resolved.parent)
+        if kustomization is None or kustomization == resolved:
+            continue
+        try:
+            named = resolved.name in kustomization.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            named = False
+        if named:
+            continue
+        relative = PurePosixPath(path).parent / kustomization.name
+        unwired.append((str(relative), kustomization, resolved.name))
+    return unwired
+
+
+def _kustomizations_with(
+    unwired: list[tuple[str, Path, str]],
+) -> list[tuple[Path, str]] | None:
+    """Each kustomization's new text, or None if any of them cannot be edited safely.
+
+    All or nothing: a finding whose fix spans two overlays and can only be wired
+    into one of them would open a pull request that renders half of itself.
+    """
+    rewritten: list[tuple[Path, str]] = []
+    for _, kustomization, name in unwired:
+        try:
+            text = kustomization.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        grown = append_kustomize_resource(text, name)
+        if grown is None:
+            return None
+        rewritten.append((kustomization, grown))
+    return rewritten
+
+
 def kubernetes_declarations(root: Path) -> dict[tuple[str, str], list[str]]:
     """Index the Kubernetes objects a GitOps clone declares, as `(kind, name)`.
 
@@ -10147,6 +10396,15 @@ def _handle_finish_dry_run(
             f"WARNING: {fid}'s remediation path is not a readable file inside "
             f"{root}; it degrades to a manual remediation and opens no pull request."
         )
+    wired, unwirable = wire_kustomize_additions(findings, root, apply=False)
+    for fid, where in wired.items():
+        log(f"DRY RUN: {fid}'s new manifest would be registered with {where}.")
+    for fid in unwirable:
+        log(
+            f"WARNING: {fid}'s new manifest sits in a Kustomize root that does "
+            "not name it and could not be edited safely; it degrades to a manual "
+            "remediation rather than opening a pull request that renders nothing."
+        )
     for fid in degrade_reverted_gcloud_remediations(findings, root):
         log(
             f"DRY RUN: {fid}'s gcloud remediation targets a field the GitOps "
@@ -10551,9 +10809,25 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # the least useful outcome and the hardest to act on. Refuse by name,
     # proceed with the rest, and let the operator see exactly which is which.
     degraded = set(degrade_missing_remediations(findings, root))
+    # And a manifest a Kustomize root does not list is refused for the same
+    # reason one step later: it is written, but nothing renders it, so the pull
+    # request would merge and leave the cluster as it was.
+    wired, unwirable = wire_kustomize_additions(findings, root)
+    for fid, where in wired.items():
+        log(f"{fid}: registered its new manifest with {where}.")
+    degraded |= set(unwirable)
     refused = [fid for fid in args.finding if fid in degraded]
     requested = [fid for fid in args.finding if fid not in degraded]
     for fid in refused:
+        if fid in unwirable:
+            log(
+                f"REFUSED {fid}: its new manifest sits in a Kustomize root that "
+                "does not list it, and the kustomization could not be edited "
+                "safely — Kustomize renders only what the kustomization lists, "
+                "so the pull request would merge and change nothing. Add the "
+                "resources entry by hand, then ask again."
+            )
+            continue
         log(
             f"REFUSED {fid}: its remediation path is not a readable file inside "
             f"{root} — either nothing was written there, or the path does not "
@@ -10564,9 +10838,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
         # Nothing survives, so there is no partial success to report and an
         # exit 0 with an empty list would read as "done".
         raise ValidationError(
-            f"--finding: the remediation path for {', '.join(refused)} is not a "
-            f"readable file inside {root} — it was never written, or it does not "
-            "resolve inside the clone; fix that before calling remediate"
+            f"--finding: no remediation for {', '.join(refused)} can open a pull "
+            f"request — the reason for each is logged above; fix that before "
+            "calling remediate"
         )
 
     issue_number = args.issue
@@ -10739,6 +11013,18 @@ def handle_finish(args: argparse.Namespace) -> None:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
+        )
+    # And a fix the audit wrote into a Kustomize root that does not list it is
+    # registered there, so the pull request renders rather than merging inert.
+    wired, unwirable = wire_kustomize_additions(findings, root)
+    for fid, where in wired.items():
+        log(f"{fid}: registered its new manifest with {where}.")
+    for fid in unwirable:
+        log(
+            f"WARNING: {fid}'s new manifest sits in a Kustomize root that does "
+            "not list it and could not be registered safely; the finding is "
+            "published with a manual remediation instead of a pull request that "
+            "would merge and change nothing."
         )
     for fid in degrade_reverted_gcloud_remediations(findings, root):
         log(
