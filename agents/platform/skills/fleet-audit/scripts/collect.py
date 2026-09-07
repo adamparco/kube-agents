@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete eighteen-check roster
-(§3.1–§3.18 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete nineteen-check roster
+(§3.1–§3.19 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete thirteen-check roster (§2.1–§2.13 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -790,12 +790,20 @@ def services_with_endpoints(dump: dict) -> list[dict]:
         name = meta.get("name", "")
         live = 0
         resolved: set[str] = set()
+        endpoint_nodes: list[str] = []
         for slice_ in slices_by_service.get((ns, name), []):
             for endpoint in slice_.get("endpoints") or []:
                 conditions = endpoint.get("conditions") or {}
                 if conditions.get("terminating"):
                     continue
                 live += 1
+                # §3.19's evidence: where the scheduler actually put the pod.
+                # `ready` is tri-state and absent means ready, so only an
+                # explicit False is excluded. An endpoint with no `nodeName`
+                # is not a pod on a node -- it is skipped rather than counted
+                # as an unknown node, which would read as spread.
+                if conditions.get("ready") is not False and endpoint.get("nodeName"):
+                    endpoint_nodes.append(endpoint["nodeName"])
             for port in slice_.get("ports") or []:
                 if port.get("port") is not None:
                     resolved.add(port.get("name") or "")
@@ -822,9 +830,32 @@ def services_with_endpoints(dump: dict) -> list[dict]:
                 "named_targets": named_targets,
                 "backend": backend,
                 "declared_ports": declared,
+                "endpoint_nodes": endpoint_nodes,
             }
         )
     return out
+
+
+def nodes_named_by_endpoints(dump: dict) -> set[str]:
+    """Every node any EndpointSlice in the cluster names.
+
+    Nodes are not a kind this audit collects, so this is the only evidence in
+    the dump that the cluster has more than one of them. §3.19 needs exactly
+    that much and no more: a cluster whose slices never name a second node
+    cannot be faulted for putting a workload's replicas together.
+
+    System namespaces are deliberately included. The question is about the
+    cluster, not about the audited workloads, and `kube-system`'s slices are
+    usually the widest sample of nodes available here.
+    """
+    nodes: set[str] = set()
+    for item in dump.get("items", []) or []:
+        if item.get("kind") != "EndpointSlice":
+            continue
+        for endpoint in item.get("endpoints") or []:
+            if endpoint.get("nodeName"):
+                nodes.add(endpoint["nodeName"])
+    return nodes
 
 
 def _selector_matches_a_zeroed_workload(dump: dict, ns: str, selector: dict) -> str | None:
@@ -891,6 +922,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "services": services_by_namespace(dump),
         "cronjobs": cronjobs_with_jobs(dump),
         "service_endpoints": services_with_endpoints(dump),
+        "endpoint_nodes_seen": nodes_named_by_endpoints(dump),
         "workloads": workloads,
         "workload_keys": workload_keys(dump),
     }
@@ -1396,6 +1428,143 @@ def check_no_spread(workload: dict, context: dict) -> dict | None:
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"replicas={replicas}, no topologySpreadConstraints or podAntiAffinity",
+    }
+
+
+# `whenUnsatisfiable`'s two values. The field is optional and the API server
+# defaults it to `DoNotSchedule`, so an absent key is binding and only the
+# literal string below is not -- reading a missing key as advisory would flag
+# every correctly-written constraint on the fleet.
+_SPREAD_ADVISORY = "ScheduleAnyway"
+_SPREAD_BINDING = "DoNotSchedule"
+
+# Below two endpoints there is no co-location to observe: one replica cannot
+# be spread, and the finding is about replicas that are together rather than
+# about a workload that has only one.
+_MIN_ENDPOINTS_TO_COLOCATE = 2
+
+_IMPACT_SPREAD_NOT_ACHIEVED = (
+    "Every ready replica of this workload is on one node right now, and the "
+    "manifest contains nothing that would have stopped that: the spreading it "
+    "declares is a preference the scheduler is free to ignore, and it did. "
+    "Losing that one node -- a pool upgrade draining it, a preemption, a "
+    "hardware fault -- takes the whole workload out at once, and the replica "
+    "count in the manifest reads as though it could not."
+)
+
+
+def _endpoint_nodes_for(workload: dict, context: dict) -> tuple[set[str], int]:
+    """Nodes hosting this workload's ready endpoints, and how many were counted.
+
+    Read off EndpointSlices rather than Pods because Pods are not in this
+    audit's dump — they are the largest kind in any cluster and the dump is
+    written to disk. The slice carries `nodeName` on each endpoint, which is
+    the scheduler's own answer to where the pod landed.
+
+    Only Services this workload alone backs are consulted. A Service fronting
+    two workloads mixes their endpoints, and "all endpoints on one node" would
+    then be a claim about the pair rather than about the object the finding
+    names — so a Service another audited workload also matches is skipped, and
+    a workload behind only such Services produces no evidence and no finding.
+    """
+    key = f"{workload['kind']}/{workload['name']}"
+    # One Service's slices, not the union of several. A workload behind both a
+    # headless and a ClusterIP Service appears in both, and adding them would
+    # report twice as many endpoints as it has replicas. The widest single view
+    # is the honest one.
+    widest: list[str] = []
+    for entry in context["service_endpoints"]:
+        if entry["ns"] != workload["ns"]:
+            continue
+        selector = {"matchLabels": entry["selector"]}
+        if not selector_matches(selector, workload["pod_labels"]):
+            continue
+        shared = any(
+            f"{other['kind']}/{other['name']}" != key
+            and other["ns"] == workload["ns"]
+            and selector_matches(selector, other["pod_labels"])
+            for other in context["workloads"]
+        )
+        if shared:
+            continue
+        found = entry.get("endpoint_nodes") or []
+        if len(found) > len(widest):
+            widest = found
+    return set(widest), len(widest)
+
+
+def check_spread_not_achieved(workload: dict, context: dict) -> dict | None:
+    """§3.19 — advisory spreading that demonstrably did not spread.
+
+    §3.8 asks whether a workload declares spreading at all and stops there, so a
+    `topologySpreadConstraints` block satisfies it whatever the block says —
+    and `whenUnsatisfiable: ScheduleAnyway` is scored rather than enforced.
+
+    The obvious check on that hole, "flag every workload whose spreading is
+    advisory", is one this audit must not ship: §3.8's own remediation
+    prescribes `ScheduleAnyway`, and deliberately so, because `DoNotSchedule`
+    on `kubernetes.io/hostname` can leave a pod Pending forever. A check
+    written that way would re-flag every workload §3.8 had just fixed, which is
+    a tool arguing with itself in a customer's ledger.
+
+    So this fires on the observation instead: the spreading is advisory **and**
+    every ready endpoint is on one node. That is not a prediction about what
+    the scheduler might do, it is what it did, and it cannot be raised against
+    a workload whose advisory constraint is in fact holding the replicas apart.
+
+    Suppressed where the cluster's own EndpointSlices never name a second node,
+    which is the only evidence in this dump that more than one node exists —
+    co-location is forced there and the manifest is not the defect. That test
+    is deliberately weak: it establishes that a second node exists, not that
+    this workload could have been placed on it. The finding claims only what it
+    can see, that the replicas are together and nothing asked otherwise.
+    """
+    if workload["kind"] == "DaemonSet":
+        return None
+    replicas = workload["spec"].get("replicas", 1) or 1
+    if replicas < _MIN_ENDPOINTS_TO_COLOCATE:
+        return None
+    constraints = workload["template"].get("topologySpreadConstraints") or []
+    anti_affinity = ((workload["template"].get("affinity") or {}).get("podAntiAffinity")) or {}
+    required = anti_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or []
+    preferred = anti_affinity.get("preferredDuringSchedulingIgnoredDuringExecution") or []
+
+    def keyed_on_topology(terms, is_preferred):
+        for entry in terms:
+            term = entry.get("podAffinityTerm", entry) if is_preferred else entry
+            if term.get("topologyKey") in (_HOSTNAME_KEY, _ZONE_KEY):
+                return True
+        return False
+
+    # A binding rule of either kind ends it. `required` podAntiAffinity is
+    # enforced by definition; a constraint is enforced unless it opts out.
+    if keyed_on_topology(required, False):
+        return None
+    if any(c.get("whenUnsatisfiable", _SPREAD_BINDING) != _SPREAD_ADVISORY for c in constraints):
+        return None
+
+    advisory = [f"topologySpreadConstraint on {c.get('topologyKey', '')} is {_SPREAD_ADVISORY}" for c in constraints]
+    if keyed_on_topology(preferred, True):
+        advisory.append("podAntiAffinity is preferredDuringScheduling")
+    # Nothing declared at all is §3.8's finding, not this one, and reporting
+    # both would put two verdicts on one object in one ledger.
+    if not advisory:
+        return None
+
+    # A cluster whose slices only ever name one node has one node, and a
+    # workload cannot be faulted for landing on it.
+    if len(context.get("endpoint_nodes_seen") or set()) < _MIN_ENDPOINTS_TO_COLOCATE:
+        return None
+
+    nodes, counted = _endpoint_nodes_for(workload, context)
+    if counted < _MIN_ENDPOINTS_TO_COLOCATE or len(nodes) != 1:
+        return None
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": (
+            f"replicas={replicas}, all {counted} ready endpoints on node {sorted(nodes)[0]}; "
+            f"every spreading rule is advisory: {'; '.join(advisory)}"
+        ),
     }
 
 
@@ -4558,6 +4727,17 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "major",
         None,
         _IMPACT_LIVENESS_PREEMPTS,
+    ),
+    CheckSpec(
+        "spread-not-achieved",
+        "workload",
+        check_spread_not_achieved,
+        # `major`, where §3.8's hypothetical is `minor`: this one has already
+        # happened. The replicas are on one node now, so the workload has the
+        # availability of a single pod whatever its replica count says.
+        "major",
+        None,
+        _IMPACT_SPREAD_NOT_ACHIEVED,
     ),
 )
 

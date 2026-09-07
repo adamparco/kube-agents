@@ -1130,6 +1130,185 @@ class TestNoSpread(unittest.TestCase):
         self.assertIsNone(collect.check_no_spread(self.wl(replicas=1), context_of()))
 
 
+class TestSpreadNotAchieved(unittest.TestCase):
+    """§3.19. Advisory spreading that demonstrably did not spread.
+
+    The declaration-shape version of this check -- "flag every workload whose
+    spreading is advisory" -- is the one that must not ship: §3.8's own
+    remediation prescribes `ScheduleAnyway`, so it would re-flag every
+    workload §3.8 had just fixed. The observation is what makes it a finding.
+    """
+
+    NODE_A = "gke-node-a"
+    NODE_B = "gke-node-b"
+    ADVISORY = [{"maxSkew": 1, "topologyKey": collect._HOSTNAME_KEY, "whenUnsatisfiable": "ScheduleAnyway"}]
+
+    def wl(self, replicas=2, tsc=None, anti_affinity=None, kind="Deployment", name="api"):
+        d = deployment(name, **{"spec.replicas": replicas})
+        d["kind"] = kind
+        d["spec"]["template"]["metadata"] = {"labels": {"app": name}}
+        if tsc is not None:
+            d["spec"]["template"]["spec"]["topologySpreadConstraints"] = tsc
+        if anti_affinity is not None:
+            d["spec"]["template"]["spec"]["affinity"] = {"podAntiAffinity": anti_affinity}
+        return collect.normalize_workloads(dump_of(d))[0]
+
+    def ctx(self, workload, endpoints=None, seen=None, others=(), services=None):
+        if endpoints is None:
+            endpoints = [self.NODE_A, self.NODE_A]
+        if seen is None:
+            seen = {self.NODE_A, self.NODE_B}
+        if services is None:
+            services = [("api-svc", endpoints)]
+        return context_of(
+            service_endpoints=[
+                {
+                    "ns": workload["ns"],
+                    "name": svc,
+                    "selector": {"app": workload["name"]},
+                    "endpoint_nodes": list(nodes),
+                }
+                for svc, nodes in services
+            ],
+            endpoint_nodes_seen=set(seen),
+            workloads=[workload, *others],
+        )
+
+    def test_advisory_spreading_that_landed_on_one_node_is_flagged(self):
+        wl = self.wl(tsc=self.ADVISORY)
+        hit = collect.check_spread_not_achieved(wl, self.ctx(wl))
+        self.assertIsNotNone(hit)
+        self.assertIn(self.NODE_A, hit["excerpt"])
+        self.assertIn("all 2 ready endpoints", hit["excerpt"])
+        self.assertIn("ScheduleAnyway", hit["excerpt"])
+
+    def test_endpoints_on_two_nodes_are_not_flagged(self):
+        """The advisory constraint held. There is nothing to report."""
+        wl = self.wl(tsc=self.ADVISORY)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl, endpoints=[self.NODE_A, self.NODE_B])))
+
+    def test_a_single_node_cluster_is_never_flagged(self):
+        """Co-location is forced, so the manifest is not the defect."""
+        wl = self.wl(tsc=self.ADVISORY)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl, seen={self.NODE_A})))
+
+    def test_a_binding_constraint_is_not_flagged_even_when_colocated(self):
+        """Something enforced spreading; that it did not is a scheduler
+        question, not a manifest one."""
+        tsc = [{"topologyKey": collect._HOSTNAME_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+        wl = self.wl(tsc=tsc)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+    def test_an_absent_when_unsatisfiable_reads_as_binding(self):
+        """The API server defaults the field to `DoNotSchedule`."""
+        wl = self.wl(tsc=[{"topologyKey": collect._HOSTNAME_KEY}])
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+    def test_one_binding_rule_beside_advisory_ones_suppresses_it(self):
+        tsc = self.ADVISORY + [{"topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+        wl = self.wl(tsc=tsc)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+    def test_required_anti_affinity_beside_an_advisory_constraint_suppresses_it(self):
+        anti = {"requiredDuringSchedulingIgnoredDuringExecution": [{"topologyKey": collect._ZONE_KEY}]}
+        wl = self.wl(tsc=self.ADVISORY, anti_affinity=anti)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+    def test_preferred_anti_affinity_alone_counts_as_advisory(self):
+        anti = {"preferredDuringSchedulingIgnoredDuringExecution": [{"podAffinityTerm": {"topologyKey": collect._ZONE_KEY}}]}
+        wl = self.wl(anti_affinity=anti)
+        hit = collect.check_spread_not_achieved(wl, self.ctx(wl))
+        self.assertIsNotNone(hit)
+        self.assertIn("preferredDuringScheduling", hit["excerpt"])
+
+    def test_anti_affinity_on_an_unrelated_topology_key_is_not_spreading(self):
+        anti = {"preferredDuringSchedulingIgnoredDuringExecution": [{"podAffinityTerm": {"topologyKey": "rack"}}]}
+        wl = self.wl(anti_affinity=anti)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+    def test_declaring_nothing_at_all_is_left_to_no_spread(self):
+        """§3.8 owns the empty case; firing here too would put two verdicts on
+        one object in one ledger."""
+        wl = self.wl()
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+        self.assertIsNotNone(collect.check_no_spread(wl, context_of()))
+
+    def test_one_endpoint_is_not_co_location(self):
+        wl = self.wl(tsc=self.ADVISORY)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl, endpoints=[self.NODE_A])))
+
+    def test_no_endpoints_at_all_produce_no_finding(self):
+        """A workload behind no Service leaves no evidence, so it is out of
+        scope rather than clean -- the SOP says so under coverage."""
+        wl = self.wl(tsc=self.ADVISORY)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl, services=[])))
+
+    def test_a_service_shared_with_another_workload_is_not_evidence(self):
+        """Its slices mix two workloads' pods, so co-location would be a claim
+        about the pair rather than about the object the finding names."""
+        wl = self.wl(tsc=self.ADVISORY)
+        other = self.wl(name="api")
+        other["kind"], other["name"] = "StatefulSet", "api-sts"
+        other["pod_labels"] = {"app": "api"}
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl, others=[other])))
+
+    def test_two_services_backing_it_report_the_widest_view_not_the_sum(self):
+        """A headless Service beside a ClusterIP one would otherwise report
+        twice as many endpoints as the workload has replicas."""
+        wl = self.wl(tsc=self.ADVISORY)
+        ctx = self.ctx(wl, services=[("api-svc", [self.NODE_A, self.NODE_A]), ("api-headless", [self.NODE_A, self.NODE_A])])
+        hit = collect.check_spread_not_achieved(wl, ctx)
+        self.assertIn("all 2 ready endpoints", hit["excerpt"])
+
+    def test_a_daemonset_is_never_flagged(self):
+        wl = self.wl(tsc=self.ADVISORY, kind="DaemonSet")
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+    def test_single_replica_is_never_flagged(self):
+        wl = self.wl(replicas=1, tsc=self.ADVISORY)
+        self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+
+class TestEndpointNodeCollection(unittest.TestCase):
+    """The dump-level half of §3.19: which nodes the slices name."""
+
+    def dump(self, **kwargs):
+        return dump_of(
+            service("api-svc", selector={"app": "api"}),
+            endpointslice("api-svc", **kwargs),
+        )
+
+    def nodes_for(self, **kwargs):
+        entries = collect.services_with_endpoints(self.dump(**kwargs))
+        return entries[0]["endpoint_nodes"]
+
+    def test_ready_endpoints_report_their_node(self):
+        self.assertEqual(self.nodes_for(addresses=2, nodes=["n1", "n2"]), ["n1", "n2"])
+
+    def test_an_endpoint_marked_not_ready_is_excluded(self):
+        self.assertEqual(self.nodes_for(addresses=2, nodes=["n1", "n2"], unready=(1,)), ["n1"])
+
+    def test_a_terminating_endpoint_is_excluded(self):
+        self.assertEqual(self.nodes_for(addresses=1, terminating=2, nodes=["n1"]), ["n1"])
+
+    def test_an_endpoint_with_no_node_name_is_skipped_not_counted_as_a_node(self):
+        """Counting it as an unknown node would read as spread."""
+        self.assertEqual(self.nodes_for(addresses=2, nodes=["n1"]), ["n1"])
+
+    def test_nodes_named_by_endpoints_spans_system_namespaces(self):
+        """The question is how many nodes the cluster has, and kube-system's
+        slices are usually the widest sample available here."""
+        dump = dump_of(
+            service("api-svc", selector={"app": "api"}),
+            endpointslice("api-svc", addresses=1, nodes=["n1"]),
+            endpointslice("kube-dns", ns="kube-system", addresses=2, nodes=["n1", "n2"]),
+        )
+        self.assertEqual(collect.nodes_named_by_endpoints(dump), {"n1", "n2"})
+
+    def test_a_slice_naming_no_nodes_contributes_nothing(self):
+        self.assertEqual(collect.nodes_named_by_endpoints(self.dump(addresses=2)), set())
+
+
 class TestProbes(unittest.TestCase):
     def wl(self, probes=None):
         d = deployment("api")
@@ -2321,14 +2500,24 @@ class TestCronjobRunsOverlap(unittest.TestCase):
         self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
 
 
-def endpointslice(service_name, ns="default", addresses=1, terminating=0, ports=None):
+def endpointslice(service_name, ns="default", addresses=1, terminating=0, ports=None, nodes=None, unready=()):
     """An EndpointSlice with `addresses` ready endpoints and `terminating`
     endpoints on their way out.
 
     `ports` is the list of service-port names the controller managed to
     resolve, which is what it writes: a name it could not find on the pod is
-    left out of the slice entirely rather than written with a null number."""
+    left out of the slice entirely rather than written with a null number.
+
+    `nodes` gives a `nodeName` to each ready endpoint in order, which is what
+    §3.19 reads; omitting it produces the pre-§3.19 shape, where no endpoint
+    names a node at all. `unready` is the indices among them the controller
+    marked `ready: False`."""
     endpoints = [{"addresses": [f"10.0.0.{i}"]} for i in range(addresses)]
+    for i, endpoint in enumerate(endpoints):
+        if nodes is not None and i < len(nodes):
+            endpoint["nodeName"] = nodes[i]
+        if i in unready:
+            endpoint["conditions"] = {"ready": False}
     endpoints += [
         {"addresses": [f"10.0.1.{i}"], "conditions": {"terminating": True}}
         for i in range(terminating)
