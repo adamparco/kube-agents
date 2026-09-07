@@ -306,6 +306,185 @@ class FetchMemoryMeansTest(unittest.TestCase):
         self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", result.argv[0])
 
 
+def lb_series(rule, *values, resource="loadbalancing.googleapis.com/ExternalNetworkLoadBalancerRule"):
+    return {
+        "resource": {"type": resource, "labels": {"project_id": "acme", "forwarding_rule_name": rule}},
+        "points": [{"value": {"int64Value": str(v)}} for v in values],
+    }
+
+
+class FakeLbSession:
+    """Answers the three queries `fetch_lb_traffic` issues, by metric."""
+
+    def __init__(self, *, ingress=(), egress_packets=(), egress_bytes=(), status=200, text="", raises=None):
+        self.by_metric = {
+            fw.LB_INGRESS_PACKETS_METRIC: list(ingress),
+            fw.LB_EGRESS_PACKETS_METRIC: list(egress_packets),
+            fw.LB_EGRESS_BYTES_METRIC: list(egress_bytes),
+        }
+        self.status, self.text, self.raises, self.calls = status, text, raises, []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(dict(params or {}))
+        if self.raises:
+            raise self.raises
+        if self.status != 200:
+            return FakeResponse(self.status, text=self.text)
+        metric = params["filter"].split('"')[1]
+        return FakeResponse(200, {"timeSeries": self.by_metric[metric]})
+
+
+class FetchLbTrafficTest(unittest.TestCase):
+    """§3.13's traffic read -- what the rule in front of an idle workload met."""
+
+    RULES = [
+        {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+        {"name": "rule-b", "IPAddress": "35.245.254.69", "loadBalancingScheme": "EXTERNAL"},
+    ]
+
+    def fetch(self, session, rules=None, **kwargs):
+        return fw.fetch_lb_traffic("acme", self.RULES if rules is None else rules, session=session, now=NOW, **kwargs)
+
+    def test_the_answer_is_keyed_by_address_not_by_rule_name(self):
+        # The join on the other end is a Service's
+        # `status.loadBalancer.ingress[].ip`, and nothing in the Monitoring
+        # answer carries an address.
+        traffic, result = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 100000)]))
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(traffic["34.186.100.26"]["rule"], "rule-a")
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 100000)
+
+    def test_points_within_a_series_are_summed(self):
+        # DELTA counters aligned to a day: seven buckets that add up to the
+        # window, not seven candidates for a maximum.
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 10, 20, 30)]))
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 60)
+
+    def test_the_duplicate_resource_type_is_not_double_counted(self):
+        """The trap that would have published 745,404 for a rule that saw 374,158.
+
+        Monitoring reports the same L4 traffic under the legacy `tcp_lb_rule`
+        resource and again under `ExternalNetworkLoadBalancerRule`, and
+        `crossSeriesReducer` does not merge across resource types -- so
+        grouping by the rule name still returns two near-equal series. The
+        figures below are the live pair read off adamparco-kage.
+        """
+        traffic, _ = self.fetch(
+            FakeLbSession(
+                ingress=[
+                    lb_series("rule-a", 374158),
+                    lb_series("rule-a", 371246, resource="tcp_lb_rule"),
+                ]
+            )
+        )
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 374158)
+
+    def test_a_rule_with_no_series_is_present_with_no_figures(self):
+        # Present, so the caller can say "unmeasured"; `None`, so it cannot
+        # say "zero".
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 1)]))
+        self.assertIn("35.245.254.69", traffic)
+        self.assertIsNone(traffic["35.245.254.69"]["ingress_packets"])
+
+    def test_a_series_with_no_rule_label_is_dropped(self):
+        """The mis-grouped answer, which carries the project's whole traffic.
+
+        `metric.labels.forwarding_rule_name` is a valid thing to ask for and
+        returns exactly this: one unlabelled series holding every rule's
+        packets. Attributing it to a rule would be a fabricated number an
+        order of magnitude too large.
+        """
+        unlabelled = {"resource": {"type": "tcp_lb_rule", "labels": {"project_id": "acme"}}, "points": [{"value": {"int64Value": "743426"}}]}
+        traffic, _ = self.fetch(FakeLbSession(ingress=[unlabelled, lb_series("rule-a", 374158)]))
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 374158)
+
+    def test_only_external_rules_are_measured(self):
+        rules = [
+            {"name": "internal", "IPAddress": "10.150.0.78", "loadBalancingScheme": "INTERNAL"},
+            {"name": "psc", "IPAddress": "10.150.0.60"},
+            {"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"},
+        ]
+        traffic, _ = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 5)]), rules=rules)
+        self.assertEqual(sorted(traffic), ["34.186.100.26"])
+
+    def test_a_project_with_no_external_rule_reads_as_nothing_to_measure(self):
+        traffic, result = self.fetch(FakeLbSession(), rules=[])
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, 0)
+        self.assertIn("no EXTERNAL forwarding rule", result.stderr)
+
+    def test_an_api_error_keeps_its_status_and_measures_nothing(self):
+        traffic, result = self.fetch(FakeLbSession(status=403, text="caller lacks monitoring.timeSeries.list"))
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, 403)
+        self.assertIn("monitoring.timeSeries.list", result.stderr)
+
+    def test_a_transport_exception_is_a_failed_read_not_a_crash(self):
+        traffic, result = self.fetch(FakeLbSession(raises=OSError("connection reset")))
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, -1)
+
+    def test_no_session_degrades_the_way_every_other_read_here_does(self):
+        traffic, result = self.fetch(None)
+        self.assertEqual(traffic, {})
+        self.assertEqual(result.rc, -1)
+        self.assertIn("ADC", result.stderr)
+
+    def test_the_query_groups_by_the_resource_label(self):
+        session = FakeLbSession(ingress=[lb_series("rule-a", 1)])
+        self.fetch(session, window_hours=24)
+        params = session.calls[0]
+        self.assertEqual(params["aggregation.groupByFields"], ["resource.labels.forwarding_rule_name"])
+        self.assertEqual(params["aggregation.crossSeriesReducer"], "REDUCE_SUM")
+        self.assertEqual(params["aggregation.perSeriesAligner"], "ALIGN_SUM")
+        self.assertEqual(params["aggregation.alignmentPeriod"], "86400s")
+        self.assertEqual(params["interval.startTime"], "2026-07-31T00:00:00Z")
+
+    def test_all_three_metrics_are_read(self):
+        session = FakeLbSession(ingress=[lb_series("rule-a", 1)])
+        self.fetch(session)
+        self.assertEqual(
+            [call["filter"].split('"')[1] for call in session.calls],
+            [fw.LB_INGRESS_PACKETS_METRIC, fw.LB_EGRESS_PACKETS_METRIC, fw.LB_EGRESS_BYTES_METRIC],
+        )
+
+    def test_pagination_follows_the_next_page_token(self):
+        pages = [
+            {"timeSeries": [lb_series("rule-a", 10)], "nextPageToken": "more"},
+            {"timeSeries": [lb_series("rule-b", 20)]},
+        ]
+        seen = []
+
+        class Paged:
+            def get(self, url, params=None, timeout=None):
+                seen.append(params.get("pageToken"))
+                if fw.LB_INGRESS_PACKETS_METRIC not in params["filter"]:
+                    return FakeResponse(200, {"timeSeries": []})
+                return FakeResponse(200, pages.pop(0) if pages else {"timeSeries": []})
+
+        traffic, _ = self.fetch(Paged())
+        self.assertEqual(traffic["34.186.100.26"]["ingress_packets"], 10)
+        self.assertEqual(traffic["35.245.254.69"]["ingress_packets"], 20)
+        self.assertEqual(seen[:2], [None, "more"])
+
+    def test_the_recorded_label_names_what_a_reader_would_re_run(self):
+        _, result = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 1)]))
+        label = result.argv[0]
+        self.assertIn("projects/acme/timeSeries", label)
+        self.assertIn(fw.LB_RULE_LABEL, label)
+        self.assertIn(fw.LB_INGRESS_PACKETS_METRIC, label)
+        self.assertIn(f"window={fw.USAGE_WINDOW_HOURS}h", label)
+
+    def test_the_digest_survives_an_unmeasured_rule(self):
+        # The rendered stand-in holds `None` in three columns for `rule-b`. A
+        # tuple sort that ever compared one against a number would raise, and
+        # the whole project's traffic read would come back as a crash.
+        _, result = self.fetch(FakeLbSession(ingress=[lb_series("rule-a", 1)]))
+        rows = json.loads(result.stdout)
+        self.assertEqual([row[0] for row in rows], ["34.186.100.26", "35.245.254.69"])
+        self.assertIsNone(rows[1][2])
+
+
 class OrphanPvTest(unittest.TestCase):
     def pv(self, phase, reclaim="Retain", **overrides):
         doc = obj("PersistentVolume", "pv-1", **{"spec.persistentVolumeReclaimPolicy": reclaim, "status.phase": phase, "spec.capacity": {"storage": "10Gi"}})
@@ -1654,13 +1833,17 @@ class IdleWorkloadTest(unittest.TestCase):
     def controller(self, kind="Deployment", name="hello-world", *, ns=NS, created="2026-07-01T00:00:00Z"):
         return obj(kind, name, ns=ns, **{"metadata.creationTimestamp": created})
 
-    def svc(self, name="hello-world", *, ns=NS, kind="LoadBalancer", selector=None):
-        return obj(
-            "Service",
-            name,
-            ns=ns,
-            **{"spec.type": kind, "spec.selector": {"app": "hello-world"} if selector is None else selector},
-        )
+    def svc(self, name="hello-world", *, ns=NS, kind="LoadBalancer", selector=None, ip=None):
+        fields = {
+            "spec.type": kind,
+            "spec.selector": {"app": "hello-world"} if selector is None else selector,
+        }
+        # Only when asked. A Service still waiting on an address has no
+        # `status.loadBalancer.ingress` at all, and that is the shape every
+        # fixture predating the traffic read carries.
+        if ip:
+            fields["status.loadBalancer.ingress"] = [{"ip": ip}]
+        return obj("Service", name, ns=ns, **fields)
 
     def context(self, pods=None, controllers=None, services=()):
         pods = [self.pod()] if pods is None else pods
@@ -1672,8 +1855,13 @@ class IdleWorkloadTest(unittest.TestCase):
             "statefulsets": [c for c in controllers if c["kind"] == "StatefulSet"],
         }
 
-    def hits(self, peaks=None, **kw):
-        return fw.check_idle_workload(self.context(**kw), self.IDLE if peaks is None else peaks, now=NOW)
+    def hits(self, peaks=None, *, lb_traffic=None, **kw):
+        return fw.check_idle_workload(
+            self.context(**kw),
+            self.IDLE if peaks is None else peaks,
+            now=NOW,
+            lb_traffic=lb_traffic,
+        )
 
     def test_flags_a_floor_bound_deployment_nothing_is_using(self):
         hits = self.hits()
@@ -1964,10 +2152,165 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("CPU or memory", impact)
         self.assertIn("packets are not sessions", impact)
 
+    # ----------------------------------------------------------------- #
+    # The traffic clause. Every one of these turns on the same question:
+    # what the excerpt is entitled to say about a forwarding rule it has,
+    # has not, or cannot measure.
+    # ----------------------------------------------------------------- #
+
+    IP = "34.186.100.26"
+
+    def traffic(self, *, ingress=None, egress_packets=None, egress_bytes=None, ip=None, rule="a-rule"):
+        return {
+            ip or self.IP: {
+                "rule": rule,
+                "ingress_packets": ingress,
+                "egress_packets": egress_packets,
+                "egress_bytes": egress_bytes,
+            }
+        }
+
+    def test_a_busy_rule_serving_no_payload_says_so(self):
+        """The live shape of the two findings that merged a stand-down.
+
+        374,158 inbound packets answered at 63.9 bytes each -- busy enough to
+        look like use and too small to be a response. Before this the excerpt
+        said nothing at all and the impact said nobody was calling it.
+        """
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=273430, egress_bytes=17459228),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("metered 374,158 inbound packets over 168h", excerpt)
+        self.assertIn("17,459,228 bytes across 273,430 outbound packets, 64 bytes each", excerpt)
+        self.assertIn("without ever sending a payload", excerpt)
+        self.assertIn("unsolicited connection attempts", excerpt)
+
+    def test_a_rule_serving_real_payload_warns_against_the_stand_down(self):
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=200000, egress_packets=100000, egress_bytes=120000000),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("1,200 bytes each", excerpt)
+        self.assertIn("something is being served", excerpt)
+        self.assertIn("measured a forwarding rule, not a caller", excerpt)
+
+    def test_traffic_under_the_floor_reads_as_background(self):
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=812, egress_packets=400, egress_bytes=25000),
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("metered 812 inbound packets over 168h", excerpt)
+        self.assertIn("under the 10,000-packet floor", excerpt)
+        self.assertIn("nothing measurable reached it", excerpt)
+        # The payload ratio is 62.5 bytes here too, and saying so would be an
+        # observation about 400 packets. Below the floor there is nothing to
+        # characterise.
+        self.assertNotIn("bytes each", excerpt)
+
+    def test_a_rule_that_answered_nothing_says_that(self):
+        hits = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=50000, egress_packets=0, egress_bytes=0),
+        )
+        self.assertIn("answered none of them", hits[0]["excerpt"])
+
+    def test_an_unmeasured_rule_is_not_reported_as_quiet(self):
+        """The distinction the whole read exists for.
+
+        Monitoring holding no series for a rule is the answer §3.13 used to
+        treat as silence -- implicitly, by never asking. A zero here would be
+        a fabricated measurement.
+        """
+        hits = self.hits(services=[self.svc(ip=self.IP)], lb_traffic=self.traffic())
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("no Cloud Monitoring traffic series", excerpt)
+        self.assertIn("unmeasured rather than zero", excerpt)
+        self.assertNotIn("metered", excerpt)
+
+    def test_no_traffic_read_at_all_writes_no_clause(self):
+        # `lb_traffic=None` is a run with no Monitoring session, or the
+        # collector invoked by hand. Silence, not a zero and not a caveat.
+        excerpt = self.hits(services=[self.svc(ip=self.IP)])[0]["excerpt"]
+        self.assertNotIn("forwarding rule metered", excerpt)
+        self.assertNotIn("unmeasured", excerpt)
+
+    def test_an_address_the_read_does_not_cover_writes_no_clause(self):
+        hits = self.hits(
+            services=[self.svc(ip="35.245.254.69")],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=1, egress_bytes=1),
+        )
+        self.assertNotIn("metered", hits[0]["excerpt"])
+
+    def test_a_service_with_no_address_yet_writes_no_clause(self):
+        hits = self.hits(
+            services=[self.svc()],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=1, egress_bytes=1),
+        )
+        self.assertNotIn("metered", hits[0]["excerpt"])
+
+    def test_a_cluster_ip_service_never_reaches_the_traffic_read(self):
+        # A `ClusterIP` Service holds no forwarding rule, so even an address
+        # the read covers is not this workload's load balancer.
+        hits = self.hits(
+            services=[self.svc(kind="ClusterIP", ip=self.IP)],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=1, egress_bytes=1),
+        )
+        self.assertNotIn("metered", hits[0]["excerpt"])
+
+    def test_two_rules_are_summed_and_named_in_the_plural(self):
+        second = "34.186.110.29"
+        traffic = self.traffic(ingress=20000, egress_packets=10000, egress_bytes=400000)
+        traffic.update(self.traffic(ingress=30000, egress_packets=10000, egress_bytes=600000, ip=second, rule="b-rule"))
+        hits = self.hits(
+            services=[self.svc(ip=self.IP), self.svc(name="hello-world-2", ip=second)],
+            lb_traffic=traffic,
+        )
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("The 2 forwarding rules in front of it metered 50,000 inbound packets", excerpt)
+        self.assertIn("1,000,000 bytes across 20,000 outbound packets, 50 bytes each", excerpt)
+
+    def test_the_traffic_clause_precedes_the_endpoints_clause(self):
+        """Order is the argument: what it costs, what it carried, what needs it."""
+        excerpt = self.hits(
+            services=[self.svc(ip=self.IP)],
+            lb_traffic=self.traffic(ingress=374158, egress_packets=273430, egress_bytes=17459228),
+        )[0]["excerpt"]
+        self.assertLess(excerpt.index("still fronts it"), excerpt.index("metered"))
+        self.assertLess(excerpt.index("metered"), excerpt.index("no endpoints"))
+
+    def test_traffic_does_not_move_the_severity_or_the_triage_marker(self):
+        """Measuring the rule does not decide the stand-down; a reader does.
+
+        A rule serving real payload is the strongest reason not to promote
+        this finding, and a rule serving none is not a reason to promote it --
+        10,000 packets a week is a floor for noise, not evidence that nothing
+        needs the workload. Both stay `major`, both stay marked.
+        """
+        for label, traffic in (
+            ("payload", self.traffic(ingress=200000, egress_packets=100000, egress_bytes=120000000)),
+            ("scanning", self.traffic(ingress=374158, egress_packets=273430, egress_bytes=17459228)),
+            ("quiet", self.traffic(ingress=1, egress_packets=1, egress_bytes=1)),
+            ("unmeasured", self.traffic()),
+        ):
+            with self.subTest(label):
+                hits = self.hits(services=[self.svc(ip=self.IP)], lb_traffic=traffic)
+                self.assertEqual(hits[0]["severity"], "major")
+                self.assertEqual(hits[0]["_selected_by"], ["Service/hello-world"])
+
     def test_the_thresholds_match_the_sop(self):
         self.assertEqual(fw.IDLE_WORKLOAD_UTILISATION, 0.2)
         self.assertEqual(fw.IDLE_WORKLOAD_MIN_AGE_DAYS, 14)
         self.assertEqual(fw.IDLE_SERVICE_TRIAGE, "service-fronted")
+        self.assertEqual(fw.LB_TRAFFIC_MIN_PACKETS, 10000)
+        self.assertEqual(fw.LB_TRAFFIC_PAYLOAD_BYTES_PER_PACKET, 100)
+        # The qualifier is the constant. `metric.labels.forwarding_rule_name`
+        # is accepted by the API and attributes the project's whole traffic to
+        # one rule.
+        self.assertEqual(fw.LB_RULE_LABEL, "resource.labels.forwarding_rule_name")
 
 
 class UnderrequestTest(unittest.TestCase):
@@ -3300,6 +3643,45 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("orphan-lb was not evaluated", target["limitations"])
         self.assertIn("registry-no-cleanup was not evaluated", target["limitations"])
 
+    def recording(self, fail=None):
+        seen = []
+        inner = self.run_with(fail)
+
+        def run(argv, **kwargs):
+            seen.append(argv)
+            return inner(argv, **kwargs)
+
+        return run, seen
+
+    def test_a_rule_list_read_before_the_pool_is_not_read_again_here(self):
+        """§3.13's traffic read needs these rules before any cluster is
+        collected, so `collect_fleet` hoists the call and hands the answer down.
+        Re-reading it would double a per-project gcloud call and leave two
+        answers that can disagree about the same project."""
+        run, seen = self.recording()
+        pre = ([{"name": "rule-a", "IPAddress": "34.186.100.26", "loadBalancingScheme": "EXTERNAL"}], run_of(0, "[]"))
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW, forwarding_rules=pre)
+        self.assertEqual(target["outcome"], "collected")
+        self.assertEqual([argv for argv in seen if argv[2] == "forwarding-rules"], [])
+        self.assertIn("orphan-lb", [c["check"] for c in target["commands"]])
+
+    def test_without_a_pre_read_the_rules_are_still_read_here(self):
+        """The fallback that keeps this file runnable on its own and keeps the
+        eleven call sites that predate the hoist honest."""
+        run, seen = self.recording()
+        fw.collect_project_compute("acme", True, self.FACTS, run=run, now=NOW)
+        self.assertEqual(len([argv for argv in seen if argv[2] == "forwarding-rules"]), 1)
+
+    def test_a_pre_read_that_failed_still_fails_the_gate(self):
+        """§3.6 owns this read's failure whoever issued it. Passing the pair
+        down must not turn a PERMISSION_DENIED into a project that collected
+        cleanly with `orphan-lb` silently missing."""
+        pre = (None, run_of(1, "", "PERMISSION_DENIED: compute.forwardingRules.list"))
+        target = fw.collect_project_compute("acme", True, self.FACTS, run=self.run_with(), now=NOW, forwarding_rules=pre)
+        self.assertEqual(target["outcome"], "gate-failed")
+        self.assertIn("gcloud compute forwarding-rules list", target["error"])
+        self.assertIn("PERMISSION_DENIED", target["error"])
+
 
 class CollectClusterTest(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
@@ -4061,6 +4443,161 @@ class MultiProjectCollectFleetTest(unittest.TestCase):
                 manifest = fw.collect_fleet("acme", run=run, session=usage_session(), now=NOW)
         project = next(c for c in manifest["clusters"] if c["name"] == "project/acme")
         self.assertNotIn("orphan-lb", {c["check"] for c in project["commands"]})
+
+
+class LbTrafficReachesTheIdleCheckTest(unittest.TestCase):
+    """The hoist: rules read once per project, before the worker pool.
+
+    §3.13 has to turn a Service's external address into a forwarding-rule name
+    before any cluster is collected, and only `gcloud compute forwarding-rules
+    list` holds both halves of that join. So the read moved out of
+    `collect_project_compute`, which runs after the pool, and the answer is
+    handed down to both consumers. The two things that can go wrong are
+    invisible in a report: reading it twice, or reading it in the right place
+    and never passing it to the check.
+    """
+
+    IP = "34.186.100.26"
+    RULE = {"name": "rule-a", "IPAddress": IP, "loadBalancingScheme": "EXTERNAL"}
+
+    class Session:
+        """`usage_session`'s answers plus the three load-balancer counters."""
+
+        def __init__(self, inner, ingress, egress_packets, egress_bytes):
+            self.inner = inner
+            self.lb = {
+                fw.LB_INGRESS_PACKETS_METRIC: ingress,
+                fw.LB_EGRESS_PACKETS_METRIC: egress_packets,
+                fw.LB_EGRESS_BYTES_METRIC: egress_bytes,
+            }
+            self.lb_calls = 0
+
+        def get(self, url, params=None, timeout=None):
+            metric = params["filter"].split('"')[1]
+            if metric not in self.lb:
+                return self.inner.get(url, params=params, timeout=timeout)
+            self.lb_calls += 1
+            return FakeResponse(200, {"timeSeries": [lb_series("rule-a", self.lb[metric])]})
+
+    def collect(self, *, ingress=500000, egress_packets=400000, egress_bytes=24000000, projects=("acme",)):
+        idle = IdleWorkloadTest()
+        items = [
+            idle.pod(),
+            obj("Deployment", "hello-world", ns=idle.NS, **{"spec.replicas": 1}),
+            obj(
+                "Service",
+                "hello-world",
+                ns=idle.NS,
+                **{
+                    "spec.type": "LoadBalancer",
+                    "spec.selector": {"app": "hello-world"},
+                    "status.loadBalancer.ingress": [{"ip": self.IP}],
+                },
+            ),
+        ]
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append(argv)
+            if argv[:2] == ["gcloud", "projects"] and "list" in argv:
+                return run_of(0, "".join(f"{p}\n" for p in projects))
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                cluster = {"name": "c1", "location": "us-central1", "status": "RUNNING", "autopilot": {"enabled": False}}
+                return run_of(0, json.dumps([cluster]))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(*items)))
+            if argv[:4] == ["gcloud", "compute", "forwarding-rules", "list"]:
+                return run_of(0, json.dumps([self.RULE]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        session = self.Session(
+            usage_session((IdleWorkloadTest.NS, IdleWorkloadTest.POD, 0.0021, 6.0)),
+            ingress,
+            egress_packets,
+            egress_bytes,
+        )
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fw.collect_fleet(
+                    None if len(projects) > 1 else projects[0], run=run, session=session, now=NOW
+                )
+        return manifest, seen, session
+
+    def cluster(self, manifest):
+        return next(c for c in manifest["clusters"] if c["name"] == "c1")
+
+    def idle_finding(self, manifest):
+        return next(c for c in self.cluster(manifest)["candidates"] if c["check"] == "idle-workload")
+
+    def test_the_rule_list_is_read_once_per_project(self):
+        _, seen, _ = self.collect()
+        self.assertEqual(len([a for a in seen if a[:4] == ["gcloud", "compute", "forwarding-rules", "list"]]), 1)
+
+    def test_each_project_gets_its_own_read_and_its_own_traffic(self):
+        _, seen, session = self.collect(projects=("acme", "beta"))
+        reads = [a for a in seen if a[:4] == ["gcloud", "compute", "forwarding-rules", "list"]]
+        self.assertEqual(sorted(a[a.index("--project") + 1] for a in reads), ["acme", "beta"])
+        # Three metrics per project, and no fourth read for the second
+        # consumer: §3.6 reuses the same list rather than re-querying.
+        self.assertEqual(session.lb_calls, 6)
+
+    def test_the_traffic_read_is_recorded_under_its_own_slug(self):
+        """Not under `idle-workload`. That key holds the usage read, and
+        `adopt_collector_evidence` publishes it as the command behind every
+        finding on the check -- overwriting it would leave each sizing claim
+        citing a load-balancer query."""
+        manifest, _, _ = self.collect()
+        commands = {c["check"]: c["command"] for c in self.cluster(manifest)["commands"]}
+        self.assertIn("cpu/core_usage_time", commands["idle-workload"])
+        self.assertIn("timeSeries", commands["idle-workload-traffic"])
+        self.assertIn(fw.LB_RULE_LABEL, commands["idle-workload-traffic"])
+
+    def test_the_traffic_slug_is_the_only_command_outside_the_sop_roster(self):
+        """It is a read, not a check, and the distinction has teeth.
+
+        `commands` is a lookup keyed by slug, so an extra entry costs nothing.
+        The document's `checks_run` is validated against §3's roster and would
+        reject the whole run for a slug that is not in it. Every other command
+        this collector records is a roster check; this one is deliberately not,
+        and the SOP tells the model so.
+        """
+        import audit_report
+
+        manifest, _, _ = self.collect()
+        roster = set(audit_report.audit_checks("fleet-wide-cost-analysis"))
+        self.assertTrue(roster)
+        slugs = {c["check"] for c in self.cluster(manifest)["commands"]}
+        self.assertIn("idle-workload-traffic", slugs)
+        self.assertEqual(slugs - roster, {"idle-workload-traffic"})
+
+    def test_the_measured_traffic_reaches_the_published_excerpt(self):
+        """End to end: rules read before the pool, joined to the Service's
+        assigned address, and the answer written into the evidence the ledger
+        carries. 24,000,000 bytes over 400,000 packets is 60 each -- headers
+        with no payload, the shape of the two rules whose findings merged a
+        stand-down on 2026-09-07."""
+        manifest, _, _ = self.collect()
+        excerpt = self.idle_finding(manifest)["excerpt"]
+        self.assertIn("metered 500,000 inbound packets", excerpt)
+        self.assertIn("60 bytes each", excerpt)
+        self.assertIn("without ever sending a payload", excerpt)
+
+    def test_a_rule_serving_payload_warns_in_the_published_excerpt(self):
+        manifest, _, _ = self.collect(egress_bytes=400000 * 1500)
+        self.assertIn("something is being served", self.idle_finding(manifest)["excerpt"])
+
+    def test_the_finding_is_still_gated_for_triage_whatever_the_traffic_said(self):
+        """Traffic informs the reader; it does not release the sweep. A rule
+        under the noise floor is not evidence nothing needs the workload, and
+        that population is exactly what merged PRs 184-186."""
+        manifest, _, _ = self.collect(ingress=10, egress_packets=0, egress_bytes=0)
+        finding = self.idle_finding(manifest)
+        self.assertIn("nothing measurable reached it", finding["excerpt"])
+        self.assertEqual(finding["needs_triage"], "service-fronted")
 
 
 class ManifestComposesWithAuditReportTest(unittest.TestCase):

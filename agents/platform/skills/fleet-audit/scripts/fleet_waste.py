@@ -185,6 +185,48 @@ MONITORING_SCOPE = "https://www.googleapis.com/auth/monitoring.read"
 MONITORING_TIMEOUT_S = 120
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
+# What §3.13 reads to say what reached the load balancer in front of an idle
+# workload. Three DELTA counters on the L4 external forwarding rule, which is
+# what a GKE `type: LoadBalancer` Service creates.
+LB_INGRESS_PACKETS_METRIC = "loadbalancing.googleapis.com/l3/external/ingress_packets_count"
+LB_EGRESS_PACKETS_METRIC = "loadbalancing.googleapis.com/l3/external/egress_packets_count"
+LB_EGRESS_BYTES_METRIC = "loadbalancing.googleapis.com/l3/external/egress_bytes_count"
+# A *resource* label, and the qualifier is the whole reason this is a named
+# constant rather than a literal in the request. `metric.labels.forwarding_rule_name`
+# is a perfectly valid thing to ask the Monitoring API to group by, and it does
+# not fail: the field does not exist on these metrics, so every rule in the
+# project collapses into one unlabelled series and the caller reads the fleet's
+# entire traffic as belonging to whichever rule it was asking about. Verified
+# against adamparco-kage on 2026-09-07 -- the metric grouping returned one
+# series totalling 743,426 packets where the resource grouping returned three,
+# the largest of them 374,158.
+LB_RULE_LABEL = "resource.labels.forwarding_rule_name"
+# The forwarding-rule scheme these metrics cover. An INTERNAL rule and a
+# Private Service Connect attachment report nothing under `l3/external`, and an
+# EXTERNAL_MANAGED (proxy) rule reports under `https/` instead -- so including
+# them would return an empty answer indistinguishable from a rule that has one,
+# which is the "unmeasured, not zero" mistake this whole read exists to stop
+# making.
+LB_EXTERNAL_SCHEME = "EXTERNAL"
+# A day, against `USAGE_WINDOW_HOURS`' week: the read comes back as seven points
+# per rule rather than one. The check sums them, but a rule that went quiet
+# mid-window is then a question a reader can answer from the manifest without
+# re-running anything.
+LB_TRAFFIC_ALIGNMENT_S = 86400
+# Under this many inbound packets across the window the rule metered nothing
+# worth weighing. `USAGE_WINDOW_HOURS` is 10,080 minutes, so the floor is
+# almost exactly one packet a minute -- which is less than a public address
+# collects from internet scanners with nothing behind it at all.
+LB_TRAFFIC_MIN_PACKETS = 10000
+# Mean bytes per *outbound* packet, below which the rule answered without ever
+# sending a payload. An IP+TCP header alone is 40 bytes and a SYN-ACK or RST
+# with options runs to about 60, so a week that averages under this served
+# nobody anything. It is the number that separates the two shapes of traffic
+# §3.13 kept confusing: on 2026-09-07 the two forwarding rules whose findings
+# merged a stand-down unattended had metered 374,158 and 367,736 inbound
+# packets -- and answered at 63.9 and 75.6 bytes per packet, across 42 client
+# countries. Busy, and serving nothing.
+LB_TRAFFIC_PAYLOAD_BYTES_PER_PACKET = 100
 # The materiality floor `check_overrequest` applies to the *request* on an idle
 # dimension, so the check does not report a 10m sidecar whose 8m of headroom is
 # arithmetically a 5x over-request and operationally nothing.
@@ -751,6 +793,166 @@ def fetch_memory_means(
 
     rendered = json.dumps(sorted((ns, pod, round(mem, 1)) for (ns, pod), mem in means.items()))
     return means, True, Run([label], 0, rendered, "", time.monotonic() - started)
+
+
+def _read_lb_series(
+    session: SessionFn,
+    url: str,
+    *,
+    metric: str,
+    start: datetime,
+    now: datetime,
+) -> tuple[dict[str, float], tuple[int, str] | None]:
+    """One load-balancer counter, totalled over the window per forwarding rule.
+
+    Two collapses happen here and they are different operations. Confusing them
+    doubles a number that goes into a published finding, which is the failure
+    this whole read was added to stop.
+
+    Within a series the points are **summed**. These are DELTA counters and the
+    alignment period is a day, so the answer is seven buckets that add up to
+    the window.
+
+    Across the series of one rule the totals are **maxed**, not added. The same
+    traffic is reported twice -- once under the legacy `tcp_lb_rule` /
+    `udp_lb_rule` monitored resources and again under
+    `loadbalancing.googleapis.com/ExternalNetworkLoadBalancerRule` -- and
+    `crossSeriesReducer` does not merge across resource *types*, so grouping by
+    the rule name still returns two near-equal series per rule. Measured
+    against adamparco-kage over 168h on 2026-09-07: rule `ab3a83e6…` came back
+    as 374,158 and 371,246 inbound packets, and summing them would have
+    published 745,404 for a rule that saw 374,158. `max` also does the right
+    thing for a rule only one of the two types reports, which is most of them.
+    """
+    sink: dict[str, float] = {}
+    page_token = None
+    while True:
+        params = {
+            "filter": f'metric.type="{metric}"',
+            "interval.startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "interval.endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "aggregation.alignmentPeriod": f"{LB_TRAFFIC_ALIGNMENT_S}s",
+            "aggregation.perSeriesAligner": "ALIGN_SUM",
+            "aggregation.crossSeriesReducer": "REDUCE_SUM",
+            "aggregation.groupByFields": [LB_RULE_LABEL],
+            "pageSize": "2000",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            response = session.get(url, params=params, timeout=MONITORING_TIMEOUT_S)
+        except Exception as exc:
+            return {}, (-1, f"{metric}: {type(exc).__name__}: {exc}")
+        if response.status_code != 200:
+            return {}, (response.status_code, f"{metric}: {response.text}")
+        body = response.json()
+        for series in body.get("timeSeries") or []:
+            labels = (series.get("resource") or {}).get("labels") or {}
+            rule = labels.get("forwarding_rule_name", "")
+            # An unlabelled series is the mis-grouped answer `LB_RULE_LABEL`
+            # describes, and it carries the project's whole traffic. Dropping it
+            # loses a rule's figures at worst; keeping it invents them.
+            if not rule:
+                continue
+            total = 0.0
+            for point in series.get("points") or []:
+                value = _point_value(point)
+                if value is not None:
+                    total += value
+            sink[rule] = max(sink.get(rule, 0.0), total)
+        page_token = body.get("nextPageToken")
+        if not page_token:
+            return sink, None
+
+
+def fetch_lb_traffic(
+    project: str,
+    rules: list | None,
+    *,
+    session: SessionFn,
+    now: datetime,
+    window_hours: int = USAGE_WINDOW_HOURS,
+) -> tuple[dict[str, dict], Run]:
+    """What each external forwarding rule in `project` metered, keyed by address.
+
+    Keyed by IP and not by rule name because of what the join needs on the
+    other end: a Service carries `status.loadBalancer.ingress[].ip` and no rule
+    name, the Monitoring answer carries a rule name and no address, and
+    `gcloud compute forwarding-rules list` is the only thing that holds both.
+    That is why `collect_fleet` reads the rules before the worker pool instead
+    of leaving them where §3.6 uses them.
+
+    Every `EXTERNAL` rule appears in the answer. A rule Monitoring returned no
+    series for is present with `None` figures, and that distinction is the
+    point: an absent address means this run has nothing to say, a `None` means
+    the rule was not measured, and neither is a zero. `check_idle_workload`
+    keeps all three apart, because reading any of them as "no traffic" is how
+    the check came to assert a caller it had never looked for.
+    """
+    started = time.monotonic()
+    start = now - timedelta(hours=window_hours)
+    url = f"https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+    metrics = (
+        ("ingress_packets", LB_INGRESS_PACKETS_METRIC),
+        ("egress_packets", LB_EGRESS_PACKETS_METRIC),
+        ("egress_bytes", LB_EGRESS_BYTES_METRIC),
+    )
+    # Recorded in the manifest in place of an argv, the way `fetch_usage_peaks`
+    # records its own: not runnable as-is, but it names the project, the three
+    # metrics, the grouping and the window, which is what a reader checking a
+    # traffic figure in an excerpt needs in order to re-read it.
+    label = (
+        f"GET monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+        f" group_by={LB_RULE_LABEL}"
+        f" metrics={','.join(metric for _, metric in metrics)} window={window_hours}h"
+    )
+
+    def fail(rc: int, message: str) -> tuple[dict, Run]:
+        return {}, Run([label], rc, "", message[:300], time.monotonic() - started)
+
+    if session is None:
+        return fail(-1, "no Cloud Monitoring session: ADC credentials were unavailable at startup")
+
+    addresses = {
+        str(rule.get("name") or ""): str(rule.get("IPAddress") or "")
+        for rule in (rules or [])
+        if isinstance(rule, dict)
+        and rule.get("loadBalancingScheme") == LB_EXTERNAL_SCHEME
+        and rule.get("IPAddress")
+        and rule.get("name")
+    }
+    if not addresses:
+        return fail(0, f"this project has no {LB_EXTERNAL_SCHEME} forwarding rule to measure")
+
+    totals: dict[str, dict[str, float]] = {}
+    for key, metric in metrics:
+        sink, err = _read_lb_series(session, url, metric=metric, start=start, now=now)
+        if err is not None:
+            return fail(*err)
+        for rule, value in sink.items():
+            totals.setdefault(rule, {})[key] = value
+
+    by_address = {
+        address: {
+            "rule": rule,
+            **{key: totals.get(rule, {}).get(key) for key, _ in metrics},
+        }
+        for rule, address in addresses.items()
+    }
+    # Stands in for the stdout the manifest digests, the way `fetch_usage_peaks`'
+    # rendering does. Sorted by address explicitly rather than by the whole row:
+    # the rows carry `None` where a rule went unmeasured, and a tuple sort that
+    # ever reached one of those columns would raise instead of ordering.
+    rendered = json.dumps(
+        sorted(
+            (
+                [address, entry["rule"], entry["ingress_packets"], entry["egress_packets"], entry["egress_bytes"]]
+                for address, entry in by_address.items()
+            ),
+            key=lambda row: row[0],
+        )
+    )
+    return by_address, Run([label], 0, rendered, "", time.monotonic() - started)
 
 
 # --------------------------------------------------------------------------- #
@@ -2271,7 +2473,105 @@ def _selecting_services(context: dict, ns: str, labels: dict) -> list[str]:
     return sorted(matched)
 
 
-def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> list[dict]:
+def _fronting_addresses(context: dict, ns: str, fronting: list[str]) -> list[str]:
+    """The external addresses the Services in `fronting` were actually given.
+
+    `status`, not `spec`: `spec.loadBalancerIP` is a request, and a Service
+    still waiting on one has none. An address here is one GCP assigned, which
+    is the only kind a forwarding rule can be joined to.
+    """
+    wanted = set(fronting)
+    found = set()
+    for svc in context["services"]:
+        meta = svc.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        if f"Service/{meta.get('name', '')}" not in wanted:
+            continue
+        for ingress in ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []:
+            if isinstance(ingress, dict) and ingress.get("ip"):
+                found.add(str(ingress["ip"]))
+    return sorted(found)
+
+
+def _idle_traffic_clause(
+    context: dict, ns: str, fronting: list[str], lb_traffic: dict | None
+) -> str:
+    """What the forwarding rules in front of an idle controller metered.
+
+    The sentence this check owed a reader and did not have. §3.13 used to
+    publish "a workload nobody is calling" off a CPU and memory read, and on
+    2026-09-07 three findings carrying that phrase merged a scale-to-zero
+    unattended -- two of them on rules that had metered several hundred
+    thousand packets in the same window the finding quoted. `d1b8fd23`
+    retracted the claim. This supplies the measurement it was standing in for.
+
+    Four answers, and the distinction between the last two is the one that
+    matters. A rule with figures gets them, with the mean payload per outbound
+    packet, because packet counts alone cannot tell a session from a port scan
+    and the payload can. A rule Monitoring holds no series for is reported as
+    unmeasured, never as quiet. And an address this run knows nothing about --
+    no session, no rules read, a Service still waiting for an IP -- gets no
+    clause at all, because silence is honest and a zero is not.
+    """
+    if lb_traffic is None or not fronting:
+        return ""
+    entries = [
+        lb_traffic[address]
+        for address in _fronting_addresses(context, ns, fronting)
+        if address in lb_traffic
+    ]
+    if not entries:
+        return ""
+    subject = (
+        "Its forwarding rule"
+        if len(entries) == 1
+        else f"The {len(entries)} forwarding rules in front of it"
+    )
+    measured = [entry for entry in entries if entry.get("ingress_packets") is not None]
+    if not measured:
+        return (
+            f". {subject} carries no Cloud Monitoring traffic series over the "
+            f"trailing {USAGE_WINDOW_HOURS}h, so what reached "
+            f"{'it' if len(entries) == 1 else 'them'} is unmeasured rather than zero"
+        )
+    ingress = sum(entry["ingress_packets"] for entry in measured)
+    egress_packets = sum(entry.get("egress_packets") or 0.0 for entry in measured)
+    egress_bytes = sum(entry.get("egress_bytes") or 0.0 for entry in measured)
+    metered = (
+        f". {subject} metered {ingress:,.0f} inbound packet"
+        f"{'' if ingress == 1 else 's'} over {USAGE_WINDOW_HOURS}h"
+    )
+    if ingress < LB_TRAFFIC_MIN_PACKETS:
+        return (
+            f"{metered}, under the {LB_TRAFFIC_MIN_PACKETS:,}-packet floor this "
+            f"check treats as the background an exposed address collects on its "
+            f"own -- nothing measurable reached it"
+        )
+    if not egress_packets:
+        return f"{metered} and answered none of them"
+    per_packet = egress_bytes / egress_packets
+    answered = (
+        f"{metered} and answered with {egress_bytes:,.0f} bytes across "
+        f"{egress_packets:,.0f} outbound packets, {per_packet:,.0f} bytes each"
+    )
+    if per_packet < LB_TRAFFIC_PAYLOAD_BYTES_PER_PACKET:
+        return (
+            f"{answered} -- under the {LB_TRAFFIC_PAYLOAD_BYTES_PER_PACKET}-byte "
+            f"mark a served response clears, so the rule was busy without ever "
+            f"sending a payload, which is the shape of unsolicited connection "
+            f"attempts to a public address rather than of sessions"
+        )
+    return (
+        f"{answered}, which is enough payload that something is being served. "
+        f"Find out what before standing the controller down: this check "
+        f"measured a forwarding rule, not a caller"
+    )
+
+
+def check_idle_workload(
+    context: dict, usage_peaks: dict, *, now: datetime, lb_traffic: dict | None = None
+) -> list[dict]:
     """A controller nothing is using, whose request no resize can lower.
 
     The complement of `check_overrequest`, and the population `bc437731`
@@ -2383,6 +2683,12 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
                 f"so a forwarding rule and its external IP bill for it too — usually "
                 f"several times the pod's own cost"
             )
+        # Immediately after the cost clause and before the endpoints one,
+        # because it is the same rule's story: what it costs, then what it
+        # carried, then what depends on it. Empty unless a rule was both found
+        # and read -- see `_idle_traffic_clause` for why an unmeasured rule
+        # still gets a sentence and an unknown one does not.
+        excerpt += _idle_traffic_clause(context, entry["ns"], fronting, lb_traffic)
         # Cost is not the only thing a Service says about an idle workload, and
         # the other thing it says is the one that takes a serving system down.
         # A `ClusterIP` Service costs nothing, so it never reaches the clause
@@ -3296,7 +3602,7 @@ def _metrics_gap_phrase(result: Run, read: str) -> str:
     )
 
 
-def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime, declarations: dict | None = None, releases: dict[tuple, dict] | None = None) -> tuple[dict, dict]:
+def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datetime, declarations: dict | None = None, releases: dict[tuple, dict] | None = None, lb_traffic: tuple[dict, Run] | None = None) -> tuple[dict, dict]:
     """Returns `(manifest_entry, fleet_facts)` — the second only populated
     when the object dump succeeded; `collect_fleet` unions it across every
     cluster before running the project-scoped checks that need it."""
@@ -3458,7 +3764,23 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # whose resize would change nothing because nothing is using it, or
         # one whose resize 3.1 refuses to make because it is `Guaranteed`.
         commands["idle-workload"] = usage_record
-        for hit in check_idle_workload(context, usage_peaks, now=now):
+        # A second read behind the same check, recorded under its own slug.
+        # Not a check: nothing in §3's roster is called this, so it must never
+        # reach the document's `checks_run`, which validates against that
+        # roster and would reject the run. What it is is the evidence behind
+        # the traffic sentence in an `idle-workload` excerpt, and a figure a
+        # reader cannot re-read is a figure they have to take on trust -- which
+        # is the position §3.13 was in when it asserted a caller.
+        #
+        # Its own slug and not a second write to `idle-workload`: that key
+        # holds the usage read, `adopt_collector_evidence` publishes it as the
+        # command behind every finding here, and overwriting it would leave
+        # each sizing claim citing a load-balancer query.
+        if lb_traffic is not None:
+            commands["idle-workload-traffic"] = _record(lb_traffic[1].argv[0], lb_traffic[1])
+        for hit in check_idle_workload(
+            context, usage_peaks, now=now, lb_traffic=lb_traffic[0] if lb_traffic else None
+        ):
             emitted = emit("idle-workload", hit)
             # Without this the retracted impact never reaches a reader.
             # `adopt_arm_impact` adopts the collector's sentence only for
@@ -3951,7 +4273,20 @@ def check_orphan_lb(forwarding_rules: list[dict], target_pools: list[dict], back
     return hits
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None) -> dict | None:
+def forwarding_rules_argv(project: str) -> list[str]:
+    """§3.6's rule list, named once because two callers now need the same read.
+
+    `collect_fleet` runs it before the worker pool, because §3.13's traffic
+    read has to turn a Service's external address into a forwarding rule name
+    before any cluster is collected, and hands the answer to
+    `collect_project_compute` below. One read, two consumers -- adding a second
+    `gcloud compute forwarding-rules list` per project would double the call
+    and leave two answers that can disagree.
+    """
+    return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
+
+
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -3964,8 +4299,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     disks_parsed, disks_result = run_and_gate(disks_argv, run=run)
     addr_argv = ["gcloud", "compute", "addresses", "list", "--project", project, "--filter", "status!=IN_USE", "--format", "json"]
     addr_parsed, addr_result = run_and_gate(addr_argv, run=run)
-    fwd_argv = ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
-    fwd_parsed, fwd_result = run_and_gate(fwd_argv, run=run)
+    # Read here only when nobody read it already. `collect_fleet` needs the
+    # same answer before the worker pool starts and passes it down; running
+    # this file by hand, or from a test that does not, still gets the read.
+    fwd_argv = forwarding_rules_argv(project)
+    fwd_parsed, fwd_result = forwarding_rules or run_and_gate(fwd_argv, run=run)
     tp_argv = ["gcloud", "compute", "target-pools", "list", "--project", project, "--format", "json"]
     tp_parsed, tp_result = run_and_gate(tp_argv, run=run)
     bs_argv = ["gcloud", "compute", "backend-services", "list", "--project", project, "--format", "json"]
@@ -4139,9 +4477,27 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
     declarations = workload_declarations(workspace) if workspace else {}
     releases = release_declarations(workspace) if workspace else {}
 
+    # Also before the pool, and for a reason of ordering rather than economy.
+    # §3.13 asks what the load balancer in front of an idle workload metered,
+    # and the only thing that maps a Service's external address to the
+    # forwarding rule Cloud Monitoring reports under is this list -- so it has
+    # to be in hand before the first cluster is collected. `collect_project_compute`
+    # then reuses the same answer for §3.6 rather than re-reading it.
+    forwarding_rules: dict[str, tuple[object | None, Run]] = {}
+    lb_traffic: dict[str, tuple[dict, Run]] = {}
+    for p in projects:
+        forwarding_rules[p] = run_and_gate(forwarding_rules_argv(p), run=run)
+        rules, _ = forwarding_rules[p]
+        # A failed rule list is §3.6's problem to report -- the five-read gate
+        # in `collect_project_compute` still sees it and still fails the target.
+        # Here it means only that the traffic sentence goes unwritten, which is
+        # the silence `_idle_traffic_clause` prefers to a fabricated zero.
+        if isinstance(rules, list):
+            lb_traffic[p] = fetch_lb_traffic(p, rules, session=session, now=now)
+
     results: list[tuple[dict, dict]] = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max(1, min(len(clusters), max_workers))) as pool:
-        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now, declarations=declarations, releases=releases): i for i, c in enumerate(clusters)}
+        futures = {pool.submit(collect_cluster, c, run=run, session=session, now=now, declarations=declarations, releases=releases, lb_traffic=lb_traffic.get(c["project"])): i for i, c in enumerate(clusters)}
         for future in as_completed(futures):
             index = futures[future]
             try:
@@ -4186,7 +4542,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         for _, facts in group:
             for key in fleet_facts:
                 fleet_facts[key] |= facts[key]
-        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p))
+        project_entry = collect_project_compute(p, all_reachable, fleet_facts, run=run, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p))
         if project_entry:
             project_entries.append(project_entry)
 
