@@ -9846,6 +9846,299 @@ class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
             self.assertNotIn("release_declaration", candidate, candidate["check"])
 
 
+class TestNamespaceDirectories(unittest.TestCase):
+    """Where a *new* object for a namespace goes, which neither index answers.
+
+    The two above resolve an object that exists to the file declaring it. A
+    finding whose fix is a NetworkPolicy or a ServiceAccount that does not
+    exist yet cannot use either, and the model's own reasoning about it was
+    wrong on 2026-09-07 in a way that read as careful -- see
+    `collect.namespace_directories`.
+    """
+
+    OVERLAY_APPLICATION = textwrap.dedent(
+        """\
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: podinfo-kustomize
+        spec:
+          source:
+            repoURL: https://github.com/acme/infra.git
+            path: clusters/prod-usc1/kustomize/podinfo
+          destination:
+            name: prod-usc1
+            namespace: podinfo-kustomize
+        """
+    )
+    CHART_APPLICATION = textwrap.dedent(
+        """\
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: cert-manager
+        spec:
+          source:
+            repoURL: https://charts.jetstack.io
+            chart: cert-manager
+            targetRevision: v1.14.4
+          destination:
+            name: prod-usc1
+            namespace: cert-manager
+        """
+    )
+
+    def declared(self, name, namespace):
+        return textwrap.dedent(
+            f"""\
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: {name}
+              namespace: {namespace}
+            """
+        )
+
+    def resolve(self, files, *, directories=()):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative in directories:
+                (root / relative).mkdir(parents=True, exist_ok=True)
+            for relative, text in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            return collect.namespace_directories(
+                collect.workload_declarations(root),
+                collect.release_declarations(root),
+                root,
+            )
+
+    def test_a_namespace_the_repo_already_declares_into_resolves_to_that_directory(self):
+        found = self.resolve(
+            {"clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop")}
+        )
+        self.assertEqual(
+            found[("prod-usc1", "shop")],
+            {"path": "clusters/prod-usc1/workloads", "source": "sibling"},
+        )
+
+    def test_a_kustomize_overlay_answers_for_the_namespace_it_renders_into(self):
+        """The 2026-09-07 case. The Application's source is a Kustomize root in
+        this repository, so a new object for the namespace goes into it -- the
+        published finding said no file could carry the fix.
+        """
+        found = self.resolve(
+            {
+                "argocd/apps/podinfo-kustomize.yaml": self.OVERLAY_APPLICATION,
+                "clusters/prod-usc1/kustomize/podinfo/kustomization.yaml": "resources: []\n",
+            }
+        )
+        self.assertEqual(
+            found[("prod-usc1", "podinfo-kustomize")],
+            {
+                "path": "clusters/prod-usc1/kustomize/podinfo",
+                "source": "overlay",
+                "declaration": "argocd/apps/podinfo-kustomize.yaml",
+            },
+        )
+
+    def test_a_chart_answers_for_no_namespace(self):
+        """A values override reaches an object the chart renders; it cannot
+        create one. The chart's directory is in another repository.
+        """
+        found = self.resolve({"argocd/apps/cert-manager.yaml": self.CHART_APPLICATION})
+        self.assertNotIn(("prod-usc1", "cert-manager"), found)
+
+    def test_a_sibling_directory_outranks_an_overlay_over_the_same_namespace(self):
+        """A plain file in a directory Argo CD applies needs no wiring at all,
+        where a file in an overlay renders only once `resources:` names it.
+        """
+        found = self.resolve(
+            {
+                "argocd/apps/podinfo-kustomize.yaml": self.OVERLAY_APPLICATION,
+                "clusters/prod-usc1/kustomize/podinfo/kustomization.yaml": "resources: []\n",
+                "clusters/prod-usc1/workloads/app.yaml": self.declared(
+                    "app", "podinfo-kustomize"
+                ),
+            }
+        )
+        self.assertEqual(found[("prod-usc1", "podinfo-kustomize")]["source"], "sibling")
+
+    def test_two_directories_declaring_into_one_namespace_resolve_to_neither(self):
+        found = self.resolve(
+            {
+                "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                "clusters/prod-usc1/extra/other.yaml": self.declared("other", "shop"),
+            }
+        )
+        self.assertNotIn(("prod-usc1", "shop"), found)
+
+    def test_the_cluster_arm_answers_for_a_namespace_no_file_declares(self):
+        """The arm with the yield. `cert-manager` is declared by nothing here,
+        and a NetworkPolicy for it still belongs in the directory Argo CD
+        applies to the cluster rather than in a fork of the chart.
+        """
+        found = self.resolve(
+            {"clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop")}
+        )
+        self.assertEqual(
+            found[("prod-usc1", collect.NAMESPACE_KEY_ANY)],
+            {"path": "clusters/prod-usc1/workloads", "source": "cluster"},
+        )
+
+    def test_the_cluster_arm_needs_one_unambiguous_directory(self):
+        found = self.resolve(
+            {
+                "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                "clusters/prod-usc1/extra/other.yaml": self.declared("other", "wharf"),
+            }
+        )
+        self.assertNotIn(("prod-usc1", collect.NAMESPACE_KEY_ANY), found)
+        # Each namespace still resolves on its own: the ambiguity is about
+        # which directory serves the *cluster*, not either namespace.
+        self.assertEqual(found[("prod-usc1", "shop")]["source"], "sibling")
+        self.assertEqual(found[("prod-usc1", "wharf")]["source"], "sibling")
+
+    def test_a_namespace_restricting_appproject_withdraws_the_cluster_arm(self):
+        found = self.resolve(
+            {
+                "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                "argocd/projects/team.yaml": textwrap.dedent(
+                    """\
+                    apiVersion: argoproj.io/v1alpha1
+                    kind: AppProject
+                    metadata:
+                      name: team
+                    spec:
+                      destinations:
+                        - server: '*'
+                          namespace: shop
+                    """
+                ),
+            }
+        )
+        self.assertNotIn(("prod-usc1", collect.NAMESPACE_KEY_ANY), found)
+        # The sibling arm is untouched: it names a directory that already
+        # declares into that namespace, which the project plainly permits.
+        self.assertEqual(found[("prod-usc1", "shop")]["source"], "sibling")
+
+    def test_a_wildcard_appproject_leaves_the_cluster_arm_standing(self):
+        found = self.resolve(
+            {
+                "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                "argocd/projects/team.yaml": textwrap.dedent(
+                    """\
+                    apiVersion: argoproj.io/v1alpha1
+                    kind: AppProject
+                    metadata:
+                      name: team
+                    spec:
+                      destinations:
+                        - server: '*'
+                          namespace: '*'
+                    """
+                ),
+            }
+        )
+        self.assertEqual(found[("prod-usc1", collect.NAMESPACE_KEY_ANY)]["source"], "cluster")
+
+    def test_an_appproject_with_no_destinations_withdraws_the_cluster_arm(self):
+        """A project permitting nothing is a restriction, not the absence of
+        one, and an unparseable file is treated the same way: cost findings
+        rather than open wrong pull requests.
+        """
+        found = self.resolve(
+            {
+                "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                "argocd/projects/team.yaml": textwrap.dedent(
+                    """\
+                    apiVersion: argoproj.io/v1alpha1
+                    kind: AppProject
+                    metadata:
+                      name: team
+                    spec: {}
+                    """
+                ),
+            }
+        )
+        self.assertNotIn(("prod-usc1", collect.NAMESPACE_KEY_ANY), found)
+
+    def test_an_empty_clone_resolves_nothing(self):
+        self.assertEqual(self.resolve({}), {})
+
+    def test_the_indexes_are_optional(self):
+        """Absent PyYAML empties both, and this must return an empty map rather
+        than raising -- the behaviour that shipped before it existed.
+        """
+        self.assertEqual(collect.namespace_directories({}, {}, None), {})
+
+
+class TestCandidatesCarryTheirNamespaceDirectory(unittest.TestCase):
+    """The annotation has to reach a candidate, as the other two do.
+
+    Same failure mode as its two siblings above: a correct index that never
+    reaches `emit` looks exactly like a repository with nowhere to put a file.
+    """
+
+    CLUSTER = {"name": "prod-usc1", "location": "us-central1", "status": "RUNNING"}
+
+    def clone(self, tmp):
+        path = Path(tmp) / "infra"
+        (path / "clusters/prod-usc1/workloads").mkdir(parents=True)
+        (path / "clusters/prod-usc1/workloads/app.yaml").write_text(
+            textwrap.dedent(
+                """\
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: app
+                  namespace: shop
+                """
+            )
+        )
+        return path
+
+    def candidates(self, *items):
+        def run(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, json.dumps([self.CLUSTER]), "", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
+                    patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet(
+                    "obtainability-audit", "acme", run=run, workspace=self.clone(tmp),
+                )
+        return [c for cluster in manifest["clusters"] for c in cluster.get("candidates") or []]
+
+    def test_a_candidate_in_a_declared_namespace_carries_the_sibling_directory(self):
+        candidates = self.candidates(deployment("app", **{"metadata.namespace": "shop"}))
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertEqual(
+                candidate["namespace_directory"],
+                {"path": "clusters/prod-usc1/workloads", "source": "sibling"},
+                candidate["check"],
+            )
+
+    def test_a_candidate_elsewhere_on_the_cluster_falls_back_to_the_cluster_arm(self):
+        """The namespace is declared by no file, which is the ordinary case and
+        the one that produced 56 `manual` findings.
+        """
+        candidates = self.candidates(deployment("other", **{"metadata.namespace": "wharf"}))
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertEqual(
+                candidate["namespace_directory"],
+                {"path": "clusters/prod-usc1/workloads", "source": "cluster"},
+                candidate["check"],
+            )
+
+
 class TestChecksRevision(unittest.TestCase):
     """Every collector tells the harness which version of itself ran.
 

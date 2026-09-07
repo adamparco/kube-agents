@@ -4484,6 +4484,130 @@ class TestReleaseDeclaredManualRemediations(HarnessTestCase):
         )
 
 
+class TestNamespaceDirectoryManualRemediations(HarnessTestCase):
+    """The undeclared note, where the fix adds an object rather than changing one.
+
+    "No pull request can carry this fix" follows from the object being
+    undeclared only if the fix has to edit that object's declaration. A
+    namespace missing a NetworkPolicy needs no such file, and
+    `collect.namespace_directories` resolves where a new one goes.
+    """
+
+    DIRECTORY = "clusters/prod-us-east/workloads"
+    APPLICATION = "clusters/prod-us-east/apps/cert-manager.yaml"
+
+    def declare(self, relative, kind, name):
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            f"apiVersion: apps/v1\nkind: {kind}\nmetadata:\n  name: {name}\n",
+            encoding="utf-8",
+        )
+
+    def manifest(self, directory=None, source="cluster", release=None):
+        candidate = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Deployment/cert-manager",
+        }
+        if directory:
+            candidate["namespace_directory"] = {"path": directory, "source": source}
+        if release:
+            candidate["release_declaration"] = {
+                "path": release,
+                "kind": "Application",
+                "renderer": "helm",
+            }
+        return {"clusters": [{"name": "prod-us-east", "candidates": [candidate]}]}
+
+    def finding(self):
+        return make_finding(obj="Deployment/cert-manager", remediation={"kind": "manual"})
+
+    def test_the_directory_is_named_instead_of_the_refusal(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                [finding], self.workspace, self.manifest(self.DIRECTORY)
+            ),
+            [finding["id"]],
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn("Not declared in this repository", note)
+        self.assertIn(f"new objects for this namespace are declared under `{self.DIRECTORY}`", note)
+        self.assertNotIn("no pull request can carry this fix", note)
+
+    def test_a_release_declaration_outranks_a_directory(self):
+        """Where this object's own spec is configured beats where a new object
+        beside it would go — the first is the fix, the second is a place.
+        """
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding],
+            self.workspace,
+            self.manifest(self.DIRECTORY, release=self.APPLICATION),
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn(f"chart release declared at `{self.APPLICATION}`", note)
+        self.assertNotIn(self.DIRECTORY, note)
+
+    def test_no_directory_still_gets_the_refusal(self):
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest()
+        )
+        self.assertIn(
+            "no pull request can carry this fix", finding["remediation"]["note"]
+        )
+
+    def test_the_two_sentences_replace_each_other(self):
+        """Same discipline as the release variant: this pass runs after the
+        carry, so it has to retract yesterday's verdict rather than stack on it.
+        """
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest()
+        )
+        self.assertIn("no pull request can carry this fix", finding["remediation"]["note"])
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(self.DIRECTORY)
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn(self.DIRECTORY, note)
+        self.assertNotIn("no pull request can carry this fix", note)
+        self.assertEqual(note.count("Not declared in this repository"), 1)
+
+    def test_an_overlay_directory_reads_the_same_way(self):
+        """The three arms differ in how the path was established, not in what
+        the reader does with it, so the sentence does not branch on `source`.
+        """
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        overlay = "clusters/prod-us-east/kustomize/podinfo"
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(overlay, source="overlay")
+        )
+        self.assertIn(f"under `{overlay}`", finding["remediation"]["note"])
+
+    def test_a_directory_does_not_annotate_a_declared_object(self):
+        """The pass is about undeclared objects. One the repository declares is
+        skipped before either variant is chosen.
+        """
+        self.declare("clusters/app/cert-manager.yaml", "Deployment", "cert-manager")
+        finding = self.finding()
+        self.assertEqual(
+            audit_report.disclose_undeclared_manual_remediations(
+                [finding], self.workspace, self.manifest(self.DIRECTORY)
+            ),
+            [],
+        )
+        self.assertNotIn("note", finding["remediation"])
+
+
 class TestReconciledManualRemediations(unittest.TestCase):
     """A hand-applied fix on an object something else holds the spec of.
 

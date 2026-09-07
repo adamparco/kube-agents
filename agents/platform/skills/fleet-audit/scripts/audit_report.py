@@ -682,6 +682,23 @@ def _release_declared_note(path: str, renderer: str = "") -> str:
     return f"{_UNDECLARED_LEDE}; it is rendered by {noun} declared at `{path}`.)_"
 
 
+# The third variant, for the fix that adds an object rather than changing one.
+# `_UNDECLARED_NOTE`'s "no pull request can carry this fix" reads as measured
+# and is not: it follows from the object being undeclared only if the fix has
+# to edit that object's declaration. A NetworkPolicy, a PodDisruptionBudget or
+# a ServiceAccount the namespace is missing needs no such file, and the
+# directory a new one goes in is something `collect.namespace_directories`
+# resolved against this clone.
+#
+# Names the directory and stops, on `_DECLARED_LEDE`'s discipline. Whether
+# *this* finding's fix is an addition is the model's to say, and a sentence
+# here asserting it would be wrong on every `probes-liveness` -- an edit to a
+# workload no directory can conjure. Naming the path is as far as the parse
+# goes; it costs a line and buys the reader the one thing they cannot look up.
+def _namespace_directory_note(path: str) -> str:
+    return f"{_UNDECLARED_LEDE}; new objects for this namespace are declared under `{path}`.)_"
+
+
 # The mirror of the pair above, for the case the ledger got wrong rather than
 # left unsaid. Naming the file is the whole point of this one -- "somewhere in
 # the repository" is not an answer a reader can act on -- so unlike
@@ -9883,6 +9900,34 @@ def _release_declaration_index(manifest: dict | None) -> dict[str, tuple[str, st
     return index
 
 
+def _namespace_directory_index(manifest: dict | None) -> dict[str, str]:
+    """Map finding id to the clone directory a new object for it would go in.
+
+    `_release_declaration_index` above answers "where is this object
+    configured". This answers "where would a *new* object beside it go", which
+    is the question `_UNDECLARED_NOTE`'s "no pull request can carry this fix"
+    silently assumes has no answer. It usually does — see
+    `collect.namespace_directories`, which resolves it three ways.
+
+    Keys the same way and for the same reason.
+    """
+    index: dict[str, str] = {}
+    for entry in (manifest or {}).get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            directory = candidate.get("namespace_directory")
+            path = str((directory or {}).get("path") or "").strip()
+            if not path:
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            index[derive_finding_id(keyed)] = path
+    return index
+
+
 def retract_contradicted_declaration_denials(
     findings: list[dict], root: Path, manifest: dict | None = None
 ) -> list[str]:
@@ -10084,9 +10129,27 @@ def disclose_undeclared_manual_remediations(
     note says which of the two, because the reader looking for a `values:` block
     in an overlay finds nothing and concludes the path is wrong.
 
+    A third variant covers the fix that *adds* an object. "No pull request can
+    carry this fix" follows from the object being undeclared only where the fix
+    has to edit that object's declaration, and a namespace missing a
+    NetworkPolicy or a PodDisruptionBudget needs no such file — so where
+    `collect.namespace_directories` resolved somewhere for a new object to go,
+    the note names that directory instead. It is the weakest of the three and
+    sits last: a release declaration says where this object's own spec is set,
+    which is a better answer whenever there is one.
+
+    None of the three retracts the model's own denial, and the third must not.
+    "No file in this repository declares an applied object in this namespace"
+    is *true* on the `cluster` arm — nothing does, and the directory is a home
+    for a new one rather than a declaration of an old one. What is false is the
+    conclusion drawn from it, and the answer to that is this sentence beside it
+    rather than a deletion; see `retract_contradicted_declaration_denials` for
+    the two cases where a deletion is right.
+
     Returns the ids annotated, for the caller to log.
     """
     releases = _release_declaration_index(manifest)
+    directories = _namespace_directory_index(manifest)
 
     declared = kubernetes_declarations(root)
     if not declared:
@@ -10116,8 +10179,18 @@ def disclose_undeclared_manual_remediations(
             continue
         if (kind, name) in declared:
             continue
-        release = releases.get(derive_finding_id(finding))
-        sentence = _release_declared_note(*release) if release else _UNDECLARED_NOTE
+        finding_id = derive_finding_id(finding)
+        release = releases.get(finding_id)
+        directory = directories.get(finding_id)
+        if release:
+            # The more specific of the two: it names where this object's own
+            # spec is configured, where a directory only says where a new one
+            # beside it would go.
+            sentence = _release_declared_note(*release)
+        elif directory:
+            sentence = _namespace_directory_note(directory)
+        else:
+            sentence = _UNDECLARED_NOTE
         remediation["note"] = (f"{note} " if note else "") + sentence
         annotated.append(str(finding.get("id", "")))
     return annotated

@@ -126,6 +126,41 @@ FLUX_HELM_REPOSITORY_KIND = "HelmRepository"
 # -- `helm install`, or Flux driving it -- by release namespace and name.
 RELEASE_KEY_APPLICATION = "application"
 RELEASE_KEY_RELEASE = "release"
+# A third key on that same index, answering a different question: not "where
+# is this object declared" but "where would a *new* object for this namespace
+# go". Only a local Kustomize root can answer it, because only a local root is
+# a directory in this repository that renders into the namespace.
+RELEASE_KEY_NAMESPACE = "namespace"
+# `(cluster, RELEASE_KEY_NAMESPACE, namespace)` is three wide, as the
+# Application key is; only the release key is four. The tag discriminates on
+# its own, and the width is checked with it so that reading `key[2]` stays
+# safe if a later key shape is added at a different width.
+NAMESPACE_KEY_WIDTH = 3
+# The two ways that question resolves, carried on the record so the SOP can
+# tell them apart: a directory already holding objects applied to the
+# namespace, or the Kustomize root an Application renders into it. A sibling
+# needs no wiring; an overlay's `resources:` list has to name the new file,
+# which `audit_report.wire_kustomize_additions` does at publish time.
+NAMESPACE_DIRECTORY_SIBLING = "sibling"
+NAMESPACE_DIRECTORY_OVERLAY = "overlay"
+NAMESPACE_DIRECTORY_CLUSTER = "cluster"
+# The namespace slot the `cluster` arm's entry occupies. Empty is free for it:
+# both other arms key off a namespace an object declares, and neither index
+# records an object without one. A cluster-scoped object -- a
+# ClusterRoleBinding, a StorageClass -- carries the empty namespace itself and
+# so reaches this entry on the first lookup rather than the fallback, which is
+# right, since the directory is where a new one of those belongs too.
+NAMESPACE_KEY_ANY = ""
+# What would make the `cluster` arm wrong, and the one thing that suppresses
+# it. An Argo CD AppProject can whitelist the namespaces its Applications may
+# write to, and an object outside that list is refused at sync rather than
+# applied. This collector cannot tell which project owns a plain-directory
+# Application -- it parses only chart and overlay sources -- so it cannot check
+# the right project and instead checks all of them: one restrictive
+# `destinations` entry anywhere in the clone withdraws the arm fleet-wide.
+ARGOCD_APPPROJECT_KIND = "AppProject"
+ARGOCD_DESTINATIONS_FIELD = "destinations"
+ARGOCD_DESTINATION_WILDCARD = "*"
 # Where a values override goes, per reconciler. Argo CD accepts both a YAML
 # string (`values`) and a structured block (`valuesObject`); this names the one
 # already in the file, and `valuesObject` when neither is, because a structured
@@ -7154,6 +7189,12 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             # answers.
             if chart and release_namespace:
                 record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
+            # A local Kustomize root is also an answer to "where does a new
+            # object for this namespace go", which no other key gives. A chart
+            # is not: its directory is in another repository, and the values
+            # override that reaches an *existing* object cannot create one.
+            if overlay and release_namespace and entry["chart"]:
+                record((cluster, RELEASE_KEY_NAMESPACE, release_namespace), entry)
         elif kind == FLUX_HELM_RELEASE_KIND:
             # Flux is installed per-cluster, so the path convention is the only
             # cluster signal a HelmRelease carries.
@@ -7218,6 +7259,157 @@ def release_declaration_for(
     return None
 
 
+def _projects_restrict_namespaces(root: Path | None) -> bool:
+    """Whether any Argo CD AppProject in the clone whitelists namespaces.
+
+    True withdraws `namespace_directories`' `cluster` arm, whose whole claim is
+    that a directory applied to a cluster may carry an object for any namespace
+    on it. An AppProject's `destinations[].namespace` is what makes that false,
+    and Argo CD refuses the object at sync rather than applying it.
+
+    Deliberately blunt: one restrictive project anywhere withdraws the arm
+    everywhere, because this collector parses chart and overlay sources only
+    and so cannot say which project owns the plain-directory Application whose
+    directory the arm names. Unreadable or unparseable is treated as
+    restrictive, which costs findings rather than opening wrong pull requests.
+    """
+    if root is None:
+        return False
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
+    except ImportError:
+        return True
+    try:
+        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
+    except OSError:
+        return True
+    for path in paths:
+        if GIT_DIR_NAME in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return True
+        if ARGOCD_APPPROJECT_KIND not in text:
+            continue
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except yaml.YAMLError:
+            return True
+        for doc in docs:
+            if not isinstance(doc, dict) or doc.get("kind") != ARGOCD_APPPROJECT_KIND:
+                continue
+            spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            destinations = spec.get(ARGOCD_DESTINATIONS_FIELD)
+            if not isinstance(destinations, list):
+                # A project with no destinations permits nothing at all, which
+                # is a restriction rather than the absence of one.
+                return True
+            for destination in destinations:
+                if not isinstance(destination, dict):
+                    return True
+                if str(destination.get("namespace") or "") != ARGOCD_DESTINATION_WILDCARD:
+                    return True
+    return False
+
+
+def namespace_directories(
+    declarations: dict[tuple[str, str, str, str], set[str]],
+    releases: dict[tuple, dict],
+    root: Path | None = None,
+) -> dict[tuple[str, str], dict]:
+    """Where a *new* object for one cluster's namespace belongs in the clone.
+
+    The two indexes above both answer "where is this object declared", and a
+    finding whose fix is an edit needs nothing more. A finding whose fix is a
+    new object needs the other question answered — `netpol-missing` writes a
+    NetworkPolicy that does not exist yet, `default-sa-automount` a
+    ServiceAccount — and neither index answers it, because the object they
+    would look up is the one that is missing.
+
+    So the model is left to decide, and its reasoning is wrong in a way that
+    reads as careful. From the 2026-09-07 obtainability run, on a namespace
+    this function resolves: "No file in this repository declares an applied
+    object in namespace podinfo-kustomize -- only the ArgoCD Application
+    sources that install a chart/overlay into it, which is not a sibling under
+    SOP section 3's rule." Every clause of that is true and the conclusion is
+    false. `clusters/spot-capacity-test/kustomize/podinfo/` is a Kustomize root
+    *in this repository* that the Application renders into that namespace;
+    `_argocd_kustomize_source` proved it is one, against the clone, before the
+    finding was written. The collector knew and the model did not.
+
+    Two shapes, in precedence order:
+
+    - `NAMESPACE_DIRECTORY_SIBLING` — the one directory holding declarations
+      already applied to that cluster and namespace. This is the SOP's own
+      sibling rule, computed from the parsed index rather than grepped, and it
+      wins where both apply: a directory of plain manifests is applied as it
+      stands, so a file added to it needs no wiring at all.
+    - `NAMESPACE_DIRECTORY_OVERLAY` — the local Kustomize root an Argo CD
+      Application renders into the namespace. A file added here renders only
+      once the `resources:` list names it, which
+      `audit_report.wire_kustomize_additions` appends at publish time.
+    - `NAMESPACE_DIRECTORY_CLUSTER` — the one directory in the clone declaring
+      objects applied to that *cluster*, whatever their namespace, stored under
+      `NAMESPACE_KEY_ANY` for the caller to fall back to. This is the arm with
+      the yield, and the reason is that the namespaces a finding lands in are
+      mostly not ones the repo declares into: on 2026-09-07 the manual findings
+      here sat in `argocd`, `cert-manager` and `kubeagents-system`, none of
+      which any file names, while the cluster each of them runs on has a
+      directory Argo CD applies wholesale. A NetworkPolicy for `cert-manager`
+      goes there — that is where a NetworkPolicy for someone else's chart
+      belongs anyway, rather than in a fork of the chart.
+
+      Two things have to hold, and both are checked rather than assumed. The
+      directory has to be unambiguous, as in the other arms. And no AppProject
+      may whitelist namespaces, since that is what turns "applied to the
+      cluster" into "applied to these namespaces on it"; see
+      `_projects_restrict_namespaces`, which is deliberately blunt about it. A
+      remediation using this arm has to set `metadata.namespace` explicitly:
+      the Application's own destination namespace, where it has one, is only
+      the default for objects that declare none.
+
+    Two directories declaring into one namespace is the ambiguity
+    `declaration_for` refuses, and is refused here for the same reason: naming
+    one would name the wrong one about half the time. Absent means unresolved,
+    never "nowhere" — the SOP's grep is still the answer then.
+    """
+    resolved: dict[tuple[str, str], dict] = {}
+    directories: dict[tuple[str, str], set[str]] = {}
+    per_cluster: dict[str, set[str]] = {}
+    for (cluster, _kind, namespace, _name), paths in (declarations or {}).items():
+        for path in paths:
+            parent = str(Path(path).parent)
+            directories.setdefault((cluster, namespace), set()).add(parent)
+            per_cluster.setdefault(cluster, set()).add(parent)
+    for key, found in directories.items():
+        if len(found) == 1:
+            resolved[key] = {
+                "path": next(iter(found)),
+                "source": NAMESPACE_DIRECTORY_SIBLING,
+            }
+    for key, entry in (releases or {}).items():
+        if len(key) != NAMESPACE_KEY_WIDTH or key[1] != RELEASE_KEY_NAMESPACE:
+            continue
+        cluster, namespace = key[0], key[2]
+        if (cluster, namespace) in resolved:
+            continue
+        resolved[(cluster, namespace)] = {
+            "path": entry["chart"],
+            "source": NAMESPACE_DIRECTORY_OVERLAY,
+            "declaration": entry["path"],
+        }
+    if not _projects_restrict_namespaces(root):
+        for cluster, found in per_cluster.items():
+            if len(found) != 1:
+                continue
+            resolved[(cluster, NAMESPACE_KEY_ANY)] = {
+                "path": next(iter(found)),
+                "source": NAMESPACE_DIRECTORY_CLUSTER,
+            }
+    return resolved
+
+
 def collect_cluster(
     cluster: dict,
     audit_id: str,
@@ -7226,6 +7418,7 @@ def collect_cluster(
     run: RunFn = default_run,
     declarations: dict[tuple[str, str, str, str], set[str]] | None = None,
     releases: dict[tuple, dict] | None = None,
+    namespaces: dict[tuple[str, str], dict] | None = None,
 ) -> dict:
     """One manifest `clusters[]` entry (§6): every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
@@ -7303,6 +7496,17 @@ def collect_cluster(
             resolved = release_declaration_for(releases, name, release)
             if resolved:
                 emitted["release_declaration"] = resolved
+        # Where a *new* object for this namespace would go, which is a
+        # different question from either of the two above and the only one a
+        # create-an-object remediation can use. Attached whatever else
+        # resolved: an object with its own file still needs somewhere to put a
+        # NetworkPolicy that has none. See `namespace_directories`.
+        if namespaces:
+            directory = namespaces.get((name, emitted["namespace"])) or namespaces.get(
+                (name, NAMESPACE_KEY_ANY)
+            )
+            if directory:
+                emitted["namespace_directory"] = directory
         # What reasserts this object's spec, where something does. A workload
         # check gets it off the workload record; a cluster check has to put it
         # on the hit itself, because `workload` is None there and only the
@@ -7492,6 +7696,7 @@ def collect_fleet(
     # would read the same tree sixteen times to get the same answer.
     declarations = workload_declarations(workspace) if workspace else {}
     releases = release_declarations(workspace) if workspace else {}
+    namespaces = namespace_directories(declarations, releases, workspace)
 
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -7504,6 +7709,7 @@ def collect_fleet(
                 run=run,
                 declarations=declarations,
                 releases=releases,
+                namespaces=namespaces,
             ): index
             for index, cluster in enumerate(clusters)
         }

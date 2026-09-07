@@ -196,20 +196,43 @@ describe the file it would have written leaves the finding unresolvable. Two thi
 first. The object must be genuinely absent, from the cluster as well as from the repo: one that is
 live but whose declaration you merely failed to find is the case above, and a second file claiming
 it is a duplicate resource id that both Config Sync and Argo reject. And the directory you write
-into must already be reconciled onto the target, which you establish from a **sibling** — another
-object declared here that belongs to the same target you are fixing. What counts as a sibling
-follows the target's scope: for a cluster-scoped finding, another object applied to that cluster;
-for a project- or subnet-scoped one, another declaration governing that same project, whether it is
-a Config Connector resource or a Terraform file. Write the new file beside the sibling, named after
-the object, following the sibling's conventions rather than your own: same file-per-object
-granularity, same labels and namespace fields. Never a new top-level directory and never a parent
-that is not already in the clone, because the repository is reconciled by a tool that applies a
-fixed set of paths, and a file outside them is applied by nothing — which makes the pull request a
-no-op that reads as a fix.
+into must already be reconciled onto the target.
 
-No sibling means the target is not wired to this repo. Then the finding is `kind: manual`, the
-manifest you would have written goes in `recommendation.action`, and `recommendation.rationale` says
-which of the two you established and how you established it.
+**The candidate usually tells you that directory outright.** Where the collector could resolve it,
+the candidate carries a `namespace_directory` of `{path, source}`, and that path is the answer —
+parsed out of the clone, not grepped, so prefer it over anything you work out yourself. Its `source`
+says what established it and is the only part that changes what you write:
+
+- `sibling` — the directory already declares objects in this namespace on this cluster. Write the
+  new file there, following the neighbouring files' conventions.
+- `overlay` — the path is a Kustomize root an Argo CD Application renders into this namespace.
+  Write the file there; the harness appends it to the root's `resources:` list when it opens the
+  pull request, and refuses the remediation rather than shipping a file nothing renders.
+- `cluster` — the directory is applied wholesale to this cluster, and the namespace is one no file
+  here declares into. That is the ordinary case for a workload someone else's chart installs, and
+  it is still a pull request: a NetworkPolicy for `cert-manager` belongs beside your own manifests,
+  not in a fork of the chart. **Set `metadata.namespace` explicitly** — the directory serves the
+  whole cluster, so nothing else will.
+
+Do not argue with the field. A candidate carrying `namespace_directory` has had the question
+answered against the clone; writing "no file in this repository declares an applied object in this
+namespace" over the top of it publishes a denial of a fact the run measured, and that is a defect
+whichever of you is right.
+
+No `namespace_directory` is no claim either way, not "nowhere" — the index is empty without a
+workspace. Fall back to establishing a **sibling** yourself: another object declared here that
+belongs to the same target you are fixing. What counts follows the target's scope: for a
+cluster-scoped finding, another object applied to that cluster; for a project- or subnet-scoped one,
+another declaration governing that same project, whether it is a Config Connector resource or a
+Terraform file. Write the new file beside the sibling, named after the object, following the
+sibling's conventions rather than your own: same file-per-object granularity, same labels and
+namespace fields. Never a new top-level directory and never a parent that is not already in the
+clone, because the repository is reconciled by a tool that applies a fixed set of paths, and a file
+outside them is applied by nothing — which makes the pull request a no-op that reads as a fix.
+
+No sibling either means the target is not wired to this repo. Then the finding is `kind: manual`,
+the manifest you would have written goes in `recommendation.action`, and `recommendation.rationale`
+says which of the two you established and how you established it.
 
 **Do not leave unrelated uncommitted work in that tree during an audit.** Opening a remediation pull
 request requires switching branches, and the harness forces the switch. It snapshots and restores
