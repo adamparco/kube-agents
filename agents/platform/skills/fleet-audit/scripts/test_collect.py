@@ -6539,6 +6539,143 @@ class TestKccObjectWedged(unittest.TestCase):
         )
 
 
+def lb_service(
+    name="db",
+    ns="payments",
+    ports=(5432,),
+    svc_type="LoadBalancer",
+    annotations=None,
+    labels=None,
+    source_ranges=None,
+    ingress=("34.10.11.12",),
+    protocol=None,
+):
+    svc = {
+        "kind": "Service",
+        "metadata": {"namespace": ns, "name": name, "annotations": annotations or {}, "labels": labels or {}},
+        "spec": {
+            "type": svc_type,
+            "ports": [
+                {"port": p, **({"protocol": protocol} if protocol else {})} for p in ports
+            ],
+        },
+    }
+    if source_ranges is not None:
+        svc["spec"]["loadBalancerSourceRanges"] = list(source_ranges)
+    # Omitted rather than emptied when `ingress` is None, for the reason
+    # `ai_service` gives: a balancer still provisioning has no `ingress` key.
+    if ingress is not None:
+        svc["status"] = {"loadBalancer": {"ingress": [{"ip": addr} for addr in ingress]}}
+    return svc
+
+
+class TestLbWorldOpen(unittest.TestCase):
+    def run_on(self, *services):
+        return collect.check_lb_world_open({"services": list(services)})
+
+    def test_a_world_open_postgres_port_is_flagged(self):
+        hits = self.run_on(lb_service())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Service/db")
+        self.assertEqual(hits[0]["namespace"], "payments")
+        self.assertIn("5432/TCP (PostgreSQL)", hits[0]["excerpt"])
+
+    def test_the_address_is_never_published(self):
+        # The whole content of this vulnerability is where to connect, and
+        # these findings are filed as comments on a public GitHub issue.
+        # `adopt_collector_evidence` forces this excerpt over whatever the
+        # model wrote, so the rule holds here or nowhere.
+        hits = self.run_on(lb_service(ingress=("34.10.11.12",)))
+        self.assertNotIn("34.10.11.12", hits[0]["excerpt"])
+        self.assertIn("1 assigned address, none of them private", hits[0]["excerpt"])
+
+    def test_a_web_port_is_not_flagged(self):
+        # The exclusion that keeps the check usable: a LoadBalancer publishing
+        # 80 or 443 is a LoadBalancer doing its job, and admitting them reports
+        # every one in the fleet, daily.
+        self.assertEqual(self.run_on(lb_service(ports=(80, 443, 8080))), [])
+
+    def test_a_web_port_beside_a_management_port_is_still_flagged(self):
+        hits = self.run_on(lb_service(ports=(443, 6379)))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("6379/TCP (Redis)", hits[0]["excerpt"])
+        self.assertNotIn("443", hits[0]["excerpt"])
+
+    def test_every_management_port_is_named_in_order(self):
+        hits = self.run_on(lb_service(ports=(27017, 22)))
+        self.assertIn("22/TCP (SSH), 27017/TCP (MongoDB)", hits[0]["excerpt"])
+
+    def test_a_clusterip_is_not_flagged(self):
+        self.assertEqual(self.run_on(lb_service(svc_type="ClusterIP")), [])
+
+    def test_a_nodeport_is_not_flagged(self):
+        # GKE's node firewall does not admit a node port from outside by
+        # default, so the Service alone does not put the port on the internet.
+        self.assertEqual(self.run_on(lb_service(svc_type="NodePort")), [])
+
+    def test_the_current_internal_lb_annotation_is_not_flagged(self):
+        svc = lb_service(annotations={"networking.gke.io/load-balancer-type": "Internal"})
+        self.assertEqual(self.run_on(svc), [])
+
+    def test_the_legacy_internal_lb_annotation_is_not_flagged(self):
+        svc = lb_service(annotations={"cloud.google.com/load-balancer-type": "Internal"})
+        self.assertEqual(self.run_on(svc), [])
+
+    def test_a_real_source_range_is_not_flagged(self):
+        # GKE programs `loadBalancerSourceRanges` into the firewall in front of
+        # the forwarding rule, so it is enforcement rather than intent.
+        self.assertEqual(self.run_on(lb_service(source_ranges=["10.0.0.0/8"])), [])
+
+    def test_a_default_route_source_range_restricts_nothing(self):
+        hits = self.run_on(lb_service(source_ranges=["0.0.0.0/0"]))
+        self.assertEqual(len(hits), 1)
+
+    def test_an_unparseable_source_range_restricts_nothing(self):
+        hits = self.run_on(lb_service(source_ranges=["not-a-cidr"]))
+        self.assertEqual(len(hits), 1)
+
+    def test_an_rfc1918_address_is_not_reachable_from_the_internet(self):
+        self.assertEqual(self.run_on(lb_service(ingress=("10.150.0.78",))), [])
+
+    def test_one_public_address_beside_a_private_one_is_still_flagged(self):
+        hits = self.run_on(lb_service(ingress=("10.150.0.78", "34.10.11.12")))
+        self.assertEqual(len(hits), 1)
+
+    def test_a_balancer_with_no_address_yet_is_flagged_on_its_spec(self):
+        hits = self.run_on(lb_service(ingress=None))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("no address assigned yet", hits[0]["excerpt"])
+
+    def test_a_udp_port_sharing_a_number_is_not_flagged(self):
+        # None of these are UDP services; flagging one would be flagging the
+        # number rather than the thing.
+        self.assertEqual(self.run_on(lb_service(ports=(27017,), protocol="UDP")), [])
+
+    def test_an_omitted_protocol_reads_as_tcp(self):
+        self.assertEqual(len(self.run_on(lb_service(ports=(3306,)))), 1)
+
+    def test_a_system_namespace_is_suppressed(self):
+        self.assertEqual(self.run_on(lb_service(ns="kube-system")), [])
+
+    def test_an_addon_managed_service_is_suppressed(self):
+        svc = lb_service(labels={"addonmanager.kubernetes.io/mode": "Reconcile"})
+        self.assertEqual(self.run_on(svc), [])
+
+    def test_a_service_with_no_ports_is_not_flagged(self):
+        self.assertEqual(self.run_on(lb_service(ports=())), [])
+
+    def test_the_port_set_matches_the_networking_sop(self):
+        """The two checks must agree on what a management port is. §2.6 flags
+        the firewall rule and this flags the Service that made GKE write it, so
+        a port admitted there and not here is a rule §2.6 reports daily and
+        this leaves open."""
+        sop = Path(__file__).resolve().parents[2] / "gcp-networking-fabric-audit" / "scripts" / "networking_audit.py"
+        source = sop.read_text(encoding="utf-8")
+        block = source.split("MANAGEMENT_PORTS = {", 1)[1].split("}", 1)[0]
+        declared = {int(line.split(":", 1)[0].strip()) for line in block.splitlines() if ":" in line}
+        self.assertEqual(declared, set(collect._WORLD_OPEN_LB_PORTS))
+
+
 class TestComplianceCollectCluster(unittest.TestCase):
     """One end-to-end pass over compliance-audit's real collection plan --
     five distinct kubectl/gcloud commands, gated and cross-referenced --
@@ -6573,7 +6710,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=()):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -6593,6 +6730,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     return Run(argv, 0, json.dumps(dump_of(*netpol_items)), "", 0.1)
                 if kinds == "sa":
                     return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
+                if kinds == "svc":
+                    return Run(argv, 0, json.dumps(dump_of(*svc_items)), "", 0.1)
                 if kinds == "ccnp" and ccnp_run is not None:
                     return ccnp_run
                 if kinds == collect.KCC_CATEGORY:
@@ -6634,7 +6773,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 13)
+        self.assertEqual(len(result["commands"]), 14)
 
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
@@ -6750,7 +6889,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 13)
+        self.assertEqual(len(command_slugs), 14)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -6956,14 +7095,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Fourteen checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is ten, each with a command
+        Fifteen checks minus the three Autopilot rules out and the one no
+        cluster without Config Connector can run is eleven, each with a command
         behind it, and the four dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 10)
+        self.assertEqual(len(command_slugs), 11)
         self.assertEqual(len(na_slugs), 4)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))

@@ -804,6 +804,10 @@ EXTERNALNAME_SERVICE_TYPE = "ExternalName"
 # that just echoed the field would read `type=None` on most Services.
 DEFAULT_SERVICE_TYPE = "ClusterIP"
 
+# The one `spec.type` that asks the cloud provider for a public address and a
+# forwarding rule, which is the whole premise of `check_lb_world_open`.
+SERVICE_TYPE_LOAD_BALANCER = "LoadBalancer"
+
 
 def services_with_endpoints(dump: dict) -> list[dict]:
     """Every non-system, pod-selecting Service paired with what its
@@ -5257,6 +5261,190 @@ def check_inference_endpoint_public(context: dict) -> list[dict]:
     return hits
 
 
+# The ports `gcp_networking_fabric_sop.md` §2.6 calls management ports, mirrored
+# from `networking_audit.MANAGEMENT_PORTS` rather than imported: that module is
+# another skill's, and this one imports nothing from it. Keep the two in step --
+# a port admitted there and not here is a rule §2.6 reports and this check
+# leaves open, which is the pair's worst failure because the two findings are
+# supposed to agree on what "management port" means.
+#
+# 80, 443 and 8080 are absent for §2.6's reason, restated here because the
+# temptation to add them is stronger on this side: a LoadBalancer Service
+# publishing a web port to the internet is a LoadBalancer Service doing its job,
+# and admitting them would flag every one in the fleet.
+_WORLD_OPEN_LB_PORTS: dict[int, str] = {
+    22: "SSH",
+    1433: "MSSQL",
+    2379: "etcd",
+    2380: "etcd-peer",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    6379: "Redis",
+    9200: "Elasticsearch",
+    10250: "kubelet",
+    27017: "MongoDB",
+}
+
+# The two annotations GKE accepts for "give me an internal load balancer". The
+# second is the legacy spelling and still honoured, so reading only the first
+# would report an internal Service as world-open.
+_INTERNAL_LB_ANNOTATIONS = (
+    "networking.gke.io/load-balancer-type",
+    "cloud.google.com/load-balancer-type",
+)
+_INTERNAL_LB_ANNOTATION_VALUE = "Internal"
+
+# `spec.ports[].protocol` when the field is omitted.
+_DEFAULT_SERVICE_PROTOCOL = "TCP"
+
+# S2, the label GKE stamps on the add-ons it manages. Named here rather than
+# repeated as a literal because this is the first Service-scoped check to apply
+# the suppression; the workload-scoped ones inherit it from `normalize_workloads`.
+_ADDON_MANAGER_MODE_LABEL = "addonmanager.kubernetes.io/mode"
+
+_IMPACT_LB_WORLD_OPEN = (
+    "This Service holds a public load-balancer address that forwards a "
+    "management or datastore port straight to its pods, with no source-range "
+    "allowlist in front of it. Anyone on the internet can open a connection to "
+    "it, so the only thing standing between the service behind that port and "
+    "the whole internet is whatever authentication that service does itself -- "
+    "and the ports here belong to software that is routinely deployed with "
+    "none, on the assumption that the network is the boundary. Public address "
+    "ranges are scanned continuously, so this is found without being looked for."
+)
+
+
+def _is_internal_load_balancer(meta: dict) -> bool:
+    """Whether either GKE internal-load-balancer annotation is set on this Service."""
+    annotations = meta.get("annotations") or {}
+    return any(
+        annotations.get(key) == _INTERNAL_LB_ANNOTATION_VALUE for key in _INTERNAL_LB_ANNOTATIONS
+    )
+
+
+def _assigned_public_addresses(svc: dict) -> tuple[list[str], list[str]]:
+    """`(assigned, public)` load-balancer addresses, per `_is_private_address`.
+
+    Both `ip` and `hostname` off every ingress entry, for the reason
+    `check_inference_endpoint_public` gives where it does the same thing: an
+    entry may carry each, and short-circuiting on `ip` throws away a hostname
+    that counts as public.
+    """
+    assigned = [
+        addr
+        for ing in ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        for addr in (ing.get("ip") or "", ing.get("hostname") or "")
+        if addr
+    ]
+    return assigned, [addr for addr in assigned if not _is_private_address(addr)]
+
+
+def check_lb_world_open(context: dict) -> list[dict]:
+    """Cluster-scoped: a LoadBalancer Service publishing a management port to the internet.
+
+    A `type: LoadBalancer` Service is an instruction to GCP to put a public
+    address and a forwarding rule in front of some pods, and GKE carries it out
+    without asking what is behind them. Point one at a database and the database
+    is on the internet -- reachable by anyone who scans the address space, which
+    for a Postgres or Redis port is a matter of hours. Nothing in Kubernetes
+    objects to it. The Service admits, the load balancer provisions, the
+    `EXTERNAL-IP` column fills in, and every check anyone would think to run says
+    the Service is healthy, because it is: it is doing exactly what the manifest
+    asked.
+
+    It is one field that does it, and usually a copied one. A Service written
+    `type: ClusterIP` for local development, promoted with `type: LoadBalancer`
+    to reach it from a laptop, and merged. A Helm chart whose `service.type` is
+    set in the values file used for every environment. A datastore moved out of
+    `kube-system` into its own namespace with the Service carried across intact.
+
+    Scoped by port, and that is what makes the finding decidable. §3.5's
+    `inference-endpoint-public` flags any world-reachable model endpoint and is
+    always `manual`, because the range of callers a model server is supposed to
+    serve is a fact about intended usage this audit cannot read. Here there is
+    no such range: nothing legitimately reaches a cluster's Redis, etcd or
+    kubelet port from the open internet, so the fix does not depend on knowing
+    who the caller was meant to be, and a pull request can carry it.
+
+    Deliberately not the web ports, which is the one exclusion that keeps this
+    check usable -- see `_WORLD_OPEN_LB_PORTS`.
+
+    Three conditions beyond the port, each of which would otherwise produce a
+    finding on something that is not exposed:
+
+    - An internal load balancer is not on the internet whatever ports it
+      publishes, and both annotation spellings say so.
+    - `spec.loadBalancerSourceRanges` is enforcement, not intent: GKE programs it
+      into the firewall in front of the forwarding rule. A Service that restricts
+      to real CIDRs is bounded rather than open. `_restricting_source_ranges`
+      already reads a `0.0.0.0/0` entry as no restriction at all.
+    - `status.loadBalancer` records the address that was actually handed out. A
+      Service whose every assigned address is private -- an internal balancer
+      configured some other way, or a cluster whose provider ignores the type --
+      is not reachable from the internet, so calling it exposed is just wrong.
+      No address yet means the balancer is still provisioning, and the spec is
+      all there is.
+
+    UDP is excluded because none of these ports are UDP services; a UDP 27017 is
+    not MongoDB, and flagging it would be flagging the number rather than the
+    thing.
+
+    The address is never published. This finding is filed as a comment on a
+    public GitHub issue, and the whole content of the vulnerability is where to
+    connect -- the port names what it is, the count carries the scale, and
+    neither hands a reader the target. `adopt_collector_evidence` overwrites the
+    model's excerpt with this string, so it is the excerpt that ships.
+    """
+    hits = []
+    for svc in context.get("services") or []:
+        meta, spec = svc.get("metadata") or {}, svc.get("spec") or {}
+        if spec.get("type") != SERVICE_TYPE_LOAD_BALANCER:
+            continue
+        if _is_system_namespace(meta.get("namespace", "")):  # S1
+            continue
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):  # S2
+            continue
+        if _is_internal_load_balancer(meta):
+            continue
+        if _restricting_source_ranges(spec):
+            continue
+        assigned, public = _assigned_public_addresses(svc)
+        if assigned and not public:
+            continue
+        exposed = sorted(
+            {
+                port
+                for entry in spec.get("ports") or []
+                if isinstance(entry, dict)
+                and (entry.get("protocol") or _DEFAULT_SERVICE_PROTOCOL) == _DEFAULT_SERVICE_PROTOCOL
+                for port in (entry.get("port"),)
+                if isinstance(port, int) and port in _WORLD_OPEN_LB_PORTS
+            }
+        )
+        if not exposed:
+            continue
+        named = ", ".join(f"{port}/TCP ({_WORLD_OPEN_LB_PORTS[port]})" for port in exposed)
+        hits.append(
+            {
+                "namespace": meta.get("namespace", ""),
+                "object": f"Service/{meta.get('name', '')}",
+                "reconciler": reconciler_of(meta),
+                "excerpt": (
+                    f"type=LoadBalancer, no internal-LB annotation and no "
+                    f"loadBalancerSourceRanges, publishing {named} to 0.0.0.0/0"
+                    + (
+                        f"; {len(public)} assigned address{'es' if len(public) > 1 else ''}, "
+                        "none of them private"
+                        if public
+                        else "; no address assigned yet"
+                    )
+                ),
+            }
+        )
+    return hits
+
+
 def _kcc_ready_condition(item: dict) -> dict | None:
     """The `Ready` condition off a Config Connector object, if it has one."""
     status = item.get("status")
@@ -5893,6 +6081,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_UNBOUND_SA_AUTOMOUNT,
     ),
+    CheckSpec(
+        "lb-world-open",
+        "cluster",
+        check_lb_world_open,
+        "critical",
+        None,
+        _IMPACT_LB_WORLD_OPEN,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -6015,6 +6211,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
     "kcc-object-wedged": ("kcc",),
+    "lb-world-open": ("services",),
 }
 
 # `kubectl get gcp` is the category Config Connector registers across every CRD
@@ -6153,6 +6350,17 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
     commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(netpol_argv)}", result)
+
+    # Gated like the reads above rather than treated as optional: every cluster
+    # has a Services API, so a failure here is a broken read and not an absent
+    # feature, and `check_lb_world_open` reading an empty list would report a
+    # cluster clean on a collection it never saw.
+    service_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
+    parsed, result = gated(service_argv)
+    if parsed is None:
+        raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    context["services"] = parsed.get("items", []) or []
+    commands["lb-world-open"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(service_argv)}", result)
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp

@@ -141,6 +141,7 @@ AUDITS: dict[str, AuditSpec] = {
             "kcc-object-wedged",
             "image-floating-tag",
             "unbound-sa-automount",
+            "lb-world-open",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
