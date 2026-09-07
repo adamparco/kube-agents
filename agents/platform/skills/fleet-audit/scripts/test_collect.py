@@ -1022,6 +1022,152 @@ class TestHpaCannotScale(unittest.TestCase):
         self.assertIn("Deployment/gone not found", hits[0]["excerpt"])
 
 
+class TestHpaFloorsAtOne(unittest.TestCase):
+    """§3.22 — the floor, not the instantaneous replica count."""
+
+    def ctx(self, *, min_replicas=1, max_replicas=5, replicas=3, ns="default",
+            strategy=None, selector=None, ports=None, hpa_kw=None, target=None):
+        d = deployment("api", ns=ns, **{"spec.replicas": replicas})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        if strategy is not None:
+            d["spec"]["strategy"] = {"type": strategy}
+        docs = [d]
+        h = hpa("h", ns=ns, min_replicas=min_replicas, max_replicas=max_replicas,
+                target=target or {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+                **(hpa_kw or {}))
+        if min_replicas is None:
+            del h["spec"]["minReplicas"]
+        docs.append(h)
+        if selector is not False:
+            docs.append(service("s", ns=ns, selector=selector or {"app": "api"},
+                                ports=ports if ports is not None else [{"name": "http", "port": 80}]))
+        return context_of(dump_of(*docs))
+
+    def test_a_floor_of_one_behind_a_service_is_flagged_on_the_hpa(self):
+        hits = collect.check_hpa_floors_at_one(self.ctx())
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "HorizontalPodAutoscaler/h")
+        self.assertEqual(hits[0]["namespace"], "default")
+        self.assertIn("minReplicas 1", hits[0]["excerpt"])
+        self.assertIn("scaling Deployment/api", hits[0]["excerpt"])
+        self.assertIn("(serving traffic)", hits[0]["excerpt"])
+
+    def test_the_instantaneous_replica_count_does_not_suppress_it(self):
+        """The whole point of the check.
+
+        §3.11 reads `spec.replicas` and stays quiet at three. The 03:00
+        rollout does not happen at three -- it happens at the floor, which is
+        one, and this check has to fire whatever the dump caught the
+        autoscaler doing.
+        """
+        for replicas in (1, 3, 12):
+            with self.subTest(replicas=replicas):
+                hits = collect.check_hpa_floors_at_one(self.ctx(replicas=replicas))
+                self.assertEqual(len(hits), 1)
+                self.assertIn(f"spec.replicas reads now ({replicas})", hits[0]["excerpt"])
+
+    def test_an_absent_min_replicas_is_the_api_default_and_says_so(self):
+        hits = collect.check_hpa_floors_at_one(self.ctx(min_replicas=None))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("minReplicas 1 (unset, so the API default)", hits[0]["excerpt"])
+
+    def test_a_declared_floor_is_not_labelled_as_defaulted(self):
+        hits = collect.check_hpa_floors_at_one(self.ctx(min_replicas=1))
+        self.assertNotIn("unset", hits[0]["excerpt"])
+
+    def test_a_floor_above_one_is_not_flagged(self):
+        self.assertEqual(collect.check_hpa_floors_at_one(self.ctx(min_replicas=2)), [])
+
+    def test_a_ceiling_of_one_belongs_to_hpa_cannot_scale(self):
+        # min == max == 1 is that check's pinned arm at `major`, and asking for
+        # a floor of 2 under a ceiling of 1 is rejected by the API.
+        ctx = self.ctx(min_replicas=1, max_replicas=1)
+        self.assertEqual(collect.check_hpa_floors_at_one(ctx), [])
+        self.assertEqual(len(collect.check_hpa_cannot_scale(ctx)), 1)
+
+    def test_the_two_hpa_checks_never_both_fire(self):
+        ctx = self.ctx(min_replicas=1, max_replicas=5)
+        self.assertEqual(len(collect.check_hpa_floors_at_one(ctx)), 1)
+        self.assertEqual(collect.check_hpa_cannot_scale(ctx), [])
+
+    def test_a_target_no_service_selects_is_not_flagged(self):
+        self.assertEqual(collect.check_hpa_floors_at_one(self.ctx(selector=False)), [])
+
+    def test_a_service_that_selects_something_else_does_not_count(self):
+        self.assertEqual(collect.check_hpa_floors_at_one(self.ctx(selector={"app": "other"})), [])
+
+    def test_a_metrics_only_service_still_fires_but_says_which_scope(self):
+        # The impact differs and the exposure line carries it, exactly as
+        # §3.11 and §3.9 do. Suppressing it would hide a real gap in the
+        # scrape; claiming user traffic would be false.
+        hits = collect.check_hpa_floors_at_one(self.ctx(ports=[{"name": "http-metrics", "port": 9402}]))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(metrics scrape only)", hits[0]["excerpt"])
+
+    def test_a_recreate_strategy_is_left_alone(self):
+        self.assertEqual(collect.check_hpa_floors_at_one(self.ctx(strategy="Recreate")), [])
+
+    def test_a_gke_managed_namespace_hpa_is_not_flagged(self):
+        # S1. Every cluster in the fleet carries `kube-state-metrics` in
+        # `gke-managed-cim` with a floor of one behind a Service, and it is
+        # not the operator's to raise -- one false finding per cluster.
+        self.assertEqual(collect.check_hpa_floors_at_one(self.ctx(ns="gke-managed-cim")), [])
+
+    def test_an_addonmanager_labelled_hpa_is_not_flagged(self):
+        # S2, for the addon outside a namespace S1 covers.
+        ctx = self.ctx(hpa_kw={})
+        ctx["hpas"]["default"][0]["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        self.assertEqual(collect.check_hpa_floors_at_one(ctx), [])
+
+    def test_a_dangling_target_belongs_to_hpa_cannot_scale(self):
+        ctx = self.ctx(target={"apiVersion": "apps/v1", "kind": "Deployment", "name": "gone"})
+        self.assertEqual(collect.check_hpa_floors_at_one(ctx), [])
+        self.assertEqual(len(collect.check_hpa_cannot_scale(ctx)), 1)
+
+    def test_a_target_in_another_api_group_is_not_this_workload(self):
+        ctx = self.ctx(target={"apiVersion": "acme.io/v1", "kind": "Deployment", "name": "api"})
+        self.assertEqual(collect.check_hpa_floors_at_one(ctx), [])
+
+    def test_the_finding_carries_the_hpas_own_reconciler(self):
+        # The fix edits the HPA, so a note about what reasserts the Deployment
+        # would send the reader to the wrong file.
+        ctx = self.ctx()
+        ctx["hpas"]["default"][0]["metadata"]["annotations"] = {
+            "argocd.argoproj.io/tracking-id": "platform:autoscaling/HorizontalPodAutoscaler:default/h"
+        }
+        hits = collect.check_hpa_floors_at_one(ctx)
+        self.assertIsNotNone(hits[0]["reconciler"])
+
+
+class TestSingleReplicaDefersToTheHpaCheck(unittest.TestCase):
+    """§3.11's new exclusion — the two checks partition one population."""
+
+    def ctx_and_workload(self, *, with_hpa, min_replicas=1):
+        d = deployment("api", **{"spec.replicas": 1})
+        d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        docs = [d, service("s", selector={"app": "api"}, ports=[{"name": "http", "port": 80}])]
+        if with_hpa:
+            docs.append(hpa("h", min_replicas=min_replicas, max_replicas=5))
+        ctx = context_of(dump_of(*docs))
+        return ctx, collect.normalize_workloads(dump_of(d))[0]
+
+    def test_without_an_hpa_it_still_fires(self):
+        ctx, wl = self.ctx_and_workload(with_hpa=False)
+        self.assertIsNotNone(collect.check_single_replica(wl, ctx))
+
+    def test_an_hpa_hands_the_workload_to_the_floor_check(self):
+        ctx, wl = self.ctx_and_workload(with_hpa=True)
+        self.assertIsNone(collect.check_single_replica(wl, ctx))
+        self.assertEqual(len(collect.check_hpa_floors_at_one(ctx)), 1)
+
+    def test_neither_fires_where_the_hpa_already_floors_above_one(self):
+        # `spec.replicas: 1` under `minReplicas: 2` is the autoscaler mid-flight
+        # or a stale field; either way nothing here is a finding.
+        ctx, wl = self.ctx_and_workload(with_hpa=True, min_replicas=2)
+        self.assertIsNone(collect.check_single_replica(wl, ctx))
+        self.assertEqual(collect.check_hpa_floors_at_one(ctx), [])
+
+
 class TestRigidScheduling(unittest.TestCase):
     def wl(self, node_selector=None, affinity=None, kind="Deployment", vct=False):
         d = deployment("api")
@@ -3564,12 +3710,17 @@ class TestCollectCluster(unittest.TestCase):
         # true of a cluster whose *workload* set is empty. 3.12, 3.15, 3.16 and
         # 3.17 in particular are only ever reachable this way -- neither a
         # CronJob nor a Service is a workload, so a cluster that holds nothing
-        # else still owes all four an answer.
+        # else still owes all four an answer. `hpa-floors-at-one` is the one
+        # cluster-scoped check that does need a workload -- it reads the HPA's
+        # target to ask whether a Service selects it -- and it is still not
+        # inapplicable here, because the question it asks is about HPAs and
+        # this cluster's answer is that it holds none.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
         self.assertEqual(
             cluster_slugs,
             {
                 "hpa-cannot-scale",
+                "hpa-floors-at-one",
                 "blocking-pdb",
                 "schedule-never-succeeds",
                 "cronjob-runs-overlap",

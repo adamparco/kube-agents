@@ -472,6 +472,9 @@ def output_digest(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
+#: The group every kind in `WORKLOAD_KINDS` lives in. Named because a
+#: `scaleTargetRef` is matched on it as well as on kind and name.
+_WORKLOAD_API_VERSION = "apps/v1"
 OPT_OUT_KEY = "kubeagents.x-k8s.io/reliability-audit"
 
 # The owners S3 is entitled to defer to. Kind and API group both have to
@@ -1412,20 +1415,34 @@ def check_blocking_pdb(context: dict) -> list[dict]:
     return hits
 
 
+def _hpa_targeting(workload: dict, context: dict) -> dict | None:
+    """The HorizontalPodAutoscaler that owns this workload's replica count.
+
+    Three checks need this and each used to spell it out: `no-hpa` to stay
+    quiet where one exists, `single-replica` to stay quiet for the same reason,
+    and `hpa-floors-at-one` to fire. The match is on `scaleTargetRef`, which
+    carries `apiVersion` as well as `kind` and `name` -- a custom resource can
+    be named `Deployment` in another group, and it is not this one.
+    """
+    for hpa in context["hpas"].get(workload["ns"], []):
+        target = (hpa.get("spec") or {}).get("scaleTargetRef") or {}
+        if (
+            target.get("apiVersion") == _WORKLOAD_API_VERSION
+            and target.get("kind") == workload["kind"]
+            and target.get("name") == workload["name"]
+        ):
+            return hpa
+    return None
+
+
 def check_no_hpa(workload: dict, context: dict) -> dict | None:
     if workload["kind"] != "Deployment":
         return None
     replicas = workload["spec"].get("replicas", 1) or 1
     if replicas < 3:
         return None
-    for hpa in context["hpas"].get(workload["ns"], []):
-        target = (hpa.get("spec") or {}).get("scaleTargetRef") or {}
-        if (
-            target.get("apiVersion") == "apps/v1"
-            and target.get("kind") == "Deployment"
-            and target.get("name") == workload["name"]
-        ):
-            return None
+    if _hpa_targeting(workload, context):
+        return None
     return {
         "object": f"Deployment/{workload['name']}",
         "excerpt": f"replicas={replicas}, no HorizontalPodAutoscaler targets this Deployment",
@@ -1492,6 +1509,97 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
                         "reconciler": reconciler,
                     }
                 )
+    return hits
+
+
+#: Kubernetes' own default when an HPA omits `minReplicas`. Named because an
+#: absent floor and a floor of one are the same workload, and the check has to
+#: say which of the two it found.
+DEFAULT_HPA_MIN_REPLICAS = 1
+#: The floor this check asks for. Two is the smallest number at which a
+#: rollout, a drain, or a preemption leaves something serving, and asking for
+#: more would be a capacity opinion this check has no basis for.
+HPA_FLOOR_TARGET_REPLICAS = 2
+
+
+def check_hpa_floors_at_one(context: dict) -> list[dict]:
+    """A Service-backed workload whose autoscaler is allowed to reach one pod.
+
+    §3.11 asks whether a Deployment declares one replica. That is the right
+    question for a workload whose replica count is a written-down number, and
+    the wrong one for a workload whose replica count an HPA rewrites all day:
+    `spec.replicas` in the dump is whatever the autoscaler happened to want at
+    the moment the audit read it. An audit that fires at 06:50 UTC sees three
+    replicas and says nothing; the rollout at 03:00 sees one and drops every
+    request. The floor is the durable fact and the instantaneous count is not,
+    so this check reads `minReplicas` and ignores `spec.replicas` entirely.
+
+    The floor being one is also the case where the usual objection to §3.11's
+    finding does not apply. There the answer is `manual` because going HA
+    "touches leader election, session handling, and storage" -- true of a
+    workload nobody has ever run two copies of. An HPA with `maxReplicas` above
+    one is the owner's own written statement that a controller may run several
+    copies concurrently with no human in the loop, so those three questions
+    were settled before this check looked. Raising the *floor* asks strictly
+    less of the workload than the ceiling it already carries, which is what
+    makes this a one-line manifest change rather than guidance.
+
+    The finding names the HPA and not the workload, so §4's declaration rule
+    resolves the file the fix actually edits. Editing `spec.replicas` on the
+    Deployment instead is the trap: the autoscaler writes that field, and a
+    pull request setting it to two merges, reconciles, and is undone on the
+    next HPA sync.
+    """
+    workloads = {(w["ns"], w["kind"], w["name"]): w for w in context["workloads"]}
+    hits = []
+    for ns, hpas in context["hpas"].items():
+        if _is_system_namespace(ns):  # S1
+            continue
+        for hpa in hpas:
+            meta = hpa.get("metadata") or {}
+            if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):  # S2
+                continue
+            spec = hpa.get("spec") or {}
+            floor = spec.get("minReplicas")
+            floor = DEFAULT_HPA_MIN_REPLICAS if floor is None else floor
+            if floor != DEFAULT_HPA_MIN_REPLICAS:
+                continue
+            # `hpa-cannot-scale` owns a ceiling of one, at `major`, and calls
+            # it cosmetic autoscaling. Raising the floor to two there would
+            # ask for a floor above the ceiling, which the API rejects.
+            if (spec.get("maxReplicas") or 0) < HPA_FLOOR_TARGET_REPLICAS:
+                continue
+            target = spec.get("scaleTargetRef") or {}
+            workload = workloads.get((ns, target.get("kind"), target.get("name")))
+            # Absent from the audited set means exempted (S4), scaled to zero
+            # (S5), or genuinely gone -- and the last of those is
+            # `hpa-cannot-scale`'s dangling arm, not this finding.
+            if workload is None or target.get("apiVersion") != _WORKLOAD_API_VERSION:
+                continue
+            # §3.11's reason, and it bites harder here: `Recreate` says two
+            # copies must never run at once, which an HPA above one already
+            # contradicts. Reporting a floor on top of that would be the third
+            # opinion about a workload whose owner needs to settle the first two.
+            if (workload["spec"].get("strategy") or {}).get("type") == "Recreate":
+                continue
+            services = _selecting_services(workload, context)
+            if not services:
+                continue
+            declared = "" if spec.get("minReplicas") is not None else " (unset, so the API default)"
+            hits.append(
+                {
+                    "namespace": ns,
+                    "object": f"HorizontalPodAutoscaler/{meta.get('name', '')}",
+                    "excerpt": (
+                        f"minReplicas {floor}{declared}, maxReplicas {spec.get('maxReplicas')}, "
+                        f"scaling {workload['kind']}/{workload['name']}; at the floor that "
+                        f"workload is a single pod, whatever spec.replicas reads now "
+                        f"({workload['spec'].get('replicas', DEFAULT_HPA_MIN_REPLICAS)})\n"
+                        f"{_exposure_line(services)}"
+                    ),
+                    "reconciler": reconciler_of(meta),
+                }
+            )
     return hits
 
 
@@ -2021,6 +2129,15 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
     if (workload["spec"].get("replicas", 1) or 1) != 1:
         return None
     if (workload["spec"].get("strategy") or {}).get("type") == "Recreate":
+        return None
+    # An HPA wrote this `1` and will write the next number too, so both halves
+    # of this finding are wrong on such a workload: the count is a snapshot
+    # rather than a declaration, and the remediation this check carries --
+    # guidance about leader election, storage, and session handling -- answers
+    # a question the owner settled when they let a controller add replicas
+    # unattended. `hpa-floors-at-one` reports it off the floor instead, and
+    # points the fix at the field the autoscaler does not overwrite.
+    if _hpa_targeting(workload, context):
         return None
     services = _selecting_services(workload, context)
     if not services:
@@ -5266,6 +5383,17 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         None,
         "An HPA is attached but cannot scale this workload in either "
         "direction, or targets an object that no longer exists.",
+    ),
+    CheckSpec(
+        "hpa-floors-at-one",
+        "cluster",
+        check_hpa_floors_at_one,
+        "minor",
+        None,
+        "The autoscaler is allowed to take this Service-backed workload down "
+        "to one pod, and at that floor every rollout, node drain, and "
+        "preemption is a full outage -- during exactly the quiet hours the "
+        "floor is reached.",
     ),
     CheckSpec(
         "rigid-scheduling",

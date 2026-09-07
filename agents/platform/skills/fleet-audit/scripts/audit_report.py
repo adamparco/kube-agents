@@ -184,6 +184,7 @@ AUDITS: dict[str, AuditSpec] = {
             "spread-not-achieved",
             "prestop-outlives-grace",
             "rwo-claim-contended",
+            "hpa-floors-at-one",
         ),
     ),
     "fleet-wide-cost-analysis": AuditSpec(
