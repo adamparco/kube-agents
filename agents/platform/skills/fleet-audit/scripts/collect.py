@@ -7325,6 +7325,40 @@ def _projects_restrict_namespaces(root: Path | None) -> bool:
     return False
 
 
+def _kustomize_roots(releases: dict[tuple, dict]) -> dict[str, set[str]]:
+    """Per cluster, the local directories Argo CD renders through Kustomize.
+
+    A directory `release_declarations` recorded as a Kustomize root is not a
+    directory objects are applied *from*, even though every manifest in it
+    parses and `workload_declarations` indexes each one under its own cluster.
+    Kustomize builds what the kustomization lists, so a file dropped in renders
+    only once `resources:` names it -- the failure
+    `audit_report.wire_kustomize_additions` exists to catch.
+
+    Keyed by cluster, because that is the destination of the Application the
+    root belongs to, and every key `release_declarations` writes leads with it.
+    """
+    roots: dict[str, set[str]] = {}
+    for key, entry in (releases or {}).items():
+        if not key or entry.get("renderer") != RENDERER_KUSTOMIZE:
+            continue
+        path = str(entry.get("chart") or "").strip()
+        if path:
+            roots.setdefault(str(key[0]), set()).add(str(Path(path)))
+    return roots
+
+
+def _plainly_applied(directories: set[str], roots: set[str]) -> set[str]:
+    """`directories`, minus each one a Kustomize root at or above it renders."""
+    kept: set[str] = set()
+    for directory in directories:
+        path = Path(directory)
+        if any(path == Path(entry) or Path(entry) in path.parents for entry in roots):
+            continue
+        kept.add(directory)
+    return kept
+
+
 def namespace_directories(
     declarations: dict[tuple[str, str, str, str], set[str]],
     releases: dict[tuple, dict],
@@ -7381,6 +7415,19 @@ def namespace_directories(
       the Application's own destination namespace, where it has one, is only
       the default for objects that declare none.
 
+      Unambiguous is counted over the directories objects are applied *from*,
+      which is not every directory holding a manifest: a Kustomize root is
+      indexed like any other and renders only what its kustomization lists, so
+      counting it makes a cluster ambiguous that has exactly one plain-apply
+      tree. That was not hypothetical either. On 2026-09-07 the clone held five
+      such directories across four clusters and this arm resolved three of
+      them; the cluster it skipped was `spot-capacity-test`, whose second
+      directory is the `clusters/spot-capacity-test/kustomize/podinfo` overlay
+      that the merged `no-pdb` remediation had just added. `_kustomize_roots`
+      is the exclusion, and it takes the root's subdirectories with it, since a
+      manifest one level down inside an overlay is no more applied as it stands
+      than one at the top.
+
     Two directories declaring into one namespace is the ambiguity
     `declaration_for` refuses, and is refused here for the same reason: naming
     one would name the wrong one about half the time. Absent means unresolved,
@@ -7412,11 +7459,13 @@ def namespace_directories(
             "declaration": entry["path"],
         }
     if not _projects_restrict_namespaces(root):
+        rendered = _kustomize_roots(releases)
         for cluster, found in per_cluster.items():
-            if len(found) != 1:
+            applied = _plainly_applied(found, rendered.get(cluster) or set())
+            if len(applied) != 1:
                 continue
             resolved[(cluster, NAMESPACE_KEY_ANY)] = {
-                "path": next(iter(found)),
+                "path": next(iter(applied)),
                 "source": NAMESPACE_DIRECTORY_CLUSTER,
             }
     return resolved

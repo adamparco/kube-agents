@@ -10029,6 +10029,149 @@ class TestNamespaceDirectories(unittest.TestCase):
         self.assertEqual(found[("prod-usc1", "shop")]["source"], "sibling")
         self.assertEqual(found[("prod-usc1", "wharf")]["source"], "sibling")
 
+    def overlaid(self, files):
+        """`files`, plus the overlay Application and the kustomization proving
+        `clusters/prod-usc1/kustomize/podinfo` is a Kustomize root.
+        """
+        return {
+            "argocd/apps/podinfo-kustomize.yaml": self.OVERLAY_APPLICATION,
+            "clusters/prod-usc1/kustomize/podinfo/kustomization.yaml": (
+                "resources:\n  - deploy.yaml\n"
+            ),
+            **files,
+        }
+
+    def test_an_overlay_root_does_not_make_the_cluster_arm_ambiguous(self):
+        """The live shape on 2026-09-07, and the reason this exclusion exists.
+
+        `spot-capacity-test` had one plain-apply directory and one Kustomize
+        root -- added by a merged `no-pdb` remediation -- so it was the one
+        cluster in the clone whose fallback directory resolved to nothing.
+        """
+        found = self.resolve(
+            self.overlaid(
+                {
+                    "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                    "clusters/prod-usc1/kustomize/podinfo/deploy.yaml": self.declared(
+                        "podinfo", "podinfo-kustomize"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(
+            found[("prod-usc1", collect.NAMESPACE_KEY_ANY)],
+            {"path": "clusters/prod-usc1/workloads", "source": "cluster"},
+        )
+
+    def test_a_manifest_below_an_overlay_root_is_excluded_with_it(self):
+        """One level down inside an overlay is no more applied as it stands
+        than the top of it, so it cannot be the directory the arm names either.
+        """
+        found = self.resolve(
+            self.overlaid(
+                {
+                    "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                    "clusters/prod-usc1/kustomize/podinfo/base/deploy.yaml": self.declared(
+                        "podinfo", "podinfo-kustomize"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(
+            found[("prod-usc1", collect.NAMESPACE_KEY_ANY)]["path"],
+            "clusters/prod-usc1/workloads",
+        )
+
+    def test_a_cluster_whose_only_directory_is_an_overlay_root_gets_no_arm(self):
+        """Excluding down to nothing is not the same as resolving. There is no
+        directory here a file can simply be added to.
+        """
+        found = self.resolve(
+            self.overlaid(
+                {
+                    "clusters/prod-usc1/kustomize/podinfo/deploy.yaml": self.declared(
+                        "podinfo", "podinfo-kustomize"
+                    )
+                }
+            )
+        )
+        self.assertNotIn(("prod-usc1", collect.NAMESPACE_KEY_ANY), found)
+
+    def test_the_excluded_root_still_answers_for_its_own_namespace(self):
+        """The exclusion is scoped to the cluster arm's count. The namespace
+        the overlay renders into still resolves to it, which is what
+        `audit_report.wire_kustomize_additions` then wires.
+        """
+        found = self.resolve(
+            self.overlaid(
+                {
+                    "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                    "clusters/prod-usc1/kustomize/podinfo/deploy.yaml": self.declared(
+                        "podinfo", "podinfo-kustomize"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(
+            found[("prod-usc1", "podinfo-kustomize")]["path"],
+            "clusters/prod-usc1/kustomize/podinfo",
+        )
+
+    def test_a_second_plain_directory_is_still_ambiguous_alongside_an_overlay(self):
+        """The exclusion must not over-fire. Two directories objects really are
+        applied from is the ambiguity the arm has always refused.
+        """
+        found = self.resolve(
+            self.overlaid(
+                {
+                    "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                    "clusters/prod-usc1/extra/other.yaml": self.declared("other", "wharf"),
+                    "clusters/prod-usc1/kustomize/podinfo/deploy.yaml": self.declared(
+                        "podinfo", "podinfo-kustomize"
+                    ),
+                }
+            )
+        )
+        self.assertNotIn(("prod-usc1", collect.NAMESPACE_KEY_ANY), found)
+
+    def test_the_exclusion_is_scoped_to_the_cluster_the_application_targets(self):
+        """A root is a root for the cluster its Application deploys to. Letting
+        one cluster's overlay silence another's directory would resolve a
+        second cluster to a tree Argo CD never applies there.
+        """
+        elsewhere = self.OVERLAY_APPLICATION.replace("name: prod-usc1", "name: prod-euw1")
+        found = self.resolve(
+            {
+                "argocd/apps/podinfo-kustomize.yaml": elsewhere,
+                "clusters/prod-usc1/kustomize/podinfo/kustomization.yaml": "resources: []\n",
+                "clusters/prod-usc1/workloads/app.yaml": self.declared("app", "shop"),
+                "clusters/prod-usc1/kustomize/podinfo/deploy.yaml": self.declared(
+                    "podinfo", "podinfo-kustomize"
+                ),
+            }
+        )
+        self.assertNotIn(("prod-usc1", collect.NAMESPACE_KEY_ANY), found)
+
+    def test_a_chart_release_is_not_an_excluded_root(self):
+        """`_kustomize_roots` reads the renderer, not the presence of a path. A
+        chart's directory is in another repository and excludes nothing here.
+        """
+        self.assertEqual(
+            collect._kustomize_roots(
+                {
+                    ("prod-usc1", "application", "cert-manager"): {
+                        "renderer": "helm",
+                        "chart": "cert-manager",
+                    },
+                    ("prod-usc1", "application", "podinfo"): {
+                        "renderer": "kustomize",
+                        "chart": "clusters/prod-usc1/kustomize/podinfo",
+                    },
+                }
+            ),
+            {"prod-usc1": {"clusters/prod-usc1/kustomize/podinfo"}},
+        )
+
     def test_a_namespace_restricting_appproject_withdraws_the_cluster_arm(self):
         found = self.resolve(
             {
