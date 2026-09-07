@@ -7970,6 +7970,195 @@ class TestUncorroboratedFindings(BaseTestCase):
         self.assertEqual(audit_report._render_withheld([], [], [], []), [])
 
 
+class TestTriageMarkedFindings(BaseTestCase):
+    """A finding the collector stands behind whose *fix* it cannot vouch for.
+
+    `check_idle_workload` measures CPU and memory and nothing else. Its
+    remediation is `spec.replicas: 0`, and where a Service selects the pods
+    that also empties the Service of endpoints -- a consequence the check has
+    no reading on, because nothing in it has ever measured a caller. On
+    2026-09-07 three such findings cleared the floor, opened as pull requests
+    and merged unattended, standing down three Deployments; two of them sat
+    behind forwarding rules that had metered 837,460 and 785,748 inbound
+    packets over the same week the finding quoted.
+
+    Distinct from `TestUncorroboratedFindings` above in the direction of the
+    doubt. There the collector declined to make the finding. Here it made it,
+    graded it, and marked the fix.
+    """
+
+    def test_a_marked_candidate_marks_its_finding(self):
+        m = {
+            "clusters": [
+                _ran(
+                    "c1",
+                    "idle-workload",
+                    candidates=[
+                        {
+                            **_cand("idle-workload", "c1", "Deployment/a"),
+                            "needs_triage": "service-fronted",
+                        }
+                    ],
+                )
+            ]
+        }
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], m
+            ),
+            {"f1"},
+        )
+
+    def test_an_unmarked_candidate_does_not(self):
+        m = {
+            "clusters": [
+                _ran(
+                    "c1",
+                    "idle-workload",
+                    candidates=[_cand("idle-workload", "c1", "Deployment/a")],
+                )
+            ]
+        }
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_marker_this_gate_does_not_own_is_ignored(self):
+        """`guaranteed-qos` and the four `gce-compute-fleet` markers are the
+        model's triage cue, not the sweep's. Only what `NO_SWEEP_TRIAGE` names
+        stops a pull request; widening it here would silently freeze streams
+        that have used the field for two months.
+        """
+        m = {
+            "clusters": [
+                _ran(
+                    "c1",
+                    "overrequest",
+                    candidates=[
+                        {
+                            **_cand("overrequest", "c1", "Deployment/a"),
+                            "needs_triage": "guaranteed-qos",
+                        }
+                    ],
+                )
+            ]
+        }
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "overrequest", "c1", "Deployment/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_marked_candidate_on_another_object_does_not_reach_this_finding(self):
+        m = {
+            "clusters": [
+                _ran(
+                    "c1",
+                    "idle-workload",
+                    candidates=[
+                        {
+                            **_cand("idle-workload", "c1", "Deployment/a"),
+                            "needs_triage": "service-fronted",
+                        },
+                        _cand("idle-workload", "c1", "Deployment/b"),
+                    ],
+                )
+            ]
+        }
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [
+                    _pub("a", "idle-workload", "c1", "Deployment/a"),
+                    _pub("b", "idle-workload", "c1", "Deployment/b"),
+                ],
+                m,
+            ),
+            {"a"},
+        )
+
+    def test_no_manifest_marks_nothing(self):
+        """A stream with no collector -- the manual fallback every SOP still
+        depends on -- must not have its sweep frozen by a field that cannot
+        exist there."""
+        self.assertEqual(
+            audit_report.triage_marked_findings(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
+            ),
+            set(),
+        )
+
+    def test_the_sweep_passes_over_it(self):
+        plan = audit_report.promotion_candidates(
+            [
+                manifest_finding("free", "a.yaml", severity="major"),
+                manifest_finding("fronted", "b.yaml", severity="major"),
+            ],
+            {},
+            triage_marked={"fronted"},
+        )
+        self.assertEqual(plan.promote, ["free"])
+        self.assertEqual(plan.needs_triage, ["fronted"])
+        # Neither of the other two refusals: the grade cleared the floor and
+        # the collector did flag it, so both of those blocks would read false.
+        self.assertEqual(plan.below_floor, [])
+        self.assertEqual(plan.uncorroborated, [])
+
+    def test_an_explicit_remediate_still_opens_it(self):
+        """The whole point of marking rather than dropping. A reader who has
+        looked at the traffic line and decided is exactly the judgement the
+        collector could not supply."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("fronted", "b.yaml", severity="major")],
+            {},
+            ["fronted"],
+            triage_marked={"fronted"},
+        )
+        self.assertEqual(plan.promote, ["fronted"])
+        self.assertEqual(plan.needs_triage, [])
+
+    def test_a_live_pull_request_still_wins(self):
+        """Ordering. The live-PR test runs first, so a marked finding that
+        already has one drops out silently instead of landing in the awaiting
+        block -- otherwise the ledger invites `/remediate` on work in review."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("fronted", "b.yaml", severity="major")],
+            {"fronted": {"number": 9, "state": "OPEN", "labels": []}},
+            triage_marked={"fronted"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.needs_triage, [])
+
+    def test_the_ledger_names_it_and_does_not_call_it_unbacked(self):
+        body = "\n".join(
+            audit_report._render_withheld(
+                [],
+                [
+                    _titled("unbacked", "major", "A reslug"),
+                    _titled("fronted", "major", "A stand-down"),
+                ],
+                [],
+                ["unbacked"],
+                ["fronted"],
+            )
+        )
+        self.assertIn("2 finding(s) carry a manifest remediation", body)
+        self.assertIn("`fronted` — A stand-down", body)
+        self.assertIn("its fix is what needs a decision", body)
+        # The two blocks say opposite things about the collector, so the
+        # `unbacked` sentence must not be the one covering `fronted`.
+        self.assertLess(
+            body.index("Read these before asking"),
+            body.index("its fix is what needs a decision"),
+        )
+
+    def test_nothing_renders_when_every_list_is_empty(self):
+        self.assertEqual(audit_report._render_withheld([], [], [], [], []), [])
+
+
 class TestBelowFloorDisclosure(BaseTestCase):
     """The floor refuses far more than the cap, and used to say nothing.
 

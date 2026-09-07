@@ -697,7 +697,13 @@ to put in a diff otherwise. Three paths lead there:
   five per run**. The surplus is named in the ledger as awaiting `/remediate`, so nothing is
   silently dropped, and so is every `minor` one, which sits below the severity floor and stays there
   until someone asks. "Live" excludes a pull request the harness itself closed as stale (that one is
-  re-openable) and includes one a human closed or merged (those are not).
+  re-openable) and includes one a human closed or merged (those are not). Two further things stop
+  the sweep and neither is about the grade. A finding filed under a check the collector ran on that
+  cluster without flagging the object is not re-derivable, so the sweep will not act on it. And a
+  candidate the collector marked `needs_triage: service-fronted` names a fix whose consequence the
+  collector could not measure — `spec.replicas: 0` on a workload some Service selects, where the
+  check read CPU and memory and nothing read a caller. Both are named in the ledger under their own
+  sentences, and `/remediate` opens either.
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
   access to the repository. This path is uncapped: a human asked for that one by name.
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named

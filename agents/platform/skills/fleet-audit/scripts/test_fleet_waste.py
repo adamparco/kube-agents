@@ -1904,9 +1904,70 @@ class IdleWorkloadTest(unittest.TestCase):
         self.assertIn("trailing 12h", hits[0]["excerpt"])
         self.assertIn("under a full daily cycle", hits[0]["excerpt"])
 
+    def test_a_service_selecting_it_marks_the_fix_for_triage(self):
+        """The gate the 2026-09-07 incident bought.
+
+        Three findings of this shape auto-promoted and merged unattended,
+        standing down three Deployments; two sat behind forwarding rules that
+        had metered 837,460 and 785,748 inbound packets across the very week
+        the finding quoted. Nothing in this check measures a call -- it reads
+        CPU and memory -- so the marker is what stops the sweep deciding.
+        """
+        hits = self.hits(services=[self.svc()])
+        self.assertEqual(hits[0]["_selected_by"], ["Service/hello-world"])
+
+    def test_a_cluster_ip_service_marks_it_too_and_stays_minor(self):
+        """The reason `_selecting_services` is not `_fronting_load_balancers`.
+
+        A `ClusterIP` Service is free, so it must not lift the grade -- and it
+        is still a stable name something in the cluster may be calling, so the
+        stand-down must not open itself.
+        """
+        hits = self.hits(services=[self.svc(kind="ClusterIP")])
+        self.assertEqual(hits[0]["severity"], "minor")
+        self.assertEqual(hits[0]["_selected_by"], ["Service/hello-world"])
+        self.assertIn("Service/hello-world also selects its pods", hits[0]["excerpt"])
+        self.assertIn("no endpoints", hits[0]["excerpt"])
+        self.assertIn("not whether anything still resolves that name", hits[0]["excerpt"])
+
+    def test_a_load_balancer_is_not_named_twice(self):
+        """Both clauses fire on a `LoadBalancer`, and they say different things
+        -- one about the bill, one about the endpoints. Naming the Service in
+        each reads as two findings about two objects."""
+        excerpt = self.hits(services=[self.svc()])[0]["excerpt"]
+        self.assertEqual(excerpt.count("Service/hello-world"), 1)
+        self.assertIn("That Service selects its pods", excerpt)
+
+    def test_nothing_selecting_it_leaves_the_fix_unmarked(self):
+        hits = self.hits()
+        self.assertEqual(hits[0]["_selected_by"], [])
+        self.assertNotIn("no endpoints", hits[0]["excerpt"])
+
+    def test_a_service_selecting_something_else_does_not_mark_it(self):
+        self.assertEqual(
+            self.hits(services=[self.svc(selector={"app": "other"})])[0]["_selected_by"], []
+        )
+
+    def test_a_selectorless_service_does_not_mark_it(self):
+        # `all()` over no pairs is True, so without the emptiness guard a
+        # hand-fed Service would freeze every stand-down in its namespace.
+        self.assertEqual(self.hits(services=[self.svc(selector={})])[0]["_selected_by"], [])
+
+    def test_a_service_in_another_namespace_does_not_mark_it(self):
+        self.assertEqual(self.hits(services=[self.svc(ns="elsewhere")])[0]["_selected_by"], [])
+
+    def test_the_impact_no_longer_claims_nobody_is_calling_it(self):
+        """The sentence itself. It read "a workload nobody is calling" for
+        eleven days over a check that has never measured a call."""
+        impact = fw.IMPACT["idle-workload"]
+        self.assertNotIn("nobody is calling", impact)
+        self.assertIn("CPU or memory", impact)
+        self.assertIn("packets are not sessions", impact)
+
     def test_the_thresholds_match_the_sop(self):
         self.assertEqual(fw.IDLE_WORKLOAD_UTILISATION, 0.2)
         self.assertEqual(fw.IDLE_WORKLOAD_MIN_AGE_DAYS, 14)
+        self.assertEqual(fw.IDLE_SERVICE_TRIAGE, "service-fronted")
 
 
 class UnderrequestTest(unittest.TestCase):

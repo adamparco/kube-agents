@@ -275,6 +275,12 @@ IDLE_WORKLOAD_UTILISATION = 0.2
 # fortnight.
 IDLE_WORKLOAD_MIN_AGE_DAYS = 14
 
+# The `needs_triage` marker on an idle controller a Service selects. Read by
+# `triage_marked_findings` in audit_report.py, which withholds these from the
+# automatic sweep -- so the string has to match the one that file names, and
+# the two files carry it separately because neither imports the other.
+IDLE_SERVICE_TRIAGE = "service-fronted"
+
 # `check_underrequest`'s floor is on the overage -- how far sustained usage sits
 # above the request -- rather than on the request, because that overage is the
 # quantity doing the harm: it is what the scheduler failed to book on the node,
@@ -2238,6 +2244,33 @@ def _fronting_load_balancers(context: dict, ns: str, labels: dict) -> list[str]:
     return sorted(matched)
 
 
+def _selecting_services(context: dict, ns: str, labels: dict) -> list[str]:
+    """Every Service in `ns` whose selector this controller's pods match.
+
+    A deliberate copy of `_fronting_load_balancers` with the `LoadBalancer`
+    test removed, rather than a widening of it. That function's answer feeds
+    §3.13's severity, where `LoadBalancer` is the whole point -- the forwarding
+    rule and external IP are the charge that lifts the finding to `major`.
+    Widening it in place would grade every `ClusterIP`-backed idle workload
+    `major` and promote it, which is the reverse of what this is for.
+
+    What this answers is a different question: does anything in the cluster
+    have a stable name to call this workload by. A `ClusterIP` Service is not
+    a cost -- it is free -- but it is the thing that makes a stand-down
+    somebody else's outage rather than a reclaimed reservation.
+    """
+    matched = []
+    for svc in context["services"]:
+        spec = svc.get("spec") or {}
+        meta = svc.get("metadata") or {}
+        if meta.get("namespace", "") != ns:
+            continue
+        selector = spec.get("selector") or {}
+        if selector and all(labels.get(k) == v for k, v in selector.items()):
+            matched.append(f"Service/{meta.get('name', '')}")
+    return sorted(matched)
+
+
 def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> list[dict]:
     """A controller nothing is using, whose request no resize can lower.
 
@@ -2350,6 +2383,32 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
                 f"so a forwarding rule and its external IP bill for it too — usually "
                 f"several times the pod's own cost"
             )
+        # Cost is not the only thing a Service says about an idle workload, and
+        # the other thing it says is the one that takes a serving system down.
+        # A `ClusterIP` Service costs nothing, so it never reaches the clause
+        # above -- but it is a stable name something else in the cluster may
+        # still be calling, and a stand-down empties it of endpoints. This
+        # check has never measured a call, so it names what selects the pods
+        # and stops there; `needs_triage` below is what keeps the sweep from
+        # deciding for a reader.
+        selecting = _selecting_services(context, entry["ns"], entry["labels"])
+        if selecting:
+            unnamed = [svc for svc in selecting if svc not in set(fronting)]
+            if unnamed:
+                clause = (
+                    f"{' and '.join(unnamed)} also select"
+                    f"{'s' if len(unnamed) == 1 else ''} its pods"
+                )
+            elif len(selecting) == 1:
+                clause = "That Service selects its pods"
+            else:
+                clause = "Those Services select its pods"
+            excerpt += (
+                f". {clause}, so standing the controller down leaves "
+                f"{'it' if len(selecting) == 1 else 'them'} with no endpoints; this "
+                f"check measured CPU and memory, not whether anything still resolves "
+                f"{'that name' if len(selecting) == 1 else 'those names'}"
+            )
         excerpt += "."
 
         hits.append(
@@ -2357,6 +2416,9 @@ def check_idle_workload(context: dict, usage_peaks: dict, *, now: datetime) -> l
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
                 "excerpt": excerpt,
+                # Dropped by `_emit`'s fixed key set, read by the emit loop in
+                # `collect_cluster` -- the same handoff `_guaranteed` uses.
+                "_selected_by": selecting,
                 # A floor-bound request is small by construction, so on that
                 # arm the pod alone never justifies more than `minor`. The load
                 # balancer does: it is the larger charge, and unlike the pod it
@@ -2703,7 +2765,16 @@ IMPACT = {
     "scaledown-blocked": "An unevictable pod on an under-allocated node blocks both scale-down and security patching.",
     "terminal-pods": "Finished objects accumulate in etcd and slow every full API-server list.",
     "idle-namespace": "A namespace with no running workload still holds a load balancer or bound storage.",
-    "idle-workload": "Nothing has used this controller for weeks, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a workload nobody is calling. The excerpt says which of the two reasons applies.",
+    # "nobody is calling it" was in this sentence for eleven days and nothing in
+    # the collector ever measured a call. On 2026-09-07 three findings carrying
+    # it auto-promoted, merged unattended, and stood down three Deployments --
+    # two of them behind forwarding rules that had metered 837,460 and 785,748
+    # inbound packets over the same week the finding quoted. The traffic turned
+    # out to be internet background scanning, so the claim was probably true in
+    # substance; it was certainly unmeasured, and an audit that guesses right is
+    # still an audit a reader cannot check. What this check measures is CPU and
+    # memory, so that is all it now asserts.
+    "idle-workload": "Nothing has used this controller's CPU or memory for weeks, and no resize can give any of the reservation back -- it, and any load balancer in front of it, bill for a reservation nothing draws on. Whether anything is still calling it is a separate question this check does not settle: the excerpt gives what the forwarding rule metered, and packets are not sessions. The excerpt also says which of the two no-resize reasons applies.",
     "registry-no-cleanup": "Artifact Registry bills for every byte it holds and deletes nothing on its own, so a repository with no cleanup policy costs more every time CI pushes and never costs less.",
 }
 
@@ -3387,7 +3458,27 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # whose resize would change nothing because nothing is using it, or
         # one whose resize 3.1 refuses to make because it is `Guaranteed`.
         commands["idle-workload"] = usage_record
-        candidates += [emit("idle-workload", h) for h in check_idle_workload(context, usage_peaks, now=now)]
+        for hit in check_idle_workload(context, usage_peaks, now=now):
+            emitted = emit("idle-workload", hit)
+            # Without this the retracted impact never reaches a reader.
+            # `adopt_arm_impact` adopts the collector's sentence only for
+            # candidates that mark it authoritative, and `carry_unchanged_findings`
+            # reuses last run's prose whenever evidence is byte-identical -- which
+            # for a workload that has been idle for a month is every run. The
+            # findings that stood down three Deployments would have gone on
+            # publishing "a workload nobody is calling" forever with the constant
+            # above corrected.
+            emitted["impact_authoritative"] = True
+            # The one shape of this finding whose pull request can take a
+            # serving system down, held out of the automatic sweep. Everything
+            # else here reclaims a reservation; a Service-backed stand-down
+            # removes the endpoints behind a name something may still be
+            # calling, and this check has no way to know whether anything is.
+            # `/remediate` still opens it, which is the point -- the judgement
+            # the collector cannot supply is a reader's to supply by name.
+            if hit.get("_selected_by"):
+                emitted["needs_triage"] = IDLE_SERVICE_TRIAGE
+            candidates.append(emitted)
     elif not context["nodes"] and usage_result.rc == 0:
         # A cluster with no nodes cannot be over-requesting: there is no
         # capacity for a reservation to waste, and nothing has run for a
