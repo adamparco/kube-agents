@@ -2225,12 +2225,32 @@ class TestPrestopOutlivesGrace(unittest.TestCase):
     def test_a_native_sleep_equal_to_the_grace_period_is_flagged(self):
         # Equal, not merely greater: at `wait == grace` the kubelet SIGKILLs
         # with the hook still sleeping, so it is provably truncated.
+        #
+        # This case is the whole native arm, so do not relax it to `>`. The
+        # apiserver validates `sleep.seconds` against the grace period and
+        # rejects anything larger -- on GKE 1.35, `seconds: 31` under a 30s
+        # ceiling is refused and `seconds: 30` applies -- so equality is the
+        # only truncated native hook that can reach a cluster. The next test
+        # covers a shape only reachable through a dump, not through admission.
         hit = self.check([self.container({"sleep": {"seconds": 30}})])
         self.assertIsNotNone(hit)
         self.assertEqual(hit["object"], "Deployment/api")
 
     def test_a_native_sleep_longer_than_the_grace_period_is_flagged(self):
         self.assertIsNotNone(self.check([self.container({"sleep": {"seconds": 45}})]))
+
+    def test_a_shell_sleep_far_past_the_ceiling_is_flagged(self):
+        # The asymmetry that makes the check worth having. Nothing validates
+        # an `exec` hook against the grace period: `sleep 600` under a 10s
+        # ceiling applies without complaint, where the same wait written as
+        # `sleep: {seconds: 600}` is rejected outright. Every hook that runs
+        # far past its ceiling is therefore a shell one.
+        hit = self.check(
+            [self.container({"exec": {"command": ["/bin/sh", "-c", "sleep 600"]}})], grace=10
+        )
+        self.assertIsNotNone(hit)
+        self.assertIn("waits 600s", hit["excerpt"])
+        self.assertIn("terminationGracePeriodSeconds=10", hit["excerpt"])
 
     def test_one_second_of_headroom_is_not_a_finding(self):
         # The check claims only what the kubelet guarantees. "Too little room

@@ -1983,6 +1983,15 @@ def check_prestop_outlives_grace(workload: dict, context: dict) -> dict | None:
     provably truncated, while "the hook leaves too little room for the
     application to shut down" needs a number for how much room an application
     needs, which this audit cannot know.
+
+    `>=` rather than `>` is also what keeps the native handler in scope at all.
+    The apiserver validates `lifecycle.preStop.sleep.seconds` against the grace
+    period and refuses anything larger -- measured on GKE 1.35, `seconds: 31`
+    under a 30s ceiling is rejected outright and `seconds: 30` is accepted --
+    so `wait == grace` is the only truncated native shape that can exist on a
+    cluster. Tightening this to `>` would silently retire the native arm
+    rather than narrow it. Nothing validates the shell spelling, which is why
+    the waits that run far past the ceiling are all `exec` hooks.
     """
     grace = workload["template"].get("terminationGracePeriodSeconds")
     if grace is None:
