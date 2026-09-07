@@ -5,8 +5,8 @@ wearing prose.
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
 **Scope of this file today: the collector engine, plus three streams' check
-tables in full.** `obtainability-audit`'s complete seventeen-check roster
-(§3.1–§3.17 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
+tables in full.** `obtainability-audit`'s complete eighteen-check roster
+(§3.1–§3.18 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
 complete thirteen-check roster (§2.1–§2.13 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
@@ -1540,6 +1540,110 @@ def check_probes_liveness(workload: dict, context: dict) -> dict | None:
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": f"containers missing a liveness probe: {', '.join(missing)}",
+    }
+
+
+# The four probe handlers a container can declare. Order is irrelevant --
+# `v1.Probe` is a union and admission rejects a second one -- but the tuple has
+# to be exhaustive, because a handler this does not know about reads as "no
+# handler" and silently exempts the container from §3.18.
+_PROBE_HANDLERS = ("httpGet", "tcpSocket", "exec", "grpc")
+
+# `v1.Probe` defaults, from the Kubernetes API reference. Only the three that
+# decide *when* a probe gives up are here; `timeoutSeconds` and
+# `successThreshold` do not move the deadline §3.18 compares.
+_PROBE_DEFAULT_PERIOD_SECONDS = 10
+_PROBE_DEFAULT_FAILURE_THRESHOLD = 3
+_PROBE_DEFAULT_INITIAL_DELAY_SECONDS = 0
+
+_IMPACT_LIVENESS_PREEMPTS = (
+    "Both probes test the same endpoint, and the one that kills the container "
+    "gives up first. Whatever the readiness probe was meant to protect against "
+    "-- a slow dependency, a cold cache, a downstream outage -- restarts every "
+    "replica at once instead of quietly taking them out of the Service, and "
+    "the restarts keep the dependency from recovering. The readiness probe "
+    "cannot fire first, so it never gets to do its job."
+)
+
+
+def _probe_handler(probe: dict | None) -> tuple[str, str] | None:
+    """`(kind, canonical body)` of a probe's handler, or None if it has none.
+
+    Canonicalised with sorted keys so two probes that differ only in field
+    order compare equal -- the apiserver does not reorder, but a manifest
+    written by two hands can, and the check is about what the probe *tests*.
+    """
+    for kind in _PROBE_HANDLERS:
+        if isinstance(probe, dict) and probe.get(kind) is not None:
+            return kind, json.dumps(probe[kind], sort_keys=True)
+    return None
+
+
+def _probe_deadline_seconds(probe: dict) -> int:
+    """Seconds from container start until this probe's failure takes effect.
+
+    `initialDelaySeconds + failureThreshold x periodSeconds`. Approximate by
+    construction -- the kubelet's first check lands somewhere inside the first
+    period, and a probe that times out costs `timeoutSeconds` on top -- but
+    both probes are approximated the same way, and §3.18 only ever compares
+    the two against each other.
+    """
+    return probe.get("initialDelaySeconds", _PROBE_DEFAULT_INITIAL_DELAY_SECONDS) + (
+        probe.get("failureThreshold", _PROBE_DEFAULT_FAILURE_THRESHOLD)
+        * probe.get("periodSeconds", _PROBE_DEFAULT_PERIOD_SECONDS)
+    )
+
+
+def check_liveness_preempts_readiness(workload: dict, context: dict) -> dict | None:
+    """§3.18 -- a liveness probe that fires no later than its readiness twin.
+
+    The pair only matters when both probes test *the same thing*: then the
+    cluster has two responses to one signal, one of which (stop routing) is
+    recoverable and one of which (restart) is not. Kubernetes runs them
+    independently, so which response happens is decided by whichever deadline
+    comes first -- and when liveness's is the shorter or equal one, the
+    readiness probe is decoration. It can never remove the pod from a Service
+    before the container is killed out from under it.
+
+    That is the whole rule, and it is deliberately narrower than the
+    antipattern it belongs to. A shared endpoint with real headroom on the
+    liveness side is the *documented* way to use one health handler for both,
+    so a fleet's worth of `livenessProbe`/`readinessProbe` pairs pointing at
+    one `/healthz` are not findings; on this fleet the rule cut nine matching
+    pairs to four. What is left is provable from the manifest without knowing
+    anything about what the endpoint does, which is what makes it safe to open
+    a pull request against.
+
+    Deliberately not flagged: a liveness probe stricter than a readiness probe
+    on a *different* handler. It fails the same way, but the two probes may
+    genuinely test different things -- a local liveness endpoint and a
+    dependency-aware readiness one is the correct shape -- and the collector
+    cannot tell that from a shape that is wrong.
+    """
+    bad = []
+    for container in workload["template"].get("containers") or []:
+        if container.get("name") in _SELF_HEALTH_SIDECARS:
+            continue
+        liveness, readiness = container.get("livenessProbe"), container.get("readinessProbe")
+        handler = _probe_handler(liveness)
+        if handler is None or handler != _probe_handler(readiness):
+            continue
+        live_at, ready_at = _probe_deadline_seconds(liveness), _probe_deadline_seconds(readiness)
+        if live_at > ready_at:
+            continue
+        # Name both deadlines and the handler they share. The remediation is a
+        # choice between widening liveness, repointing it, and deleting it,
+        # and a reader cannot make that choice without seeing how much room
+        # there is between the two numbers -- here, none.
+        bad.append(
+            f"{container.get('name', '')}: {handler[0]} {handler[1]} is both probes; "
+            f"liveness fails at ~{live_at}s, readiness at ~{ready_at}s"
+        )
+    if not bad:
+        return None
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": "; ".join(bad),
     }
 
 
@@ -4446,6 +4550,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "nothing for it. The pods are up and the Service lists their "
         "addresses, so every check anyone would run says it is healthy while "
         "the port refuses.",
+    ),
+    CheckSpec(
+        "liveness-preempts-readiness",
+        "workload",
+        check_liveness_preempts_readiness,
+        "major",
+        None,
+        _IMPACT_LIVENESS_PREEMPTS,
     ),
 )
 

@@ -1326,6 +1326,192 @@ class TestProbes(unittest.TestCase):
         self.assertIsNotNone(liveness_hit)
 
 
+class TestLivenessPreemptsReadiness(unittest.TestCase):
+    HTTP = {"path": "/healthz", "port": 8080}
+
+    def wl(self, *containers):
+        dep = deployment("api")
+        dep["spec"]["template"]["spec"]["containers"] = list(containers)
+        return collect.normalize_workloads(dump_of(dep))[0]
+
+    def container(self, name="app", liveness=..., readiness=..., **kwargs):
+        """A container whose two probes share `HTTP` unless overridden.
+
+        The default is the finding: one handler copied into both blocks with
+        every timing left at its default, which makes the two deadlines equal.
+        """
+        c = {"name": name, "resources": {}, **kwargs}
+        if liveness is not ...:
+            c["livenessProbe"] = liveness
+        else:
+            c["livenessProbe"] = {"httpGet": dict(self.HTTP)}
+        if readiness is not ...:
+            c["readinessProbe"] = readiness
+        else:
+            c["readinessProbe"] = {"httpGet": dict(self.HTTP)}
+        return c
+
+    def hits(self, *containers):
+        return collect.check_liveness_preempts_readiness(self.wl(*containers), context_of())
+
+    def test_two_defaulted_probes_on_one_handler_are_flagged(self):
+        self.assertIsNotNone(self.hits(self.container()))
+
+    def test_headroom_on_the_liveness_side_is_the_documented_shape(self):
+        # The majority of shared-handler pairs, and not a finding: readiness
+        # gives up at 30s and liveness at 300s, so a blip de-registers the pod
+        # and only a wedged process is ever restarted.
+        self.assertIsNone(
+            self.hits(
+                self.container(
+                    liveness={"httpGet": dict(self.HTTP), "failureThreshold": 30},
+                )
+            )
+        )
+
+    def test_one_second_of_headroom_is_still_headroom(self):
+        # The rule is `<=`, not "close enough". A deliberate margin the
+        # collector second-guesses is a finding its author cannot act on.
+        self.assertIsNone(
+            self.hits(
+                self.container(
+                    liveness={"httpGet": dict(self.HTTP), "initialDelaySeconds": 1},
+                )
+            )
+        )
+
+    def test_liveness_strictly_sooner_is_flagged(self):
+        self.assertIsNotNone(
+            self.hits(
+                self.container(
+                    liveness={"httpGet": dict(self.HTTP), "failureThreshold": 1},
+                )
+            )
+        )
+
+    def test_different_handlers_are_never_flagged(self):
+        # Same failure on paper, but a local liveness endpoint beside a
+        # dependency-aware readiness one is the correct shape and reads
+        # identically from here.
+        self.assertIsNone(
+            self.hits(
+                self.container(
+                    liveness={"httpGet": {"path": "/livez", "port": 8080}, "failureThreshold": 1},
+                )
+            )
+        )
+
+    def test_a_different_port_on_the_same_path_is_a_different_handler(self):
+        self.assertIsNone(
+            self.hits(self.container(liveness={"httpGet": {"path": "/healthz", "port": 9090}}))
+        )
+
+    def test_field_order_within_a_handler_does_not_decide_it(self):
+        # `json.dumps(sort_keys=True)`'s job. The apiserver does not reorder,
+        # but two hands writing the same probe can.
+        self.assertIsNotNone(
+            self.hits(
+                self.container(
+                    liveness={"httpGet": {"port": 8080, "path": "/healthz"}},
+                    readiness={"httpGet": {"path": "/healthz", "port": 8080}},
+                )
+            )
+        )
+
+    def test_each_handler_kind_is_recognised(self):
+        for kind, body in (
+            ("tcpSocket", {"port": 8080}),
+            ("exec", {"command": ["/bin/health"]}),
+            ("grpc", {"port": 8080}),
+        ):
+            with self.subTest(kind=kind):
+                probe = {kind: dict(body)}
+                hit = self.hits(self.container(liveness=dict(probe), readiness=dict(probe)))
+                self.assertIsNotNone(hit)
+                self.assertIn(kind, hit["excerpt"])
+
+    def test_a_probe_with_no_handler_this_knows_is_not_flagged(self):
+        # The exemption `_PROBE_HANDLERS` has to stay exhaustive to avoid: a
+        # handler added to `v1.Probe` later reads as "no handler" here, and
+        # silently exempts the container rather than failing loudly.
+        probe = {"someFutureHandler": {"port": 8080}}
+        self.assertIsNone(self.hits(self.container(liveness=dict(probe), readiness=dict(probe))))
+
+    def test_a_container_with_only_one_probe_belongs_to_3_9_or_3_10(self):
+        self.assertIsNone(self.hits(self.container(liveness=None)))
+        self.assertIsNone(self.hits(self.container(readiness=None)))
+
+    def test_neither_probe_declared_is_not_this_finding(self):
+        self.assertIsNone(self.hits(self.container(liveness=None, readiness=None)))
+
+    def test_a_self_health_sidecar_is_skipped(self):
+        self.assertIsNone(self.hits(self.container(name="istio-proxy")))
+
+    def test_a_flagged_container_beside_a_skipped_one_still_reports(self):
+        hit = self.hits(self.container(name="istio-proxy"), self.container(name="app"))
+        self.assertIsNotNone(hit)
+        self.assertNotIn("istio-proxy", hit["excerpt"])
+
+    def test_every_offending_container_is_named(self):
+        hit = self.hits(self.container(name="app"), self.container(name="sidecar"))
+        self.assertIn("app", hit["excerpt"])
+        self.assertIn("sidecar", hit["excerpt"])
+
+    def test_the_excerpt_carries_both_deadlines_and_the_shared_handler(self):
+        # The remediation is a choice between widening, repointing and
+        # deleting, and none of those is decidable without seeing how much
+        # room there is between the two numbers.
+        hit = self.hits(
+            self.container(liveness={"httpGet": dict(self.HTTP), "failureThreshold": 2})
+        )
+        self.assertIn("~20s", hit["excerpt"])
+        self.assertIn("~30s", hit["excerpt"])
+        self.assertIn("/healthz", hit["excerpt"])
+
+    def test_the_deadlines_are_written_as_approximations(self):
+        # They are `initialDelay + failureThreshold x period`, which is not
+        # wall-clock truth for either probe. Publishing a bare number invites
+        # a reader to check it against a stopwatch and conclude the check is
+        # broken.
+        self.assertIn("~", self.hits(self.container())["excerpt"])
+
+    def test_initial_delay_counts_towards_the_deadline(self):
+        # A liveness probe that merely starts later is not safer once it does:
+        # 60 + 3x10 beats readiness's 30, so it is not flagged...
+        self.assertIsNone(
+            self.hits(
+                self.container(liveness={"httpGet": dict(self.HTTP), "initialDelaySeconds": 60})
+            )
+        )
+        # ...but the same delay on the readiness side puts liveness first again.
+        self.assertIsNotNone(
+            self.hits(
+                self.container(readiness={"httpGet": dict(self.HTTP), "initialDelaySeconds": 60})
+            )
+        )
+
+    def test_period_and_threshold_both_move_the_deadline(self):
+        self.assertIsNone(
+            self.hits(self.container(liveness={"httpGet": dict(self.HTTP), "periodSeconds": 60}))
+        )
+
+    def test_timeout_and_success_threshold_do_not_move_it(self):
+        # Neither changes when a probe gives up, so neither can turn a finding
+        # into a pass. `successThreshold` is readiness-only in the API and
+        # `timeoutSeconds` bounds one attempt, not the sequence.
+        self.assertIsNotNone(
+            self.hits(
+                self.container(
+                    liveness={"httpGet": dict(self.HTTP), "timeoutSeconds": 30},
+                    readiness={"httpGet": dict(self.HTTP), "successThreshold": 5},
+                )
+            )
+        )
+
+    def test_the_object_is_named_kind_slash_name(self):
+        self.assertEqual(self.hits(self.container())["object"], "Deployment/api")
+
+
 class TestSingleReplica(unittest.TestCase):
     def wl(self, replicas=1, strategy=None, kind="Deployment"):
         d = deployment("api", **{"spec.replicas": replicas})
@@ -2572,7 +2758,14 @@ class TestCollectCluster(unittest.TestCase):
             {"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"memory": "1Gi"}},
         )
         d["spec"]["template"]["spec"]["containers"][0]["readinessProbe"] = {"httpGet": {"path": "/", "port": 80}}
-        d["spec"]["template"]["spec"]["containers"][0]["livenessProbe"] = {"httpGet": {"path": "/", "port": 80}}
+        # §3.18: one handler serving both probes is fine, and is the shape most
+        # charts ship -- but only with headroom on the liveness side. Copied
+        # verbatim into both blocks, as this fixture used to be, the two
+        # deadlines are equal and the readiness probe can never fire first.
+        d["spec"]["template"]["spec"]["containers"][0]["livenessProbe"] = {
+            "httpGet": {"path": "/", "port": 80},
+            "failureThreshold": 30,
+        }
         result, _ = self.collect([d])
         self.assertEqual(result["candidates"], [])
 
