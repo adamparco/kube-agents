@@ -2373,9 +2373,21 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
     # Service-backed" -- a rollout-drops-user-traffic claim -- one section
     # below the readiness finding on those same two Deployments that had just
     # said the only Service in front of them is a scrape endpoint.
+    excerpt = f"single replica, Service-backed\n{_exposure_line(services)}"
+    # The one fact that bars the manifest arm, and it has to ride in the
+    # excerpt: `emit` builds the published candidate from a fixed key set, so a
+    # `manifest_blocked` flag on the hit would be dropped silently, while
+    # `adopt_collector_evidence` forces this string onto the finding verbatim.
+    # A second replica cannot schedule off the first one's node here -- it sits
+    # in `ContainerCreating` with a `Multi-Attach error` until something gives,
+    # which is 3.21's finding and 3.21's fix. The finding itself still stands:
+    # a drain is a full outage whatever the volume does.
+    claims = _exclusive_claims(workload, context)
+    if claims:
+        excerpt += "\nmounts an exclusively-attachable claim: " + "; ".join(claims)
     return {
         "object": f"Deployment/{workload['name']}",
-        "excerpt": f"single replica, Service-backed\n{_exposure_line(services)}",
+        "excerpt": excerpt,
     }
 
 

@@ -2172,17 +2172,20 @@ class TestLivenessPreemptsReadiness(unittest.TestCase):
 
 
 class TestSingleReplica(unittest.TestCase):
-    def wl(self, replicas=1, strategy=None, kind="Deployment"):
+    def wl(self, replicas=1, strategy=None, kind="Deployment", volumes=None):
         d = deployment("api", **{"spec.replicas": replicas})
         d["kind"] = kind
         d["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
         if strategy is not None:
             d["spec"]["strategy"] = {"type": strategy}
+        if volumes is not None:
+            d["spec"]["template"]["spec"]["volumes"] = list(volumes)
         return collect.normalize_workloads(dump_of(d))[0]
 
-    def svc_ctx(self, ports=None):
+    def svc_ctx(self, ports=None, claims=()):
         return context_of(
-            services={"default": [service("s", selector={"app": "api"}, **({"ports": ports} if ports else {}))]}
+            services={"default": [service("s", selector={"app": "api"}, **({"ports": ports} if ports else {}))]},
+            claims=collect.claims_by_key(dump_of(*claims)),
         )
 
     def test_a_single_replica_service_backed_deployment_is_flagged(self):
@@ -2231,6 +2234,32 @@ class TestSingleReplica(unittest.TestCase):
 
     def test_no_service_means_never_flagged(self):
         self.assertIsNone(collect.check_single_replica(self.wl(), context_of()))
+
+    def test_an_exclusive_claim_is_named_so_the_manifest_arm_can_refuse(self):
+        """§3.11's manifest arm sets the replica key to 2; here that deadlocks.
+
+        The second pod cannot schedule off the first one's node and waits in
+        `ContainerCreating` with a `Multi-Attach error` indefinitely. The
+        finding still stands -- a drain is a full outage whatever the volume
+        does -- so the bar has to travel in the excerpt, which is the only
+        field `emit` carries through and `adopt_collector_evidence` publishes
+        verbatim.
+        """
+        volumes = [{"name": "data", "persistentVolumeClaim": {"claimName": "api-data"}}]
+        hit = collect.check_single_replica(
+            self.wl(volumes=volumes), self.svc_ctx(claims=[pvc("api-data")])
+        )
+        self.assertIn("mounts an exclusively-attachable claim:", hit["excerpt"])
+        self.assertIn("api-data", hit["excerpt"])
+        self.assertIn("ReadWriteOnce", hit["excerpt"])
+
+    def test_a_shareable_claim_does_not_bar_the_manifest_arm(self):
+        volumes = [{"name": "data", "persistentVolumeClaim": {"claimName": "api-data"}}]
+        hit = collect.check_single_replica(
+            self.wl(volumes=volumes),
+            self.svc_ctx(claims=[pvc("api-data", modes=("ReadWriteMany",))]),
+        )
+        self.assertNotIn("exclusively-attachable", hit["excerpt"])
 
 
 def cronjob(
