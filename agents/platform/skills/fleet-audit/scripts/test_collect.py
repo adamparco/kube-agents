@@ -1561,6 +1561,110 @@ class TestProbes(unittest.TestCase):
         self.assertIsNotNone(liveness_hit)
 
 
+class TestReadinessDerivedFromLiveness(unittest.TestCase):
+    """§3.9's one exception to "do not generate probe YAML".
+
+    A container declaring a liveness probe has already told the kubelet which
+    handler answers for it, so a readiness probe copied from it asks nothing
+    new of the workload. The deadline is the part that has to be got right:
+    equal deadlines are §3.18, so a fix that produced them would close this
+    finding by opening that one on the same container.
+    """
+
+    MARKER = "readiness derivable from the liveness probe:"
+
+    def wl(self, *containers):
+        dep = deployment("api")
+        dep["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        dep["spec"]["template"]["spec"]["containers"] = list(containers)
+        return collect.normalize_workloads(dump_of(dep))[0]
+
+    def svc_ctx(self):
+        return context_of(services={"default": [service("s", selector={"app": "api"})]})
+
+    def container(self, name="app", liveness=None):
+        c = {"name": name, "resources": {}}
+        if liveness is not None:
+            c["livenessProbe"] = liveness
+        return c
+
+    def excerpt(self, *containers):
+        hit = collect.check_probes_readiness(self.wl(*containers), self.svc_ctx())
+        self.assertIsNotNone(hit)
+        return hit["excerpt"]
+
+    def test_a_liveness_probe_supplies_the_handler_and_a_tighter_deadline(self):
+        # Defaults put liveness at 0 + 3 x 10 = 30s, so readiness gets 5s
+        # periods and a threshold of 3 -- 15s, half of it.
+        line = self.excerpt(self.container(liveness={"httpGet": {"path": "/livez", "port": 9403}}))
+        self.assertIn(self.MARKER, line)
+        self.assertIn('httpGet {"path": "/livez", "port": 9403}', line)
+        self.assertIn("initialDelaySeconds 0, periodSeconds 5, failureThreshold 3", line)
+        self.assertIn("~15s, inside liveness's ~30s", line)
+
+    def test_the_derived_deadline_is_always_strictly_inside_the_liveness_one(self):
+        for probe, expected in (
+            ({"httpGet": {"port": 1}, "failureThreshold": 2, "periodSeconds": 10}, (5, 2)),
+            ({"httpGet": {"port": 1}, "periodSeconds": 30}, (5, 9)),
+            ({"httpGet": {"port": 1}, "failureThreshold": 2, "periodSeconds": 3}, (5, 1)),
+            ({"httpGet": {"port": 1}, "failureThreshold": 1, "periodSeconds": 5}, (1, 1)),
+            ({"httpGet": {"port": 1}, "initialDelaySeconds": 60}, (5, 9)),
+        ):
+            with self.subTest(probe=probe):
+                live_at = collect._probe_deadline_seconds(probe)
+                period, threshold = expected
+                self.assertLess(period * threshold, live_at)
+                self.assertIn(
+                    f"periodSeconds {period}, failureThreshold {threshold}",
+                    self.excerpt(self.container(liveness=probe)),
+                )
+
+    def test_a_liveness_deadline_with_no_room_beneath_it_stays_manual(self):
+        # `failureThreshold: 1, periodSeconds: 1` fails at ~1s. Nothing fits
+        # inside that, and inventing a readiness probe that gives up sooner
+        # than the kubelet can call it twice is worse than the finding.
+        probe = {"httpGet": {"port": 1}, "failureThreshold": 1, "periodSeconds": 1}
+        self.assertEqual(collect._probe_deadline_seconds(probe), 1)
+        self.assertNotIn(self.MARKER, self.excerpt(self.container(liveness=probe)))
+
+    def test_a_liveness_probe_with_no_recognised_handler_supplies_nothing(self):
+        self.assertNotIn(self.MARKER, self.excerpt(self.container(liveness={"initialDelaySeconds": 5})))
+
+    def test_no_liveness_probe_leaves_the_finding_manual(self):
+        self.assertNotIn(self.MARKER, self.excerpt(self.container()))
+
+    def test_one_container_short_of_a_handler_withholds_the_line_from_all_of_them(self):
+        # All or nothing: a patch giving readiness to `app` and not to `web`
+        # leaves this finding open on `web`, and a finding its own remediation
+        # does not close is one the audit republishes every day.
+        line = self.excerpt(
+            self.container(name="app", liveness={"httpGet": {"path": "/livez", "port": 9403}}),
+            self.container(name="web"),
+        )
+        self.assertIn("app, web", line)
+        self.assertNotIn(self.MARKER, line)
+
+    def test_every_container_with_a_handler_is_named_in_the_line(self):
+        line = self.excerpt(
+            self.container(name="app", liveness={"httpGet": {"path": "/livez", "port": 9403}}),
+            self.container(name="web", liveness={"tcpSocket": {"port": 8080}}),
+        )
+        self.assertIn("app: copy the liveness handler", line)
+        self.assertIn('web: copy the liveness handler tcpSocket {"port": 8080}', line)
+
+    def test_a_container_that_already_has_readiness_is_not_in_the_line(self):
+        line = self.excerpt(
+            self.container(name="app", liveness={"httpGet": {"path": "/livez", "port": 9403}}),
+            {
+                "name": "web",
+                "resources": {},
+                "livenessProbe": {"tcpSocket": {"port": 8080}},
+                "readinessProbe": {"tcpSocket": {"port": 8080}},
+            },
+        )
+        self.assertNotIn("web", line.split(self.MARKER)[-1])
+
+
 class TestLivenessPreemptsReadiness(unittest.TestCase):
     HTTP = {"path": "/healthz", "port": 8080}
 

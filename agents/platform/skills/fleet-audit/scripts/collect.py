@@ -1817,18 +1817,28 @@ def check_probes_readiness(workload: dict, context: dict) -> dict | None:
     services = _selecting_services(workload, context)
     if not services:
         return None
-    missing = [
-        c.get("name", "")
+    behind = [
+        c
         for c in _containers_behind_a_service(workload, services)
         if c.get("name") not in _SELF_HEALTH_SIDECARS and not c.get("readinessProbe")
     ]
-    if not missing:
+    if not behind:
         return None
+    # All the containers or none of them. A patch that gives readiness probes
+    # to two of three leaves this finding open on the third, and a finding its
+    # own remediation does not close is one the audit republishes every day.
+    copyable = [_readiness_from_liveness(container) for container in behind]
+    derivable = (
+        ""
+        if any(line is None for line in copyable)
+        else "\nreadiness derivable from the liveness probe: " + "; ".join(copyable)
+    )
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": (
-            f"Service-backed, containers missing a readiness probe: {', '.join(missing)}\n"
-            f"{_exposure_line(services)}"
+            "Service-backed, containers missing a readiness probe: "
+            f"{', '.join(c.get('name', '') for c in behind)}\n"
+            f"{_exposure_line(services)}{derivable}"
         ),
     }
 
@@ -1895,6 +1905,60 @@ def _probe_deadline_seconds(probe: dict) -> int:
     return probe.get("initialDelaySeconds", _PROBE_DEFAULT_INITIAL_DELAY_SECONDS) + (
         probe.get("failureThreshold", _PROBE_DEFAULT_FAILURE_THRESHOLD)
         * probe.get("periodSeconds", _PROBE_DEFAULT_PERIOD_SECONDS)
+    )
+
+
+#: Timings for a readiness probe copied from a liveness probe. The handler
+#: comes from the container; only the deadline is chosen here, and it has to
+#: land strictly inside the liveness one -- a readiness probe that gives up at
+#: the same moment is §3.18, planted by the fix that closed §3.9.
+_READINESS_FROM_LIVENESS_INITIAL_DELAY_SECONDS = 0
+_READINESS_FROM_LIVENESS_PERIOD_SECONDS = 5
+#: Half of the liveness budget, so the pod leaves the Service well before the
+#: kubelet restarts it rather than a second before.
+_READINESS_FROM_LIVENESS_BUDGET_DIVISOR = 2
+#: The period to fall back to where a liveness deadline is too tight to halve
+#: in 5-second steps.
+_READINESS_FROM_LIVENESS_TIGHT_PERIOD_SECONDS = 1
+
+
+def _readiness_from_liveness(container: dict) -> str | None:
+    """A readiness probe this container's own liveness probe already licenses.
+
+    §3.9's remediation is `manual` because a probe's path, port and timings are
+    application knowledge. That holds for a container declaring no probe at
+    all, and not for one declaring a liveness probe: the kubelet is already
+    calling that handler and the application is already answering it, or the
+    container would be restarting. Copying it into a readiness probe asks
+    nothing new of the workload, and turns the largest sub-case of a `manual`
+    finding into one a pull request can close.
+
+    Only the deadline is invented, and deliberately tighter than the liveness
+    deadline it comes from, so the pod leaves the Service before the kubelet
+    restarts it. Equal deadlines are the §3.18 antipattern -- a fix that
+    produced them would close this finding by opening that one on the same
+    container.
+
+    Returns the sentence the excerpt carries, or None where there is no
+    liveness handler to copy, or its deadline leaves no room beneath it.
+    """
+    liveness = container.get("livenessProbe")
+    handler = _probe_handler(liveness)
+    if handler is None:
+        return None
+    live_at = _probe_deadline_seconds(liveness)
+    period = _READINESS_FROM_LIVENESS_PERIOD_SECONDS
+    threshold = max(1, live_at // (period * _READINESS_FROM_LIVENESS_BUDGET_DIVISOR))
+    if period * threshold >= live_at:
+        period, threshold = _READINESS_FROM_LIVENESS_TIGHT_PERIOD_SECONDS, 1
+        if period >= live_at:
+            return None
+    ready_at = _READINESS_FROM_LIVENESS_INITIAL_DELAY_SECONDS + period * threshold
+    return (
+        f"{container.get('name', '')}: copy the liveness handler {handler[0]} {handler[1]}, "
+        f"with initialDelaySeconds {_READINESS_FROM_LIVENESS_INITIAL_DELAY_SECONDS}, "
+        f"periodSeconds {period}, failureThreshold {threshold} -- readiness then fails "
+        f"at ~{ready_at}s, inside liveness's ~{live_at}s"
     )
 
 
