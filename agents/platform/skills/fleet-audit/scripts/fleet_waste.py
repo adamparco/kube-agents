@@ -116,6 +116,14 @@ FLUX_HELM_REPOSITORY_KIND = "HelmRepository"
 # -- `helm install`, or Flux driving it -- by release namespace and name.
 RELEASE_KEY_APPLICATION = "application"
 RELEASE_KEY_RELEASE = "release"
+# A third key on that same index, answering a different question: not "where
+# is this object declared" but "where would a *new* object for this namespace
+# go". Only a local Kustomize root can answer it, because only a local root is
+# a directory in this repository that renders into the namespace. No check here
+# creates an object, so nothing in this file reads the key; it is built anyway
+# because `release_declarations` is a copy of `collect.py`'s and the copy is
+# kept identical, not trimmed to what one stream happens to use.
+RELEASE_KEY_NAMESPACE = "namespace"
 # Where a values override goes, per reconciler. Argo CD accepts both a YAML
 # string (`values`) and a structured block (`valuesObject`); this names the one
 # already in the file, and `valuesObject` when neither is, because a structured
@@ -2832,7 +2840,7 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
     chart. That is what sends a right-sizing finding to `manual` -- and
     right-sizing is the fix a pull request carries best, because `resources` is
     the one key nearly every chart publishes. See `collect.release_declarations`,
-    which holds the full reasoning, the two key shapes, and why `ApplicationSet`
+    which holds the full reasoning, the three key shapes, and why `ApplicationSet`
     is deliberately not indexed.
 
     Returns `{}` when PyYAML is absent or the clone is unreadable.
@@ -2956,6 +2964,12 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             # answers.
             if chart and release_namespace:
                 record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
+            # A local Kustomize root is also an answer to "where does a new
+            # object for this namespace go", which no other key gives. A chart
+            # is not: its directory is in another repository, and the values
+            # override that reaches an *existing* object cannot create one.
+            if overlay and release_namespace and entry["chart"]:
+                record((cluster, RELEASE_KEY_NAMESPACE, release_namespace), entry)
         elif kind == FLUX_HELM_RELEASE_KIND:
             # Flux is installed per-cluster, so the path convention is the only
             # cluster signal a HelmRelease carries.
