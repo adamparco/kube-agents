@@ -949,6 +949,138 @@ class TestBlockingPdb(unittest.TestCase):
         entry["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
         self.assertEqual(collect.check_blocking_pdb(self.ctx(entry)), [])
 
+    def test_a_percentage_that_rounds_up_to_the_whole_count_is_blocking(self):
+        # ceil(75% of 3) is 3, so this permits nothing -- the same hard block as
+        # minAvailable: 3, in the spelling that reads proportional.
+        hits = collect.check_blocking_pdb(self.ctx(pdb("p", min_available="75%"), replicas=3))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("desiredHealthy 3", hits[0]["excerpt"])
+        self.assertIn("0 evictions permitted", hits[0]["excerpt"])
+
+    def test_a_percentage_that_leaves_room_is_not_blocking(self):
+        # ceil(50% of 4) is 2, leaving two evictions.
+        self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="50%"), replicas=4)), [])
+
+    def test_any_percentage_over_a_floor_of_one_is_blocking(self):
+        # ceil of any non-zero fraction of 1 is 1, so even "1%" refuses the only
+        # pod there is. This is the shape a chart's default produces.
+        hits = collect.check_blocking_pdb(self.ctx(pdb("p", min_available="1%"), replicas=1))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("desiredHealthy 1", hits[0]["excerpt"])
+
+    def test_zero_percent_permits_everything(self):
+        self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="0%"), replicas=3)), [])
+
+    def test_a_percentage_is_resolved_against_the_hpa_floor(self):
+        # 50% of the five replicas running now is 3 of 5 and looks safe; 50% of
+        # the floor of 2 is 1 of 2, still safe. 60% of 2 is ceil(1.2) = 2, which
+        # is not. The floor is what decides, and only the floor.
+        safe = self.ctx(pdb("p", min_available="50%"), replicas=5, hpas=[hpa("h", min_replicas=2)])
+        self.assertEqual(collect.check_blocking_pdb(safe), [])
+        blocked = self.ctx(pdb("p", min_available="60%"), replicas=5, hpas=[hpa("h", min_replicas=2)])
+        hits = collect.check_blocking_pdb(blocked)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("minAvailable 60% of 2 resolves to desiredHealthy 2", hits[0]["excerpt"])
+
+    def test_a_malformed_percentage_falls_through_rather_than_raising(self):
+        # Not a shape the apiserver accepts, so there is nothing to resolve; the
+        # point is that it does not take the collector down with a ValueError.
+        self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="7.5%"), replicas=3)), [])
+
+    def test_a_percentage_over_a_workload_scaled_to_zero_is_not_reported(self):
+        # floor 0 makes the arithmetic meaningless, and there is nothing to
+        # evict either way. The guard is that it does not report, not that it
+        # divides by zero -- ceil(x * 0 / 100) is 0, which is >= 0.
+        self.assertEqual(collect.check_blocking_pdb(self.ctx(pdb("p", min_available="100%"), replicas=0)), [])
+
+
+class TestPdbOverlapping(unittest.TestCase):
+    def ctx(self, *pdb_entries, labels=None, ns="default", replicas=3):
+        d = deployment("api", ns=ns, **{"spec.replicas": replicas})
+        d["spec"]["template"]["metadata"] = {"labels": labels if labels is not None else {"app": "api"}}
+        return context_of(
+            pdbs={ns: list(pdb_entries)},
+            workloads=collect.normalize_workloads(dump_of(d)),
+        )
+
+    def test_two_budgets_over_one_workload_is_flagged(self):
+        ctx = self.ctx(pdb("chart-pdb", max_unavailable=1), pdb("hand-written", max_unavailable=1))
+        hits = collect.check_pdb_overlapping(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "Deployment/api")
+        self.assertIn("chart-pdb, hand-written", hits[0]["excerpt"])
+        self.assertIn("2 PodDisruptionBudgets", hits[0]["excerpt"])
+
+    def test_one_budget_is_the_norm_and_is_not_flagged(self):
+        self.assertEqual(collect.check_pdb_overlapping(self.ctx(pdb("only", max_unavailable=1))), [])
+
+    def test_a_second_budget_selecting_something_else_is_not_an_overlap(self):
+        elsewhere = pdb("other", max_unavailable=1, selector={"matchLabels": {"app": "worker"}})
+        self.assertEqual(collect.check_pdb_overlapping(self.ctx(pdb("mine", max_unavailable=1), elsewhere)), [])
+
+    def test_an_empty_selector_swallows_the_namespace_and_overlaps(self):
+        # policy/v1: `selector: {}` matches every pod in the namespace. This is
+        # the shape 3.3's remediation is forbidden from emitting, and the way a
+        # namespace-wide budget silently overlaps every workload in it.
+        catch_all = pdb("catch-all", max_unavailable=1, selector={})
+        hits = collect.check_pdb_overlapping(self.ctx(pdb("mine", max_unavailable=1), catch_all))
+        self.assertEqual(len(hits), 1)
+
+    def test_an_absent_selector_selects_nothing_and_does_not_overlap(self):
+        # The other half of the same distinction: null selects no pods, so
+        # collapsing it to {} the way selector_matches does would make every
+        # workload in a namespace holding one real budget read as covered twice.
+        null = pdb("null-selector", max_unavailable=1)
+        del null["spec"]["selector"]
+        self.assertEqual(collect.check_pdb_overlapping(self.ctx(pdb("mine", max_unavailable=1), null)), [])
+
+    def test_an_addon_budget_still_counts_toward_the_overlap(self):
+        # S2 suppresses a finding about an object nobody can edit; here the
+        # editable half is the user's budget, and the finding is the pair.
+        addon = pdb("gke-addon", max_unavailable=1)
+        addon["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        hits = collect.check_pdb_overlapping(self.ctx(pdb("mine", max_unavailable=1), addon))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("gke-addon is addon-managed", hits[0]["excerpt"])
+
+    def test_an_overlap_of_addon_budgets_alone_is_not_reported(self):
+        entries = []
+        for name in ("addon-a", "addon-b"):
+            entry = pdb(name, max_unavailable=1)
+            entry["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+            entries.append(entry)
+        self.assertEqual(collect.check_pdb_overlapping(self.ctx(*entries)), [])
+
+    def test_a_system_namespace_is_never_reported(self):
+        ctx = self.ctx(pdb("a", ns="kube-system"), pdb("b", ns="kube-system"), ns="kube-system")
+        self.assertEqual(collect.check_pdb_overlapping(ctx), [])
+
+    def test_three_budgets_report_once_naming_all_three(self):
+        ctx = self.ctx(pdb("c"), pdb("a"), pdb("b"))
+        hits = collect.check_pdb_overlapping(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("3 PodDisruptionBudgets: a, b, c", hits[0]["excerpt"])
+
+    def test_two_overlapped_workloads_report_separately(self):
+        # One catch-all budget beside two per-workload ones: two findings, each
+        # naming its own workload, because the fix may differ between them.
+        api = deployment("api", **{"spec.replicas": 2})
+        api["spec"]["template"]["metadata"] = {"labels": {"app": "api"}}
+        worker = deployment("worker", **{"spec.replicas": 2})
+        worker["spec"]["template"]["metadata"] = {"labels": {"app": "worker"}}
+        ctx = context_of(
+            pdbs={
+                "default": [
+                    pdb("catch-all", selector={}),
+                    pdb("api-pdb", selector={"matchLabels": {"app": "api"}}),
+                    pdb("worker-pdb", selector={"matchLabels": {"app": "worker"}}),
+                ]
+            },
+            workloads=collect.normalize_workloads(dump_of(api, worker)),
+        )
+        hits = collect.check_pdb_overlapping(ctx)
+        self.assertEqual([h["object"] for h in hits], ["Deployment/api", "Deployment/worker"])
+
 
 class TestNoHpa(unittest.TestCase):
     def wl(self, replicas=3, kind="Deployment"):
@@ -3752,11 +3884,12 @@ class TestCollectCluster(unittest.TestCase):
         # true of a cluster whose *workload* set is empty. 3.12, 3.15, 3.16 and
         # 3.17 in particular are only ever reachable this way -- neither a
         # CronJob nor a Service is a workload, so a cluster that holds nothing
-        # else still owes all four an answer. `hpa-floors-at-one` is the one
-        # cluster-scoped check that does need a workload -- it reads the HPA's
-        # target to ask whether a Service selects it -- and it is still not
-        # inapplicable here, because the question it asks is about HPAs and
-        # this cluster's answer is that it holds none.
+        # else still owes all four an answer. `hpa-floors-at-one` and
+        # `pdb-overlapping` are the two cluster-scoped checks that do need a
+        # workload -- the first reads the HPA's target to ask whether a Service
+        # selects it, the second counts the budgets reaching each workload --
+        # and neither is inapplicable here, because a cluster holding no HPA
+        # and no budget has answered both.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"}
         self.assertEqual(
             cluster_slugs,
@@ -3764,6 +3897,7 @@ class TestCollectCluster(unittest.TestCase):
                 "hpa-cannot-scale",
                 "hpa-floors-at-one",
                 "blocking-pdb",
+                "pdb-overlapping",
                 "schedule-never-succeeds",
                 "cronjob-runs-overlap",
                 "service-selects-nothing",

@@ -1394,6 +1394,29 @@ def _hpa_targeting(workload: dict, context: dict) -> dict | None:
     return None
 
 
+#: Suffix marking a Kubernetes `IntOrString` as a percentage, and the scale it
+#: is a percentage of. Named because `blocking-pdb` both tests for the suffix
+#: and divides by the scale, and the two have to agree about which spelling of
+#: `minAvailable` it is resolving.
+PDB_PERCENT_SUFFIX = "%"
+PDB_PERCENT_SCALE = 100
+
+
+def _percent_value(quantity) -> int | None:
+    """The number in a `"75%"`-shaped `IntOrString`, or None for anything else.
+
+    Kubernetes restricts the percentage form to whole numbers, so a value that
+    does not parse as one is not a percentage the apiserver would have accepted
+    and is left to the integer arm.
+    """
+    if not isinstance(quantity, str) or not quantity.endswith(PDB_PERCENT_SUFFIX):
+        return None
+    try:
+        return int(quantity[: -len(PDB_PERCENT_SUFFIX)])
+    except ValueError:
+        return None
+
+
 def check_blocking_pdb(context: dict) -> list[dict]:
     """Cluster-scoped: iterates PDBs, not workloads, because the finding is
     about the PDB's own shape. A PDB matching no workload (orphaned) or a
@@ -1414,6 +1437,16 @@ def check_blocking_pdb(context: dict) -> list[dict]:
     succeed is the 03:00 node upgrade, at the floor. `hpa-floors-at-one` makes
     the same correction to `single-replica`; both are the same mistake about
     the same field.
+
+    A percentage `minAvailable` is resolved rather than compared literally.
+    Kubernetes computes `desiredHealthy = ceil(pct * expectedCount)`, so
+    `minAvailable: "75%"` over three replicas is a desiredHealthy of three and
+    zero permitted evictions -- the identical hard block that `minAvailable: 3`
+    produces, written in the spelling people reach for precisely because it
+    looks proportional and therefore safe. Every percentage over a floor of one
+    resolves the same way, since `ceil` of any non-zero fraction of one is one.
+    `"100%"` used to be special-cased here and is now just the case where the
+    arithmetic is obvious.
     """
     hits = []
     for ns, pdbs in context["pdbs"].items():
@@ -1458,9 +1491,22 @@ def check_blocking_pdb(context: dict) -> list[dict]:
             if hpa is not None:
                 declared_floor = (hpa.get("spec") or {}).get("minReplicas")
                 floor = DEFAULT_HPA_MIN_REPLICAS if declared_floor is None else declared_floor
-            blocking = max_unavailable in (0, "0%") or min_available == "100%"
-            if isinstance(min_available, int) and matched is not None and min_available >= floor:
-                blocking = True
+            percent = _percent_value(min_available)
+            # What the disruption controller will require to be up, for the
+            # percentage spelling only -- the integer spelling is already the
+            # number, and `maxUnavailable` is a different computation the two
+            # unconditional arms below cover between them.
+            desired_healthy = (
+                math.ceil(percent * floor / PDB_PERCENT_SCALE)
+                if percent is not None and floor
+                else None
+            )
+            blocking = max_unavailable in (0, "0%")
+            if matched is not None:
+                if isinstance(min_available, int) and min_available >= floor:
+                    blocking = True
+                if desired_healthy is not None and desired_healthy >= floor:
+                    blocking = True
             if not blocking or matched is None or replicas == 0:
                 continue
             scale = f"replicas={replicas}"
@@ -1471,12 +1517,19 @@ def check_blocking_pdb(context: dict) -> list[dict]:
                     f"with minReplicas {floor}, which is the count the eviction API "
                     f"has to satisfy this budget at"
                 )
+            arithmetic = ""
+            if desired_healthy is not None:
+                arithmetic = (
+                    f"; minAvailable {min_available} of {floor} resolves to "
+                    f"desiredHealthy {desired_healthy}, leaving "
+                    f"{max(floor - desired_healthy, 0)} evictions permitted at the floor"
+                )
             hits.append(
                 {
                     "namespace": ns,
                     "object": f"PodDisruptionBudget/{name}",
                     "excerpt": f"maxUnavailable={max_unavailable!r} minAvailable={min_available!r} "
-                    f"against {matched['kind']}/{matched['name']} ({scale})",
+                    f"against {matched['kind']}/{matched['name']} ({scale}){arithmetic}",
                     # The PDB's own reconciler, not the matched workload's. The
                     # finding is about the PDB's shape and the fix edits the PDB,
                     # so a note naming what holds the Deployment would send the
@@ -1484,6 +1537,87 @@ def check_blocking_pdb(context: dict) -> list[dict]:
                     "reconciler": reconciler_of(meta),
                 }
             )
+    return hits
+
+
+#: Fewest budgets over one workload that the eviction subresource refuses. One
+#: is the norm; two is the outage. Named because the check tests for it and the
+#: excerpt reports the count, and the two have to mean the same thing.
+PDB_OVERLAP_MINIMUM = 2
+
+_IMPACT_PDB_OVERLAPPING = (
+    "The eviction API refuses every pod covered by more than one "
+    "PodDisruptionBudget, so node-pool upgrades, node auto-repair and "
+    "autoscaler scale-down all stall on this workload until one budget is "
+    "removed -- and both budgets report disruptions allowed while it happens."
+)
+
+
+def check_pdb_overlapping(context: dict) -> list[dict]:
+    """Cluster-scoped: a workload whose pods more than one PDB selects.
+
+    A second budget over the same pods is not additive protection, which is
+    what it looks like and why nobody removes it. `Eviction` on a pod matched
+    by two PDBs returns 500 -- `This pod has more than one PodDisruptionBudget,
+    which the eviction subresource does not support` -- so `kubectl drain`,
+    node-pool upgrades, auto-repair and scale-down all stop there. It is the
+    same outage `blocking-pdb` reports and it hides better: both budgets show a
+    healthy `status.disruptionsAllowed`, because each is computed as though it
+    were the only one, so every signal an operator would think to read says the
+    workload is evictable.
+
+    Anchored on workloads rather than on budgets, which decides two things.
+    `normalize_workloads` has already applied S1-S5, so the system namespaces
+    where GKE's own budgets overlap each other cost nothing and report nothing.
+    And the object named is the workload, not either budget: which of the two
+    should go is a judgement -- a chart's PDB beside a hand-written one, or one
+    broad budget catching a workload it was never meant to cover -- and naming
+    a budget would also make the finding id depend on which one sorted first,
+    so a run where that order changed would read as one finding resolving and
+    another appearing. 3.23 tells the model how to choose and §4 already
+    permits a remediation to edit a manifest other than the object it names.
+
+    S2 does *not* exclude a budget from the count. An addon-managed PDB
+    overlapping a user's is the most likely way a real fleet reaches this
+    state, and the eviction API does not care who wrote either one; suppressing
+    the addon's half would hide the finding whose fix -- narrow the user's
+    budget -- is the most clearly correct one there is. What S2 does is
+    suppress the finding where *every* covering budget is addon-managed, since
+    that is a drain block nobody can close, the reason 3.6 records.
+    """
+    hits = []
+    for workload in context["workloads"]:
+        covering = []
+        for pdb in context["pdbs"].get(workload["ns"], []):
+            # `policy/v1` splits the two spellings `selector_matches` collapses:
+            # an *empty* selector matches every pod in the namespace, an absent
+            # or null one matches none. Reading a missing selector as a match
+            # would make every workload in a namespace holding one budget look
+            # doubly covered.
+            selector = (pdb.get("spec") or {}).get("selector")
+            if selector is None or not selector_matches(selector, workload["pod_labels"]):
+                continue
+            covering.append(pdb)
+        if len(covering) < PDB_OVERLAP_MINIMUM:
+            continue
+        addon = [
+            (p.get("metadata") or {}).get("name", "")
+            for p in covering
+            if "addonmanager.kubernetes.io/mode" in ((p.get("metadata") or {}).get("labels") or {})
+        ]
+        if len(addon) == len(covering):
+            continue
+        names = sorted((p.get("metadata") or {}).get("name", "") for p in covering)
+        note = f"; {', '.join(sorted(addon))} is addon-managed and not the operator's to edit" if addon else ""
+        hits.append(
+            {
+                "namespace": workload["ns"],
+                "object": f"{workload['kind']}/{workload['name']}",
+                "excerpt": f"pods labelled {workload['pod_labels']} are selected by "
+                f"{len(covering)} PodDisruptionBudgets: {', '.join(names)}{note}",
+                "reconciler": workload.get("reconciler"),
+            }
+        )
     return hits
 
 
@@ -5414,6 +5548,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         "Blocks every node drain in this cluster indefinitely: node-pool "
         "upgrades, node auto-repair, and autoscaler scale-down all stall "
         "until a human deletes or edits this PDB.",
+    ),
+    CheckSpec(
+        "pdb-overlapping",
+        "cluster",
+        check_pdb_overlapping,
+        "critical",
+        None,
+        _IMPACT_PDB_OVERLAPPING,
     ),
     CheckSpec(
         "no-hpa",
