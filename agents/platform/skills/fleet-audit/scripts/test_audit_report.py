@@ -538,6 +538,7 @@ class BaseTestCase(unittest.TestCase):
                 "coverage_gaps": [],
                 "unpublished_candidates": [],
                 "wholly_unpublished_checks": [],
+                "uncorroborated_findings": [],
             },
             doc,
             NOW,
@@ -2987,6 +2988,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "coverage_gaps": [],
                 "unpublished_candidates": [],
                 "wholly_unpublished_checks": [],
+                "uncorroborated_findings": [],
                 "chat_summary": (
                     "Security & RBAC Posture Audit: 1 critical, 0 major, 0 minor "
                     "(1 new) — https://github.com/acme/fleet/issues/7"
@@ -3047,6 +3049,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "coverage_gaps": [],
                 "unpublished_candidates": [],
                 "wholly_unpublished_checks": [],
+                "uncorroborated_findings": [],
                 "chat_summary": (
                     "Security & RBAC Posture Audit: 2 critical, 0 major, 0 minor "
                     "(1 new, 1 resolved) — https://github.com/acme/fleet/issues/42"
@@ -5639,6 +5642,7 @@ class TestFinishClean(HarnessTestCase):
                 "coverage_gaps": [],
                 "unpublished_candidates": [],
                 "wholly_unpublished_checks": [],
+                "uncorroborated_findings": [],
                 "chat_summary": (
                     "Security & RBAC Posture Audit: clean, ledger closed "
                     "(2 resolved) — https://github.com/acme/fleet/issues/42"
@@ -5784,6 +5788,7 @@ class TestFinishClean(HarnessTestCase):
                 "coverage_gaps": [],
                 "unpublished_candidates": [],
                 "wholly_unpublished_checks": [],
+                "uncorroborated_findings": [],
                 "chat_summary": "[SILENT]",
             },
         )
@@ -7793,6 +7798,176 @@ class TestWhollyUnpublishedChecks(BaseTestCase):
         groups = audit_report.wholly_unpublished_checks([], m)
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(groups[0]["objects"]), 7)
+
+
+def _ran(cluster, *slugs, candidates=None, rc=0):
+    """A manifest entry recording that the collector ran these checks here."""
+    return {
+        "name": cluster,
+        "commands": [{"check": s, "rc": rc, "command": f"kubectl get {s}"} for s in slugs],
+        "candidates": list(candidates or []),
+    }
+
+
+def _pub(fid, check, cluster, obj, namespace=""):
+    """A published finding whose derived id lines up with `_cand`'s.
+
+    Both sides of the join are `(check, cluster, namespace, object)`, and
+    `_cand` leaves the namespace empty; `make_finding` defaults it to
+    `payments`, which would put every finding here in a different bucket from
+    the candidate it is meant to match.
+    """
+    return make_finding(fid=fid, check=check, cluster=cluster, obj=obj, namespace=namespace)
+
+
+def _titled(fid, severity, title):
+    """A manifest finding with a title of its own, which the ledger renders."""
+    return make_finding(
+        fid=fid,
+        severity=severity,
+        title=title,
+        remediation={"kind": "manifest", "path": f"{fid}.yaml", "note": "n"},
+    )
+
+
+class TestUncorroboratedFindings(BaseTestCase):
+    """A finding filed under a check the collector ran and did not flag it for.
+
+    On 2026-09-07 `fleet-wide-cost-analysis` published two findings under
+    `check: "idle-workload"` for the two `ai-inference` Deployments. That check
+    gates on a 14-day controller age; both were 7.6 days old, so it emitted
+    nothing for either and `check_overrequest` emitted both instead. The
+    findings graded `major`, carried `Set spec.replicas: 0`, cleared the
+    auto-promotion floor, and merged nineteen seconds after opening.
+    """
+
+    def test_a_finding_matching_its_candidate_is_corroborated(self):
+        m = {"clusters": [_ran("c1", "overrequest", candidates=[_cand("overrequest", "c1", "deploy/a")])]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "overrequest", "c1", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_the_reslug_is_caught(self):
+        """The event itself: published under a slug whose check ran and passed."""
+        m = {"clusters": [_ran("c1", "overrequest", "idle-workload", candidates=[_cand("overrequest", "c1", "deploy/a")])]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c1", "deploy/a")], m
+            ),
+            {"f1"},
+        )
+
+    def test_a_check_the_collector_never_ran_is_silent(self):
+        """The manual fallback. A slug absent from `commands` corroborates
+        nothing either way, and every stream depends on the model being able to
+        publish there.
+        """
+        m = {"clusters": [_ran("c1", "overrequest")]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "probes-liveness", "c1", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_failed_command_is_not_corroboration(self):
+        """`rc != 0` is a check that tried and could not read the cluster."""
+        m = {"clusters": [_ran("c1", "idle-workload", rc=1)]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c1", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_check_run_on_another_cluster_does_not_reach_this_one(self):
+        m = {"clusters": [_ran("c1", "idle-workload"), _ran("c2")]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c2", "deploy/a")], m
+            ),
+            set(),
+        )
+
+    def test_a_second_object_under_a_check_that_did_flag_one(self):
+        """Exhaustiveness is the premise: a check that ran flagged everything it
+        found, so an object it omitted is one it passed, not one it missed.
+        """
+        m = {"clusters": [_ran("c1", "no-pdb", candidates=[_cand("no-pdb", "c1", "deploy/a")])]}
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [
+                    _pub("a", "no-pdb", "c1", "deploy/a"),
+                    _pub("b", "no-pdb", "c1", "deploy/b"),
+                ],
+                m,
+            ),
+            {"b"},
+        )
+
+    def test_no_manifest_corroborates_nothing_and_blocks_nothing(self):
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [_pub("f1", "idle-workload", "c1", "deploy/a")], None
+            ),
+            set(),
+        )
+
+    def test_the_sweep_passes_over_it_and_says_so(self):
+        plan = audit_report.promotion_candidates(
+            [
+                manifest_finding("backed", "a.yaml", severity="major"),
+                manifest_finding("unbacked", "b.yaml", severity="major"),
+            ],
+            {},
+            uncorroborated={"unbacked"},
+        )
+        self.assertEqual(plan.promote, ["backed"])
+        self.assertEqual(plan.uncorroborated, ["unbacked"])
+        # Not filed under severity: the grade is not what refused it, and
+        # `below_floor` is rendered as an invitation.
+        self.assertEqual(plan.below_floor, [])
+
+    def test_an_explicit_remediate_still_opens_it(self):
+        """A person who reads the finding and names it has supplied the
+        judgement the collector withheld. Gating that too would leave no way to
+        act on a real finding a collector's own gate happens to exclude.
+        """
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("unbacked", "b.yaml", severity="major")],
+            {},
+            ["unbacked"],
+            uncorroborated={"unbacked"},
+        )
+        self.assertEqual(plan.promote, ["unbacked"])
+        self.assertEqual(plan.uncorroborated, [])
+
+    def test_the_ledger_names_it_apart_from_the_floor(self):
+        body = "\n".join(
+            audit_report._render_withheld(
+                [],
+                [
+                    _titled("min", "minor", "A minor thing"),
+                    _titled("unbacked", "major", "A stand-down"),
+                ],
+                ["min"],
+                ["unbacked"],
+            )
+        )
+        self.assertIn("2 finding(s) carry a manifest remediation", body)
+        self.assertIn("Read these before asking", body)
+        self.assertIn("`unbacked` — A stand-down", body)
+        self.assertIn("`min` — A minor thing", body)
+        # The floor's sentence must not annex the uncorroborated one: they are
+        # separate blocks because one invites `/remediate` and one warns first.
+        floor_at = body.index(f"Graded below `{audit_report.AUTO_PROMOTION_FLOOR}`")
+        self.assertLess(floor_at, body.index("Read these before asking"))
+
+    def test_nothing_renders_when_all_three_are_empty(self):
+        self.assertEqual(audit_report._render_withheld([], [], [], []), [])
 
 
 class TestBelowFloorDisclosure(BaseTestCase):
@@ -9985,6 +10160,7 @@ class TestReportStore(HarnessTestCase):
                 # Nothing else in this envelope records that a drop happened:
                 # the check still reports as run, `coverage_gaps` is still
                 # empty, and `partial` is still false.
+                "uncorroborated_findings",
                 "unpublished_candidates",
                 "wholly_unpublished_checks",
             ],

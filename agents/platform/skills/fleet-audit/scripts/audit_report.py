@@ -2358,6 +2358,10 @@ def report_envelope(
         "wholly_unpublished_checks": list(
             payload.get("wholly_unpublished_checks") or []
         ),
+        # The same join from the finding's end: published under a slug the
+        # collector ran and did not flag them for. Stored beside the two above
+        # because a re-slug shows up in both and is only visible in the pair.
+        "uncorroborated_findings": list(payload.get("uncorroborated_findings") or []),
         "collect_s": payload.get("collect_s"),
         "inspect_s": payload.get("inspect_s"),
         "publish_s": payload.get("publish_s"),
@@ -4716,6 +4720,68 @@ def collector_flagged_ids(manifest: dict | None) -> set[str]:
     return flagged
 
 
+def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[str]:
+    """Findings published under a slug the collector ran and did not flag them for.
+
+    The inverse of `unpublished_candidates`, and the direction nothing was
+    watching. That one asks what the collector saw and the document did not
+    repeat; this asks what the document says the collector saw and it did not.
+    A check whose command the collector ran to `rc == 0` on a cluster is
+    exhaustive over that cluster — it derives its candidates from the live API,
+    so an object it did not emit is an object it looked at and passed. A finding
+    published under that slug for that object is not a judgement about a
+    candidate. It is a verdict attributed to a collector that returned the
+    opposite one.
+
+    `fleet-wide-cost-analysis` did that on 2026-09-07 and it cost two live
+    Deployments. `check_idle_workload` gates on
+    `IDLE_WORKLOAD_MIN_AGE_DAYS = 14`; both `ai-inference` Deployments were 7.6
+    days old, so it emitted nothing for either and `check_overrequest` — whose
+    stand-down test hits the same bar — emitted both. The document carried two
+    findings under `check: "idle-workload"` for those exact objects, graded
+    `major`, remediation `Set spec.replicas: 0`, with the excerpt `Created
+    2026-08-30 (>14 days)`. No format string in the collector produces that
+    sentence; the age it asserts is off by a factor of two and is the only thing
+    in the finding that makes the stand-down look admissible. Both cleared
+    `AUTO_PROMOTION_FLOOR`, opened as pull requests, and auto-merged nineteen
+    seconds later. `adopt_collector_evidence` could not correct the prose,
+    because the re-slug is what made it a finding with no matching candidate,
+    which is the state that function documents as legitimate.
+
+    What this returns is used to withhold *auto*-promotion, not to drop the
+    finding. Publishing it is right: the model may well have seen something, and
+    the operator is the one who should hear about it. Opening a pull request on
+    it with no human in the loop is the part that cannot be justified, because
+    the only thing standing behind the sweep is that a deterministic collector
+    confirmed the condition — and here one declined to. `/remediate <id>` still
+    works, and should: a person who reads the finding and asks for it by name
+    has supplied the judgement the collector withheld.
+
+    Silent on everything else. A check the collector never ran, ran to a
+    non-zero `rc`, or declared not applicable corroborates nothing either way,
+    and the model's own inspection is then the only reading there is — that is
+    the manual fallback every stream depends on, and this must not touch it.
+    """
+    if not manifest:
+        return set()
+    ran: dict[str, set[str]] = {}
+    for entry in manifest.get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        ran.setdefault(str(entry.get("name") or ""), set()).update(
+            str(command.get("check") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0
+        )
+    flagged = collector_flagged_ids(manifest)
+    return {
+        str(finding.get("id") or "")
+        for finding in findings
+        if str(finding.get("check") or "") in ran.get(str(finding.get("cluster") or ""), set())
+        and derive_finding_id(finding) not in flagged
+    }
+
+
 def _candidate_rows(manifest: dict | None) -> list[dict]:
     """Every collector candidate, keyed and labelled the way a finding is.
 
@@ -5842,6 +5908,11 @@ class PromotionPlan(NamedTuple):
     # reported separately rather than folded in. Empty when `auto_promote` is
     # off, because the `remediate` subcommand runs no sweep to be blocked by.
     below_floor: list[str] = []
+    # Manifest findings the sweep passed over because the collector ran their
+    # check and did not flag them. Reported apart from `below_floor` because the
+    # answer differs: severity invites `/remediate` on a fix everyone agrees on,
+    # this invites a human to check whether the finding is real first.
+    uncorroborated: list[str] = []
 
 
 def promotion_candidates(
@@ -5851,6 +5922,7 @@ def promotion_candidates(
     cap: int = AUTO_PROMOTION_CAP,
     requested_at: dict[str, str] | None = None,
     auto_promote: bool = True,
+    uncorroborated: set[str] | None = None,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
@@ -5885,6 +5957,14 @@ def promotion_candidates(
     It is returned so the ledger can name it, because on a real fleet it is the
     filter that stops nearly everything and the cap is the one that stops
     nothing: see `_render_withheld` for the measurement.
+
+    `uncorroborated` is the one filter here that is not about volume. Everything
+    else in the sweep asks whether this fix is worth opening unattended; that
+    asks whether a deterministic collector agreed the problem exists, which is
+    the only reason opening one unattended is defensible at all.
+    `uncorroborated_findings` computes the set and gives the two Deployments it
+    was written for. It gates the sweep and nothing else: an explicit
+    `/remediate` is handled in the loop above and never consults it.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
@@ -5922,6 +6002,8 @@ def promotion_candidates(
 
     auto: list[str] = []
     below_floor: list[str] = []
+    unbacked: list[str] = []
+    uncorroborated_set = uncorroborated or set()
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
@@ -5930,6 +6012,15 @@ def promotion_candidates(
             continue
         pr = pr_by_finding.get(fid)
         if pr is not None and not pr_closed_by_harness(pr):
+            continue
+        # Ahead of severity, because a finding the collector declined to make is
+        # not a finding whose grade is worth discussing, and `below_floor`
+        # invites `/remediate` on whatever lands in it. See
+        # `uncorroborated_findings` for what the sweep is standing on and why
+        # this stops only the sweep: the `requested_set` arm above never reaches
+        # here, so a human can still ask for it by name.
+        if fid in uncorroborated_set:
+            unbacked.append(fid)
             continue
         # Severity is tested last of the three, which is the only order that
         # can tell the floor's refusals apart from the rest. Tested first, a
@@ -5951,7 +6042,9 @@ def promotion_candidates(
         auto.append(fid)
 
     promote.extend(auto[:cap])
-    return PromotionPlan(promote, auto[cap:], already_open, superseded, below_floor)
+    return PromotionPlan(
+        promote, auto[cap:], already_open, superseded, below_floor, unbacked
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -6753,6 +6846,7 @@ def _render_withheld(
     withheld: list[str],
     findings: list[dict],
     below_floor: list[str] | None = None,
+    uncorroborated: list[str] | None = None,
 ) -> list[str]:
     """Name the manifest fixes this run opened no pull request for.
 
@@ -6774,11 +6868,15 @@ def _render_withheld(
     -- defence-in-depth a reader may reasonably never ask for -- rather than
     the whole declarative output of the fleet.
 
-    Both are named, in separate blocks, because the answer to them differs: the
-    cap clears itself on the next run, and the floor never does.
+    Each is named in its own block, because the answer to them differs: the cap
+    clears itself on the next run, the floor never does, and the third one is
+    not an invitation at all. A finding the collector ran the check for and
+    declined to flag is one to read before asking for anything — see
+    `uncorroborated_findings` for the two Deployments that cost.
     """
     floor = list(below_floor or [])
-    if not withheld and not floor:
+    unbacked = list(uncorroborated or [])
+    if not withheld and not floor and not unbacked:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
 
@@ -6792,10 +6890,10 @@ def _render_withheld(
         "",
         "## Awaiting `/remediate`",
         "",
-        f"{len(withheld) + len(floor)} finding(s) carry a manifest remediation "
-        "this run opened no pull request for. Comment `/remediate <finding-id>` "
-        "to open any of them now — an explicit request is neither capped nor "
-        "held to the severity floor.",
+        f"{len(withheld) + len(floor) + len(unbacked)} finding(s) carry a "
+        "manifest remediation this run opened no pull request for. Comment "
+        "`/remediate <finding-id>` to open any of them now — an explicit request "
+        "is neither capped nor held to the severity floor.",
         "",
     ]
     if withheld:
@@ -6814,6 +6912,18 @@ def _render_withheld(
             "sweep will pass over these again every run until someone asks:",
             "",
             *rows(floor),
+            "",
+        ]
+    if unbacked:
+        out += [
+            "**Read these before asking.** The collector ran the check each one "
+            "is filed under and did not flag that object, so what stands behind "
+            "the rest of this list — a deterministic re-derivation from the live "
+            "API — does not stand behind these. The sweep will not open a pull "
+            "request on its own; `/remediate` still will, and is your judgement "
+            "rather than the collector's:",
+            "",
+            *rows(unbacked),
             "",
         ]
     while out and out[-1] == "":
@@ -7017,6 +7127,7 @@ def render_issue_body(
     pr_urls: dict[str, str] | None = None,
     withheld: list[str] | None = None,
     below_floor: list[str] | None = None,
+    uncorroborated: list[str] | None = None,
     repo: str | None = None,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
@@ -7047,7 +7158,7 @@ def render_issue_body(
     fixed: list[str] = _render_header(audit_id)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id)
     withheld_section = _render_withheld(
-        list(withheld or []), findings, list(below_floor or [])
+        list(withheld or []), findings, list(below_floor or []), list(uncorroborated or [])
     )
 
     # Measure the footer with an empty delta block: each finding is separately
@@ -10525,7 +10636,9 @@ def _handle_finish_dry_run(
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
-    plan = promotion_candidates(findings, {})
+    plan = promotion_candidates(
+        findings, {}, uncorroborated=uncorroborated_findings(findings, manifest)
+    )
 
     # Groups over the whole finding set, filtered to those holding a promoted
     # id — identical to `_open_promoted_prs`. Grouping the promoted subset in
@@ -10556,6 +10669,11 @@ def _handle_finish_dry_run(
             f"BELOW THE `{AUTO_PROMOTION_FLOOR}` FLOOR "
             f"({len(plan.below_floor)}): {', '.join(plan.below_floor)}"
         )
+    if plan.uncorroborated:
+        log(
+            "THE COLLECTOR RAN THIS CHECK AND DID NOT FLAG THESE "
+            f"({len(plan.uncorroborated)}): {', '.join(plan.uncorroborated)}"
+        )
     rendered = render_issue_body(
         data,
         generated_at=now,
@@ -10564,6 +10682,7 @@ def _handle_finish_dry_run(
         states=states,
         withheld=plan.withheld,
         below_floor=plan.below_floor,
+        uncorroborated=plan.uncorroborated,
         repo=repo,
     )
     if rendered.partial:
@@ -11145,6 +11264,18 @@ def handle_finish(args: argparse.Namespace) -> None:
     # back for space still counts as accounted for.
     unpublished = unpublished_candidates(findings, manifest)
     wholly_dropped = wholly_unpublished_checks(findings, manifest)
+    # The same join read the other way round. Recorded beside the two above
+    # because on a re-slug they are one event seen from opposite ends -- the
+    # candidate reads as dropped, the finding reads as ordinary -- and only
+    # having both in the report makes them joinable.
+    uncorroborated = sorted(uncorroborated_findings(findings, manifest))
+    if uncorroborated:
+        log(
+            f"NOTE: {len(uncorroborated)} finding(s) are filed under a check the "
+            "collector ran on their cluster without flagging that object. The "
+            "automatic sweep will pass over them; `/remediate` still works. "
+            f"{', '.join(uncorroborated)}"
+        )
     if unpublished:
         log(
             f"NOTE: {len(unpublished)} collector candidate(s) are absent from this "
@@ -11507,6 +11638,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             "coverage_gaps": gaps,
             "unpublished_candidates": unpublished,
             "wholly_unpublished_checks": wholly_dropped,
+            "uncorroborated_findings": uncorroborated,
             "inspect_s": inspect_s,
             "publish_s": round(time.monotonic() - entry_mono, 1),
             "collect_s": collect_s,
@@ -11594,7 +11726,14 @@ def handle_finish(args: argparse.Namespace) -> None:
         pr_by_finding,
         requests.targets,
         requested_at=requests.requested_at,
+        uncorroborated=uncorroborated_findings(findings, manifest),
     )
+    for fid in plan.uncorroborated:
+        log(
+            f"{fid}: the collector ran this check on this cluster and emitted no "
+            "candidate for this object, so the sweep will not open a pull request "
+            f"on it. Comment `/remediate {fid}` if you have read it and want one."
+        )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
     sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
@@ -11616,6 +11755,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         pr_urls=pr_urls,
         withheld=plan.withheld,
         below_floor=plan.below_floor,
+        uncorroborated=plan.uncorroborated,
         repo=repo,
     )
     if rendered.partial:
@@ -11783,6 +11923,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 pr_urls=pr_urls,
                 withheld=plan.withheld,
                 below_floor=plan.below_floor,
+                uncorroborated=plan.uncorroborated,
                 repo=repo,
             )
             relink = _write_temp(relinked.body)
@@ -11908,6 +12049,7 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "coverage_gaps": gaps,
                 "unpublished_candidates": unpublished,
                 "wholly_unpublished_checks": wholly_dropped,
+                "uncorroborated_findings": uncorroborated,
                 "inspect_s": inspect_s,
                 "publish_s": round(time.monotonic() - entry_mono, 1),
                 "collect_s": collect_s,

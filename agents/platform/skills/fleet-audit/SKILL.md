@@ -459,6 +459,19 @@ field, and publishes nothing:
 
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
+
+  **Where a candidate exists for the object, `check` is that candidate's own slug.** Re-filing it
+  under a different slug is not a stylistic choice about which SOP section reads best: the harness
+  joins findings to candidates on `(check, cluster, namespace, object)`, so a re-slug severs the
+  finding from the collector output that produced it. On 2026-09-07 the cost stream took two
+  `overrequest` candidates and published them under `idle-workload`, whose own gate — a 14-day
+  controller age — had excluded both at 7.6 days. The findings graded `major`, cleared the
+  auto-promotion floor with nothing deterministic standing behind them, and merged a scale-to-zero
+  nineteen seconds after opening. A finding filed under a slug the collector ran on that cluster
+  without flagging that object is now published with the sweep passed over it, listed in the
+  ledger's _Awaiting `/remediate`_ block under its own heading. If a candidate reads better under
+  another section, say so in `impact` or `recommendation` and leave `check` alone.
+
 - **Do not write an `id`.** The harness derives it as `<check>.<cluster>.<namespace>.<object>` — one
   grammar for all audit streams — lowercasing each part, replacing every run of non-alphanumerics
   with `-`, and substituting `_` for an absent namespace. Any `id` in the document is discarded.
