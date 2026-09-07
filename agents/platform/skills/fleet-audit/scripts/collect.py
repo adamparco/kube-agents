@@ -2093,24 +2093,35 @@ _EXCLUSIVE_ACCESS_MODES = frozenset({"ReadWriteOnce", "ReadWriteOncePod"})
 DEFAULT_MAX_SURGE = "25%"
 
 _IMPACT_RWO_ROLLOUT_DEADLOCK = (
-    "Every rollout of this workload deadlocks and it silently stops taking "
-    "updates. The default strategy starts a replacement pod before the old one "
-    "is gone, both pods claim the same ReadWriteOnce volume, and the scheduler "
-    "has no reason to place the new pod on the node holding it -- so the "
-    "replacement sits in ContainerCreating with a Multi-Attach error until the "
-    "progress deadline expires. The old pod is never deleted, so nothing goes "
-    "down and no alert fires: the Deployment keeps serving the image it was "
-    "already running, and every later change, security patch included, is "
-    "accepted by the API server and never reaches a container."
+    "Whether this workload can be updated is decided by the scheduler rather "
+    "than by anything in its manifest. The default strategy starts a "
+    "replacement pod before the old one is gone, and both claim the same "
+    "ReadWriteOnce volume -- which is attachable by one node at a time, not by "
+    "one pod. Placed beside the original the replacement starts normally and "
+    "the rollout completes. Placed on any other node it sits in "
+    "ContainerCreating with a Multi-Attach error until the progress deadline "
+    "expires, and that is the outcome whenever the volume's node cannot take a "
+    "second copy: it is full, it is cordoned for an upgrade, or an affinity "
+    "rule sends the pod elsewhere. A workload given a volume of its own is "
+    "usually sized so that a second copy does not fit beside it. **When it "
+    "does deadlock, the failure is silent.** maxUnavailable will not let the "
+    "old pod leave until the replacement is ready and the replacement never "
+    "will be, so nothing goes down and no alert fires: the Deployment keeps "
+    "serving the image it was already running, and every later change, "
+    "security patch included, is accepted by the API server and reaches no "
+    "container."
 )
 
 _IMPACT_RWO_REPLICAS_PINNED = (
-    "This workload cannot reach the replica count it declares. Its replicas "
-    "all claim one ReadWriteOnce volume, which one node holds at a time, so "
-    "every pod the scheduler places elsewhere stays in ContainerCreating with "
-    "a Multi-Attach error. What runs is one pod, and the capacity and "
-    "redundancy the manifest asks for are not there -- while the Deployment's "
-    "own replica field, and every dashboard reading it, says they are."
+    "This workload reaches the replica count it declares only for as long as "
+    "every one of its pods happens to be on the same node. They all claim one "
+    "ReadWriteOnce volume, which is attachable by one node at a time, and the "
+    "scheduler spreads the pods of a ReplicaSet by default -- so any pod "
+    "placed away from the volume stays in ContainerCreating with a "
+    "Multi-Attach error. The redundancy the manifest asks for is the thing "
+    "this costs: pods that did co-locate share the fate of that one node, and "
+    "pods that did not never start. Either way the Deployment's replica field, "
+    "and every dashboard reading it, reports capacity that is not there."
 )
 
 
@@ -2188,28 +2199,43 @@ def _exclusive_claims(workload: dict, context: dict) -> list[str]:
 def check_rwo_claim_contended(workload: dict, context: dict) -> dict | None:
     """3.21 -- two pods sent to one volume only one node can hold.
 
-    A `ReadWriteOnce` claim is attached to a single node at a time. Put two
-    pods that can coexist behind one, and whichever the scheduler places on
-    the other node never starts: the volume cannot be attached twice, and the
-    kubelet reports `Multi-Attach error for volume` until something gives.
+    A `ReadWriteOnce` claim is attached by one **node** at a time -- not by one
+    pod, which is what `ReadWriteOncePod` means and why the two modes both
+    exist. Put two pods that can coexist behind one claim and the outcome is
+    the scheduler's to decide: co-located they both mount it and nothing is
+    wrong, separated the second sits in ContainerCreating with a
+    `Multi-Attach error for volume` until something gives.
 
-    Two shapes reach that state and this check reports both, because they are
-    the same cause and take different fixes.
+    That conditionality is the reason this is worth reporting rather than a
+    reason not to. Nothing in the manifest decides which way it goes, so the
+    workload's ability to be updated depends on free capacity on one
+    particular node -- and the moments that capacity disappears are exactly
+    the moments the rollout matters: the node filled up, or it was cordoned
+    for an upgrade. A workload given a volume of its own is also usually sized
+    so a second copy does not fit beside it in the first place. Measured on a
+    GKE Autopilot cluster, a single-replica Deployment small enough to double
+    up on its node rolled cleanly twice in a row; the finding on it is latent,
+    and the fix is what keeps it latent.
+
+    Two shapes reach the contended state and this check reports both, because
+    they are the same cause and take different fixes.
 
     The first is a rollout. `RollingUpdate` -- the default, and the strategy of
     a Deployment that never mentions one -- creates the replacement before
-    removing the original, so the two overlap by design. **The failure this
-    produces is silence.** No pod goes down, because the old one is not
-    permitted to leave until the new one is ready and the new one never will
-    be; the Deployment reports `Available` throughout, the rollout eventually
-    records `ProgressDeadlineExceeded`, and the workload carries on serving
-    the image it was already running. Every subsequent change is accepted by
-    the API server and lands nowhere, which is how a workload with a fully
-    reconciled GitOps repository behind it can sit on a year-old image.
+    removing the original, so the two overlap by design. **When it does
+    deadlock, the failure is silence.** No pod goes down, because the old one
+    is not permitted to leave until the new one is ready and the new one never
+    will be; the Deployment reports `Available` throughout, the rollout
+    eventually records `ProgressDeadlineExceeded`, and the workload carries on
+    serving the image it was already running. Every subsequent change is
+    accepted by the API server and lands nowhere, which is how a workload with
+    a fully reconciled GitOps repository behind it can sit on a year-old image.
 
     The second is a replica count. Above one replica the pods coexist by
-    definition rather than during a rollout, so all but one stay pending
-    forever and the declared capacity is fiction.
+    definition rather than during a rollout, and the scheduler spreads a
+    ReplicaSet's pods across nodes by default -- so what does not co-locate
+    stays pending, and what does co-locate has given up the redundancy the
+    replica count was asking for.
 
     That first shape is very common and it is the one worth a check, because
     every other reading of the object says the workload is fine. It needs no
