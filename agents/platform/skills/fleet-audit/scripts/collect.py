@@ -3684,6 +3684,152 @@ def check_wildcard_rbac(context: dict) -> list[dict]:
     return hits
 
 
+# The two subjects that name a caller which presented no credential at all.
+# `system:anonymous` is the user the API server assigns such a request;
+# `system:unauthenticated` is the group it puts that user in. They are
+# interchangeable in a binding, so a check reading one and not the other
+# reports half of the shape.
+_ANONYMOUS_SUBJECTS = frozenset({"system:anonymous", "system:unauthenticated"})
+
+# Every principal that did present a credential. On GKE that is every Google
+# account with `container.clusters.get` on the project, which is a set nobody
+# enumerated and one that grows with the project's IAM rather than with any
+# decision about this cluster.
+_AUTHENTICATED_SUBJECT = "system:authenticated"
+
+_IMPACT_ANONYMOUS_RBAC_ANONYMOUS = (
+    "This binding grants a caller that presented no credential at all. Every "
+    "other control in the cluster -- Workload Identity, ServiceAccount tokens, "
+    "authorized networks, the whole of RBAC -- is written on the assumption "
+    "that reaching the API server means holding an identity, and this binding "
+    "removes that assumption for the resources it names. If the control plane "
+    "has a public endpoint, the caller is the internet."
+)
+
+_IMPACT_ANONYMOUS_RBAC_AUTHENTICATED = (
+    "This binding grants write access to `system:authenticated`, which is not "
+    "a team -- it is every principal the API server accepts a credential from. "
+    "On GKE that is every Google account holding `container.clusters.get` on "
+    "the project, so the set of people who can write to this cluster is "
+    "whatever the project's IAM happens to say today, and it widens every time "
+    "someone is added to the project for an unrelated reason."
+)
+
+
+def _rules_of_role_ref(context: dict, role_ref: dict, namespace: str) -> list[dict] | None:
+    """The rules of the Role or ClusterRole a binding names, or `None` if absent.
+
+    `None` and `[]` are different answers and the caller has to tell them
+    apart: an empty rule list is a role that grants nothing, while a missing
+    role is a binding pointing at an object that does not exist, which grants
+    nothing today and everything the role is written to grant on the day
+    someone creates it.
+    """
+    kind, name = role_ref.get("kind"), role_ref.get("name")
+    for role in context.get("roles") or []:
+        meta = role.get("metadata") or {}
+        if role.get("kind") != kind or meta.get("name") != name:
+            continue
+        # A ClusterRole is cluster-scoped, so the binding's namespace does not
+        # narrow which one it means; a Role only resolves inside its own.
+        if kind == "Role" and meta.get("namespace", "") != namespace:
+            continue
+        return role.get("rules") or []
+    return None
+
+
+def _rules_write(rules: list[dict]) -> list[str]:
+    """The escalating verbs these rules carry, sorted, or `[]` for read-only."""
+    return sorted({verb for rule in rules for verb in (rule.get("verbs") or []) if verb in _ESCALATING_VERBS or verb == "*"})
+
+
+def check_anonymous_rbac_binding(context: dict) -> list[dict]:
+    """§2.16 -- a binding whose subject is everyone rather than someone.
+
+    §2.4 and §2.5 both run every subject through `_is_non_system_subject`,
+    which returns `False` for any `User` or `Group` whose name starts
+    `system:`. That exclusion is load-bearing and correct for what it was
+    written for: GKE ships dozens of `system:`-prefixed bootstrap bindings on
+    every cluster, and reporting them was the flood §1 exists to avoid. What
+    it also swallows is the three `system:` subjects that are not a component
+    identity but a wildcard over callers -- `system:anonymous`,
+    `system:unauthenticated`, and `system:authenticated`. So the single worst
+    RBAC mistake anyone makes is the one shape those two checks are
+    structurally unable to report, and it stays invisible however severe the
+    role behind it is: a ClusterRoleBinding of `cluster-admin` to
+    `system:anonymous` produces nothing from either.
+
+    It is a mistake people make on purpose. `kubectl create clusterrolebinding
+    <x> --clusterrole=cluster-admin --user=system:anonymous` is the accepted
+    answer to a dozen "my dashboard says forbidden" questions, and
+    `--group=system:authenticated` is how a team gets `edit` without anyone
+    writing down who is on it.
+
+    The two arms are graded differently because they fail differently. For an
+    anonymous subject any role at all is the finding, resolved or not: `view`
+    bound to `system:anonymous` hands every ConfigMap and every pod spec in
+    the cluster to whoever can reach the endpoint. For
+    `system:authenticated` the role decides, and a read-only one is not
+    reported at all -- `view` bound to that group is how a great many
+    organisations make a cluster browsable, `_sa_grant_is_universal` already
+    treats it as a legitimate posture rather than a defect, and a check that
+    called it critical here would be arguing with the same file.
+
+    `_BASELINE_AUTHENTICATED_ROLES` is the four roles Kubernetes itself binds
+    this way on every cluster. They are excluded rather than reported and
+    downgraded, because they are not a choice anyone made.
+
+    `system:serviceaccounts` is deliberately absent. It is universal in the
+    same way, but it names workloads rather than people, the remediation is a
+    different one, and §2.14 already reasons about it where it matters.
+    """
+    hits = []
+    for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or []):
+        role_ref = binding.get("roleRef") or {}
+        if role_ref.get("name") in _BASELINE_AUTHENTICATED_ROLES:
+            continue
+        meta = binding.get("metadata") or {}
+        namespace = meta.get("namespace", "")
+        kind = binding.get("kind") or ""
+        for subject in binding.get("subjects") or []:
+            if subject.get("kind") not in ("User", "Group"):
+                continue
+            name = subject.get("name") or ""
+            anonymous = name in _ANONYMOUS_SUBJECTS
+            if not anonymous and name != _AUTHENTICATED_SUBJECT:
+                continue
+            ref = f"{role_ref.get('kind', '')}/{role_ref.get('name', '')}"
+            if anonymous:
+                impact = _IMPACT_ANONYMOUS_RBAC_ANONYMOUS
+                excerpt = f"{kind}/{meta.get('name', '')} -> {ref} for {subject.get('kind')}/{name}"
+            else:
+                rules = _rules_of_role_ref(context, role_ref, namespace)
+                if rules is None:
+                    # The role does not exist, so the binding grants nothing
+                    # and there is no verb list to build the sentence from.
+                    # Reporting it would be a critical on an object that
+                    # currently does what the remediation would make it do.
+                    continue
+                writes = _rules_write(rules)
+                if not writes:
+                    continue
+                impact = _IMPACT_ANONYMOUS_RBAC_AUTHENTICATED
+                excerpt = (
+                    f"{kind}/{meta.get('name', '')} -> {ref} for Group/{name}"
+                    f"; {ref} grants {', '.join(writes)}"
+                )
+            hits.append(
+                {
+                    "namespace": namespace,
+                    "object": f"{kind}/{meta.get('name', '')}",
+                    "excerpt": excerpt,
+                    "impact": impact,
+                    "reconciler": reconciler_of(meta),
+                }
+            )
+    return hits
+
+
 # Cilium writes the pod's namespace into the endpoint's label set under this
 # key, and Dataplane V2's ClusterNetworkPolicy selects on it. `k8s:` is the
 # source prefix Cilium adds to labels it learned from Kubernetes; a policy may
@@ -6089,6 +6235,17 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_LB_WORLD_OPEN,
     ),
+    CheckSpec(
+        "anonymous-rbac-binding",
+        "cluster",
+        check_anonymous_rbac_binding,
+        "critical",
+        None,
+        # Every hit carries its own, because the two arms grant to different
+        # sets of callers and a sentence true of one is false of the other.
+        # This is the anonymous arm's, which is the one a reader reaches for.
+        _IMPACT_ANONYMOUS_RBAC_ANONYMOUS,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -6205,6 +6362,7 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
 _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "cluster-admin-binding": ("rbac",),
     "wildcard-rbac": ("rbac",),
+    "anonymous-rbac-binding": ("rbac",),
     "netpol-missing": ("netpol", "namespaces", "workloads", "ccnp"),
     "default-sa-automount": ("serviceaccounts", "workloads"),
     "workload-identity-off": ("describe",),
@@ -6339,7 +6497,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
     context["rolebindings"] = [i for i in items if i.get("kind") == "RoleBinding"]
     record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(rbac_argv)}", result)
-    for slug in ("cluster-admin-binding", "wildcard-rbac"):
+    for slug in ("cluster-admin-binding", "wildcard-rbac", "anonymous-rbac-binding"):
         commands[slug] = record
 
     netpol_argv = ["kubectl", "get", "netpol,ns", "-A", "-o", "json"]

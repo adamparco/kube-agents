@@ -4916,6 +4916,163 @@ class TestWildcardRbac(unittest.TestCase):
         self.assertEqual(hits[0]["excerpt"].count("system:serviceaccount:default:app"), 1)
 
 
+class TestAnonymousRbacBinding(unittest.TestCase):
+    WRITE_RULE = [{"verbs": ["get", "patch"], "resources": ["*"], "apiGroups": [""]}]
+    READ_RULE = [{"verbs": ["get", "list", "watch"], "resources": ["*"], "apiGroups": [""]}]
+
+    def test_anonymous_bound_to_cluster_admin_is_critical(self):
+        ctx = context_of(clusterrolebindings=[crb("anon-admin", [subject("User", "system:anonymous")])])
+        hits = collect.check_anonymous_rbac_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ClusterRoleBinding/anon-admin")
+        self.assertIn("system:anonymous", hits[0]["excerpt"])
+
+    def test_the_two_checks_it_complements_report_nothing_on_the_same_binding(self):
+        """The gap this check exists for. §2.4 and §2.5 both run every subject
+        through `_is_non_system_subject`, which excludes anything named
+        `system:*` -- so `cluster-admin` bound to the internet is invisible to
+        both of them. A future change that makes either one report it is what
+        turns this check into a duplicate, and this is where that shows up."""
+        ctx = context_of(
+            roles=[cluster_role("cluster-admin", [{"verbs": ["*"], "resources": ["*"], "apiGroups": ["*"]}])],
+            clusterrolebindings=[crb("anon-admin", [subject("User", "system:anonymous")])],
+        )
+        self.assertEqual(collect.check_cluster_admin_binding(ctx), [])
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+        self.assertEqual(len(collect.check_anonymous_rbac_binding(ctx)), 1)
+
+    def test_unauthenticated_is_read_as_well_as_anonymous(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("Group", "system:unauthenticated")])])
+        self.assertEqual(len(collect.check_anonymous_rbac_binding(ctx)), 1)
+
+    def test_a_read_only_role_is_still_flagged_for_an_anonymous_subject(self):
+        """The arm split. `view` bound to `system:anonymous` hands every
+        ConfigMap and pod spec in the cluster to an unauthenticated caller, so
+        the role does not decide this arm."""
+        ctx = context_of(
+            roles=[cluster_role("view", self.READ_RULE)],
+            clusterrolebindings=[
+                role_binding("ClusterRole", "view", [subject("Group", "system:unauthenticated")])
+            ],
+        )
+        self.assertEqual(len(collect.check_anonymous_rbac_binding(ctx)), 1)
+
+    def test_an_anonymous_binding_to_an_absent_role_is_still_flagged(self):
+        """No resolution happens on this arm, so a roleRef the dump does not
+        carry does not silence it."""
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("User", "system:anonymous")], role="ghost")])
+        self.assertEqual(len(collect.check_anonymous_rbac_binding(ctx)), 1)
+
+    def test_authenticated_with_a_writing_role_is_flagged(self):
+        ctx = context_of(
+            roles=[cluster_role("edit", self.WRITE_RULE)],
+            clusterrolebindings=[role_binding("ClusterRole", "edit", [subject("Group", "system:authenticated")])],
+        )
+        hits = collect.check_anonymous_rbac_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("grants patch", hits[0]["excerpt"])
+
+    def test_authenticated_with_a_read_only_role_is_not_flagged(self):
+        """`view` bound to `system:authenticated` is how many organisations
+        make a cluster browsable, and `_sa_grant_is_universal` already treats
+        it as a posture rather than a defect."""
+        ctx = context_of(
+            roles=[cluster_role("view", self.READ_RULE)],
+            clusterrolebindings=[role_binding("ClusterRole", "view", [subject("Group", "system:authenticated")])],
+        )
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_authenticated_bound_to_an_absent_role_is_not_flagged(self):
+        """A roleRef naming nothing grants nothing today, and there is no verb
+        list to build the impact sentence from."""
+        ctx = context_of(
+            clusterrolebindings=[role_binding("ClusterRole", "ghost", [subject("Group", "system:authenticated")])]
+        )
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_a_verb_wildcard_counts_as_writing(self):
+        ctx = context_of(
+            roles=[cluster_role("god", [{"verbs": ["*"], "resources": ["*"], "apiGroups": ["*"]}])],
+            clusterrolebindings=[role_binding("ClusterRole", "god", [subject("Group", "system:authenticated")])],
+        )
+        hits = collect.check_anonymous_rbac_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("grants *", hits[0]["excerpt"])
+
+    def test_the_four_baseline_roles_are_never_flagged(self):
+        for role in sorted(collect._BASELINE_AUTHENTICATED_ROLES):
+            with self.subTest(role=role):
+                ctx = context_of(
+                    clusterrolebindings=[
+                        role_binding("ClusterRole", role, [subject("Group", "system:unauthenticated")])
+                    ]
+                )
+                self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_service_account_groups_belong_to_the_other_check(self):
+        for name in ("system:serviceaccounts", "system:serviceaccounts:default"):
+            with self.subTest(name=name):
+                ctx = context_of(clusterrolebindings=[crb("b", [subject("Group", name)])])
+                self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_an_ordinary_system_component_subject_is_not_flagged(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("User", "system:kube-scheduler")])])
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_a_namespaced_rolebinding_carries_its_namespace(self):
+        ctx = context_of(
+            rolebindings=[
+                role_binding("Role", "local", [subject("User", "system:anonymous")], ns="payments")
+            ]
+        )
+        hits = collect.check_anonymous_rbac_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["namespace"], "payments")
+        self.assertEqual(hits[0]["object"], "RoleBinding/local-binding")
+
+    def test_a_namespaced_role_only_resolves_inside_its_own_namespace(self):
+        """A `Role` of the same name in another namespace is a different
+        object, and resolving against it would grade this binding on rules it
+        does not have."""
+        ctx = context_of(
+            roles=[cluster_role("local", self.WRITE_RULE, ns="other")],
+            rolebindings=[
+                role_binding("Role", "local", [subject("Group", "system:authenticated")], ns="payments")
+            ],
+        )
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_a_service_account_subject_is_not_this_checks_finding(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("ServiceAccount", "system:anonymous", "default")])])
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+    def test_one_binding_naming_both_universal_subjects_reports_both(self):
+        ctx = context_of(
+            clusterrolebindings=[
+                crb("b", [subject("User", "system:anonymous"), subject("Group", "system:unauthenticated")])
+            ]
+        )
+        self.assertEqual(len(collect.check_anonymous_rbac_binding(ctx)), 2)
+
+    def test_the_two_arms_carry_different_impact_sentences(self):
+        anon = collect.check_anonymous_rbac_binding(
+            context_of(clusterrolebindings=[crb("a", [subject("User", "system:anonymous")])])
+        )
+        auth = collect.check_anonymous_rbac_binding(
+            context_of(
+                roles=[cluster_role("edit", self.WRITE_RULE)],
+                clusterrolebindings=[role_binding("ClusterRole", "edit", [subject("Group", "system:authenticated")])],
+            )
+        )
+        self.assertNotEqual(anon[0]["impact"], auth[0]["impact"])
+        self.assertIn("presented no credential", anon[0]["impact"])
+        self.assertIn("is not a team", auth[0]["impact"])
+
+    def test_a_binding_with_no_subjects_reports_nothing(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [])])
+        self.assertEqual(collect.check_anonymous_rbac_binding(ctx), [])
+
+
 class TestPodWorkloadRef(unittest.TestCase):
     """The excerpt of a partial-coverage `netpol-missing` finding names the
     workloads no policy selects. That name is the only actionable string in
@@ -6773,7 +6930,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 14)
+        self.assertEqual(len(result["commands"]), 15)
 
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
@@ -6889,7 +7046,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 14)
+        self.assertEqual(len(command_slugs), 15)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -7095,14 +7252,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Fifteen checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is eleven, each with a command
+        Sixteen checks minus the three Autopilot rules out and the one no
+        cluster without Config Connector can run is twelve, each with a command
         behind it, and the four dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 11)
+        self.assertEqual(len(command_slugs), 12)
         self.assertEqual(len(na_slugs), 4)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))

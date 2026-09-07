@@ -142,6 +142,7 @@ AUDITS: dict[str, AuditSpec] = {
             "image-floating-tag",
             "unbound-sa-automount",
             "lb-world-open",
+            "anonymous-rbac-binding",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
