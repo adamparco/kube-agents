@@ -290,6 +290,23 @@ IDLE_WORKLOAD_MIN_AGE_DAYS = 14
 # scheduling, and it is an upstream chart default no operator here owns.
 UNDERREQUEST_FLOOR_MIB = 128.0
 
+# §3.11 sizes the new memory request at 1.3x the observed per-replica peak.
+# 1.3 and not §3.1's 2x because sizing up costs bookable capacity on every node
+# the controller lands on, and the mean already establishes that this is the
+# steady state rather than a spike. The number lived only in the SOP and in a
+# prose comment below, which left the collector unable to apply it and the
+# model recomputing it from an excerpt rounded to two decimals of a GiB.
+UNDERREQUEST_PEAK_MULTIPLIER = 1.3
+
+# Where the new request lands above the container's declared limit, §3.11
+# raises the limit with it, to twice the new request. A request above its limit
+# is rejected at admission, so a remediation that raises one and leaves the
+# other stops the workload scheduling. Observed on 2026-09-07: `litellm` on
+# `kube-agents-host` was published with a 2153Mi per-replica prescription
+# against a 2048Mi per-replica limit, and its recommendation said "limits and
+# CPU request untouched".
+UNDERREQUEST_LIMIT_MULTIPLIER = 2
+
 # `check_unsized`'s floor is not a materiality test like the two above -- it does
 # not decide whether to report, only what number to recommend. Everything this
 # check finds is worth reporting whatever its size, because the cost is the
@@ -1823,7 +1840,12 @@ def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = 
 
 
 def _resize_target(
-    peak_total: float, replicas: int, *, floor: float, unit: float
+    peak_total: float,
+    replicas: int,
+    *,
+    floor: float,
+    unit: float,
+    multiplier: float = OVERREQUEST_PEAK_MULTIPLIER,
 ) -> float:
     """The per-replica request §3.1's resize would write: `ceil(peak x 2)`,
     clamped up to `50m` / `64Mi`.
@@ -1833,8 +1855,13 @@ def _resize_target(
     number itself: left to infer it, the model reports one it worked out from
     the rounded peak the excerpt quotes, and the 2026-09-06 cost report asked
     for `about 10m` on a dimension whose floor is `50m`.
+
+    §3.11 sizes at 1.3x rather than 2x and calls this with
+    `multiplier=UNDERREQUEST_PEAK_MULTIPLIER`. The ceil and the per-replica
+    division are the same in both directions, and stating them twice is how
+    the two halves of one edit drift apart.
     """
-    return max(floor, math.ceil(peak_total / replicas * OVERREQUEST_PEAK_MULTIPLIER / unit) * unit)
+    return max(floor, math.ceil(peak_total / replicas * multiplier / unit) * unit)
 
 
 def _resize_shrinks_request(
@@ -2424,6 +2451,52 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
             f"{mean_mem / mem_req_total * 100:.0f}% of request, {overage / 1024.0:.2f} GiB above it; "
             f"peak {peak_mem / 1024.0:.2f} GiB. Sustained, not a burst."
         )
+        # State the prescribed request rather than leaving it to be recomputed,
+        # for the reason `_resize_target` records and §3.1 already acts on: the
+        # per-replica peak below is printed to two decimals of a GiB, so
+        # `litellm` on 2026-09-07 reads as 1.62 GiB and 1.62 x 1.3 gives
+        # 2.11 GiB where the unrounded 1655.96 MiB gives 2153Mi. The floor
+        # passed here cannot bind -- the new request is 1.3x a peak that is at
+        # least the mean, and the mean is already above the current request.
+        new_request = _resize_target(
+            peak_mem,
+            replicas,
+            floor=OVERREQUEST_RESIZE_FLOOR_MIB,
+            unit=1.0,
+            multiplier=UNDERREQUEST_PEAK_MULTIPLIER,
+        )
+        per_replica = " per replica" if replicas > 1 else ""
+        excerpt += f" Raise the memory request to {new_request:.0f}Mi{per_replica}."
+        # A request above its limit is rejected at admission, so a remediation
+        # that raises the request and leaves the limit alone does not degrade
+        # the workload -- it stops it scheduling at all. On 2026-09-07 that is
+        # exactly what shipped: `litellm` on `kube-agents-host` was published
+        # with a 2153Mi per-replica prescription against a 2048Mi per-replica
+        # limit, and the model had no way to see it. The only limit the excerpt
+        # printed was the 4.0 GiB controller total, which is twice the
+        # prescription, so the comparison a reader makes from the excerpt alone
+        # says it fits. Divide by the replica count here rather than asking for
+        # that division to be remembered.
+        #
+        # Every container must declare a memory limit for the sum to be a
+        # ceiling anything enforces. Admission is per container, so a pod
+        # pairing a limited sidecar with an unlimited main container has a
+        # `mem_lim_total` binding neither. No controller on the sixteen-cluster
+        # fleet is shaped that way on 2026-09-07; the guard is here so that one
+        # appearing does not produce a sentence about a limit that does not
+        # exist.
+        limited = all(
+            parse_mem_mib(str(lim.get("memory", "0")))
+            for pod in entry["pods"]
+            for lim in pod["limits"]
+        )
+        if limited and new_request > mem_lim_total / replicas:
+            excerpt += (
+                f" That exceeds the {mem_lim_total / replicas:.0f}Mi memory limit declared"
+                f"{per_replica}, and a request above its limit is rejected at admission, so "
+                f"raise the limit to {new_request * UNDERREQUEST_LIMIT_MULTIPLIER:.0f}Mi in "
+                f"the same edit."
+            )
         # §3.11 sizes the new request at ceil(peak x 1.3), and the manifest it
         # edits declares one replica's request. Handing over only the summed
         # peak inflates a two-replica controller's request by 2x -- which is

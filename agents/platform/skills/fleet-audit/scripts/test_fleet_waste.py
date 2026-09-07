@@ -2022,6 +2022,118 @@ class UnderrequestTest(unittest.TestCase):
         self.assertIn(f"trailing {fw.USAGE_WINDOW_HOURS}h", excerpt)
         self.assertIn("Sustained, not a burst", excerpt)
 
+    # `litellm` on `kube-agents-host` as the 2026-09-07 08:33 UTC run measured
+    # it, re-read from Cloud Monitoring at 14:13 the same day: two replicas,
+    # 512Mi requested and 2Gi limited each, per-replica mean 1011.25 MiB and
+    # per-replica peak 1655.96 MiB.
+    LIVE_MEAN_PR = 1011.25
+    LIVE_PEAK_PR = 1655.96
+
+    def live_litellm(self, mem_lim="2Gi"):
+        """The published finding's excerpt, from its own numbers."""
+        pods = [self.pod(name="litellm-1", mem_lim=mem_lim), self.pod(name="litellm-2", mem_lim=mem_lim)]
+        means = {("kubeagents-system", f"litellm-{i}"): self.LIVE_MEAN_PR for i in (1, 2)}
+        peaks = {("kubeagents-system", f"litellm-{i}"): (0.05, self.LIVE_PEAK_PR) for i in (1, 2)}
+        return self.check(pods, means, peaks)[0]["excerpt"]
+
+    def test_a_prescription_above_the_limit_says_to_raise_the_limit(self):
+        """The 2026-09-07 finding, and the regression this pins.
+
+        It was published prescribing 2153Mi per replica against a 2048Mi
+        per-replica limit -- a manifest the API server rejects at admission --
+        and its recommendation read "limits and CPU request untouched". The
+        model had no way to see it: the only limit the excerpt printed was the
+        4.0 GiB controller total, which is twice the prescription.
+        """
+        excerpt = self.live_litellm()
+        self.assertIn("Raise the memory request to 2153Mi per replica.", excerpt)
+        self.assertIn("exceeds the 2048Mi memory limit declared per replica", excerpt)
+        self.assertIn("rejected at admission", excerpt)
+        self.assertIn("raise the limit to 4306Mi in the same edit", excerpt)
+
+    def test_a_prescription_under_the_limit_says_nothing_about_the_limit(self):
+        # 17 of the 19 sizing-eligible controllers on the fleet are this case.
+        excerpt = self.live_litellm(mem_lim="4Gi")
+        self.assertIn("Raise the memory request to 2153Mi per replica.", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_the_limit_boundary_is_strict(self):
+        """A request equal to its limit is admissible, so equality says nothing.
+
+        `ceil(1000 x 1.3) = 1300`, and a 1300Mi limit is exactly reached.
+        """
+        pod = self.pod(mem_req="512Mi", mem_lim="1300Mi")
+        means = {("kubeagents-system", "litellm-1"): 900.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1000.0)}
+        excerpt = self.check([pod], means, peaks)[0]["excerpt"]
+        self.assertIn("Raise the memory request to 1300Mi.", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_the_prescription_is_computed_from_the_unrounded_peak(self):
+        """§3.1's `about 10m` failure, transplanted.
+
+        The excerpt prints the per-replica peak to two decimals of a GiB, so
+        1655.96 MiB reads as 1.62 GiB and 1.62 x 1.3 comes to 2.11 GiB. The
+        measurement behind it gives 2153Mi, which is 2.10 GiB. Recomputing
+        from the printed figure is off by a MiB in the direction that matters,
+        because the comparison against the limit is what it decides.
+        """
+        excerpt = self.live_litellm()
+        self.assertIn("a 1.62 GiB peak", excerpt)  # the per-replica figure, rounded
+        self.assertIn("2153Mi", excerpt)
+        self.assertNotIn("2157Mi", excerpt)  # ceil(1.62 * 1024 * 1.3)
+
+    def test_no_memory_limit_gets_the_request_but_no_limit_clause(self):
+        # The 1 live controller with no memory limit at all: nothing to collide
+        # with, so the prescription stands alone.
+        pod = self.pod(mem_lim=None)
+        pod["spec"]["containers"][0]["resources"].pop("limits")
+        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertIn("Raise the memory request to", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_a_partially_limited_pod_gets_no_limit_clause(self):
+        """Admission is per container; the summed limit binds neither.
+
+        A pod pairing a limited sidecar with an unlimited main container has a
+        `mem_lim_total` that is a real number and enforces nothing. No
+        controller on the fleet is shaped this way on 2026-09-07 -- this pins
+        the guard against the first one that is.
+        """
+        pod = self.pod(mem_req="512Mi", mem_lim="2Gi")
+        pod["spec"]["containers"].append(
+            {"name": "sidecar", "resources": {"requests": {"memory": "0"}}}
+        )
+        excerpt = self.check([pod], {("kubeagents-system", "litellm-1"): 900.0})[0]["excerpt"]
+        self.assertIn("Raise the memory request to", excerpt)
+        self.assertNotIn("raise the limit", excerpt)
+
+    def test_the_per_replica_suffix_tracks_the_replica_count(self):
+        # `check_overrequest`'s rule: on a single-replica controller the
+        # qualifier distinguishes nothing and reads as though it did.
+        pod = self.pod(mem_req="512Mi", mem_lim="8Gi")
+        means = {("kubeagents-system", "litellm-1"): 900.0}
+        peaks = {("kubeagents-system", "litellm-1"): (0.05, 1000.0)}
+        one = self.check([pod], means, peaks)[0]["excerpt"]
+        self.assertIn("Raise the memory request to 1300Mi.", one)
+        self.assertNotIn("per replica", one)
+        self.assertIn("Raise the memory request to 2153Mi per replica.", self.live_litellm(mem_lim="8Gi"))
+
+    def test_resize_target_defaults_to_the_overrequest_multiplier(self):
+        """Adding the keyword must not have moved §3.1's number.
+
+        `_resize_target` is shared, and the three `check_overrequest` /
+        `check_unsized` call sites pass no multiplier.
+        """
+        self.assertEqual(fw.UNDERREQUEST_PEAK_MULTIPLIER, 1.3)
+        self.assertEqual(fw.UNDERREQUEST_LIMIT_MULTIPLIER, 2)
+        self.assertEqual(fw.OVERREQUEST_PEAK_MULTIPLIER, 2)
+        both = dict(floor=fw.OVERREQUEST_RESIZE_FLOOR_MIB, unit=1.0)
+        self.assertEqual(fw._resize_target(1000.0, 2, **both), 1000.0)
+        self.assertEqual(
+            fw._resize_target(1000.0, 2, **both, multiplier=fw.UNDERREQUEST_PEAK_MULTIPLIER), 650.0
+        )
+
     def test_it_shares_overrequests_exclusions(self):
         """Both directions of one edit must agree on which pods are eligible,
         or a DaemonSet excluded from shrinking becomes eligible for growing.
