@@ -1507,12 +1507,13 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
     dangling (target absent from the dump). Severity rides on the hit, not
     the check table default, because the two sub-cases disagree.
 
-    The only cluster-scoped check that walks a `*_by_namespace` map with no
-    workload to anchor it, so it is the only one that has to apply S1 and S2
-    itself. `check_no_hpa` reads `context["hpas"]` under a workload's own
-    namespace and `check_blocking_pdb` drops a PDB whose target is not in the
-    audited set, so both inherit the suppressions for free. This one did
-    not, and GKE makes that expensive: `kube-state-metrics` lives in
+    Walks a `*_by_namespace` map with no workload to anchor it, so S1 and S2
+    have to be applied here rather than inherited. `check_no_hpa` reads
+    `context["hpas"]` under a workload's own namespace and gets them for free;
+    `check_blocking_pdb` inherits S1 the same way, through the matched workload,
+    and applies S2 to the budget's own labels because an addon can mark the PDB
+    and not the Deployment. This one inherited neither, and GKE makes that
+    expensive: `kube-state-metrics` lives in
     `gke-managed-cim` and `opentelemetry-collector` in `gke-managed-otel`, S1
     keeps their StatefulSet and Deployment out of `workloads`, and their HPAs
     then read as pointing at objects that do not exist. That was 17 `minor`
