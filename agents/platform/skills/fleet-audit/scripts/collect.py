@@ -1549,7 +1549,8 @@ _IMPACT_PDB_OVERLAPPING = (
     "The eviction API refuses every pod covered by more than one "
     "PodDisruptionBudget, so node-pool upgrades, node auto-repair and "
     "autoscaler scale-down all stall on this workload until one budget is "
-    "removed -- and both budgets report disruptions allowed while it happens."
+    "removed -- and the budget the disruption controller is keeping current "
+    "goes on reporting disruptions allowed while it happens."
 )
 
 
@@ -1561,10 +1562,12 @@ def check_pdb_overlapping(context: dict) -> list[dict]:
     by two PDBs returns 500 -- `This pod has more than one PodDisruptionBudget,
     which the eviction subresource does not support` -- so `kubectl drain`,
     node-pool upgrades, auto-repair and scale-down all stop there. It is the
-    same outage `blocking-pdb` reports and it hides better: both budgets show a
-    healthy `status.disruptionsAllowed`, because each is computed as though it
-    were the only one, so every signal an operator would think to read says the
-    workload is evictable.
+    same outage `blocking-pdb` reports and it hides better: the disruption
+    controller picks one of the covering budgets per pod, arbitrarily, and only
+    that one is woken by the pod's events, so it goes on reporting a healthy
+    `status.disruptionsAllowed` while every eviction fails. The others freeze at
+    whatever they last computed. Neither number answers the question, which is
+    why the check counts budgets rather than reading either one's status.
 
     Anchored on workloads rather than on budgets, which decides two things.
     `normalize_workloads` has already applied S1-S5, so the system namespaces
