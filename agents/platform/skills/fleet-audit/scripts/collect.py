@@ -475,6 +475,11 @@ WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 #: The group every kind in `WORKLOAD_KINDS` lives in. Named because a
 #: `scaleTargetRef` is matched on it as well as on kind and name.
 _WORKLOAD_API_VERSION = "apps/v1"
+#: Kubernetes' own default when an HPA omits `minReplicas`. Named because an
+#: absent floor and a floor of one are the same workload: `hpa-floors-at-one`
+#: has to say which of the two it found, and `blocking-pdb` has to compare
+#: against the same number either way.
+DEFAULT_HPA_MIN_REPLICAS = 1
 OPT_OUT_KEY = "kubeagents.x-k8s.io/reliability-audit"
 
 # The owners S3 is entitled to defer to. Kind and API group both have to
@@ -1367,6 +1372,28 @@ def check_no_pdb(workload: dict, context: dict) -> dict | None:
     }
 
 
+def _hpa_targeting(workload: dict, context: dict) -> dict | None:
+    """The HorizontalPodAutoscaler that owns this workload's replica count.
+
+    Four checks need this and each used to spell it out: `no-hpa` to stay quiet
+    where one exists, `single-replica` to stay quiet for the same reason,
+    `hpa-floors-at-one` to fire, and `blocking-pdb` to learn how far down the
+    replica count it is comparing against can actually go. The match is on
+    `scaleTargetRef`, which carries `apiVersion` as well as `kind` and `name` --
+    a custom resource can be named `Deployment` in another group, and it is not
+    this one.
+    """
+    for hpa in context["hpas"].get(workload["ns"], []):
+        target = (hpa.get("spec") or {}).get("scaleTargetRef") or {}
+        if (
+            target.get("apiVersion") == _WORKLOAD_API_VERSION
+            and target.get("kind") == workload["kind"]
+            and target.get("name") == workload["name"]
+        ):
+            return hpa
+    return None
+
+
 def check_blocking_pdb(context: dict) -> list[dict]:
     """Cluster-scoped: iterates PDBs, not workloads, because the finding is
     about the PDB's own shape. A PDB matching no workload (orphaned) or a
@@ -1377,12 +1404,40 @@ def check_blocking_pdb(context: dict) -> list[dict]:
     selector) reports against the first match; the SOP does not specify a
     tie-break and this is conservative — under-reporting a real block is
     unlikely when the norm is one PDB per workload.
+
+    Where an HPA owns the matched workload's replica count, the comparison is
+    against the autoscaler's floor rather than `spec.replicas`. That field is a
+    snapshot of what the autoscaler wanted when the audit read it, so comparing
+    against it answers "is the drain blocked at this instant" when the question
+    is "can this pair of manifests block a drain at all" — and the instant an
+    audit reads is the middle of the working day, while the drain that has to
+    succeed is the 03:00 node upgrade, at the floor. `hpa-floors-at-one` makes
+    the same correction to `single-replica`; both are the same mistake about
+    the same field.
     """
     hits = []
     for ns, pdbs in context["pdbs"].items():
+        # S1, stated here rather than relied on. `normalize_workloads` already
+        # drops system-namespace workloads, and a PDB only matches a workload in
+        # its own namespace, so nothing in `kube-system` or `gke-managed-*`
+        # reaches the report either way. What this line adds is the reason --
+        # a blocking PDB there really does wedge every drain and is still not
+        # the operator's to edit, so a `critical` naming it is a finding nobody
+        # can close -- and an exit before the selector scan, which the
+        # GKE-written PDBs that dominate the population would otherwise walk
+        # every workload for.
+        if _is_system_namespace(ns):
+            continue
         for pdb in pdbs:
             spec = pdb.get("spec") or {}
-            name = (pdb.get("metadata") or {}).get("name", "")
+            meta = pdb.get("metadata") or {}
+            name = meta.get("name", "")
+            # S2 against the PDB's own labels, which nothing else here checks:
+            # `normalize_workloads` reads the labels on the workload, and an
+            # addon's PDB over an ordinary workload carries the marker on the
+            # PDB alone.
+            if "addonmanager.kubernetes.io/mode" in (meta.get("labels") or {}):
+                continue
             max_unavailable, min_available = spec.get("maxUnavailable"), spec.get("minAvailable")
             selector = spec.get("selector") or {}
             matched = next(
@@ -1394,45 +1449,42 @@ def check_blocking_pdb(context: dict) -> list[dict]:
                 None,
             )
             replicas = matched["spec"].get("replicas", 1) or 1 if matched else None
+            hpa = _hpa_targeting(matched, context) if matched is not None else None
+            # The lowest replica count nothing has to happen for the workload to
+            # reach. Without an autoscaler that is the declared count; with one
+            # it is the floor, and the declared count is a reading rather than a
+            # decision.
+            floor = replicas
+            if hpa is not None:
+                declared_floor = (hpa.get("spec") or {}).get("minReplicas")
+                floor = DEFAULT_HPA_MIN_REPLICAS if declared_floor is None else declared_floor
             blocking = max_unavailable in (0, "0%") or min_available == "100%"
-            if isinstance(min_available, int) and matched is not None and min_available >= replicas:
+            if isinstance(min_available, int) and matched is not None and min_available >= floor:
                 blocking = True
             if not blocking or matched is None or replicas == 0:
                 continue
+            scale = f"replicas={replicas}"
+            if hpa is not None:
+                scale = (
+                    f"replicas={replicas} now, but scaled by "
+                    f"HorizontalPodAutoscaler/{(hpa.get('metadata') or {}).get('name', '')} "
+                    f"with minReplicas {floor}, which is the count the eviction API "
+                    f"has to satisfy this budget at"
+                )
             hits.append(
                 {
                     "namespace": ns,
                     "object": f"PodDisruptionBudget/{name}",
                     "excerpt": f"maxUnavailable={max_unavailable!r} minAvailable={min_available!r} "
-                    f"against {matched['kind']}/{matched['name']} (replicas={replicas})",
+                    f"against {matched['kind']}/{matched['name']} ({scale})",
                     # The PDB's own reconciler, not the matched workload's. The
                     # finding is about the PDB's shape and the fix edits the PDB,
                     # so a note naming what holds the Deployment would send the
                     # reader to the wrong chart.
-                    "reconciler": reconciler_of(pdb.get("metadata") or {}),
+                    "reconciler": reconciler_of(meta),
                 }
             )
     return hits
-
-
-def _hpa_targeting(workload: dict, context: dict) -> dict | None:
-    """The HorizontalPodAutoscaler that owns this workload's replica count.
-
-    Three checks need this and each used to spell it out: `no-hpa` to stay
-    quiet where one exists, `single-replica` to stay quiet for the same reason,
-    and `hpa-floors-at-one` to fire. The match is on `scaleTargetRef`, which
-    carries `apiVersion` as well as `kind` and `name` -- a custom resource can
-    be named `Deployment` in another group, and it is not this one.
-    """
-    for hpa in context["hpas"].get(workload["ns"], []):
-        target = (hpa.get("spec") or {}).get("scaleTargetRef") or {}
-        if (
-            target.get("apiVersion") == _WORKLOAD_API_VERSION
-            and target.get("kind") == workload["kind"]
-            and target.get("name") == workload["name"]
-        ):
-            return hpa
-    return None
 
 
 def check_no_hpa(workload: dict, context: dict) -> dict | None:
@@ -1512,12 +1564,8 @@ def check_hpa_cannot_scale(context: dict) -> list[dict]:
     return hits
 
 
-#: Kubernetes' own default when an HPA omits `minReplicas`. Named because an
-#: absent floor and a floor of one are the same workload, and the check has to
-#: say which of the two it found.
-DEFAULT_HPA_MIN_REPLICAS = 1
-#: The floor this check asks for. Two is the smallest number at which a
-#: rollout, a drain, or a preemption leaves something serving, and asking for
+#: The floor `hpa-floors-at-one` asks for. Two is the smallest number at which
+#: a rollout, a drain, or a preemption leaves something serving, and asking for
 #: more would be a capacity opinion this check has no basis for.
 HPA_FLOOR_TARGET_REPLICAS = 2
 

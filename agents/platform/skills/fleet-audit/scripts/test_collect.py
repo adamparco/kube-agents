@@ -868,14 +868,18 @@ class TestNoPdb(unittest.TestCase):
 
 
 class TestBlockingPdb(unittest.TestCase):
-    def ctx(self, pdb_entry, replicas=3, labels=None):
+    def ctx(self, pdb_entry, replicas=3, labels=None, hpas=None, ns="default"):
         # pdb()'s default selector is {"matchLabels": {"app": "api"}}, so the
         # workload needs that label by default too, or every "blocking"
         # fixture below fails to match and asserts nothing.
-        d = deployment("api", **{"spec.replicas": replicas})
+        d = deployment("api", ns=ns, **{"spec.replicas": replicas})
         d["spec"]["template"]["metadata"] = {"labels": labels if labels is not None else {"app": "api"}}
         workloads = collect.normalize_workloads(dump_of(d))
-        return context_of(pdbs={"default": [pdb_entry]}, workloads=workloads)
+        return context_of(
+            pdbs={ns: [pdb_entry]},
+            workloads=workloads,
+            hpas={ns: hpas} if hpas is not None else {},
+        )
 
     def test_max_unavailable_zero_is_blocking(self):
         hits = collect.check_blocking_pdb(self.ctx(pdb("p", max_unavailable=0)))
@@ -906,6 +910,44 @@ class TestBlockingPdb(unittest.TestCase):
         ctx = context_of(pdbs={"default": [pdb("p", max_unavailable=0, selector={"matchLabels": {"app": "nope"}})]},
                           workloads=collect.normalize_workloads(dump_of(deployment("api"))))
         self.assertEqual(collect.check_blocking_pdb(ctx), [])
+
+    def test_min_available_below_live_replicas_but_at_the_hpa_floor_is_blocking(self):
+        # The whole point of the floor: five replicas now, two at 03:00, and a
+        # minAvailable of 2 refuses every eviction once the autoscaler gets
+        # there. Comparing against spec.replicas alone reports nothing.
+        ctx = self.ctx(pdb("p", min_available=2), replicas=5, hpas=[hpa("h", min_replicas=2)])
+        hits = collect.check_blocking_pdb(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("minReplicas 2", hits[0]["excerpt"])
+        self.assertIn("replicas=5 now", hits[0]["excerpt"])
+
+    def test_min_available_below_the_hpa_floor_is_not_blocking(self):
+        ctx = self.ctx(pdb("p", min_available=2), replicas=5, hpas=[hpa("h", min_replicas=3)])
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
+
+    def test_an_absent_hpa_floor_defaults_to_one(self):
+        autoscaler = hpa("h")
+        del autoscaler["spec"]["minReplicas"]
+        ctx = self.ctx(pdb("p", min_available=1), replicas=4, hpas=[autoscaler])
+        hits = collect.check_blocking_pdb(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("minReplicas 1", hits[0]["excerpt"])
+
+    def test_an_hpa_pointing_elsewhere_leaves_the_declared_count_in_charge(self):
+        elsewhere = {"apiVersion": "apps/v1", "kind": "Deployment", "name": "other"}
+        ctx = self.ctx(pdb("p", min_available=2), replicas=5, hpas=[hpa("h", min_replicas=2, target=elsewhere)])
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
+
+    def test_a_pdb_in_a_system_namespace_is_never_reported(self):
+        ctx = self.ctx(pdb("p", ns="kube-system", max_unavailable=0), ns="kube-system")
+        self.assertEqual(collect.check_blocking_pdb(ctx), [])
+
+    def test_an_addon_managed_pdb_over_an_ordinary_workload_is_skipped(self):
+        # S2 on the budget, not on the workload: normalize_workloads reads the
+        # marker off the Deployment, and this Deployment does not carry it.
+        entry = pdb("p", max_unavailable=0)
+        entry["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        self.assertEqual(collect.check_blocking_pdb(self.ctx(entry)), [])
 
 
 class TestNoHpa(unittest.TestCase):
