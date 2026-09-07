@@ -858,6 +858,30 @@ def nodes_named_by_endpoints(dump: dict) -> set[str]:
     return nodes
 
 
+def zones_named_by_endpoints(dump: dict) -> set[str]:
+    """Every failure-injection zone any EndpointSlice in the cluster names.
+
+    Read for the same reason as the node set and from the same field family:
+    `endpoints[].zone` is the node's `topology.kubernetes.io/zone` label,
+    copied onto the slice by the endpoint controller. It answers the one
+    question §3.19's remediation turns on that the node set cannot -- whether
+    zone-keyed spreading can do anything here at all. On a zonal cluster every
+    node shares one zone, so raising a zone-keyed constraint to
+    `DoNotSchedule` leaves the skew at nought and changes no placement: the
+    pull request merges, the finding survives, and the reviewer's trust is
+    spent on a no-op. Same sampling rule as the node set -- system namespaces
+    included, because the question is about the cluster.
+    """
+    zones: set[str] = set()
+    for item in dump.get("items", []) or []:
+        if item.get("kind") != "EndpointSlice":
+            continue
+        for endpoint in item.get("endpoints") or []:
+            if endpoint.get("zone"):
+                zones.add(endpoint["zone"])
+    return zones
+
+
 def _selector_matches_a_zeroed_workload(dump: dict, ns: str, selector: dict) -> str | None:
     """`Kind/name` of a workload this selector matches that is scaled to zero.
 
@@ -923,6 +947,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "cronjobs": cronjobs_with_jobs(dump),
         "service_endpoints": services_with_endpoints(dump),
         "endpoint_nodes_seen": nodes_named_by_endpoints(dump),
+        "endpoint_zones_seen": zones_named_by_endpoints(dump),
         "workloads": workloads,
         "workload_keys": workload_keys(dump),
     }
@@ -1559,11 +1584,25 @@ def check_spread_not_achieved(workload: dict, context: dict) -> dict | None:
     nodes, counted = _endpoint_nodes_for(workload, context)
     if counted < _MIN_ENDPOINTS_TO_COLOCATE or len(nodes) != 1:
         return None
+    # The shape of the topology, appended because the remediation turns on it
+    # and the model cannot read it from anywhere else in this document. Three
+    # edits close this finding and they are not interchangeable: raising a
+    # zone-keyed constraint on a single-zone cluster is a no-op, and a
+    # hostname-keyed `DoNotSchedule` pends a replica where the cluster has
+    # fewer nodes than the workload has replicas. Both branches are decidable
+    # from these two counts, so the SOP decides them rather than the model
+    # guessing -- which is what produced a `manual` on 2026-09-07, correctly
+    # hesitant and still a pull request nobody got.
+    cluster_nodes = len(context.get("endpoint_nodes_seen") or set())
+    cluster_zones = len(context.get("endpoint_zones_seen") or set())
+    topology = f"this cluster's EndpointSlices name {cluster_nodes} nodes"
+    if cluster_zones:
+        topology += f" across {cluster_zones} zone{'' if cluster_zones == 1 else 's'}"
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": (
             f"replicas={replicas}, all {counted} ready endpoints on node {sorted(nodes)[0]}; "
-            f"every spreading rule is advisory: {'; '.join(advisory)}"
+            f"every spreading rule is advisory: {'; '.join(advisory)}; {topology}"
         ),
     }
 

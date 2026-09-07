@@ -1141,6 +1141,7 @@ class TestSpreadNotAchieved(unittest.TestCase):
 
     NODE_A = "gke-node-a"
     NODE_B = "gke-node-b"
+    ZONE_A = "us-east4-a"
     ADVISORY = [{"maxSkew": 1, "topologyKey": collect._HOSTNAME_KEY, "whenUnsatisfiable": "ScheduleAnyway"}]
 
     def wl(self, replicas=2, tsc=None, anti_affinity=None, kind="Deployment", name="api"):
@@ -1153,13 +1154,15 @@ class TestSpreadNotAchieved(unittest.TestCase):
             d["spec"]["template"]["spec"]["affinity"] = {"podAntiAffinity": anti_affinity}
         return collect.normalize_workloads(dump_of(d))[0]
 
-    def ctx(self, workload, endpoints=None, seen=None, others=(), services=None):
+    def ctx(self, workload, endpoints=None, seen=None, others=(), services=None, zones=None):
         if endpoints is None:
             endpoints = [self.NODE_A, self.NODE_A]
         if seen is None:
             seen = {self.NODE_A, self.NODE_B}
         if services is None:
             services = [("api-svc", endpoints)]
+        if zones is None:
+            zones = {self.ZONE_A}
         return context_of(
             service_endpoints=[
                 {
@@ -1171,8 +1174,39 @@ class TestSpreadNotAchieved(unittest.TestCase):
                 for svc, nodes in services
             ],
             endpoint_nodes_seen=set(seen),
+            endpoint_zones_seen=set(zones),
             workloads=[workload, *others],
         )
+
+    def test_the_excerpt_carries_the_counts_the_remediation_branches_on(self):
+        """Three edits close this finding and they are not interchangeable.
+
+        A hostname-keyed `DoNotSchedule` pends a replica where the cluster has
+        fewer nodes than the workload has replicas, and a zone-keyed one is a
+        no-op where every node shares a zone -- it merges, the finding
+        survives, and the reviewer paid attention for nothing. Neither count is
+        anywhere else in the finding, so on 2026-09-07 the model read the
+        three-way choice, saw no way to pick, and wrote `manual` on both hits:
+        honest, and still a pull request nobody got.
+        """
+        wl = self.wl(tsc=self.ADVISORY)
+        hit = collect.check_spread_not_achieved(wl, self.ctx(wl))
+        self.assertIn("this cluster's EndpointSlices name 2 nodes across 1 zone", hit["excerpt"])
+
+    def test_the_zone_count_is_pluralised(self):
+        wl = self.wl(tsc=self.ADVISORY)
+        hit = collect.check_spread_not_achieved(wl, self.ctx(wl, zones={self.ZONE_A, "us-east4-b"}))
+        self.assertIn("2 nodes across 2 zones", hit["excerpt"])
+
+    def test_a_dump_with_no_zone_labels_omits_the_clause_rather_than_claiming_nought(self):
+        # `endpoints[].zone` is optional. Writing "across 0 zones" would read as
+        # a fact about the cluster instead of a gap in the dump, and the SOP's
+        # `M == 1` branch -- the one that must not produce a manifest -- would
+        # fire on it.
+        wl = self.wl(tsc=self.ADVISORY)
+        hit = collect.check_spread_not_achieved(wl, self.ctx(wl, zones=set()))
+        self.assertIn("name 2 nodes", hit["excerpt"])
+        self.assertNotIn("zone", hit["excerpt"].split("name 2 nodes")[1])
 
     def test_advisory_spreading_that_landed_on_one_node_is_flagged(self):
         wl = self.wl(tsc=self.ADVISORY)
@@ -1307,6 +1341,26 @@ class TestEndpointNodeCollection(unittest.TestCase):
 
     def test_a_slice_naming_no_nodes_contributes_nothing(self):
         self.assertEqual(collect.nodes_named_by_endpoints(self.dump(addresses=2)), set())
+
+    def test_zones_named_by_endpoints_reads_the_slices_own_zone_field(self):
+        """What tells a zonal cluster from a regional one.
+
+        The remediation turns on it: a `DoNotSchedule` rule keyed on a zone
+        every node already shares leaves the skew at nought and moves no pod,
+        so the pull request merges and the finding survives.
+        """
+        dump = dump_of(
+            service("api-svc", selector={"app": "api"}),
+            endpointslice("api-svc", addresses=2, nodes=["n1", "n2"], zones=["us-east4-a", "us-east4-a"]),
+            endpointslice("kube-dns", ns="kube-system", addresses=1, nodes=["n3"], zones=["us-east4-b"]),
+        )
+        self.assertEqual(collect.zones_named_by_endpoints(dump), {"us-east4-a", "us-east4-b"})
+
+    def test_a_slice_with_no_zone_field_contributes_nothing(self):
+        # The field is optional, so an empty set means "the dump does not say",
+        # not "one zone" -- which is why the excerpt drops the clause instead
+        # of writing a count.
+        self.assertEqual(collect.zones_named_by_endpoints(self.dump(addresses=2, nodes=["n1", "n2"])), set())
 
 
 class TestProbes(unittest.TestCase):
@@ -2673,7 +2727,9 @@ class TestCronjobRunsOverlap(unittest.TestCase):
         self.assertEqual(len(collect.check_schedule_never_succeeds(context_of(dump_of(*items)))), 1)
 
 
-def endpointslice(service_name, ns="default", addresses=1, terminating=0, ports=None, nodes=None, unready=()):
+def endpointslice(
+    service_name, ns="default", addresses=1, terminating=0, ports=None, nodes=None, unready=(), zones=None
+):
     """An EndpointSlice with `addresses` ready endpoints and `terminating`
     endpoints on their way out.
 
@@ -2689,6 +2745,8 @@ def endpointslice(service_name, ns="default", addresses=1, terminating=0, ports=
     for i, endpoint in enumerate(endpoints):
         if nodes is not None and i < len(nodes):
             endpoint["nodeName"] = nodes[i]
+        if zones is not None and i < len(zones):
+            endpoint["zone"] = zones[i]
         if i in unready:
             endpoint["conditions"] = {"ready": False}
     endpoints += [
