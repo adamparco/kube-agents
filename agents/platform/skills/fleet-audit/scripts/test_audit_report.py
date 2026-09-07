@@ -4055,7 +4055,13 @@ class TestReleaseDeclaredManualRemediations(HarnessTestCase):
             encoding="utf-8",
         )
 
-    def manifest(self, path, obj="Deployment/cert-manager", cluster="prod-us-east"):
+    def manifest(
+        self,
+        path,
+        obj="Deployment/cert-manager",
+        cluster="prod-us-east",
+        renderer="helm",
+    ):
         candidate = {
             "check": "netpol-missing",
             "cluster": cluster,
@@ -4070,6 +4076,7 @@ class TestReleaseDeclaredManualRemediations(HarnessTestCase):
                 "repo": "https://charts.jetstack.io",
                 "version": "v1.14.4",
                 "values_field": "spec.source.helm.valuesObject",
+                "renderer": renderer,
             }
         return {"clusters": [{"name": cluster, "candidates": [candidate]}]}
 
@@ -4094,6 +4101,33 @@ class TestReleaseDeclaredManualRemediations(HarnessTestCase):
         self.assertIn("Not declared in this repository", note)
         self.assertIn(f"chart release declared at `{self.APPLICATION}`", note)
         self.assertNotIn("no pull request can carry this fix", note)
+
+    def test_a_kustomize_source_is_not_called_a_chart_release(self):
+        # An Argo CD Application with a `spec.source.kustomize` renders no chart
+        # and has no values file. Calling it "the chart release" sends the reader
+        # looking for a `values:` block that is not there, and the edit they
+        # actually want goes under `spec.source.kustomize.patches`.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(self.APPLICATION, renderer="kustomize")
+        )
+        note = finding["remediation"]["note"]
+        self.assertIn(f"Kustomize overlay declared at `{self.APPLICATION}`", note)
+        self.assertNotIn("chart release", note)
+
+    def test_an_unrecognised_renderer_still_names_the_file(self):
+        # The path is the part the reader can act on, so an unfamiliar renderer
+        # costs the characterisation and not the sentence.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        finding = self.finding()
+        audit_report.disclose_undeclared_manual_remediations(
+            [finding], self.workspace, self.manifest(self.APPLICATION, renderer="jsonnet")
+        )
+        self.assertIn(
+            f"the release declared at `{self.APPLICATION}`",
+            finding["remediation"]["note"],
+        )
 
     def test_an_unresolved_release_still_gets_the_refusal(self):
         # The common case and the one that must not regress: nothing in this
@@ -4570,6 +4604,74 @@ class TestRetractedDeclarationDenials(HarnessTestCase):
         # The note still carried a denial, so the finding is reported; the
         # rationale, which carried none, is byte-identical.
         self.assertEqual(findings[0]["recommendation"]["rationale"], keep)
+
+    def test_the_repository_first_word_order_is_caught(self):
+        # The shape that got through on 2026-09-07, on `no-pdb` against
+        # `podinfo-kustomize`: repository named first, negation second, and the
+        # verb uninflected. The regex it replaced pinned the other order.
+        self.declare("clusters/app/web.yaml", "Deployment", "waste-cpu-only")
+        findings = [self.denying_finding()]
+        findings[0]["recommendation"]["rationale"] = (
+            "This object is rendered by the Argo CD Application "
+            "`podinfo-kustomize-spot-capacity-test`, which this GitOps repository "
+            "does not declare, so no file here can carry the fix. Add a "
+            "PodDisruptionBudget where the overlay is built."
+        )
+        audit_report.retract_contradicted_declaration_denials(findings, self.workspace)
+        rationale = findings[0]["recommendation"]["rationale"]
+        self.assertEqual(rationale, "Add a PodDisruptionBudget where the overlay is built.")
+
+    def release_manifest(self, path, renderer="kustomize"):
+        return {
+            "clusters": [
+                {
+                    "name": "prod-us-east",
+                    "candidates": [
+                        {
+                            "check": "netpol-missing",
+                            "cluster": "prod-us-east",
+                            "namespace": "payments",
+                            "object": "Deployment/waste-cpu-only",
+                            "release_declaration": {
+                                "path": path,
+                                "kind": "Application",
+                                "renderer": renderer,
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+
+    OVERLAY = "argocd/apps/podinfo-kustomize-spot-capacity-test.yaml"
+
+    def test_a_release_declared_object_gets_its_denial_retracted(self):
+        # No file declares a rendered object -- that is what rendering means --
+        # so the one-declaring-path gate can never fire on this branch, and
+        # until 2026-09-07 that left it the one place the denial and the
+        # sentence naming the file shipped together.
+        findings = [self.denying_finding()]
+        self.assertEqual(
+            audit_report.retract_contradicted_declaration_denials(
+                findings, self.workspace, self.release_manifest(self.OVERLAY)
+            ),
+            [findings[0]["id"]],
+        )
+        self.assertNotIn("not declared", findings[0]["remediation"]["note"])
+
+    def test_an_object_with_neither_declaration_keeps_its_denial(self):
+        # The denial is true here, and deleting a true sentence is the one
+        # failure this pass must not have. Something unrelated is declared so
+        # the per-finding gate is what refuses, not the "could not look" bail.
+        self.declare("clusters/app/web.yaml", "Deployment", "web")
+        findings = [self.denying_finding()]
+        self.assertEqual(
+            audit_report.retract_contradicted_declaration_denials(
+                findings, self.workspace, self.release_manifest(None)
+            ),
+            [],
+        )
+        self.assertEqual(findings[0]["remediation"]["note"], self.LIVE_NOTE)
 
 
 class TestDeclaredManualRemediations(HarnessTestCase):

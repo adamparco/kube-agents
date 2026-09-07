@@ -643,8 +643,31 @@ _UNDECLARED_NOTE = f"{_UNDECLARED_LEDE}, so no pull request can carry this fix.)
 # know *why* the finding stayed manual. The likely reason -- the chart exposes
 # no values key reaching the field -- is the model's to say in
 # `recommendation.action`, and asserting it here would read as verified.
-def _release_declared_note(path: str) -> str:
-    return f"{_UNDECLARED_LEDE}; it is rendered by the chart release declared at `{path}`.)_"
+#
+# The renderer strings `collect.release_declarations` writes into each record,
+# mirrored rather than imported: this script does not import the collector.
+_RENDERER_HELM = "helm"
+_RENDERER_KUSTOMIZE = "kustomize"
+
+# What the sentence calls the thing at that path, which is not cosmetic. An
+# Argo CD Application with a `spec.source.kustomize` renders no chart and has
+# no values file, so "the chart release" sends the reader hunting a `values:`
+# block that does not exist -- the edit there goes under
+# `spec.source.kustomize.patches`. Naming the renderer is as far as this pass
+# can honestly go; which key to add is the model's to say in
+# `recommendation.action`.
+_RELEASE_RENDERER_NOUNS = {
+    _RENDERER_HELM: "the chart release",
+    _RENDERER_KUSTOMIZE: "the Kustomize overlay",
+}
+# A record whose renderer this script does not recognise still has a path worth
+# naming; the sentence just declines to characterise what sits at it.
+_RELEASE_RENDERER_FALLBACK_NOUN = "the release"
+
+
+def _release_declared_note(path: str, renderer: str = "") -> str:
+    noun = _RELEASE_RENDERER_NOUNS.get(renderer, _RELEASE_RENDERER_FALLBACK_NOUN)
+    return f"{_UNDECLARED_LEDE}; it is rendered by {noun} declared at `{path}`.)_"
 
 
 # The mirror of the pair above, for the case the ledger got wrong rather than
@@ -697,15 +720,54 @@ def _reconciled_note(reconciler: str) -> str:
 # script from an index it built by parsing the clone, while this one is authored
 # during the run by a model that grepped and missed. Both ship in the same
 # finding and say opposite things, and the reader has no way to tell which was
-# measured. Three shapes, each seen or invited by an SOP; the first is the one
-# observed on 2026-09-05, in both `remediation.note` and
-# `recommendation.rationale` of the same two findings.
-_DECLARATION_DENIAL_RE = re.compile(
-    r"\b(?:not|never)\b[^.;]{0,60}\bdeclared\b[^.;]{0,60}\b(?:repo|repository|GitOps)\b"
-    r"|\bdeclared\s+nowhere\b"
-    r"|\bno\s+(?:file|manifest)\b[^.;]{0,60}\bdeclares\b",
+# measured.
+#
+# Two conditions on one clause, rather than one regex spanning the sentence.
+# The single-regex version pinned the word order -- negation, then "declared",
+# then the repository -- and on 2026-09-07 a `no-pdb` finding wrote the same
+# claim the other way round and sailed through: "rendered by the Argo CD
+# Application `podinfo-kustomize-spot-capacity-test`, which this GitOps
+# repository does not declare, so no file here can carry the fix". Repository
+# first, negation second, and the verb inflected "declare" rather than
+# "declared". It shipped beside the index's "it is rendered by the chart
+# release declared at `argocd/apps/podinfo-kustomize-spot-capacity-test.yaml`",
+# which names the very file the sentence says does not exist.
+#
+# So: a negation binding a `declar*` verb, in either order, *and* the
+# repository named somewhere in the same clause. Both are required because
+# either alone over-reaches. "the chart does not expose a values key" is a
+# negation and no denial; "declared in this repository at `x`" is the
+# repository and the opposite of a denial. Requiring the negation to sit within
+# a few words of the verb is what keeps "the repository does declare this, but
+# not in a file the audit can patch" -- true, and about something else --
+# intact.
+#
+# Two shapes need no subject because they carry it. "no file declares this" is
+# already about the clone whether or not the sentence goes on to name it -- a
+# file is what a repository is made of -- and "declared nowhere" leaves no room
+# for a subject at all. Both were matched by the regex this pair replaces, and
+# demanding a repository token of them now would be a regression dressed as a
+# tightening.
+_DECLARATION_DENIAL_SELF_SUFFICIENT_RE = re.compile(
+    r"\bno\s+(?:file|files|manifest|manifests)\b[^.;]{0,40}?\bdeclar\w*"
+    r"|\bdeclar\w*\b[^.;]{0,40}?\bnowhere\b",
     re.I,
 )
+_DECLARATION_DENIAL_NEGATED_DECLARE_RE = re.compile(
+    r"\b(?:not|never|no|nothing|neither)\b[^.;]{0,40}?\bdeclar\w*",
+    re.I,
+)
+_DECLARATION_DENIAL_SUBJECT_RE = re.compile(r"\b(?:repo|repository|GitOps)\b", re.I)
+
+
+def _denies_declaration(clause: str) -> bool:
+    """Whether one clause claims this repository declares the object nowhere."""
+    if _DECLARATION_DENIAL_SELF_SUFFICIENT_RE.search(clause):
+        return True
+    return bool(
+        _DECLARATION_DENIAL_NEGATED_DECLARE_RE.search(clause)
+        and _DECLARATION_DENIAL_SUBJECT_RE.search(clause)
+    )
 
 # What the retraction deletes: one sentence, or one semicolon-joined clause. Not
 # a comma, deliberately. "not declared in the repository, so a fix could not
@@ -9500,8 +9562,8 @@ def _strip_declaration_notes(remediation: dict) -> str:
 def _drop_declaration_denials(text: str) -> str:
     """Return `text` with every clause denying the declaration removed.
 
-    Leaves the machine-authored sentences alone. Both ledes match
-    `_DECLARATION_DENIAL_RE` -- `_UNDECLARED_NOTE` opens "Not declared in this
+    Leaves the machine-authored sentences alone. Both ledes satisfy
+    `_denies_declaration` -- `_UNDECLARED_NOTE` opens "Not declared in this
     repository" -- and deleting them here would fight `_strip_declaration_notes`
     for the same characters. Those two are appended and stripped by this script
     from an index; only the model's prose is in question.
@@ -9509,10 +9571,16 @@ def _drop_declaration_denials(text: str) -> str:
     Returns `text` unchanged when every clause is a denial. A rationale reduced
     to the empty string renders as a finding with no reason at all, which is a
     worse page than one carrying a sentence the note beneath it contradicts.
+
+    Returns it unchanged too when no clause is one, rather than the rejoin of
+    the split. The rejoin normalises whitespace, so a caller comparing before
+    against after would read a paragraph break collapsing as a retraction and
+    log a disagreement that never happened.
     """
-    if not text or not _DECLARATION_DENIAL_RE.search(text):
+    if not text:
         return text
     kept: list[str] = []
+    dropped = False
     for clause in _CLAUSE_SPLIT_RE.split(text):
         clause = clause.strip()
         if not clause:
@@ -9520,16 +9588,52 @@ def _drop_declaration_denials(text: str) -> str:
         if _DECLARED_LEDE in clause or _UNDECLARED_LEDE in clause:
             kept.append(clause)
             continue
-        if _DECLARATION_DENIAL_RE.search(clause):
+        if _denies_declaration(clause):
+            dropped = True
             if kept and kept[-1].endswith(_DANGLING_PUNCTUATION):
                 kept[-1] = kept[-1][:-1] + _SENTENCE_END
             continue
         kept.append(clause)
+    if not dropped:
+        return text
     return " ".join(kept) if kept else text
 
 
+def _release_declaration_index(manifest: dict | None) -> dict[str, tuple[str, str]]:
+    """Map finding id to the `(path, renderer)` the collector resolved its release to.
+
+    Shared by the retraction below and the disclosure further down, which read
+    the same records for opposite purposes -- one to delete the model's claim
+    that no file declares the object, one to name the file that disproves it.
+    They diverged once already: the disclosure gained the release branch and the
+    retraction did not, so a chart- or overlay-rendered object got the naming
+    sentence appended and kept the denial it contradicts.
+
+    Keys on `derive_finding_id`, not on the object, because a candidate is a
+    workload and a finding may name something attached to it.
+    """
+    index: dict[str, tuple[str, str]] = {}
+    for entry in (manifest or {}).get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        cluster_name = str(entry.get("name") or "")
+        for candidate in entry.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            release = candidate.get("release_declaration")
+            path = str((release or {}).get("path") or "").strip()
+            if not path:
+                continue
+            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
+            index[derive_finding_id(keyed)] = (
+                path,
+                str((release or {}).get("renderer") or ""),
+            )
+    return index
+
+
 def retract_contradicted_declaration_denials(
-    findings: list[dict], root: Path
+    findings: list[dict], root: Path, manifest: dict | None = None
 ) -> list[str]:
     """Delete the model's "not declared in the GitOps repository" where it is false.
 
@@ -9553,8 +9657,20 @@ def retract_contradicted_declaration_denials(
     would be this pass authoring a claim into a field the model owns, and the
     same claim is about to arrive in the note from the index that can prove it.
 
-    Gated on exactly one declaring path, the same bar
-    `disclose_declared_manual_remediations` sets and for a stronger reason here.
+    Two kinds of evidence clear the bar, and a finding needs either. The first
+    is exactly one declaring path in the clone, the same bar
+    `disclose_declared_manual_remediations` sets. The second is a release the
+    collector resolved to a file here -- a chart or a Kustomize overlay renders
+    the object, so the clone declares it nowhere by construction and the first
+    test can never fire, which is precisely the branch
+    `disclose_undeclared_manual_remediations` appends "it is rendered by … at
+    `<path>`" on. Until 2026-09-07 only the first existed, so that branch
+    published the naming sentence and the denial it disproves in the same
+    finding: a `no-pdb` on `podinfo-kustomize` carried "which this GitOps
+    repository does not declare, so no file here can carry the fix" beside a
+    note giving the file.
+
+    On the first test, one path and not merely one or more.
     `kubernetes_declarations` keys on `(kind, name)` without the namespace, so a
     name reused across two namespaces resolves to two paths and the model's
     denial may well be true of the object the finding means. Deleting a true
@@ -9574,9 +9690,14 @@ def retract_contradicted_declaration_denials(
     when the repository was right.
     """
     declared = kubernetes_declarations(root)
-    if not declared:
+    releases = _release_declaration_index(manifest)
+    if not declared and not releases:
         # Empty is "could not look", not "declares nothing" -- and reading it
-        # the other way here would delete true sentences wholesale.
+        # the other way here would delete true sentences wholesale. The release
+        # index rescues the case only in the sense that it is per-finding
+        # evidence rather than a global claim: one resolved path is a fact about
+        # one object, so it is safe even where the walk of the clone came back
+        # with nothing.
         return []
 
     retracted: list[str] = []
@@ -9585,7 +9706,10 @@ def retract_contradicted_declaration_denials(
         kind, _, name = obj.partition("/")
         if kind not in _GITOPS_DECLARABLE_KINDS or not name:
             continue
-        if len(declared.get((kind, name)) or []) != 1:
+        if (
+            len(declared.get((kind, name)) or []) != 1
+            and derive_finding_id(finding) not in releases
+        ):
             continue
         edited = False
         for section, field in _DECLARATION_DENIAL_FIELDS:
@@ -9700,28 +9824,18 @@ def disclose_undeclared_manual_remediations(
     having to strip its own previous output first, which is what `_UNDECLARED_LEDE`
     is for.
 
-    A workload a chart renders is undeclared by this index and always will be:
-    the object exists only after Helm expands the chart. Where the collector
-    resolved its release to an Application or a HelmRelease in this repository,
-    the note names that file instead of claiming no pull request can carry the
-    fix -- which is false there, a values override being exactly such a request.
+    A rendered workload is undeclared by this index and always will be: the
+    object exists only after Helm expands the chart or Kustomize builds the
+    overlay. Where the collector resolved its release to an Application or a
+    HelmRelease in this repository, the note names that file instead of claiming
+    no pull request can carry the fix -- which is false there, a values override
+    or a `spec.source.kustomize.patches` entry being exactly such a request. The
+    note says which of the two, because the reader looking for a `values:` block
+    in an overlay finds nothing and concludes the path is wrong.
 
     Returns the ids annotated, for the caller to log.
     """
-    releases: dict[str, str] = {}
-    for entry in (manifest or {}).get("clusters") or []:
-        if not isinstance(entry, dict):
-            continue
-        cluster_name = str(entry.get("name") or "")
-        for candidate in entry.get("candidates") or []:
-            if not isinstance(candidate, dict):
-                continue
-            release = candidate.get("release_declaration")
-            path = str((release or {}).get("path") or "").strip()
-            if not path:
-                continue
-            keyed = {**candidate, "cluster": str(candidate.get("cluster") or cluster_name)}
-            releases[derive_finding_id(keyed)] = path
+    releases = _release_declaration_index(manifest)
 
     declared = kubernetes_declarations(root)
     if not declared:
@@ -9751,8 +9865,8 @@ def disclose_undeclared_manual_remediations(
             continue
         if (kind, name) in declared:
             continue
-        release_path = releases.get(derive_finding_id(finding))
-        sentence = _release_declared_note(release_path) if release_path else _UNDECLARED_NOTE
+        release = releases.get(derive_finding_id(finding))
+        sentence = _release_declared_note(*release) if release else _UNDECLARED_NOTE
         remediation["note"] = (f"{note} " if note else "") + sentence
         annotated.append(str(finding.get("id", "")))
     return annotated
@@ -10784,12 +10898,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     # Before the disclosure, not after: the disclosure appends the sentence that
     # proves the retracted one false, and a pass that ran afterwards would have
     # to read past its own output to find the model's.
-    for fid in retract_contradicted_declaration_denials(findings, root):
+    for fid in retract_contradicted_declaration_denials(findings, root, manifest):
         log(
             f"{fid} claimed in its own prose that the object is not declared in "
-            "the GitOps repository, and the repository declares it in exactly "
-            "one file; the sentence was dropped rather than published beside "
-            "the note that contradicts it."
+            "the GitOps repository, and the repository either declares it in "
+            "exactly one file or declares the release that renders it; the "
+            "sentence was dropped rather than published beside the note that "
+            "contradicts it."
         )
     for fid in disclose_declared_manual_remediations(findings, root):
         log(
