@@ -4641,6 +4641,166 @@ class TestDefaultSaAutomount(unittest.TestCase):
         self.assertEqual(collect.check_default_sa_automount(ctx), [])
 
 
+class TestUnboundSaAutomount(unittest.TestCase):
+    """§2.14 -- a named ServiceAccount no binding grants anything, mounted anyway.
+
+    §2.7 stops at `default`, so every workload here is invisible to it: the
+    chart created a ServiceAccount, which is the recommended thing to do, and
+    then bound it to nothing and left the automount default alone.
+    """
+
+    @staticmethod
+    def sa(name, ns="shop", automount=None):
+        doc = {"kind": "ServiceAccount", "metadata": {"namespace": ns, "name": name}}
+        if automount is not None:
+            doc["automountServiceAccountToken"] = automount
+        return doc
+
+    @staticmethod
+    def wl(sa_name="api-sa", ns="shop", **spec):
+        if sa_name is not None:
+            spec["serviceAccountName"] = sa_name
+        return {"kind": "Deployment", "ns": ns, "name": "api", "spec": spec}
+
+    @staticmethod
+    def binding(sa_name, ns="shop", kind="RoleBinding", role="reader"):
+        return {
+            "kind": kind,
+            "metadata": {"name": f"{sa_name}-{role}"},
+            "roleRef": {"kind": "Role", "name": role},
+            "subjects": [{"kind": "ServiceAccount", "namespace": ns, "name": sa_name}],
+        }
+
+    def ctx(self, **overrides):
+        base = {
+            "serviceaccounts": [self.sa("api-sa")],
+            "workloads": [self.wl()],
+            "rolebindings": [],
+            "clusterrolebindings": [],
+        }
+        base.update(overrides)
+        return context_of(**base)
+
+    def test_a_named_sa_with_no_binding_at_all_is_flagged(self):
+        (hit,) = collect.check_unbound_sa_automount(self.ctx())
+        self.assertEqual(hit["object"], "Deployment/api")
+        self.assertEqual(hit["namespace"], "shop")
+        # The excerpt names the ServiceAccount, because the object name does
+        # not: charts routinely name the two differently.
+        self.assertIn("api-sa", hit["excerpt"])
+
+    def test_a_rolebinding_naming_the_sa_suppresses_it(self):
+        self.assertEqual(
+            collect.check_unbound_sa_automount(self.ctx(rolebindings=[self.binding("api-sa")])), []
+        )
+
+    def test_a_clusterrolebinding_naming_the_sa_suppresses_it(self):
+        ctx = self.ctx(clusterrolebindings=[self.binding("api-sa", kind="ClusterRoleBinding")])
+        self.assertEqual(collect.check_unbound_sa_automount(ctx), [])
+
+    def test_a_binding_naming_the_same_sa_name_in_another_namespace_does_not(self):
+        # ServiceAccount subjects are namespaced and the names collide across a
+        # fleet -- `api-sa` in `staging` grants nothing to `api-sa` in `shop`.
+        ctx = self.ctx(rolebindings=[self.binding("api-sa", ns="staging")])
+        self.assertEqual(len(collect.check_unbound_sa_automount(ctx)), 1)
+
+    def test_the_default_service_account_is_never_flagged(self):
+        # §2.7's finding. Emitting both on one object would publish the same
+        # remediation twice under two ids.
+        for spec in ({}, {"serviceAccountName": "default"}):
+            with self.subTest(spec=spec):
+                ctx = self.ctx(
+                    serviceaccounts=[default_sa("shop")],
+                    workloads=[{"kind": "Deployment", "ns": "shop", "name": "api", "spec": spec}],
+                )
+                self.assertEqual(collect.check_unbound_sa_automount(ctx), [])
+
+    def test_the_pod_level_override_suppresses_it(self):
+        ctx = self.ctx(workloads=[self.wl(automountServiceAccountToken=False)])
+        self.assertEqual(collect.check_unbound_sa_automount(ctx), [])
+
+    def test_the_service_account_level_override_suppresses_it(self):
+        ctx = self.ctx(serviceaccounts=[self.sa("api-sa", automount=False)])
+        self.assertEqual(collect.check_unbound_sa_automount(ctx), [])
+
+    def test_a_service_account_that_does_not_exist_is_not_flagged(self):
+        # No object, no token, no pod -- the workload does not start. Sending a
+        # pull request to disable a mount that is not happening would be a
+        # finding about the wrong thing.
+        self.assertEqual(collect.check_unbound_sa_automount(self.ctx(serviceaccounts=[])), [])
+
+    def test_the_deprecated_service_account_field_is_read_too(self):
+        ctx = self.ctx(workloads=[{"kind": "Deployment", "ns": "shop", "name": "api", "spec": {"serviceAccount": "api-sa"}}])
+        self.assertEqual(len(collect.check_unbound_sa_automount(ctx)), 1)
+
+    def test_the_finding_carries_the_workloads_reconciler(self):
+        wl = self.wl()
+        wl["reconciler"] = "argocd:workloads-shop"
+        (hit,) = collect.check_unbound_sa_automount(self.ctx(workloads=[wl]))
+        self.assertEqual(hit["reconciler"], "argocd:workloads-shop")
+
+    def test_a_group_binding_to_every_service_account_suppresses_the_whole_cluster(self):
+        # The correctness hole this check has to close. `view` bound to
+        # `system:authenticated` grants every ServiceAccount read on the
+        # cluster without naming one, so the unbound claim is false everywhere
+        # and the check reports nothing rather than reporting something untrue.
+        for group in ("system:authenticated", "system:serviceaccounts", "system:serviceaccounts:shop"):
+            with self.subTest(group=group):
+                ctx = self.ctx(
+                    clusterrolebindings=[
+                        {
+                            "kind": "ClusterRoleBinding",
+                            "metadata": {"name": "browsable"},
+                            "roleRef": {"kind": "ClusterRole", "name": "view"},
+                            "subjects": [{"kind": "Group", "name": group}],
+                        }
+                    ]
+                )
+                self.assertEqual(collect.check_unbound_sa_automount(ctx), [])
+
+    def test_the_four_kubernetes_baseline_group_bindings_do_not(self):
+        # Every cluster ships these, so counting them would retire the check
+        # fleet-wide on day one. They grant discovery, `/version`, `/healthz`, a
+        # self-review of one's own permissions, and the OIDC issuer document --
+        # the baseline every authenticated principal already has.
+        ctx = self.ctx(
+            clusterrolebindings=[
+                {
+                    "kind": "ClusterRoleBinding",
+                    "metadata": {"name": f"system:{role}"},
+                    "roleRef": {"kind": "ClusterRole", "name": role},
+                    "subjects": [{"kind": "Group", "name": "system:authenticated"}],
+                }
+                for role in (
+                    "system:basic-user",
+                    "system:discovery",
+                    "system:public-info-viewer",
+                    "system:service-account-issuer-discovery",
+                )
+            ]
+        )
+        self.assertEqual(len(collect.check_unbound_sa_automount(ctx)), 1)
+
+    def test_a_group_binding_to_an_ordinary_group_is_not_a_suppression(self):
+        # `platform-team@acme.com` is a set of humans, not the service accounts.
+        ctx = self.ctx(
+            clusterrolebindings=[
+                {
+                    "kind": "ClusterRoleBinding",
+                    "metadata": {"name": "platform-admin"},
+                    "roleRef": {"kind": "ClusterRole", "name": "edit"},
+                    "subjects": [{"kind": "Group", "name": "platform-team@acme.com"}],
+                }
+            ]
+        )
+        self.assertEqual(len(collect.check_unbound_sa_automount(ctx)), 1)
+
+    def test_it_is_on_the_compliance_roster(self):
+        spec = next(c for c in collect.COMPLIANCE_CHECKS if c.slug == "unbound-sa-automount")
+        self.assertEqual(spec.kind, "cluster")
+        self.assertEqual(spec.severity, "major")
+
+
 class TestWorkloadIdentityOff(unittest.TestCase):
     def test_empty_workload_pool_is_flagged(self):
         ctx = context_of(cluster_describe={"workloadIdentityConfig": {}})
@@ -5735,7 +5895,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 12)
+        self.assertEqual(len(result["commands"]), 13)
 
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
@@ -5851,7 +6011,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 12)
+        self.assertEqual(len(command_slugs), 13)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -6057,14 +6217,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Thirteen checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is nine, each with a command
+        Fourteen checks minus the three Autopilot rules out and the one no
+        cluster without Config Connector can run is ten, each with a command
         behind it, and the four dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 9)
+        self.assertEqual(len(command_slugs), 10)
         self.assertEqual(len(na_slugs), 4)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))

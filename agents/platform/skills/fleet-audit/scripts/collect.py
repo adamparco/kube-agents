@@ -7,7 +7,7 @@ See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 **Scope of this file today: the collector engine, plus three streams' check
 tables in full.** `obtainability-audit`'s complete twenty-check roster
 (§3.1–§3.20 of `governance/obtainability_audit_sop.md`), `compliance-audit`'s
-complete thirteen-check roster (§2.1–§2.13 of `governance/compliance_audit_sop.md`),
+complete fourteen-check roster (§2.1–§2.14 of `governance/compliance_audit_sop.md`),
 and `ai-security-audit`'s complete six-check roster (§3.1–§3.6 of
 `governance/ai_security_audit_sop.md`) are all converted — every check any of
 the three SOPs defines is fully mechanical (design §2, point 2: none needed a
@@ -2456,7 +2456,7 @@ def check_service_port_unresolved(context: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all thirteen checks of §2.
+# compliance-audit: all fourteen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -3241,6 +3241,143 @@ def check_default_sa_automount(context: dict) -> list[dict]:
                 # per workload, because the ServiceAccount half of the test is
                 # a namespace fact. The record carries the same field the
                 # workload checks read.
+                "reconciler": wl.get("reconciler"),
+            }
+        )
+    return hits
+
+
+# The four `system:` ClusterRoles Kubernetes binds to a group every principal
+# is in, on every cluster, out of the box. They are what "this token grants
+# nothing" means: API discovery, `/version`, `/healthz`, a self-review of one's
+# own permissions, and the OIDC issuer document. §2.14 has to know them by name
+# because it reads group-subject bindings to decide whether an unbound
+# ServiceAccount is really unbound -- and if these four counted, no
+# ServiceAccount on any cluster would ever qualify.
+_UNIVERSAL_SA_GROUPS = frozenset({"system:authenticated", "system:serviceaccounts"})
+_BASELINE_AUTHENTICATED_ROLES = frozenset({
+    "system:basic-user",
+    "system:discovery",
+    "system:public-info-viewer",
+    "system:service-account-issuer-discovery",
+})
+
+_IMPACT_UNBOUND_SA_AUTOMOUNT = (
+    "This workload mounts a live API-server credential into every container, "
+    "and no RoleBinding or ClusterRoleBinding grants the ServiceAccount it "
+    "belongs to anything. An attacker reaching the filesystem -- through a "
+    "path-traversal read, an SSRF the container proxies, a leaked log of the "
+    "token, or code execution -- gets an authenticated identity on the API "
+    "server for free, and authenticated is the boundary most of a cluster's "
+    "defences are written against. Turning the mount off costs this workload "
+    "nothing, because there is no grant behind the token for it to lose."
+)
+
+
+def _sa_grant_is_universal(context: dict) -> bool:
+    """Whether this cluster grants every ServiceAccount something by group.
+
+    §2.14's whole claim is "no binding grants this ServiceAccount anything",
+    and a binding whose subject is a *group* covering service accounts breaks
+    it without naming any of them. Some organisations do exactly that --
+    `view` bound to `system:authenticated` is a common way to make a cluster
+    browsable -- and on such a cluster every finding this check could emit
+    would be false.
+
+    The four roles in `_BASELINE_AUTHENTICATED_ROLES` are excluded because
+    Kubernetes ships them bound this way on every cluster. Anything else
+    grants real access to the whole group, so the check reports nothing here
+    rather than reporting something untrue.
+    """
+    for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or []):
+        if (binding.get("roleRef") or {}).get("name") in _BASELINE_AUTHENTICATED_ROLES:
+            continue
+        for subject in binding.get("subjects") or []:
+            if subject.get("kind") != "Group":
+                continue
+            name = subject.get("name") or ""
+            if name in _UNIVERSAL_SA_GROUPS or name.startswith("system:serviceaccounts:"):
+                return True
+    return False
+
+
+def check_unbound_sa_automount(context: dict) -> list[dict]:
+    """§2.14 -- a token mounted for a ServiceAccount nothing has granted.
+
+    §2.7 covers the `default` ServiceAccount and stops there, which was the
+    right scope when it was written and is no longer where the shape lives. A
+    chart that follows current practice creates a ServiceAccount of its own,
+    so `serviceAccountName` is set and §2.7 goes quiet -- and then most charts
+    bind that ServiceAccount to nothing, because the workload never calls the
+    API server, and leave `automountServiceAccountToken` alone, because it
+    defaults to on. The result is a credential in the container filesystem
+    that exists for no reason, on a workload §2.7 by construction cannot see.
+
+    The unbound test is what makes this safe to open a pull request against.
+    "This workload does not use its token" is not readable from a manifest and
+    a finding asserting it is one an owner can refute from memory, which is
+    why §2.7's impact sentence deliberately does not claim it. "Nothing has
+    granted this ServiceAccount anything" is a different statement: it is
+    provable from the RBAC dump, and it makes the remediation costless without
+    needing to know what the container does. Either the token is unused, or
+    the workload is already failing every API call it makes -- and in the
+    second case turning the mount off does not make it worse, it makes a
+    second problem visible.
+
+    An explicit projected `serviceAccountToken` volume is unaffected by
+    `automountServiceAccountToken` and is therefore not an exclusion: a
+    workload federating to Vault or to an external audience keeps working
+    across this fix. GKE Workload Identity likewise reaches Google Cloud
+    through the metadata server rather than this token.
+    """
+    if _sa_grant_is_universal(context):
+        return []
+    bound = {
+        (subject.get("namespace") or "", subject.get("name") or "")
+        for binding in (context.get("clusterrolebindings") or []) + (context.get("rolebindings") or [])
+        for subject in binding.get("subjects") or []
+        if subject.get("kind") == "ServiceAccount"
+    }
+    # Only the SAs that exist. A `serviceAccountName` naming an absent object
+    # mounts no token at all -- the pod does not start -- so it is not this
+    # check's finding, and reporting it as one would send a pull request to
+    # turn off a mount that is not happening.
+    declared = {
+        ((sa.get("metadata") or {}).get("namespace", ""), (sa.get("metadata") or {}).get("name", "")): sa
+        for sa in context.get("serviceaccounts") or []
+    }
+    hits = []
+    for wl in context.get("workloads") or []:
+        sa_name = wl["spec"].get("serviceAccountName") or wl["spec"].get("serviceAccount") or "default"
+        if sa_name == "default":
+            continue  # §2.7's finding; never emit both on one object
+        key = (wl["ns"], sa_name)
+        sa = declared.get(key)
+        if sa is None:
+            continue
+        if wl["spec"].get("automountServiceAccountToken") is False:
+            continue
+        if sa.get("automountServiceAccountToken") is False:
+            continue
+        if key in bound:
+            continue
+        hits.append(
+            {
+                "namespace": wl["ns"],
+                "object": f"{wl['kind']}/{wl['name']}",
+                # Name the ServiceAccount. The fix goes on the workload, but a
+                # reviewer's first question is which identity is unbound, and
+                # the object name does not answer it -- charts routinely name
+                # the ServiceAccount something other than the Deployment.
+                "excerpt": (
+                    f"serviceAccountName={sa_name}, automountServiceAccountToken unset on both "
+                    f"the pod and the ServiceAccount; no RoleBinding or ClusterRoleBinding "
+                    f"names ServiceAccount {wl['ns']}/{sa_name} as a subject"
+                ),
+                # Same reason as §2.7's: a cluster-kind check that walks the
+                # workload list itself still owes each hit the workload's
+                # reconciler, or the finding cannot say a hand-applied fix
+                # would be reverted.
                 "reconciler": wl.get("reconciler"),
             }
         )
@@ -4994,6 +5131,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         "minor",  # overridden per hit: major where the live pods already disagree
         None,
         _IMPACT_IMAGE_FLOATING,
+    ),
+    CheckSpec(
+        "unbound-sa-automount",
+        "cluster",
+        check_unbound_sa_automount,
+        "major",
+        None,
+        _IMPACT_UNBOUND_SA_AUTOMOUNT,
     ),
 )
 

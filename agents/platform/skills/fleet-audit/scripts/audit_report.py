@@ -140,6 +140,7 @@ AUDITS: dict[str, AuditSpec] = {
             "podsecurity-gaps",
             "kcc-object-wedged",
             "image-floating-tag",
+            "unbound-sa-automount",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
