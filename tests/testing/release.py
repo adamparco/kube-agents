@@ -15,6 +15,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "k8s-operator",
     "platform-agent",
     "credential-proxy",
+    "agent-sandbox",
     "replay-proxy",
     "pubsub-platform",
     "gke-stockout-investigator",
@@ -266,7 +267,7 @@ exit 1
 
 
 def create_mock_helm_binary(bin_dir, log_file=None, fail_lint=False, fail_package=False, fail_push=False):
-    """Creates a mock helm CLI supporting lint, package, and push commands."""
+    """Creates a mock helm CLI supporting lint, package, push, and registry login commands."""
     bin_path = pathlib.Path(bin_dir)
     bin_path.mkdir(parents=True, exist_ok=True)
     helm_path = bin_path / "helm"
@@ -278,6 +279,18 @@ def create_mock_helm_binary(bin_dir, log_file=None, fail_lint=False, fail_packag
 
     content = f"""#!/bin/sh
 echo "mock helm: $@" >> "{log_path}"
+if [ "$1" = "registry" ] && [ "$2" = "login" ]; then
+  # The real helm reads the password from stdin when --password-stdin is
+  # given. A mock that exits without reading it races the writer: under
+  # `set -o pipefail`, a `printf token | helm registry login` whose helm exits
+  # first kills printf with SIGPIPE and the pipeline reports failure.
+  for arg in "$@"; do
+    if [ "$arg" = "--password-stdin" ]; then
+      cat >/dev/null
+    fi
+  done
+  exit 0
+fi
 if [ "$1" = "lint" ]; then
   {lint_exit}
 fi
@@ -423,5 +436,40 @@ def create_mock_release_bundle_marker(
         f"name=kube-agents\nversion={version}\ntag={resolved_tag}\ncommit={commit}\n"
     )
     return marker_file
+
+
+def populate_mock_release_files(repo_dir):
+    """Populates all required release stamping files in a mock repository."""
+    repo_path = pathlib.Path(repo_dir)
+    for script in ["install.sh", "uninstall.sh", "upgrade.sh"]:
+        (repo_path / script).write_text('#!/bin/bash\nBAKED_RELEASE_VERSION=""\n')
+
+    chart_dir = repo_path / "charts" / "kube-agents"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    (chart_dir / "Chart.yaml").write_text(
+        'apiVersion: v2\n'
+        'name: kube-agents\n'
+        'version: 0.1.0\n'
+        'appVersion: "0.1.0"\n'
+    )
+
+    tf_dir = repo_path / "terraform" / "examples" / "full-install"
+    tf_dir.mkdir(parents=True, exist_ok=True)
+    (tf_dir / "variables.tf").write_text(
+        'variable "project_id" {\n'
+        '  description = "GCP Project ID"\n'
+        '  type        = string\n'
+        '}\n\n'
+        'variable "image_tag" {\n'
+        '  description = "Release image tag"\n'
+        '  type        = string\n'
+        '  default     = "0.1.0"\n'
+        '}\n'
+    )
+    (tf_dir / "terraform.tfvars.example").write_text(
+        'project_id = "my-project"\n'
+        '# image_tag = "0.1.0"\n'
+    )
+
 
 

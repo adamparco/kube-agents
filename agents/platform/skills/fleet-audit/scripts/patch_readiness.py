@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """patch_readiness.py — Procedural collector for the Upgrade & Patch
 Readiness Audit (`security-patch-orchestrator`).
 

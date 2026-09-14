@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """networking_audit.py — Procedural collector for the GCP networking fabric
 and VPC IPAM audit.
 

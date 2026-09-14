@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """report_status.py — the read side of the fleet-audit report store.
 
 Projects `reports/<audit-id>/{started.json, latest.json, runs/}` into one small

@@ -161,12 +161,12 @@ func withCommonLabels(obj metav1.Object, agent *agentv1alpha1.PlatformAgent) {
 // also already the off switch charts/kube-agents/README.md tells operators to set by hand
 // for exactly this cluster shape; this makes it the default there.
 //
-// It does NOT reach the hermes_otel plugin, which is where agent *spans* go. That
-// plugin does not read OTEL_EXPORTER_OTLP_ENDPOINT at all — its backend is baked into the
-// image and rewritten at start-up by deploy/shared/otel_config.py, which leaves the baked
-// value alone when the endpoint is empty. So on this path the plugin keeps pointing at
-// the managed collector. That is latent rather than noisy (the plugin exports only when
-// there are spans, and it logs no retry storm), but it is not fixed here.
+// For agent *spans*, the companion hermes_otel plugin does not read
+// OTEL_EXPORTER_OTLP_ENDPOINT directly; its config is managed by deploy/shared/otel_config.py.
+// When OTEL_SDK_DISABLED=true is set here (or HERMES_OTEL_ENABLED=false is configured),
+// deploy/shared/docker-entrypoint.sh invokes otel_config.py --disabled, marking the plugin
+// disabled (enabled: false) and clearing its backends list so no spans are created or exported
+// to the baked fallback URL (#933).
 //
 // It stays overridable: mergeEnvVars applies spec.deployment.env last, so an operator who
 // wants the exporter pointed somewhere regardless can set either variable themselves.
@@ -223,6 +223,16 @@ func otelTelemetryEnvVars(agentType, name, namespace, endpoint string, disabled 
 //	"mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
 //	"k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
 func deriveAgentImageFromOperator(operatorImage string) string {
+	return deriveImageFromOperator(operatorImage, appNamePlatformAgent)
+}
+
+// deriveImageFromOperator is the same substitution for any repository built and
+// released alongside the operator, not the platform agent alone. The sandbox is
+// the second caller: it is a fourth image from the same workflow and the same
+// commit, so an install that mirrored the operator has mirrored it too, and
+// reaching ghcr.io for it on a private-registry install is the same failure
+// this derivation exists to avoid for the agent.
+func deriveImageFromOperator(operatorImage, repository string) string {
 	lastSlash := strings.LastIndex(operatorImage, "/")
 	prefix := ""
 	refPart := operatorImage
@@ -239,7 +249,7 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 	if tagIdx := strings.Index(refPart, ":"); tagIdx >= 0 {
 		suffix = refPart[tagIdx:]
 	}
-	return prefix + appNamePlatformAgent + suffix
+	return prefix + repository + suffix
 }
 
 // defaultPlatformAgentImage returns the agent image used when a CR omits

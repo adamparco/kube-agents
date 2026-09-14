@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """report_query.py — bounded answers out of the fleet-audit report store.
 
 Seven subcommands, one small JSON document each, so that a question about a

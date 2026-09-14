@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """fleet_drift.py — Procedural collector for the Fleet Consistency Drift
 Audit (`fleet-consistency-drift`).
 

@@ -117,10 +117,40 @@ uninstall: kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | kubectl delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
+# Tags that float. A controller deployed from one is upgraded on its next pod
+# reschedule while the RBAC and CRDs applied beside it stay where they were,
+# and the first verb the newer controller needs that the older ClusterRole
+# lacks becomes an unbounded `Reconciler error` loop (#1009). The supported
+# installers go further (validate_immutable_ref in install.sh allows only a
+# 40-hex commit SHA or a numeric SemVer tag); this is a denylist of the tags
+# that are known to float, deliberately looser so the short SHAs and dev tags
+# a local build uses still deploy, with an escape hatch for a cluster that will
+# be thrown away before the next reschedule.
+MUTABLE_IMAGE_TAGS := latest main master HEAD dev
+ALLOW_MUTABLE_IMG ?=
+
+.PHONY: check-img
+check-img: ## Refuse a mutable image tag in IMG for deploy (ALLOW_MUTABLE_IMG=1 overrides).
+	@ref='$(IMG)'; \
+	case "$$ref" in *@sha256:*) exit 0 ;; esac; \
+	tag="$${ref##*:}"; \
+	case "$$tag" in "$$ref"|*/*) tag="" ;; esac; \
+	mutable=""; \
+	if [ -z "$$tag" ]; then mutable="an untagged reference"; fi; \
+	for t in $(MUTABLE_IMAGE_TAGS); do [ "$$tag" = "$$t" ] && mutable="the floating tag ':$$t'"; done; \
+	if [ -n "$$mutable" ] && [ "$(ALLOW_MUTABLE_IMG)" != "1" ]; then \
+	  echo "ERROR: IMG=$$ref is $$mutable. A controller deployed from it is silently upgraded on its next" >&2; \
+	  echo "       pod reschedule while the ClusterRole and CRDs applied with it stay put, and the newer" >&2; \
+	  echo "       controller then fails every reconcile with 'forbidden' (see issue #1009)." >&2; \
+	  echo "       Deploy an immutable ref instead, e.g. IMG=<registry>/k8s-operator:\$$(git rev-parse HEAD)," >&2; \
+	  echo "       or set ALLOW_MUTABLE_IMG=1 for a cluster you will throw away before then." >&2; \
+	  exit 1; \
+	fi
+
 # The image is pinned in a throwaway copy of config/ so that `kustomize edit`
 # does not rewrite the tracked config/manager/kustomization.yaml.
 .PHONY: deploy
-deploy: kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: kustomize check-img ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R config "$$tmp/config"; \
 	(cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=${IMG}); \
@@ -244,6 +274,10 @@ controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessar
 $(CONTROLLER_GEN): $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
+.PHONY: envtest-path
+envtest-path: envtest ## Print the KUBEBUILDER_ASSETS path (installs the binaries if absent).
+	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path
+
 .PHONY: setup-envtest
 setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
 	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
@@ -265,7 +299,7 @@ define go-install-tool
 @[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
 set -e; \
 package=$(2)@$(3) ;\
-echo "Downloading $${package}" ;\
+echo "Downloading $${package}" >&2 ;\
 rm -f "$(1)" ;\
 GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\

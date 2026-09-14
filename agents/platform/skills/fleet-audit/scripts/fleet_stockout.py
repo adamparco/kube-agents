@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """fleet_stockout.py — Procedural collector for the Fleet Stockout
 Prevention & Capacity Audit (`stockout-prevention`).
 

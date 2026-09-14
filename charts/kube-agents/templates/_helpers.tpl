@@ -206,12 +206,21 @@ it has to be right when the policy is applied. So it comes from telemetry.collec
 when given, and otherwise from the endpoint host, which is a cluster-local Service name in
 the case this feature exists for (<svc>.<ns>.svc.cluster.local, or the shortened <svc>.<ns>).
 
-Anything else — an external vendor endpoint, a bare hostname — fails the render, but only
-when litellm.otel is on. Silently falling back to gke-managed-otel would emit a policy that
-blocks the very collector the user just configured, and the symptom would be zero spans
-with a green install. With litellm.otel off (the default) there is no LiteLLM exporter for
-the policy to block, so failing the whole install over an egress rule nothing uses would
-punish a user who only meant to repoint the agents.
+Anything else — an external vendor endpoint, a bare hostname — has no namespace to open,
+and what the static policy does then follows the operator's dynamic copy. With
+litellm.otel on, this renders "" and the caller emits no OTLP rule: the exporter goes out
+over the port-443 rule, and a made-up namespaceSelector would open 4317/4318 to a
+namespace nothing exports to. With litellm.otel off (the default) there is no LiteLLM
+exporter, and the rule keeps the shipping gke-managed-otel default rather than changing
+a policy over an egress rule nothing uses.
+
+The host is parsed the way the operator's otlpCollectorNamespace (k8s-operator,
+platformagent_manifests.go) parses the same value when it builds the dynamic policy —
+exact lowercase scheme prefixes, cut at the first "/", then at the first ":" — so the two
+renders reach the same verdict about the same endpoint.
+
+Only the static litellm-policy render calls this. On the default install the operator
+owns the policy and resolves the namespace at reconcile time from the CR.
 */}}
 {{- define "kube-agents.otlpCollectorNamespace" -}}
 {{- if .Values.telemetry.collectorNamespace -}}
@@ -232,8 +241,6 @@ gke-managed-otel
 {{- index $parts 1 -}}
 {{- else if not .Values.litellm.otel -}}
 gke-managed-otel
-{{- else -}}
-{{- fail (printf "telemetry.otlpEndpoint %q does not name an in-cluster Service, so the LiteLLM NetworkPolicy cannot tell which namespace to allow egress to. Set telemetry.collectorNamespace, or set litellm.networkPolicy=false if the policy is managed elsewhere." .Values.telemetry.otlpEndpoint) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -401,4 +408,56 @@ wrong Service.
 
 {{- define "kube-agents.webhookConfigurationPrefix" -}}
 {{ .Release.Name }}-{{ .Release.Namespace }}
+{{- end }}
+
+{{/*
+Validates and resolves a Deployment's rollingUpdate fenceposts, returning a
+YAML map with `maxSurge` and `maxUnavailable`. Callers parse the output with
+`| fromYaml`.
+
+Both fenceposts at zero leaves the Deployment no way to make progress and
+the API server rejects it ("may not be 0 when maxSurge is 0"), so fail
+the render rather than the apply. See values.yaml's rollingUpdate blocks.
+
+A fencepost with no usable value takes the given default (defaultSurge,
+defaultUnavailable) and renders explicitly. "No usable value" has to mean
+the empty string as well as nil/invalid: `--set <scope>.maxUnavailable=` and
+a values file's `maxUnavailable: ""` both reach here as an empty string,
+which is a perfectly good `kind` and so survives a nil test. Rendering
+either through would emit `maxUnavailable:` with nothing after it, and
+Kubernetes then applies its own 25% default.
+
+Both fields are IntOrString, which is what makes the zero test awkward:
+`int` is cast.ToInt and reads "25%" as 0, so it would refuse a pair of
+perfectly good percentages, while a list of literal spellings misses
+"0.0". Compare numerically with the percent sign stripped — "0%"
+resolves to 0 on the cluster, so it is the same misconfiguration spelled
+differently. `float64` is cast.ToFloat64, which reports anything it
+cannot parse as 0, so the numeric test is gated on both values actually
+being numeric: without that, `maxSurge: abc` is refused as a zero and
+the message names the wrong problem. Non-numeric input is left to the
+API server, which is where it was rejected before this guard existed.
+
+Takes a dict: {rollingUpdate, defaultSurge, defaultUnavailable, scope}.
+*/}}
+{{- define "kube-agents.rollingUpdateFenceposts" -}}
+{{- $ru := .rollingUpdate | default dict -}}
+{{- $surge := $ru.maxSurge -}}
+{{- $unavail := $ru.maxUnavailable -}}
+{{- $defaultSurge := .defaultSurge -}}
+{{- if kindIs "invalid" $defaultSurge }}{{- $defaultSurge = 1 }}{{- end -}}
+{{- $defaultUnavail := .defaultUnavailable -}}
+{{- if kindIs "invalid" $defaultUnavail }}{{- $defaultUnavail = 0 }}{{- end -}}
+{{- if or (kindIs "invalid" $surge) (eq (toString $surge) "") }}{{- $surge = $defaultSurge }}{{- end -}}
+{{- if or (kindIs "invalid" $unavail) (eq (toString $unavail) "") }}{{- $unavail = $defaultUnavail }}{{- end -}}
+{{- $surgeNum := trimSuffix "%" (trim (toString $surge)) -}}
+{{- $unavailNum := trimSuffix "%" (trim (toString $unavail)) -}}
+{{- $numeric := "^[0-9]+(\\.[0-9]+)?$" -}}
+{{- if and (regexMatch $numeric $surgeNum) (regexMatch $numeric $unavailNum) -}}
+{{- if and (eq (float64 $surgeNum) 0.0) (eq (float64 $unavailNum) 0.0) -}}
+{{- fail (printf "%s: maxSurge (%v) and maxUnavailable (%v) may not both be zero — the Deployment would have no way to make progress, and the API server rejects it." .scope $surge $unavail) -}}
+{{- end -}}
+{{- end -}}
+maxSurge: {{ $surge }}
+maxUnavailable: {{ $unavail }}
 {{- end }}

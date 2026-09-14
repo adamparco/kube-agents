@@ -90,9 +90,22 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_local_path_returns_none(self, run):
         res = MagicMock()
-        res.stdout = "/srv/git/kube-agents.git\n"
         run.return_value = res
-        self.assertIsNone(get_current_git_repo())
+        for url in (
+            "/srv/git/kube-agents.git",
+            # `git remote add origin github.com/gke-labs/kube-agents` succeeds:
+            # git takes it as a relative local path, not a GitHub URL. It is a
+            # directory name, and `repo_ref`'s shorthand lift gives it an
+            # inferred github.com host -- which is right for a repository
+            # someone registered and wrong for a remote git emitted. Admitting
+            # it here mints an installation token for whichever org the
+            # directory happens to name.
+            "github.com/gke-labs/kube-agents",
+            "GitHub.com/gke-labs/kube-agents",
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                self.assertIsNone(get_current_git_repo())
 
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_failure_returns_none(self, run):
@@ -108,6 +121,36 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             refresh_git_credentials("invalid-repo-no-slash")
         self.assertIn("Could not identify target repository", str(cm.exception))
+
+    def test_refresh_git_credentials_refuses_a_host_shaped_repository(self):
+        """The slug gate, not a slash count.
+
+        The check this replaced counted separators, so every value here passed
+        it and reached the Minty branch below, which splits on the first slash
+        and posts the left half as an org name: `github.com/acme` would have
+        been minted for an org called `github.com`. Nothing downstream of that
+        branch validates, so these have to fail here or not at all.
+
+        `" acme/toolkit "` is deliberately absent: the line above the gate
+        strips whitespace and slashes and it is the *stripped* value that goes
+        on to the broker, so normalising it there is safe. What is not safe is
+        normalising and then posting the original, which is why
+        `credential_proxy` gets the strict predicate.
+        """
+        for repository in (
+            "github.com/acme",
+            "www.github.com/acme",
+            "ssh.github.com/acme",
+            "acme/..",
+            "acme/-toolkit",
+            "acme/toolkit.git",
+        ):
+            with self.subTest(repository=repository):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials(repository)
+                self.assertIn(
+                    "Could not identify target repository", str(cm.exception)
+                )
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
@@ -128,6 +171,59 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(
             "http://127.0.0.1:8765/v1/github/refresh", request.full_url
+        )
+
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token")
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_federated_identity_replaces_gcloud(self, urlopen, run, fetch):
+        # The co-located sandbox proxy. gcloud refuses to mint an ID token from
+        # an external_account credential, so calling it here is not a fallback
+        # that costs a retry -- it is the failure the federated branch exists to
+        # avoid, and it must not be reached at all.
+        fetch.return_value = "an.id.token"
+        response = MagicMock()
+        # status is compared against 500 before the body is read, so a bare
+        # MagicMock here is a TypeError rather than a 200.
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b"ghs_installation_token"
+        urlopen.return_value = response
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            token = refresh_git_credentials("owner/repository")
+
+        self.assertEqual("ghs_installation_token", token)
+        self.assertNotIn(
+            "print-identity-token",
+            " ".join(str(call.args[0]) for call in run.call_args_list),
+        )
+        self.assertEqual("an.id.token", urlopen.call_args.args[0].headers["X-oidc-token"])
+
+    @patch("github_token_refresh.wif_credentials.fetch_identity_token")
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_metadata_server_placement_still_asks_gcloud(self, urlopen, run, fetch):
+        # Every placement other than the co-located one. fetch_identity_token
+        # returns None off a metadata-server identity, and this path has to stay
+        # exactly as it was.
+        fetch.return_value = None
+        run.return_value = MagicMock(stdout="gcloud.id.token\n")
+        response = MagicMock()
+        # status is compared against 500 before the body is read, so a bare
+        # MagicMock here is a TypeError rather than a 200.
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b"ghs_installation_token"
+        urlopen.return_value = response
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            refresh_git_credentials("owner/repository")
+
+        self.assertIn(
+            "print-identity-token",
+            " ".join(str(call.args[0]) for call in run.call_args_list),
+        )
+        self.assertEqual(
+            "gcloud.id.token", urlopen.call_args.args[0].headers["X-oidc-token"]
         )
 
     @patch("github_token_refresh.subprocess.run")
@@ -479,6 +575,83 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     main()
                 self.assertEqual(1, cm.exception.code)
+
+
+class SandboxForwardTest(unittest.TestCase):
+    """The gateway pod holds nothing that can mint, so it forwards.
+
+    Without this branch a `no_agent` cron job on the gateway falls through to
+    the direct mint and dies on a `gcloud` that is not installed there.
+    """
+
+    def _sandbox(self, enabled, completed=None):
+        import subprocess
+
+        module = MagicMock()
+        module.sandbox_enabled.return_value = enabled
+        module.run.return_value = completed or subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        )
+        return module
+
+    def test_the_gateway_forwards_the_mint_into_the_sandbox(self):
+        sandbox = self._sandbox(True)
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual("", refresh_git_credentials("owner/repository"))
+        sandbox.run.assert_called_once_with(
+            [
+                "python3",
+                github_token_refresh.SANDBOX_REFRESH_SCRIPT,
+                "owner/repository",
+            ],
+            timeout=github_token_refresh.SANDBOX_REFRESH_TIMEOUT_SECONDS,
+        )
+
+    def test_a_nonzero_exit_in_the_sandbox_raises_rather_than_returning_quietly(self):
+        import subprocess
+
+        sandbox = self._sandbox(
+            True,
+            subprocess.CompletedProcess([], 3, stdout="", stderr="broker said no\n"),
+        )
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials("owner/repository")
+        self.assertIn("exit 3", str(cm.exception))
+        self.assertIn("broker said no", str(cm.exception))
+
+    @patch("github_token_refresh.subprocess.run")
+    def test_no_sandbox_leaves_the_direct_mint_alone(self, run):
+        # The sandbox is not configured, so this is the credential-holding
+        # deployment and the branch has to stay out of the way.
+        sandbox = self._sandbox(False)
+        run.side_effect = [Exception("fail1"), Exception("fail2")]
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials("owner/repository")
+        self.assertIn("Failed to retrieve Google OIDC token", str(cm.exception))
+        sandbox.run.assert_not_called()
+
+    def test_the_credential_proxy_url_still_wins(self):
+        # In the sandbox both are true. Taking the sandbox branch there would
+        # ssh into the pod the call is already running in.
+        sandbox = self._sandbox(True)
+        with patch.dict(sys.modules, {"sandbox_exec": sandbox}):
+            with patch("github_token_refresh.urllib.request.urlopen") as urlopen:
+                response = MagicMock()
+                response.status = 200
+                response.__enter__.return_value = response
+                urlopen.return_value = response
+                with patch.dict(
+                    os.environ,
+                    {"CREDENTIAL_PROXY_URL": "http://broker:8765"},
+                    clear=True,
+                ):
+                    self.assertEqual("", refresh_git_credentials("owner/repository"))
+        sandbox.run.assert_not_called()
 
 
 class LooksLikeAuthFailureTest(unittest.TestCase):

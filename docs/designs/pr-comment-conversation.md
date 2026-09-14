@@ -73,7 +73,7 @@ Three properties are load-bearing, and each has a test:
   resolver that cannot run is not, and reaches the room as a `⚠️` line naming the reason code.
   Flattening the two would make a broken watcher indistinguishable from a quiet repository — the
   same distinction `test_resolver.py` protects one layer down, and the same reason the job is
-  `deliver: "all"` rather than `"local"`.
+  `deliver: "chat"` rather than `"local"`.
 - **A raising sweep does not stop its sibling.** Two separate jobs gave that isolation for free;
   consolidating buys it back with a `try` per sweep.
 
@@ -180,7 +180,7 @@ class ForgeProvider(Protocol):
     def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
                                                           # can_write, can_write_known,
                                                           # created_at, kind, path/line
-    def post_comment(self, repo, pr, body_file) -> None
+    def post_comment(self, repo, pr, body) -> None        # the text; travels on fd 0, not a path
     def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
     def list_commits(self, repo, pr) -> list[Commit]      # sha + committed_at, tip last;
                                                           # backs the reply claim check
@@ -191,8 +191,12 @@ the claim check enforces — see step 4 of the worker skill below.
 
 `GitHubProvider` implements it over the proxied `gh`, merging GitHub's three comment endpoints
 (`issues/N/comments`, `pulls/N/comments`, `pulls/N/reviews`) into one normalised list. Selection
-dispatches on the host in `SETTINGS.md`'s `Git Repo:` line. Every provider call goes through one
-`_call()` seam, so a `ProxyForgeProvider` speaking to a future sidecar route drops in without
+dispatches on the host `repo_ref.parse` reads out of the repository value the caller passes: a host
+with no provider registered raises rather than falling back, while a value naming no host at all —
+the bare `owner/name` every caller here passes today, or no repository at all — still selects
+GitHub. [`version-control-support.md`](version-control-support.md) owns that rule
+under "Repository identity". Every provider call goes through
+one `_call()` seam, so a `ProxyForgeProvider` speaking to a future sidecar route drops in without
 touching anything above it.
 
 Three shapes exist because of a forge that is not GitHub:
@@ -223,9 +227,10 @@ Three shapes exist because of a forge that is not GitHub:
   therefore permanent. The collaborator endpoint's 404 is an answer; any other failure is not, so
   the provider reports it as unknown and the sweep holds the trigger for a tick rather than guessing.
 
-The module also owns the plumbing that would otherwise become a third copy: the `gh` runner, the
-`gh auth status` preflight, and the `Git Repo:` parsing that turns `SETTINGS.md` into an
-`owner/repo`.
+The module also owns the plumbing that would otherwise become a third copy: the `gh` runner and the
+`gh auth status` preflight. Repository parsing was the third such thing until #504 removed the
+`SETTINGS.md` path that fed it; what remains of it lives in `repo_ref.py`, which `forge.py` calls
+rather than reimplements.
 
 ### Five departures from this section, and why
 
@@ -255,7 +260,7 @@ The module also owns the plumbing that would otherwise become a third copy: the 
 
 The provider protocol makes this feature portable. The stack under it is not — token brokering, the
 sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
-that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
+that is caused by this design. [`version-control-support.md`](version-control-support.md) owns the full
 account and the order the layers have to be unwound in; this section records only what bears on the
 protocol above them.
 
@@ -330,12 +335,13 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   it as untrusted posts a public refusal at a collaborator over a transient API failure — which the
   marker then makes permanent. Holding costs one tick and the next one asks again. The count goes
   to stderr, like deferral.
-- **Anything the gate posts is written to `/opt/data/scratch`, never `/tmp`.** `gh` in this container
-  is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
-  filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
-  file the container executing the command cannot open, and every refusal dies on "no such file" —
-  as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
-  the sort of thing a second implementation rediscovers the hard way.
+- **Anything the gate posts goes to `gh` on stdin, never as a path.** `gh` does not run where the
+  caller does: the gate runs in the agent pod, ssh carries the command to the sandbox, and the shim
+  forwards it to the credential broker in a third pod. A `--body-file /some/path` names a file only
+  the first of those can open. Both earlier attempts to make a path work failed — `/tmp` is a
+  per-container `emptyDir`, so every refusal died on "no such file" live, and the shared volume that
+  replaced it then needed the file made group-readable across the uid split of #955. `--body-file -`
+  needs neither, and is what the fleet audit already does (`audit_report.BODY_STDIN`).
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
@@ -391,11 +397,11 @@ marker format, and `handled_node_ids`. Both consumers must agree on all of it ex
 is a plausible owner. Three layers, then: `forge.py` is mechanism, `pr_triggers.py` is policy, the
 gate and the skill are consumers.
 
-One function in it is a deliberate **copy** rather than an import, pinned by an agreement test that
-fails if the original moves: `forge._parse_repo`, from the issue resolver's `resolver.py`. The
-original lives inside a skill, and a module shared by every skill must not import from one. The copy
-and its test are deletable in one move on the day the resolver migrates onto the shared modules,
-which §7 already names as out of scope here.
+One function in it began as a deliberate **copy** rather than an import — `forge._parse_repo`, from
+the issue resolver's `resolver.py` — because the original lived inside a skill and a module shared
+by every skill must not import from one. Both copies and the agreement test that pinned them are
+gone: repository parsing lives in `repo_ref.py`. `forge.py` calls it directly; the skill scripts
+reach it through `gitops_workspace`'s wrappers, which is the same import direction as before.
 
 ### Why the trigger is anchored to the start of the comment
 
@@ -660,7 +666,7 @@ The mechanism is already shipped, which is the point:
 
 - The age is free. `Comment.created_at` is in the payload the sweep already fetches, and
   `pr_triggers.handled_node_ids` already computes whether a trigger is unanswered.
-- The channel is free. `github-repo-watcher` is `deliver: "all"` so that a sweep which cannot run is
+- The channel is free. `github-repo-watcher` is `deliver: "chat"` so that a sweep which cannot run is
   audible (§2); an escalation is the same class of message and rides the same stdout.
 - There is no new state, no table, no route, and nothing for `submit_suggestion.py` to register.
 

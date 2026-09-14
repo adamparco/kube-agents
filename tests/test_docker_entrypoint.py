@@ -489,6 +489,25 @@ def _extract_shell_function(name):
     raise AssertionError(f"{name}() is never closed in {_ENTRYPOINT}")
 
 
+def _extract_shell_block(opener, closer="fi"):
+    """Return the text of a top-level block, from the line equal to `opener` to `closer`.
+
+    Same bargain as `_extract_shell_function`, for the steps that are written inline
+    rather than as a function: run the shipped lines, never a paraphrase of them. The
+    block must start at column zero and end at the first later line equal to `closer`,
+    which is how the script already writes its top-level steps.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, line in enumerate(lines) if line == opener]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one `{opener}` in {_ENTRYPOINT}, found {len(starts)}")
+    start = starts[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == closer:
+            return "\n".join(lines[start : end + 1]) + "\n"
+    raise AssertionError(f"`{opener}` is never closed by `{closer}` in {_ENTRYPOINT}")
+
+
 class FreshVolumeDetectionTest(unittest.TestCase):
     """A fresh volume is not an absent file, and getting that wrong cost a whole install.
 
@@ -765,7 +784,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
     NEW = f"skills.new.{POD}"
     OLD = f"skills.old.{POD}"
 
-    def _sync(self, src_parent, dst_parent, preamble="", pod=None):
+    def _sync(self, src_parent, dst_parent, preamble="", pod=None, overlay=None):
         """Run the real function under `set -e`, returning the completed process.
 
         `preamble` is shell injected between the function definition and the call.
@@ -782,7 +801,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
         """
         script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
         script += preamble
-        script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
+        script += f'sync_profile_skills "{src_parent}" "{dst_parent}" "{overlay or ""}"\necho DONE\n'
         return subprocess.run(
             ["sh", "-c", script],
             capture_output=True,
@@ -813,6 +832,72 @@ class SyncProfileSkillsTest(unittest.TestCase):
         for path in [root, *root.rglob("*")]:
             if path.is_dir():
                 path.chmod(0o700)
+
+    def test_the_overlay_is_composed_into_the_same_atomic_swap(self):
+        """The A2A skill rides 2.6a's staging as $3 rather than being copied into
+        the live directory afterwards.
+
+        Written as a second pass over $_dst it would be a non-staged writer on a
+        volume the staging protocol exists to protect: landing inside another
+        replica's swap window it recreates skills/ holding only its own file,
+        which sends that pod down the "reappeared during the swap" arm and
+        leaves the shared profile with no real skills at all. Composed here,
+        template and overlay install together in one rename.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            self._tree(tmp / "a2a" / "skills", **{"a2a-topics.md": "bus"})
+            self._tree(tmp / "profile" / "skills", **{"stale.md": "x"})
+
+            proc = self._sync(
+                tmp / "template", tmp / "profile", overlay=tmp / "a2a" / "skills"
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = sorted(p.name for p in (tmp / "profile" / "skills").iterdir())
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
+            # No staging litter survives a clean run.
+            self.assertFalse((tmp / "profile" / self.NEW).exists())
+            self.assertFalse((tmp / "profile" / self.OLD).exists())
+
+    def test_no_overlay_leaves_the_template_alone(self):
+        """A today install passes an empty $3 — the flip-back self-clean. The
+        skill is gone because the swap rebuilt skills/ from the template only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            self._tree(
+                tmp / "profile" / "skills",
+                **{"platform.md": "old", "a2a-topics.md": "left from next"},
+            )
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = sorted(p.name for p in (tmp / "profile" / "skills").iterdir())
+            self.assertEqual(installed, ["platform.md"])
+
+    def test_an_unstageable_overlay_keeps_the_existing_copy(self):
+        """Same class as a failed stage: abandon the swap rather than install a
+        half-composed tree, and never fail the boot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            overlay = self._tree(tmp / "a2a" / "skills", **{"a2a-topics.md": "bus"})
+            self._tree(tmp / "profile" / "skills", **{"existing.md": "keep me"})
+            overlay.chmod(0o000)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile", overlay=overlay)
+
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("DONE", proc.stdout)
+                installed = sorted(
+                    p.name for p in (tmp / "profile" / "skills").iterdir()
+                )
+                self.assertEqual(installed, ["existing.md"])
+            finally:
+                self._restore_modes(tmp)
 
     def test_the_image_copy_replaces_the_volume_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1518,6 +1603,248 @@ class ApiKeyPinCheckTest(unittest.TestCase):
                 proc = self._run(content)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("SURVIVED", proc.stdout)
+
+
+class SandboxMirrorGateTest(unittest.TestCase):
+    """Step 5.7 pushes the profile layout into the shell sandbox, and is fatal.
+
+    The agent's Kubernetes credentials are read-only, so nothing in this container can
+    write an Event or a condition to say the migration failed. Exiting non-zero is the
+    one channel it has: the kubelet restarts the container, and the operator's
+    getDeploymentStatusDetails scans the gateway pod's container statuses and copies the
+    waiting reason into the CR as phase Degraded. Come up 0 instead and the CR reads
+    Ready while the model's files sit on this volume where its shell cannot see them —
+    which is what happened on a live upgrade, to ten cluster profile homes at once.
+
+    So the exit status is the contract, and these pin both directions of it. The
+    transient case does not arrive here as a failure at all: sandbox_mirror.py returns 0
+    when the sandbox has not started yet and leaves its marker unwritten, so the next
+    start retries. What reaches this block non-zero is a wrong --remote-root or a
+    transfer that ran and failed, and neither gets better on its own.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(
+            'SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"'
+        )
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, invoked)` — `invoked` says whether the interpreter was reached
+        at all, which is the only way to tell "the mirror passed" from "the gate above
+        it never ran".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            (target / "logs").mkdir(parents=True)
+            (target / "scripts").mkdir()
+            if install_script:
+                (target / "scripts" / "sandbox_mirror.py").write_text("", encoding="utf-8")
+
+            # Stands in for the venv interpreter, and records that it ran. The log line
+            # it writes is what the failure path is supposed to put in front of an
+            # operator, so the test can assert the tail carried it out to stderr.
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                "#!/bin/sh\n"
+                f'echo "$@" >"{marker}"\n'
+                'echo "mirror said something an operator needs to read"\n'
+                f"exit {rc}\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                },
+            )
+            return proc, marker.exists()
+
+    def test_a_failed_migration_ends_start_up(self):
+        proc, invoked = self._run(rc=1)
+        self.assertTrue(invoked, "the mirror never ran, so this asserts nothing")
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "a migration that failed left the container coming up healthy; the CR will "
+            "say Ready and nothing will say the model's files did not cross",
+        )
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_failure_names_itself_and_carries_the_log_out(self):
+        """`kubectl logs` is where the CR's Degraded message sends you; it has to say why."""
+        proc, _ = self._run(rc=1)
+        self.assertIn("FATAL", proc.stderr)
+        self.assertIn(
+            "mirror said something an operator needs to read",
+            proc.stderr,
+            "the cause stayed in logs/sandbox_mirror.log on the PVC, which is exactly "
+            "the silence this change exists to end",
+        )
+
+    def test_a_clean_migration_leaves_start_up_alone(self):
+        proc, invoked = self._run(rc=0)
+        self.assertTrue(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Two tar streams into one directory race; only the primary mirrors.
+
+        Run with a mirror that would fail, so a regression that drops the gate fails
+        this loudly rather than passing on a stub that happens to succeed.
+        """
+        proc, invoked = self._run(rc=1, primary="0")
+        self.assertFalse(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_an_image_without_the_script_is_not_a_failure(self):
+        """The block is guarded on the script existing, and predates it in some images."""
+        proc, invoked = self._run(rc=1, install_script=False)
+        self.assertFalse(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+
+class A2AModeProbeTest(unittest.TestCase):
+    """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
+
+    The probe hands the operator's managed .env to Python and lets runtime_mode —
+    the one agent-side reader the mode spec allows — answer. Exit meanings:
+    0 next (overlay), 1 today or no managed scope (skip silently), 2 no readable
+    managed env (skip with a warning; on an operator-managed install that is a
+    fault the skill's silent absence would otherwise hide).
+
+    The parse is the strict KEY=value renderManagedEnv writes, never `.`-sourced:
+    the entrypoint is pid 1, and sourcing would execute whatever a value that
+    grew a space turned into. That property is asserted here, not just claimed.
+    """
+
+    def _probe(self, managed_env, pwned_marker=None, extra_env=None, reader=True):
+        """Run the real probe. `managed_env` is the .env body, or None for no file,
+        or ... (Ellipsis) for HERMES_MANAGED_DIR unset entirely.
+
+        `extra_env` adds process environment the container would have inherited.
+        `reader=False` drops runtime_mode off the path, standing in for a broken
+        image.
+        """
+        script = f"{_extract_shell_function('a2a_mode_probe')}\na2a_mode_probe\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            # The image runs the probe on $INSTALL_DIR's venv Python and imports
+            # runtime_mode from /opt/defaults/scripts; neither exists on a host.
+            # The venv is faked with a symlink and the module comes in through
+            # PYTHONPATH — sys.path.insert of an absent directory is harmless, so
+            # the probe under test is byte-identical to the one the image runs.
+            (tmp / ".venv" / "bin").mkdir(parents=True)
+            (tmp / ".venv" / "bin" / "python3").symlink_to(sys.executable)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "INSTALL_DIR": str(tmp),
+            }
+            if reader:
+                env["PYTHONPATH"] = str(_REPO / "agents" / "platform" / "scripts")
+            if extra_env:
+                env.update(extra_env)
+            if managed_env is not Ellipsis:
+                managed = tmp / "managed"
+                managed.mkdir()
+                env["HERMES_MANAGED_DIR"] = str(managed)
+                if managed_env is not None:
+                    body = managed_env
+                    if pwned_marker:
+                        body = body.replace("{MARKER}", str(pwned_marker))
+                    (managed / ".env").write_text(body, encoding="utf-8")
+            return subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
+            )
+
+    def test_next_answers_overlay(self):
+        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=next\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_today_answers_skip(self):
+        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_an_unrecognized_mode_fails_closed(self):
+        """runtime_mode's own rule, exercised through the probe: the dark stack
+        stays dark from both sides of the boundary."""
+        proc = self._probe("KUBEAGENTS_MODE=quantum\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_pin_free_env_reads_as_today(self):
+        proc = self._probe("API_SERVER_KEY=x\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_missing_managed_env_is_reported_not_conflated(self):
+        proc = self._probe(None)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_no_managed_scope_at_all_skips_silently(self):
+        """Unset HERMES_MANAGED_DIR is a non-operator start (compose, docker run),
+        not a fault — the same marker every other managed-scope step gates on."""
+        proc = self._probe(Ellipsis)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_the_inherited_container_env_cannot_decide_the_mode(self):
+        """The managed file is the ONLY delivery path, which is the spec's whole
+        point — one answer per agent, computed in one place.
+
+        This is not hypothetical: an AgentPlugin's spec.env is copied into the
+        agent container verbatim with no allowlist, so a plugin can put this key
+        in the process environment. Before os.environ.clear() the probe read it
+        whenever the file was silent, which made the plugin a second writer of a
+        decision the operator owns. Found by adversarial review before this
+        shipped.
+        """
+        # Key absent from the file entirely: the inherited value must not fill in.
+        proc = self._probe("API_SERVER_KEY=x\n", extra_env={"KUBEAGENTS_MODE": "next"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        # And the file still wins when the two disagree.
+        proc = self._probe(
+            "KUBEAGENTS_MODE=today\n", extra_env={"KUBEAGENTS_MODE": "next"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_malformed_line_is_skipped_not_called_unreadable(self):
+        """An empty key is not a pin. os.environ refuses one, and letting that
+        raise reported a perfectly readable file as missing."""
+        proc = self._probe("=x\nKUBEAGENTS_MODE=next\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_missing_reader_is_a_fault_not_a_decision(self):
+        """A broken image must not read as 'today' behind a bare traceback: the
+        skill would be silently absent with nothing saying why."""
+        proc = self._probe("KUBEAGENTS_MODE=next\n", reader=False)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_a_hostile_value_is_data_not_shell(self):
+        """The reason this is a parse and not a `.`: a value carrying a space and
+        a command must neither break the gate nor run."""
+        with tempfile.TemporaryDirectory() as outside:
+            marker = pathlib.Path(outside) / "pwned"
+            proc = self._probe(
+                "SLACK_HOME_CHANNEL_NAME=general chat; touch {MARKER}\n"
+                "KUBEAGENTS_MODE=next\n",
+                pwned_marker=marker,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(marker.exists(), "a managed .env value was executed")
 
 
 if __name__ == "__main__":

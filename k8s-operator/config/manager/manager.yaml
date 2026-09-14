@@ -22,6 +22,17 @@ spec:
       control-plane: controller-manager
       app.kubernetes.io/name: kube-agents-operator
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Why maxUnavailable is 0 here: this Pod is the admission webhook backend
+      # (ENABLE_WEBHOOKS: "true", containerPort: 10250) and config/webhook uses
+      # failurePolicy: Fail. At replicas: 1, maxUnavailable: 1 sets minAvailable: 0,
+      # terminating the old Pod before the replacement is Ready and causing an
+      # admission outage. maxUnavailable: 0 ensures the old Pod serves until the
+      # replacement passes readiness checks.
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       annotations:
@@ -50,12 +61,17 @@ spec:
             # point the images the operator deploys at your own registry.
             # PLATFORM_AGENT_IMAGE is the default agent image when a
             # PlatformAgent CR omits spec.deployment.image; the credential-proxy
-            # sidecar image is derived from the agent image unless
-            # CREDENTIAL_PROXY_IMAGE is set explicitly.
+            # image is derived from the agent image unless
+            # CREDENTIAL_PROXY_IMAGE is set explicitly. AGENT_SANDBOX_IMAGE is
+            # the shell sandbox StatefulSet's image, which is not derived —
+            # it is a separate repository — and is overridden per agent by
+            # spec.harness.experimental.shellSandbox.image.
             # - name: PLATFORM_AGENT_IMAGE
             #   value: "registry.example.com/kube-agents/platform-agent:latest"
             # - name: CREDENTIAL_PROXY_IMAGE
             #   value: "registry.example.com/kube-agents/credential-proxy:latest"
+            # - name: AGENT_SANDBOX_IMAGE
+            #   value: "registry.example.com/kube-agents/agent-sandbox:latest"
             # - name: FLUENT_BIT_IMAGE
             #   value: "registry.example.com/mirror/fluent-bit:5.1.1"
             # IMAGE_PULL_SECRETS is the pull identity for those images, as

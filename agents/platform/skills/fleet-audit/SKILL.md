@@ -59,6 +59,14 @@ its `skills` preloaded, and this profile's `max_turns`. `started.json` appearing
 report-store directory is the run having taken the lock; `hermes cron list` shows `Execution:
 running` from the same moment.
 
+**Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod,
+where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so
+`command not found` there is the split working as designed rather than a broken install. When you hit
+it, say the on-demand trigger is unavailable and that the stream will run on its 06:20 schedule. That
+does not license either fallback: not `cronjob(action='run')`, and not running the audit yourself —
+see the next paragraph. The gap is a deliberate deferral of the shell-sandbox design, not an
+oversight.
+
 **Do not run the audit yourself in the session that received the request.** A triggered run gets its
 own process and its own turn budget. A session that improvises the audit instead has neither — and
 when the request is "run them all", it has one turn budget for work the schedule spreads across
@@ -85,13 +93,27 @@ missing record means. Nothing in this skill reads it.
 ## The two-command lifecycle
 
 Run both commands from your normal working directory — the profile directory, where `./skills/...`
-resolves. **You are not in a git checkout, and you do not need to be.** The
-audit crons start in the profile directory; the harness clones the GitOps repository itself, into
-`/opt/data/gitops/<audit-id>/<owner>__<name>` on the shared volume, and runs every git and gh call
-inside it. The clone is keyed by audit id because the audit streams share the volume with each other
-and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
-can no longer reset another stream's working copy out from under it. The repository comes from the
-`$GITOPS_STATE_CONFIGMAP` ConfigMap, which the operator manages and which is readable before any clone exists.
+resolves. **You are not in a git checkout, and you do not need to be.** The audit crons start in the
+profile directory; the harness establishes its own workspace at
+`/opt/data/gitops/<audit-id>/<owner>__<name>` and resolves every `remediation.path` against it. The
+workspace is keyed by audit id because the audit streams share the volume with each other and with
+every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule can no
+longer reset another stream's working copy out from under it. The repository comes from the
+`$GITOPS_STATE_CONFIGMAP` ConfigMap, which the operator manages and which is readable before any
+workspace exists.
+
+What that workspace contains depends on the install, and `start` tells you which one you have as its
+`mode` field:
+
+- **`content`** — the workspace is an empty directory. The repository lives in the credential broker,
+  which owns the only checkout; you write manifests into the directory and the harness hands the
+  bytes over. Nothing on your side is a git repository, so there is nothing here to read the
+  repository out of: use `list` and `fetch` (below) for that.
+- **`directory`** — the workspace is a clone of the GitOps repository on the shared volume, and the
+  harness runs `checkout`, `add`, `commit` and `push` inside it.
+
+Everything else is identical, including where you write manifests and what `finish` publishes. Where
+the two differ, this file says which mode it is talking about.
 
 ### Step 1 — `start`
 
@@ -112,18 +134,23 @@ to do with what was asked. Naming an interpreter makes the file an argument rath
 executable, so nothing reads it. Every invocation in this file and in all nine SOPs is spelled
 that way; do not shorten one back.
 
-This resolves the target repository (using `--repo` if specified, falling back to the single configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints a repo-scoped GitHub token, clones or refreshes the
-GitOps workspace and leaves it on a clean `main`, ensures the audit's labels exist, locates the
-stream's open ledger issue, and clears any findings document a crashed run left behind. If the user asked for a specific repository that is not yet registered, instruct the user or cluster administrator to add it to `$GITOPS_STATE_CONFIGMAP`. It creates
-**no branch** — there is no report branch. It prints exactly one JSON line:
+This resolves the target repository (using `--repo` if specified, falling back to the single
+configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints
+a repo-scoped GitHub token, establishes a clean workspace, ensures the audit's labels exist, locates
+the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
+user asked for a specific repository that is not yet registered, instruct the user or cluster
+administrator to add it to `$GITOPS_STATE_CONFIGMAP`. It creates **no branch** — there is no report
+branch. It prints exactly one JSON line:
 
 ```json
 {
   "issue": 128,
   "repo": "acme/fleet",
+  "mode": "content",
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
+  "context_repos": ["acme/terraform-live"],
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
   "checks_contract": "Run every check above against every cluster you can read. …"
@@ -151,14 +178,25 @@ you read. **It is the work list, not a substitute for the SOP** — the slug say
 says what the check _is_ and what counts as a violation, so read the whole file before you start.
 `sop` names it.
 
-`workspace` is the clone. **Every `remediation.path` is resolved against it**, so a manifest written
-anywhere else is a file the harness will never find — the finding degrades to a manual one and no
-pull request opens. `start` scrubs that directory before handing it to you; `finish` does not, which
-is what lets the files you write in between survive.
+`workspace` is where your manifests go. **Every `remediation.path` is resolved against it**, so a
+manifest written anywhere else is a file the harness will never find — the finding degrades to a
+manual one and no pull request opens. `start` scrubs that directory before handing it to you;
+`finish` does not, which is what lets the files you write in between survive.
+
+`mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
+workspace is empty rather than a checkout. Read it rather than guessing from what is on disk.
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
+
+`context_repos` names the repositories registered for **declared intent**: the `context_repos` key
+of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
+whose SOP has a declared-intent step (today `obtainability-audit`, §4a) searches them before it
+reports a posture as a finding. They are read and nothing else: the key is separate from
+`managed_repos`, the harness never merges the two, so the broker's push gate, the repository
+resolver and the sweep never see them. The list is empty when nothing is registered or the key
+could not be read, which `start` says on stderr; the GitOps clone is searched either way.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -179,11 +217,13 @@ own.
 
 **The Declaration Rule — where that file goes.** A remediation that changes an object the repo
 already declares goes to that declaration: locate it (`grep -rl "name: <object>" --include='*.yaml'
-<workspace>`), name that file's repo-relative path, and rewrite it as the object's complete desired
-manifest. **Root that grep at the `workspace` path `start` gave you, never at `.`.** Your working
-directory is not the clone, and the directory above the clone holds one clone per stream — so a bare
-`.` returns the same declaration once per stream, and the collision rule that closes this paragraph
-then reads one declared object as many and sends a perfectly declarable fix to `kind: manual`.
+<workspace>` in directory mode; in content mode the `grep` subcommand below with
+`--pattern 'name: <object>'`), name that file's repo-relative path, and rewrite it as the object's
+complete desired manifest. **Root that grep at the `workspace` path `start` gave you, never at `.`.**
+Your working directory is not the clone, and the directory above the clone holds one clone per
+stream — so a bare `.` returns the same declaration once per stream, and the collision rule that
+closes this paragraph then reads one declared object as many and sends a perfectly declarable fix
+to `kind: manual`.
 Open the hits before trusting them — `grep` is kind-blind and unanchored, so it also matches
 `app.kubernetes.io/name:` label lines and objects whose names merely share a prefix, and a hit is
 not a declaration until you have opened it and confirmed it declares the object you observed, on the
@@ -234,10 +274,37 @@ No sibling either means the target is not wired to this repo. Then the finding i
 the manifest you would have written goes in `recommendation.action`, and `recommendation.rationale`
 says which of the two you established and how you established it.
 
-**Do not leave unrelated uncommitted work in that tree during an audit.** Opening a remediation pull
-request requires switching branches, and the harness forces the switch. It snapshots and restores
-every path you declared, and returns you to the branch you started on — but a file it was never told
-about is not covered by that guarantee.
+**Directory mode only: do not leave unrelated uncommitted work in that tree during an audit.**
+Opening a remediation pull request there requires switching branches, and the harness forces the
+switch. It snapshots and restores every path you declared, and returns you to the branch you started
+on — but a file it was never told about is not covered by that guarantee. Content mode switches no
+branch and writes nothing back into the workspace, so this does not apply.
+
+#### Reading the repository in content mode
+
+The clone is gone, so three commands stand in for it. `grep` searches inside the files, `list` names
+them, and `fetch` copies the ones you name into the workspace:
+
+```bash
+python3 ./skills/fleet-audit/scripts/audit_report.py grep  --audit <audit-id> --pattern 'namespace: payments'
+python3 ./skills/fleet-audit/scripts/audit_report.py list  --audit <audit-id> --prefix clusters/prod-us-east
+python3 ./skills/fleet-audit/scripts/audit_report.py fetch --audit <audit-id> --path clusters/prod-us-east/payments-netpol.yaml
+```
+
+`grep` runs broker-side and answers with matching lines; it is a fixed string unless `--regex`, and
+`--prefix` narrows it. Use it when what you know is what a file says. `list` answers with paths and
+sizes, never content — use it when what you know is where the file lives. The broker caps what each
+returns, so read `truncated` on both and **pass `--prefix`** on a large repository. `fetch` writes
+each file into the workspace at its repo-relative path, which is exactly where a remediation editing
+that file has to end up; fetch it, edit it in place, and name the same path in the finding.
+
+All three take `--branch`, and a second round needs it. Without it they answer from the base, so a
+file the remediation branch has already changed — by an earlier run or by a reviewer — comes back as
+the base has it, and committing the edit onto that branch reverts the change. The revert
+fast-forwards, so nothing objects. Pass the remediation branch whenever the remote already has one;
+a branch it does not have falls back to the base, which is what a first round wants anyway.
+
+All three exit 2 in directory mode, where the clone already holds the file.
 
 ### Step 3 — `finish`
 
@@ -259,25 +326,28 @@ collector writes.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with thirteen fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
-`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `chat_summary` (the whole of what a scheduled
-run replies; see [The clean run](#the-clean-run)), and three timing fields: `inspect_s`
+JSON line with seventeen fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`,
+`prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `declared` (the number of postures a repository
+declaration kept off the ledger; it never decides silence), `chat_summary` (the whole of what a
+scheduled run replies; see [The clean run](#the-clean-run)), three lists naming what the run held
+back or could not corroborate — `unpublished_candidates`, `wholly_unpublished_checks`,
+`uncorroborated_findings`, elided from the examples below for width — and three timing fields: `inspect_s`
 (wall-clock from `start` to `finish`, i.e. the inspection phase; `null` when `start`'s
 timestamp file is missing), `publish_s` (time `finish` itself spent publishing), and `collect_s`
 (the collector's own wall-clock; `null` on a run that passed no collector manifest). The timing
 fields are telemetry — read them for the report if useful, never branch on them:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: 2 critical, 4 major, 1 minor (7 new, 1 PR opened) — …","inspect_s":214.0,"publish_s":41.5,"collect_s":18.2}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"chat_summary":"Compliance Audit: 2 critical, 4 major, 1 minor (7 new, 1 PR opened) — …","inspect_s":214.0,"publish_s":41.5,"collect_s":18.2}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: 0 critical, 5 major, 2 minor (2 new, 3 resolved, 1 PR closed) — …","inspect_s":180.2,"publish_s":38.9,"collect_s":16.7}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"chat_summary":"Compliance Audit: 0 critical, 5 major, 2 minor (2 new, 3 resolved, 1 PR closed) — …","inspect_s":180.2,"publish_s":38.9,"collect_s":16.7}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"chat_summary":"Compliance Audit: clean, ledger closed (5 resolved, 1 PR closed) — …","inspect_s":95.1,"publish_s":12.3,"collect_s":null}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"chat_summary":"Compliance Audit: clean, ledger closed (5 resolved, 1 PR closed) — …","inspect_s":95.1,"publish_s":12.3,"collect_s":null}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or gh side effects. It applies the same grouping and the same
 degradation as the real run, so the branch names it names are the branch names it would create. It
-resolves every `remediation.path` against the same `workspace` clone the real run uses, not against
+resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
@@ -402,9 +472,29 @@ the run. See [The clean run](#the-clean-run) for the full rule.
         "note": "Apply a default-deny NetworkPolicy."
       }
     }
+  ],
+  "declared": [
+    {
+      "check": "no-hpa",
+      "cluster": "prod-us-east",
+      "namespace": "payments",
+      "object": "Deployment/api",
+      "title": "api is pinned at three replicas by Terraform",
+      "declaration": {
+        "repo": "acme/terraform-live",
+        "path": "clusters/prod-us-east/payments.tf",
+        "excerpt": "replicas = 3  # fixed: the upstream rate limit is per-instance"
+      }
+    }
   ]
 }
 ```
+
+(The `declared` entry is illustrative and crosses streams: a real compliance document would be
+rejected for carrying it. `declared[].check` is validated against the stream's `declarable` set in
+`AUDITS` — its posture checks, a subset of the roster — and only `obtainability-audit` has one
+today, because only its SOP has a step that writes the list. A non-empty `declared` on any other
+stream exits 2; `[]` validates everywhere.)
 
 Field rules the validator enforces — a violation exits 2 naming the offending finding index and
 field, and publishes nothing:
@@ -543,12 +633,25 @@ field, and publishes nothing:
   `--logging=SYSTEM,WORKLOAD`. Write the flag's own vocabulary, and if you cannot confirm what
   that is, the finding is `kind: manual` and the command belongs in `recommendation.action` as
   prose.
+- `declared` is **optional**, and is not a list of findings. Each entry is a posture a check would
+  have flagged that a linked repository declares on purpose — see
+  [`declared`](#declared) below. It carries `check`, `cluster`, `namespace`, `object` and `title`
+  under the same rules as a finding, plus a `declaration` object whose `repo` is an `owner/name`
+  slug, whose `path` follows the remediation-path rules, and whose `excerpt` is the non-empty lines
+  that pin the property. No `severity`, no `remediation`, no `id`. The document is rejected when an
+  entry's four identity fields match a finding's — a posture is reported or declared, never both —
+  when its `cluster` is not in `scope.clusters`, or when its `check` is not one of the stream's
+  declarable posture checks (a declared fault is a declared bug, and a stream with no
+  declared-intent step has none). A document without the key validates as before.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
-  namespace — grep the clone for `namespace: <namespace>`, then **open the hits and confirm one
-  declares an object you observed on the target cluster** before writing beside it. A `grep` for a
-  name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
-  until you have read it. **The parent directory must already exist in the clone**; if no sibling
+  namespace — search the repository for `namespace: <namespace>`, then **open the hits and confirm
+  one declares an object you observed on the target cluster** before writing beside it. A `grep` for
+  a name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
+  until you have read it. In directory mode that search is a `grep` over the clone; in content mode
+  it is the `grep` subcommand, which the broker runs over its own checkout, and `fetch` to read the
+  hits it named.
+  **The parent directory must already exist in the repository**; if no sibling
   can be confirmed, or the hits straddle two directories you cannot tell apart, the finding is
   `kind: manual` with no path. The harness cannot check this for
   you: it validates the shape of a path, not whether anything reconciles it, and it will create
@@ -610,6 +713,32 @@ Three fields, all required, all load-bearing for the human who has to decide:
 - **`rationale`** — why _this_ fix and not the obvious alternative. **Name the alternative you
   considered and why you rejected it.** A rationale that restates the action is not a rationale.
 - **`risk`** — what breaks on apply, and the read-only check to run first.
+
+### `declared`
+
+A finding says the fleet is wrong; a declared posture says the fleet is what somebody meant. The
+list exists because the audits judge live state against generic practice, and a platform team that
+pinned a replica count in Terraform on purpose was getting the same `no-hpa` finding every morning
+until someone suppressed it by hand. The SOP's declared-intent step (`obtainability_audit_sop.md`
+§4a, the pilot) searches the GitOps clone's `provisioning/` and `knowledge/` directories and every
+repository in `context_repos` for a declaration that names the same object and pins the flagged
+property, and moves a match here instead of into `findings`.
+
+What the shape enforces:
+
+- **It is not a finding.** No id is derived, so a declared posture never enters the hidden delta
+  block: it is not announced as new when the declaration appears and not announced as resolved when
+  it goes, and nothing about it is ever promoted to a pull request. A finding that moves here
+  _does_ read as resolved in that run's delta — that is the intended outcome, and the ledger's
+  _Declared intent_ section says where it went.
+- **It is refutable.** Every entry names `repo:path` and quotes the lines that pin the property,
+  and the ledger renders both, so a reviewer who disagrees changes or removes the declaration and
+  the posture returns as a finding on the next run. A declaration the worker did not read is not
+  one it may cite.
+- **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
+  set in `AUDITS`, four for the pilot, and the validator rejects any other check with exit 2. A
+  drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
+  document that lists it under `declared` publishes nothing.
 
 ## Evidence rules
 
@@ -686,6 +815,16 @@ April close every morning forever. Post a fresh one.
 
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
+
+Below the findings, a ledger whose document carried a `declared` list renders a **Declared intent**
+table: one row per entry, with the check, the cluster, the object, `repo:path`, and the title and
+excerpt. Rows have no state and no id — nothing in that table is tracked between runs — and the
+table is capped at 50 rows and says how many it left out. On a clean run the ledger closes without
+being rewritten, so the all-clear comment lists the declared postures instead, with the same
+`repo:path` pointers — and that comment is the last ledger record: a later clean run with nothing
+but declarations opens no ledger and posts nothing, because the ledger tracks findings and a
+standing declaration is the same every morning. From then on the declaration in the repository is
+the record, and `finish` reports the count as `declared`.
 
 ## Remediation pull requests
 
@@ -783,7 +922,7 @@ subcommand does not re-propose them. Revival belongs to the write-gated `/remedi
 which exists for the person at the terminal who could have written that comment themselves. An
 agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 
-`refused` names the targets whose remediation is not a readable file inside the clone — either the
+`refused` names the targets whose remediation is not a readable file inside the workspace — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
 all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. The
 other targets still open — `/remediate all` expands to every **manifest-remediation** id in the
@@ -792,7 +931,7 @@ none. Say which were refused when you acknowledge the command.
 
 Exit 2 means nothing was published, for one of three reasons — read the message before reporting
 which: a named id is not in the document at all, a named target is not a `manifest`, or _every_
-named target was refused because its file is not readable inside the clone. The first two are fixed
+named target was refused because its file is not readable inside the workspace. The first two are fixed
 by dropping the bad id and asking again; only the third is about writing manifests.
 
 **Findings whose remediation paths intersect share one pull request.** They have to: separate
@@ -835,6 +974,10 @@ previous run knew — the ids its body rendered plus every finding in its stored
 judged against every finding in this document, rendered or not. A finding cut for space still
 reproduces and is never reported as fixed; one that loses a budget contest and wins the next is not
 reported as new.
+
+The **Declared intent** table is measured with the fixed sections, before the findings claim what
+is left, so on a body near the limit it is the findings that yield — and it is row-capped, so what
+it can cost is bounded.
 
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
 `checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the
@@ -948,16 +1091,16 @@ genuinely the first, and everything in it is new.
 - **Never `git add .` or `git add -A`.** The harness stages only the distinct paths you named in
   `remediation.path`, through `git --literal-pathspecs`, and refuses glob metacharacters in a path
   outright. Do not run your own `git add`.
-- **Every `remediation.path` stays inside the clone, and the harness proves it twice.** The string
+- **Every `remediation.path` stays inside the workspace, and the harness proves it twice.** The string
   must be repo-relative with no `..`, no glob metacharacter, and no leading `:` — and before the
   file is read or staged it is re-resolved against the `workspace` root, where no path component may
   be a symlink and the resolved path must sit under the resolved root. Do not create a symlink in
-  the clone and point a remediation through it: `manifests/vendor/x.yaml` is beyond reproach until
+  the workspace and point a remediation through it: `manifests/vendor/x.yaml` is beyond reproach until
   `manifests/vendor` is a link to `/etc`, and then the contents of a file outside the repository are
   committed to a public pull request. Nothing is read from a path that fails either test. The
   finding degrades to `manual` with a note saying so, the run logs a `SECURITY:` line naming the
   path, and the report still publishes — but no pull request opens for that finding until the path
-  is a real file inside the clone.
+  is a real file inside the workspace.
 - **Never open a second ledger issue for a stream.** Do not call `gh issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.

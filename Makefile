@@ -13,6 +13,12 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
+# The sandbox image is built from a different Dockerfile and shares none of
+# those bases, so it takes its own list. Passing the union to both would make
+# every build warn about build args the Dockerfile never declares.
+SANDBOX_IMAGE_VARS := PYTHON_IMAGE
+SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
 # What the image reports as its own version. Hermes interpolates it into the
 # `User-Agent` of every remote-MCP call, so an image built without it is
 # indistinguishable on the wire from any other. Both cloudbuild files, the
@@ -23,7 +29,7 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -43,7 +49,7 @@ help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\n"} /^[a-zA-Z_0-9][a-zA-Z_0-9 -]*:.*##/ { printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # Docker builds
-docker-build: docker-build-agents docker-build-credential-proxy ## Build every image in deploy/docker/Dockerfile (the default target).
+docker-build: docker-build-agents docker-build-credential-proxy docker-build-sandbox ## Build every image this repository ships (the default target).
 docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build the agent images (see the AGENTS variable).
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
@@ -57,8 +63,20 @@ $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
 	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
+# Context is the repository root, not deploy/sandbox: the image ships the same
+# credential-proxy client and PATH script the agent image does, and copying
+# them into deploy/sandbox to narrow the context is how the two drift apart.
+docker-build-sandbox: ## Build the agent shell sandbox image.
+	docker build --platform linux/amd64 $(SANDBOX_IMAGE_ARGS) -t $(REPO)/agent-sandbox:latest -f deploy/sandbox/Dockerfile .
+
+# Not folded into docker-build-sandbox: it runs containers and binds a port,
+# which a plain build should not do. The script explains why the checks it makes
+# cannot be made statically.
+docker-smoke-sandbox: docker-build-sandbox ## Build the sandbox image and exercise it over ssh.
+	deploy/sandbox/smoke-test.sh $(REPO)/agent-sandbox:latest
+
 # Docker pushes
-docker-push: docker-push-agents docker-push-credential-proxy ## Build and push every image to $$REPO.
+docker-push: docker-push-agents docker-push-credential-proxy docker-push-sandbox ## Build and push every image to $$REPO.
 docker-push-agents: $(foreach agent,$(AGENTS),docker-push-$(agent)) ## Build and push the agent images.
 
 .PHONY: $(foreach agent,$(AGENTS),docker-push-$(agent))
@@ -67,6 +85,9 @@ $(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
 
 docker-push-credential-proxy: docker-build-credential-proxy ## Build and push the credential-proxy image.
 	docker push $(REPO)/credential-proxy:latest
+
+docker-push-sandbox: docker-build-sandbox ## Build and push the agent shell sandbox image.
+	docker push $(REPO)/agent-sandbox:latest
 
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/installer/*.sh scripts/dev/*.sh 2>/dev/null || true
@@ -78,7 +99,7 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents).
 	@./scripts/mirror_images.sh $(ARGS)
 
-images-check: ## Verify images.json still matches every pin it mirrors, and that the chart renders nothing off a public registry when mirrored (CI runs this).
+images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, and that the chart renders nothing off a public registry when mirrored (CI runs this).
 	@./hack/check-image-inventory.sh
 
 
@@ -112,7 +133,7 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # `make test-python-deps`. CI installs the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Thirteen globs rather than one because the tests do
+# without editing this file. Several globs rather than one because the tests do
 # not all live under skills -- the admin console, the shared agent scripts,
 # Chat Agent plugins and hooks, image patches, image build and repository
 # tooling in scripts/ each hold their own. scripts/ is here
@@ -271,7 +292,7 @@ e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -280,6 +301,7 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> go test (a2a)";  cd a2a && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
 	@echo "==> verify OK"
 
 test-python: ## Run the Python unit tests outside k8s-operator/.
@@ -545,11 +567,24 @@ docs-check-map:
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules from k8s-operator/config.
+chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config; the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config and its hand-written webhook template matches config/webhook (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
+
+iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "iac-parity-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
+		exit 1; \
+	}
+	@python3 scripts/check_iac_parity.py
+
+# The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
+# in front of the real binary (#1309 shipped against a stub that answered `null`
+# where Terraform answers `tostring(null)`; #1350 has the story).
+tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
+	@./hack/check-tfvar-console.sh
 
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
@@ -559,6 +594,15 @@ tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, 
 
 fleet-audit-view: ## Render the fleet-audit report store from the agent pod (e.g. make fleet-audit-view ARGS="--namespace kubeagents-system").
 	@python3 scripts/fleet_audit_status_view.py $(ARGS)
+
+# Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
+# by someone remembering them, and a conformance suite whose CI entry depends
+# on a glob is a conformance suite that stops running. It has its own
+# unfiltered workflow (.github/workflows/conformance.yml) for the same reason,
+# and the package's load_tests refuses root discovery so `make test-python`
+# cannot also half-run it with bucket 2 surfacing as skips.
+conformance: ## Run the security invariant conformance suite (bucket 1, no cluster)
+	@python3 tests/conformance/run.py
 
 validate: ## Fail if any skill sits under agents/*/defaults/skills/.
 	@if [ -n "$(BAD_SKILLS)" ]; then \

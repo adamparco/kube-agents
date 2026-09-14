@@ -15,8 +15,17 @@
       "repository": "ghcr.io/gke-labs/kube-agents/credential-proxy",
       "tagPolicy": "release",
       "override": "CREDENTIAL_PROXY_IMAGE",
-      "pulledBy": "The credential-proxy sidecar in the agent pod.",
-      "description": "The platform-agent image plus the Envoy-based credential proxy runtime."
+      "pulledBy": "The credential-proxy Deployment, and the agent-api-auth sidecar in the agent pod.",
+      "description": "Envoy, the credential runtime, and the CLIs it wraps — the only image holding real credentials."
+    },
+    {
+      "name": "agent-sandbox",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/agent-sandbox",
+      "tagPolicy": "release",
+      "override": "AGENT_SANDBOX_IMAGE",
+      "pulledBy": "The shell sandbox StatefulSet the operator renders beside every agent pod.",
+      "description": "SSH-reachable shell sandbox: Python, an SSH server, and the credential-proxy CLI wrappers, with no credentials and no path back into the agent pod."
     },
     {
       "name": "k8s-operator",
@@ -172,8 +181,17 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway and a2a/Dockerfile.worker builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
+    },
+    {
+      "name": "node",
+      "origin": "build-time",
+      "repository": "docker.io/library/node",
+      "tag": "22-slim",
+      "buildArg": "NODE_IMAGE",
+      "pulledBy": "a2a/Dockerfile.worker runtime stage.",
+      "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary."
     },
     {
       "name": "python",
@@ -181,8 +199,8 @@
       "repository": "docker.io/library/python",
       "tag": "3.14-slim",
       "buildArg": "PYTHON_IMAGE",
-      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile.",
-      "description": "Runtime base for the replay proxy."
+      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile.",
+      "description": "Runtime base for the replay proxy, and for the agent sandbox — which needs a python3 on PATH because that is what execute_code invokes."
     },
     {
       "name": "distroless-static",
@@ -190,7 +208,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile runtime stage.",
+      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout and a2a/Dockerfile.gateway runtime stages.",
       "description": "Runtime base for the operator image."
     },
     {

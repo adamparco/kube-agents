@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Five checks, all offline and standard library only:
+Six checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -31,6 +31,9 @@ Five checks, all offline and standard library only:
     Every cron prompt sends the worker to an SOP that exists.
 ``cron-deliver``
     Every cron job's ``deliver`` names somewhere a message can actually go.
+``cron-risk``
+    Every cron job declares a risk tier (``low`` or ``high``) the runtime
+    approval gate can key its command policy off.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
@@ -93,8 +96,11 @@ PROFILES = ("platform", "chat", "cluster")
 # upstream file, not something this repository ships.
 ASSET_SUFFIXES = frozenset({".md", ".py", ".sh", ".json", ".yaml", ".yml"})
 
-# What `/opt/defaults` holds, in the order the image layers it, from the COPY
-# lines in deploy/docker/Dockerfile.
+# What `/opt/defaults` holds in the agent image, in the order that image layers
+# it, from the COPY lines in the `agent-base` and `platform` stages of
+# deploy/docker/Dockerfile. The credential-proxy stage has a /opt/defaults of
+# its own holding only the credential runtime; it is a different image and has
+# no profile homes, so its COPY lines are not part of this model.
 #
 # It reaches ONE profile home. docker-entrypoint.sh:253 does
 # `cp -ru /opt/defaults/. "$TARGET_DIR/"`, and $TARGET_DIR is the *default*
@@ -119,6 +125,7 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("scripts/profile_overlay.py", "deploy/shared/profile_overlay.py"),
     ("scripts/profile_plugins.py", "deploy/shared/profile_plugins.py"),
     ("scripts/otel_config.py", "deploy/shared/otel_config.py"),
+    ("scripts/sandbox_mirror.py", "deploy/shared/sandbox_mirror.py"),
 )
 
 # What a specialist profile home actually contains, which is not the whole of
@@ -240,6 +247,9 @@ FRONTMATTER_DESCRIPTION = re.compile(
     r"|\n(?:[ \t]+\S.*\n?)+)",
     re.MULTILINE,
 )
+
+# The valid risk tiers a cron job can declare (SKILL-002).
+ALLOWED_CRON_RISK = frozenset({"low", "high"})
 
 
 @dataclass(frozen=True)
@@ -855,6 +865,31 @@ def check_cron_delivery() -> list[Finding]:
     return findings
 
 
+def check_cron_risk() -> list[Finding]:
+    """Every cron job must declare a valid risk tier (SKILL-002).
+
+    A cron job with no declared risk runs at the global cron_mode with nothing
+    keyed off it. The runtime approval gate requires a declared risk tier to
+    determine whether to enforce the fail-closed read-only command policy.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            risk = job.get("risk")
+            if risk not in ALLOWED_CRON_RISK:
+                findings.append(
+                    Finding(
+                        "cron-risk",
+                        str(rel),
+                        f"job {job['id']!r} has risk={risk!r}; must be one of "
+                        f"{sorted(ALLOWED_CRON_RISK)} — a cron job with no declared risk "
+                        "runs at the global cron_mode with nothing keyed off it",
+                    )
+                )
+    return findings
+
+
 def _nearest(name: str, owned: dict[str, Path]) -> str | None:
     """The closest real skill name, for the common single-character slips."""
     matches = difflib.get_close_matches(name, sorted(owned), n=1, cutoff=0.85)
@@ -910,6 +945,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_skill_manifests(skills)
         + check_cron_assets()
         + check_cron_delivery()
+        + check_cron_risk()
     )
     if findings:
         print(

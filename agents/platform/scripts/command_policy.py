@@ -314,17 +314,21 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "backend-services", "list"),
         ("compute", "disks", "describe"),
         ("compute", "disks", "list"),
-        # The only read behind §2.6 `firewall-world-open-ingress`, and the
-        # check is inert without it: a rule's `sourceRanges`, `allowed` and
-        # `direction` have no other surface, so the collector gate-failed the
-        # whole project-scoped target on the first run after the check
-        # shipped (2026-09-06, rc=126, rule gcp.read-only). That run reported
-        # `partial: true` and named the gap rather than claiming clean, which
-        # is the machinery working -- but the two `critical` candidates the
-        # check finds on this fleet, 0.0.0.0/0 on tcp:22 and tcp:3389, went
-        # unpublished for want of one allowlist entry. Pure read; the writes
-        # one word away (`firewall-rules create`, `update`, `delete`) stay
-        # refused and the tests assert it.
+        # The read side of the firewall rules the networking SOP's Red Lines
+        # forbid modifying, and list/describe is all that is granted. A live
+        # install refused both under gcp.read-only while the model investigated
+        # the fabric (#1126), and `list` is also the only read behind §2.6
+        # `firewall-world-open-ingress` -- the check is inert without it: a
+        # rule's `sourceRanges`, `allowed` and `direction` have no other
+        # surface, so the collector gate-failed the whole project-scoped target
+        # on the first run after the check shipped (2026-09-06, rc=126, rule
+        # gcp.read-only). That run reported `partial: true` and named the gap
+        # rather than claiming clean, which is the machinery working -- but the
+        # two `critical` candidates the check finds on this fleet, 0.0.0.0/0 on
+        # tcp:22 and tcp:3389, went unpublished for want of one allowlist
+        # entry. Pure reads; the writes one word away (`firewall-rules create`,
+        # `update`, `delete`) stay refused and the tests assert it.
+        ("compute", "firewall-rules", "describe"),
         ("compute", "firewall-rules", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
@@ -373,29 +377,32 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "sole-tenancy", "node-groups", "list"),
         ("compute", "sole-tenancy", "node-groups", "list-nodes"),
         # The daily `gcp-networking-fabric-audit` cron executes
-        # governance/gcp_networking_fabric_sop.md exactly, and of the reads
-        # that SOP issues only forwarding-rules list was in this set --
-        # four of its five checks had no data source. Same shape as the
-        # stockout gap below: the job runs, reports, and measures nothing.
+        # governance/gcp_networking_fabric_sop.md exactly, and the networks,
+        # routers and security-policies entries were derived from the command
+        # spellings that SOP carries. A SOP spelling assumes its arguments are
+        # already bound, so a leaf read listed on its own can be unreachable:
+        # `routers get-nat-mapping-info $ROUTER` was listed while `routers
+        # list`, the only way to bind $ROUTER, was not, and the audit's one
+        # critical NAT check never ran (#1126). Grant a discovery read
+        # alongside every leaf read that needs one; `networks describe` and
+        # `routers describe` are the detail reads behind the two lists.
         # `compute project-info describe` is the stockout SOP's quota
         # remediation read. The writes one word away (networks create,
-        # security-policies create, project-info add-metadata) stay
-        # refused, and the tests assert it.
+        # routers create, firewall-rules create, security-policies create,
+        # project-info add-metadata) stay refused, and the tests assert it.
+        ("compute", "networks", "describe"),
         ("compute", "networks", "list"),
         ("compute", "networks", "subnets", "describe"),
         ("compute", "networks", "subnets", "list"),
         ("compute", "networks", "subnets", "list-usable"),
         ("compute", "project-info", "describe"),
+        ("compute", "routers", "describe"),
         ("compute", "routers", "get-nat-mapping-info"),
-        # get-nat-mapping-info alone was not enough to run cloud-nat-exhaustion.
-        # networking_audit.py reads all three -- `routers list` for each NAT's
-        # natIpAllocateOption/maxPortsPerVm, `routers get-status` for
-        # result.natStatus[].autoAllocatedNatIps -- and the SOP's own Command
-        # line names them as the corroborating reads. Unlisted, `routers list`
-        # failed the gate first, which took the collector's whole project-level
-        # target down with it and skipped three further checks that had nothing
-        # to do with Cloud NAT. Both are pure reads; `routers create`/`update`/
-        # `delete`/`add-interface` stay refused, and the tests assert it.
+        # `routers get-status` is the third read networking_audit.py's
+        # cloud-nat-exhaustion check needs: result.natStatus[].autoAllocatedNatIps,
+        # which neither `list` nor `get-nat-mapping-info` carries. A pure read;
+        # `routers create`/`update`/`delete`/`add-interface` stay refused, and
+        # the tests assert it.
         ("compute", "routers", "get-status"),
         ("compute", "routers", "list"),
         ("compute", "security-policies", "list"),

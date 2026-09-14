@@ -20,9 +20,10 @@ Four properties carry most of the weight:
 * **An unknown permission is not a "no".** A 404 from the collaborator endpoint
   means no write access; a proxy fault means nothing at all, and the sweep turns
   a "no" into a public refusal that is never retried.
-* **The repository parser agrees with `resolver.py`'s.** They are two copies of
-  one hardened parser, and `ParserAgreementTest` is what stops them drifting
-  until `resolver.py` migrates onto this module.
+* **An unsupported host raises rather than falling back to GitHub.** Falling
+  back is what would point `gh` at a same-named GitHub repository on behalf of
+  a URL naming somebody else's forge. The parse behind that decision is
+  `test_repo_ref.py`'s subject, not this file's.
 """
 
 import importlib.util
@@ -58,10 +59,15 @@ class FakeGh:
         self.responses = responses or {}
         self.default = default if default is not None else (0, "[]", "")
         self.calls: list[list[str]] = []
+        # What each call put on fd 0, positionally aligned with `calls`. The
+        # body of a comment travels this way now, so a test that only inspects
+        # argv can no longer see what was posted.
+        self.stdins: list[str | None] = []
 
-    def __call__(self, argv, **_kwargs):
+    def __call__(self, argv, *, stdin=None, **_kwargs):
         argv = list(argv)
         self.calls.append(argv)
+        self.stdins.append(stdin)
         joined = " ".join(argv)
         for key, value in self.responses.items():
             if key in joined:
@@ -76,63 +82,54 @@ class FakeGh:
                 return argv
         raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
-
-def write_settings(tmpdir: str, value: str) -> str:
-    path = os.path.join(tmpdir, "SETTINGS.md")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"# Settings\n\n- **Git Repo:** {value}\n")
-    return path
-
-
-class ParseRepoTest(unittest.TestCase):
-    def _resolve(self, value):
-        return forge._parse_repo(value)
-
-    def test_bare_shorthand(self):
-        self.assertEqual(self._resolve("acme/toolkit"), "acme/toolkit")
-
-    def test_https_url(self):
-        self.assertEqual(
-            self._resolve("https://github.com/acme/toolkit"), "acme/toolkit"
-        )
-
-    def test_scp_form_ssh_remote(self):
-        self.assertEqual(
-            self._resolve("git@github.com:acme/toolkit.git"), "acme/toolkit"
-        )
-
-    def test_www_prefix(self):
-        self.assertEqual(
-            self._resolve("https://www.github.com/acme/toolkit"), "acme/toolkit"
-        )
-
-    def test_git_suffix_is_stripped(self):
-        self.assertEqual(self._resolve("acme/toolkit.git"), "acme/toolkit")
-
-    def test_github_com_as_a_path_segment_on_another_host_is_rejected(self):
-        """The confused-deputy shape the anchored regex exists for."""
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evil.com/github.com/attacker/repo")
-
-    def test_userinfo_cannot_smuggle_the_host(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://user@evil.com/github.com/attacker/repo")
-
-    def test_lookalike_host_is_rejected(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evilgithub.com/attacker/repo")
-
-    def test_traversal_satisfies_the_shorthand_pattern_and_is_still_rejected(self):
-        """`BARE_REPO_RE` admits "../.." — the component check is what stops it."""
-        self.assertTrue(forge.BARE_REPO_RE.match("../.."))
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("../..")
-
-    def test_leading_dash_would_be_parsed_as_a_flag(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("-oops/repo")
+    def stdin_of(self, fragment: str):
+        for argv, stdin in zip(self.calls, self.stdins):
+            if fragment in " ".join(argv):
+                return stdin
+        raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
 
+class ProviderSelectionTest(unittest.TestCase):
+    """`provider_for`. The parse itself is `test_repo_ref.py`'s subject."""
+
+    def test_no_repository_means_github(self):
+        """What the sweep passes: it discovers repositories after choosing."""
+        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
+
+    def test_bare_shorthand_means_github(self):
+        self.assertIsInstance(forge.provider_for("acme/toolkit"), forge.GitHubProvider)
+
+    def test_github_url_selects_github(self):
+        for value in (
+            "https://github.com/acme/toolkit",
+            "git@github.com:acme/toolkit.git",
+            "https://www.github.com/acme/toolkit",
+        ):
+            with self.subTest(value=value):
+                self.assertIsInstance(
+                    forge.provider_for(value), forge.GitHubProvider
+                )
+
+    def test_a_host_with_no_provider_raises_rather_than_falling_back(self):
+        """The fallback is what would run `gh` against a same-named GitHub repo."""
+        with self.assertRaises(forge.UnknownForgeHost) as ctx:
+            forge.provider_for("git@gitlab.com:group/project")
+        self.assertEqual(ctx.exception.reason, "FORGE_HOST_UNSUPPORTED")
+
+    def test_github_com_inside_another_host_no_longer_selects_github(self):
+        """The substring test this replaced selected `GitHubProvider` here."""
+        with self.assertRaises(forge.UnknownForgeHost):
+            forge.provider_for("https://example.invalid/github.com/o/r")
+
+    def test_an_unparseable_value_carries_the_operator_facing_reason_code(self):
+        with self.assertRaises(forge.RepoUnparseable) as ctx:
+            forge.provider_for("../..")
+        self.assertEqual(ctx.exception.reason, "GIT_REPO_UNPARSEABLE")
+
+    def test_the_run_seam_is_forwarded_to_the_provider(self):
+        fake = FakeGh()
+        provider = forge.provider_for(repo="acme/toolkit", run=fake)
+        self.assertIs(provider._run, fake)
 
 
 class NormaliseLoginTest(unittest.TestCase):
@@ -274,6 +271,40 @@ class RunGhTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("404", result.stderr)
 
+    def test_the_call_goes_to_the_sandbox(self):
+        """The agent image holds no gh, and this module's cron consumer runs there.
+
+        The three tests above pass either way — `sandbox_exec.run` falls back to
+        `subprocess.run` when no sandbox is configured, which is what a test
+        machine looks like. So this is the one that would notice the routing
+        being reverted to a direct `subprocess.run(["gh", ...])`.
+        """
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            return_value=_completed(["gh", "auth", "status"], 0, "ok", ""),
+        ) as ran:
+            result = forge.run_gh(["auth", "status"])
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(ran.call_args.args[0], ["gh", "auth", "status"])
+
+    def test_stdin_reaches_the_sandbox(self):
+        """`--body-file -` is only half of it; the bytes have to be forwarded."""
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            return_value=_completed(["gh", "pr", "comment"], 0, "", ""),
+        ) as ran:
+            forge.run_gh(["pr", "comment", "1", "--body-file", "-"], stdin="hello")
+        self.assertEqual(ran.call_args.kwargs["stdin"], "hello")
+
+    def test_an_unreachable_sandbox_is_not_a_quiet_repository(self):
+        """A transport failure has to reach the caller, not become an empty result."""
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            side_effect=forge.sandbox_exec.SandboxUnavailable("no route"),
+        ):
+            with self.assertRaises(forge.sandbox_exec.SandboxUnavailable):
+                forge.run_gh(["issue", "list"])
+
     def test_auth_failure_retries_after_credential_refresh(self):
         github_token_refresh.reset_refresh_state()
         with mock.patch(
@@ -304,7 +335,7 @@ class RunGhTest(unittest.TestCase):
     def test_provider_passes_repo_to_call(self):
         calls = []
 
-        def fake_run(argv, repo=None):
+        def fake_run(argv, repo=None, *, stdin=None):
             calls.append((argv, repo))
             return _completed(argv, 0, "[]", "")
 
@@ -456,7 +487,7 @@ class CallSeamTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_type_error_in_runner_propagates(self):
-        def bad_runner(argv, repo=None):
+        def bad_runner(argv, repo=None, *, stdin=None):
             raise TypeError("something inside runner broke")
 
         provider = forge.GitHubProvider(run=bad_runner)
@@ -964,24 +995,37 @@ class ListCommentsTest(unittest.TestCase):
 
 
 class PostCommentTest(unittest.TestCase):
-    def test_body_is_passed_as_a_file_never_on_the_command_line(self):
+    BODY = "Thanks — that is fixed in a1b2c3d.\n\n> your words back at you\n"
+
+    def _post(self, fake):
+        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+        forge.GitHubProvider(run=fake).post_comment("acme/toolkit", pr, self.BODY)
+
+    def test_body_travels_on_stdin_never_on_the_command_line(self):
         """A reviewer's words go back through a proxy and two shells' quoting."""
         fake = FakeGh(default=(0, "", ""))
-        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
-        forge.GitHubProvider(run=fake).post_comment(
-            "acme/toolkit", pr, "/opt/data/scratch/pr_12.md"
-        )
+        self._post(fake)
         argv = fake.argv_containing("pr comment")
         self.assertIn("--body-file", argv)
         self.assertNotIn("--body", argv)
-        self.assertEqual(argv[argv.index("--body-file") + 1], "/opt/data/scratch/pr_12.md")
+        self.assertEqual(argv[argv.index("--body-file") + 1], "-")
         self.assertEqual(argv[argv.index("-R") + 1], "acme/toolkit")
+        self.assertEqual(fake.stdin_of("pr comment"), self.BODY)
+
+    def test_no_argument_names_a_path(self):
+        """The three processes in this call have three different filesystems.
+
+        A path would name a file in the agent pod; `gh` runs in the broker pod.
+        """
+        fake = FakeGh(default=(0, "", ""))
+        self._post(fake)
+        for arg in fake.argv_containing("pr comment"):
+            self.assertFalse(arg.startswith("/"), arg)
 
     def test_a_failed_post_is_not_swallowed(self):
         fake = FakeGh(default=(1, "", "HTTP 403"))
-        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
         with self.assertRaises(forge.ForgeError):
-            forge.GitHubProvider(run=fake).post_comment("acme/toolkit", pr, "/tmp/x.md")
+            self._post(fake)
 
 
 class AcknowledgeTest(unittest.TestCase):
@@ -1198,23 +1242,6 @@ class PermissionUnknownTest(unittest.TestCase):
         pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
         comments = forge.GitHubProvider(run=fake).list_comments(REPO, pr)
         self.assertTrue(comments[0].can_write)
-
-
-class ProviderForTest(unittest.TestCase):
-    def test_github_host_selects_the_github_provider(self):
-        self.assertIsInstance(forge.provider_for(repo="https://github.com/acme/toolkit"), forge.GitHubProvider)
-
-    def test_bare_shorthand_means_github(self):
-        """The operator writes `owner/repo` through verbatim; it is `gh -R`'s own form."""
-        self.assertIsInstance(forge.provider_for(repo="acme/toolkit"), forge.GitHubProvider)
-
-    def test_omitted_repo_defaults_to_github_provider(self):
-        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
-
-    def test_the_run_seam_is_forwarded_to_the_provider(self):
-        fake = FakeGh()
-        provider = forge.provider_for(repo="acme/toolkit", run=fake)
-        self.assertIs(provider._run, fake)
 
 
 class ProtocolConformanceTest(unittest.TestCase):

@@ -35,8 +35,8 @@ delivery, so routing it through a card loses the run. A poller is the inverse: i
 has nothing to deliver on almost every tick, its product goes to GitHub, and it
 owes a model turn only when real work exists — which is why `github-repo-watcher`
 is a `no_agent` script that costs nothing when idle and files a card when it
-finds something. It still names an audible `deliver` for itself — `"chat"`, like
-every other entry here — so a sweep that cannot run still says so. Being
+finds something. It still names an audible `deliver` for itself — `"chat"` — like
+every other report-producing entry here, so a sweep that cannot run still says so. Being
 `no_agent` changes what it delivers, not whether it does: a clean tick prints
 nothing and relays nothing, and only a sweep that failed produces text.
 
@@ -46,6 +46,28 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `kanban-workspace-gc` is neither a watchdog nor a poller
+
+The third shape, and the reason it is here rather than anywhere else: it is
+housekeeping that needs the board DB, and the board DB is on the agent pod.
+`kanban_workspace_gc.py` removes the scratch workspaces Hermes leaves behind —
+`kanban_db._cleanup_workspace` runs from `complete_task` and nowhere else, so a
+card that reaches a terminal state any other way keeps its directory forever, and
+under `terminal.backend: ssh` the sandbox's copy is never removed even on the
+path that works. `docs/designs/agent-shell-sandboxing.md` has the account.
+
+It reports nothing on a clean run and only on a run it could not finish, which
+is the same contract `github-repo-watcher` keeps. What it removed goes to
+stderr, where the scheduler logs it: a job announcing its own housekeeping every
+night is a job the room learns to skip, and the message that must not be skipped
+is the failure.
+
+Daily is deliberate rather than conservative. The first install to run this had
+accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
+68 KB in the sandbox; the first sweep removed 21 and 9 of them, leaving 164 KB
+and nothing. A tighter interval buys nothing against that rate and spends an SSH
+round trip per tick.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two
@@ -53,20 +75,30 @@ rosters both carrying one id is that audit running twice per schedule,
 concurrently with itself, writing its ledger issue twice. The per-job lock
 (`cron/.job-<id>.lock`) is per profile directory, so it does not stop this.
 
-## `deliver` is never `"local"`
+## `deliver` is `"local"` on exactly one job
 
-Every enabled job here sets `deliver` to `"chat"` (`"all"` is the other audible
-value). `cron/scheduler.py::_resolve_delivery_targets` returns an **empty target list**
-for `"local"` — the outcome is written to `last_output` and delivered nowhere. A
-watchdog whose run failed would then be indistinguishable from a quiet fleet.
-Both audible values carry a failure: the scheduler builds one with
-`_summarize_cron_failure_for_delivery` and delivers it on the same leg.
+Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
+values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+returns an **empty target list** for `"local"` — the outcome is written to
+`last_output` and delivered nowhere. A watchdog whose run failed would then be
+indistinguishable from a quiet fleet. Both audible values carry a failure: the
+scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
+on the same leg.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
+The exception is `chat-delivery-watch`, whose job is to notice that the chat leg
+itself is down. Its product is a GitHub ledger issue and an `ALERT` line in
+`logs/chat_delivery_watch.log` that fluent-bit ships to Cloud Logging, neither of
+which passes through chat, and a chat delivery for it would be circular. The
+design is in
+[`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md)
+under "Detecting a broken leg".
+
 `test_every_watchdog_declares_all_delivery` in
-`../skills/fleet-audit/scripts/test_audit_report.py` enforces this.
+`../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
+the exemption by name, pinned to a `no_agent` entry whose script exists.
 
 ## `deliver: "chat"` — reporting through the Chat Agent
 
@@ -84,8 +116,9 @@ reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install a job left on `"all"` is now heard twice on _each_ of them
-rather than twice in one place. Every entry here names `"chat"`, so this reaches
-only a runtime-created job or a hand-edited roster.
+rather than twice in one place. One entry here names `"all"`
+(`gcp-networking-fabric-audit`) and accepts that; the rest name `"chat"`, apart
+from `chat-delivery-watch`, which is `"local"` for the reason given above.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -100,7 +133,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every job here names `"chat"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start
@@ -181,3 +214,31 @@ keeps the check rosters honest by scanning the whole SOP rather than a citation.
 No prompt is quoted here on purpose. A copy in prose is one more place to go
 stale, and the tests above check the roster against the SOPs — not this file
 against the roster.
+
+## `risk` tier contract
+
+Every job entry across both rosters declares an explicit `"risk": "low" | "high"`.
+The field is validated by `scripts/check_prompt_assets.py` (`check_cron_risk`) and enforced
+across pod restarts by `profile_scaffold.py::merge_cron_store` (an image-owned key).
+Runtime-created jobs (`cron.jobs::create_job` and `tools.cronjob_tools::cronjob`) stamp
+`"risk": "low"` at creation time unless an explicit `risk` is provided. Existing unannotated
+legacy jobs are backfilled to `"risk": "low"` across all profiles:
+Platform Agent roster during scaffold merge (`profile_scaffold.py::merge_cron_store`),
+Chat Agent roster during reconciliation (`cron_jobs_sync.py`), and cluster profiles both at
+profile creation (`cluster_agent_profile.py`) and pod startup (`docker-entrypoint.sh` via
+`profile_scaffold.py --backfill-cron`). Unannotated in-flight executions or dispatches with no
+tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_gate.py`.
+
+- `"low"`: Read-only governance watchdogs, audits, and internal scheduler plumbing. Runs under
+  the configured `cron_mode` (typically `approve`), protected by the denylist floor (hardline +
+  `approvals.deny` + Tirith POSIX shell content scan), terminal escape rejection, lookalike TLD
+  blocks, and `execute_code` blocks.
+- `"high"`: Workloads with broad operational authority or untrusted input sources (such as
+  `github-repo-watcher`), as well as unannotated dispatches. For agentic (prompt-driven) jobs,
+  this applies a fail-closed read-only command policy (`cron_command_policy_block`): every command
+  segment must be an allowlisted inspection command (`kubectl get/describe/logs/top`, `gcloud … list/describe`,
+  read-only text utilities, `--dry-run` validations); mutating, unknown, or unanalyzable commands
+  are refused while the run continues. For `no_agent: true` jobs like `github-repo-watcher`, there is
+  no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of
+  the untrusted input the subprocess ingests (runtime isolation is tracked in #913; today the tier is
+  metadata only for those jobs).

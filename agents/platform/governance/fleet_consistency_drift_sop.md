@@ -2,7 +2,7 @@
 
 **Purpose:** Find the cluster that does not match its peers. For each configuration facet, compute what the majority of comparable clusters do, then report the outliers — answering "eleven of my twelve clusters have Binary Authorization on; which one doesn't, and why didn't I know?"
 
-**Data sources:** The baseline is **derived from the live fleet and nowhere else.** `gcloud container clusters list/describe --format=json`, `gcloud container node-pools list/describe --format=json`, read-only `kubectl`, the `gke` MCP server, and the platform MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). There is no Platform Master Blueprint, no standards document, no CMDB, no Terraform state, no Config Sync repo, no BigQuery, no Prometheus. If you find yourself wanting an "expected value" from outside the fleet, you have left this SOP.
+**Data sources:** The baseline is **derived from the live fleet and nowhere else.** `gcloud container clusters list/describe --format=json`, `gcloud container node-pools list/describe --format=json` (Standard clusters only; skip `node-pools` commands where `autopilot.enabled` is true), read-only `kubectl`, the `gke` MCP server, and the platform MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). There is no Platform Master Blueprint, no standards document, no CMDB, no Terraform state, no Config Sync repo, no BigQuery, no Prometheus. If you find yourself wanting an "expected value" from outside the fleet, you have left this SOP.
 
 ---
 
@@ -168,7 +168,7 @@ Every facet reads only GKE control-plane and node-pool metadata through `gcloud 
 - **Do NOT flag:** a cluster whose set is a strict **superset** of the baseline — collecting more telemetry than peers is not drift. Flag subsets and disjoint sets, and name the missing components — **every** one on the candidate's `missing:` line, which the collector computed from the same set difference that decided the finding. Do not re-derive that list from `baseline:` and `observed:`, and do not shorten it: a cluster observed `NONE` is missing the whole baseline, and a title naming one component of two reads as though the other still worked. The same holds for `managed-prometheus`, which is the one facet here that is not set-valued: only `OFF` against an `ON` majority is a finding, never `ON` against an `OFF` one.
 - **Severity:** base `major` when the outlier is missing `SYSTEM_COMPONENTS`, otherwise base `minor`.
 - **Impact:** the outlier is invisible to fleet dashboards and alerts built on the peers' component set.
-- **Remediation:** `gcloud` — `gcloud container clusters update … --logging=<t* comma list> --monitoring=<t* comma list>`.
+- **Remediation:** `gcloud` — `gcloud container clusters update … --logging=<t* comma list> --monitoring=<t* comma list>`, with `--enable-managed-prometheus` or `--disable-managed-prometheus` on Standard.
 
 #### 4.7 Binary Authorization (`binary-authorization`)
 

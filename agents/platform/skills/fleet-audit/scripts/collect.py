@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """collect.py — Procedural collector for the fleet-audit checks that are code
 wearing prose.
 
@@ -437,7 +437,7 @@ def run_and_gate(
     such envelope, so it gates on parsing as an object at all. Both share
     the same failure mode this function exists to catch: exit 0 with
     truncated or empty output, which the credential proxy's output cap makes
-    a real possibility, not a theoretical one. That cap is 16 MiB per stream
+    a real possibility, not a theoretical one. That cap is 8 MiB per stream
     as the operator deploys it, 4 MiB if `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`
     is unset; either way a 16-cluster `-A -o json` dump can reach it.
     """

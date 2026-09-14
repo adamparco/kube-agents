@@ -128,10 +128,12 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "kube-agents-observability",
     ],
     "Reliability": [
+        "fleet-upgrade-verification",
         "gke-reliability",
         "gke-upgrades",
     ],
     "Manifests and remediation": [
+        "gcp-config-connector",
         "gke-manifest-generation",
         "submit-suggestion",
     ],
@@ -139,6 +141,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "fleet-audit",
         "fleet-audit-reports",
         "github-issue-resolver",
+        "inspect-repository",
         "pr-conversation",
     ],
 }
@@ -150,6 +153,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
 CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
 
 CRON_CADENCE = {
+    "40 5 * * *": "Daily 05:40",
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
     "50 8 * * *": "Daily 08:50",

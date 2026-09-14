@@ -14,6 +14,10 @@ export DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
 export DEFAULT_RELEASE_REPO="gke-labs/kube-agents"
 export DEFAULT_INITIAL_VERSION="0.1.0"
 
+# The shape of a GA release tag: pure numeric X.Y.Z, no 'v' prefix. One
+# definition, so the validator and the two tag lookups below cannot drift apart.
+readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
+
 # The registry the docker-free existence probe below knows how to query, and the
 # manifest media types that probe must accept. Omitting the OCI types gets a
 # MANIFEST_UNKNOWN carrying "Accept header does not support OCI manifests" — a
@@ -26,6 +30,7 @@ export REQUIRED_RELEASE_IMAGES=(
   "k8s-operator"
   "platform-agent"
   "credential-proxy"
+  "agent-sandbox"
   "replay-proxy"
   "pubsub-platform"
   "gke-stockout-investigator"
@@ -41,14 +46,21 @@ export RELEASE_BUNDLE_DIRECTORIES=(
   "examples"
 )
 
+export RELEASE_INSTALLER_SCRIPTS=(
+  "install.sh"
+  "uninstall.sh"
+  "upgrade.sh"
+)
+
 export RELEASE_HELM_CHARTS=(
   "charts/kube-agents"
 )
 
+export RELEASE_TERRAFORM_EXAMPLE_VARS="terraform/examples/full-install/variables.tf"
+export RELEASE_TERRAFORM_EXAMPLE_TFVARS="terraform/examples/full-install/terraform.tfvars.example"
+
 export RELEASE_BUNDLE_ROOT_FILES=(
-  "install.sh"
-  "uninstall.sh"
-  "upgrade.sh"
+  "${RELEASE_INSTALLER_SCRIPTS[@]}"
   "install.defaults.env"
   "install.env.example"
   "images.json"
@@ -201,7 +213,7 @@ validate_pure_numeric_semver() {
     echo "❌ ERROR: ${label} must be specified." >&2
     return 1
   fi
-  if [[ ! "${ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "${ver}" =~ ${GA_TAG_SHAPE_REGEX} ]]; then
     echo "❌ ERROR: ${label} '${ver}' is not a valid pure numeric SemVer (e.g. 0.1.0, 0.2.0). 'v' prefix is not supported." >&2
     return 1
   fi
@@ -230,12 +242,45 @@ compare_semver() {
 get_latest_ga_tag() {
   local default_fallback="${1:-}"
   local latest
-  latest="$(git tag -l --sort=version:refname '[0-9]*' 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n 1 || true)"
+  latest="$(git tag -l --sort=version:refname '[0-9]*' 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" | tail -n 1 || true)"
   if [ -n "${latest}" ]; then
     echo "${latest}"
   else
     echo "${default_fallback}"
   fi
+}
+
+# Finds the highest pure numeric GA tag strictly below a version (e.g. 0.4.0 for
+# 0.5.0). Prints nothing when no lower GA tag exists, as for the first release.
+#
+# Separate from get_latest_ga_tag because the two answer different questions at
+# different moments: by the time publish_github_release.sh runs, tag_ga_release.sh
+# has already created the new tag, so the latest GA tag *is* the release being
+# published, and what the release notes need is the one before it. Order comes
+# from compare_semver rather than from `--sort`, so 0.10.0 ranks above 0.9.0.
+#
+# Arguments: $1 = the version to look below (pure numeric X.Y.Z). Returns
+# non-zero without one, or with one that is not a GA version.
+get_previous_ga_tag() {
+  local version="${1:-}"
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for get_previous_ga_tag." >&2
+    return 1
+  fi
+  validate_pure_numeric_semver "${version}" "Version" || return 1
+
+  local previous="" tag
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    if [ "$(compare_semver "${tag}" "${version}")" != "-1" ]; then
+      continue
+    fi
+    if [ -z "${previous}" ] || [ "$(compare_semver "${tag}" "${previous}")" = "1" ]; then
+      previous="${tag}"
+    fi
+  done < <(git tag -l '[0-9]*' 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" || true)
+
+  echo "${previous}"
 }
 
 # Finds the latest validated release candidate tag (rc_*_validated)
@@ -288,11 +333,12 @@ release_read_commit_range() {
 # bang on the type, or a BREAKING CHANGE / BREAKING-CHANGE footer.
 #
 # Both callers take the same answer from here rather than each holding a copy of
-# the regexes. calculate_next_version.sh reads it to pick the bump, and
-# resolve_scheduled_release.sh reads it to decide whether an unattended release
-# has to stop for a human. Two copies drift in a way nothing notices: widen one
-# to catch a footer variant and the gate silently stops halting on that shape,
-# so a breaking change ships unattended with every suite green.
+# the regexes. calculate_next_version.sh reads it to pick the bump (bumping MINOR
+# in 0.y.z under SemVer Clause 4, or MAJOR in >= 1.0.0), and
+# resolve_scheduled_release.sh reads it to decide whether an unattended release on
+# stable GA (>= 1.0.0) has to stop for a human. Two copies drift in a way nothing
+# notices: widen one to catch a footer variant and the gate silently stops
+# halting on that shape on stable releases.
 #
 # Herestrings rather than `echo … | grep -q`. Under `set -o pipefail` grep exits
 # on its first match, the producer then dies on SIGPIPE, and the pipeline reports
@@ -309,6 +355,25 @@ commit_messages_have_breaking_change() {
     return 0
   fi
   if grep -qE "^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+" <<<"${bodies}"; then
+    return 0
+  fi
+  return 1
+}
+
+# Answers "is this GA release version in pre-1.0 initial development under SemVer Clause 4?"
+# That is, does MAJOR == 0?
+#
+# Shared by calculate_next_version.sh (to select minor-breaking vs major bump)
+# and resolve_scheduled_release.sh (to decide whether a breaking change halts for human review).
+# Keeping the predicate in one place ensures the automated release gate and the version calculator
+# agree on what ends initial development.
+#
+# Arguments: $1 = version tag or string (e.g., "0.4.0", "1.0.0").
+ga_tag_is_initial_development() {
+  local tag="${1:-}"
+  local major
+  IFS='.' read -r major _ _ <<< "${tag}"
+  if [[ "${major}" =~ ^[0-9]+$ ]] && [ "${major}" -eq 0 ]; then
     return 0
   fi
   return 1
@@ -625,9 +690,9 @@ candidate_supports_shared_pipeline() {
   return 0
 }
 
-# Reports whether the staging redeploys AT A GIVEN COMMIT would start on a given
+# Reports whether the staging deploy AT A GIVEN COMMIT would start on a given
 # tag, by reading the `push: tags:` patterns out of that commit's own copy of
-# staging-redeploy-agent.yml.
+# staging-deploy.yml (or legacy staging-redeploy-agent.yml for older commits).
 #
 # A push event runs the workflows in the pushed ref's tree, not the ones on the
 # default branch, and a promotion tag lands on a candidate commit that can be days
@@ -635,11 +700,9 @@ candidate_supports_shared_pipeline() {
 # candidate, and a promotion pushed at a commit whose trigger does not match the
 # tag succeeds, deploys nothing, and reports green — after which
 # get_existing_staging_tag sees the tag and no later run retries that candidate.
-#
-# The three redeploys share one trigger, so agent stands for all three.
 staging_trigger_matches_at_commit() {
   local commit="${1:-}" tag="${2:-}"
-  local workflow=".github/workflows/staging-redeploy-agent.yml"
+  local workflow=".github/workflows/staging-deploy.yml"
   local yaml patterns pattern
 
   if [ -z "${commit}" ] || [ -z "${tag}" ]; then
@@ -647,7 +710,11 @@ staging_trigger_matches_at_commit() {
     return 2
   fi
 
-  yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || return 1
+  yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || {
+    # Backward compatibility with candidates that predate the consolidation to staging-deploy.yml
+    workflow=".github/workflows/staging-redeploy-agent.yml"
+    yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || return 1
+  }
 
   # The list items under the single `tags:` key, unquoted. Stops at the first
   # line that is neither a list item nor blank, so it cannot run on into the rest
@@ -837,17 +904,99 @@ stamp_baked_release_version() {
     return 1
   fi
 
-  for script_name in install.sh uninstall.sh upgrade.sh; do
+  for script_name in "${RELEASE_INSTALLER_SCRIPTS[@]}"; do
     local script_path="${repo_dir}/${script_name}"
-    if [ -f "${script_path}" ]; then
-      sed -i.bak -E "s/^BAKED_RELEASE_VERSION=[\"'].*[\"']/BAKED_RELEASE_VERSION=\"${version}\"/" "${script_path}" && rm -f "${script_path}.bak"
-      if ! grep -q "^BAKED_RELEASE_VERSION=\"${version}\"" "${script_path}"; then
-        echo "❌ ERROR: Failed to stamp BAKED_RELEASE_VERSION in ${script_name} (placeholder line '^BAKED_RELEASE_VERSION=...' not found)." >&2
-        git -C "${repo_dir}" checkout -- install.sh uninstall.sh upgrade.sh >/dev/null 2>&1 || true
-        return 1
-      fi
+    if [ ! -f "${script_path}" ]; then
+      echo "❌ ERROR: Target installer script not found at ${script_path}!" >&2
+      return 1
+    fi
+    sed -i.bak -E "s/^BAKED_RELEASE_VERSION=[\"'].*[\"']/BAKED_RELEASE_VERSION=\"${version}\"/" "${script_path}" && rm -f "${script_path}.bak"
+    if ! grep -q "^BAKED_RELEASE_VERSION=\"${version}\"" "${script_path}"; then
+      echo "❌ ERROR: Failed to stamp BAKED_RELEASE_VERSION in ${script_name} (placeholder line '^BAKED_RELEASE_VERSION=...' not found)." >&2
+      return 1
     fi
   done
+}
+
+# Stamps version and appVersion into Helm Chart.yaml for each chart in RELEASE_HELM_CHARTS
+stamp_helm_chart_versions() {
+  local version="${1:-}"
+  local repo_dir="${2:-${REPO_ROOT}}"
+
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for stamp_helm_chart_versions." >&2
+    return 1
+  fi
+
+  for chart_rel_path in "${RELEASE_HELM_CHARTS[@]}"; do
+    local chart_yaml="${repo_dir}/${chart_rel_path}/Chart.yaml"
+    if [ ! -f "${chart_yaml}" ]; then
+      echo "❌ ERROR: Helm chart file not found at ${chart_yaml}!" >&2
+      return 1
+    fi
+    sed -i.bak -E \
+      -e "s/^version:[[:space:]].*/version: ${version}/" \
+      -e "s/^appVersion:[[:space:]].*/appVersion: \"${version}\"/" \
+      "${chart_yaml}" && rm -f "${chart_yaml}.bak"
+
+    if ! grep -q -E "^version:[[:space:]]+${version}$" "${chart_yaml}"; then
+      echo "❌ ERROR: Failed to stamp version in ${chart_yaml}!" >&2
+      return 1
+    fi
+    if ! grep -q -E "^appVersion:[[:space:]]+\"${version}\"$" "${chart_yaml}"; then
+      echo "❌ ERROR: Failed to stamp appVersion in ${chart_yaml}!" >&2
+      return 1
+    fi
+  done
+}
+
+# Stamps release image tag into Terraform defaults (variables.tf and terraform.tfvars.example)
+stamp_terraform_release_versions() {
+  local version="${1:-}"
+  local repo_dir="${2:-${REPO_ROOT}}"
+
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for stamp_terraform_release_versions." >&2
+    return 1
+  fi
+
+  local var_file="${repo_dir}/${RELEASE_TERRAFORM_EXAMPLE_VARS}"
+  if [ ! -f "${var_file}" ]; then
+    echo "❌ ERROR: Terraform variables file not found at ${var_file}!" >&2
+    return 1
+  fi
+  sed -i.bak -E "/variable \"image_tag\"/,/^[[:space:]]*\}/ s/([[:space:]]*default[[:space:]]*=[[:space:]]*)\"[^\"]*\"/\1\"${version}\"/" "${var_file}" && rm -f "${var_file}.bak"
+
+  if ! grep -q -E "default[[:space:]]*=[[:space:]]*\"${version}\"" "${var_file}"; then
+    echo "❌ ERROR: Failed to stamp image_tag default in ${var_file}!" >&2
+    return 1
+  fi
+
+  local tfvars_file="${repo_dir}/${RELEASE_TERRAFORM_EXAMPLE_TFVARS}"
+  if [ ! -f "${tfvars_file}" ]; then
+    echo "❌ ERROR: Terraform example tfvars file not found at ${tfvars_file}!" >&2
+    return 1
+  fi
+  sed -i.bak -E "s/^#([[:space:]]*image_tag[[:space:]]*=[[:space:]]*)\"[^\"]*\"/#\1\"${version}\"/" "${tfvars_file}" && rm -f "${tfvars_file}.bak"
+  if ! grep -q -E "^#[[:space:]]*image_tag[[:space:]]*=[[:space:]]*\"${version}\"" "${tfvars_file}"; then
+    echo "❌ ERROR: Failed to stamp image_tag example in ${tfvars_file}!" >&2
+    return 1
+  fi
+}
+
+# Stamps all release version touchpoints: installer scripts, Helm Chart.yaml, and Terraform defaults
+stamp_release_versions() {
+  local version="${1:-}"
+  local repo_dir="${2:-${REPO_ROOT}}"
+
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for stamp_release_versions." >&2
+    return 1
+  fi
+
+  stamp_baked_release_version "${version}" "${repo_dir}" || return 1
+  stamp_helm_chart_versions "${version}" "${repo_dir}" || return 1
+  stamp_terraform_release_versions "${version}" "${repo_dir}" || return 1
 }
 
 # Validates if a release tag commit is either directly the candidate commit
@@ -896,7 +1045,7 @@ is_valid_stamped_or_direct_release_commit() {
   return 0
 }
 
-# Creates a release commit on detached HEAD with stamped BAKED_RELEASE_VERSION
+# Creates a release commit on detached HEAD with stamped release versions
 create_stamped_release_commit() {
   local version="${1:-}"
   local target_sha="${2:-}"
@@ -905,14 +1054,6 @@ create_stamped_release_commit() {
   if [ -z "${version}" ] || [ -z "${target_sha}" ]; then
     echo "❌ ERROR: version and target_sha are required for create_stamped_release_commit." >&2
     return 1
-  fi
-
-  # Preserve caller's current branch / ref and restore on function return
-  local orig_ref
-  orig_ref="$(git -C "${repo_dir}" symbolic-ref --short -q HEAD 2>/dev/null || git -C "${repo_dir}" rev-parse HEAD 2>/dev/null || echo "")"
-  if [ -n "${orig_ref}" ]; then
-    # shellcheck disable=SC2064
-    trap "git -C '${repo_dir}' checkout -- install.sh uninstall.sh upgrade.sh >/dev/null 2>&1 || true; git -C '${repo_dir}' checkout '${orig_ref}' >/dev/null 2>&1 || true" RETURN
   fi
 
   # Idempotency check: if release tag already exists and is a valid release commit for target_sha, reuse it
@@ -925,28 +1066,57 @@ create_stamped_release_commit() {
     fi
   fi
 
+  local candidate_files=(
+    "${RELEASE_INSTALLER_SCRIPTS[@]}"
+  )
+  for chart_rel_path in "${RELEASE_HELM_CHARTS[@]}"; do
+    candidate_files+=("${chart_rel_path}/Chart.yaml")
+  done
+  candidate_files+=(
+    "${RELEASE_TERRAFORM_EXAMPLE_VARS}"
+    "${RELEASE_TERRAFORM_EXAMPLE_TFVARS}"
+  )
+
+  # Refuse to proceed if any release candidate files have uncommitted changes
+  local dirty_release_files
+  dirty_release_files="$(git -C "${repo_dir}" status --porcelain -- "${candidate_files[@]}" 2>/dev/null || true)"
+  if [ -n "${dirty_release_files}" ]; then
+    echo "❌ ERROR: Cannot create stamped release commit with uncommitted changes in release files:" >&2
+    echo "${dirty_release_files}" >&2
+    echo "Please commit, stash, or revert changes in release files before releasing." >&2
+    return 1
+  fi
+
+  # Preserve caller's current branch / ref and restore on function return
+  local orig_ref
+  orig_ref="$(git -C "${repo_dir}" symbolic-ref --short -q HEAD 2>/dev/null || git -C "${repo_dir}" rev-parse HEAD 2>/dev/null || echo "")"
+  if [ -n "${orig_ref}" ]; then
+    # shellcheck disable=SC2064
+    trap "for f in \"\${candidate_files[@]}\"; do git -C '${repo_dir}' checkout -- \"\$f\" >/dev/null 2>&1 || true; done; git -C '${repo_dir}' checkout '${orig_ref}' >/dev/null 2>&1 || true" RETURN
+  fi
+
   # 1. Checkout detached HEAD at candidate commit
-  if ! git -C "${repo_dir}" checkout --detach "${target_sha}"; then
+  if ! git -C "${repo_dir}" checkout --detach "${target_sha}" >/dev/null; then
     echo "❌ ERROR: Failed to checkout candidate commit '${target_sha}' on detached HEAD." >&2
     return 1
   fi
 
-  # 2. Stamp BAKED_RELEASE_VERSION in root installer scripts
-  if ! stamp_baked_release_version "${version}" "${repo_dir}"; then
-    echo "❌ ERROR: Failed to stamp baked release version into installer scripts." >&2
+  # 2. Stamp release versions across installer scripts, Helm Chart.yaml, and Terraform defaults
+  if ! stamp_release_versions "${version}" "${repo_dir}"; then
+    echo "❌ ERROR: Failed to stamp release versions." >&2
     return 1
   fi
 
   # 3. If files were modified, create release commit on detached HEAD (does NOT touch main branch)
   local modified_files=()
-  for script_name in install.sh uninstall.sh upgrade.sh; do
-    if [ -f "${repo_dir}/${script_name}" ] && [ -n "$(git -C "${repo_dir}" status --porcelain "${script_name}" 2>/dev/null || true)" ]; then
-      modified_files+=("${script_name}")
+  for file_rel in "${candidate_files[@]}"; do
+    if [ -f "${repo_dir}/${file_rel}" ] && [ -n "$(git -C "${repo_dir}" status --porcelain "${file_rel}" 2>/dev/null || true)" ]; then
+      modified_files+=("${file_rel}")
     fi
   done
 
   if [ ${#modified_files[@]} -gt 0 ]; then
-    echo "📝 Stamping baked release version '${version}' in release tag commit..." >&2
+    echo "📝 Stamping release version '${version}' in release tag commit..." >&2
     setup_git_bot_user
     git -C "${repo_dir}" add "${modified_files[@]}"
     git -C "${repo_dir}" commit -m "chore(release): stamp release version ${version}" >/dev/null

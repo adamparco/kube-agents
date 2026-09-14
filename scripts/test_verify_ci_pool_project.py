@@ -1997,23 +1997,39 @@ class IamGrantsTest(unittest.TestCase):
         member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
         return json.dumps({"bindings": [{"role": "roles/iam.workloadIdentityUser", "members": [member]}]})
 
+    def _litellm_wi_policy(self, project_id):
+        member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-litellm]"
+        return json.dumps({"bindings": [{"role": "roles/iam.workloadIdentityUser", "members": [member]}]})
+
     def _reader_policy(self, members):
         return json.dumps({"bindings": [{"role": "roles/artifactregistry.reader", "members": members}]})
+
+    def _fleet_reader_policy(self, members=None):
+        """seeded-fleet-reader's own policy, with the Prow runner able to borrow it."""
+        if members is None:
+            members = [checker.PROW_RUNNER_MEMBER]
+        return json.dumps(
+            {"bindings": [{"role": "roles/iam.serviceAccountTokenCreator", "members": members}]}
+        )
 
     def _project_policy(
         self,
         project_id="kube-agents-evals-3",
         prow_roles=None,
         platform_roles=None,
+        litellm_roles=None,
         conditional_roles=(),
         extra_bindings=(),
     ):
-        """The project's own policy: both identities holding exactly what they should."""
+        """The project's own policy: all three identities holding exactly what they should."""
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         platform = checker.platform_gsa_roles(project_id) if platform_roles is None else platform_roles
+        litellm = checker.LITELLM_GSA_ROLES if litellm_roles is None else litellm_roles
         platform_member = checker.PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+        litellm_member = checker.LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
         bindings = [{"role": r, "members": [checker.PROW_RUNNER_MEMBER]} for r in sorted(prow)]
         bindings += [{"role": r, "members": [platform_member]} for r in sorted(platform)]
+        bindings += [{"role": r, "members": [litellm_member]} for r in sorted(litellm)]
         bindings += [
             {
                 "role": r,
@@ -2037,8 +2053,10 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -2049,8 +2067,10 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-2")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-2")),
                 _ok(self._project_policy("kube-agents-evals-2")),
                 _ok(self._reader_policy([f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"])),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-2", project_number)
         self.assertFalse(result.passed)
@@ -2067,18 +2087,112 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(json.dumps({"bindings": []})),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
         self.assertTrue(any("Workload Identity" in d for d in result.details), result.details)
+
+    def test_missing_litellm_wi_binding_fails(self):
+        # The gap every pool project provisioned before model_provider =
+        # "vertex_ai" landed in provision_ci_pool_project.sh's tfvars carries:
+        # the deploy annotates the kubeagents-litellm KSA, no binding backs
+        # it, and every leased presubmit reds at the model-call gate (#1097).
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(json.dumps({"bindings": []})),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("kubeagents-litellm-gsa" in d and "Workload Identity" in d for d in result.details),
+            result.details,
+        )
+
+    def test_missing_litellm_gsa_fails(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
+                      "service account."),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Missing GSA" in d and "kubeagents-litellm-gsa" in d for d in result.details),
+            result.details,
+        )
+
+    def test_litellm_gsa_missing_role_fails(self):
+        # The 2026-09-03 pool rollout's finding (#1208): the WI binding check
+        # alone passed a project that would still fail at the model call for
+        # want of aiplatform.user.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(litellm_roles=set())),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("roles/aiplatform.user" in d and "LiteLLM" in d for d in result.details),
+            result.details,
+        )
+
+    def test_litellm_gsa_extra_role_fails(self):
+        # Closed in both directions like the platform GSA: the gateway proxies
+        # attacker-influenceable content and must hold aiplatform.user only.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(
+                    litellm_roles=checker.LITELLM_GSA_ROLES | {"roles/container.viewer"})),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("roles/container.viewer" in d and "LiteLLM" in d for d in result.details),
+            result.details,
+        )
+
+    def test_denied_litellm_policy_is_unverified_not_a_missing_gsa(self):
+        # Same anti-enumeration shape as the platform GSA read below: a denied
+        # read is "not checked", never "missing".
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-6")),
+                _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: Permission "
+                      "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
+                _ok(self._project_policy("kube-agents-evals-6")),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("Missing GSA" in d for d in result.details), result.details)
 
     def test_denied_gsa_policy_is_unverified_not_a_missing_gsa(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: Permission "
                       "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
+                _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6")),
                 _ok(
                     self._reader_policy(
@@ -2088,6 +2202,7 @@ class IamGrantsTest(unittest.TestCase):
                         ]
                     )
                 ),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
@@ -2102,9 +2217,11 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _fail("ERROR: (gcloud.projects.get-iam-policy) PERMISSION_DENIED: Permission "
                       "'resourcemanager.projects.getIamPolicy' denied on resource"),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
@@ -2112,7 +2229,8 @@ class IamGrantsTest(unittest.TestCase):
         self.assertTrue(
             any("were not checked" in w for w in result.warnings), result.warnings)
         self.assertEqual(
-            "the Workload Identity binding, the cross-project AR reader grants verified; "
+            "the Workload Identity binding, the cross-project AR reader grants, "
+            "the fleet reader's token-creator binding verified; "
             "the Prow runner and platform GSA project roles not checked",
             result.message,
         )
@@ -2124,9 +2242,11 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6")),
                 _fail("ERROR: PERMISSION_DENIED: Permission 'artifactregistry.repositories.getIamPolicy' "
                       "denied on resource"),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
@@ -2134,8 +2254,9 @@ class IamGrantsTest(unittest.TestCase):
         # only the skipped half cannot tell whether the other one passed or was
         # skipped too, and goes and re-checks something this run already did.
         self.assertEqual(
-            "the Workload Identity binding, the Prow runner and platform GSA project roles "
-            "verified; the cross-project AR reader grants not checked",
+            "the Workload Identity binding, the Prow runner and platform GSA project roles, "
+            "the fleet reader's token-creator binding verified; "
+            "the cross-project AR reader grants not checked",
             result.message,
         )
 
@@ -2147,8 +2268,10 @@ class IamGrantsTest(unittest.TestCase):
                 # PERMISSION_DENIED, so a missing GSA is still reportable.
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
                       "service account."),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy("kube-agents-evals-3")),
                 _ok(self._reader_policy(["serviceAccount:123456@cloudbuild.gserviceaccount.com"])),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2161,8 +2284,10 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(self._project_policy("kube-agents-evals-6", prow_roles=without_container_admin)),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertFalse(result.passed)
@@ -2174,6 +2299,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-6")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-6")),
                 _ok(
                     self._project_policy(
                         "kube-agents-evals-6",
@@ -2182,6 +2308,7 @@ class IamGrantsTest(unittest.TestCase):
                     )
                 ),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertFalse(result.passed)
@@ -2193,8 +2320,10 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(prow_roles=checker.PROW_RUNNER_ROLES | {"roles/artifactregistry.writer"})),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
@@ -2203,9 +2332,11 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     platform_roles=checker.platform_gsa_roles("kube-agents-evals-3") - {"roles/container.viewer"})),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2218,9 +2349,11 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     platform_roles=checker.platform_gsa_roles("kube-agents-evals-3") | {"roles/container.admin"})),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2232,9 +2365,11 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(
                     extra_bindings=[{"role": "roles/storage.objectViewer", "members": ["allUsers"]}])),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2246,16 +2381,113 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(extra_bindings=[{
                     "role": "roles/storage.objectViewer",
                     "members": ["allAuthenticatedUsers"],
                     "condition": {"title": "t", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"},
                 }])),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
         self.assertTrue(any("allAuthenticatedUsers" in d for d in result.details), result.details)
+
+    def test_fleet_reader_token_creator_present_passes(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(
+            "Workload Identity, Prow runner and platform GSA project roles, "
+            "cross-project AR reader grants, and the fleet reader's token-creator "
+            "binding verified",
+            result.message,
+        )
+
+    def test_fleet_reader_missing_token_creator_fails(self):
+        # The pool's state on 2026-09-03: every project has the account, none
+        # has the binding, and every fleet check ran as the runner instead
+        # (gke-labs/kube-agents#1051).
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy(members=[])),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("seeded-fleet-reader@kube-agents-evals-3" in d for d in result.details),
+            result.details,
+        )
+
+    def test_fleet_reader_account_absent_fails(self):
+        # kube-agents-evals and -2, -3, -4 as they stood on 2026-09-03: fleets
+        # applied before the module grew the account. NOT_FOUND is not a denial,
+        # so this is a failure rather than an unverified warning.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
+                      "service account."),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(any("bench/tf/fleet" in d for d in result.details), result.details)
+
+    def test_unparseable_fleet_reader_policy_fails(self):
+        # gcloud exiting 0 with something that is not a policy is not an
+        # absence of the binding; reporting it as one would send an operator to
+        # re-apply Terraform that is already correct.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok("Updates are available for some Google Cloud CLI components."),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Failed parsing policy" in d for d in result.details), result.details
+        )
+
+    def test_denied_fleet_reader_policy_is_unverified(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: "
+                      "Permission iam.serviceAccounts.getIamPolicy is required"),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertTrue(result.passed, result.details)
+        self.assertTrue(
+            any("impersonation grant was not checked" in w for w in result.warnings),
+            result.warnings,
+        )
+        self.assertEqual(
+            "the Workload Identity binding, the Prow runner and platform GSA project roles, "
+            "the cross-project AR reader grants verified; "
+            "the fleet reader's token-creator binding not checked",
+            result.message,
+        )
 
 
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
@@ -2355,6 +2587,27 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         ).read_text()
         documented = self._loop_roles(page, "deploy/ci-pool-projects.md")
         self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
+
+
+class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
+    """PROW_RUNNER_MEMBER must equal bench/tf/fleet's token-creator default.
+
+    The verifier asserts one member holds the grant and Terraform grants it to
+    another, and neither reads the other. Rename the runner in one place and the
+    verifier fails every correctly-applied project -- or, worse round, passes a
+    project whose grant went to an account that no longer runs anything.
+    """
+
+    def test_matches_the_variable_default(self):
+        variables = (checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text()
+        block = re.search(
+            r'variable "fleet_reader_token_creators".*?\n\}', variables, re.S
+        )
+        self.assertIsNotNone(block, "fleet_reader_token_creators is gone from variables.tf")
+        default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
+        self.assertIsNotNone(default, "fleet_reader_token_creators has no default")
+        members = re.findall(r'"([^"]+)"', default.group(1))
+        self.assertEqual(members, [checker.PROW_RUNNER_MEMBER])
 
 
 class ExitStatusTest(unittest.TestCase):

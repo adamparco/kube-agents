@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """fleet_waste.py — Procedural collector for the Fleet Waste Audit
 (`fleet-wide-cost-analysis`).
 

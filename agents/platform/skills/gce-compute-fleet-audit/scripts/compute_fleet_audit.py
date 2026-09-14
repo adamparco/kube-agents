@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """compute_fleet_audit.py — Procedural collector for the GCE Compute Engine
 and MIG fleet audit.
 

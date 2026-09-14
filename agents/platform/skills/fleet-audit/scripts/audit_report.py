@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """
 audit_report.py — Deterministic reporting harness for the fleet-audit skill.
 
@@ -14,7 +14,7 @@ read-only and emitting a findings.json**; every git/gh operation, every rendered
 body, the commit subjects, the timestamps, and the run-over-run delta are
 produced here, deterministically.
 
-Two-command lifecycle, plus one on-demand command:
+Two-command lifecycle, plus three on-demand commands:
 
     audit_report.py start     --audit <audit-id>
     audit_report.py finish    --audit <audit-id> --findings-file <path>
@@ -22,6 +22,27 @@ Two-command lifecycle, plus one on-demand command:
                           [--dry-run]
     audit_report.py remediate --audit <audit-id> --findings-file <path>
                           --finding <id> [--finding <id>...] [--dry-run]
+    audit_report.py fetch     --audit <audit-id> --path <repo-path> [--path ...]
+    audit_report.py list      --audit <audit-id> [--prefix <repo-path>]
+
+There are two ways a fix reaches GitHub, and which one runs depends on whether
+the broker has content workspaces armed.
+
+**Content mode.** The workspace `start` hands over is a plain directory. The
+agent writes its remediation manifests into it, and `finish` reads the bytes and
+hands them to the broker, which owns the only checkout. Nothing here ever sees a
+`.git`, so nothing here can author the `.git/config` that every known
+code-execution route through the credential container needs — a filter driver,
+an alias, a hook path. `list` and `fetch` are the read half — the names of the
+files in the broker's checkout, and the bytes of the ones a fix has to start
+from.
+
+**Directory mode**, which is what ran before and still runs when the broker has
+not been armed: a leased clone on the shared volume, and `checkout`, `add`,
+`commit`, `push` run in it through the shim.
+
+`start` reports which one it took as the `mode` field of its JSON line, and the
+mode is resolved once per process so a single run cannot take both forks.
 
 The pure functions (validate/render/delta) carry no I/O and are unit tested in
 test_audit_report.py; the thin shell below them owns all subprocess execution.
@@ -106,6 +127,17 @@ class AuditSpec(NamedTuple):
     `checks`, so a check added to a partitioned stream cannot land in the roster
     without an owning target kind — it would otherwise be a check the harness
     silently stops requiring of anyone.
+
+    `declarable` names the checks a repository declaration may move out of
+    `findings` into `declared`: the stream's *posture* checks, the ones whose
+    flagged shape an owner can have chosen on purpose. Empty for a stream whose
+    SOP has no declared-intent step, and empty is what it means: the validator
+    rejects any `declared[]` entry whose check is not in it, so "a declaration
+    justifies posture, never a fault" is an exit 2 rather than a sentence in the
+    SOP. A findings document that moves `blocking-pdb` — a declared bug — into
+    `declared` fails validation instead of publishing a silenced fault as
+    intended. Never a superset of `checks`, never a `derived` slug;
+    `test_declarable_checks_are_posture_checks_on_the_roster` holds both.
     """
 
     title: str
@@ -113,6 +145,7 @@ class AuditSpec(NamedTuple):
     checks: tuple[str, ...]
     derived: tuple[str, ...] = ()
     scopes: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    declarable: tuple[str, ...] = ()
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
@@ -189,6 +222,12 @@ AUDITS: dict[str, AuditSpec] = {
             "hpa-floors-at-one",
             "pdb-overlapping",
         ),
+        # §4a of the SOP: the four checks that judge a posture rather than a
+        # fault, and so the only four a repository declaration may keep off the
+        # ledger. `hpa-cannot-scale` is declarable only in its `min == max`
+        # shape; the validator cannot tell the shapes apart from the slug, and
+        # the SOP's step carries that distinction.
+        declarable=("no-pdb", "no-hpa", "hpa-cannot-scale", "single-replica"),
     ),
     "fleet-wide-cost-analysis": AuditSpec(
         "Fleet Waste Audit",
@@ -1097,6 +1136,17 @@ MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
+# Rows in the ledger's `## Declared intent` table: postures a check would have
+# flagged that a linked repository declares on purpose. The table is measured
+# against the body before the findings are, so it is capped the way the delta
+# rows are — a fleet with hundreds of declared postures still publishes its
+# findings, and says how many rows it left out.
+MAX_DECLARED_ROWS = 50
+# What a `declared[]` entry must point at. A declared posture with nothing to
+# point at is a finding the worker chose not to write, so all three are
+# required: the repository and path a reviewer opens, and the lines that pin
+# the flagged property so the claim can be read off the row.
+DECLARATION_FIELDS = ("repo", "path", "excerpt")
 
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
@@ -1656,6 +1706,16 @@ def audit_finding_checks(audit_id: str) -> frozenset[str]:
     """Every slug a `finding.check` may cite: the roster plus the derived ones."""
     spec = AUDITS.get(audit_id)
     return frozenset(spec.checks + spec.derived) if spec else frozenset()
+
+
+def audit_declarable_checks(audit_id: str) -> frozenset[str]:
+    """The slugs a `declared[].check` may cite: the stream's posture checks.
+
+    Empty for every stream whose SOP has no declared-intent step, and an empty
+    set rejects every entry — see `AuditSpec.declarable`.
+    """
+    spec = AUDITS.get(audit_id)
+    return frozenset(spec.declarable) if spec else frozenset()
 
 
 def audit_sop(audit_id: str) -> str:
@@ -3610,6 +3670,123 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # path above is normalised here: these strings are what get published,
         # and every reader downstream sees whatever they say.
         normalise_finding_commands(finding)
+
+    # Postures a check would have flagged and a linked repository declares on
+    # purpose. Optional: a document without the key is the shape every stream
+    # wrote before declarations existed, and it validates unchanged. An entry
+    # carries a finding's four identity fields and the declaration that
+    # justifies the posture — no severity, no remediation, no id — because it
+    # is not a finding: it never enters the delta block, is never announced as
+    # new or resolved, and never becomes a pull request.
+    #
+    # The check is held to the stream's `declarable` set, not to the roster: a
+    # declaration justifies a posture, never a fault, and the set is where that
+    # rule stops being prose. A stream with no declared-intent step has an
+    # empty set, so a non-empty list on it is rejected whole; `[]` is accepted
+    # everywhere because it says the same thing as an absent key.
+    declared = data.get("declared")
+    if declared is not None:
+        if not isinstance(declared, list):
+            raise ValidationError(
+                "declared: must be a list when present — one entry per posture a "
+                "repository declaration justified, or omit the key"
+            )
+        declarable = audit_declarable_checks(audit_id)
+        seen_declared: dict[str, int] = {}
+        # Lazy for the reason the module comment on `sys.path` gives; the slug
+        # rule is the one `resolve_repo` applies, so a declaration names a
+        # repository the same way a `--repo` flag does.
+        import gitops_workspace
+
+        for i, entry in enumerate(declared):
+            where = f"declared[{i}]"
+            if not isinstance(entry, dict):
+                raise ValidationError(f"{where}: expected an object")
+            if not declarable:
+                raise ValidationError(
+                    f"{where}: the {audit_id} SOP has no declared-intent step, so "
+                    "no check in it may be moved to `declared` — every candidate "
+                    "is a finding. Drop the entry, or omit the key"
+                )
+            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            check = str(entry["check"])
+            if check not in finding_check_set:
+                # No roster, for the reason `findings[].check` gives none.
+                raise ValidationError(
+                    f"{where}.check: {check!r} is not a check in the {audit_id} "
+                    "SOP. Name checks by the backticked slug in their `####` "
+                    f"heading. {_sop_pointer(audit_id)}"
+                )
+            if check not in declarable:
+                # The declarable set is not printed either: it is a subset of
+                # the roster, and the SOP step that writes this list names it.
+                raise ValidationError(
+                    f"{where}.check: {check!r} judges a fault, not a posture, so "
+                    "no repository declaration justifies it — a declared fault is "
+                    "a declared bug and stays a finding. The declared-intent step "
+                    f"of governance/{audit_sop(audit_id)} names the checks it may "
+                    "move; write this one under `findings`"
+                )
+            _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
+            _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
+            cluster = str(entry["cluster"])
+            if cluster not in audited_names:
+                raise ValidationError(
+                    f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
+                    "declaration justifies a posture this run observed, so the "
+                    "cluster it was observed on must be one this run read"
+                )
+            _require_str(entry.get("namespace", ""), f"{where}.namespace")
+            _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            for field in ("cluster", "object"):
+                if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
+                    raise ValidationError(
+                        f"{where}.{field}: {entry[field]!r} has no letter or digit "
+                        "in it, so it names nothing"
+                    )
+            declaration = entry.get("declaration")
+            if not isinstance(declaration, dict):
+                raise ValidationError(
+                    f"{where}.declaration: required object with "
+                    f"{', '.join(repr(f) for f in DECLARATION_FIELDS)} — a posture "
+                    "with no declaration to point at is a finding, not a declaration"
+                )
+            repo = declaration.get("repo")
+            if not isinstance(repo, str) or not gitops_workspace.is_valid_repo_slug(repo):
+                raise ValidationError(
+                    f"{where}.declaration.repo: must name the repository as "
+                    f"owner/name, got {repo!r}"
+                )
+            # Same rules as a remediation path: it is a pointer a reviewer
+            # follows into a repository, so it is repo-relative, one literal
+            # file, and nowhere near `..` or `.git`.
+            declaration["path"] = _require_repo_relative(
+                declaration.get("path"), f"{where}.declaration.path"
+            )
+            _require_str(
+                declaration.get("excerpt"),
+                f"{where}.declaration.excerpt",
+                allow_empty=False,
+            )
+            # Identity, on the same four fields as a finding, so that one
+            # posture cannot be both. A worker that writes the finding *and*
+            # the declaration has not decided, and the ledger would report the
+            # object as broken in one section and intended in the next.
+            full_id = derive_finding_id(entry)
+            if full_id in seen_ids:
+                raise ValidationError(
+                    f"{where}: same identity as findings[{seen_ids[full_id]}] — "
+                    f"check {check!r} against {entry['object']!r} in "
+                    f"{cluster!r}/{entry.get('namespace') or '(cluster)'} is "
+                    "listed as a finding and as declared. A posture is one or "
+                    "the other: if the declaration covers it, drop the finding; "
+                    "if it does not, drop the declaration"
+                )
+            if full_id in seen_declared:
+                raise ValidationError(
+                    f"{where}: same identity as declared[{seen_declared[full_id]}]"
+                )
+            seen_declared[full_id] = i
 
     return data
 
@@ -7029,6 +7206,70 @@ def _render_withheld(
     return out
 
 
+def _declared_pointer(entry: dict) -> tuple[str, str]:
+    """`(object, repo:path)` for one `declared[]` entry, ready for a code span.
+
+    Shared by the ledger table and the clean-run comment so the two never
+    name the same declaration two different ways.
+    """
+    declaration = entry.get("declaration") or {}
+    where = f"{declaration.get('repo', '')}:{declaration.get('path', '')}"
+    namespace = str(entry.get("namespace") or "").strip()
+    obj = str(entry.get("object", ""))
+    if namespace:
+        obj = f"{namespace}/{obj}"
+    # The pointer is the one cell a reader follows rather than reads, so it
+    # gets the identifier ceiling instead of the cell one: a `repo:path`
+    # clipped at 120 characters renders as a path that does not exist, in a
+    # code span that says it does. 320 clears any slug plus a deep path and
+    # still bounds a hostile value, the same trade `_ident` makes.
+    return _cell(obj), _cell(where, limit=MAX_IDENT_CHARS)
+
+
+def _render_declared(declared: list[dict]) -> list[str]:
+    """The postures a check would have flagged and a linked repository declares.
+
+    A section of its own rather than a fourth severity, because a finding has
+    an identity, a severity and a slot in the hidden delta block, and a
+    declared posture must have none of those: it is not news when it appears,
+    not a fix when it goes, and never a candidate for a pull request. What it
+    owes the reader is the pointer — `repo:path` and the lines that pin the
+    property — so the claim that this was intended can be checked, and
+    refuted by editing the declaration.
+    """
+    if not declared:
+        return []
+    out = [
+        "",
+        "## Declared intent",
+        "",
+        f"{len(declared)} posture(s) a check would have flagged are declared on "
+        "purpose in a linked repository, so they are not findings. Each row "
+        "names the declaration; a reviewer who disagrees with one changes or "
+        "removes the declaration, and the posture returns as a finding on the "
+        "next run.",
+        "",
+        "| Check | Cluster | Object | Declared at | Declaration |",
+        "| ----- | ------- | ------ | ----------- | ----------- |",
+    ]
+    for entry in declared[:MAX_DECLARED_ROWS]:
+        obj, where = _declared_pointer(entry)
+        excerpt = _cell(str((entry.get("declaration") or {}).get("excerpt", "")))
+        what = _cell(str(entry.get("title", "")))
+        if excerpt:
+            what = f"{what}: `{excerpt}`"
+        out.append(
+            f"| `{_cell(str(entry.get('check', '')))}` "
+            f"| `{_cell(str(entry.get('cluster', '')))}` "
+            f"| `{obj}` | `{where}` | {what} |"
+        )
+    if len(declared) > MAX_DECLARED_ROWS:
+        out.append(
+            f"| _…and {len(declared) - MAX_DECLARED_ROWS} more_ |  |  |  |  |"
+        )
+    return out
+
+
 class RenderedIssue(NamedTuple):
     """A ledger body together with what it actually managed to say.
 
@@ -7263,10 +7504,15 @@ def render_issue_body(
         list(uncorroborated or []),
         list(needs_triage or []),
     )
+    # Measured with the fixed sections, not against what the findings leave:
+    # the table is row-capped and says what it saw, and a declaration that
+    # silently fell off the body would put the posture back in the reader's
+    # mind as unexplained.
+    declared_section = _render_declared(list(data.get("declared") or []))
 
     # Measure the footer with an empty delta block: each finding is separately
     # charged for its own id slot inside select_rendered_findings.
-    overhead = len("\n".join(fixed + withheld_section))
+    overhead = len("\n".join(fixed + declared_section + withheld_section))
     overhead += len("\n".join(_render_footer(audit_id, generated_at, [])))
     overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
     if states:
@@ -7289,11 +7535,13 @@ def render_issue_body(
     # Whatever the findings did not need. The evidence appendix is the last
     # claim on the budget, never a competitor for it — a run with 400 findings
     # publishes the findings and drops the appendix, not the reverse.
-    spent = len("\n".join(fixed + findings_lines + withheld_section + footer))
+    spent = len(
+        "\n".join(fixed + findings_lines + declared_section + withheld_section + footer)
+    )
     evidence = _render_check_evidence(clusters, audit_id, max(BODY_BUDGET - spent, 0))
 
     body = "\n".join(
-        fixed + findings_lines + withheld_section + evidence + footer
+        fixed + findings_lines + declared_section + withheld_section + evidence + footer
     )
     if len(body) > MAX_BODY_CHARS:
         raise BodyTooLargeError(
@@ -7475,6 +7723,7 @@ def render_clean_comment(
                 "problem that stopped happening; confirm against the fleet before "
                 "reading this as a fleet-wide fix.",
             ]
+        out += _declared_comment_lines(data)
         return _clip_comment("\n".join(out))
 
     # Not closing. Which of the two reasons decides the headline, because they
@@ -7509,7 +7758,43 @@ def render_clean_comment(
             "check returned no reading this run, so its absence from the report is "
             "silence rather than a fix."
         )
+
+    out += _declared_comment_lines(data)
     return _clip_comment("\n".join(out))
+
+
+def _declared_comment_lines(data: dict) -> list[str]:
+    """The declared postures, for the tail of every clean comment.
+
+    A clean run closes the ledger without rewriting it, so this comment is
+    the last place a declared posture is published on the issue tracker:
+    once the ledger is closed, a clean run with declarations opens nothing
+    (see the CLEAN branch of `handle_finish`), and the record is the
+    declaration itself in the repository plus the `declared` count on the
+    `finish` line. Say what was seen and where it is declared; "0 findings"
+    over a fleet with pinned replicas the operator never hears about is a
+    quieter claim than the run can back. Both branches of
+    `render_clean_comment` — closing, and held open over a gap — carry it,
+    because either is the only comment the run posts.
+    """
+    declared = list(data.get("declared") or [])
+    if not declared:
+        return []
+    out = [
+        "",
+        f"{len(declared)} posture(s) a check would have flagged are declared "
+        "on purpose in a linked repository and were not reported as findings:",
+        "",
+    ]
+    for entry in declared[:MAX_DECLARED_ROWS]:
+        obj, where = _declared_pointer(entry)
+        out.append(
+            f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
+            f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
+        )
+    if len(declared) > MAX_DECLARED_ROWS:
+        out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
+    return out
 
 
 def _select_pr_by_head(prs: list[dict], branch: str) -> dict | None:
@@ -7844,6 +8129,7 @@ def run_cmd(
     capture: bool = True,
     cwd: str | Path | None = None,
     timeout: float | None = None,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -7859,6 +8145,11 @@ def run_cmd(
     push is allowed to take as long as it takes. Only the cluster reads set it,
     and a timeout surfaces as `returncode` 124 rather than an exception, so a
     `check=False` caller handles it on the same branch as any other failure.
+
+    `stdin` is how a document reaches the tool without a file. The shim forwards
+    fd 0 for an argv that named `-` as an input file, so `--body-file -` carries
+    a pull-request body across the container boundary that a
+    `--body-file /some/path` could only cross while the two shared a volume.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -7875,6 +8166,7 @@ def run_cmd(
             capture_output=capture,
             cwd=str(target) if target is not None else None,
             timeout=timeout,
+            input=stdin,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {shlex.join(cmd)}")
@@ -7908,9 +8200,63 @@ def git(
 
 
 def gh(
-    args: list[str], *, check: bool = True, cwd: str | Path | None = None
+    args: list[str],
+    *,
+    check: bool = True,
+    cwd: str | Path | None = None,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
-    return run_cmd(["gh"] + args, check=check, cwd=cwd)
+    return run_cmd(["gh"] + args, check=check, cwd=cwd, stdin=stdin)
+
+
+# Which mechanism publishes a fix, and where the answer comes from.
+#
+# Content mode hands the broker `{path, bytes}` and a commit message; the broker
+# owns the only checkout and this container never sees a `.git`. Directory mode
+# is what ran before: a leased clone on a volume both containers mount, with the
+# agent running `checkout`, `add`, `commit` and `push` in it through the shim.
+#
+# The two are live at once while the fleet migrates, and the switch is not a
+# flag in this container. The broker either has the routes armed or it does not,
+# so the answer is asked of the broker once per process and remembered — every
+# later branch in the run has to take the same fork, and a second probe could
+# answer differently if the sidecar restarted mid-run.
+_CONTENT_MODE: bool = False
+
+
+def proxy_endpoint() -> str:
+    return os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
+
+
+def content_mode() -> bool:
+    return _CONTENT_MODE
+
+
+def set_content_mode(enabled: bool) -> None:
+    global _CONTENT_MODE
+    _CONTENT_MODE = bool(enabled)
+
+
+def detect_content_mode() -> bool:
+    """Ask the broker whether it takes content. False on anything unclear.
+
+    Falling back to the directory path on an unreachable broker is right for
+    this one question and wrong as a general habit: the fallback publishes the
+    audit through the mechanism that has been shipping for months, whereas
+    refusing would drop the whole run over a probe. Every *other* call in the
+    run still goes through the proxy and still fails loudly if it is down.
+    """
+    endpoint = proxy_endpoint()
+    if not endpoint:
+        return False
+    import credential_proxy_client
+
+    try:
+        return credential_proxy_client.workspaces_available(endpoint)
+    except Exception as exc:  # noqa: BLE001 — a probe must not end the run
+        log(f"could not ask the broker about content workspaces ({exc}); "
+            "publishing through the leased clone instead")
+        return False
 
 
 # Answers already obtained this run, keyed on `(repo, login)` both case-folded
@@ -8006,9 +8352,6 @@ def refresh_credentials(repo: str | None = None) -> None:
     refresh_git_credentials(repo)
 
 
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
-
 def resolve_repo(
     audit_id: str | None = None,
     repo: str | None = None,
@@ -8036,7 +8379,7 @@ def resolve_repo(
 
     if repo and str(repo).strip():
         r = str(repo).strip()
-        if not BARE_REPO_RE.match(r):
+        if not gitops_workspace.is_valid_repo_slug(r):
             raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
         # An unreadable list and an empty one are the same fact -- there is no
         # list to check `r` against -- so they get the same answer. Raising
@@ -8057,12 +8400,12 @@ def resolve_repo(
             raise ValueError(
                 f"Repository {r!r} is not in the managed repositories list: {managed}"
             )
-        return r
+        return gitops_workspace.validate_repo_org(r)
 
     if workspace is not None:
         try:
             w_repo = gitops_workspace.resolve_repo(workspace=workspace)
-            if w_repo and BARE_REPO_RE.match(w_repo):
+            if w_repo and gitops_workspace.is_valid_repo_slug(w_repo):
                 return w_repo
         except Exception:
             pass
@@ -8377,24 +8720,21 @@ def close_ledger_reads_clean(
         banner_body = body
     else:
         banner_body = f"{clean_close_banner(audit_id, generated_at)}\n\n{body}"
-    body_file = _write_temp(banner_body)
-    try:
-        res = gh(
-            [
-                "issue",
-                "edit",
-                str(number),
-                "-R",
-                repo,
-                "--title",
-                issue_title(audit_id, []),
-                "--body-file",
-                body_file,
-            ],
-            check=False,
-        )
-    finally:
-        _unlink(body_file)
+    res = gh(
+        [
+            "issue",
+            "edit",
+            str(number),
+            "-R",
+            repo,
+            "--title",
+            issue_title(audit_id, []),
+            "--body-file",
+            BODY_STDIN,
+        ],
+        stdin=banner_body,
+        check=False,
+    )
     return res.returncode == 0
 
 
@@ -8442,28 +8782,24 @@ def refresh_coverage_ledger(
     # timestamp, so a run that changed neither number still has something newer
     # to say than what is published.
     wanted = coverage_issue_title(audit_id, gaps)
-    body_file = _write_temp(
-        render_issue_body(
-            data, generated_at=now, audit_id=audit_id, gaps=gaps, repo=repo
-        ).body
+    body = render_issue_body(
+        data, generated_at=now, audit_id=audit_id, gaps=gaps, repo=repo
+    ).body
+    res = gh(
+        [
+            "issue",
+            "edit",
+            str(number),
+            "-R",
+            repo,
+            "--title",
+            wanted,
+            "--body-file",
+            BODY_STDIN,
+        ],
+        stdin=body,
+        check=False,
     )
-    try:
-        res = gh(
-            [
-                "issue",
-                "edit",
-                str(number),
-                "-R",
-                repo,
-                "--title",
-                wanted,
-                "--body-file",
-                body_file,
-            ],
-            check=False,
-        )
-    finally:
-        _unlink(body_file)
     if res.returncode != 0:
         log(
             f"Could not refresh coverage ledger #{number}; it still renders the "
@@ -8496,55 +8832,29 @@ def fetch_issue_comments(repo: str, number: int) -> list[dict]:
     return [c for c in comments if isinstance(c, dict)]
 
 
-def _write_temp(text: str, suffix: str = ".md") -> str:
-    """Write a body to a file `gh` can actually open.
-
-    Not `/tmp`. `gh` is not a binary in this container — the shim POSTs argv to
-    a sidecar which runs the real `gh` **in its own filesystem**, and `/tmp` is
-    a per-container emptyDir. A `--body-file /tmp/…` path therefore names a file
-    that exists in the agent container and does not exist in the one running the
-    command, so every issue create, every issue edit and every comment fails
-    with "no such file". The shared PersistentVolumeClaim at /opt/data is the
-    only filesystem both containers can see.
-
-    Being on the shared volume is necessary but not sufficient. Since #955 the
-    sandbox (uid 10000) and the credential sidecar (uid 10001) are different
-    users who share files only through the pod's fsGroup, and
-    `NamedTemporaryFile` creates 0600, owner-only — a file the sidecar's `gh`
-    cannot open even on the PVC. Hence the `fchmod` to group-readable below.
-
-    NO fallback to the container-private temp directory. There used to be one,
-    for the PVC-less off-cluster case, and in-cluster it converted a fixable
-    mount or permission problem into a guaranteed publish failure that *looked*
-    like a graceful degrade: the sidecar can never see this container's private
-    tmp, so every `gh` write died locally while the audit itself reported
-    nothing wrong (#1030). Off-cluster, point FLEET_AUDIT_SCRATCH_DIR at any
-    writable directory; the unit tests patch SCRATCH_DIR.
-    """
-    try:
-        Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            "w", suffix=suffix, delete=False, encoding="utf-8", dir=SCRATCH_DIR
-        )
-        with handle:
-            # Group-readable across the #955 uid split: the sidecar running the
-            # real `gh` is not the owner of this file.
-            os.fchmod(handle.fileno(), 0o664)
-            handle.write(text)
-    except OSError as exc:
-        raise RuntimeError(
-            "publish path broken: cannot stage a gh body file in the shared "
-            f"scratch directory {SCRATCH_DIR} (uid {os.getuid()}): {exc}. "
-            "The credential sidecar resolves --body-file paths in its own "
-            "filesystem, so a container-private temp file can never work — "
-            "fix the shared mount/permissions (see "
-            "gke-labs/kube-agents#1030), or set FLEET_AUDIT_SCRATCH_DIR when "
-            "running off-cluster."
-        ) from exc
-    return handle.name
+# Every `gh` flag below that used to name a file now names `-`, and the document
+# travels on stdin.
+#
+# It used to be a real file, and the comment that stood here explained at length
+# why it could not be in `/tmp`: `gh` is not a binary in this container, the shim
+# POSTs argv to another container which runs the real `gh` in *its* filesystem,
+# and a `/tmp` path names a file that exists on one side and not the other. The
+# answer then was the shared PersistentVolumeClaim, the only filesystem both
+# could see. That shared volume is what this change exists to remove — an
+# agent-writable tree the credential container also reads is the arrangement
+# behind every code-execution finding in this area — so the body stops being a
+# file. Nothing needs one: a pull-request body is a document, and `-` is how
+# every one of these subcommands takes a document.
+BODY_STDIN = "-"
 
 
 def _unlink(path: str) -> None:
+    """Remove a file this process wrote, ignoring one that is already gone.
+
+    Not for `gh` bodies any more — those travel on stdin, above. The run lock's
+    claim file and the report store's temporary write both still land on disk
+    and are cleared with this.
+    """
     try:
         os.remove(path)
     except OSError:
@@ -8579,36 +8889,34 @@ def post_comment(repo: str, number: int, text: str, *, what: str) -> None:
     close sat outside the try/finally. A comment is a courtesy; the state
     change is the point.
     """
-    comment_file = _write_temp(text)
-    try:
-        res = gh(
-            ["issue", "comment", str(number), "-R", repo, "-F", comment_file],
-            check=False,
+    res = gh(
+        # `--body-file` rather than the `-F` short form it replaces: the shim
+        # decides whether to forward fd 0 by matching the flag, and its list is
+        # deliberately short. A one-letter flag is the kind that means something
+        # else to another tool, so the long spelling is the one to widen it to.
+        ["issue", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
+        check=False,
+        stdin=text,
+    )
+    if res.returncode != 0:
+        log(
+            f"WARNING: could not post the {what} on #{number} "
+            f"(gh exited {res.returncode}); continuing."
         )
-        if res.returncode != 0:
-            log(
-                f"WARNING: could not post the {what} on #{number} "
-                f"(gh exited {res.returncode}); continuing."
-            )
-    finally:
-        _unlink(comment_file)
 
 
 def post_pr_comment(repo: str, number: int, text: str, *, what: str) -> None:
     """`gh pr comment`, with the same log-and-continue posture as post_comment."""
-    comment_file = _write_temp(text)
-    try:
-        res = gh(
-            ["pr", "comment", str(number), "-R", repo, "-F", comment_file],
-            check=False,
+    res = gh(
+        ["pr", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
+        check=False,
+        stdin=text,
+    )
+    if res.returncode != 0:
+        log(
+            f"WARNING: could not post the {what} on PR #{number} "
+            f"(gh exited {res.returncode}); continuing."
         )
-        if res.returncode != 0:
-            log(
-                f"WARNING: could not post the {what} on PR #{number} "
-                f"(gh exited {res.returncode}); continuing."
-            )
-    finally:
-        _unlink(comment_file)
 
 
 # --------------------------------------------------------------------------- #
@@ -8865,27 +9173,37 @@ def sync_open_remediation_labels(
         sync_remediation_labels(repo, number, audit_id, highest)
 
 
-def open_remediation_pr(
-    repo: str,
+class _GroupPush(NamedTuple):
+    """What landing a group's files learned, for the pull-request step after it.
+
+    `base` is the branch the pull request targets, which the two mechanisms
+    answer differently: the clone asks its own `origin/HEAD`, the broker reports
+    the base of the repository it cloned. `proposable` is False when there is
+    nothing to propose — the fix is already on the base — and the caller returns
+    without opening anything.
+    """
+
+    base: str
+    proposable: bool
+
+
+def _land_group_via_clone(
     audit_id: str,
     group: list[dict],
-    *,
+    branch: str,
+    paths: list[str],
     snapshot: dict[str, bytes],
     root: Path,
-    issue_number: int | None,
-    existing: dict | None,
-    generated_at: datetime,
-) -> str | None:
-    """Branch off the base, write the group's files, push, and open/refresh its PR.
+) -> _GroupPush:
+    """Cut the branch in the leased clone, stage the files, commit, force-push.
 
     `finish` owns the working tree while it runs: the checkout is forced, and
-    the files are re-materialised from `snapshot` afterwards, because a branch
-    switch is the only way to get a diff against the base and an unforced switch
-    fails whenever the base already carries a path the agent left untracked.
-    Do not leave unrelated uncommitted work in the tree during an audit.
+    the caller re-materialises the files from `snapshot` afterwards, because a
+    branch switch is the only way to get a diff against the base and an unforced
+    switch fails whenever the base already carries a path the agent left
+    untracked. Do not leave unrelated uncommitted work in the tree during an
+    audit.
     """
-    branch = assert_pushable(group_branch_for(audit_id, group))
-    paths = group_paths(group)
     base = base_branch()
 
     git(["fetch", "origin", base])
@@ -8914,7 +9232,7 @@ def open_remediation_pr(
             f"{branch}: the remediation is already present on {base}; "
             "no pull request opened."
         )
-        return None
+        return _GroupPush(base, False)
     if staged.returncode != 1:
         raise RuntimeError(
             f"{branch}: `git diff --cached --quiet` exited {staged.returncode}; "
@@ -8923,60 +9241,142 @@ def open_remediation_pr(
         )
     git(["commit", "-m", group_commit_subject(audit_id, group)])
     git(["push", "-f", "origin", branch])
+    return _GroupPush(base, True)
 
-    body_file = _write_temp(
-        render_remediation_pr_body(
-            audit_id, group, issue_number=issue_number, generated_at=generated_at
+
+def _land_group_via_broker(
+    repo: str,
+    audit_id: str,
+    group: list[dict],
+    branch: str,
+    paths: list[str],
+    snapshot: dict[str, bytes],
+) -> _GroupPush:
+    """Hand the broker the group's bytes and let it own the branch.
+
+    Nothing here names a directory, which is the whole of the difference. The
+    bytes were read out of the agent's scratch tree before this call; what
+    crosses to the credential container is content and a commit message, so
+    there is no `.git` on this side to define a filter driver, an alias or a
+    hook path in, and no shared volume for the two containers to disagree about.
+
+    One behaviour differs from the clone path on purpose. The clone recuts the
+    branch from the base every run, which discards any commit a reviewer pushed
+    to it; the broker continues the branch when the remote already has it. The
+    branch name is a digest of the exact path set (`group_branch_for`), so
+    continuing can never leave a stale file behind — a group whose files changed
+    is a different branch — and the only thing the recut was destroying was
+    somebody's work.
+    """
+    import credential_proxy_client
+
+    changes = {path: snapshot[path] for path in paths}
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=branch
+    ) as workspace:
+        continuing = workspace.started_from == f"origin/{branch}"
+        result = workspace.commit(
+            branch=branch,
+            message=group_commit_subject(audit_id, group),
+            changes=changes,
         )
+        if not result["committed"]:
+            # Nothing to commit means two different things, and reporting the
+            # wrong one either hides a fix that is already up for review or
+            # claims one that was never opened.
+            if not continuing:
+                log(
+                    f"{branch}: the remediation is already present on "
+                    f"{workspace.base}; no pull request opened."
+                )
+                return _GroupPush(workspace.base, False)
+            log(
+                f"{branch}: the branch already carries this fix; its pull "
+                "request is refreshed without a push."
+            )
+            return _GroupPush(workspace.base, True)
+        workspace.push(branch)
+        return _GroupPush(workspace.base, True)
+
+
+def open_remediation_pr(
+    repo: str,
+    audit_id: str,
+    group: list[dict],
+    *,
+    snapshot: dict[str, bytes],
+    root: Path,
+    issue_number: int | None,
+    existing: dict | None,
+    generated_at: datetime,
+) -> str | None:
+    """Land the group's files on their own branch, then open or refresh its PR.
+
+    How the branch gets to the remote depends on the mode; everything after it
+    — the title, the body, the labels — does not, so the pull-request half is
+    written once and both mechanisms feed it.
+    """
+    branch = assert_pushable(group_branch_for(audit_id, group))
+    paths = group_paths(group)
+    landed = (
+        _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot)
+        if content_mode()
+        else _land_group_via_clone(audit_id, group, branch, paths, snapshot, root)
+    )
+    if not landed.proposable:
+        return None
+    base = landed.base
+
+    body = render_remediation_pr_body(
+        audit_id, group, issue_number=issue_number, generated_at=generated_at
     )
     title = remediation_pr_title(audit_id, group)
     highest = next(
         (s for s in SEVERITIES if severity_counts(group)[s]), SEVERITIES[-1]
     )
-    try:
-        if existing and str(existing.get("state", "")).upper() == "OPEN":
-            number = str(existing["number"])
-            gh(
-                [
-                    "pr",
-                    "edit",
-                    number,
-                    "-R",
-                    repo,
-                    "--title",
-                    title,
-                    "--body-file",
-                    body_file,
-                ]
-            )
-            sync_remediation_labels(repo, number, audit_id, highest)
-            return str(existing.get("url") or "")
-        res = gh(
+    if existing and str(existing.get("state", "")).upper() == "OPEN":
+        number = str(existing["number"])
+        gh(
             [
                 "pr",
-                "create",
+                "edit",
+                number,
                 "-R",
                 repo,
-                "--base",
-                base,
-                "--head",
-                branch,
                 "--title",
                 title,
                 "--body-file",
-                body_file,
-                "--label",
-                "agent:audit",
-                "--label",
-                f"audit:{audit_id}",
-                "--label",
-                "audit:remediation",
-                "--label",
-                f"severity:{highest}",
-            ]
+                BODY_STDIN,
+            ],
+            stdin=body,
         )
-    finally:
-        _unlink(body_file)
+        sync_remediation_labels(repo, number, audit_id, highest)
+        return str(existing.get("url") or "")
+    res = gh(
+        [
+            "pr",
+            "create",
+            "-R",
+            repo,
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body-file",
+            BODY_STDIN,
+            "--label",
+            "agent:audit",
+            "--label",
+            f"audit:{audit_id}",
+            "--label",
+            "audit:remediation",
+            "--label",
+            f"severity:{highest}",
+        ],
+        stdin=body,
+    )
 
     lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
     return lines[-1] if lines else None
@@ -10510,8 +10910,32 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
     tree; they are untracked until a remediation branch stages them, so a reset
     on the way into `finish` would delete every fix the audit just wrote and
     then report each one as a file the model forgot to produce.
+
+    In content mode there is no clone: the same leased path is a plain
+    directory the agent writes manifests into, and the repository lives in the
+    broker. Everything downstream that reads this path — the missing-file
+    degradation, the containment check, the snapshot — asks the filesystem
+    rather than git, so they do not care which one they got. Deciding the mode
+    here rather than at each publish site is what keeps a single run from
+    taking both forks.
     """
     import gitops_workspace
+
+    set_content_mode(detect_content_mode())
+    if content_mode():
+        scratch = gitops_workspace.ensure_scratch_workspace(
+            repo,
+            lease=audit_id,
+            root=GITOPS_WORKSPACE,
+            reset=reset,
+            owner=f"fleet-audit:{audit_id}",
+        )
+        # No identity to configure: nothing commits here. The `gh` calls the run
+        # still makes are addressed with `-R owner/name` and do not need a
+        # working tree, but they do need a directory that exists, which is what
+        # this hands the runner.
+        set_workspace(scratch)
+        return scratch
 
     target = gitops_workspace.ensure_workspace(
         repo,
@@ -10535,6 +10959,28 @@ def _workspace_runner(
     covers the clone path like every other subprocess in the skill.
     """
     return run_cmd(cmd, cwd=cwd, check=check)
+
+
+def context_repos() -> list[str]:
+    """The `context_repos` slugs, or an empty list when the key cannot be read.
+
+    Unreadable is not fatal at `start`: the declared-intent step is a
+    pre-report filter over an optional list, and a run that cannot read it
+    searches the GitOps clone alone and reports every unmatched posture as a
+    finding — the same outcome an install with no context repositories gets.
+    The warning is what keeps that from being silent.
+    """
+    import gitops_workspace
+
+    try:
+        return list(gitops_workspace.get_context_github_repos())
+    except Exception as exc:
+        log(
+            "WARNING: could not read context_repos from the gitops-state "
+            f"ConfigMap ({exc}); the declared-intent step searches the GitOps "
+            "clone only this run."
+        )
+        return []
 
 
 def handle_start(args: argparse.Namespace) -> None:
@@ -10613,14 +11059,32 @@ def handle_start(args: argparse.Namespace) -> None:
             {
                 "issue": existing_issue,
                 "repo": repo,
-                # Where this stream's GitOps clone actually is. The agent does
-                # not start in a working tree and cannot guess this — the path
-                # carries a lease segment, and it is private to this audit, so
-                # a manifest written anywhere else is either a file the harness
-                # will never find or a write into another agent's tree.
+                # Which mechanism will publish the fixes. It changes one thing
+                # the agent can see — in `content` mode the workspace is a
+                # scratch directory rather than a checkout, so there is nothing
+                # in it to read the repository out of — and nothing else it
+                # does. Reported rather than inferred: the agent cannot see the
+                # broker's configuration, and guessing from the absence of a
+                # `.git` is the kind of inference that reads a failed clone as
+                # a mode switch.
+                "mode": "content" if content_mode() else "directory",
+                # Where this stream's workspace actually is. The agent does not
+                # start in one and cannot guess this — the path carries a lease
+                # segment, and it is private to this audit, so a manifest
+                # written anywhere else is either a file the harness will never
+                # find or a write into another agent's tree.
                 "workspace": str(root),
                 "findings_path": findings_path,
                 "pending_remediation_requests": pending,
+                # The repositories the SOP's declared-intent step reads —
+                # `context_repos` in the gitops-state ConfigMap, `owner/name`
+                # slugs. Printed here so the worker never runs `kubectl get
+                # configmap` for it, and so the list it searched is the list
+                # the harness read. Read-only by construction: this key is
+                # never merged into `managed_repos`, so nothing here can be
+                # pushed to or swept. The GitOps clone is searched regardless
+                # and is not repeated in this list unless it was registered.
+                "context_repos": context_repos(),
                 # The roster, handed over rather than left to be discovered.
                 #
                 # It is in the SOP, and the SOP is required reading, but "the
@@ -10654,6 +11118,153 @@ def handle_start(args: argparse.Namespace) -> None:
                     "reasons. A check you could have run and did not is not one "
                     "of those; it is a limitations note and a real gap."
                 ),
+            }
+        )
+    )
+
+
+def handle_fetch(args: argparse.Namespace) -> None:
+    """Copy files out of the repository and into the workspace, content mode only.
+
+    The read half. A remediation that rewrites an existing manifest has to start
+    from what the manifest currently says, and in content mode the workspace
+    holds nothing to read it out of — that is what removing the clone costs. So
+    the file comes back the same way the fix goes out: as content, over the
+    broker, with no path crossing between the two containers.
+
+    Directory mode is refused rather than emulated. The file is already in the
+    clone there, and a command that silently did nothing would teach an agent to
+    call it in both modes and believe it had refreshed something.
+    """
+    audit_id = validate_audit_id(args.audit)
+    repo = resolve_repo(audit_id=audit_id)
+    refresh_credentials(repo)
+    root = ensure_workspace(repo, audit_id)
+    if not content_mode():
+        raise ValidationError(
+            f"fetch needs the content-passing broker; this run is in directory "
+            f"mode, where {root} is a clone and the file is already in it"
+        )
+
+    import credential_proxy_client
+
+    # Resolved before anything is read, and against the same rule every
+    # remediation path answers to: `..`, an absolute path, or a symlinked
+    # ancestor is refused here rather than turned into a write somewhere else.
+    # The broker validates the path too, on its own tree; this one is about
+    # where the bytes land locally, which is a question only this side can ask.
+    targets = {path: resolve_inside_repo(root, path, "fetch") for path in args.path}
+
+    written: list[str] = []
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=args.branch
+    ) as workspace:
+        for path, target in targets.items():
+            content = workspace.read(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            written.append(path)
+    print(json.dumps({"workspace": str(root), "files": written}))
+
+
+def handle_list(args: argparse.Namespace) -> None:
+    """Name the files in the broker's checkout, content mode only.
+
+    The other half of the read. `fetch` needs a path, and the rule that a
+    remediation path is discovered rather than invented means the path has to
+    come from the repository — which in directory mode the audit finds by
+    grepping the clone. There is no clone here, so this is where the names come
+    from: a walk of the broker's tree, prefix-narrowed, with anything named
+    `.git` filtered out at every depth so the one directory the agent must not
+    see cannot be listed however it is spelled.
+
+    It answers with names and sizes, not content. Searching inside the files is
+    `grep`, below; this is for narrowing by path when the name is the thing you
+    know. The broker caps how many entries it will return, so a bare listing of
+    a large repository is a truncated one — pass `--prefix`.
+    """
+    audit_id = validate_audit_id(args.audit)
+    repo = resolve_repo(audit_id=audit_id)
+    refresh_credentials(repo)
+    root = ensure_workspace(repo, audit_id)
+    if not content_mode():
+        raise ValidationError(
+            f"list needs the content-passing broker; this run is in directory "
+            f"mode, where {root} is a clone you can read directly"
+        )
+
+    import credential_proxy_client
+
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=args.branch
+    ) as workspace:
+        entries = workspace.list(args.prefix)
+    # `truncated` travels with the entries. A listing that stopped at the
+    # broker's ceiling looks complete otherwise, and the audit's next move is to
+    # read a path — one it saw, or one it inferred from a listing that ended
+    # early without saying so.
+    print(
+        json.dumps(
+            {
+                "repo": repo,
+                "entries": entries,
+                "total": entries.total,
+                "truncated": entries.truncated,
+            }
+        )
+    )
+
+
+def handle_grep(args: argparse.Namespace) -> None:
+    """Search inside the files of the broker's checkout, content mode only.
+
+    The directory-mode audit finds a remediation path by grepping the clone for
+    `namespace: <namespace>`. There is no clone in content mode, and narrowing
+    with `list --prefix` and reading the candidates only works when the path is
+    already most of the answer. This is the search itself: the broker runs it
+    over its own tree and sends back matching lines, so a path can still be
+    discovered from what a file says rather than from what it is called.
+
+    It answers with matches, not files. Confirming a hit is still a `fetch` and
+    a read — a match on `namespace: payments` is kind-blind and can be a label
+    line — so this narrows the candidate set rather than replacing the read.
+
+    Directory mode is refused for the same reason `fetch` and `list` are: the
+    clone is right there, and a command that quietly emulated it would teach an
+    audit to call it in both modes.
+    """
+    audit_id = validate_audit_id(args.audit)
+    repo = resolve_repo(audit_id=audit_id)
+    refresh_credentials(repo)
+    root = ensure_workspace(repo, audit_id)
+    if not content_mode():
+        raise ValidationError(
+            f"grep needs the content-passing broker; this run is in directory "
+            f"mode, where {root} is a clone you can grep directly"
+        )
+
+    import credential_proxy_client
+
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=args.branch
+    ) as workspace:
+        result = workspace.grep(
+            args.pattern,
+            prefix=args.prefix,
+            regex=args.regex,
+            ignore_case=args.ignore_case,
+        )
+    # `truncated` travels with the matches, for the reason it does in `list`: a
+    # search that stopped at the broker's ceiling reads as "these are all the
+    # hits", and "the repository does not declare that namespace" is the
+    # conclusion an audit draws from it.
+    print(
+        json.dumps(
+            {
+                "repo": repo,
+                "matches": result.get("matches", []),
+                "total": result.get("total", 0),
+                "truncated": result.get("truncated", False),
             }
         )
     )
@@ -10720,6 +11331,13 @@ def _handle_finish_dry_run(
             f"DRY RUN: every candidate for check '{group['check']}' on cluster "
             f"'{group['cluster']}' is absent from this document "
             f"({len(group['objects'])} object(s)). {', '.join(group['objects'])}"
+        )
+
+    declared = list(data.get("declared") or [])
+    if declared:
+        log(
+            f"DECLARED: {len(declared)} posture(s) justified by a repository "
+            "declaration and not reported as findings."
         )
 
     if not findings:
@@ -10877,9 +11495,13 @@ def _open_promoted_prs(
     ids: if a critical finding shares its remediation file with a minor one,
     the file fixes both, and the pull request has to say so.
 
-    The working tree is restored to the branch and file contents it started
-    with, so a run that opens pull requests leaves the workspace exactly as a
-    run that opens none.
+    In directory mode the working tree is restored to the branch and file
+    contents it started with, so a run that opens pull requests leaves the
+    workspace exactly as a run that opens none. Content mode has nothing to
+    restore: no branch is switched and no file in the scratch tree is written,
+    because the bytes go to the broker instead. The snapshot is still taken —
+    it is what gets sent — but the checkout, the restore, and the promise the
+    SKILL.md makes about untracked work all belong to the clone.
 
     A group that fails to publish is logged and skipped rather than aborting
     the run. The ledger is already written by this point, and it records the
@@ -10899,7 +11521,7 @@ def _open_promoted_prs(
     if not groups:
         return OpenedPRs([], [])
 
-    started_on = current_branch()
+    started_on = "" if content_mode() else current_branch()
     snapshot = snapshot_paths(root, manifest_paths(findings))
     opened: list[str] = []
     records: list[dict] = []
@@ -10939,7 +11561,11 @@ def _open_promoted_prs(
     finally:
         if started_on and started_on != "HEAD":
             git(["checkout", "--force", started_on], check=False)
-        for path, blob in snapshot.items():
+        # Only the clone needs restoring. Content mode switched no branch, so
+        # nothing overwrote the files the agent wrote, and rewriting them would
+        # be a write into the scratch tree for no reason.
+        restore = {} if content_mode() else snapshot
+        for path, blob in restore.items():
             # Same containment proof as the outbound write, and the same reason
             # — the tree just changed under us again. Logged rather than
             # raised: this is a `finally`, and an exception here would replace
@@ -11269,6 +11895,7 @@ def handle_finish(args: argparse.Namespace) -> None:
             "run as partial."
         )
     findings = list(data["findings"])
+    declared = list(data.get("declared") or [])
     now = datetime.now(timezone.utc)
     # Timing: `inspect_s` is t0 → here (the LLM-inclusive inspection phase),
     # `publish_s` is here → the exit payload, and `collect_s` — present only
@@ -11683,26 +12310,23 @@ def handle_finish(args: argparse.Namespace) -> None:
             rendered = render_issue_body(
                 data, generated_at=now, audit_id=audit_id, gaps=gaps, repo=repo
             )
-            body_file = _write_temp(rendered.body)
-            try:
-                res = gh(
-                    [
-                        "issue",
-                        "create",
-                        "-R",
-                        repo,
-                        "--title",
-                        coverage_issue_title(audit_id, gaps),
-                        "--body-file",
-                        body_file,
-                        "--label",
-                        "agent:audit",
-                        "--label",
-                        f"audit:{audit_id}",
-                    ]
-                )
-            finally:
-                _unlink(body_file)
+            res = gh(
+                [
+                    "issue",
+                    "create",
+                    "-R",
+                    repo,
+                    "--title",
+                    coverage_issue_title(audit_id, gaps),
+                    "--body-file",
+                    BODY_STDIN,
+                    "--label",
+                    "agent:audit",
+                    "--label",
+                    f"audit:{audit_id}",
+                ],
+                stdin=rendered.body,
+            )
             lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
             existing_url = lines[-1] if lines else None
             existing_issue = issue_number_from_url(existing_url)
@@ -11710,6 +12334,16 @@ def handle_finish(args: argparse.Namespace) -> None:
                 f"Audit {audit_id} found nothing and had no ledger, but "
                 f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
                 f"fleet; opened {existing_url or 'a coverage ledger'}."
+            )
+        elif declared:
+            # Nothing to open and nothing to close, but not nothing to say:
+            # the run deferred to a declaration, and with no ledger the only
+            # trace is this line and the count on the JSON line below. The
+            # declaration in the repository is the durable record.
+            log(
+                f"Audit {audit_id} is clean and has no open ledger; "
+                f"{len(declared)} declared posture(s) were not reported as "
+                "findings — the declarations in the repository are the record."
             )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
@@ -11748,6 +12382,12 @@ def handle_finish(args: argparse.Namespace) -> None:
             and delta_known,
             "partial": bool(gaps),
             "coverage_gaps": gaps,
+            # How many postures a declaration kept off the ledger.
+            # Not a silence term: a standing declaration is the same
+            # every morning, and a count that woke the channel daily
+            # would be muted within a week. An on-demand run reports
+            # it because on-demand runs report everything.
+            "declared": len(declared),
             "unpublished_candidates": unpublished,
             "wholly_unpublished_checks": wholly_dropped,
             "uncorroborated_findings": uncorroborated,
@@ -11918,48 +12558,46 @@ def handle_finish(args: argparse.Namespace) -> None:
     # What the published body's hidden block ends up carrying, and so what the
     # store records as this run's memory. The relink edit below can change it.
     published_ids = rendered.rendered_ids
-    body_file = _write_temp(rendered.body)
-    try:
-        if existing_issue is None:
-            res = gh(
-                [
-                    "issue",
-                    "create",
-                    "-R",
-                    repo,
-                    "--title",
-                    title,
-                    "--body-file",
-                    body_file,
-                    "--label",
-                    "agent:audit",
-                    "--label",
-                    f"audit:{audit_id}",
-                ]
-            )
-            status = "OPENED"
-            lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-            issue_url = lines[-1] if lines else None
-            number = issue_number_from_url(issue_url)
-        else:
-            gh(
-                [
-                    "issue",
-                    "edit",
-                    str(existing_issue),
-                    "-R",
-                    repo,
-                    "--title",
-                    title,
-                    "--body-file",
-                    body_file,
-                ]
-            )
-            status = "UPDATED"
-            number = existing_issue
-            issue_url = existing_url or fetch_issue_url(repo, existing_issue)
-    finally:
-        _unlink(body_file)
+    if existing_issue is None:
+        res = gh(
+            [
+                "issue",
+                "create",
+                "-R",
+                repo,
+                "--title",
+                title,
+                "--body-file",
+                BODY_STDIN,
+                "--label",
+                "agent:audit",
+                "--label",
+                f"audit:{audit_id}",
+            ],
+            stdin=rendered.body,
+        )
+        status = "OPENED"
+        lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
+        issue_url = lines[-1] if lines else None
+        number = issue_number_from_url(issue_url)
+    else:
+        gh(
+            [
+                "issue",
+                "edit",
+                str(existing_issue),
+                "-R",
+                repo,
+                "--title",
+                title,
+                "--body-file",
+                BODY_STDIN,
+            ],
+            stdin=rendered.body,
+        )
+        status = "UPDATED"
+        number = existing_issue
+        issue_url = existing_url or fetch_issue_url(repo, existing_issue)
 
     if number is not None:
         apply_severity_label(repo, number, findings)
@@ -12048,14 +12686,11 @@ def handle_finish(args: argparse.Namespace) -> None:
                 needs_triage=plan.needs_triage,
                 repo=repo,
             )
-            relink = _write_temp(relinked.body)
-            try:
-                edit = gh(
-                    ["issue", "edit", str(number), "-R", repo, "--body-file", relink],
-                    check=False,
-                )
-            finally:
-                _unlink(relink)
+            edit = gh(
+                ["issue", "edit", str(number), "-R", repo, "--body-file", BODY_STDIN],
+                stdin=relinked.body,
+                check=False,
+            )
             # Rebound only once the edit lands, so the store's `current_ids`
             # stays exactly the hidden block the ledger ended up carrying. The
             # pull-request links can push a finding over the body budget that
@@ -12169,6 +12804,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # WARNING in the run log.
                 "partial": bool(gaps),
                 "coverage_gaps": gaps,
+                # Same field as the CLEAN branch; see the note there.
+                "declared": len(declared),
                 "unpublished_candidates": unpublished,
                 "wholly_unpublished_checks": wholly_dropped,
                 "uncorroborated_findings": uncorroborated,
@@ -12207,6 +12844,30 @@ def handle_finish(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+
+
+def _add_read_branch_argument(parser: argparse.ArgumentParser) -> None:
+    """`--branch` for the three content-mode reads.
+
+    Without it every read answers from the base branch, and on a second round
+    that is the wrong file: the remediation branch already carries a commit,
+    possibly a reviewer's, and an edit that starts from the base and is
+    committed onto the branch reverts it. The revert fast-forwards, so nothing
+    anywhere objects. Naming the branch is what makes `read`, `list` and `grep`
+    answer with the file as the pull request has it — see Workspace.open in
+    credential_proxy_client.py, which was built for exactly this.
+
+    A branch the remote does not have yet is not an error: the broker falls
+    back to the base, which is what a first round wants anyway.
+    """
+    parser.add_argument(
+        "--branch",
+        default=None,
+        metavar="BRANCH",
+        help="Read from this remediation branch rather than the base. Pass it "
+        "when the fix already has a branch on the remote, or the edit starts "
+        "from the base and the commit reverts what is on the branch.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -12279,6 +12940,61 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Copy repository files into the workspace so a fix can edit them "
+        "(content mode only).",
+    )
+    fetch_parser.add_argument("--audit", required=True, help="Audit id.")
+    fetch_parser.add_argument(
+        "--path",
+        required=True,
+        action="append",
+        metavar="REPO_PATH",
+        help="Repository-relative path to copy in; repeat for more than one.",
+    )
+    _add_read_branch_argument(fetch_parser)
+
+    list_parser = subparsers.add_parser(
+        "list",
+        help="Name the files in the broker's checkout, so a remediation path can be "
+        "discovered rather than invented (content mode only).",
+    )
+    list_parser.add_argument("--audit", required=True, help="Audit id.")
+    list_parser.add_argument(
+        "--prefix",
+        default=None,
+        metavar="REPO_PATH",
+        help="Restrict the listing to this directory. The broker caps the "
+        "number of entries it returns, so a large repository needs one.",
+    )
+    _add_read_branch_argument(list_parser)
+
+    grep_parser = subparsers.add_parser(
+        "grep",
+        help="Search inside the files of the broker's checkout, so a remediation "
+        "path can be discovered from what a file says (content mode only).",
+    )
+    grep_parser.add_argument("--audit", required=True, help="Audit id.")
+    grep_parser.add_argument(
+        "--pattern",
+        required=True,
+        help="What to search for. A fixed string unless --regex.",
+    )
+    grep_parser.add_argument(
+        "--prefix",
+        default=None,
+        metavar="REPO_PATH",
+        help="Restrict the search to this directory.",
+    )
+    grep_parser.add_argument(
+        "--regex", action="store_true", help="Treat --pattern as a regular expression."
+    )
+    grep_parser.add_argument(
+        "--ignore-case", action="store_true", help="Match without regard to case."
+    )
+    _add_read_branch_argument(grep_parser)
+
     remediate_parser = subparsers.add_parser(
         "remediate",
         help="Open a remediation pull request for named findings (uncapped).",
@@ -12329,6 +13045,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.subcommand == "start":
                 handle_start(args)
+            elif args.subcommand == "fetch":
+                handle_fetch(args)
+            elif args.subcommand == "list":
+                handle_list(args)
+            elif args.subcommand == "grep":
+                handle_grep(args)
             elif args.subcommand == "remediate":
                 handle_remediate(args)
             else:

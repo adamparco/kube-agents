@@ -1,4 +1,7 @@
+import re
+import shlex
 import unittest
+from pathlib import Path
 
 from command_policy import (
     evaluate,
@@ -6,6 +9,20 @@ from command_policy import (
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
+
+# The gcp-config-connector skill is prompt material that spells out the
+# commands the model runs verbatim, and it promises to stay read-only. Both
+# halves are checked below against the policy itself: a fenced command the
+# policy refuses would present at runtime as a skill that stops halfway
+# through Step 2, and no other test in the tree would notice.
+CONFIG_CONNECTOR_SKILL_DIR = (
+    Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
+)
+FENCED_SHELL_BLOCK = re.compile(r"^```(?:bash|sh|shell)\n(.*?)^```", re.MULTILINE | re.DOTALL)
+GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
+# Fewer fenced commands than this means the parser or the path went stale
+# and the allowed-commands test would pass by finding nothing.
+MIN_FENCED_COMMANDS = 8
 
 
 def _gcloud_words(argv):
@@ -1185,22 +1202,69 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         # spellings.
         for argv, desc in (
             (["gcloud", "compute", "networks", "list", "--project=p",
-              "--format=json"], "SOP:60 VPC inventory"),
+              "--format=json"], "SOP:66 VPC inventory"),
             (["gcloud", "compute", "networks", "subnets", "list",
-              "--format=json"], "SOP:26 subnet inventory"),
+              "--format=json"], "SOP:31 subnet inventory"),
             (["gcloud", "compute", "networks", "subnets", "list-usable",
-              "--project=p", "--format=json"], "SOP:38 usable ranges"),
+              "--project=p", "--format=json"], "SOP:43 usable ranges"),
             (["gcloud", "compute", "networks", "subnets", "describe",
-              "gke-pods-subnet", "--region=us-central1"], "SOP:164 subnet detail"),
+              "gke-pods-subnet", "--region=us-central1"], "SOP:170 subnet detail"),
+            (["gcloud", "compute", "routers", "list", "--project=p",
+              "--format=json"], "SOP:50 router discovery"),
             (["gcloud", "compute", "routers", "get-nat-mapping-info", "r",
-              "--region=us-central1", "--project=p"], "SOP:45 NAT mappings"),
+              "--region=us-central1", "--project=p"], "SOP:51 NAT mappings"),
             (["gcloud", "compute", "security-policies", "list", "--project=p",
-              "--format=json"], "SOP:68 Cloud Armor inventory"),
+              "--format=json"], "SOP:74 Cloud Armor inventory"),
             (["gcloud", "compute", "project-info", "describe"],
-             "stockout SOP:199 quota remediation read"),
+             "stockout SOP:204 quota remediation read"),
         ):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_a_leaf_read_ships_with_the_discovery_read_that_binds_its_argument(self):
+        # The allowlist was derived from SOP command spellings, and a SOP
+        # spelling arrives with its arguments already bound: check 2.2 reads
+        # `get-nat-mapping-info $ROUTER`, so that verb was listed and `routers
+        # list` -- the only way to learn a router's name -- was not. The check
+        # never ran on a live install, and the model retried the refusal seven
+        # times in five minutes (#1126). The SOP now spells the discovery step,
+        # but the rule outlives the SOP text: do not remove a discovery read
+        # here because no SOP line contains it. `--regions` is the flag
+        # `routers list` scopes by; an entry whose flags are not in the arity
+        # table is refused as unreadable before the entry is consulted.
+        for argv, desc in (
+            (["gcloud", "compute", "routers", "list", "--regions=us-central1",
+              "--project=p", "--format=json"], "routers list by region"),
+            (["gcloud", "compute", "routers", "describe", "r",
+              "--region=us-central1", "--project=p"], "router NAT config"),
+            (["gcloud", "compute", "routers", "get-nat-mapping-info", "r",
+              "--region=us-central1", "--project=p"], "the leaf read"),
+            (["gcloud", "compute", "networks", "describe", "n", "--project=p"],
+             "network detail behind networks list"),
+            # Not SOP reads: refused on the live install in #1126 during a
+            # networking investigation, granted as read-only inventory.
+            (["gcloud", "compute", "firewall-rules", "list",
+              "--filter=network:default", "--project=p"], "firewall inventory"),
+            (["gcloud", "compute", "firewall-rules", "describe", "f",
+              "--project=p"], "firewall rule detail"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_a_verb_gcloud_does_not_have_is_not_granted_by_a_neighbour(self):
+        # Two spellings the model guessed on the live install (#1126) are not
+        # gcloud commands at all: `routers list-usable` borrows the subnets
+        # verb, and `compute firewalls` is not a group in the SDK. Neither
+        # is listed, and neither may be reached through the prefix scan from
+        # an entry that is.
+        for argv, desc in (
+            (["gcloud", "compute", "routers", "list-usable", "--project=p"],
+             "routers list-usable"),
+            (["gcloud", "compute", "firewalls", "list", "--project=p"],
+             "firewalls list"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
 
     def test_the_stockout_sop_spellings_reach_their_allowlist_entries(self):
         # The capacity-history and machine-types entries were added for this
@@ -1409,8 +1473,16 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
              "subnets expand-ip-range"),
             (["gcloud", "compute", "project-info", "add-metadata",
               "--metadata=k=v"], "project-info add-metadata"),
+            (["gcloud", "compute", "networks", "update", "n"], "networks update"),
             (["gcloud", "compute", "routers", "create", "r"], "routers create"),
             (["gcloud", "compute", "routers", "update", "r"], "routers update"),
+            (["gcloud", "compute", "routers", "delete", "r"], "routers delete"),
+            (["gcloud", "compute", "firewall-rules", "create", "f"],
+             "firewall-rules create"),
+            (["gcloud", "compute", "firewall-rules", "update", "f"],
+             "firewall-rules update"),
+            (["gcloud", "compute", "firewall-rules", "delete", "f"],
+             "firewall-rules delete"),
             (["gcloud", "compute", "security-policies", "create", "p"],
              "security-policies create"),
             (["gcloud", "billing", "budgets", "create", "--billing-account=A"],
@@ -1549,6 +1621,66 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
+    """agents/platform/skills/gcp-config-connector authors KCC manifests for a
+    pull request and validates them read-only. Every kubectl and gcloud
+    command its fenced blocks spell must be one the policy allows, and the
+    validation it tells the model to leave to reviewers must be one the
+    policy refuses -- otherwise the skill's own text would coach the model
+    into a refusal, or the refusal it relies on would not exist.
+    """
+
+    @staticmethod
+    def _fenced_commands():
+        commands = []
+        for path in sorted(CONFIG_CONNECTOR_SKILL_DIR.rglob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            for block in FENCED_SHELL_BLOCK.findall(text):
+                for line in block.replace("\\\n", " ").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    argv = shlex.split(line)
+                    if argv and argv[0] in GOVERNED_TOOLS:
+                        commands.append((path.name, argv))
+        return commands
+
+    def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
+        commands = self._fenced_commands()
+        self.assertGreaterEqual(
+            len(commands), MIN_FENCED_COMMANDS,
+            f"found {len(commands)} governed commands under "
+            f"{CONFIG_CONNECTOR_SKILL_DIR}; the skill moved or the fence parser is stale",
+        )
+        for name, argv in commands:
+            with self.subTest(file=name, command=" ".join(argv)):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+
+    def test_the_validation_the_skill_defers_to_reviewers_is_refused(self):
+        # SKILL.md Step 4 says server-side dry-run, apply and diff are the
+        # reviewer's step because the policy refuses them, and its SQL
+        # reference says `gcloud sql instances describe` is not a read the
+        # model has. Each of those claims is asserted here so the skill text
+        # cannot drift away from the policy it describes.
+        for argv, desc in (
+            (["kubectl", "apply", "--dry-run=server", "-f", "nodepool.yaml"],
+             "server-side dry-run"),
+            (["kubectl", "apply", "-f", "nodepool.yaml"], "apply"),
+            (["kubectl", "create", "-f", "nodepool.yaml"], "create"),
+            (["kubectl", "diff", "-f", "nodepool.yaml"], "diff"),
+            (["gcloud", "sql", "instances", "describe", "orders-db", "--project=p"],
+             "the sql read the skill says it lacks"),
+            (["gcloud", "container", "node-pools", "update", "default-pool",
+              "--cluster=c", "--location=us-central1"], "node-pools update"),
+            (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
+              "--project=p"], "firewall-rules update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
 
 if __name__ == "__main__":
     unittest.main()
