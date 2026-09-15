@@ -1,0 +1,35 @@
+---
+name: gce-compute-fleet-audit
+description: Audits standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, and orphaned disk snapshots.
+---
+
+# Task
+
+Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial console boot failures, sole-tenant node group headroom, and orphaned disk snapshots, emitting findings for the `fleet-audit` reporting harness.
+
+# Workflow
+
+## 1. Execute Compute Inspection
+
+Run the profile-relative compute fleet collector to sweep target projects. It writes a collector manifest to stdout:
+
+```bash
+python3 ./skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py > /opt/data/scratch/manifest_gce-compute-fleet-audit.json
+```
+
+## 2. Evaluate Findings Against SOP Checks
+
+Read the manifest and follow `governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `limitations` and `candidates`:
+
+All four roster checks are collector-verified; none is yours to hand-run.
+
+- `gce-startup-script-status`: serial console boot failures and startup script errors.
+- `mig-convergence-stalled`: MIGs creating and deleting at once, or unable to create at all.
+- `sole-tenant-headroom`: node group reservations at capacity with no failover host spare.
+- `orphaned-snapshots`: Persistent Disk snapshots of deleted disks older than 90 days.
+
+`ops-agent-guest-health` is not on the roster — SOP §2.3 says why, and `finish` rejects any mention of it.
+
+## 3. Hand Findings to Fleet Audit
+
+Emit findings using the `fleet-audit` harness lifecycle (`start` ... `finish`), passing `--manifest-file` to `finish` as the SOP's §5 directs. `finish` refuses to run without it.

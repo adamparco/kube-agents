@@ -28,11 +28,7 @@ _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 _NIGHTLY = _WORKFLOWS / "nightly-pipeline.yml"
 _COMMON_SH = _REPO_ROOT / "scripts" / "release" / "common.sh"
 
-_STAGING_REDEPLOYS = (
-    "staging-redeploy-agent.yml",
-    "staging-redeploy-controller.yml",
-    "staging-redeploy-integrations.yml",
-)
+_STAGING_DEPLOY = "staging-deploy.yml"
 
 
 def _doc(path: pathlib.Path) -> dict:
@@ -44,22 +40,22 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         self.doc = _doc(_NIGHTLY)
         self.jobs = self.doc["jobs"]
 
-    def test_it_lands_without_a_schedule(self):
-        """Dispatch-only until it has been exercised by hand.
-
-        A cron here would point an untested pipeline at a GCP project on the
-        night it merges. Turning the schedule on is its own reviewable change;
-        delete this test in that change.
-        """
-        self.assertNotIn("schedule", self.doc[True])
-        self.assertIn("workflow_dispatch", self.doc[True])
-
-    def test_every_called_workflow_targets_the_nightly_environment(self):
+    def test_every_called_workflow_targets_the_environment_it_is_named_for(self):
+        """Everything that touches the NIGHTLY cluster has to say `nightly`."""
         called = {name: job for name, job in self.jobs.items() if "uses" in job}
         self.assertTrue(called, "the pipeline is supposed to call reusable workflows")
         for name, job in called.items():
             with self.subTest(job=name):
-                self.assertEqual(job["with"]["github_environment"], "nightly")
+                self.assertEqual(
+                    job["with"]["github_environment"], "nightly"
+                )
+
+    def test_the_promotion_runs_only_after_a_green_matrix(self):
+        """A red matrix promotes nothing and leaves staging where it is."""
+        job = self.jobs["step-4-create-staging-tag"]
+        self.assertIn("step-3-run-e2e-matrix", job["needs"])
+        self.assertIn("step-1-resolve-candidate", job["needs"])
+        self.assertNotIn("always()", job.get("if", ""))
 
     def test_the_resolve_job_binds_the_nightly_environment(self):
         """It reads vars.REGISTRY_PREFIX; unbound, that resolves to empty in silence."""
@@ -72,8 +68,8 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         "skipped" and lose the summary line saying why. The condition sits on the
         steps so the run records the decision it made.
         """
-        job = self.jobs["step-4-promote-to-staging"]
-        self.assertNotIn("skip_promotion", job["if"])
+        job = self.jobs["step-4-create-staging-tag"]
+        self.assertNotIn("skip_promotion", job.get("if", ""))
         step_conditions = [step.get("if", "") for step in job["steps"]]
         self.assertTrue(
             any("skip_promotion" in cond for cond in step_conditions),
@@ -84,8 +80,8 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         """Otherwise a failed tag push strands a GKE cluster with nothing to diagnose.
 
         A skipped or failed job skips its dependents. Step 4 runs only after a
-        green matrix and fails only on credential problems — a missing
-        RELEASE_BOT_TOKEN, a rejected push — none of which leave anything on the
+        green matrix and fails only on credential problems — an invalid
+        release bot key or ID, a rejected push — none of which leave anything on the
         cluster worth looking at. The RC pipeline can afford the same dependency
         because its next scheduled run reclaims the environment within three
         hours; this pipeline has no schedule, so nothing would remove it at all.
@@ -101,7 +97,7 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         teardown = self.jobs["step-5-teardown-env"]
         self.assertNotIn(
             "always()",
-            teardown["if"],
+            teardown.get("if", ""),
             "always() removes the implicit success() and destroys the environments "
             "a failed run leaves standing for diagnosis",
         )
@@ -109,12 +105,22 @@ class NightlyPipelineWiringTest(unittest.TestCase):
 
     def test_the_promotion_tag_is_pushed_with_the_release_bot_token(self):
         """A tag pushed with GITHUB_TOKEN triggers no workflow, so staging never deploys."""
+        steps = self.jobs["step-4-create-staging-tag"]["steps"]
+        token_step = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+        )
+        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+        self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
+        self.assertEqual(token_step["with"].get("permission-contents"), "write")
+        self.assertEqual(token_step["with"].get("permission-workflows"), "write")
         checkout = next(
             step
-            for step in self.jobs["step-4-promote-to-staging"]["steps"]
+            for step in steps
             if str(step.get("uses", "")).startswith("actions/checkout@")
         )
-        self.assertIn("RELEASE_BOT_TOKEN", checkout["with"]["token"])
+        self.assertIn(token_step.get("id", "release-token"), checkout["with"]["token"])
 
 
 class ConcurrencyGroupTest(unittest.TestCase):
@@ -148,15 +154,13 @@ class StagingTagContractTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout.strip()
 
-    def test_the_derived_tag_matches_every_staging_redeploy_trigger(self):
+    def test_the_derived_tag_matches_staging_deploy_trigger(self):
         tag = self._derived_tag()
-        for workflow in _STAGING_REDEPLOYS:
-            with self.subTest(workflow=workflow):
-                patterns = _doc(_WORKFLOWS / workflow)[True]["push"]["tags"]
-                self.assertTrue(
-                    any(fnmatch.fnmatch(tag, pattern) for pattern in patterns),
-                    f"{tag!r} matches none of {patterns!r}",
-                )
+        patterns = _doc(_WORKFLOWS / _STAGING_DEPLOY)[True]["push"]["tags"]
+        self.assertTrue(
+            any(fnmatch.fnmatch(tag, pattern) for pattern in patterns),
+            f"{tag!r} matches none of {patterns!r}",
+        )
 
     def test_the_promotion_tag_is_annotated(self):
         """Which is what makes the peel below necessary rather than defensive.
@@ -182,29 +186,164 @@ class StagingTagContractTest(unittest.TestCase):
             "tag",
         )
 
-    def test_no_staging_redeploy_passes_the_raw_push_sha_to_the_deploy(self):
-        """An annotated tag's ref resolves to the tag object, not to the commit.
+    def test_staging_deploy_peels_tag_to_commit(self):
+        """An annotated tag's ref resolves to the tag object, not to the commit."""
+        doc = _doc(_WORKFLOWS / _STAGING_DEPLOY)
+        jobs = doc["jobs"]
+        resolve = jobs["resolve-commit"]
+        self.assertTrue(
+            any("resolve_deploy.sh" in step.get("run", "") and step.get("env", {}).get("TARGET_ENVIRONMENT") == "staging" for step in resolve["steps"]),
+            "resolve-commit is supposed to call resolve_deploy.sh with TARGET_ENVIRONMENT: staging",
+        )
+        self.assertEqual(jobs["deploy"]["needs"], "resolve-commit")
+        image_tag = jobs["deploy"]["with"].get("image_tag")
+        self.assertNotIn("github.sha", str(image_tag))
+        self.assertIn("resolve-commit", str(image_tag))
 
-        github.sha is the new value of the pushed ref, so on these triggers it is
-        that tag object's SHA. It reaches `helm upgrade --set …image.tag`, and
-        GHCR images are published under commit SHAs, so the unpeeled value names
-        an image that was never built.
-        """
-        for workflow in _STAGING_REDEPLOYS:
-            with self.subTest(workflow=workflow):
-                jobs = _doc(_WORKFLOWS / workflow)["jobs"]
-                resolve = jobs["resolve-commit"]
-                self.assertTrue(
-                    any("peel_tag_commit.sh" in step.get("run", "") for step in resolve["steps"]),
-                    "resolve-commit is supposed to peel the tag",
-                )
-                self.assertEqual(jobs["call-deploy"]["needs"], "resolve-commit")
-                for key in ("image_tag", "checkout_sha"):
-                    value = jobs["call-deploy"]["with"].get(key)
-                    if value is None:
-                        continue
-                    self.assertNotIn("github.sha", value, f"{key} must use the peeled commit")
-                    self.assertIn("resolve-commit", value, f"{key} must use the peeled commit")
+    def test_staging_deploy_calls_reconcile_environment_for_staging(self):
+        doc = _doc(_WORKFLOWS / _STAGING_DEPLOY)
+        deploy_job = doc["jobs"]["deploy"]
+        self.assertIn("reconcile-environment.yml", deploy_job["uses"])
+        self.assertEqual(deploy_job["with"]["github_environment"], "staging")
+        self.assertEqual(deploy_job["with"]["mode"], "apply")
+
+    def test_staging_deploy_verifies_candidate_images(self):
+        doc = _doc(_WORKFLOWS / _STAGING_DEPLOY)
+        steps = doc["jobs"]["resolve-commit"]["steps"]
+        self.assertTrue(
+            any("verify_candidate_images.sh" in step.get("run", "") for step in steps),
+            "resolve-commit must verify candidate images in GHCR",
+        )
+
+    def test_staging_deploy_workflow_dispatch_defaults_lease_policy_to_fail(self):
+        doc = _doc(_WORKFLOWS / _STAGING_DEPLOY)
+        inputs = doc[True]["workflow_dispatch"]["inputs"]
+        self.assertEqual(inputs["lease_policy"]["default"], "fail")
+
+    def test_staging_deploy_has_verify_deploy_job_asserting_applied(self):
+        doc = _doc(_WORKFLOWS / _STAGING_DEPLOY)
+        self.assertIn("verify-deploy", doc["jobs"])
+        verify = doc["jobs"]["verify-deploy"]
+        self.assertEqual(set(verify["needs"]), {"resolve-commit", "deploy"})
+        steps = verify["steps"]
+        self.assertTrue(
+            any("verify_deploy_result.sh" in s.get("run", "") for s in steps),
+            "verify-deploy must invoke verify_deploy_result.sh",
+        )
+
+    def test_the_resolve_job_binds_the_staging_environment(self):
+        """It reads vars.REGISTRY_PREFIX; unbound, that resolves to empty in silence."""
+        doc = _doc(_WORKFLOWS / _STAGING_DEPLOY)
+        self.assertEqual(doc["jobs"]["resolve-commit"].get("environment"), "staging")
+
+
+_AUTOPUSH_DEPLOY = "autopush-deploy.yml"
+
+
+class AutopushDeployWiringTest(unittest.TestCase):
+    def setUp(self):
+        self.doc = _doc(_WORKFLOWS / _AUTOPUSH_DEPLOY)
+        self.jobs = self.doc["jobs"]
+
+    def test_the_resolve_job_binds_the_autopush_environment(self):
+        """It reads vars.REGISTRY_PREFIX; unbound, that resolves to empty in silence."""
+        self.assertEqual(self.jobs["resolve-candidate"].get("environment"), "autopush")
+
+    def test_triggers_include_workflow_run_and_dispatch(self):
+        on = self.doc[True]
+        self.assertNotIn("schedule", on, "autopush deploy must not run on cron")
+        self.assertIn("workflow_run", on)
+        self.assertEqual(on["workflow_run"]["workflows"], ["Publish Images to GHCR"])
+        self.assertIn("workflow_dispatch", on)
+
+    def test_concurrency_group_locks_autopush_deploy_without_cancelling(self):
+        concurrency = self.doc.get("concurrency", {})
+        self.assertEqual(concurrency.get("group"), "autopush-deploy")
+        self.assertFalse(concurrency.get("cancel-in-progress"), "running deploys must not be cancelled mid-flight")
+
+    def test_upstream_repository_guard_present(self):
+        resolve = self.jobs["resolve-candidate"]
+        self.assertIn("github.repository == 'gke-labs/kube-agents'", resolve.get("if", ""))
+        self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", resolve.get("if", ""))
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", resolve.get("if", ""))
+
+    def test_resolve_candidate_calls_script(self):
+        resolve = self.jobs["resolve-candidate"]
+        steps = resolve["steps"]
+        self.assertTrue(
+            any("resolve_deploy.sh" in step.get("run", "") and step.get("env", {}).get("TARGET_ENVIRONMENT") == "autopush" for step in steps),
+            "resolve-candidate must use resolve_deploy.sh with TARGET_ENVIRONMENT: autopush",
+        )
+
+    def test_resolve_candidate_verifies_candidate_images(self):
+        resolve = self.jobs["resolve-candidate"]
+        steps = resolve["steps"]
+        self.assertTrue(
+            any("verify_candidate_images.sh" in step.get("run", "") for step in steps),
+            "resolve-candidate must verify candidate images in GHCR",
+        )
+
+    def test_autopush_deploy_workflow_dispatch_defaults_lease_policy_to_fail(self):
+        inputs = self.doc[True]["workflow_dispatch"]["inputs"]
+        self.assertEqual(inputs["lease_policy"]["default"], "fail")
+
+    def test_autopush_deploy_has_verify_deploy_job_asserting_applied(self):
+        self.assertIn("verify-deploy", self.jobs)
+        verify = self.jobs["verify-deploy"]
+        self.assertEqual(set(verify["needs"]), {"resolve-candidate", "deploy"})
+        steps = verify["steps"]
+        self.assertTrue(
+            any("verify_deploy_result.sh" in s.get("run", "") for s in steps),
+            "verify-deploy must invoke verify_deploy_result.sh",
+        )
+
+    def test_deploy_job_calls_reconcile_environment_for_autopush(self):
+        deploy = self.jobs["deploy"]
+        self.assertEqual(deploy["needs"], "resolve-candidate")
+        self.assertIn("reconcile-environment.yml", deploy["uses"])
+        self.assertEqual(deploy["with"]["github_environment"], "autopush")
+        self.assertEqual(deploy["with"]["mode"], "apply")
+        self.assertIn("needs.resolve-candidate.outputs.commit_sha", deploy["with"]["image_tag"])
+        self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
+
+
+class DockerPublishGhcrWiringTest(unittest.TestCase):
+    def setUp(self):
+        self.doc = _doc(_WORKFLOWS / "docker-publish-ghcr.yml")
+        self.jobs = self.doc["jobs"]
+
+    def test_single_workflow_builds_all_required_images(self):
+        self.assertIn("publish-operator", self.jobs)
+        self.assertIn("publish-agents", self.jobs)
+        self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
+
+
+class ReleaseBotTokenWiringTest(unittest.TestCase):
+    """Every workflow that mints a token for RELEASE_BOT_APP_ID must request both
+    contents: write (for creating refs/tags) and workflows: write (to prevent GH013
+    rejections when the tagged commit has workflow diffs relative to main)."""
+
+    def test_every_release_bot_token_mint_requests_workflows_write(self):
+        workflows = [
+            "nightly-pipeline.yml",
+            "release-publish.yml",
+            "rc-create-tag.yml",
+            "rc-tag-validated.yml",
+        ]
+        for name in workflows:
+            with self.subTest(workflow=name):
+                doc = _doc(_WORKFLOWS / name)
+                token_steps = [
+                    step
+                    for job in (doc.get("jobs") or {}).values()
+                    for step in (job.get("steps") or [])
+                    if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+                    and "RELEASE_BOT_APP_ID" in str(step.get("with", {}).get("app-id", ""))
+                ]
+                self.assertTrue(token_steps, f"expected at least one release bot token step in {name}")
+                for step in token_steps:
+                    self.assertEqual(step["with"].get("permission-contents"), "write")
+                    self.assertEqual(step["with"].get("permission-workflows"), "write")
 
 
 if __name__ == "__main__":

@@ -65,6 +65,14 @@ from session_kv_server import clean_workload_name, clean_reason_label, clean_eve
 API_KEY = "test-session-kv-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 
+# Every variable `enabled_chat_platforms` consults when no config file settles
+# the question. Tests that care which platforms are enabled clear these first,
+# so the answer comes from the test rather than from whatever the machine
+# running the suite happens to export.
+PLATFORM_SIGNAL_KEYS = tuple(
+    key for keys in session_kv_server._CHAT_ENV_SIGNALS.values() for key in keys
+)
+
 class TestSessionKvServerUtils(unittest.TestCase):
 
     def test_clean_workload_name_pod_replicas(self):
@@ -853,6 +861,15 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/incidents/recent?chat_id=c", None),
         ("GET", "/v1/alert-quota", None),
         ("POST", "/v1/cron-reports", {"job_id": "j", "report": "r"}),
+        ("POST", "/v1/findings", {"findings": []}),
+        ("GET", "/v1/findings/ranked", None),
+        ("GET", "/v1/findings", None),
+        ("POST", "/v1/findings/f-1/surfaced", {}),
+        ("PATCH", "/v1/findings/f-1", {"state": "accepted"}),
+        ("POST", "/v1/findings/f-1/verified", {"outcome": "resolved"}),
+        ("POST", "/v1/findings/expire-snoozes", None),
+        ("GET", "/v1/findings/publication/backlog", None),
+        ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
     )
 
     def setUp(self):
@@ -870,9 +887,10 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # ValueError, get caught by the 502 handler, and this suite would still
         # pass because it only asserts the status is not 401/403/503. So the
         # arity here is what keeps the authenticated case exercising a healthy
-        # relay rather than the exception path.
+        # relay rather than the exception path. `degraded` is the reason string,
+        # so the healthy value is empty.
         self._relay = patch.object(
-            session_kv_server, "relay_cron_report", return_value=(None, False, [])
+            session_kv_server, "relay_cron_report", return_value=(None, "", [])
         )
         self._relay.start()
 
@@ -884,7 +902,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
     def _call(self, method, path, body, headers=None):
         if method == "GET":
             return self.client.get(path, headers=headers or {})
-        return self.client.post(path, json=body, headers=headers or {})
+        return getattr(self.client, method.lower())(path, json=body, headers=headers or {})
 
     def test_declared_routes_are_all_covered(self):
         """Fails when a route is added without deciding whether it needs a key."""
@@ -892,10 +910,16 @@ class TestSessionKvServerAuth(unittest.TestCase):
             (method, route.path)
             for route in session_kv_server.app.routes
             for method in getattr(route, "methods", set()) or set()
-            if method in ("GET", "POST")
+            if method in ("GET", "POST", "PATCH", "PUT")
         }
         covered = {
-            (method, path.split("?")[0].replace("sess-1", "{session_id}"))
+            (
+                method,
+                path.split("?")[0]
+                .replace("sess-1", "{session_id}")
+                .replace("f-1", "{finding_id}")
+                .replace("publication/backlog", "publication/{publisher}"),
+            )
             for method, path, _ in self.PROTECTED_ROUTES
         } | {("GET", "/healthz")}
         self.assertEqual(declared, covered)
@@ -1073,6 +1097,77 @@ class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
         session_kv_server._register_session_routing(
             "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
         self.assertEqual(self._read()["origin"], "k8s-watcher")
+
+    def test_two_platforms_answering_at_once_both_keep_their_route(self):
+        """`platform_threads` is read-modify-written, and both writers are one run.
+
+        A relayed cron report calls this once per enabled platform for one
+        session id, so the two calls race by design rather than by accident.
+        Under sqlite3's implicit deferred transaction nothing is locked until
+        the UPDATE, so both read `platform_threads` before either wrote it back
+        and the second commit dropped the first's entry -- a row naming one
+        platform when two answered, which stays invisible until a leg that
+        failed once stays unthreaded for the rest of the day.
+
+        Deterministic rather than timing-hopeful: the slack writer is released
+        the instant the google_chat writer has read the row, which is exactly
+        the interleaving that loses an entry. The sleep is the *window*, not
+        the synchronisation -- it holds the transaction open long enough for
+        the other thread to reach its own read, so a slow machine makes this
+        test more reliable rather than less.
+        """
+        import threading
+
+        google_chat_has_read = threading.Event()
+        real_loads = session_kv_server.json.loads
+
+        def loads_then_let_the_other_writer_in(*args, **kwargs):
+            parsed = real_loads(*args, **kwargs)
+            if threading.current_thread().name == "google-chat-writer":
+                google_chat_has_read.set()
+                time.sleep(0.4)
+            return parsed
+
+        def write_google_chat():
+            session_kv_server._register_session_routing(
+                "k8s-evt-abc123", "google_chat", "spaces/AAQA123/threads/xYz")
+
+        def write_slack():
+            google_chat_has_read.wait(timeout=5)
+            session_kv_server._register_session_routing(
+                "k8s-evt-abc123", "slack", "1712345678.000100")
+
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        threads = [
+            threading.Thread(target=write_google_chat, name="google-chat-writer"),
+            threading.Thread(target=write_slack, name="slack-writer"),
+        ]
+        with patch.object(session_kv_server.json, "loads", loads_then_let_the_other_writer_in):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+        self.assertFalse(any(t.is_alive() for t in threads), "a writer never finished")
+
+        row = self._read()
+        threads = row.get("platform_threads") or {}
+        self.assertEqual(
+            sorted(threads),
+            ["google_chat", "slack"],
+            "a concurrent writer's thread was overwritten",
+        )
+        self.assertEqual(threads["slack"]["chat_id"], "C0123456789")
+        self.assertEqual(threads["google_chat"]["thread_id"], "spaces/AAQA123/threads/xYz")
+        # The flat keys hold ONE address and the last writer sets it, which
+        # here is slack -- the google_chat writer holds the write lock until it
+        # commits, so the ordering is the test's rather than the scheduler's.
+        # Which platform ends up owning them is decided in `relay_cron_report`,
+        # which registers the owner last; what matters here is that the row
+        # stays internally consistent rather than describing a thread nothing
+        # recorded.
+        self.assertEqual(row["platform"], "slack")
+        self.assertEqual(row["thread_id"], threads["slack"]["thread_id"])
+        self.assertEqual(row["chat_id"], threads["slack"]["chat_id"])
 
 
 class TestActivePlatformFallback(unittest.TestCase):
@@ -2161,14 +2256,24 @@ class TestCronReportRelay(unittest.TestCase):
 
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        # An ambient signal on whatever machine runs the suite must not decide
+        # what these cases resolve to: every case that reaches the relay patches
+        # `enabled_chat_platforms`, and one that inherited a stray
+        # GOOGLE_CHAT_RELAY_URL instead would fan the sends out and break the
+        # call-count assertions for a reason nothing in the test names. So clear
+        # the signals first, then set the one this class needs.
+        #
         # Slack's chat_id comes from SLACK_HOME_CHANNEL (`_register_session_routing`),
         # and without one `_send_to_chat` cannot thread a Slack reply at all --
         # which is #1094's autopush install, not a properly configured one. The
         # fan-out tests below are about a dual-platform install that works, so
         # they get the home channel autopush is missing.
-        env = patch.dict(os.environ, {"SLACK_HOME_CHANNEL": "C0123456789"})
+        env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS:
+            os.environ.pop(key, None)
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
         # The temp database is shared across this file; a stale routing row for
         # a derived session id would make the second test see the first's thread.
         with sqlite3.connect(temp_db_path) as conn:
@@ -2294,6 +2399,11 @@ class TestCronReportRelay(unittest.TestCase):
             ok = self.client.post("/v1/cron-reports", json={"job_id": "j9", "report": "x"})
 
         self.assertEqual(ok.json()["relay"], "ok")
+        # The healthy answer carries an empty detail rather than omitting it, so
+        # a caller can read the field unconditionally.
+        self.assertEqual(ok.json()["relay_detail"], "")
+        self.assertIn("Chat Agent turn", degraded.json()["relay_detail"])
+        self.assertIn("[unrelayed]", degraded.json()["relay_detail"])
 
     def test_a_send_failure_is_answered_as_a_failure(self):
         """The invariant `deliver` exists to protect: a broken watchdog is audible.
@@ -2754,6 +2864,381 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertEqual(json.loads(blob).get("title"), "Deploy verification")
 
 
+class TestRelayReachesEveryEnabledPlatform(unittest.TestCase):
+    """One report, one thread in each channel the operator actually reads.
+
+    The bug: `relay_cron_report` posted to `get_active_platform()` alone, so on
+    an install with both wired up the eight governance audits went to Slack and
+    Google Chat never saw one -- while the run recorded a clean delivery and the
+    log recorded a successful send, because from the relay's point of view one
+    had happened.
+    """
+
+    SLACK_THREAD = "1712345678.000100"
+    GCHAT_THREAD = "spaces/AAA/threads/T1"
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS:
+            os.environ.pop(key, None)
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        os.environ["GOOGLE_CHAT_RELAY_URL"] = "http://127.0.0.1:8765"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        # Unlike the classes above, this one does NOT patch
+        # `enabled_chat_platforms` -- the point of `test_a_single_platform_..`
+        # below is that the route really consults it. Both config layers
+        # outrank the environment, so they have to be pointed at nothing or a
+        # `/etc/hermes/config.yaml` on the machine running the suite decides
+        # what these cases resolve to.
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            patcher = patch.object(
+                session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM session_metadata")
+                conn.execute("DELETE FROM incidents")
+
+    def _threads(self, *failing):
+        """A `_send_to_chat` that answers with the thread of whichever platform
+        it was handed, so a send addressed to the wrong one is visible.
+
+        Platforms named in `failing` return None, which is what
+        `_send_to_chat` does on a non-zero `hermes send`, unparseable stdout, or
+        an empty message id.
+        """
+        answers = {"slack": self.SLACK_THREAD, "google_chat": self.GCHAT_THREAD}
+        for platform in failing:
+            answers[platform] = None
+        return lambda platform, message, chat_id="", thread_id="": answers.get(platform)
+
+    def _post(self, send, job_id="fan-out", report="raw finding"):
+        with patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": job_id, "profile": "platform", "report": report},
+            )
+        return response, sender
+
+    def _meta(self):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            (blob,) = conn.execute(
+                "SELECT metadata FROM session_metadata").fetchone()
+        return json.loads(blob)
+
+    def test_both_channels_get_the_report(self):
+        response, sender = self._post(self._threads())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["relay"], "ok")
+        self.assertEqual(
+            [call.args[0] for call in sender.call_args_list],
+            ["google_chat", "slack"],
+        )
+        # The same composed message, not a summary for one and the raw report
+        # for the other.
+        self.assertEqual({call.args[1] for call in sender.call_args_list}, {"composed"})
+
+    def test_each_platform_keeps_its_own_thread(self):
+        """A Slack timestamp handed to Google Chat resolves nothing.
+
+        Both sends share one session id, so a single stored thread would have
+        the second report reply into the first platform's thread -- which is not
+        a degraded delivery but a refused one.
+        """
+        self._post(self._threads(), job_id="threading")
+        _, sender = self._post(self._threads(), job_id="threading", report="second")
+
+        by_platform = {call.args[0]: call.args[2:] for call in sender.call_args_list}
+        self.assertEqual(by_platform["slack"], ("C0123456789", self.SLACK_THREAD))
+        self.assertEqual(by_platform["google_chat"], ("spaces/AAA", self.GCHAT_THREAD))
+
+    def test_the_flat_keys_still_describe_exactly_one_owner(self):
+        """`kanban_event_routing.py` reads them to address a card, which has one
+        destination. Two entries in `platform_threads` must not make that field
+        a lie -- the relay registers the owner LAST so the last write wins on
+        purpose rather than by whichever leg happened to finish second."""
+        self._post(self._threads())
+        meta = self._meta()
+        self.assertEqual(meta["platform"], "google_chat")
+        self.assertEqual(meta["thread_id"], self.GCHAT_THREAD)
+        self.assertEqual(meta["chat_id"], "spaces/AAA")
+        self.assertEqual(
+            meta["platform_threads"],
+            {
+                "slack": {"chat_id": "C0123456789", "thread_id": self.SLACK_THREAD},
+                "google_chat": {"chat_id": "spaces/AAA", "thread_id": self.GCHAT_THREAD},
+            },
+        )
+
+    def test_a_reply_in_either_thread_finds_the_report(self):
+        """`incidents` is keyed on (chat_id, thread_id), so one row per thread.
+
+        With a single row, a follow-up question asked in the channel that did not
+        get the primary reaches an agent that has never seen the finding.
+        """
+        import sqlite3
+
+        self._post(self._threads())
+        with sqlite3.connect(temp_db_path) as conn:
+            rows = conn.execute(
+                "SELECT chat_id, thread_id, report FROM incidents ORDER BY chat_id").fetchall()
+        self.assertEqual(
+            [(r[0], r[1]) for r in rows],
+            [("C0123456789", self.SLACK_THREAD), ("spaces/AAA", self.GCHAT_THREAD)],
+        )
+        self.assertEqual({r[2] for r in rows}, {"composed"})
+
+    def test_one_leg_failing_still_delivers_and_names_the_leg(self):
+        """The report is in a channel, so this is not a failed run -- but a
+        Google Chat send that has been broken all week must not read as clean."""
+        import sqlite3
+
+        response, sender = self._post(self._threads('google_chat'))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["undelivered"], "google_chat")
+        self.assertEqual(len(sender.call_args_list), 2, "the failure must not abort the loop")
+        with sqlite3.connect(temp_db_path) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0], 1)
+
+    def test_a_failed_leg_says_which_leg_and_does_not_claim_a_failed_turn(self):
+        """A bare `degraded` sent the reader looking for the wrong thing.
+
+        Both consumers of the verdict printed one hardcoded sentence — "the Chat
+        Agent turn failed, so the channel has the raw text marked [unrelayed]".
+        Here the turn succeeded and Slack has a properly composed report; what is
+        wrong is that Google Chat has nothing. An operator handed that sentence
+        greps two channels for a marker neither of them contains and never learns
+        which one is missing the report.
+
+        The two facts are carried by two fields, each single-purpose:
+        `relay_detail` is the CAUSE and is empty when the turn was fine, and
+        `undelivered` is the platform names. Folding the names into the prose as
+        well made both consumers print the same fact twice.
+        """
+        body = self._post(self._threads('google_chat'))[0].json()
+        self.assertEqual(body["undelivered"], "google_chat")
+        # The turn succeeded, so nothing may suggest it did not -- and the name
+        # of the missing leg is not repeated here.
+        self.assertEqual(body["relay_detail"], "")
+        self.assertEqual(body["relay"], "ok")
+
+    def test_the_surviving_leg_becomes_the_owner(self):
+        """Google Chat leads the fan-out order, but a card cannot be addressed
+        to a thread that was never opened."""
+        self._post(self._threads('google_chat'))
+        meta = self._meta()
+        self.assertEqual(meta["platform"], "slack")
+        self.assertEqual(meta["thread_id"], self.SLACK_THREAD)
+        self.assertNotIn("google_chat", meta["platform_threads"])
+
+    def test_every_leg_failing_is_a_failure(self):
+        response, _ = self._post(self._threads('slack', 'google_chat'))
+        self.assertEqual(response.status_code, 502)
+        detail = response.json()["detail"]
+        self.assertIn("not delivered", detail)
+        # Both are named, because the string becomes last_delivery_error and
+        # "not delivered" without a platform sends nobody anywhere.
+        self.assertIn("slack", detail)
+        self.assertIn("google_chat", detail)
+
+    def test_a_single_platform_install_sends_once(self):
+        """The control. Without it every assertion above passes on a fan-out
+        that ignores the environment and always posts twice."""
+        os.environ.pop("SLACK_RELAY_URL")
+        os.environ.pop("SLACK_HOME_CHANNEL")
+        _, sender = self._post(self._threads())
+        self.assertEqual([call.args[0] for call in sender.call_args_list], ["google_chat"])
+
+
+class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
+    """`deliver: "all"` posts the raw report itself; the relay must not repeat it.
+
+    A forward hazard the fan-out introduces, not an observed bug. Before the
+    fan-out there was no collision to see: the relay went to
+    `get_active_platform()` alone, which was Slack, while `all` resolved to
+    Google Chat, so each channel got exactly one copy. The live install's
+    incident store bears that out -- every row it holds is the Slack DM, and no
+    report has ever reached Google Chat through the relay. Making the relay
+    reach both platforms is what would put two copies in the one the scheduler
+    was already handling. Two probes on 2026-08-30, one down each path, showed
+    both paths are live and reach the same client; they carried distinct labels,
+    so they demonstrated the collision was possible, not that it had happened.
+
+    The set is computed in the cron child and sent on the request, not worked out
+    here. `all` expands over the platforms with a home channel *in that child*,
+    and this process has the full pod environment -- so deciding locally would
+    subtract a leg the scheduler never sent.
+
+    Which is the sharp edge these tests exist to hold: the subtraction is only
+    ever allowed to remove a strict subset. A duplicate is a nuisance and a
+    missed audit is not, so every path out of here sends to at least one
+    platform.
+    """
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS:
+            os.environ.pop(key, None)
+        # A home channel each, which is what makes this a dual-platform install
+        # here: with no config file to read, `enabled_chat_platforms` falls
+        # through to the environment signals, and the home channel is one of
+        # them. It is also what the class docstring assumes when it says `all`
+        # expands over the platforms with a home channel.
+        os.environ["SLACK_HOME_CHANNEL"] = "C0123456789"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        # Both config layers outrank the environment, so point them at nothing
+        # rather than let a config on the machine running the suite decide how
+        # wide the fan-out is before the subtraction even happens.
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            patcher = patch.object(
+                session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM session_metadata")
+                conn.execute("DELETE FROM incidents")
+
+    def _post(self, also_delivered_to=None, job_id="dedup"):
+        payload = {"job_id": job_id, "profile": "platform", "report": "a finding"}
+        if also_delivered_to is not None:
+            payload["also_delivered_to"] = also_delivered_to
+        with patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed") as turn, \
+             patch.object(
+                 session_kv_server, "_send_to_chat", side_effect=lambda p, *a, **k: f"t-{p}"
+             ) as sender:
+            response = self.client.post("/v1/cron-reports", json=payload)
+        return response, sender, turn
+
+    def _sent_to(self, sender):
+        return [call.args[0] for call in sender.call_args_list]
+
+    def test_a_platform_the_scheduler_handled_is_not_sent_to_again(self):
+        response, sender, _ = self._post(["google_chat"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._sent_to(sender), ["slack"])
+
+    def test_covering_every_platform_relays_anyway_rather_than_send_nothing(self):
+        """The one case where the subtraction must be refused outright.
+
+        `also_delivered_to` is a claim about what the scheduler *will* post,
+        assembled from which home channels resolve in the cron child -- and a
+        channel that resolves can still fail on the send, as Slack's direct leg
+        did on the live install (`rc=1`, no home channel). Honouring a set that
+        covers everything would put the operator one failed send away from
+        silence, so the floor holds and both platforms get the composed report.
+        """
+        response, sender, _ = self._post(["slack", "google_chat"])
+        self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["relay"], "ok")
+
+    def test_no_sibling_set_can_reduce_the_fan_out_to_nothing(self):
+        """The invariant behind the case above, stated over every subset."""
+        from itertools import chain, combinations
+
+        enabled = ["google_chat", "slack"]
+        every_subset = chain.from_iterable(
+            combinations(enabled + ["telegram"], n) for n in range(4)
+        )
+        for handled in every_subset:
+            with self.subTest(also_delivered_to=handled):
+                _, sender, _ = self._post(list(handled))
+                self.assertTrue(
+                    self._sent_to(sender),
+                    f"{handled} left the report with nowhere to go",
+                )
+
+    def test_an_older_relay_plugin_omits_the_field_and_still_fans_out(self):
+        """The field only ever removes targets, so a missing one cannot lose a
+        delivery -- it restores exactly the behaviour that shipped before it."""
+        _, sender, _ = self._post(None)
+        self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
+
+    def test_a_platform_that_is_not_enabled_here_suppresses_nothing(self):
+        _, sender, _ = self._post(["telegram", "discord"])
+        self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
+
+    def test_an_unenabled_platform_is_logged_as_that_and_not_as_full_coverage(self):
+        """Two different things leave the fan-out at its full width, and the log
+        collapsed them into the more reassuring one.
+
+        `handled` covering every enabled platform is the floor holding; `handled`
+        naming only platforms this install does not run is a deliver value that
+        posts nowhere. Both leave `platforms == all_targets`, so the second was
+        reported as "claims every platform (telegram)" -- a sentence that names
+        the symptom of the interesting case and asserts the boring one.
+        """
+        with self.assertLogs("session_kv_server", level="INFO") as captured:
+            self._post(["telegram"])
+        line = next(m for m in captured.output if "deliver value" in m)
+        self.assertIn("none of which this install has enabled", line)
+        self.assertIn("telegram", line)
+        self.assertNotIn("claims every platform", line)
+
+    def test_covering_every_platform_still_logs_that_it_is_the_floor_holding(self):
+        with self.assertLogs("session_kv_server", level="INFO") as captured:
+            self._post(["slack", "google_chat"])
+        line = next(m for m in captured.output if "deliver value" in m)
+        self.assertIn("claims every platform", line)
+
+    def test_a_partial_sibling_set_logs_the_skip_and_neither_other_line(self):
+        with self.assertLogs("session_kv_server", level="INFO") as captured:
+            self._post(["google_chat"])
+        joined = "\n".join(captured.output)
+        self.assertIn("skipping google_chat", joined)
+        self.assertNotIn("claims every platform", joined)
+        self.assertNotIn("none of which this install has enabled", joined)
+
+    def test_names_are_matched_the_way_the_registry_spells_them(self):
+        _, sender, _ = self._post(["  Google_Chat  "])
+        self.assertEqual(self._sent_to(sender), ["slack"])
+
+    def test_junk_is_dropped_rather_than_scrubbed_into_a_real_name(self):
+        """A scrub that turned "goo gle chat" into a platform name would suppress
+        a delivery on the strength of a typo."""
+        _, sender, _ = self._post(["", "  ", "slack:C123", "../slack", 7, None])
+        self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
+
+    def test_a_non_list_is_ignored(self):
+        _, sender, _ = self._post("google_chat")
+        self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
+
+    def test_the_live_shape_keeps_the_only_leg_that_reaches_slack(self):
+        """The install this was found on: `config.yaml` carries no Slack
+        `home_channel`, so the cron child cannot address Slack and `all`
+        resolves to Google Chat alone. The relay leg is the only thing that
+        reaches Slack, and subtracting it would leave that channel silent.
+        """
+        _, sender, _ = self._post(["google_chat"])
+        self.assertIn("slack", self._sent_to(sender))
+
+
 class TestCronReportLabelSanitisation(unittest.TestCase):
     """`job_id`, `profile` and `title` are caller-supplied, not server-written.
 
@@ -2989,6 +3474,216 @@ class TestRecentReportsIndex(unittest.TestCase):
         self.assertEqual(report["thread_id"], "T-watcher")
         self.assertEqual(report["job_id"], "")
         self.assertEqual(report["profile"], "")
+
+
+class TestFindingsQueueApi(unittest.TestCase):
+    """The eight /v1/findings routes. The rules they enforce are pinned in
+    test_findings_queue.py; these tests are about the HTTP surface."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM findings")
+                conn.execute("DELETE FROM queue_publications")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _finding(self, **overrides):
+        finding = {
+            "source": "inventory",
+            "check": "probes-readiness",
+            "project": "acme-prod",
+            "cluster": "prod-eu",
+            "namespace": "payments",
+            "object": "Deployment/checkout",
+            "title": "No readinessProbe on a 3-replica serving Deployment",
+            "detail": "no readinessProbe on any container",
+            "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+            "recommendation": {"action": "Add one", "rationale": "Rollouts shift traffic early", "risk": "Tight probes restart healthy pods"},
+            "remediation": {"kind": "manifest", "path": "apps/checkout.yaml", "note": "Add the probe"},
+            "verification": {"kind": "kubectl", "command": "kubectl get deploy checkout -o json", "still_failing_when": "no probe"},
+        }
+        finding.update(overrides)
+        return finding
+
+    def _register(self, *findings, scope=None):
+        response = self.client.post("/v1/findings", json={"findings": list(findings), "scope": scope})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_expire_snoozes_route_reports_the_count(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        self.client.patch(
+            f"/v1/findings/{fid}", json={"state": "snoozed", "snoozed_until": "2000-01-01"}
+        )
+        self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+        response = self.client.post("/v1/findings/expire-snoozes")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"expired": 1})
+        ranked = self.client.get("/v1/findings/ranked").json()["findings"]
+        self.assertEqual([f["id"] for f in ranked], [fid])
+
+    def test_register_then_rank(self):
+        self._register(self._finding())
+        findings = self.client.get("/v1/findings/ranked").json()["findings"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["rank_score"], 90)
+        self.assertEqual(findings[0]["severity"], "major")
+        self.assertEqual(findings[0]["state"], "queued")
+
+    def test_a_bad_rubric_is_a_400_not_a_500(self):
+        response = self.client.post(
+            "/v1/findings",
+            json={"findings": [self._finding(rubric={"B": 4, "L": 6, "detect": 2, "recover": 2, "C": 1.0})]},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("B", response.json()["detail"])
+
+    def test_the_lifecycle_over_http(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+
+        surfaced = self.client.post(f"/v1/findings/{fid}/surfaced", json={"chat_id": "spaces/AAA"})
+        self.assertEqual(surfaced.json()["surface_count"], 1)
+
+        accepted = self.client.patch(f"/v1/findings/{fid}", json={"state": "accepted"})
+        self.assertEqual(accepted.json()["state"], "accepted")
+
+        verified = self.client.post(f"/v1/findings/{fid}/verified", json={"outcome": "resolved", "observed": "probe present"})
+        self.assertEqual(verified.json()["state"], "resolved")
+        self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_unknown_findings_are_404(self):
+        self.assertEqual(self.client.post("/v1/findings/nope/surfaced", json={}).status_code, 404)
+        self.assertEqual(self.client.patch("/v1/findings/nope", json={"state": "accepted"}).status_code, 404)
+        self.assertEqual(
+            self.client.post("/v1/findings/nope/verified", json={"outcome": "resolved"}).status_code, 404
+        )
+
+    def test_two_writers_registering_the_same_finding_do_not_collide(self):
+        # The event watcher (Go) and the agent are both first-class writers, so
+        # a check-then-act INSERT under a deferred transaction is the designed
+        # concurrency here, not an edge case.
+        import sqlite3
+        import threading
+
+        from fastapi.testclient import TestClient
+
+        barrier = threading.Barrier(2)
+        codes = []
+
+        def register():
+            client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+            barrier.wait()
+            codes.append(client.post("/v1/findings", json={"findings": [self._finding()]}).status_code)
+
+        threads = [threading.Thread(target=register) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sorted(codes), [200, 200], "a concurrent registration was rejected")
+        self.assertEqual(len(self.client.get("/v1/findings/ranked").json()["findings"]), 1)
+
+    def test_a_broken_stored_rubric_is_not_reported_as_a_missing_finding(self):
+        # A bare KeyError anywhere in the call tree used to surface as
+        # "no finding 'L'", telling the agent to drop a row that is right there.
+        import sqlite3
+
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute('UPDATE findings SET rubric = \'{"B": 3}\' WHERE id = ?', (fid,))
+
+        response = self.client.post(
+            f"/v1/findings/{fid}/verified",
+            json={
+                "outcome": "still_failing",
+                "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+            },
+        )
+
+        self.assertNotEqual(response.status_code, 404, response.text)
+
+    def test_a_rejected_value_is_not_echoed_back_whole(self):
+        payload = "A" * 20000
+        responses = (
+            self.client.post(
+                "/v1/findings",
+                json={
+                    "findings": [
+                        self._finding(rubric={"B": payload, "L": 6, "detect": 3, "recover": 2, "C": 1.0})
+                    ]
+                },
+            ),
+            self.client.get("/v1/findings", params={"state": payload}),
+            self.client.put(f"/v1/findings/publication/{payload}", json={"target_kind": "chat"}),
+        )
+        for response in responses:
+            self.assertEqual(response.status_code, 400, response.text[:200])
+            detail = response.json()["detail"]
+            self.assertLess(len(detail), 300, detail[:200])
+            self.assertNotIn(payload, detail)
+
+    def test_list_filters_pass_through(self):
+        self._register(
+            self._finding(),
+            self._finding(cluster="prod-us", object="Deployment/ledger"),
+        )
+        self.assertEqual(len(self.client.get("/v1/findings?cluster=prod-eu").json()["findings"]), 1)
+        self.assertEqual(len(self.client.get("/v1/findings?severity=major").json()["findings"]), 2)
+        self.assertEqual(len(self.client.get("/v1/findings?project=acme-prod").json()["findings"]), 2)
+        self.assertEqual(len(self.client.get("/v1/findings?project=acme-staging").json()["findings"]), 0)
+        self.assertEqual(self.client.get("/v1/findings?state=pending").status_code, 400)
+
+    def test_publication_round_trip(self):
+        self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 404)
+        put = self.client.put(
+            "/v1/findings/publication/backlog",
+            json={"target_kind": "github-issue", "target_ref": "https://example.invalid/i/1", "content_hash": "abc"},
+        )
+        self.assertEqual(put.status_code, 200, put.text)
+        self.assertEqual(
+            self.client.get("/v1/findings/publication/backlog").json()["content_hash"], "abc"
+        )
+
+    def test_the_backlog_has_no_ttl(self):
+        """`cleanup_old_records` must not treat a finding as an expiring record.
+
+        Every other table in this database ages out at CLEANUP_TTL_DAYS. A
+        backlog item that did the same would be silently re-created by the next
+        sweep, and a `dismissed` one would come back as if nobody had answered.
+        """
+        import sqlite3
+
+        self._register(self._finding())
+        self.client.put(
+            "/v1/findings/publication/backlog",
+            json={"target_kind": "github-issue", "target_ref": "https://example.invalid/i/1"},
+        )
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                aged = f"-{session_kv_server.CLEANUP_TTL_DAYS * 3} days"
+                conn.execute(
+                    "UPDATE findings SET first_seen = datetime('now', ?), last_verified = datetime('now', ?)",
+                    (aged, aged),
+                )
+                conn.execute("UPDATE queue_publications SET last_published = datetime('now', ?)", (aged,))
+                session_kv_server.cleanup_old_records(conn)
+
+        self.assertEqual(len(self.client.get("/v1/findings/ranked").json()["findings"]), 1)
+        self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 200)
 
 
 if __name__ == "__main__":

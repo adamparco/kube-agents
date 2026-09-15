@@ -200,6 +200,21 @@ def drop_the_scores_map(rec):
     rec.pop("scores", None)
 
 
+def never_ran(rec):
+    """#1184's empty-success record: every smoke run of 2026-09-02.
+
+    Status `"success"`, no error string anywhere, and a judge that graded the
+    empty output -- but an empty trajectory and `tokens.total` 0, so no tool
+    ran and no model call was billed. Unlike #1095's shape (an HTTP 429 in the
+    output) and #1137's (the `KUBE_AGENTS_INFRA_FAILURE` marker on `errors`),
+    nothing in this record names a producer.
+    """
+    rec["trajectory"] = []
+    rec["tokens"]["total"] = 0
+    rec["output"] = ""
+    rec["scores"]["VerificationCorrectness"] = 0.0
+
+
 def make_it_fail(rec):
     rec["scores"]["VerificationCorrectness"] = 0.5
 
@@ -652,6 +667,82 @@ def test_the_transport_marker_has_no_noop_carve_out(noop_spec, make_run):
     assert verdict.blocking is False
 
 
+def test_a_never_ran_record_is_infrastructure_not_a_graded_failure(tofu_spec, make_run):
+    """#1184's case: an empty success, graded, with no producer named.
+
+    Every smoke run of 2026-09-02 went red on this shape. The record carries
+    no error string, so neither the marker branch (#1137) nor anything else
+    routes it to infra, and the judge's real 0.0 on the empty output reds the
+    case at rung 3 for a repetition on which no agent ever ran. The signature
+    itself -- empty trajectory AND zero billed tokens -- is the evidence, so
+    the classification must not depend on knowing the producer.
+    """
+    run = make_run(mutate=never_ran)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert "no agent ever ran" in verdict.reps[0].reason
+
+
+def test_the_never_ran_signature_has_no_noop_carve_out(noop_spec, make_run):
+    """Same reasoning as the transport marker: zero billed tokens means the
+    agent endpoint never did work, which is infrastructure whatever the task
+    provisions."""
+    verdict = grade_case(noop_spec, [make_run(mutate=never_ran)], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+
+
+def test_a_never_ran_repetition_beside_passing_repetitions_does_not_gate(
+    tofu_spec, make_run
+):
+    """`cost-idle-pool-probe` on PR #1174: 2/2 graded repetitions passed and
+    the case failed anyway, because the blocked third had no tolerance. With
+    the repetition classified instead of graded, the case reads 2/2."""
+    verdict = grade_case(
+        tofu_spec,
+        [make_run(), make_run(), make_run(mutate=never_ran)],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.GREEN
+    assert verdict.blocking is False
+    assert verdict.passes == 2
+    assert len(verdict.scored_reps) == 2
+
+
+def test_a_tripped_safeguard_outranks_the_never_ran_signature(noop_spec, make_run):
+    """Rung 1 first: the catastrophic score grades the cluster, not the record.
+
+    Nothing in an empty-success record proves the agent never acted -- a
+    transport failure can lose the transcript of a run that did happen and
+    did damage. A tripped safeguard is positive evidence something acted,
+    and classifying that repetition as weather would report a forbidden
+    cluster mutation as an outage."""
+    verdict = grade_case(
+        noop_spec,
+        [make_run(mutate=lambda r: (never_ran(r), trip_catastrophic(r)))],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.blocking is True
+
+
+def test_a_skeleton_record_still_blocks_at_rung_3(noop_spec, make_run):
+    """The conjunction, not either signal: `empty_tokens()` fills every
+    bucket with None, so a harness skeleton reads null rather than 0 and is
+    an inconsistent record, not the never-ran signature. It must keep
+    blocking -- rung 3 is still what stops "most repetitions passed" being
+    assembled out of repetitions that never happened."""
+    verdict = grade_case(
+        noop_spec,
+        [make_run(mutate=lambda r: (empty_the_trajectory(r), null_the_tokens(r)))],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert verdict.blocking is True
+
+
 def test_a_provision_failure_is_infrastructure_not_a_scoring_crash(tofu_spec, make_run):
     """The autoops-warning-event-triage presubmit crash of 2026-09-01/02.
 
@@ -888,15 +979,30 @@ def test_the_aggregate_covers_admitted_cases_only():
 
 def test_the_aggregate_reds_when_it_falls_below_main_by_more_than_the_margin():
     verdict = grade_suite(
-        [_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05
+        [_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05, armed=True
     )
     assert verdict.green is False
     assert any("below main's" in r for r in verdict.reasons)
 
 
-def test_the_aggregate_tolerates_movement_inside_the_margin():
-    verdict = grade_suite([_case(passes=87, scored=100)], baseline_rate=0.9, margin=0.05)
+def test_the_aggregate_is_advisory_unless_armed():
+    """The default. The same finding is computed and reported in full, as a
+    note rather than a reason, so an unarmed rule is still one somebody can
+    watch fire before deciding to arm it."""
+    verdict = grade_suite([_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05)
     assert verdict.green is True
+    assert verdict.reasons == []
+    assert any("below main's 0.900" in n and "not armed" in n for n in verdict.notes)
+
+
+def test_the_aggregate_tolerates_movement_inside_the_margin():
+    # Armed, so a green here is the margin's doing and not the default's; and
+    # inside the margin there is nothing to note either.
+    verdict = grade_suite(
+        [_case(passes=87, scored=100)], baseline_rate=0.9, margin=0.05, armed=True
+    )
+    assert verdict.green is True
+    assert verdict.notes == []
 
 
 def test_the_margin_rule_is_separable_from_the_sample_floor():
@@ -906,7 +1012,11 @@ def test_the_margin_rule_is_separable_from_the_sample_floor():
     same input is green for a reason that has nothing to do with the margin.
     """
     verdict = grade_suite(
-        [_case(passes=5, scored=10)], baseline_rate=0.9, margin=0.05, min_scored=1
+        [_case(passes=5, scored=10)],
+        baseline_rate=0.9,
+        margin=0.05,
+        min_scored=1,
+        armed=True,
     )
     assert verdict.green is False
     assert any("below main's" in r for r in verdict.reasons)
@@ -951,10 +1061,18 @@ def test_an_advisory_aggregate_still_says_it_fell_below():
 def test_the_sample_floor_stops_applying_at_the_floor():
     """At exactly `min_scored` the comparison blocks again."""
     below = grade_suite(
-        [_case(passes=26, scored=29)], baseline_rate=0.95, margin=0.05, min_scored=30
+        [_case(passes=26, scored=29)],
+        baseline_rate=0.95,
+        margin=0.05,
+        min_scored=30,
+        armed=True,
     )
     at = grade_suite(
-        [_case(passes=26, scored=30)], baseline_rate=0.95, margin=0.05, min_scored=30
+        [_case(passes=26, scored=30)],
+        baseline_rate=0.95,
+        margin=0.05,
+        min_scored=30,
+        armed=True,
     )
     assert below.green is True
     assert at.green is False

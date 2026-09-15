@@ -268,6 +268,13 @@ done
 # Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
 # `gcloud builds submit` as substitutions, so Cloud Build does the push and the
 # GKE nodes do the pull. This account touches the registry at no point.
+#
+# One role is here by derivation rather than by measurement: `iam.roleAdmin`.
+# The kube-agents-iam module defines a custom role, and `projectIamAdmin` --
+# which is what a runner used to get -- carries no `iam.roles.*` permission, so
+# terraform apply fails PERMISSION_DENIED on a project provisioned without it.
+# A pool project provisioned before that role existed therefore needs a re-run
+# of this script, which is what verify_ci_pool_project.py reports.
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow runner access to ${PROJECT_ID}..."
 for role in \
@@ -275,6 +282,7 @@ for role in \
   roles/cloudbuild.builds.viewer \
   roles/container.admin \
   roles/container.developer \
+  roles/iam.roleAdmin \
   roles/iam.serviceAccountAdmin \
   roles/iam.serviceAccountUser \
   roles/logging.logWriter \
@@ -419,11 +427,20 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # -input=false, so a missing one is a hard "No value for required variable"
     # rather than a prompt. api_server_key is generated the same way
     # hack/ci-deploy.sh generates it when unset (openssl rand -hex 16).
+    # model_provider drives more than the chart: at "vertex_ai" the
+    # composition's litellm_vertex_iam module creates the gateway's own
+    # kubeagents-litellm-gsa, its roles/aiplatform.user grant, and the
+    # Workload Identity binding hack/ci-deploy.sh's per-lease helm upgrade
+    # relies on. The eval installs moved off the GEMINI_API_KEY path after
+    # its fixed paid-tier-3 quota redded every smoke run on 2026-09-02
+    # (#1097; diagnosis on #1184). verify_ci_pool_project.py checks the
+    # binding, so a project provisioned before this line reports the gap.
     cat > "${TFVARS}" <<EOF
 project_id     = "${PROJECT_ID}"
 cluster_name   = "${HOST_CLUSTER_NAME}"
 location       = "${REGION}"
 api_server_key = "$(openssl rand -hex 16)"
+model_provider = "vertex_ai"
 EOF
 
     KUBE_AGENTS_STATE_BUCKET="${STATE_BUCKET}" \
@@ -441,11 +458,9 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     tofu init -reconfigure \
       -backend-config="bucket=${STATE_BUCKET}" \
       -backend-config="prefix=seeded-fleet"
-    # fleet_reader_token_creators is left at its empty default: the member is the
-    # Prow runner identity, and hack/fleet-kubeconfigs.sh only uses the reader
-    # account when FLEET_READONLY_SA is exported (see bench/tf/fleet/README.md,
-    # "A read-only credential for evaluations"). Until then the binding grants
-    # nothing that gets used, and seeded-fleet-reader sits unimpersonated.
+    # fleet_reader_token_creators defaults to the Prow runner, so this apply also
+    # grants it impersonation on seeded-fleet-reader. Do not pass it with -var;
+    # variables.tf says why every apply has to carry the same value.
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else

@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import time
 from typing import List, Optional, Tuple
 
 import pytest
@@ -14,7 +15,26 @@ _AUDIT_REPORT_SCRIPT = (
     _REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
 )
 
-# All 7 Registered Audit Streams and their human titles
+_POD_WAIT_TIMEOUT_SECONDS = 120
+_POD_POLL_INTERVAL_SECONDS = 5
+
+# Where the refresh client lives inside the pod the probe execs into. Both pod
+# layouts bake it into the image at /opt/defaults/scripts and their entrypoints
+# copy it onto the data volume at /opt/data/scripts on every start; the volume
+# copy is preferred because that is the one the agent itself runs. No wider
+# search: a copy found elsewhere (a GitOps clone under the data volume, say)
+# would let the probe pass on an image that lost its own.
+_REFRESH_SCRIPT_NAME = "github_token_refresh.py"
+_REFRESH_SCRIPT_CANDIDATES = (
+    f"/opt/data/scripts/{_REFRESH_SCRIPT_NAME}",
+    f"/opt/defaults/scripts/{_REFRESH_SCRIPT_NAME}",
+)
+_REFRESH_CONFIRMATION = "Refreshed GitHub credentials via"
+# The exec budget covers the refresh (its client waits up to 60s on the proxy)
+# plus the gh call, with room for a slow broker.
+_PROBE_TIMEOUT_SECONDS = 180
+
+# All Registered Audit Streams and their human titles
 AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("compliance-audit", "Security & RBAC Posture Audit"),
     ("security-patch-orchestrator", "Upgrade & Patch Readiness Audit"),
@@ -23,6 +43,8 @@ AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("fleet-consistency-drift", "Fleet Consistency Drift Audit"),
     ("ai-security-audit", "AI Workload Security Audit"),
     ("stockout-prevention", "Fleet Stockout Prevention & Capacity Audit"),
+    ("gcp-networking-fabric-audit", "GCP Networking Fabric & VPC IPAM Audit"),
+    ("gce-compute-fleet-audit", "GCE Compute Engine and MIG Fleet Audit"),
 ]
 
 
@@ -33,33 +55,28 @@ def test_github_token_minting_and_connectivity(
 ) -> None:
     """Verifies live in-cluster GitHub authentication, token minting, and repository reachability.
 
-    Executes a genuinely 100% read-only probe inside the platform-agent pod:
-    1. Triggers token refresh via the Envoy credential proxy sidecar and GitHub Token Minter (Cloud KMS).
+    Executes a genuinely 100% read-only probe inside the agent's shell sandbox pod, or the
+    legacy gateway pod on an install that has no sandbox:
+    1. Triggers token refresh through the credential proxy and GitHub Token Minter (Cloud KMS).
     2. Executes `gh api repos/<target_repo>` from the shared workspace root.
     3. Verifies repository access and permissions over the network.
     Does NOT invoke `audit_report.py start`, preventing workspace reset, lease scrubbing, or label writes.
+
+    Step 1 is the only thing that mints on a fresh install: nothing at startup writes the
+    proxy's gh credentials, so a probe that skips it passes or fails on whether some earlier
+    task happened to mint. The probe therefore fails when the refresh client cannot be found
+    or the refresh fails, instead of falling through to `gh`.
     """
     if not gke_cluster_name or not github_repo:
         pytest.fail("GKE cluster name and GITHUB_REPO are required for live GitHub connectivity probe.")
 
-    # Find running platform-agent pod
-    proc_pod = subprocess.run(
-        [
-            "kubectl",
-            "get",
-            "pod",
-            "-n",
-            agent_namespace,
-            "-l",
-            "kubeagents.x-k8s.io/has-credential-proxy=true",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if proc_pod.returncode != 0 or not proc_pod.stdout.strip():
+    # 1. Wait for running shell sandbox pod (StatefulSet app=<name>-shell, container: shell)
+    deadline = time.time() + _POD_WAIT_TIMEOUT_SECONDS
+    pod_name = ""
+    container_name = "shell"
+    agent_name = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
+
+    while time.time() < deadline:
         proc_pod = subprocess.run(
             [
                 "kubectl",
@@ -68,7 +85,7 @@ def test_github_token_minting_and_connectivity(
                 "-n",
                 agent_namespace,
                 "-l",
-                "app=platform-agent-gateway",
+                f"app={agent_name}-shell",
                 "--field-selector=status.phase=Running",
                 "-o",
                 "jsonpath={.items[0].metadata.name}",
@@ -76,51 +93,72 @@ def test_github_token_minting_and_connectivity(
             capture_output=True,
             text=True,
         )
-    if proc_pod.returncode != 0 or not proc_pod.stdout.strip():
-        # Fallback to checking any running pod in agent namespace with 'agent' or 'gateway' in name
-        proc_pod_all = subprocess.run(
+        if proc_pod.returncode == 0 and proc_pod.stdout.strip():
+            pod_name = proc_pod.stdout.strip()
+            container_name = "shell"
+            break
+        time.sleep(_POD_POLL_INTERVAL_SECONDS)
+
+    # 2. Fallback for legacy single-pod layout: gateway pod with container platform-agent
+    if not pod_name:
+        proc_gw = subprocess.run(
             [
                 "kubectl",
                 "get",
                 "pod",
                 "-n",
                 agent_namespace,
+                "-l",
+                f"app={agent_name}-gateway",
                 "--field-selector=status.phase=Running",
                 "-o",
-                "jsonpath={.items[*].metadata.name}",
+                "jsonpath={.items[0].metadata.name}",
             ],
             capture_output=True,
             text=True,
         )
-        if proc_pod_all.returncode == 0 and proc_pod_all.stdout.strip():
-            candidate_pods = [
-                p for p in proc_pod_all.stdout.split()
-                if ("agent" in p or "gateway" in p) and not any(k in p for k in ("minter", "minty", "operator", "hindsight"))
-            ]
-            if candidate_pods:
-                proc_pod = type("Proc", (), {"returncode": 0, "stdout": candidate_pods[0]})()
+        if proc_gw.returncode == 0 and proc_gw.stdout.strip():
+            pod_name = proc_gw.stdout.strip()
+            container_name = "platform-agent"
 
-    if proc_pod.returncode != 0 or not proc_pod.stdout.strip():
-        pytest.fail(f"No running platform-agent-gateway pod found in namespace '{agent_namespace}'.")
-
-    pod_name = proc_pod.stdout.strip()
+    if not pod_name:
+        pytest.fail(
+            f"No running agent shell or legacy gateway pod found in namespace '{agent_namespace}' within {_POD_WAIT_TIMEOUT_SECONDS}s."
+        )
 
     # Refresh credentials via broker and query repository via read-only GET API
     script = f"""
 import sys, subprocess, os
 
-# 1. Refresh credentials in the credential proxy via the broker client
-p_refresh = subprocess.run(['find', '/opt', '-name', 'github_token_refresh.py'], capture_output=True, text=True)
-if p_refresh.returncode == 0 and p_refresh.stdout.strip():
-    refresh_script = p_refresh.stdout.strip().splitlines()[0]
-    res_ref = subprocess.run(['python3', refresh_script, '{github_repo}'], capture_output=True, text=True)
-    if res_ref.returncode != 0:
-        print(f"Token refresh failed: {{res_ref.stderr}}", file=sys.stderr)
-        sys.exit(res_ref.returncode)
+# 1. Refresh credentials in the credential proxy via the broker client.
+# The script is resolved from its known locations, not searched for: as the
+# sandbox user, `find /opt` cannot enter the root-owned lost+found on the
+# data volume and exits non-zero even after printing a match, so an exit-code
+# gate on it skipped this step and left the probe to pass or fail on whatever
+# credentials an earlier task had left in the proxy.
+candidates = [p for p in {_REFRESH_SCRIPT_CANDIDATES!r} if os.path.isfile(p)]
+if not candidates:
+    print(
+        f"{_REFRESH_SCRIPT_NAME} not found at any of {_REFRESH_SCRIPT_CANDIDATES!r}; "
+        "the pod cannot mint a GitHub token.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+refresh_script = candidates[0]
+res_ref = subprocess.run(['python3', refresh_script, '{github_repo}'], capture_output=True, text=True)
+if res_ref.returncode != 0:
+    print(
+        f"Token refresh via {{refresh_script}} failed (exit {{res_ref.returncode}}):\\n"
+        f"STDOUT:\\n{{res_ref.stdout}}\\nSTDERR:\\n{{res_ref.stderr}}",
+        file=sys.stderr,
+    )
+    sys.exit(res_ref.returncode)
+print(f"{_REFRESH_CONFIRMATION} {{refresh_script}}")
 
 # 2. Execute read-only GitHub API verification via Envoy proxy from workspace root
 env = os.environ.copy()
 env['PWD'] = '/opt/data'
+env['PATH'] = '/opt/credential-proxy/bin:' + env.get('PATH', '')
 cmd_gh = ['gh', 'api', f'repos/{github_repo}', '--jq', '.full_name']
 res_gh = subprocess.run(cmd_gh, cwd='/opt/data', env=env, capture_output=True, text=True)
 if res_gh.returncode != 0:
@@ -135,30 +173,37 @@ if full_name.lower() != '{github_repo}'.lower():
 print(f"Successfully authenticated and queried repository: {{full_name}}")
 """
 
-    cmd = [
+    base_exec = [
         "kubectl",
         "exec",
         "-n",
         agent_namespace,
         pod_name,
         "-c",
-        "platform-agent",
+        container_name,
         "--",
-        "python3",
-        "-c",
-        script,
     ]
+    if container_name == "shell":
+        cmd = base_exec + ["runuser", "-u", "agent", "--", "python3", "-c", script]
+    else:
+        cmd = base_exec + ["python3", "-c", script]
+
     try:
-        proc_start = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        proc_start = subprocess.run(cmd, capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS)
         assert proc_start.returncode == 0, (
             f"GitHub token minting and API probe failed inside pod '{pod_name}' (exit code {proc_start.returncode}):\n"
             f"STDOUT:\n{proc_start.stdout}\nSTDERR:\n{proc_start.stderr}"
+        )
+        assert _REFRESH_CONFIRMATION in proc_start.stdout, (
+            f"The probe reached `gh` without running the token refresh; stdout was:\n{proc_start.stdout}"
         )
         assert f"Successfully authenticated and queried repository: {github_repo}" in proc_start.stdout, (
             f"Expected successful repository query confirmation in stdout, got:\n{proc_start.stdout}"
         )
     except subprocess.TimeoutExpired:
-        pytest.fail(f"GitHub token minting / API probe timed out after 90s in pod '{pod_name}'")
+        pytest.fail(
+            f"GitHub token minting / API probe timed out after {_PROBE_TIMEOUT_SECONDS}s in pod '{pod_name}'"
+        )
 
 
 def test_github_token_minter_credential_isolation(
@@ -304,20 +349,32 @@ def test_audit_report_ledger_dryrun_all_streams(
     cluster = gke_cluster_name or "test-cluster"
     project = gcp_project_id or "test-project"
 
-    # Retrieve first valid check slug for the audit stream
-    valid_check = "sample-check"
-    try:
-        import sys
-        script_dir_str = str(_AUDIT_REPORT_SCRIPT.parent)
-        if script_dir_str not in sys.path:
-            sys.path.insert(0, script_dir_str)
-        from audit_report import AUDITS
-        if audit_id in AUDITS and AUDITS[audit_id].checks:
-            valid_check = AUDITS[audit_id].checks[0]
-    except Exception:
-        pass
+    # Retrieve first valid check slug for checks_run and a distinct second check slug for checks_not_applicable.
+    # audit_report.py rejects any document where the same check slug appears in both checks_run and checks_not_applicable.
+    import sys
+    script_dir_str = str(_AUDIT_REPORT_SCRIPT.parent)
+    if script_dir_str not in sys.path:
+        sys.path.insert(0, script_dir_str)
+    platform_scripts_dir = str(_REPO_ROOT / "agents" / "platform" / "scripts")
+    if platform_scripts_dir not in sys.path:
+        sys.path.insert(0, platform_scripts_dir)
 
-    # Construct clean findings document for the audit stream
+    from audit_report import AUDITS
+
+    assert audit_id in AUDITS, f"Audit stream '{audit_id}' not found in audit_report.AUDITS"
+    roster = AUDITS[audit_id].checks
+    assert len(roster) >= 2, f"Audit stream '{audit_id}' has {len(roster)} checks, expected at least 2"
+    valid_check = roster[0]
+    na_check = roster[1]
+    na_reason = "GKE Autopilot: Google owns this resource; check is not applicable on Autopilot clusters."
+    checks_not_applicable = [
+        {
+            "check": na_check,
+            "reason": na_reason,
+        }
+    ]
+
+    # Construct findings document for the audit stream
     mock_findings = {
         "audit": audit_id,
         "scope": {
@@ -332,17 +389,59 @@ def test_audit_report_ledger_dryrun_all_streams(
                             "command": f"kubectl --context={cluster} get pods -A",
                         }
                     ],
-                    "checks_not_applicable": [],
+                    "checks_not_applicable": checks_not_applicable,
                 }
             ],
             "skipped": [],
         },
-        "findings": [],
+        "findings": [
+            {
+                "check": valid_check,
+                "severity": "major",
+                "title": f"Sample finding for {human_name}",
+                "cluster": cluster,
+                "namespace": "default",
+                "object": "Deployment/sample-app",
+                "evidence": {
+                    "command": f"kubectl --context={cluster} get pods -A",
+                    "excerpt": "sample evidence excerpt",
+                },
+                "impact": "Sample impact description for audit finding.",
+                "recommendation": {
+                    "action": "Take recommended remediation step.",
+                    "rationale": "Rationale explaining why this change was chosen.",
+                    "risk": "Risk evaluation for this specific recommendation.",
+                },
+                "remediation": {
+                    "kind": "manual",
+                    "note": f"kubectl --context={cluster} edit deployment/sample-app",
+                },
+            }
+        ],
+    }
+
+    # `finish` refuses to publish a document nothing checked, dry-run included --
+    # the rehearsal has to fail the same way the real call would, or an agent
+    # learns the flag is optional and discovers otherwise at publish time. The
+    # manifest here mirrors the document above, so the stream is exercised
+    # through the cross-check rather than around it.
+    mock_manifest = {
+        "audit": audit_id,
+        "clusters": [
+            {
+                "name": cluster,
+                "outcome": "collected",
+                "commands": [{"check": valid_check, "rc": 0}],
+            }
+        ],
     }
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(mock_findings, f)
         temp_path = f.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(mock_manifest, f)
+        manifest_path = f.name
 
     try:
         proc = subprocess.run(
@@ -352,6 +451,7 @@ def test_audit_report_ledger_dryrun_all_streams(
                 "finish",
                 f"--audit={audit_id}",
                 f"--findings-file={temp_path}",
+                f"--manifest-file={manifest_path}",
                 "--dry-run",
             ],
             capture_output=True,
@@ -362,9 +462,22 @@ def test_audit_report_ledger_dryrun_all_streams(
             f"Audit stream '{audit_id}' ({human_name}) dry-run validation failed (exit code {proc.returncode}):\n"
             f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
+        assert "Not applicable (1)" in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing 'Not applicable (1)' section:\n"
+            f"STDOUT:\n{proc.stdout}"
+        )
+        assert f"`{na_check}`" in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing check slug '{na_check}' under Not applicable:\n"
+            f"STDOUT:\n{proc.stdout}"
+        )
+        assert na_reason in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing reason '{na_reason}' under Not applicable:\n"
+            f"STDOUT:\n{proc.stdout}"
+        )
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        for path in (temp_path, manifest_path):
+            if os.path.exists(path):
+                os.remove(path)
 
 
 @pytest.mark.parametrize(
@@ -412,6 +525,12 @@ def test_audit_report_github_api_lifecycle_mocked(
     # seven ways, so anything missed here leaks into the next parameter's run.
     original_workspace = audit_report.GITOPS_WORKSPACE
     original_scratch = audit_report.SCRATCH_DIR
+    # REPORTS_DIR joins it for a second reason: `finish` below is a real one, so
+    # it reaches `write_report`. Unpatched, that is the *live* store on the
+    # install this suite runs against -- seven synthetic runs written over seven
+    # streams' `latest.json`, and the next real run of each reads that memory
+    # and announces its whole finding set as new.
+    original_reports = audit_report.REPORTS_DIR
     original_repo_root = audit_report.repo_root
     original_run_cmd = audit_report.run_cmd
     original_refresh = audit_report.refresh_credentials
@@ -450,10 +569,16 @@ def test_audit_report_github_api_lifecycle_mocked(
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
         audit_report.SCRATCH_DIR = str(tmp_path)
+        audit_report.REPORTS_DIR = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
-        audit_report.refresh_credentials = lambda repo=None: None
-        audit_report.resolve_repo = lambda: "test-org-kube-agent/agents-repo"
+        audit_report.refresh_credentials = lambda *args, **kwargs: None
+        # `*args, **kwargs`: `handle_finish` calls this as
+        # `resolve_repo(audit_id=…, repo=…)`. A zero-arg stub raised TypeError there,
+        # `main()`'s blanket handler turned that into exit 1, and all seven audit
+        # cases failed on the stub rather than on the product — with the
+        # release-candidate pipeline as the only thing running them.
+        audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
 
         valid_check = audit_report.AUDITS[audit_id].checks[0] if audit_id in audit_report.AUDITS and audit_report.AUDITS[audit_id].checks else "single-zone-nodepool"
@@ -493,7 +618,27 @@ def test_audit_report_github_api_lifecycle_mocked(
         findings_file = tmp_path / f"findings_{audit_id}.json"
         findings_file.write_text(json.dumps(doc), encoding="utf-8")
 
-        exit_code = audit_report.main(["finish", f"--audit={audit_id}", f"--findings-file={findings_file}"])
+        # See the dry-run test above: `finish` will not publish without a
+        # manifest, so this one mirrors the document it publishes.
+        manifest_file = tmp_path / f"manifest_{audit_id}.json"
+        manifest_file.write_text(
+            json.dumps({
+                "audit": audit_id,
+                "clusters": [{
+                    "name": "platform-agent-host",
+                    "outcome": "collected",
+                    "commands": [{"check": valid_check, "rc": 0}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        exit_code = audit_report.main([
+            "finish",
+            f"--audit={audit_id}",
+            f"--findings-file={findings_file}",
+            f"--manifest-file={manifest_file}",
+        ])
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
         all_commands = [" ".join(c) for c in calls]
@@ -518,6 +663,14 @@ def test_audit_report_github_api_lifecycle_mocked(
             "SECURITY/SAFETY VIOLATION: Audit unexpectedly attempted to create a pull request!"
         )
 
+        # 5. Assert this run's report landed in the redirected store. Without
+        #    it the REPORTS_DIR patch above is invisible: `write_report` never
+        #    raises, so dropping the patch would move these writes back onto the
+        #    live store and nothing here would notice.
+        assert (tmp_path / "reports" / audit_id / "latest.json").is_file(), (
+            f"Expected '{audit_id}' finish to write latest.json under the test store."
+        )
+
     finally:
         audit_report.run_cmd = original_run_cmd
         audit_report.refresh_credentials = original_refresh
@@ -525,4 +678,5 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.repo_root = original_repo_root
         audit_report.GITOPS_WORKSPACE = original_workspace
         audit_report.SCRATCH_DIR = original_scratch
+        audit_report.REPORTS_DIR = original_reports
         audit_report.set_workspace(None)

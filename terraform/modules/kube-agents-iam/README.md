@@ -5,15 +5,34 @@ Reusable Terraform module for provisioning the Platform Agent's Google Service A
 ## Relationship to the install
 
 This is the module the full-install composition (and therefore `install.sh`) uses for the
-agent's identity. The canonical identifiers (GSA `kubeagents-platform-gsa`, KSA
-`kubeagents-platform-agent`, namespace `kubeagents-system`) also appear in
-`scripts/installer/common.sh` for the dev tooling, and the module's defaults mirror
-them.
+agent's identity. The canonical identifiers also live with the installer, and the
+module's defaults mirror them: the GSA `kubeagents-platform-gsa` and the namespace
+`kubeagents-system` as defaults in `install.defaults.env` (an install overrides them
+through `install.env`), the KSA `kubeagents-platform-agent` as a constant in
+`scripts/installer/common.sh` for the dev tooling.
 
 By default the module grants the read-only role set (the composition's
 `permission_set = "read-only"`, also the installer's default). Pass `project_roles = []` to grant
 nothing and manage roles yourself — but note the agent fails every GCP call until an
 equivalent role set exists.
+
+Whenever `project_roles` is non-empty the module also defines a project-level custom role,
+`kubeagentsSubnetUtilizationReader`, and binds it to the same GSA. Two things follow that the
+role list alone does not tell you. Its `compute.subnetworks.use` is a consumption permission
+rather than a read, so the grant is not read-only in substance — see
+[Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md) for why the
+narrower custom role is still the better of the two options. And `role_id` is a constant, not
+derived from `service_account_id`, so two instantiations of this module in one project collide on
+it. That is a harder constraint than the one the GSA name imposes, not the same one:
+`service_account_id` is a variable, so a second instantiation can be given a different name, and
+the custom role has no such escape.
+
+`terraform destroy` — which `uninstall.sh` reaches — soft-deletes that role, and GCP then holds
+the name for between 7 and 37 days. Reinstalling inside the first 7 is fine, because the provider
+finds the soft-deleted role and undeletes it. Past that the role can be neither created nor
+changed until the window closes, and `terraform apply` fails. Wait it out, or run
+`gcloud iam roles undelete kubeagentsSubnetUtilizationReader --project <project>`. `main.tf`
+carries the rest, including why turning the id into a variable is not the fix it looks like.
 
 There is no admin preset to mirror: the `gke-admin` bundle was removed (see
 [Security & IAM](../../../docs/site/src/content/docs/reference/security-and-iam.md)),

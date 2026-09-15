@@ -9,6 +9,7 @@ import socket
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 import subprocess
 import ipaddress
 import tempfile
@@ -16,6 +17,7 @@ from typing import Any
 from pathlib import Path
 from datetime import datetime
 from mcp.server import MCPServer
+import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
 from gke_endpoint import dns_endpoint_args
 
@@ -287,10 +289,7 @@ def get_project_id() -> str:
             log(f"Warning: Failed to parse USER.md: {e}")
 
     try:
-        res = subprocess.run(
-            ["gcloud", "config", "get-value", "project"],
-            capture_output=True, text=True, check=True, env=_run_env()
-        )
+        res = _run_cluster(["gcloud", "config", "get-value", "project"])
         val = res.stdout.strip()
         if val and val != "(unset)":
             return val
@@ -303,14 +302,11 @@ def get_project_id() -> str:
 def get_valid_regions(project_id: str) -> list[str]:
     """Retrieve the live list of enabled Google Cloud regions for the GKE API."""
     try:
-        res = subprocess.run(
-            [
-                "gcloud", "compute", "regions", "list",
-                f"--project={project_id}",
-                "--format=value(name)"
-            ],
-            capture_output=True, text=True, check=True, env=_run_env()
-        )
+        res = _run_cluster([
+            "gcloud", "compute", "regions", "list",
+            f"--project={project_id}",
+            "--format=value(name)"
+        ])
         regions = [line.strip() for line in res.stdout.splitlines() if line.strip()]
         if regions:
             return regions
@@ -366,7 +362,7 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
     ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=_run_env())
+        res = _run_cluster(cmd)
         data = json.loads(res.stdout)
         return json.dumps({
             "exists": True,
@@ -395,39 +391,76 @@ def _kubeconfig_slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", value) or "unset"
 
 
+# Where the sandbox keeps these files. Only `hermes` can write here: the
+# directory is 0700 hermes:hermes, created in deploy/sandbox/Dockerfile.
+#
+# That is not tidiness. A kubeconfig carries an `exec` stanza naming a binary
+# and its arguments, and kubectl runs it — so a kubeconfig the model can write
+# is arbitrary code execution as the principal this server connects as, which
+# is the one account in the sandbox the model is not supposed to reach. Every
+# other writable path there (/opt/data, /tmp) is shared with `agent`.
+SANDBOX_KUBECONFIG_DIR = "/home/hermes/.kubeconfigs"
+
+
 def _thread_kubeconfig_path(project_id: str, cluster_name: str, location: str) -> str:
     """Where to keep the per-target kubeconfig `get-credentials` writes.
 
-    This has to sit inside the credential proxy's workspace root. The gcloud
-    and kubectl that use it are shims: the real commands run in the sidecar,
-    and the server honours a caller-supplied KUBECONFIG only when every entry
-    resolves inside the shared workspace, rejecting anything else with a 400
-    rather than ignoring it (credential_proxy._resolve_kubeconfig). `/tmp` is
-    per-container and outside that root, so a path there fails the request
-    outright and takes all four cluster-scoped tools down with it.
+    Written by a gcloud and read by a kubectl that both run in the shell
+    sandbox, so the path is a sandbox path and the agent pod never holds the
+    file. Nothing else reads it — the Cluster Agents' pinned configs are a
+    separate mechanism in cluster_agent_profile.py.
 
-    $HERMES_HOME is on the shared PVC and is already what the proxy accepts for
-    the Cluster Agents' pinned configs. Keeping one file per target preserves
-    the thread isolation the /tmp path was chosen for: concurrent calls to
-    different clusters do not race on a single current-context. What lands on
-    the PVC is a cluster endpoint, its CA, and an exec stanza naming
-    gke-gcloud-auth-plugin — no bearer token.
+    One file per target, which preserves the thread isolation this was
+    originally moved off /tmp for: concurrent calls to different clusters do
+    not race on a single current-context. What the file holds is a cluster
+    endpoint, its CA, and an exec stanza naming gke-gcloud-auth-plugin — no
+    bearer token.
+
+    Unsandboxed, it stays under $HERMES_HOME for the reason it always has: the
+    gcloud and kubectl are credential-proxy shims, and the proxy honours a
+    caller-supplied KUBECONFIG only when every entry resolves inside its
+    workspace root, rejecting anything else with a 400 rather than ignoring it
+    (credential_proxy._resolve_kubeconfig). #737 Part C has to give the
+    directory above the same standing once the proxy is reachable from the
+    sandbox; until then these calls fail before the kubeconfig is consulted.
     """
-    home = os.environ.get("HERMES_HOME", "/opt/data")
-    directory = os.path.join(home, ".kubeconfigs")
-    os.makedirs(directory, exist_ok=True)
+    if sandbox_exec.sandbox_enabled():
+        directory = SANDBOX_KUBECONFIG_DIR
+    else:
+        home = os.environ.get("HERMES_HOME", "/opt/data")
+        directory = os.path.join(home, ".kubeconfigs")
+        os.makedirs(directory, exist_ok=True)
     slug = "_".join(
         _kubeconfig_slug(part) for part in (project_id, cluster_name, location)
     )
     return os.path.join(directory, f"kubeconfig_{slug}.yaml")
 
 
+def _run_cluster(cmd: list[str], env: dict[str, str] | None = None, *,
+                 timeout: int | None = None, check: bool = True):
+    """Run a kubectl or gcloud command in the shell sandbox.
+
+    `env` is the dict `switch_kube_context` hands back. Only `KUBECONFIG` is
+    taken from it and rendered into the remote command; the rest is the agent
+    pod's environment, which includes `API_SERVER_KEY` and has no business
+    crossing the connection. Callers with no cluster context pass nothing.
+    """
+    kubeconfig = (env or {}).get("KUBECONFIG")
+    return sandbox_exec.run(
+        cmd,
+        remote_env={"KUBECONFIG": kubeconfig} if kubeconfig else None,
+        local_env=env if env is not None else _run_env(),
+        timeout=timeout,
+        check=check,
+    )
+
+
 def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tuple[str, dict[str, str]]:
     """
     Point kubectl to the target GKE cluster using a thread-isolated kubeconfig.
     Returns (error_string, env_dict). If error_string is non-empty, switching failed.
-    env_dict is always populated (with HOME=/tmp injected) and should be passed as
-    env=env_dict to subsequent subprocess.run calls.
+    env_dict is always populated (with HOME=/tmp injected) and should be passed to
+    the `_run_cluster` calls that follow, which take KUBECONFIG out of it.
     """
     if not project_id and not cluster_name and not location:
         return "", _run_env()
@@ -452,7 +485,7 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
         *dns_endpoint_args(project_id, cluster_name, location, env=env),
     ]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        _run_cluster(cmd, env, timeout=30)
         return "", env
     except subprocess.CalledProcessError as e:
         return (
@@ -461,6 +494,11 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
         )
     except subprocess.TimeoutExpired:
         return f"ERROR: Timed out switching kube context to cluster '{cluster_name}'.", env
+    except sandbox_exec.SandboxUnavailable as e:
+        # Reported here rather than left to propagate, so every tool that
+        # switches context gets one error naming the sandbox. The command never
+        # ran, which is a different thing from the cluster refusing it.
+        return f"ERROR: Could not reach the shell sandbox to switch kube context: {e}", env
 
 
 @mcp.tool()
@@ -484,7 +522,7 @@ def list_cc_healthchecks(project_id: str = "", cluster_name: str = "", location:
         ctx_err, env = switch_kube_context(project_id, cluster_name, location)
         if ctx_err:
             return ctx_err
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(cmd, env, timeout=30)
         return _strip_kubectl_noise(res.stdout)
     except subprocess.TimeoutExpired:
         return "ERROR: Timed out querying Config Controller health checks after 30 seconds."
@@ -513,7 +551,7 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
         ctx_err, env = switch_kube_context(project_id, cluster_name, location)
         if ctx_err:
             return ctx_err
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(cmd, env, timeout=30)
         return _strip_kubectl_noise(res.stdout)
     except subprocess.TimeoutExpired:
         return "ERROR: Timed out retrieving Config Controller operator status after 30 seconds."
@@ -552,28 +590,39 @@ def get_cc_pod_diagnostics(
         return ctx_err
 
     try:
-        res = subprocess.run(describe_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(describe_cmd, env, timeout=30)
         results.append(f"=== POD DESCRIBE ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD DESCRIBE TIMEOUT ===\nCommand timed out after 30 seconds.\n")
     except subprocess.CalledProcessError as e:
         results.append(f"=== POD DESCRIBE ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+    except sandbox_exec.SandboxUnavailable as e:
+        # The sandbox can go away between the three calls below — they are one
+        # burst over one multiplexed connection, and an eviction lands mid-burst.
+        # Recorded per section so a partial diagnostic still reports what it got.
+        results.append(f"=== POD DESCRIBE ERROR ===\nShell sandbox unreachable: {e}\n")
 
     try:
-        res = subprocess.run(logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(logs_cmd, env, timeout=30)
         results.append(f"=== POD LOGS (CURRENT TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
     except subprocess.CalledProcessError as e:
         results.append(f"=== POD LOGS (CURRENT TAIL=100) ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+    except sandbox_exec.SandboxUnavailable as e:
+        results.append(f"=== POD LOGS (CURRENT TAIL=100) ERROR ===\nShell sandbox unreachable: {e}\n")
 
     try:
-        res = subprocess.run(prev_logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(prev_logs_cmd, env, timeout=30)
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
     except subprocess.CalledProcessError as e:
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+    except sandbox_exec.SandboxUnavailable as e:
+        # Not folded into the clause above: "no previous logs" is a statement
+        # about the pod, and the sandbox being gone is not evidence for it.
+        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ERROR ===\nShell sandbox unreachable: {e}\n")
 
     return "\n".join(results)
 
@@ -599,7 +648,7 @@ def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "
         ctx_err, env = switch_kube_context(project_id, cluster_name, location)
         if ctx_err:
             return ctx_err
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(cmd, env, timeout=30)
         data = json.loads(res.stdout)
         pods = [s for s in (_pod_summary(p) for p in (data.get("items") or [])) if s]
         return _neutralize_tokens(_strip_unsafe_chars(json.dumps(pods, indent=2)))
@@ -648,7 +697,7 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
     ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=_run_env())
+        res = _run_cluster(cmd, timeout=30)
         return _strip_audit_log_noise(res.stdout)
     except subprocess.TimeoutExpired:
         return "ERROR: Cloud Audit Logs query timed out after 30 seconds."
@@ -662,6 +711,13 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
 def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to configured chat platforms (Google Chat and/or Slack).
+
+    Link every artifact you name in the message — issue, PR, cluster, workload,
+    console view — as a markdown link `[text](url)` with the URL written out in
+    full. Never a bare `#39` and never a repo-relative reference: a chat message
+    carries no repo context, so both render as plain text and leave the reader
+    guessing which repo was meant. If you cannot resolve the URL, name the
+    artifact plainly — never construct or guess one.
 
     Args:
         message: The plaintext or markdown-formatted message string to post.
@@ -741,6 +797,9 @@ def send_notification(message: str, session_id: str = "") -> str:
     for target in targets:
         platform_name = target.split(":", 1)[0]
         try:
+            # Stays in the agent pod. `hermes` is not cluster tooling: it needs
+            # the profiles on the data PVC and the gateway on loopback, and the
+            # sandbox image does not carry the binary.
             res = subprocess.run(
                 ["hermes", "send", "--to", target, message],
                 capture_output=True, text=True, check=True, env=_run_env()
@@ -829,13 +888,21 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # Chat Agent framed it for everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
+    #
+    # `relay_detail` then says which degradation — a failed Chat Agent turn and a
+    # channel the send never reached are both `degraded` and want opposite
+    # descriptions. Older routes do not send it; the sentence they used to get is
+    # the fallback, which is right for them because they only had the one cause.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":
         labels.append("degraded")
         caveats.append(
-            "the Chat Agent turn failed, so the user sees your raw text marked "
-            "[unrelayed] rather than a composed message"
+            str(payload.get("relay_detail") or "").strip()
+            or (
+                "the Chat Agent turn failed, so the user sees your raw text marked "
+                "[unrelayed] rather than a composed message"
+            )
         )
     undelivered = str(payload.get("undelivered") or "").strip()
     if undelivered:
@@ -860,6 +927,243 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {session}). "
         "The Chat Agent posts it; do not also call send_notification for this report."
+    )
+
+
+# =============================================================================
+# The findings queue (docs/designs/inventory-findings-queue.md §6.1)
+#
+# Thin wrappers over the Session KV routes, in the shape send_notification and
+# report_to_chat already use. The ranking, the rubric and the state machine all
+# live behind those routes: nothing here decides anything.
+# =============================================================================
+
+FINDINGS_TIMEOUT_SECONDS = 20.0
+
+
+def _findings_request(method: str, path: str, body: dict | None = None) -> Any:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = _session_kv_headers({"Content-Type": "application/json"} if data else None)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:8699{path}", data=data, headers=headers, method=method
+    )
+    with urllib.request.urlopen(req, timeout=FINDINGS_TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _findings_call(method: str, path: str, body: dict | None = None) -> str:
+    try:
+        return json.dumps(_findings_request(method, path, body), indent=2)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("detail")
+        except Exception:
+            detail = None
+        return f"ERROR: the findings queue refused this ({exc.code}): {detail or exc.reason}"
+    except Exception as exc:
+        return f"ERROR: could not reach the findings queue: {exc}"
+
+
+@mcp.tool()
+def register_findings(findings: list, scope: dict | None = None) -> str:
+    """
+    Register findings in the durable queue, or update ones already there.
+
+    Identity is derived from (check, project, cluster, namespace, object), so
+    registering the same problem twice updates one row rather than creating
+    two. project is the GCP project the cluster lives in — required, because a
+    cluster name alone is ambiguous across projects. A finding the user
+    dismissed stays dismissed and is reported back as 'suppressed'.
+
+    Each finding needs: source ('inventory' | 'event-watcher' | 'audit'), check
+    (the audit stream's own slug), project, cluster, namespace (omit for
+    cluster-scoped), object, title, rubric, recommendation {action, rationale,
+    risk}, remediation {kind, path, note} and verification {kind, command,
+    still_failing_when}. Optional: detail, root_cause, actionable,
+    provider_managed.
+
+    rubric is {B, L, detect, recover, C} against the anchors in the prioritize
+    SOP: B in 1/2/3/5/8, L in 1/2/4/6/10, detect and recover in 1/2/3, C in
+    1.0/0.9/0.6. Severity and rank score are computed from it and must not be
+    passed.
+
+    Args:
+        findings: The findings to register.
+        scope: Pass {'project': '<id>', 'cluster': '<name>', 'complete': true}
+            only when this run covered that cluster in full. It lowers the
+            confidence of queued rows the run did not re-report. Omit it for a
+            partial or failed run.
+    """
+    return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
+
+
+@mcp.tool()
+def get_ranked_findings() -> str:
+    """
+    The whole open backlog, ordered worst first: actionable before unactionable,
+    then by rank score, then a deterministic tie-break.
+
+    This is what the backlog document and the daily nudge are rendered from. The
+    order is decided here — do not re-rank it.
+    """
+    return _findings_call("GET", "/v1/findings/ranked")
+
+
+@mcp.tool()
+def get_findings(
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+) -> str:
+    """
+    Look up findings by project, cluster, state or severity — the on-demand pull.
+
+    Args:
+        cluster: Restrict to one cluster. Pair with project when two projects
+            have clusters of the same name.
+        state: One of queued, surfaced, snoozed, accepted, dismissed, resolved, stale.
+        severity: One of critical, major, minor.
+        limit: Maximum rows to return (default 200).
+        project: Restrict to one GCP project.
+    """
+    query = urllib.parse.urlencode(
+        {
+            k: v
+            for k, v in (
+                ("project", project),
+                ("cluster", cluster),
+                ("state", state),
+                ("severity", severity),
+                ("limit", limit),
+            )
+            if v
+        }
+    )
+    return _findings_call("GET", f"/v1/findings?{query}" if query else "/v1/findings")
+
+
+@mcp.tool()
+def mark_finding_surfaced(finding_id: str, chat_id: str = "", thread_id: str = "") -> str:
+    """
+    Record that a finding was named in a message that has already been sent.
+
+    Call this after the send, not before: it advances the surface count a
+    publisher uses to decide what to repeat.
+
+    Args:
+        finding_id: The finding's id.
+        chat_id: The chat the message landed in, if any.
+        thread_id: The thread the message landed in, if any.
+    """
+    return _findings_call(
+        "POST", f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}/surfaced", {"chat_id": chat_id, "thread_id": thread_id}
+    )
+
+
+@mcp.tool()
+def update_finding(
+    finding_id: str,
+    state: str | None = None,
+    snoozed_until: str | None = None,
+    pr_url: str | None = None,
+    pr_state: str | None = None,
+) -> str:
+    """
+    Apply a decision the user made about a finding, or reconcile its pull request.
+
+    The user's three decisions are 'accepted' (they are working it), 'snoozed'
+    (not now, with a date) and 'dismissed' (won't fix — permanent, and the next
+    sweep will not resurrect it). A lapsed snooze is returned to the list by
+    the nudge's daily run; use 'surfaced' only to end one early. A finding that
+    no longer reproduces is not set here: that is a verification outcome.
+
+    Args:
+        finding_id: The finding's id.
+        state: accepted | snoozed | dismissed | surfaced.
+        snoozed_until: Required with 'snoozed'. An ISO date or timestamp.
+        pr_url: The pull request opened for this finding. Pass "" to unlink one.
+        pr_state: open | merged | closed. Pass "" to clear it.
+    """
+    # `is not None`, not truthiness: an omitted argument means "leave it alone"
+    # and an empty string means "clear it", which is the only way to undo a
+    # pull request link written against the wrong finding.
+    patch = {
+        key: value
+        for key, value in (
+            ("state", state),
+            ("snoozed_until", snoozed_until),
+            ("pr_url", pr_url),
+            ("pr_state", pr_state),
+        )
+        if value is not None
+    }
+    return _findings_call("PATCH", f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}", patch)
+
+
+@mcp.tool()
+def record_finding_verification(
+    finding_id: str,
+    outcome: str,
+    observed: str = "",
+    rubric: dict | None = None,
+    object_missing: bool = False,
+) -> str:
+    """
+    Report what running a finding's own verification command showed.
+
+    Three outcomes, and the third is not the second:
+
+    - 'still_failing': the command ran and the failing condition held.
+    - 'resolved': the command ran and the condition did not hold. The finding
+      leaves the queue, so use this only when the command actually ran.
+    - 'unverifiable': the command failed, timed out, was denied, or the object
+      is gone. Pass object_missing=true for the last of those. Nothing is
+      concluded about the finding and its freshness does not advance.
+
+    Args:
+        finding_id: The finding's id.
+        outcome: still_failing | resolved | unverifiable.
+        observed: What the command actually returned.
+        rubric: A corrected {B, L, detect, recover, C} when verification changed
+            what the finding is — a gap now firing, or a fault that has stopped.
+        object_missing: True when the object the finding names no longer exists.
+    """
+    return _findings_call(
+        "POST",
+        f"/v1/findings/{urllib.parse.quote(finding_id, safe='')}/verified",
+        {"outcome": outcome, "observed": observed, "rubric": rubric, "object_missing": object_missing},
+    )
+
+
+@mcp.tool()
+def findings_publication(
+    publisher: str,
+    target_kind: str = "",
+    target_ref: str = "",
+    content_hash: str = "",
+) -> str:
+    """
+    Read or write what a publisher remembers between runs.
+
+    Two publishers: 'backlog' keeps the target_ref of the document it rewrites,
+    so the next run edits that one instead of opening a second; 'nudge' keeps
+    the content_hash it last posted, which is what 'the list changed' compares
+    against. Called with only a publisher, this reads; called with target_kind,
+    it writes.
+
+    Args:
+        publisher: backlog | nudge.
+        target_kind: github-issue | repo-file | chat. Required to write.
+        target_ref: The URL or path published to.
+        content_hash: A hash of what was published.
+    """
+    if not target_kind:
+        return _findings_call("GET", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}")
+    body = {"target_kind": target_kind}
+    if target_ref:
+        body["target_ref"] = target_ref
+    if content_hash:
+        body["content_hash"] = content_hash
+    return _findings_call(
+        "PUT", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}", body
     )
 
 

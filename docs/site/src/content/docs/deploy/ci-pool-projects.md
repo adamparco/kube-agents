@@ -73,15 +73,32 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
   ```
+- **The LiteLLM gateway's Vertex AI identity**: Google Service Account `kubeagents-litellm-gsa@${PROJECT_ID}.iam.gserviceaccount.com` holding `roles/aiplatform.user` on the project, bound to KSA `kubeagents-litellm` in `kubeagents-system`. The eval installs route model traffic through Vertex AI (`hack/ci-deploy.sh` sets `litellm.modelProvider=vertex_ai`; the `GEMINI_API_KEY` path's fixed paid-tier-3 quota redded every smoke run on 2026-09-02 — [#1097](https://github.com/gke-labs/kube-agents/issues/1097), diagnosis on [#1184](https://github.com/gke-labs/kube-agents/issues/1184)), and a project missing this pair reds every presubmit that leases it at the deploy's model-call gate. It is deliberately not the platform agent's GSA — see [Security and IAM](../reference/security-and-iam.md)'s "The Vertex AI gateway is a separate identity". `scripts/provision_ci_pool_project.sh` creates it through the full-install composition (`model_provider = "vertex_ai"` in its tfvars instantiates the `litellm_vertex_iam` module), and the verifier checks the binding. For a **registered** project provisioned before that line existed, the hand repair below is the only path: section 8 forbids re-running the provisioning after registration, and a composition re-apply is worse than the key rotation section 8 names — the fresh `api_server_key` rides in through `helm_release.kube_agents`, the same release the leased run's `hack/ci-deploy.sh` upgraded, so the re-apply also carries the composition's whole value set (image tags, `gitRepo`, a credentials map without the run's `GEMINI_API_KEY`) over whatever that run installed. The repair:
+
+  ```bash
+  gcloud iam service-accounts create kubeagents-litellm-gsa --project="${PROJECT_ID}" \
+    --display-name="Kube-Agents LiteLLM Vertex AI Service Account"
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:kubeagents-litellm-gsa@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/aiplatform.user" --quiet >/dev/null
+  gcloud iam service-accounts add-iam-policy-binding \
+    kubeagents-litellm-gsa@${PROJECT_ID}.iam.gserviceaccount.com \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-litellm]"
+  ```
+
+  The grants assume `aiplatform.googleapis.com` is enabled — it is in section 1's list and the verifier checks it, and the composition enables it itself (`google_project_service.vertex_ai`) alongside the module, but the hand-repair path enables nothing, so a project missing it needs the section 1 block first. The verifier checks both directions of this GSA's role set: `roles/aiplatform.user` present, and nothing else — the gateway forwards attacker-influenceable prompt content, so its identity stays minimal (see [Security and IAM](../reference/security-and-iam.md)).
+
 - **Upload rights on the project's own registry**, so a presubmit can push its PR build images. `roles/artifactregistry.writer` is the grant to make explicitly, and `scripts/provision_ci_pool_project.sh` makes it. The pool projects that predate the script reach the same permission indirectly — Cloud Build through `roles/cloudbuild.builds.builder`, the Compute default SA through the `roles/editor` GCP grants it by default — which is why `AR_WRITER_ROLES` in `scripts/verify_ci_pool_project.py` accepts a set rather than the one role. `roles/owner` is deliberately not in it. Either build identity holding one of those roles satisfies the check.
 - **Reader on the cache images**, in the `kube-agents` repository of `kube-agents-prow` — the repository at location `us`, not the project, and not `us-central1`, because that is where `hack/ci-deploy.sh`'s default `CACHE_IMAGE` and the `:buildcache` manifests beside it live. Both identities need `roles/artifactregistry.reader` there, and the verifier fails the project if either is missing:
   - `${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`
   - `${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`
-- **The Prow runner's access to the project.** Every other grant on this page is for an identity inside the project. This one is not: the presubmit runs on the `build-kube-agents` cluster as `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, leases the project, and reaches in to fetch cluster credentials, apply the chart, submit the build and read the logs back. Nothing in the project's own configuration implies it, which is how projects 4 to 6 were provisioned, verified green and registered without it — until a lease of `kube-agents-evals-6` died on `Required "container.clusters.get" permission(s)` ([#966](https://github.com/gke-labs/kube-agents/pull/966)). Grant all twelve:
+- **The Prow runner's access to the project.** Every other grant on this page is for an identity inside the project. This one is not: the presubmit runs on the `build-kube-agents` cluster as `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, leases the project, and reaches in to fetch cluster credentials, apply the chart, submit the build and read the logs back. Nothing in the project's own configuration implies it, which is how projects 4 to 6 were provisioned, verified green and registered without it — until a lease of `kube-agents-evals-6` died on `Required "container.clusters.get" permission(s)` ([#966](https://github.com/gke-labs/kube-agents/pull/966)). Grant all thirteen:
 
   ```bash
   for role in roles/cloudbuild.builds.editor roles/cloudbuild.builds.viewer \
               roles/container.admin roles/container.developer \
+              roles/iam.roleAdmin \
               roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
               roles/logging.logWriter roles/logging.viewer \
               roles/resourcemanager.projectIamAdmin \
@@ -93,9 +110,9 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
   done
   ```
 
-  `scripts/provision_ci_pool_project.sh` makes this grant for any project it onboards; the block above is for repairing one provisioned before it did. The list is what `kube-agents-evals` holds, kept as measured rather than trimmed so a new project matches one a presubmit has passed on. It is not minimal — `container.admin` subsumes `container.developer`, `viewer` subsumes `logging.viewer` and `cloudbuild.builds.viewer`. No Artifact Registry role is in it: `hack/ci-deploy.sh` builds and pushes through `gcloud builds submit`, so Cloud Build holds the registry credentials and the runner never touches the registry itself.
+  `scripts/provision_ci_pool_project.sh` makes this grant for any project it onboards; the block above is for repairing one provisioned before it did. The list is what `kube-agents-evals` holds, kept as measured rather than trimmed so a new project matches one a presubmit has passed on. It is not minimal — `container.admin` subsumes `container.developer`, `viewer` subsumes `logging.viewer` and `cloudbuild.builds.viewer`. One entry is derived rather than measured: `roles/iam.roleAdmin`, because the `kube-agents-iam` module defines a custom role and `roles/resourcemanager.projectIamAdmin` beside it carries no `iam.roles.*` permission at all, so `terraform apply` fails `PERMISSION_DENIED` without it. A project onboarded before that role was added holds the other twelve and still cannot run an install; the verifier reports it as missing. No Artifact Registry role is in it: `hack/ci-deploy.sh` builds and pushes through `gcloud builds submit`, so Cloud Build holds the registry credentials and the runner never touches the registry itself.
 
-- **The platform agent's project roles, checked in both directions.** The agent under test authenticates as `kubeagents-platform-gsa@${PROJECT_ID}`, so this is the one set on this page where an _extra_ role fails the project as well as a missing one. The eight read-only roles come from `local.read_only_roles` in [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which is what the install passes to the IAM module — the module's own `project_roles` default is never read on that path. The verifier hardcodes the eight so it can run without a Terraform toolchain, and a unit test asserts both the composition and the module default match it, so narrowing either fails in CI rather than failing every project weeks later.
+- **The platform agent's project roles, checked in both directions.** The agent under test authenticates as `kubeagents-platform-gsa@${PROJECT_ID}`, so this is the one set on this page where an _extra_ role fails the project as well as a missing one. The read-only roles come from `local.read_only_roles` in [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which is what the install passes to the IAM module — the module's own `project_roles` default is never read on that path. The verifier hardcodes them so it can run without a Terraform toolchain, and a unit test asserts both the composition and the module default match it, so narrowing either fails in CI rather than failing every project weeks later. A further grant is expected alongside them: the IAM module also creates and binds `projects/${PROJECT_ID}/roles/kubeagentsSubnetUtilizationReader`, a project-scoped custom role, so it is named per project rather than listed with the others.
 
   Boskos leases at random, so a project that differs grades differently from the rest of the pool — a case can pass on the grant rather than on the agent, and only on the runs that happen to lease that project. Note that re-running the install does **not** strip roles it no longer grants; correcting an over-privileged project is the hand-swap in [Security and IAM](../reference/security-and-iam.md).
 
@@ -155,7 +172,7 @@ gcloud artifacts repositories set-cleanup-policies kube-agents \
 
 ## 5. GitOps repository and GitHub token minter
 
-The evaluation scenarios that exercise the GitOps workflow — the six fleet-audit streams and both remediation cases — write to GitHub. Step 0 of a fleet-audit stream (`audit_report.py start`) mints a repository-scoped GitHub App token and clones the workspace named by the `Git Repo:` line of `/opt/data/SETTINGS.md`; `finish` rewrites a ledger issue and opens remediation pull requests.
+The evaluation scenarios that exercise the GitOps workflow — the six fleet-audit streams and both remediation cases — write to GitHub. Step 0 of a fleet-audit stream (`audit_report.py start`) mints a repository-scoped GitHub App token and clones the workspace resolved from `managed_repos` in the `gitops-state` ConfigMap; `finish` rewrites a ledger issue and opens remediation pull requests.
 
 **Every pool project needs its own private GitOps repository.** Two leases must not share a ledger issue or race on a remediation branch, and a token minted in one lease must not reach another lease's repository.
 
@@ -177,6 +194,21 @@ The evaluation scenarios that exercise the GitOps workflow — the six fleet-aud
 | `kube-agents-evals-13` | `gke-agentic/kube-agents-evals-13-infra` |
 | `kube-agents-evals-14` | `gke-agentic/kube-agents-evals-14-infra` |
 | `kube-agents-evals-15` | `gke-agentic/kube-agents-evals-15-infra` |
+| `kube-agents-evals-16` | `gke-agentic/kube-agents-evals-16-infra` |
+| `kube-agents-evals-17` | `gke-agentic/kube-agents-evals-17-infra` |
+| `kube-agents-evals-18` | `gke-agentic/kube-agents-evals-18-infra` |
+| `kube-agents-evals-19` | `gke-agentic/kube-agents-evals-19-infra` |
+| `kube-agents-evals-20` | `gke-agentic/kube-agents-evals-20-infra` |
+| `kube-agents-evals-21` | `gke-agentic/kube-agents-evals-21-infra` |
+| `kube-agents-evals-22` | `gke-agentic/kube-agents-evals-22-infra` |
+| `kube-agents-evals-23` | `gke-agentic/kube-agents-evals-23-infra` |
+| `kube-agents-evals-24` | `gke-agentic/kube-agents-evals-24-infra` |
+| `kube-agents-evals-25` | `gke-agentic/kube-agents-evals-25-infra` |
+| `kube-agents-evals-26` | `gke-agentic/kube-agents-evals-26-infra` |
+| `kube-agents-evals-27` | `gke-agentic/kube-agents-evals-27-infra` |
+| `kube-agents-evals-28` | `gke-agentic/kube-agents-evals-28-infra` |
+| `kube-agents-evals-29` | `gke-agentic/kube-agents-evals-29-infra` |
+| `kube-agents-evals-30` | `gke-agentic/kube-agents-evals-30-infra` |
 
 The repository is kept private: it is throwaway state a bot rewrites on every run. [`examples/gitops-repo`](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) is the layout an audit expects to find, not a required seed — the current pool repositories carry only a LICENSE and a README, because an audit works against an empty tree and a `remediation.path` that does not exist degrades to a manual finding rather than failing the run.
 
@@ -194,9 +226,9 @@ The repository is kept private: it is throwaway state a bot rewrites on every ru
 
 ### 5.1 How CI resolves it
 
-`hack/ci-deploy.sh` maps the leased project to its repository in `gitops_repo_for_project()` and passes the result as `--set-string platformAgent.integration.github.gitRepo=...`. The operator renders that field into the `platform-agent-settings` ConfigMap as the `Git Repo:` line.
+`hack/ci-deploy.sh` maps the leased project to its repository in `gitops_repo_for_project()` and passes the result as `--set-string platformAgent.integration.github.gitRepo=...`. The operator seeds that field into the `gitops-state` ConfigMap (`managed_repos`).
 
-CI supplies the value rather than relying on the chart default, and that is deliberate. A presubmit builds and deploys the pull request's own chart, operator, and agent, so a pull request that blanks `platformAgent.integration.github.gitRepo` in `values.yaml`, or breaks the CR-to-`SETTINGS.md` rendering, is exactly the regression the eval should surface as a failed scenario — which it can only do if the value the run is supposed to use comes from outside the artefacts under test. (This is a correctness argument, not the containment boundary; see 5.3.)
+CI supplies the value rather than relying on the chart default, and that is deliberate. A presubmit builds and deploys the pull request's own chart, operator, and agent, so a pull request that blanks `platformAgent.integration.github.gitRepo` in `values.yaml`, or breaks the CR-to-ConfigMap seeding, is exactly the regression the eval should surface as a failed scenario — which it can only do if the value the run is supposed to use comes from outside the artefacts under test. (This is a correctness argument, not the containment boundary; see 5.3.)
 
 Adding a project is one line in `gitops_repo_for_project()`, one row in the table above, and one entry in `_EXPECTED_MAPPING` in [`tests/test_ci_gitops_repo.py`](https://github.com/gke-labs/kube-agents/blob/main/tests/test_ci_gitops_repo.py). The test entry is the one that is easy to skip: the suite iterates that dictionary rather than parsing the function for projects it does not know about, so a mapping added without it stays green and stays untested.
 
@@ -278,12 +310,9 @@ A half-finished apply is the case to watch for. The stack's Kubernetes provider 
 
 ### 6.1 A read-only credential for the checks
 
-An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. **This is not true today.** The Prow identity holds `roles/container.admin` in every eval project, and there are no in-cluster RoleBindings to narrow — GKE's IAM webhook is the whole authorization path.
+An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. The apply above handles this: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else, and binds `roles/iam.serviceAccountTokenCreator` on that account to `fleet_reader_token_creators`, which defaults to the Prow identity. `hack/ci-eval-pr.sh` already exports `FLEET_READONLY_SA` pointing at the account, so `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential naming `hack/fleet-reader-credential.sh`, which impersonates that account whenever `kubectl` asks for a token. It is an exec plugin rather than a token in the file because a minted token lives one hour and a presubmit runs for three.
 
-The seam exists: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else. To use it, per project:
-
-1. Add the Prow identity to `fleet_reader_token_creators` and re-apply the stack, which binds it `roles/iam.serviceAccountTokenCreator` on that account alone.
-2. Export `FLEET_READONLY_SA=seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` in the Prow job. Unset, `hack/fleet-kubeconfigs.sh` warns on every run and the kubeconfigs carry the runner's own identity.
+That default landed after the pool was provisioned. A project applied before it lacks the binding — and the oldest three lack the account as well, since it postdates them — so `hack/fleet-kubeconfigs.sh` warns per cluster and the kubeconfigs keep the runner's own `roles/container.admin` on a fleet every open pull request shares; there are no in-cluster RoleBindings to narrow, GKE's IAM webhook is the whole authorization path. Section 7's check fails either case, and re-applying the stack against the project is the repair for both.
 
 ## 7. Pre-flight verification
 
@@ -302,7 +331,7 @@ A bad command line exits `64`, not `2`, so a mistyped flag cannot be mistaken fo
 
 Two checks need more than a read-only API call, and both need `kubectl`. `Seeded Fleet Fixtures` runs `hack/fleet-kubeconfigs.sh`, which fetches cluster credentials into a temporary directory it removes on the way out. `Ledger Read Credential` reads a secret out of the build cluster and POSTs for a one-hour installation token — nothing in the pool project, but not a read either. Without `kubectl` on `PATH` both report as unverified rather than failing the project.
 
-**It is not a complete reading of this page.** Read the script's own check list rather than assuming a green run means every paragraph above is satisfied; an inventory copied here goes stale the first time a check is added, and it goes stale in the dangerous direction — a list of what _is_ checked, left behind, tells an operator to skip a verification that no longer happens. Three things running the script will not tell you: the platform agent GSA's eight read-only roles are the only set checked for extras as well as absences, the host cluster's node account's pull rights are read off `nodePools[].config.serviceAccount` rather than assumed to be the Compute Engine default, and the host cluster's location is not checked at all.
+**It is not a complete reading of this page.** Read the script's own check list rather than assuming a green run means every paragraph above is satisfied; an inventory copied here goes stale the first time a check is added, and it goes stale in the dangerous direction — a list of what _is_ checked, left behind, tells an operator to skip a verification that no longer happens. Three things running the script will not tell you: the platform agent GSA's read-only roles are the only set checked for extras as well as absences, the host cluster's node account's pull rights are read off `nodePools[].config.serviceAccount` rather than assumed to be the Compute Engine default, and the host cluster's location is not checked at all.
 
 Some items report `2` for a reason other than a refused read. The first two below cannot be settled from a machine at all, so they report `2` until an operator settles them by hand — for the mapping that means landing the pull request, not attesting to anything. The last two report `2` only when the probe cannot run: the ledger read for want of the build cluster, signing for want of the permission or the network.
 
@@ -354,3 +383,36 @@ Registration makes a project leasable; it does not make the presubmit use it. Th
 Raise it to the number of leasable projects, not the number provisioned. A slot with no project to lease blocks on Boskos rather than running.
 
 This is the one step in a different repository from section 8's roster: `oss-test-infra` holds the job config, `gke-internal/test-infra` holds the pool. Neither knows about the other, so a change to one is never a prompt to change the other.
+
+## 10. Know when to onboard the next one
+
+Onboard when the rolling p50 wait goes over 15 minutes or the rolling p95 over 45. `scripts/pool_pressure.py` measures that over a seven-day window and exits 1 when either trips; the two numbers are `DEFAULT_P50_THRESHOLD_MINUTES` and `DEFAULT_P95_THRESHOLD_MINUTES` at the top of that file, and this paragraph is what they cite. A day is judged on its own rather than blended into the window, so one bad day trips the check instead of being averaged away, and days under five runs are counted but not judged — a weekend here runs single digits, and two samples put any number at p95.
+
+```bash
+python3 scripts/pool_pressure.py                 # the last seven days
+python3 scripts/pool_pressure.py --json          # the same run as data
+python3 scripts/pool_pressure.py --as-of 2026-08-27 --window-days 1   # replay a past day
+```
+
+It exits 0 within threshold, 1 on a breach, and 2 when it could not measure — which is not a green run. Nothing it does provisions anything; `hack/pool_pressure_cron.sh` runs it on a schedule and hands a breach to a notifier, and it too only reports.
+
+### What "wait" means here
+
+Setup time: everything between Prow accepting the job and the test being able to start, in four segments the check reports separately.
+
+| segment | from              | to                                |
+| ------- | ----------------- | --------------------------------- |
+| queue   | ProwJob created   | pod created                       |
+| pod     | pod created       | container running                 |
+| setup   | container running | the run asks Boskos for a project |
+| lease   | the request       | the project is in hand            |
+
+The split is the point. A run that waited three hours in Prow's queue and a run that waited three hours inside `boskosctl acquire` are the same number in a single total and two different problems, and only one of them is solved by buying a project. Each segment reports how many runs it was measured on, because a log that stops early or a banner that has been reworded upstream makes a segment go quiet, and a median over the few runs that still parse reads exactly like a healthy pool.
+
+### Read the pool before you read the wait
+
+A long wait with the pool full is demand. A long wait with projects sitting free is not, and it has been seen: [oss-test-infra#2666](https://github.com/GoogleCloudPlatform/oss-test-infra/issues/2666) was runs stuck in `triggered` against an idle build cluster, a Prow control-plane problem that onboarding a project would have cost money and fixed nothing. So the check reads the pool alongside the wait and reports one of four causes, and **only `CAPACITY` justifies onboarding**: `CONCURRENCY_CAP` means projects exist that the cap will not let anything reach, `CONTROL_PLANE` is the #2666 shape, and `UNKNOWN` means the pool could not be read and the question is still open.
+
+The lease segment is the tiebreaker between the first and the third. A lease that took minutes is real contention; a prompt lease under a long total wait puts the delay before the pod, where Boskos has no say in it. That used to mean opening a slow build's `build-log.txt` by hand.
+
+Since [oss-test-infra#2678](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2678) the cap equals the pool, so Prow admits enough pods to claim every project and none is held in reserve. One project cleaning, dirty, or holding a leaked lease is then a run that starts on time and blocks in `boskosctl acquire` until its ten-minute timeout. The check says so when it applies, and it is the case where the lease segment is the only place the delay shows.

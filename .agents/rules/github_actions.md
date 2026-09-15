@@ -1,3 +1,9 @@
+---
+# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+paths:
+  - ".github/workflows/**"
+---
+
 # GitHub Actions rules
 
 [`AGENTS.md`](../../AGENTS.md) states both rules below under Pull Request Hygiene. This file holds
@@ -14,13 +20,13 @@ the comment together.
 ## Guard automatically-triggered credentialed workflows against forks
 
 A workflow that needs this repository's secrets and starts on its own — `push`, a tag, `schedule`,
-or `workflow_run` — carries `if: github.repository == 'gke-labs/kube-agents'` on every job. A fork
+`status`, or `workflow_run` — carries `if: github.repository == 'gke-labs/kube-agents'` on every job. A fork
 inherits those triggers but none of the secrets, so an unguarded job fails there on every sync and
 mails the fork owner. Put the guard on each job rather than trusting the skip to cascade through
 `needs`; an `always()` added later removes the implicit `success()` and the job runs anyway.
 
 Two classes need no guard: a workflow reachable only through `workflow_call` is gated by its caller
-(`reusable-deploy-*.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
+(`reconcile-environment.yml`, `teardown-environment.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
 starts it (`rc-create-tag.yml`, `deploy-environment.yml`, `rc-tag-validated.yml`,
 `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
 can publish its own Pages site.

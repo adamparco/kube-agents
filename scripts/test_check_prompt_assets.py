@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import re
 import unittest
 from pathlib import Path
@@ -60,31 +61,29 @@ def _stage_chain(text: str, target: str) -> set[str]:
     return chain
 
 
-def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list[str]]:
-    """Every build-context COPY in a Dockerfile, as its argument list.
+def _instructions(dockerfile: Path, keyword: str, target: str | None = None) -> list[str]:
+    """Every `keyword` line in a Dockerfile, continuations joined.
 
-    Continuations and the multi-source form both matter here: the lines this
-    model depends on are written as `COPY a.md \\\n b.md \\\n /opt/defaults/docs/`,
-    and a parser that reads physical lines sees none of them. That failure is
-    silent in the worst way -- it makes the comparison below pass over an empty
-    list until a `self.assertTrue(expected)` catches it.
+    Continuations matter here: the lines these models depend on are written as
+    `COPY a.md \\\n b.md \\\n /opt/defaults/docs/` and as `RUN foo; \\\n chmod
+    ...`, and a parser that reads physical lines sees neither. That failure is
+    silent in the worst way -- it makes a comparison pass over an empty list
+    until an `assertTrue` catches it.
 
-    `COPY --from=<stage>` is skipped rather than having its flag dropped. Its
-    source is another build stage, not this repository, so a path in it says
-    nothing about a file in the checkout. Today the only two land in
-    /usr/local/bin and OPT_DEFAULTS would ignore them anyway; the point is that
-    one aimed at an asset directory would otherwise be read as a repo path and
-    quietly agree with a model that is wrong.
+    `target` narrows the result to the stages that build one image. An
+    instruction in a sibling stage lands in a different image and says nothing
+    about this one -- `credential-proxy` writes its own /opt/defaults/scripts
+    from the same sources, and counting both would have the caller's model claim
+    the agent image copies each of them twice.
 
-    `target` narrows the result to the stages that build one image. A COPY in a
-    sibling stage lands in a different image and says nothing about this one --
-    `credential-proxy` writes its own /opt/defaults/scripts from the same
-    sources, and counting both would have the caller's model claim the agent
-    image copies each of them twice.
+    The result keeps file order, which is build order: a stage can only be built
+    `FROM` one defined above it, so a later line in the chain is a later layer.
+    Callers that care which instruction wins -- the last `chmod` of a directory,
+    say -- can rely on that.
     """
     text = re.sub(r"\\\n", " ", dockerfile.read_text(encoding="utf-8"))
     chain = _stage_chain(text, target) if target else None
-    instructions = []
+    lines = []
     stage = None
     for line in text.splitlines():
         tokens = line.split()
@@ -92,10 +91,26 @@ def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list
             arguments = [token for token in tokens[1:] if not token.startswith("--")]
             stage = arguments[-1] if len(arguments) >= 3 and arguments[-2].upper() == "AS" else None
             continue
-        if not line.startswith("COPY "):
+        if not tokens or tokens[0].upper() != keyword:
             continue
         if chain is not None and stage not in chain:
             continue
+        lines.append(line)
+    return lines
+
+
+def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list[str]]:
+    """Every build-context COPY in a Dockerfile, as its argument list.
+
+    `COPY --from=<stage>` is skipped rather than having its flag dropped. Its
+    source is another build stage, not this repository, so a path in it says
+    nothing about a file in the checkout. Today the only two land in
+    /usr/local/bin and OPT_DEFAULTS would ignore them anyway; the point is that
+    one aimed at an asset directory would otherwise be read as a repo path and
+    quietly agree with a model that is wrong.
+    """
+    instructions = []
+    for line in _instructions(dockerfile, "COPY", target):
         flags = [argument for argument in line.split()[1:] if argument.startswith("--")]
         if any(flag.startswith("--from=") for flag in flags):
             continue
@@ -107,6 +122,47 @@ def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list
         if len(arguments) >= 2:
             instructions.append(arguments)
     return instructions
+
+
+# `chmod <mode> /opt/defaults` anywhere inside a RUN's command chain, with or
+# without the trailing slash. The trailing lookahead is what keeps
+# /opt/defaults/scripts -- a different directory with its own mode -- out.
+_CHMOD_OPT_DEFAULTS = re.compile(
+    r"\bchmod\s+(?:-\S+\s+)*(?P<mode>\S+)\s+/opt/defaults/?(?=[\s;&|]|$)"
+)
+_NUMERIC_MODE = re.compile(r"[0-7]{3,4}")
+_SYMBOLIC_CLAUSE = re.compile(r"([ugoa]*)([-+=])([rwxXst]*)")
+
+
+def _leaves_other_execute(mode: str) -> bool | None:
+    """Whether `chmod <mode>` decides the `other` execute bit, and to what.
+
+    ``None`` means it does not decide: `chmod g+x` and `chmod o+r` both leave
+    whatever was there. A caller folding a sequence of modes skips those and
+    takes the last one that answered.
+
+    Raises on a mode it cannot read, which is the point -- a chmod this parser
+    silently ignored would let the check below pass on a directory nothing had
+    widened.
+    """
+    if _NUMERIC_MODE.fullmatch(mode):
+        return bool(int(mode[-1], 8) & 1)
+    decided = None
+    for clause in mode.split(","):
+        parsed = _SYMBOLIC_CLAUSE.fullmatch(clause)
+        if not parsed:
+            raise ValueError(f"unreadable chmod mode {mode!r}")
+        who, operator, permissions = parsed.groups()
+        # An empty `who` is `a` masked by the umask; treat it as touching other.
+        if "o" not in (who or "a") and "a" not in (who or "a"):
+            continue
+        # `X` sets execute on a directory, which /opt/defaults is.
+        executable = "x" in permissions or "X" in permissions
+        if operator == "=":
+            decided = executable
+        elif executable:
+            decided = operator == "+"
+    return decided
 
 
 class ProfileFixture:
@@ -312,6 +368,52 @@ class SyntheticProfileTests(unittest.TestCase):
         )
         self.assertEqual([], self.fixture.rules())
 
+    def test_a_cron_path_with_an_argument_after_it_is_still_checked(self):
+        """The old pattern demanded the closing quote right after the extension.
+
+        So `'collect.py <stream>'` matched nothing and the reference went
+        unchecked: three of the eight collector invocations in the platform
+        roster name a stream after the script, and renaming `collect.py` left
+        `make prompt-check` at exit 0.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": '
+            "\"Run 'skills/thing/scripts/collect.py compliance-audit'.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_a_cron_path_behind_an_interpreter_is_still_checked(self):
+        """Same gap from the other side: a prefix before the path, not after.
+
+        The cost roster spells its collector
+        `'/opt/hermes/.venv/bin/python3 skills/.../fleet_waste.py'`, which the
+        old pattern also skipped.
+        """
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "cost", "prompt": '
+            "\"Run '/opt/hermes/.venv/bin/python3 skills/thing/scripts/waste.py'.\"}]}",
+        )
+        self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_an_absolute_interpreter_is_not_itself_an_asset(self):
+        """The interpreter ships in the image, not in the profile.
+
+        Reporting `/opt/hermes/.venv/bin/python3` as missing would be a false
+        finding on every roster that spells its collector out in full, so the
+        path pattern requires the first segment to be a name rather than the
+        empty string a leading `/` produces.
+        """
+        self.fixture.write("agents/platform/skills/thing/scripts/waste.py", "x = 1\n")
+        self.fixture.skill("thing")
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "cost", "prompt": '
+            "\"Run '/opt/hermes/.venv/bin/python3 skills/thing/scripts/waste.py'.\"}]}",
+        )
+        self.assertEqual([], self.fixture.rules())
+
     def test_a_roster_that_moves_within_agents_is_still_found(self):
         """Two hardcoded paths behind is_file() made both cron rules no-ops.
 
@@ -324,6 +426,47 @@ class SyntheticProfileTests(unittest.TestCase):
             '{"jobs": [{"id": "sweep", "prompt": "Read \'governance/gone.md\'."}]}',
         )
         self.assertEqual(["cron-asset"], self.fixture.rules())
+
+    def test_cron_job_missing_risk_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": ""}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_risk()
+        self.assertEqual(["cron-risk"], [f.rule for f in findings])
+        self.assertIn("has risk=None", findings[0].message)
+
+    def test_cron_job_with_invalid_risk_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "", "risk": "super-high"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_risk()
+        self.assertEqual(["cron-risk"], [f.rule for f in findings])
+        self.assertIn("has risk='super-high'", findings[0].message)
+
+    def test_cron_job_with_valid_risk_passes(self):
+        for risk in ("low", "high"):
+            with self.subTest(risk=risk):
+                self.fixture.write(
+                    "agents/platform/cron/jobs.json",
+                    f'{{"jobs": [{{"id": "audit", "prompt": "", "risk": "{risk}"}}]}}',
+                )
+                with mock.patch.object(cpa, "REPO", self.fixture.root):
+                    findings = cpa.check_cron_risk()
+                self.assertEqual([], findings)
+
+    def test_cron_job_with_medium_risk_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "", "risk": "medium"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_risk()
+        self.assertEqual(["cron-risk"], [f.rule for f in findings])
+        self.assertIn("has risk='medium'", findings[0].message)
 
     def test_runtime_state_paths_are_not_asset_references(self):
         self.fixture.write(
@@ -403,6 +546,40 @@ class ResolutionModelTests(unittest.TestCase):
             parsed, [["agents/platform/docs/glossary.md", "/opt/defaults/docs/"]]
         )
 
+    def test_a_copy_in_an_unrelated_stage_is_not_part_of_the_agent_image(self):
+        """Two images, one Dockerfile, and /opt/defaults in both of them.
+
+        The credential-proxy stage puts the credential runtime under
+        /opt/defaults/scripts as well. It is a sibling of the agent image rather
+        than a layer of it and has no profile homes, so counting its COPY lines
+        would put a second `scripts` entry in the model for a directory the
+        entrypoint never sees. The fixture branches the two off a shared
+        agent-base, which is what the real file does: a parser that keyed on the
+        base image rather than on the stage graph would read them as one image.
+        """
+        with TemporaryDirectory() as directory:
+            dockerfile = Path(directory) / "Dockerfile"
+            dockerfile.write_text(
+                "COPY before/first-stage.md /opt/defaults/\n"
+                "FROM ${HERMES_AGENT_IMAGE}:${TAG} AS agent-base\n"
+                "COPY agents/chat/SOUL.md /opt/defaults/\n"
+                "FROM agent-base AS platform\n"
+                "COPY agents/platform/scripts/ /opt/defaults/scripts/\n"
+                "FROM agent-base AS credential-proxy\n"
+                "COPY agents/platform/scripts/ /opt/defaults/scripts/\n",
+                encoding="utf-8",
+            )
+            text = dockerfile.read_text(encoding="utf-8")
+            self.assertEqual(_stage_chain(text, "platform"), {"platform", "agent-base"})
+            parsed = _copy_instructions(dockerfile, target="platform")
+        self.assertEqual(
+            parsed,
+            [
+                ["agents/chat/SOUL.md", "/opt/defaults/"],
+                ["agents/platform/scripts/", "/opt/defaults/scripts/"],
+            ],
+        )
+
     def test_opt_defaults_matches_the_dockerfile(self):
         """OPT_DEFAULTS is a hand-written copy of the image layout.
 
@@ -418,10 +595,9 @@ class ResolutionModelTests(unittest.TestCase):
         its own /opt/defaults/scripts from the same five sources, but it is a
         different image and the entrypoint this table models never runs there.
         """
+        dockerfile = REPO / "deploy/docker/Dockerfile"
         expected: list[tuple[str, str]] = []
-        for arguments in _copy_instructions(
-            REPO / "deploy/docker/Dockerfile", target="platform"
-        ):
+        for arguments in _copy_instructions(dockerfile, target="platform"):
             *sources, destination = arguments
             if not destination.startswith("/opt/defaults/"):
                 continue
@@ -475,6 +651,78 @@ class ResolutionModelTests(unittest.TestCase):
             "from different sources; the sidecar runs credential_proxy.py out of "
             "that directory and has no other copy of it",
         )
+
+    def test_the_sidecar_leaves_opt_defaults_traversable(self):
+        """/opt/defaults must be traversable by a uid other than hermes.
+
+        agent-base leaves it 0700 hermes:hermes. Co-located with the shell
+        sandbox the sidecar runs as uid 1000, the sandbox login, so that the two
+        containers can share a working tree -- and 0700 there makes every script
+        under it unreachable however permissive the scripts' own modes are.
+
+        The symptom is a container that exits on its first line with "Permission
+        denied" against a path whose mode is 0755, which sends the reader to the
+        file rather than to its parent. It survives no other gate: the image
+        builds, the COPY comparison above passes, and the standalone placement
+        runs as hermes and never notices.
+
+        What the chain ends on is what ships, so the modes are folded in build
+        order and the last one to decide the bit is the one asserted on. A test
+        that only asked whether some line widened the directory would pass on a
+        chain that widened it and then narrowed it again -- which is exactly the
+        regression it is here to catch, since the stages below already carry
+        three chmods of this one path.
+        """
+        dockerfile = REPO / "deploy/docker/Dockerfile"
+        traversable = None
+        modes = []
+        for line in _instructions(dockerfile, "RUN", target="credential-proxy"):
+            for match in _CHMOD_OPT_DEFAULTS.finditer(line):
+                mode = match.group("mode")
+                modes.append(mode)
+                decided = _leaves_other_execute(mode)
+                if decided is not None:
+                    traversable = decided
+        self.assertTrue(
+            modes,
+            "no RUN in the credential-proxy chain chmods /opt/defaults; either the "
+            "widening is gone or this parser is stale",
+        )
+        self.assertTrue(
+            traversable,
+            "the credential-proxy chain leaves /opt/defaults untraversable by "
+            f"`other` (chmods, in build order: {modes}); co-located with the "
+            "sandbox the sidecar runs as uid 1000 and cannot reach the scripts it "
+            "is started with",
+        )
+
+    def test_the_mode_reader_behind_that_check_can_be_trusted(self):
+        """_leaves_other_execute, on the forms a Dockerfile can spell.
+
+        The check above is only as good as this: a mode it misreads as widening
+        passes a chain that ships 0700, and one it fails to read at all is a
+        chmod that silently does not count. Both are quiet, so pin the table.
+        """
+        for mode, expected in [
+            ("0755", True),
+            ("755", True),
+            ("0750", False),
+            ("0700", False),
+            ("1777", True),
+            ("o+x", True),
+            ("a+rx", True),
+            ("+x", True),
+            ("o-x", False),
+            ("o=rx", True),
+            ("o=r", False),
+            ("u+rwx,go+rX", True),
+            ("g+x", None),
+            ("o+r", None),
+        ]:
+            with self.subTest(mode=mode):
+                self.assertEqual(_leaves_other_execute(mode), expected)
+        with self.assertRaises(ValueError):
+            _leaves_other_execute("--reference=/etc/passwd")
 
     def test_the_defaults_layer_reaches_the_default_profile_and_no_other(self):
         """The `cp -ru` is to $TARGET_DIR, which is one home, not every home.
@@ -651,6 +899,7 @@ class RepositoryTests(unittest.TestCase):
                 + cpa.check_skill_refs(files, skills)
                 + cpa.check_skill_manifests(skills)
                 + cpa.check_cron_assets()
+                + cpa.check_cron_risk()
             )
         self.assertEqual([], [str(f) for f in findings])
 
@@ -712,6 +961,58 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(discovered - on_disk, set(), "rosters the checker invented")
         self.assertGreater(jobs, 0, "rosters found but every one of them is empty")
 
+    def _roster_repo(self, directory, document):
+        root = Path(directory)
+        home = root / "agents" / "platform" / "cron"
+        home.mkdir(parents=True)
+        (home / "jobs.json").write_text(json.dumps(document), encoding="utf-8")
+        return root
+
+    def test_a_roster_with_no_jobs_list_names_the_file(self):
+        """The glob's own consequence: a file this script has never seen.
+
+        Discovery exists so a roster that moves is still checked, which means
+        the first thing the loader does is index into a file nobody vetted.
+        `["jobs"]` on one without that key raised a bare `KeyError: 'jobs'`,
+        naming the line of this script that died and not the file that is
+        wrong -- and every rule downstream reads rosters, so it takes the whole
+        run with it.
+        """
+        for document in ({"job": []}, [], {"jobs": {}}, {"jobs": None}):
+            with self.subTest(document=document), TemporaryDirectory() as directory:
+                root = self._roster_repo(directory, document)
+                with mock.patch.object(cpa, "REPO", root):
+                    with self.assertRaises(SystemExit) as caught:
+                        cpa.cron_rosters()
+                self.assertIn("agents/platform/cron/jobs.json", str(caught.exception))
+                self.assertIn("jobs", str(caught.exception))
+
+    def test_a_job_with_no_id_names_the_file_and_the_index(self):
+        """Every message the cron rules print interpolates `job['id']`.
+
+        A job missing it therefore turned a finding into a traceback from
+        whichever rule reached it first, which is neither the finding nor a
+        clue about where to look.
+        """
+        for jobs in ([{"deliver": "chat"}], [{"id": "  "}], ["chat"]):
+            with self.subTest(jobs=jobs), TemporaryDirectory() as directory:
+                root = self._roster_repo(directory, {"jobs": jobs})
+                with mock.patch.object(cpa, "REPO", root):
+                    with self.assertRaises(SystemExit) as caught:
+                        cpa.cron_rosters()
+                message = str(caught.exception)
+                self.assertIn("agents/platform/cron/jobs.json", message)
+                self.assertIn("index 0", message)
+
+    def test_a_well_formed_roster_still_loads(self):
+        """The guards must not refuse the shape the repository actually ships."""
+        with TemporaryDirectory() as directory:
+            root = self._roster_repo(directory, {"jobs": [{"id": "audit"}]})
+            with mock.patch.object(cpa, "REPO", root):
+                self.assertEqual(
+                    [jobs for _, jobs in cpa.cron_rosters()], [[{"id": "audit"}]]
+                )
+
     def test_it_is_actually_looking_at_something(self):
         """A checker whose scope silently empties reports a clean repository.
 
@@ -751,6 +1052,216 @@ class RepositoryTests(unittest.TestCase):
                 f"{design} reaches no profile; checking it demands a rewrite "
                 "that breaks the citation for its only reader",
             )
+
+
+class CronDeliveryTests(unittest.TestCase):
+    """A scheduled job that reports `ok` and posts nowhere.
+
+    An unresolvable `deliver` part is dropped by the scheduler rather than
+    raising, so a job whose every part drops records `last_status: ok` with
+    `last_delivery_error: None` while reaching nobody. `gchat` stands in for that
+    typo throughout: it is the abbreviation someone reaches for, it is not a
+    registered platform, and nothing outside this check would object to it.
+    """
+
+    def _findings(self, *jobs):
+        roster = [(REPO / "agents/platform/cron/jobs.json", list(jobs))]
+        with mock.patch.object(cpa, "REPO", REPO), mock.patch.object(
+            cpa, "cron_rosters", return_value=roster
+        ):
+            return cpa.check_cron_delivery()
+
+    def test_a_target_that_resolves_to_nothing_is_caught(self):
+        findings = self._findings({"id": "compliance-audit", "deliver": "gchat"})
+        self.assertEqual(len(findings), 1, findings)
+        message = str(findings[0])
+        self.assertIn("compliance-audit", message)
+        self.assertIn("'gchat'", message)
+        self.assertIn("post", message.lower())
+
+    def test_chat_is_this_repositorys_own_relay_and_not_a_typo(self):
+        """The check shipped with `chat` missing, calling nine live jobs broken.
+
+        `deploy/docker/plugins/chat/` posts the report through the Session KV
+        server, which runs a Chat Agent turn over it and delivers the result --
+        so `chat` is the value eight of the fleet audits are supposed to carry.
+        It looks dead from outside a cron child, because `profile_cron_tick.py`
+        is the only setter of its `CHAT_HOME_CHANNEL`; that is what a checker
+        author sees, and it is what this test exists to contradict.
+        """
+        self.assertEqual(self._findings({"id": "compliance-audit", "deliver": "chat"}), [])
+
+    def test_the_values_that_mean_something_all_pass(self):
+        for deliver in ("all", "chat", "local", "origin", "slack", "google_chat"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
+
+    def test_a_null_deliver_is_the_absent_key_the_runtime_reads_it_as(self):
+        """`raw = job.get("deliver") or ""` -- null and absent are one shape.
+
+        A `get` default fires on absence only, so an explicit `null` reached
+        the splitter as the string `None` and was reported as a job delivering
+        to `'None'`. That failed `make prompt-check` over a roster the
+        scheduler runs exactly as it runs one with no `deliver` key at all.
+        """
+        for job in ({"id": "j"}, {"id": "j", "deliver": None}):
+            with self.subTest(job=job):
+                self.assertEqual(self._findings(job), [])
+
+    def test_an_explicit_target_names_its_own_destination(self):
+        """`platform:chat_id` carries an install-specific id. Nothing to check."""
+        self.assertEqual(
+            self._findings({"id": "j", "deliver": "slack:D0BKGRBM6RH:17"}), []
+        )
+
+    def test_a_misspelled_prefix_drops_exactly_as_a_misspelled_bare_value_does(self):
+        """Skipping a part on sight of a colon let this shape through.
+
+        `gchat:spaces/AAA` resolves to no platform and drops silently, which
+        is the same silence a bare `gchat` buys -- so the prefix is checked
+        the same way the bare value is.
+        """
+        for deliver in ("gchat:spaces/AAA", "gchat:spaces/AAA:thread-1"):
+            with self.subTest(deliver=deliver):
+                findings = self._findings({"id": "j", "deliver": deliver})
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn(f"'{deliver}'", str(findings[0]))
+
+    def test_an_empty_prefix_is_caught_where_an_empty_part_is_not(self):
+        """Two different things that both look like "nothing before the colon".
+
+        `"chat,,slack"` is a stray comma -- the scheduler ignores it and no
+        delivery is lost. `":C123"` names no platform, resolves to nothing and
+        drops silently, so it is the failure this check exists for. One
+        emptiness test cannot serve both.
+        """
+        self.assertEqual(self._findings({"id": "j", "deliver": "chat,,slack"}), [])
+        for deliver in (":C123", ":", "slack:C1,:C2"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(len(self._findings({"id": "j", "deliver": deliver})), 1)
+
+    def test_the_gate_is_no_stricter_than_the_parser_it_guards(self):
+        """`_resolve_delivery_targets` case-folds the platform and takes `:`.
+
+        Both shapes deliver; flagging them would block a pull request over a
+        value the runtime handles fine.
+        """
+        for deliver in ("Slack:C123", "ALL"):
+            with self.subTest(deliver=deliver):
+                self.assertEqual(self._findings({"id": "j", "deliver": deliver}), [])
+
+    def test_a_semicolon_is_not_a_separator_and_is_reported(self):
+        """The gate must mirror the parser that *delivers*, not the relay's.
+
+        `cron/scheduler.py::_resolve_delivery_targets` splits on `,` alone, so
+        `chat;slack` is one part it cannot resolve: it drops silently and the
+        job records `ok` having posted nowhere. Splitting on `;` here -- on the
+        authority of `sibling_delivery_targets`, which only decides what the
+        relay subtracts -- passed exactly that roster through
+        `make prompt-check`. Read out of the running pod on 2026-09-01.
+        """
+        for deliver in ("chat;slack", "chat; slack", "chat;gchat", ["chat;slack"]):
+            with self.subTest(deliver=deliver):
+                findings = self._findings({"id": "j", "deliver": deliver})
+                self.assertEqual(len(findings), 1, findings)
+
+    def test_every_part_of_a_comma_separated_list_is_checked(self):
+        """One good part must not vouch for a bad one.
+
+        This is the shape the bug would most plausibly come back in: someone
+        adds `all` alongside the value that was already there.
+        """
+        findings = self._findings({"id": "j", "deliver": "all,gchat"})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("'gchat'", str(findings[0]))
+
+    def test_a_list_is_flattened_the_way_the_scheduler_flattens_it(self):
+        """`_normalize_deliver_value` accepts a list, so reading one is not a bug.
+
+        Reporting the shape rather than the value would send someone to fix
+        something the scheduler runs happily.
+        """
+        self.assertEqual(self._findings({"id": "j", "deliver": ["all"]}), [])
+        self.assertEqual(len(self._findings({"id": "j", "deliver": ["gchat"]})), 1)
+
+    def test_a_list_entry_that_carries_a_separator_is_split_like_the_scheduler(self):
+        """`_normalize_deliver_value` joins the list on `,` and *then* splits.
+
+        Checking each list entry whole instead reads `"google_chat,slack"` as
+        one unknown target and fails the roster over a value the scheduler
+        resolves into two working ones. `make prompt-check` gates every pull
+        request here, so the false positive is repository-wide, not
+        roster-local.
+        """
+        self.assertEqual(
+            self._findings({"id": "j", "deliver": ["chat", "google_chat,slack"]}), []
+        )
+        # Still finds the bad half, rather than passing the whole entry.
+        findings = self._findings({"id": "j", "deliver": ["chat", "slack,gchat"]})
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("'gchat'", str(findings[0]))
+
+    def test_an_absent_deliver_is_local_and_not_a_finding(self):
+        self.assertEqual(self._findings({"id": "j"}), [])
+
+    def test_the_rosters_in_this_tree_all_deliver_somewhere(self):
+        with mock.patch.object(cpa, "REPO", REPO):
+            self.assertEqual(cpa.check_cron_delivery(), [])
+
+    def _audit_deliveries(self, rosters):
+        """Where each scheduled audit sends its report, keyed by job id.
+
+        By the skill it loads, not by a naming convention: three of the eight
+        streams end in neither `-audit` nor `-analysis`, so matching on the id
+        would have quietly graded five of them.
+        """
+        return {
+            # `or`, not a `get` default, for the reason `check_cron_delivery`
+            # gives: an explicit JSON `null` is the absent key to the runtime.
+            # A default that fires on absence alone left it as `None`, which
+            # holds no `local` and so passed the rule below.
+            job["id"]: job.get("deliver") or "local"
+            for _, roster in rosters
+            for job in roster
+            if "fleet-audit" in (job.get("skills") or [])
+        }
+
+    def test_every_scheduled_audit_reaches_a_home_channel(self):
+        """`local` passes the rule above and would silence the fleet audits.
+
+        The rule cannot object to `local` in general -- the Chat Agent's roster
+        uses it deliberately -- so the audits state their own requirement here.
+        A scheduled audit exists to put a line in the home channel; one set to
+        `local` still runs, still writes its report, and still tells nobody.
+        """
+        with mock.patch.object(cpa, "REPO", REPO):
+            rosters = cpa.cron_rosters()
+        audits = self._audit_deliveries(rosters)
+        self.assertGreaterEqual(len(audits), 8, f"audit discovery has narrowed: {audits}")
+        for audit, deliver in sorted(audits.items()):
+            with self.subTest(audit=audit):
+                self.assertNotIn(
+                    "local", str(deliver), f"{audit} runs and tells nobody"
+                )
+
+    def test_a_null_deliver_is_local_to_the_audit_rule_too(self):
+        """The one shape that cleared both gates at once.
+
+        `check_cron_delivery` reads a null `deliver` as the absent key the
+        runtime reads it as, so it reports nothing. This rule read the same
+        null as the string `None`, which holds no `local`, so it reported
+        nothing either -- an audit that runs, writes its report, and tells
+        nobody, with `make prompt-check` green over it.
+        """
+        roster = [
+            (
+                REPO / "agents/platform/cron/jobs.json",
+                [{"id": "compliance-audit", "skills": ["fleet-audit"], "deliver": None}],
+            )
+        ]
+        self.assertEqual(
+            self._audit_deliveries(roster), {"compliance-audit": "local"}
+        )
 
 
 class ProfileIsolationTests(unittest.TestCase):

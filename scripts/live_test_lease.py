@@ -38,7 +38,7 @@ format changes. Both accept `K=V` and `export K=V`, because install.env is a
 hand-authored dotenv and vars.sh was generated with `printf %q`.
 
 Usage:
-  live_test_lease.py status  [--env NAME]
+  live_test_lease.py status  [--env NAME] [--json]
   live_test_lease.py acquire [--env NAME] [--pr N] [--note TEXT] [--ttl MINUTES]
   live_test_lease.py renew   [--env NAME] [--ttl MINUTES]
   live_test_lease.py release [--env NAME] [--all]
@@ -67,8 +67,38 @@ DEFAULT_TTL_MIN = 60
 # to stay well inside the `timeout` set in .claude/settings.json. The hook makes
 # at most three of these in a row (read the lease, then renew: read again and
 # replace) plus one context probe, which is cached per classification because a
-# compound line would otherwise pay for one probe per segment.
 KUBECTL_TIMEOUT = 8
+
+
+def _get_kubectl_timeout() -> int:
+    """Resolves the kubectl execution timeout in seconds.
+
+    Reads KUBE_AGENTS_KUBECTL_TIMEOUT from the environment if set, otherwise
+    defaults to KUBECTL_TIMEOUT (8s).
+
+    Why this variable exists:
+    On cold GitHub Actions runners, the first kubectl command must cold-start
+    gke-gcloud-auth-plugin, exchange tokens with Google STS / IAM via Workload
+    Identity Federation (WIF), and perform TLS handshakes to GKE API endpoints
+    over the public internet. Under cloud latency jitter this takes ~8-9s,
+    exceeding the 8s hook budget and causing spurious acquire/status timeouts
+    (exit code 124) during reconcile and deploy CI jobs (#1465).
+
+    Where it is configured:
+    In GitHub Repository Settings under Environments (e.g. `autopush`, `staging`)
+    as `vars.KUBE_AGENTS_KUBECTL_TIMEOUT` (typically set to 15s), passed into CI
+    workflow steps via `env: KUBE_AGENTS_KUBECTL_TIMEOUT: ${{ vars.KUBE_AGENTS_KUBECTL_TIMEOUT }}`.
+    Can also be exported locally in shell environments to override the timeout.
+    """
+    raw = os.environ.get("KUBE_AGENTS_KUBECTL_TIMEOUT")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return KUBECTL_TIMEOUT
 
 # SessionEnd `reason` values that do not end the session. Claude Code fires the
 # event for `/clear` and `/resume` too, on a process that carries on with the
@@ -78,7 +108,7 @@ KUBECTL_TIMEOUT = 8
 SESSION_CONTINUES = frozenset({"clear", "resume"})
 
 # The namespace an install uses unless its configuration says otherwise. Source
-# of truth: NAMESPACE in scripts/installer/common.sh.
+# of truth: DEFAULT_NAMESPACE in install.defaults.env.
 DEFAULT_NAMESPACE = "kubeagents-system"
 
 # Only these keys are read out of an install's configuration. Both files are
@@ -586,13 +616,14 @@ def kubectl(install, args, stdin=None):
     kenv = dict(os.environ)
     if install.kubeconfig:
         kenv["KUBECONFIG"] = install.kubeconfig
+    timeout = _get_kubectl_timeout()
     try:
         proc = subprocess.run(
             cmd, input=stdin, capture_output=True, text=True,
-            timeout=KUBECTL_TIMEOUT, env=kenv,
+            timeout=timeout, env=kenv,
         )
     except subprocess.TimeoutExpired:
-        return 124, "", "kubectl timed out after %ds" % KUBECTL_TIMEOUT
+        return 124, "", "kubectl timed out after %ds" % timeout
     except FileNotFoundError:
         return 127, "", "kubectl not found on PATH"
     return proc.returncode, proc.stdout, proc.stderr
@@ -854,7 +885,14 @@ MAKE_TARGET_PREFIXES = ("deploy-", "undeploy-", "docker-push-")
 # Installer flags that print and exit without touching the install. Taking an
 # hour-long lease on a shared cluster for `./install.sh --help` is the same
 # false positive as classifying `cat install.sh` as a run.
-INSTALLER_NOOP_FLAGS = {"-h", "--help", "-?", "--dry-run"}
+#
+# `--plan` belongs here for the same reason `--dry-run` does, and is the one
+# that needs saying out loud: it reads the install's real Terraform state and
+# so looks like the mutating path, but it takes no state lock, creates no state
+# bucket, runs none of the adoption imports, and skips the Session KV backfill.
+# What it does write is local to the checkout -- terraform.tfvars and
+# backend_override.tf -- which the lease does not govern.
+INSTALLER_NOOP_FLAGS = {"-h", "--help", "-?", "--dry-run", "--plan"}
 
 # Prefixes that wrap a command without changing what it runs. Stripping them is
 # what lets the classifier look at the command word rather than at every token
@@ -1833,6 +1871,37 @@ def print_status(installs):
                   % (name, install.label, "", describe(data), yours))
 
 
+def status_json(installs):
+    """`status` for a caller that has to branch on the answer.
+
+    The human listing above is two lines per install and says "HELD" inside a
+    sentence, so the only way to act on it is to match text -- and a scheduled
+    `terraform apply` deciding whether to destroy somebody's live validation is
+    the wrong place for a grep. `unreachable` is reported as its own state
+    rather than folded into free: a cluster that cannot be asked has not
+    answered "no".
+    """
+    out = []
+    for name in sorted(installs):
+        install = installs[name]
+        entry = {"name": name, "label": install.label}
+        try:
+            data, _ = get_lease(install)
+        except Unreachable as exc:
+            entry.update(state="unreachable", detail=str(exc))
+            out.append(entry)
+            continue
+        if not lease_is_live(data):
+            entry.update(state="free", detail=describe(data) if data else "")
+        else:
+            entry.update(state="held", detail=describe(data),
+                         holder=data.get("holder", ""),
+                         expiresAt=data.get("expiresAt", ""),
+                         pr=data.get("pr", ""))
+        out.append(entry)
+    print(json.dumps(out, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="live_test_lease.py", description=__doc__,
@@ -1847,6 +1916,8 @@ def main():
     ap.add_argument("--ttl", type=int, default=DEFAULT_TTL_MIN)
     ap.add_argument("--all", action="store_true", help="release every install you hold")
     ap.add_argument("--force", action="store_true", help="steal even a live lease")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable `status` output")
     args = ap.parse_args()
 
     if args.action == "hook-pretooluse":
@@ -1870,8 +1941,12 @@ def main():
 
     try:
         if args.action == "status":
-            print_status({args.env: pick(installs, args.env)} if args.env
-                         else installs)
+            selected = ({args.env: pick(installs, args.env)} if args.env
+                        else installs)
+            if args.json:
+                status_json(selected)
+            else:
+                print_status(selected)
             return 0
 
         if args.action == "acquire":

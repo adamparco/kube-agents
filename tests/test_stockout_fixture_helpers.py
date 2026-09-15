@@ -26,6 +26,7 @@ import sys
 import time
 import types
 import unittest
+import warnings
 from unittest import mock
 
 import yaml
@@ -34,12 +35,32 @@ from test_gateway_rollout_budgets import _rollout_gate_seconds
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _FIXTURE = _ROOT / "tests" / "e2e" / "test_stockout_investigation.py"
-_AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
+_CLEAN_SCRIPT = _ROOT / "agentplugins" / "gke-stockout-investigator" / "scenarios" / "lib" / "clean_stale_kanban_tasks.py"
+_UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _E2E_RUN_WORKFLOW = _ROOT / ".github" / "workflows" / "e2e-run.yml"
+_E2E_CONFIG = _ROOT / "tests" / "e2e" / "e2e_config.yaml"
+
+
+def _load_clean_script_module():
+    spec = importlib.util.spec_from_file_location("clean_stale_kanban_tasks", _CLEAN_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+csk = _load_clean_script_module()
 
 
 class _StubFailure(Exception):
     """What the stubbed pytest.fail and pytest.skip raise."""
+
+
+class _StubSkip(_StubFailure):
+    """Raised when pytest.skip is called."""
+
+
+class _StubFail(_StubFailure):
+    """Raised when pytest.fail is called."""
 
 
 def _pytest_stub() -> types.ModuleType:
@@ -62,10 +83,10 @@ def _pytest_stub() -> types.ModuleType:
     stub.mark = mark
 
     def _fail(msg="", pytrace=True):
-        raise _StubFailure(msg)
+        raise _StubFail(msg)
 
     def _skip(msg="", **kwargs):
-        raise _StubFailure(msg)
+        raise _StubSkip(msg)
 
     stub.fail = _fail
     stub.skip = _skip
@@ -430,7 +451,7 @@ class BudgetTest(unittest.TestCase):
         # rewritten: test_gateway_rollout_budgets.py owns that expression.
         self.assertLess(
             sof._ROLLOUT_TIMEOUT_SECONDS,
-            _rollout_gate_seconds(_AGENT_WORKFLOW, "platform-agent-gateway"),
+            _rollout_gate_seconds(_UPGRADE_SCRIPT, "platform-agent-gateway"),
             "the fixture waits on a warm re-template, so its ceiling should sit below the "
             "cold-boot budget the deploy workflow sanctions",
         )
@@ -457,11 +478,442 @@ class BudgetTest(unittest.TestCase):
         )
 
     def test_every_wait_is_capped_by_the_budget(self):
-        for name in ("_INSTALL_TIMEOUT_SECONDS", "_ROLLOUT_TIMEOUT_SECONDS",
+        for name in ("_ROLLOUT_TIMEOUT_SECONDS",
                      "_PLUGIN_READY_TIMEOUT_SECONDS", "_SKILL_MOUNT_TIMEOUT_SECONDS",
-                     "_GENERATION_STABLE_SECONDS"):
+                     "_GENERATION_STABLE_SECONDS", "_AGENT_AVAILABILITY_TIMEOUT_SECONDS",
+                     "_DEGRADED_PERSISTENCE_SECONDS"):
             with self.subTest(constant=name):
                 self.assertLessEqual(getattr(sof, name), sof._FIXTURE_BUDGET_SECONDS)
+
+
+class WaitAgentAvailableTest(unittest.TestCase):
+    """Verifies that _wait_for_agent_available checks rollout, pod readiness, skill mount, and kanban cleanup."""
+
+    def test_ready_agent_returns_pod_name(self):
+        def fake_kubectl(*args, **kwargs):
+            if "rollout" in args:
+                return _completed(returncode=0)
+            if "exec" in args:
+                # Skill probe or kanban cleanup
+                return _completed(stdout="PRESENT\n")
+            if "deployment" in args:
+                return _completed(returncode=0)
+            if "platformagent" in args:
+                return _completed(stdout="/opt/data")
+            return _completed(stdout=json.dumps({"items": [GatewayPodTest._pod("gw-ready")]}))
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_current_revision_selector", return_value=None):
+            pod = sof._wait_for_agent_available("platform-agent", "ns", timeout=10)
+        self.assertEqual(pod, "gw-ready")
+
+    def test_rollout_failure_raises(self):
+        def fake_kubectl(*args, **kwargs):
+            if "rollout" in args:
+                return _completed(returncode=1, stderr="rollout timeout")
+            if "deployment" in args:
+                return _completed(returncode=0)
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubFailure) as caught:
+                sof._wait_for_agent_available("platform-agent", "ns", timeout=10)
+        self.assertIn("rollout not ready", str(caught.exception))
+
+    def test_unready_pod_raises_when_timeout_exhausted(self):
+        def fake_kubectl(*args, **kwargs):
+            if "rollout" in args:
+                return _completed(returncode=0)
+            if "deployment" in args:
+                return _completed(returncode=0)
+            return _completed(stdout=json.dumps({"items": [GatewayPodTest._pod("gw-unready", ready=False)]}))
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_current_revision_selector", return_value=None), \
+                mock.patch.object(sof.time, "sleep"):
+            with self.assertRaises(_StubFailure) as caught:
+                sof._wait_for_agent_available("platform-agent", "ns", timeout=0)
+        self.assertIn("not available and ready", str(caught.exception))
+
+    def test_slow_rollout_does_not_consume_probe_budget(self):
+        probe_iterations = 0
+
+        def fake_kubectl(*args, **kwargs):
+            nonlocal probe_iterations
+            if "rollout" in args:
+                return _completed(returncode=0)
+            if "deployment" in args:
+                return _completed(returncode=0)
+            if "exec" in args:
+                probe_iterations += 1
+                if probe_iterations >= 2:
+                    return _completed(stdout="PRESENT\n")
+                return _completed(stdout="ABSENT\n")
+            if "platformagent" in args:
+                return _completed(stdout="/opt/data")
+            return _completed(stdout=json.dumps({"items": [GatewayPodTest._pod("gw-ready")]}))
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_current_revision_selector", return_value=None), \
+                mock.patch.object(sof.time, "sleep"):
+            pod = sof._wait_for_agent_available("platform-agent", "ns", timeout=10)
+        self.assertEqual(pod, "gw-ready")
+        self.assertGreaterEqual(probe_iterations, 2)
+
+
+class PluginSkillPathTest(unittest.TestCase):
+    """Verifies that _plugin_skill_path dynamically uses targetProfile or falls back."""
+
+    def test_explicit_target_profile(self):
+        with mock.patch.object(sof, "_agent_home", return_value="/opt/data"):
+            path = sof._plugin_skill_path("platform-agent", "ns", target_profile="custom")
+        self.assertEqual(
+            path,
+            "/opt/data/profiles/custom/plugins/gkestockoutinvestigator/skills/gke-stockout-investigator/SKILL.md",
+        )
+
+    def test_empty_target_profile_uses_default_root(self):
+        with mock.patch.object(sof, "_agent_home", return_value="/opt/data"):
+            path = sof._plugin_skill_path("platform-agent", "ns", target_profile="")
+        self.assertEqual(
+            path,
+            "/opt/data/plugins/gkestockoutinvestigator/skills/gke-stockout-investigator/SKILL.md",
+        )
+
+    def test_resolves_target_profile_from_cr_when_none(self):
+        def fake_kubectl(*args, **kwargs):
+            if "agentplugins" in args:
+                return _completed(stdout="platform")
+            return _completed(stdout="")
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_agent_home", return_value="/opt/data"):
+            path = sof._plugin_skill_path("platform-agent", "ns")
+        self.assertEqual(
+            path,
+            "/opt/data/profiles/platform/plugins/gkestockoutinvestigator/skills/gke-stockout-investigator/SKILL.md",
+        )
+
+
+class CleanStaleKanbanTasksTest(unittest.TestCase):
+    """Verifies that _clean_stale_kanban_tasks returns archived count and handles fatal/non-fatal errors."""
+
+    def test_clean_stale_kanban_tasks_returns_count(self):
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout="archived 2 tasks\n2\n")):
+            count = sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts")
+        self.assertEqual(count, 2)
+
+    def test_clean_stale_kanban_tasks_raises_on_error_when_fatal(self):
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(returncode=1, stderr="reclaim failed")):
+            with self.assertRaises(RuntimeError) as caught:
+                sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts", fatal=True)
+        self.assertIn("Kanban cleanup failed on pod gw-pod", str(caught.exception))
+        self.assertIn("reclaim failed", str(caught.exception))
+
+    def test_clean_stale_kanban_tasks_warns_when_non_fatal(self):
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(returncode=1, stderr="reclaim failed")):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                count = sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts", fatal=False)
+            self.assertEqual(count, 0)
+            self.assertEqual(len(caught), 1)
+            self.assertIn("Kanban cleanup failed on pod gw-pod", str(caught[0].message))
+
+    def test_clean_stale_kanban_tasks_loads_shared_script_with_hermes_home(self):
+        recorded_args = None
+
+        def fake_kubectl(*args, **kwargs):
+            nonlocal recorded_args
+            recorded_args = args
+            return _completed(stdout="0\n")
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts")
+        self.assertIsNotNone(recorded_args)
+        py_script = recorded_args[-2]
+        self.assertIn("HERMES_HOME", py_script)
+        self.assertIn("clean_stale_tasks", py_script)
+
+
+class CleanStaleTasksScriptTest(unittest.TestCase):
+    """Direct unit tests for the in-pod clean_stale_kanban_tasks.py script."""
+
+    def test_clean_stale_tasks_reclaims_and_archives_matching_tasks(self):
+        tasks_data = {
+            "tasks": [
+                {"id": "t1", "title": "gke_stockout_alerts:123", "status": "running"},
+                {"id": "t2", "title": "gke_stockout_alerts:456", "status": "ready"},
+                {"id": "t3", "title": "other_route:789", "status": "running"},
+            ]
+        }
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "ls" in cmd:
+                if len([c for c in calls if "ls" in c]) == 1:
+                    return _completed(stdout=json.dumps(tasks_data))
+                return _completed(stdout=json.dumps({"tasks": []}))
+            return _completed(stdout="")
+
+        with mock.patch.object(csk.subprocess, "run", side_effect=fake_run):
+            count = csk.clean_stale_tasks("gke_stockout_alerts")
+
+        self.assertEqual(count, 2)
+        self.assertIn(["hermes", "kanban", "reclaim", "t1"], calls)
+        self.assertIn(["hermes", "kanban", "archive", "t1"], calls)
+        self.assertNotIn(["hermes", "kanban", "reclaim", "t2"], calls)
+        self.assertIn(["hermes", "kanban", "archive", "t2"], calls)
+        self.assertNotIn(["hermes", "kanban", "reclaim", "t3"], calls)
+        self.assertNotIn(["hermes", "kanban", "archive", "t3"], calls)
+
+    def test_clean_stale_tasks_retries_transient_archive_failure(self):
+        tasks_data = {
+            "tasks": [
+                {"id": "t1", "title": "gke_stockout_alerts:123", "status": "ready"},
+            ]
+        }
+        archive_attempts = 0
+
+        def fake_run(cmd, **kwargs):
+            nonlocal archive_attempts
+            if "ls" in cmd:
+                return _completed(stdout=json.dumps(tasks_data))
+            if "archive" in cmd:
+                archive_attempts += 1
+                if archive_attempts == 1:
+                    return _completed(returncode=1, stderr="transient lock")
+                return _completed(returncode=0)
+            return _completed(stdout="")
+
+        with mock.patch.object(csk.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(csk.time, "sleep"):
+            count = csk.clean_stale_tasks("gke_stockout_alerts")
+
+        self.assertEqual(count, 1)
+        self.assertEqual(archive_attempts, 2)
+
+    def test_clean_stale_tasks_returns_negative_one_on_ls_failure(self):
+        with mock.patch.object(csk.subprocess, "run", return_value=_completed(returncode=1, stderr="corrupt")):
+            count = csk.clean_stale_tasks("gke_stockout_alerts")
+        self.assertEqual(count, -1)
+
+    def test_clean_stale_tasks_verify_pass_warning_does_not_fail(self):
+        tasks_data = {
+            "tasks": [
+                {"id": "t1", "title": "gke_stockout_alerts:123", "status": "ready"},
+            ]
+        }
+        calls = 0
+
+        def fake_run(cmd, **kwargs):
+            nonlocal calls
+            calls += 1
+            if "ls" in cmd:
+                return _completed(stdout=json.dumps(tasks_data))
+            return _completed(stdout="")
+
+        with mock.patch.object(csk.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(csk.sys.stderr, "write") as fake_stderr:
+            count = csk.clean_stale_tasks("gke_stockout_alerts")
+
+        self.assertEqual(count, 1)
+        self.assertTrue(any("warning" in str(call) for call in fake_stderr.call_args_list))
+
+
+class EnsurePluginInstalledTest(unittest.TestCase):
+    """Verifies that ensure_stockout_plugin_installed skips when absent and proceeds when present."""
+
+    def test_skips_when_crd_is_absent(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=1, stderr="crd not found")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubSkip) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("AgentPlugin CRD", str(caught.exception))
+        self.assertIn("not found on cluster", str(caught.exception))
+
+    def test_skips_when_plugin_cr_is_absent(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="NotFound")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubSkip) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("is not installed", str(caught.exception))
+        self.assertIn("gkestockoutinvestigator", str(caught.exception))
+
+    def test_fails_when_plugin_cr_is_absent_and_expected(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="NotFound")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.dict(sof.os.environ, {"ENABLE_STOCKOUT_INVESTIGATOR": "true"}):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("was expected on this environment", str(caught.exception))
+        self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=true", str(caught.exception))
+
+    def test_proceeds_when_present(self):
+        def fake_kubectl(*args, **kwargs):
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch("subprocess.run", return_value=_completed(returncode=0)), \
+                mock.patch.object(sof, "_wait_for_plugin_ready", return_value={"spec": {"targetProfile": "platform"}}), \
+                mock.patch.object(sof, "_wait_for_gateway_rollout", return_value=("deployment/platform-agent-gateway", "settled")), \
+                mock.patch.object(sof, "_verify_skill_mounted", return_value="pod-gateway-xyz"), \
+                mock.patch.object(sof, "_clean_stale_kanban_tasks"):
+            # Proceeds cleanly through setup without skipping or failing
+            sof.ensure_stockout_plugin_installed(
+                "proj", "cluster", "us-central1", "kubeagents-system"
+            )
+
+    def test_suites_running_stockout_match_expected_suites_tuple(self):
+        doc = yaml.safe_load(_E2E_CONFIG.read_text())
+        fixture_rel = "tests/e2e/test_stockout_investigation.py"
+        suites_with_stockout = {
+            suite["name"]
+            for suite in doc.get("suites", [])
+            if fixture_rel in suite.get("tests", [])
+        }
+        self.assertEqual(
+            suites_with_stockout,
+            set(sof._EXPECTED_E2E_SUITES),
+            f"Suites in {_E2E_CONFIG} listing {fixture_rel} must match "
+            f"test_stockout_investigation._EXPECTED_E2E_SUITES exactly.",
+        )
+
+    def test_fails_when_plugin_cr_is_absent_and_suite_is_gating(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="NotFound")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.dict(sof.os.environ, {"E2E_SUITE": "rc", "ENABLE_STOCKOUT_INVESTIGATOR": ""}):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("was expected on this environment", str(caught.exception))
+
+    def test_fails_when_crd_check_encounters_transport_error(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=1, stderr="dial tcp 127.0.0.1:8080: connect: connection refused")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("Failed to reach cluster", str(caught.exception))
+        self.assertIn("connection refused", str(caught.exception))
+
+    def test_fails_when_plugin_check_encounters_transport_error(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="Unable to connect to the server: net/http: TLS handshake timeout")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("Failed to reach cluster", str(caught.exception))
+        self.assertIn("TLS handshake timeout", str(caught.exception))
+
+
+class PluginReadyStatusTest(unittest.TestCase):
+    """Verifies that _wait_for_plugin_ready tolerates transient Degraded and fails on persistent Degraded."""
+
+    def test_ready_plugin_returns_object(self):
+        obj = {
+            "metadata": {"generation": 3},
+            "status": {"phase": "Ready", "observedGeneration": 3},
+        }
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout=json.dumps(obj))):
+            res = sof._wait_for_plugin_ready("ns", time.time() + 60)
+        self.assertEqual(res["status"]["phase"], "Ready")
+
+    def test_transient_degraded_recovers_to_ready_without_failing(self):
+        degraded_obj = {
+            "metadata": {"generation": 2},
+            "status": {
+                "phase": "Degraded",
+                "observedGeneration": 2,
+                "conditions": [
+                    {"type": "Ready", "status": "False", "reason": "ImagePullFailed", "message": "Failed to pull image xyz"}
+                ],
+            },
+        }
+        ready_obj = {
+            "metadata": {"generation": 2},
+            "status": {"phase": "Ready", "observedGeneration": 2},
+        }
+        # First poll sees transient Degraded (e.g. 429 during pull); second poll sees Ready.
+        with mock.patch.object(sof, "_kubectl", side_effect=[
+            _completed(stdout=json.dumps(degraded_obj)),
+            _completed(stdout=json.dumps(ready_obj)),
+        ]), mock.patch.object(sof.time, "sleep"):
+            res = sof._wait_for_plugin_ready("ns", time.time() + 60)
+        self.assertEqual(res["status"]["phase"], "Ready")
+
+    def test_persistent_degraded_fails_with_reason_after_persistence_window(self):
+        obj = {
+            "metadata": {"generation": 2},
+            "status": {
+                "phase": "Degraded",
+                "observedGeneration": 2,
+                "conditions": [
+                    {"type": "Ready", "status": "False", "reason": "ImagePullFailed", "message": "Failed to pull image xyz"}
+                ],
+            },
+        }
+
+        class _MockClock:
+            def __init__(self, start: float = 100.0):
+                self.cur = start
+            def time(self) -> float:
+                return self.cur
+            def sleep(self, seconds: float) -> None:
+                self.cur += seconds
+
+        clock = _MockClock(start=100.0)
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout=json.dumps(obj))), \
+                mock.patch.object(sof.time, "time", side_effect=clock.time), \
+                mock.patch.object(sof.time, "sleep", side_effect=clock.sleep):
+            with self.assertRaises(_StubFail) as caught:
+                sof._wait_for_plugin_ready("ns", clock.cur + 300.0)
+        msg = str(caught.exception)
+        self.assertIn("installation failed", msg)
+        self.assertIn("phase has remained 'Degraded' for 120s", msg)
+        self.assertIn("ImagePullFailed", msg)
+        self.assertIn("Failed to pull image xyz", msg)
 
 
 if __name__ == "__main__":

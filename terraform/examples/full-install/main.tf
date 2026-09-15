@@ -8,10 +8,20 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
+    # The third read-only telemetry signal. roles/cloudtrace.viewer is granted
+    # in both permission sets, and a role on a disabled API is inert.
+    "cloudtrace.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
     "gkebackup.googleapis.com",
+    # Network Analyzer, which publishes the only per-subnet IP-utilization
+    # figure the fleet audit's subnet-ip-exhaustion check can read: gcloud's
+    # UsableSubnetwork carries no such field on any API version. Without this
+    # the check reports a coverage gap on every run rather than failing, so
+    # the install still works -- it just cannot measure subnet exhaustion.
+    "recommender.googleapis.com",
+    "developerknowledge.googleapis.com",
   ]
   pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
     "pubsub.googleapis.com",
@@ -23,6 +33,11 @@ locals {
 
   use_vertex     = var.model_provider == "vertex_ai"
   vertex_project = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
+  # The two resources that live in vertex_project rather than project_id. A
+  # cross-project serving project is often one the applying identity holds no
+  # IAM on, and the composition cannot tell that apart from a project where the
+  # grant simply has not happened yet — so the operator says which it is.
+  manage_vertex_serving = local.use_vertex && var.vertex_manage_serving_project
   # Not var.location: a model is only callable from a location that serves it,
   # and the cluster's is often not one — on a zonal cluster it is not even a
   # valid Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
@@ -58,9 +73,11 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
   ]
 
   # An explicit project_roles list always wins, so an existing configuration
@@ -84,9 +101,14 @@ locals {
       # session history.
       SESSION_KV_API_KEY = var.session_kv_api_key != "" ? var.session_kv_api_key : random_password.session_kv_api_key.result
       SESSION_KV_SALT    = var.session_kv_salt != "" ? var.session_kv_salt : random_password.session_kv_salt.result
-      ANTHROPIC_API_KEY  = var.anthropic_api_key
-      GEMINI_API_KEY     = var.gemini_api_key
-      OPENAI_API_KEY     = var.openai_api_key
+      # The agent's half of the shell sandbox keypair, generated for the same
+      # reason: nobody has to choose its value. The chart copies the public
+      # half into <name>-shell-authorized-keys for the sandbox to mount.
+      SANDBOX_SSH_PRIVATE_KEY = tls_private_key.sandbox_ssh.private_key_openssh
+      SANDBOX_SSH_PUBLIC_KEY  = tls_private_key.sandbox_ssh.public_key_openssh
+      ANTHROPIC_API_KEY       = var.anthropic_api_key
+      GEMINI_API_KEY          = var.gemini_api_key
+      OPENAI_API_KEY          = var.openai_api_key
     } : key => value if value != ""
   }
 
@@ -169,6 +191,21 @@ resource "random_password" "session_kv_salt" {
   special = false
 }
 
+# The agent's SSH keypair for the shell sandbox (#737 Part B). The agent pod
+# holds the private half and dials the sandbox with it; the sandbox authorises
+# it and holds nothing else.
+#
+# tls_private_key rather than shelling out to ssh-keygen, which is what the
+# installer scripts have to do: private_key_openssh and public_key_openssh give
+# both halves in the exact encodings sshd and `ssh -i` want, with no local-exec
+# and no provisioner. Held in Terraform state like the two passwords above, so
+# `terraform apply` is idempotent without reading the cluster — and so a plan
+# never proposes a new pair, which would lock the agent out of a running
+# sandbox until that pod restarted.
+resource "tls_private_key" "sandbox_ssh" {
+  algorithm = "ED25519"
+}
+
 resource "google_project_service" "required" {
   for_each = local.required_apis
 
@@ -228,10 +265,15 @@ locals {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id      = var.project_id
-  namespace       = var.namespace
-  project_roles   = local.agent_project_roles
-  scoped_clusters = var.scoped_clusters
+  project_id         = var.project_id
+  namespace          = var.namespace
+  project_roles      = local.agent_project_roles
+  scoped_clusters    = var.scoped_clusters
+  service_account_id = var.agent_service_account_id
+  # The KSA half of the Workload Identity member; the same variable is the
+  # chart's platformAgent.security.serviceAccountName below. The variable's
+  # description in variables.tf says why it exists and what bounds it.
+  ksa_name = var.agent_ksa_name
 
   # module.gke_cluster, and not only the API enablements, because the module's
   # workload_identity binding names the pool as an interpolated string
@@ -249,9 +291,11 @@ module "kube_agents_iam" {
 # ─── Vertex AI gateway identity (model_provider = "vertex_ai") ────────────────
 # Vertex has no API key: the LiteLLM gateway calls it as this GSA through
 # Workload Identity. The GSA lives in project_id; the aiplatform.user grant and
-# the API enablement go to the serving project, which may be a different one.
+# the API enablement go to the serving project, which may be a different one —
+# and when it is one the applying identity cannot administer,
+# vertex_manage_serving_project = false leaves both to the operator.
 resource "google_project_service" "vertex_ai" {
-  count = local.use_vertex ? 1 : 0
+  count = local.manage_vertex_serving ? 1 : 0
 
   project            = local.vertex_project
   service            = "aiplatform.googleapis.com"
@@ -263,14 +307,23 @@ module "litellm_vertex_iam" {
   count  = local.use_vertex ? 1 : 0
 
   project_id         = var.project_id
-  service_account_id = "kubeagents-litellm-gsa"
+  service_account_id = var.litellm_service_account_id
   display_name       = "Kube-Agents LiteLLM Vertex AI Service Account"
   namespace          = var.namespace
   ksa_name           = local.litellm_ksa
   # Granted below instead, so a cross-project vertex_project_id works.
   project_roles = []
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster for the reason module.kube_agents_iam's depends_on
+  # states in full: the module's workload_identity binding names the pool as
+  # an interpolated string, so Terraform sees no edge to the cluster whose
+  # creation brings the pool into existence, and on a project that has never
+  # held a Workload-Identity-enabled cluster the binding fails with "Identity
+  # Pool does not exist". This instantiation went without the edge for as long
+  # as the pool path never set model_provider = "vertex_ai" -- the first
+  # onboarding run that does (provision_ci_pool_project.sh, Step 2.1 building
+  # the project's first cluster) is exactly the case that races.
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 resource "google_project_iam_member" "litellm_vertex_user" {
@@ -279,7 +332,7 @@ resource "google_project_iam_member" "litellm_vertex_user" {
   #checkov:skip=CKV_GCP_46:Dedicated custom service account used for LiteLLM workload identity
   #checkov:skip=CKV_GCP_49:LiteLLM gateway uses dedicated service account for Vertex AI inference
   #checkov:skip=CKV_GCP_117:Vertex AI user role required for LiteLLM gateway inference access
-  count = local.use_vertex ? 1 : 0
+  count = local.manage_vertex_serving ? 1 : 0
 
   project = local.vertex_project
   role    = "roles/aiplatform.user"
@@ -304,11 +357,12 @@ module "github_minter" {
   source = "../../modules/github-minter"
   count  = var.enable_github_minter ? 1 : 0
 
-  project_id       = var.project_id
-  location         = var.location
-  namespace        = var.namespace
-  kms_keyring_name = var.github_minter_kms_keyring
-  kms_key_name     = var.github_minter_kms_key
+  project_id         = var.project_id
+  location           = var.location
+  namespace          = var.namespace
+  service_account_id = var.github_minter_service_account_id
+  kms_keyring_name   = var.github_minter_kms_keyring
+  kms_key_name       = var.github_minter_kms_key
 
   depends_on = [google_project_service.required]
 }
@@ -453,10 +507,11 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the two the chart does
-    # not render itself — the agent Deployment and the fluent-bit sidecar the
-    # operator resolves at reconcile time. See the chart README's
-    # "Installing from a mirrored registry".
+    # Reaches every image this release pulls, including the three the chart
+    # does not render itself — the agent Deployment, the shell sandbox
+    # StatefulSet, and the fluent-bit sidecar the operator resolves at
+    # reconcile time. See the chart README's "Installing from a mirrored
+    # registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
@@ -469,6 +524,18 @@ resource "helm_release" "kube_agents" {
       # Secret names only. The Secrets themselves are created out of band, so
       # no registry credential is ever written to Terraform state.
       imagePullSecrets = var.image_pull_secrets
+    }
+    # The sandbox is built from this repository at the same commit as the
+    # agent and the operator, so it takes image_tag with them. It needs its own
+    # entry because the operator does not derive it: unlike the credential
+    # broker, which comes from the agent image with the trailing name swapped,
+    # the sandbox is a separate repository the chart names in AGENT_SANDBOX_IMAGE.
+    # Leaving it out pins the sandbox to Chart.appVersion while everything
+    # around it moves, which fails the pull rather than running the wrong code.
+    agentSandbox = {
+      image = {
+        tag = var.image_tag
+      }
     }
     operator = {
       image = {
@@ -531,6 +598,9 @@ resource "helm_release" "kube_agents" {
         # With annotations set, the OPERATOR creates and manages the KSA (see
         # the chart README's ServiceAccount-ownership section); this one wires
         # Workload Identity to the GSA the kube-agents-iam module created.
+        # The KSA module.kube_agents_iam bound above -- one variable, so the
+        # binding cannot name a KSA the pod does not run as.
+        serviceAccountName = var.agent_ksa_name
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
@@ -584,16 +654,31 @@ resource "helm_release" "kube_agents" {
     # module.github_minter above. The App private key still has to be imported
     # into the module's KMS key before the Deployment goes Ready — see the
     # github-minter module README.
-    githubMinter = {
-      enabled = var.enable_github_minter
-      org     = local.github_org
-      repo    = local.github_repo_name
-      appId   = var.github_app_id
-      kms = {
-        keyring = var.github_minter_kms_keyring
-        key     = var.github_minter_kms_key
-      }
-    }
+    githubMinter = merge(
+      {
+        enabled = var.enable_github_minter
+        org     = local.github_org
+        repo    = local.github_repo_name
+        appId   = var.github_app_id
+        # The minty rule's only gate on platform-agent-scope is assertion.email
+        # against this value; left unset the chart falls back to the fixed
+        # kubeagents-platform-gsa name, so an install that overrides
+        # agent_service_account_id would annotate one GSA and allowlist another.
+        allowedServiceAccount = module.kube_agents_iam.service_account_email
+        kms = {
+          keyring = var.github_minter_kms_keyring
+          key     = var.github_minter_kms_key
+        }
+      },
+      # The chart annotates the minter KSA with gsaName and otherwise falls back
+      # to the fixed kubeagents-github-minter-gsa, so an install that sets
+      # github_minter_service_account_id would create one GSA and have the pod
+      # impersonate another. Only when the module exists: a null here would
+      # be a Helm null, which deletes the chart default instead of keeping it.
+      var.enable_github_minter ? {
+        gsaName = module.github_minter[0].service_account_id
+      } : {}
+    )
     plugins = {
       pubsubPlatform = merge(
         {

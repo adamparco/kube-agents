@@ -27,7 +27,7 @@ Create the repo under an organization, or transfer an existing one into it. A fr
 
 ## Single-organization scoping boundary
 
-Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered in the `gitops-state` ConfigMap must belong to this primary organization.
+Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization. The ConfigMap's `context_repos` key is not minted for: the policy is synced from `managed_repos` only, so a context repository is readable only if it needs no token.
 
 ## Setup checklist
 
@@ -43,7 +43,7 @@ A personal-account App is created as "Only on this account", which cannot instal
 
 ### Install variables
 
-`./install.sh` collects these in its GitOps interview and saves them to `install.env`:
+The installer (`install.sh`) collects these in its GitOps interview and saves them to `install.env`:
 
 - `GITHUB_APP_ID` — numeric App ID.
 - `GITOPS_ORG` — the organization hosting the repo. A username will not work; see above.

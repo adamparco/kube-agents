@@ -190,6 +190,13 @@ PROW_RUNNER_ROLES = {
     "roles/cloudbuild.builds.viewer",
     "roles/container.admin",
     "roles/container.developer",
+    # Derived rather than measured, unlike the rest of this set: the
+    # kube-agents-iam module defines a custom role, and projectIamAdmin below
+    # carries no iam.roles.* permission, so a project without this fails
+    # terraform apply. A project provisioned before the role was added holds
+    # everything else and still cannot run an install -- reporting that is the
+    # point, so it is listed here rather than left to the script alone.
+    "roles/iam.roleAdmin",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/logging.logWriter",
@@ -213,6 +220,16 @@ PROW_RUNNER_ROLES = {
 # CI here rather than failing correctly-provisioned projects weeks later.
 PLATFORM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
 
+# The LiteLLM gateway's identity holds exactly this set and nothing else --
+# it is a network-exposed proxy forwarding attacker-influenceable prompt
+# content, so the set is closed in both directions like the platform GSA's
+# (the site's security-and-iam.md, "The Vertex AI gateway is a separate
+# identity"). Found by the 2026-09-03 pool rollout (#1208): the WI binding
+# check alone let a project pass the verifier and still fail at the model
+# call for want of this grant.
+LITELLM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
+LITELLM_GSA_ROLES = {"roles/aiplatform.user"}
+
 # Neither belongs on a pool project at all. Called out separately because the
 # two checks above scan for one literal member each and would not see these.
 _PUBLIC_MEMBERS = {"allUsers", "allAuthenticatedUsers"}
@@ -223,10 +240,28 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.viewer",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
 }
+
+# The one grant that cannot be a literal above: the IAM module
+# defines it as a project-scoped custom role, so its resource name carries the
+# project id and differs on every pool project. `local.read_only_roles` does
+# not list it -- the module creates and binds it alongside whatever
+# `project_roles` it was handed -- which is also why the regex in
+# `PlatformGsaRolesMatchTerraformTest` cannot see it and did not catch the
+# drift: it scans for `"roles/..."` string literals and this is a resource.
+# Left out, every correctly-provisioned project reported "holds 1 role(s)
+# beyond the read-only set" and failed verification.
+PLATFORM_GSA_CUSTOM_ROLE_ID = "kubeagentsSubnetUtilizationReader"
+
+
+def platform_gsa_roles(project_id: str) -> set:
+    """Every role the install grants the platform GSA on `project_id`."""
+    return PLATFORM_GSA_ROLES | {f"projects/{project_id}/roles/{PLATFORM_GSA_CUSTOM_ROLE_ID}"}
 
 
 class CheckResult:
@@ -708,13 +743,14 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, and the cross-project AR reader grants."""
+    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
     wi_checked = False
     roles_checked = False
     prow_checked = False
+    fleet_reader_checked = False
 
     gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
@@ -749,6 +785,44 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing policy for {gsa_email}: {exc}")
 
+    # The LiteLLM gateway's own identity, created by the full-install
+    # composition's litellm_vertex_iam module once model_provider is
+    # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
+    # hack/ci-deploy.sh's per-lease helm upgrade annotates the
+    # kubeagents-litellm KSA with this GSA, so a project missing the pair
+    # reds every presubmit it leases at the deploy's model-call gate (#1097).
+    litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        litellm_gsa_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing GSA or failed reading policy for {litellm_gsa_email}",
+            f"Could not read the IAM policy on {litellm_gsa_email}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        try:
+            policy = _load_json(out)
+            expected_member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-litellm]"
+            wi_bound = any(
+                b.get("role") == "roles/iam.workloadIdentityUser" and expected_member in b.get("members", [])
+                for b in policy.get("bindings", [])
+            )
+            if not wi_bound:
+                passed = False
+                details.append(f"Workload Identity user binding missing on {litellm_gsa_email} for {expected_member}")
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {litellm_gsa_email}: {exc}")
+
     # Read off the project's own policy, which is not the effective one. Two
     # things it hides from a literal-member scan: a role inherited from an
     # ancestor (checked 2026-08-26, the pool projects sit directly under the
@@ -760,7 +834,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         if not _record_unreadable(
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
-            f"Could not read the project IAM policy on {project_id}, so the Prow runner's twelve roles, "
+            f"Could not read the project IAM policy on {project_id}, so the Prow runner's "
+            f"{len(PROW_RUNNER_ROLES)} roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -771,8 +846,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         try:
             policy = _load_json(out)
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+            litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             prow_held = set()
             platform_held = set()
+            litellm_held = set()
             public_held = set()
             for b in policy.get("bindings", []):
                 members = b.get("members", [])
@@ -794,6 +871,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     prow_held.add(b.get("role"))
                 if platform_member in members:
                     platform_held.add(b.get("role"))
+                if litellm_member in members:
+                    litellm_held.add(b.get("role"))
 
             missing = PROW_RUNNER_ROLES - prow_held
             if missing:
@@ -805,8 +884,9 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "will fail on the first gcloud call rather than at registration"
                 )
 
-            platform_missing = PLATFORM_GSA_ROLES - platform_held
-            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            expected_platform = platform_gsa_roles(project_id)
+            platform_missing = expected_platform - platform_held
+            platform_extra = platform_held - expected_platform
             if platform_missing:
                 passed = False
                 details.append(
@@ -825,6 +905,26 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "differently. Swap them per "
                     "docs/site/src/content/docs/reference/security-and-iam.md -- re-running the "
                     "install does not strip roles it no longer grants"
+                )
+            litellm_missing = LITELLM_GSA_ROLES - litellm_held
+            litellm_extra = litellm_held - LITELLM_GSA_ROLES
+            if litellm_missing:
+                passed = False
+                details.append(
+                    f"The LiteLLM gateway GSA is missing {len(litellm_missing)} role(s) on "
+                    f"{project_id}: {', '.join(sorted(litellm_missing))}. The gateway "
+                    "authenticates as this account for every vertex_ai model call, so a "
+                    "lease of this project fails at the deploy's model-call gate rather "
+                    "than at registration"
+                )
+            if litellm_extra:
+                passed = False
+                details.append(
+                    f"The LiteLLM gateway GSA holds {len(litellm_extra)} role(s) on "
+                    f"{project_id} beyond aiplatform.user: {', '.join(sorted(litellm_extra))}. "
+                    "The gateway is a network-exposed proxy forwarding "
+                    "attacker-influenceable prompt content, so its set is closed -- swap "
+                    "them per docs/site/src/content/docs/reference/security-and-iam.md"
                 )
             if public_held:
                 passed = False
@@ -880,12 +980,60 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
 
+    # The runner's permission to borrow the seeded fleet's read-only account.
+    # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
+    # seeded-fleet-reader, so every role kubeconfig keeps the runner's own
+    # roles/container.admin credential on a fleet all open pull requests share --
+    # loud in the log, but the run still passes, which is why this went unnoticed
+    # across the whole pool (gke-labs/kube-agents#1051). bench/tf/fleet now
+    # defaults the grant, so a project failing here was last applied before that
+    # default landed and needs `tofu apply` against its seeded-fleet state.
+    fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        fleet_reader_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing account or failed reading policy for {fleet_reader_email}. Apply "
+            f"bench/tf/fleet in {project_id}: the stack owns this account.",
+            f"Could not read the IAM policy on {fleet_reader_email}, so the Prow runner's "
+            "impersonation grant was not checked (and neither was the account's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        fleet_reader_checked = True
+        try:
+            policy = _load_json(out)
+            token_creator_bound = any(
+                b.get("role") == "roles/iam.serviceAccountTokenCreator"
+                and PROW_RUNNER_MEMBER in b.get("members", [])
+                for b in policy.get("bindings", [])
+            )
+            if not token_creator_bound:
+                passed = False
+                details.append(
+                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
+                    f"fleet check in this project runs under the runner's own read-write "
+                    f"credential. Re-apply bench/tf/fleet against {project_id}."
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
+
     # The summary must not assert an item a warning above retracts.
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
             ("the Prow runner and platform GSA project roles", roles_checked),
             ("the cross-project AR reader grants", prow_checked),
+            ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
     )
     if not passed:
@@ -895,7 +1043,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     else:
         message = (
             "Workload Identity, Prow runner and platform GSA project roles, "
-            "and cross-project AR reader grants verified"
+            "cross-project AR reader grants, and the fleet reader's token-creator "
+            "binding verified"
         )
 
     return CheckResult(
@@ -2279,6 +2428,13 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
     print("\n" + "-" * 80)
     if not all_passed:
         print(f"PRE-FLIGHT CHECK FAILED. Do NOT register {project_id} in Boskos until the above are resolved.")
+        # An already-registered project can start failing here without anyone
+        # touching it: this script gains an expectation, and every project
+        # provisioned before that gains a gap. The operator reading this is
+        # then holding a list of missing grants and no procedure, so name the
+        # page that carries the repair commands rather than leaving them to
+        # reconstruct it from the check names.
+        print("  Repair commands: docs/site/src/content/docs/deploy/ci-pool-projects.md")
         status = EXIT_FAILED
     elif unverified:
         print(

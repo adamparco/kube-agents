@@ -11,7 +11,8 @@ the module README for the manual command).
 {{- if .Values.githubMinter.enabled }}
 {{- $m := .Values.githubMinter }}
 {{- $org := required "githubMinter.org is required when githubMinter.enabled" $m.org }}
-{{- $repo := required "githubMinter.repo is required when githubMinter.enabled" $m.repo }}
+{{- $rawRepo := required "githubMinter.repo is required when githubMinter.enabled" $m.repo }}
+{{- $repo := regexReplaceAll "^.*/" (regexReplaceAll "\\.git$" $rawRepo "") "" }}
 {{- $projectId := required "platformAgent.harness.projectId is required when githubMinter.enabled" .Values.platformAgent.harness.projectId }}
 {{- $location := required "platformAgent.harness.location is required when githubMinter.enabled" .Values.platformAgent.harness.location }}
 {{- $clusterName := required "platformAgent.harness.clusterName is required when githubMinter.enabled" .Values.platformAgent.harness.clusterName }}
@@ -72,6 +73,20 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+  {{ $repo }}.yaml: |
+    version: 'minty.abcxyz.dev/v2'
+    rule:
+      if: "assertion.iss == 'https://accounts.google.com'"
+    scope:
+      platform-agent-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'write'
+          pull_requests: 'write'
+          issues: 'write'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -97,6 +112,9 @@ spec:
         app: github-token-minter
         {{- include "kube-agents.labels" . | nindent 8 }}
     spec:
+      {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" $m.topologySpread.enabled "replicas" $m.replicaCount "selectorLabels" "app: github-token-minter")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       serviceAccountName: {{ $m.ksaName }}
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}

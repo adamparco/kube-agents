@@ -29,9 +29,12 @@
 #     included on any `custom` set that names an admin role. RECONCILE_EXCLUDE is the opt-out,
 #     and the security reference is the canonical statement.
 #
-# It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
-# profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
-# shared pod-wide, so it operates on every profile regardless of which profile ticks it. It is
+# It runs as a `no_agent` cron job on the `default`/chat profile's roster
+# (agents/chat/defaults/cron/jobs.json), not the Platform Agent's: it belongs to no one profile,
+# and that store is the one the gateway's own ticker thread ticks directly. Scripts and the
+# profiles PVC are shared pod-wide, so it operates on every profile regardless of which profile
+# ticks it — see "This roster is not inert" and "Never put an id on both rosters" in
+# agents/platform/cron/README.md for the ticking model and why the id lives on one roster. It is
 # resilient (always exit 0 on the cron path) and posts a summary to every configured chat
 # platform only when it created or pruned. `--require-create-pass` opts out of that for a caller
 # that has to know whether the roster is actually reconciled; the bootstrap scan gate is the only
@@ -47,12 +50,14 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+import sandbox_exec
 from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     HERMES_BIN,
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
+    kubeconfig_landed,
     list_profiles,
     profile_home,
     read_cluster_identity,
@@ -68,7 +73,13 @@ def log(msg: str) -> None:
 
 
 def _run_env() -> dict[str, str]:
-    """HOME -> /tmp so gcloud can read/write credentials on the writable scratch disk."""
+    """HOME -> /tmp so a subprocess can write on the writable scratch disk.
+
+    For `hermes` only. Every gcloud call in this file goes through
+    `sandbox_exec.run`, which runs it in the shell sandbox and builds its own
+    environment there — this one carries the agent pod's, including
+    `API_SERVER_KEY`, and must not travel over the connection.
+    """
     return {**os.environ, "HOME": "/tmp"}
 
 
@@ -89,8 +100,7 @@ def _project() -> str | None:
     if p:
         return p
     try:
-        r = subprocess.run(["gcloud", "config", "get-value", "project"],
-                           capture_output=True, text=True, timeout=30, env=_run_env())
+        r = sandbox_exec.run(["gcloud", "config", "get-value", "project"], timeout=30)
         return r.stdout.strip() or None
     except Exception:  # noqa: BLE001
         return None
@@ -110,10 +120,10 @@ def _all_clusters(project: str) -> list | None:
     read was actually reconciled.
     """
     try:
-        r = subprocess.run(
+        r = sandbox_exec.run(
             ["gcloud", "container", "clusters", "list", "--project", project,
              "--format=value(name,location)"],
-            capture_output=True, text=True, check=True, timeout=120, env=_run_env(),
+            check=True, timeout=120,
         )
     except subprocess.CalledProcessError as e:
         # CalledProcessError stringifies to just the exit status; gcloud puts the
@@ -144,10 +154,7 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        subprocess.run(
-            cmd, capture_output=True, text=True, check=True,
-            timeout=DESCRIBE_TIMEOUT_SECONDS, env=_run_env(),
-        )
+        sandbox_exec.run(cmd, check=True, timeout=DESCRIBE_TIMEOUT_SECONDS)
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""
@@ -200,8 +207,14 @@ def _exclusive_run():
         yield True
 
 # Written by create_profile after the identity stamp, so their absence means the
-# scaffold was interrupted between the two.
-SCAFFOLD_ARTIFACTS = ("kubeconfig.yaml", "USER.md")
+# scaffold was interrupted between the two. The kubeconfig is checked separately:
+# it is not on this pod's filesystem.
+SCAFFOLD_ARTIFACTS = ("USER.md",)
+
+# What create_profile fetches in step 3, relative to the profile home. Named here
+# because this pod cannot stat it -- the path is resolved on whichever side
+# kubectl runs, which kubeconfig_landed decides.
+KUBECONFIG_ARTIFACT = "kubeconfig.yaml"
 
 
 def _scaffold_gaps(home: Path) -> list[str]:
@@ -215,8 +228,20 @@ def _scaffold_gaps(home: Path) -> list[str]:
     because the cluster still exists, and the half-scaffolded profile survives with
     no credentials for the life of the volume. Treating it as absent re-runs the
     scaffold, which is idempotent.
+
+    The kubeconfig is asked for over the sandbox rather than stat'ed here. With a
+    sandbox, ``gcloud container clusters get-credentials`` runs in the shell pod
+    and writes to the shell pod's volume, so this pod never sees the file:
+    stat'ing it locally reports every profile incomplete on every tick, which
+    re-scaffolds the whole fleet hourly and re-fetches a credential for each.
+    ``kubeconfig_landed`` asks the side that has it -- the same way create_profile
+    confirmed the fetch -- and answers "not landed" when the sandbox cannot be
+    reached, which is the case a recreated sandbox volume actually needs.
     """
-    return [f for f in SCAFFOLD_ARTIFACTS if not (home / f).exists()]
+    gaps = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).exists()]
+    if not kubeconfig_landed(home / KUBECONFIG_ARTIFACT):
+        gaps.insert(0, KUBECONFIG_ARTIFACT)
+    return gaps
 
 
 def reconcile(dry_run: bool = False) -> dict:
@@ -350,6 +375,10 @@ def _format_notification(report: dict) -> str:
 
 def _notify(message: str) -> None:
     """Post a summary to each configured chat platform's home channel (best-effort).
+
+    Stays in the agent pod. `hermes` is not cluster tooling: it needs the
+    profiles on the data PVC and the gateway on loopback, neither of which the
+    sandbox has, and the sandbox image does not carry the binary.
 
     The target used to be the literal `google_chat`, which meant a Slack-only
     install never heard that a Cluster Agent profile had been created or pruned:

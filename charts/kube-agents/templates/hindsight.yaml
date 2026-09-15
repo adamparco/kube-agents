@@ -39,6 +39,7 @@ spec:
       port: 8888
       targetPort: http
 ---
+{{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.hindsight.api.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "hindsight.api.rollingUpdate") | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,6 +51,11 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $rollingUpdate.maxSurge }}
+      maxUnavailable: {{ $rollingUpdate.maxUnavailable }}
   # 15 minutes, above the default 600s: a cold roll pulls 1.4 GB before the
   # container starts and only then spends the startupProbe budget loading
   # models. k8s-operator/config/integrations/hindsight/api.yaml carries the
@@ -211,10 +217,12 @@ spec:
       containers:
         - name: postgresql
           # pgvector supplies the vector extension Hindsight's embeddings need.
-          # Pinned by digest in values (from images.json): upstream publishes
-          # only a floating `latest`, so without the pin a pod reschedule can
-          # silently change the database engine. A mirrored install pulls the
-          # copy by tag, because that is what `make mirror-images` pushes.
+          # Pinned by digest in values (from images.json): upstream rebuilds a
+          # version tag in place when the Postgres base is patched, so without
+          # the pin a pod reschedule can move the database to a Postgres minor
+          # nobody chose. A mirrored install pulls the copy by tag, because that
+          # is what `make mirror-images` pushes. Before changing the tag, read
+          # the constraints on it in images.json, which is where they live.
           image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.postgresql.image.repository "tag" .Values.hindsight.postgresql.image.tag "name" "hindsight-postgresql" "root" .) }}
           imagePullPolicy: {{ .Values.hindsight.postgresql.image.pullPolicy }}
           ports:

@@ -280,15 +280,30 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # before proposing a manifest. `images delete` shares three of the
         # four words and stays refused -- the tests hold the door.
         ("artifacts", "docker", "images", "describe"),
+        # The only read behind §3.14 `registry-no-cleanup`, and the check is
+        # inert without it: a repository's `sizeBytes`, `cleanupPolicies`,
+        # `cleanupPolicyDryRun` and `mode` have no other surface, and
+        # `images describe` above is per-image, so reconstructing a repository's
+        # size from it would need one call per version -- 250 for the reference
+        # install's largest. `describe` is here for the same reason
+        # `compute disks describe` is: the remediation names it as the
+        # confirm-before-you-change read, and refusing the object-scoped read
+        # while allowing the project-wide list forces the broader one. Both are
+        # pure reads; `repositories create`, `delete`, and
+        # `set-cleanup-policies` -- the last of which is the remediation this
+        # check *proposes* -- stay refused, and the tests assert it.
+        ("artifacts", "repositories", "describe"),
+        ("artifacts", "repositories", "list"),
         ("auth", "list"),
         ("config", "get"),
         ("config", "get-value"),
         ("config", "list"),
         # `beta` is a word like any other here, so a beta path has to be
-        # listed on its own -- the GA entry above it grants nothing. These two
+        # listed on its own -- the GA entry above it grants nothing. These
         # are the stockout SOP's capacity forecast; the data has no GA
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
+        ("beta", "compute", "advice", "capacity"),
         ("beta", "compute", "advice", "capacity-history"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
@@ -299,23 +314,97 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "backend-services", "list"),
         ("compute", "disks", "describe"),
         ("compute", "disks", "list"),
+        # The read side of the firewall rules the networking SOP's Red Lines
+        # forbid modifying, and list/describe is all that is granted. A live
+        # install refused both under gcp.read-only while the model investigated
+        # the fabric (#1126), and `list` is also the only read behind §2.6
+        # `firewall-world-open-ingress` -- the check is inert without it: a
+        # rule's `sourceRanges`, `allowed` and `direction` have no other
+        # surface, so the collector gate-failed the whole project-scoped target
+        # on the first run after the check shipped (2026-09-06, rc=126, rule
+        # gcp.read-only). That run reported `partial: true` and named the gap
+        # rather than claiming clean, which is the machinery working -- but the
+        # two `critical` candidates the check finds on this fleet, 0.0.0.0/0 on
+        # tcp:22 and tcp:3389, went unpublished for want of one allowlist
+        # entry. Pure reads; the writes one word away (`firewall-rules create`,
+        # `update`, `delete`) stay refused and the tests assert it.
+        ("compute", "firewall-rules", "describe"),
+        ("compute", "firewall-rules", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
+        # The daily `gce-compute-fleet-audit` cron runs
+        # skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py, and
+        # neither read it opens with was in this set. `instances list` is the
+        # first call the collector makes against a project, and it early-returns
+        # the whole target when that read comes back empty -- so the gate, not
+        # the fleet, decided the answer, and both of the stream's checks
+        # (startup-script-failures and orphaned-snapshots) reported nothing
+        # gathered from a project whose disks and snapshots were readable all
+        # along. `get-serial-port-output` is the evidence read behind
+        # startup-script-failures: it is how the collector distinguishes an
+        # instance whose startup script exited non-zero from one that is
+        # healthy, and without it that check has no data source at all. Both
+        # are pure reads. The writes one word away -- `instances create`,
+        # `delete`, `reset`, `add-metadata` -- stay refused, including the
+        # `instances reset` the stream emits as a *proposed* remediation, and
+        # the tests assert it.
+        # `instances describe` is the object-scoped counterpart of the
+        # `disks describe` and `forwarding-rules describe` already in this set,
+        # and the omission bites on exactly the judgment §2.1 hands back: a
+        # candidate tagged `needs_triage: gke-managed-node` asks the model to
+        # decide whether one instance is a Google-managed node or an
+        # operator-owned VM, which is a question about that instance's metadata
+        # keys and labels. Confirming it against the object was refused under
+        # gcp.read-only while the project-wide `instances list` beside it
+        # returned the same fields for every instance at once -- so the gate
+        # forced the broader read, not the narrower one. Pure read; the
+        # mutations one word away stay refused and the tests assert it.
+        ("compute", "instances", "describe"),
+        ("compute", "instances", "get-serial-port-output"),
+        ("compute", "instances", "list"),
+        # The other two reads that same collector opens, added when §2.2 and
+        # §2.4 stopped being prose and became code. `instance-groups managed
+        # list` backs `mig-convergence-stalled` -- it is the only read that
+        # carries a group's `currentActions` counters, which are the whole
+        # condition. The sole-tenancy pair backs `sole-tenant-headroom`: the
+        # `list` establishes whether the project reserves any node groups at
+        # all, and `list-nodes` is the only surface carrying the per-node
+        # `totalResources`/`consumedResources` the utilisation ratio needs.
+        # Reads, all three; the resizes and deletes one word away
+        # (`instance-groups managed resize`, `delete`, `rolling-action
+        # restart`, `sole-tenancy node-groups add-nodes`) stay refused.
+        ("compute", "instance-groups", "managed", "list"),
+        ("compute", "sole-tenancy", "node-groups", "list"),
+        ("compute", "sole-tenancy", "node-groups", "list-nodes"),
         # The daily `gcp-networking-fabric-audit` cron executes
-        # governance/gcp_networking_fabric_sop.md exactly, and of the reads
-        # that SOP issues only forwarding-rules list was in this set --
-        # four of its five checks had no data source. Same shape as the
-        # stockout gap below: the job runs, reports, and measures nothing.
+        # governance/gcp_networking_fabric_sop.md exactly, and the networks,
+        # routers and security-policies entries were derived from the command
+        # spellings that SOP carries. A SOP spelling assumes its arguments are
+        # already bound, so a leaf read listed on its own can be unreachable:
+        # `routers get-nat-mapping-info $ROUTER` was listed while `routers
+        # list`, the only way to bind $ROUTER, was not, and the audit's one
+        # critical NAT check never ran (#1126). Grant a discovery read
+        # alongside every leaf read that needs one; `networks describe` and
+        # `routers describe` are the detail reads behind the two lists.
         # `compute project-info describe` is the stockout SOP's quota
         # remediation read. The writes one word away (networks create,
-        # security-policies create, project-info add-metadata) stay
-        # refused, and the tests assert it.
+        # routers create, firewall-rules create, security-policies create,
+        # project-info add-metadata) stay refused, and the tests assert it.
+        ("compute", "networks", "describe"),
         ("compute", "networks", "list"),
         ("compute", "networks", "subnets", "describe"),
         ("compute", "networks", "subnets", "list"),
         ("compute", "networks", "subnets", "list-usable"),
         ("compute", "project-info", "describe"),
+        ("compute", "routers", "describe"),
         ("compute", "routers", "get-nat-mapping-info"),
+        # `routers get-status` is the third read networking_audit.py's
+        # cloud-nat-exhaustion check needs: result.natStatus[].autoAllocatedNatIps,
+        # which neither `list` nor `get-nat-mapping-info` carries. A pure read;
+        # `routers create`/`update`/`delete`/`add-interface` stay refused, and
+        # the tests assert it.
+        ("compute", "routers", "get-status"),
+        ("compute", "routers", "list"),
         ("compute", "security-policies", "list"),
         # The daily `stockout-prevention` cron reads these three and nothing
         # else can stand in for them: reservations list is the committed
@@ -358,6 +447,13 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("projects", "describe"),
         ("projects", "get-iam-policy"),
         ("projects", "list"),
+        # Network Analyzer's IP-utilization insight, the only surface that
+        # carries per-subnet utilization: gcloud's UsableSubnetwork omits the
+        # field in v1, beta and alpha alike, so `subnet-ip-exhaustion` has no
+        # other data source. `insights list` is a read; the mutating verbs on
+        # this surface are `mark-*` (mark-accepted, mark-dismissed, ...) and
+        # `update`, none of which this entry reaches.
+        ("recommender", "insights", "list"),
         ("version",),
     }
 )
@@ -388,10 +484,36 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # events yet", so the refusal was silent — the poll loop slept forever.
         "--order", "--start-time", "--end-time",
         # The spellings the stockout SOP actually passes to the two entries
-        # added for it: capacity-history carries the first three, and
-        # machine-types list uses --zones (plural; --zone alone was listed).
-        # An allowlist entry whose flags are not here is unreachable.
+        # added for it, and `machine-types list` uses --zones (plural; --zone
+        # alone was listed). An allowlist entry whose flags are not here is
+        # unreachable.
         "--instance-selection-machine-types", "--size", "--types", "--zones",
+        # capacity-history's own required flags, which the two above are not:
+        # `--instance-selection-machine-types` and `--size` belong to the
+        # sibling `beta compute advice capacity`, and the SOP had been
+        # documenting one command's flags against the other's name. Real
+        # `capacity-history` takes `--machine-type` (singular, one type per
+        # call), `--provisioning-model`, and `--types`, plus --region/--zone.
+        # Only --types of those was listed, so the correct spelling was
+        # refused as gcp.unreadable-command before the allowlist entry for
+        # capacity-history was ever reached -- and every stockout run recorded
+        # spot-scarcity-risk as "did not run" against all four clusters.
+        "--machine-type", "--provisioning-model",
+        # The sibling `beta compute advice capacity` shapes its request with
+        # these two on top of the plural spellings above.
+        "--target-distribution-shape", "--instance-selection",
+        # `compute routers list` takes --regions (plural). Same trap as
+        # --zones above: the singular was listed and the plural was not.
+        "--regions",
+        # `recommender insights list` requires it. --location is already above.
+        "--insight-type",
+        # `compute instances get-serial-port-output --port=1`, as the GCE
+        # fleet SOP writes it. Port 1 is the console the startup-script
+        # messages land on, so the flag is the check rather than a detail --
+        # and unlisted it refused the command as gcp.unreadable-command
+        # before the allowlist entry was consulted at all, which is the same
+        # trap --zones and --machine-type above were added for.
+        "--port",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud
@@ -437,6 +559,18 @@ _GCLOUD_BOOLEAN_FLAGS = frozenset(
         # images describe`; without it the entry granting that read was
         # unreachable.
         "--show-package-vulnerability",
+        # The scope selector on every `gcloud compute` verb. A global address
+        # or forwarding rule cannot be named without it -- gcloud answers
+        # "Underspecified resource ... Specify one of the [--global, --region]
+        # flags" -- so `compute addresses describe` and `compute
+        # forwarding-rules describe`, both allowlisted above, were granted for
+        # regional resources only. fleet_waste.py's _scope_flag emits --global
+        # into the remediation for exactly the objects §3.5 and §3.6 of
+        # governance/fleet_wide_cost_analysis_sop.md tell the agent to confirm
+        # with a describe before releasing, and that confirm step was refused.
+        # --region and --zone are in _GCLOUD_FLAGS_WITH_VALUE; this is the
+        # third member of that trio and the only one that takes no value.
+        "--global",
     }
 )
 
@@ -517,6 +651,109 @@ def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | Non
         words.append(token)
         index += 1
     return words, None
+
+
+#: Surfaces where `--help` does not buy its way past the allowlist.
+#:
+#: The help escape below rests on gcloud short-circuiting to a synopsis before
+#: it acts. That was measured and it holds -- but it is gcloud's behaviour, not
+#: this module's, so the question worth asking is what happens on the day some
+#: surface parses `--help` late. For an API-calling verb the answer is nothing:
+#: `container clusters delete --help` that failed to short-circuit would reach
+#: GCP as the agent's own identity, which holds no delete permission on
+#: anything (`tests/test_agent_iam_ceiling.py` pins that ceiling). IAM is the
+#: backstop and the allowlist is defence in depth.
+#:
+#: These have no IAM backstop. They change local state inside the pod -- the
+#: active project, the active credentials, the installed toolchain -- and need
+#: no IAM permission to do it, so a short-circuit failure here is directly
+#: exploitable and silently repoints or re-identifies every command that runs
+#: afterwards. `init` is here for the same reason and not because anything
+#: measured it: it runs an auth flow and rewrites the active configuration,
+#: which is `auth` and `config` in one word.
+#:
+#: `credentialProxyPolicyJSON` in the operator covers part of this, and only
+#: part: it names `auth (login|activate-service-account)` and
+#: `components (install|update|remove)` by pattern, and it names no `config`
+#: verb at all. Measured against the deployed proxy on 2026-09-01, three
+#: commands passed that document and were allowed by this module's escape --
+#: `gcloud auth revoke --help`, `gcloud config set project <other> --help`, and
+#: `gcloud config unset project --help`. The first logs the agent out of its own
+#: service account; the second repoints every gcloud call that follows. So the
+#: exclusion is load-bearing here, not defence in depth, and a reader should not
+#: infer from the two rules above that the proxy already has this covered.
+#:
+#: Excluding them costs nothing anyone asked for. The SOP that motivated the
+#: escape wants flag syntax for `container clusters update`. One skill does run
+#: one of these surfaces -- `gke-app-onboarding`'s SKILL.md runs `gcloud auth
+#: configure-docker <region>-docker.pkg.dev --quiet` -- but that is a bare
+#: invocation, not a `--help` read: the allowlist refused it before this escape
+#: existed and refuses it now, so the exclusion takes nothing away from it.
+_NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config", "init"})
+
+#: gcloud's release-track words, which precede the surface rather than being one.
+#:
+#: `gcloud beta auth revoke` is `auth revoke` on the beta track, so a surface
+#: test that reads the first word alone reads `beta` and matches nothing. That
+#: was the hole: measured on 2026-09-01, `gcloud auth revoke --help` was refused
+#: and `gcloud beta auth revoke --help` was allowed, and the same one-word
+#: prefix walked past the exclusion for `config set`, `config unset` and
+#: `components update`. Two of those -- `beta auth revoke` and every `config`
+#: verb -- are exactly the cases the block above says the proxy document does
+#: not cover, so the prefix defeated the exclusion precisely where it was the
+#: only gate.
+_GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+
+
+def _gcloud_surface(words: list[str]) -> str | None:
+    """The surface a gcloud argv addresses, looking past any release track.
+
+    Returns None when the argv names no surface at all -- bare `gcloud`, or a
+    track word with nothing after it. Both are topic listings, so a caller
+    testing membership in a deny set gets the same answer it gave before.
+    """
+    for word in words:
+        if word not in _GCLOUD_RELEASE_TRACKS:
+            return word
+    return None
+
+
+def _gcloud_asks_for_help(argv: list[str]) -> bool:
+    """Does argv carry --help or -h in flag position?
+
+    `gcloud <anything> --help` prints a synopsis and exits without contacting
+    the API, so the verb after it is a topic rather than an action -- but the
+    allowlist reads the verb and nothing else, so `container clusters update
+    --help` was refused as a write. The security-patch SOP tells the agent to
+    confirm a remediation flag's syntax with `--help` before recording it, and
+    the refusal came back worded as a denial of the *update*, which is a
+    confusing thing to read when you asked for documentation.
+
+    Walks argv exactly the way _gcloud_words_and_flag does, so a `--help`
+    standing as another flag's value (`--format --help`) is not mistaken for
+    the flag itself, and an unknown flag ends the walk rather than being
+    stepped over -- its arity is unknown, so nothing after it can be trusted
+    and the caller's unreadable-command refusal is the right answer.
+    """
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            index += 1
+            continue
+        name, separator, _ = token.partition("=")
+        if name in ("--help", "-h"):
+            return True
+        if name in _GCLOUD_BOOLEAN_FLAGS:
+            index += 1
+            continue
+        if name in _GCLOUD_FLAGS_WITH_VALUE:
+            if not separator:
+                index += 1
+            index += 1
+            continue
+        return False
+    return False
 
 
 def _gcloud_is_read_only(words: list[str]) -> bool:
@@ -917,13 +1154,35 @@ def evaluate(argv: list[str]) -> Decision:
             return Decision(
                 allowed=False,
                 rule_id="gcp.unreadable-command",
+                # Unlike the kubectl walker, this one is strict past the command
+                # path as well, so the flag named here is usually
+                # command-specific rather than global -- `--enable-autoupgrade`
+                # and `--maintenance-window-start` reach this branch. Saying
+                # "global flag" sent readers looking for a gcloud release note
+                # that does not exist, and an agent repeating the advice into a
+                # report tells a customer something untrue. Both examples are
+                # flags on `container clusters update`, which this gate refuses
+                # as a write regardless, so the retry below is what resolves the
+                # ambiguity: if the command still fails without the flag, the
+                # flag was never the reason.
                 message=(
                     "gcloud used a flag whose arity is unknown to this module, so the "
-                    "command path cannot be read. Report a new gcloud global flag to "
-                    "your infrastructure team."
+                    "command path cannot be read. Re-run without the flag: if the "
+                    "command is refused anyway it is not a read this gate allows, and "
+                    "if it succeeds, ask your infrastructure team to teach this module "
+                    "the flag's arity."
                 ),
                 offending_flag=unknown_flag,
             )
+
+        # After the words parse, so an unknown flag is still refused, and after
+        # the three guards above, so --help cannot smuggle a file write or an
+        # identity change past them. `_gcloud_surface` rather than `words[0]`:
+        # bare `gcloud --help` parses to no words at all and is the one form of
+        # this that is unambiguously a documentation request, and a release
+        # track otherwise stands where the surface should be.
+        if _gcloud_asks_for_help(argv) and _gcloud_surface(words) not in _NO_HELP_ESCAPE_SURFACES:
+            return _ALLOWED
 
         if not _gcloud_is_read_only(words):
             return Decision(

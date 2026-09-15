@@ -12,17 +12,22 @@ install without the interview.
   destroy), including the Cloud KMS API for GKE database encryption and the Chat
   API when Google Chat is enabled.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
-  by default, `cluster_mode = "standard"` for an e2-standard-4 node pool
-  (with an optional gVisor node pool), or `create_cluster = false` to
-  install onto an existing one — with Workload Identity, Cloud KMS database
-  encryption (CMEK), the Backup for GKE agent enabled, and the
-  `kube-agents-host=true` discovery label applied.
+  by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
+  (with an optional gVisor node pool) — with Workload Identity, Cloud KMS
+  database encryption (CMEK), the Backup for GKE agent enabled, and the
+  `kube-agents-host=true` discovery label applied. Setting
+  `create_cluster = false` instead makes the module read an existing cluster:
+  it enables none of those, and its postconditions refuse the plan unless the
+  cluster already has Workload Identity and NetworkPolicy enforcement (see
+  [Prerequisites](#prerequisites)).
 - Optionally (`enable_gke_backup_plan = true`) a scheduled
   [`gke-backup-plan`](../../modules/gke-backup-plan) for the release namespace.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
-  module): the `kubeagents-platform-gsa` service account, its read-only
-  project roles, and the Workload Identity binding to the
-  `kubeagents-platform-agent` KSA (see
+  module): a service account (`kubeagents-platform-gsa` by default; a second
+  install in the same project sets `agent_service_account_id` — see
+  [Remote state](#remote-state)), its read-only project roles, and the Workload
+  Identity binding to the agent KSA (`agent_ksa_name`,
+  `kubeagents-platform-agent` by default; see
   [IAM roles](#iam-roles-permission_set-and-project_roles) below).
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
@@ -60,7 +65,21 @@ install without the interview.
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
   `vertex_project_id`, and the Workload Identity annotation the chart needs.
-  Vertex takes no API key, so no `*_api_key` variable applies.
+  Vertex takes no API key, so no `*_api_key` variable applies. The API
+  enablement and the role grant are the only two resources that live in
+  `vertex_project_id` rather than `project_id`; when that is a project the
+  applying identity cannot administer, set
+  `vertex_manage_serving_project = false` and enable the API and make the
+  grant by hand — the service account and its Workload Identity binding are
+  still created here. Decide it at the first apply: turning it off later, on
+  an install whose earlier apply created the two, destroys them on the next
+  apply and revokes the grant. To hand them over instead, remove both from
+  state first:
+
+  ```bash
+  terraform state rm 'google_project_service.vertex_ai[0]' \
+    'google_project_iam_member.litellm_vertex_user[0]'
+  ```
 
 > [!WARNING]
 > The credential variables (`api_server_key`, `*_api_key`, Slack tokens) are
@@ -74,6 +93,14 @@ install without the interview.
 
 - A GCP project you can administer.
 - Terraform `~> 1.5`.
+- With `create_cluster = false`, a cluster that meets the
+  [cluster requirements](../../../docs/site/src/content/docs/install/prerequisites.md#cluster-requirements):
+  GKE 1.29+, Workload Identity with `GKE_METADATA` on every node pool,
+  NetworkPolicy enforcement, a control plane reachable from here, and cert-manager
+  either present (`enable_cert_manager = false`) or absent. The module refuses the
+  plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
+  and checks none of the others; `install.sh` changes an adopted cluster to meet
+  those two instead, and this composition on its own never does.
 - Application Default Credentials for the Google, Kubernetes, and Helm
   providers:
 
@@ -108,12 +135,57 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 ```
 
 `auto` derives the bucket name `<project_id>-kube-agents-tfstate`; any other
-value is used verbatim. The bucket is created on first use — versioned, with
-uniform bucket-level access, in the cluster's region — and a gitignored
+value is used verbatim. `apply` and `destroy` create the bucket on first use —
+versioned, with uniform bucket-level access, in the cluster's region. `plan`
+does not: it stops instead, because a plan that creates the backend has both
+changed the project and answered the wrong question, since an empty bucket
+plans the whole composition as new and reads as total drift. A gitignored
 `backend_override.tf` points Terraform at
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
-installs in one project keep separate state. Versioning is the recovery story:
+installs in one project keep separate state. State is only half of the
+second-install story: every service account the composition creates has one
+fixed default name per project, so the second install must name its own —
+`agent_service_account_id`, and `github_minter_service_account_id` or
+`litellm_service_account_id` when it enables the minter or serves from Vertex —
+or its first apply stops on the account the first install owns. Through the
+installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
+`GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
+front door regenerates `terraform.tfvars` from; every front door that applies
+(`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
+names the key to set. Do not rely on a shell
+`export` or a hand-edited `terraform.tfvars` instead: the export dies with the
+shell and the file is regenerated on every run, and either way the next run
+resolves the name back to the default and plans the GSA's destroy-and-recreate
+under `-auto-approve` — which `lifecycle.sh`'s `guard_gsa_identity` refuses. The
+release namespace (`NAMESPACE` in `install.env`) has the same guard,
+`guard_release_namespace`, because `helm_release` treats it as ForceNew too, and
+so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
+`guard_kms_identity`): on a cluster this state created, a renamed key would be
+destroyed and recreated, which schedules the live key's versions for destruction.
+A key is rotated in Cloud KMS, not by renaming it here.
+And a distinct GSA name un-collides creation, not identity: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so two
+installs that share the namespace and the default KSA name bind the same
+principal and each agent can mint the other's GSA tokens however differently
+the GSAs are named. The second install names its own `agent_ksa_name` too. One
+variable feeds both the module's binding and the chart's `serviceAccountName`,
+so the pod and the binding move together, and it must end in `-agent`: the
+`kube-agents-agent-binding-scope` admission policy the chart ships selects the
+bindings it governs by that suffix on the bound ServiceAccount, so a name
+outside it would leave this install's agent bindings unselected by that policy
+and by any validation it gains. The validation in `variables.tf` refuses the
+plan instead, and the variable's description says what the policy does and does
+not deny today. `agent_ksa_name` has no `install.env` key of its own yet, so
+through the front doors it is a `TF_VAR_agent_ksa_name=...` line in that file:
+every front door sources it with `set -a`, and the generator never writes
+`agent_ksa_name` into `terraform.tfvars`, so the passthrough is what Terraform
+reads. The caution above applies to it with one gap — a lost line resolves the
+KSA back to the default and re-shares the identity silently, and there is no
+`guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
+GSA's destroy-and-recreate. The `agent_service_account_id` description in
+`variables.tf` carries the limits to read before relying on any of this.
+Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
@@ -126,9 +198,31 @@ gcloud storage cp gs://<bucket>/<prefix>/default.tfstate#<generation> \
   gs://<bucket>/<prefix>/default.tfstate
 ```
 
-If the state is gone entirely,
-re-run `lifecycle.sh apply` against the same tfvars — KMS adoption is
-automatic, and `terraform import` covers the rest.
+If the state is gone entirely, import the cluster back before anything else —
+`terraform import 'module.gke_cluster.google_container_cluster.<autopilot|standard>[0]' projects/<project>/locations/<location>/clusters/<cluster_name>`,
+with the provider override the BackupPlan recipe below uses — and then re-run
+`lifecycle.sh apply` against the same tfvars: KMS adoption is automatic, and
+`terraform import` covers the rest. Without that import the apply is refused up
+front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
+rather than 409ing on the cluster halfway through. Through `install.sh` the
+probe derives `create_cluster = false` instead and adopts the cluster.
+
+### Asking what an apply would change
+
+```bash
+KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh plan -detailed-exitcode
+```
+
+Read-only, and every part of that is deliberate: no state lock, so it can
+neither block nor be blocked by the apply it is reporting on; no bucket
+creation; and none of the adoption imports `apply` runs, since those write
+state. An install that needs adoption therefore shows those resources as "to
+create", which is what a plan alone can honestly say about them.
+
+`-detailed-exitcode` makes the answer machine-readable — 0 for in sync, 2 for
+there are changes, 1 for a plan that failed — which is what the scheduled drift
+report reads. `./upgrade.sh --plan`, run from the install's own checkout, is the
+front door: it renders the tfvars an upgrade would apply and then calls this.
 
 ### Recovering from an interrupted apply
 
@@ -240,14 +334,35 @@ neither means what it looks like:
   Remove the override before the next apply — it is never meant to survive an
   import, which is why `lifecycle.sh` deletes it on an `EXIT` trap.
 
+- **A retry that would create a cluster that already exists.** State left by an
+  apply that died before the cluster finished creating can hold a managed
+  cluster entry that manages nothing, and a retry against it would plan a
+  create over the live cluster and 409 halfway through. `lifecycle.sh apply`
+  refuses that before Terraform runs (`guard_cluster_ownership`, in both
+  directions) and names a way out per caller: `create_cluster = false` if the
+  cluster is somebody else's to install onto; a `terraform import` of the
+  cluster address if this state created it (a hand-written tfvars keeps
+  `create_cluster = true`, so clearing the state alone reproduces the
+  refusal); or, through `install.sh`, `uninstall.sh` or clearing the state
+  under `gs://<bucket>/<prefix>/` and re-running `install.sh`, whose probe
+  derives `create_cluster = false` for a live cluster outside state and adopts
+  it. `install.sh` itself reaches this refusal only through a race. The other thing such a state holds is the cluster's CMEK key ring
+  and key, adopted on the retry; with `create_cluster = false` the module no
+  longer manages them, so `lifecycle.sh apply` forgets them from state
+  (`forget_unmanaged_cluster_kms`) rather than let the apply schedule the key's
+  versions for destruction under the live cluster.
+
 ### The `image_tag` rule
 
-`image_tag` (default `latest`) overrides both the operator and platform-agent
-image tags. It exists because the chart is installed from this checkout, and a
-checkout's `Chart.yaml` carries an `appVersion` placeholder that never matches
-a published image tag — so the chart's usual tag defaulting cannot work here
-(see the [chart README](../../../charts/kube-agents/README.md)). `latest` is
-fine for evaluation; pin an `X.Y.Z` release tag for production.
+`image_tag` (default `latest` on `main`) overrides both the operator and platform-agent
+image tags. In CI/CD pipelines and automated testing, it is passed explicitly with the
+commit SHA on which container images were built for testing, ensuring the deployment pulls
+the exact matching artifacts. In official release bundles and release-tag checkouts, release
+automation stamps this default directly with the released SemVer version (e.g. `0.4.0`).
+It exists because the chart is installed from this checkout, and a checkout's `Chart.yaml`
+carries an `appVersion` placeholder that never matches a published image tag — so the
+chart's usual tag defaulting cannot work here (see the [chart README](../../../charts/kube-agents/README.md)).
+For production, always pin a validated numeric SemVer release tag or full commit SHA.
 
 ### Installing from a mirrored registry
 
@@ -429,13 +544,16 @@ uninstall its standalone release before setting these variables (`helm uninstall
 (`meta.helm.sh/release-name`) and refuses to adopt existing resources owned by another release.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
-[INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-4-enable-google-chat--slack-integrations-manual-required-steps):
+[INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):
 
 - **Google Chat:** register the Chat app on the Chat API configuration page —
   select Cloud Pub/Sub and enter the created topic (the `chat_topic_name`
   output, as `projects/<project>/topics/<topic>`), set visibility, and verify
   a **Service account email** appears under Connection settings after saving
-  (if it stays blank, Chat silently delivers no events). Then DM the bot; on
+  (if it stays blank, Chat silently delivers no events). That address is the
+  Workspace Add-ons service agent,
+  `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
+  the agent's own GSA. Then DM the bot; on
   first contact, optionally approve the pairing code via
   `hermes pairing approve google_chat <CODE>` in the gateway pod.
 - **Slack:** in the Slack app console enable Socket Mode and grant the bot
@@ -466,10 +584,10 @@ Use `lifecycle.sh destroy` for teardown; anything that mutates the
 Terraform-managed resources out of band (for instance removing the
 `kube-agents-host` label by hand) causes plan drift the next apply reverts.
 
-Four things in this stack are not symmetric — applying them is not the inverse
-of destroying them — and each one breaks a plain `terraform destroy`, or the
-`terraform apply` that follows it. [`lifecycle.sh`](lifecycle.sh) handles all
-four, so the cycle is repeatable:
+Several things in this stack are not symmetric — applying them is not the
+inverse of destroying them — and each one breaks a plain `terraform destroy`, or
+the `terraform apply` that follows it. [`lifecycle.sh`](lifecycle.sh) handles
+them, so the cycle is repeatable:
 
 ```bash
 make tf-destroy     # or: ./terraform/examples/full-install/lifecycle.sh destroy
@@ -478,12 +596,13 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                            | Handled by                                                                    |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s  | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)   |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged |
-| A `BackupPlan` cannot be deleted while it owns backups               | `tf-destroy` purges the plan's backups first                                  |
-| `deletion_protection = true` cannot be overridden by a destroy alone | `tf-destroy` applies it as `false`, then destroys                             |
+| Asymmetry                                                                | Handled by                                                                                                                                   |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s      | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace     | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
+| A `BackupPlan` cannot be deleted while it owns backups                   | `tf-destroy` purges the plan's backups first                                                                                                 |
+| `deletion_protection = true` cannot be overridden by a destroy alone     | `tf-destroy` applies it as `false`, then destroys                                                                                            |
+| A Pub/Sub topic or subscription that already exists makes the create 409 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`

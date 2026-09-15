@@ -73,7 +73,8 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, FLUENT_BIT_IMAGE) are
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
+  # FLUENT_BIT_IMAGE) are
   # rendered from global.imageRegistry and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
@@ -83,11 +84,46 @@ operator:
     tag: "" # defaults to Chart.appVersion
     pullPolicy: IfNotPresent
   replicaCount: 1
+  # Rollout strategy for the operator Deployment.
+  #
+  # maxUnavailable: 0 is the zero-downtime admission shape: it holds the old
+  # operator Pod (which serves the admission webhook on :10250) until the
+  # replacement passes readiness checks, preventing webhook admission outages
+  # during upgrades when failurePolicy is set to Fail. This makes the surge Pod
+  # mandatory.
+  #
+  # Set maxUnavailable to 1 on an install with strict namespace ResourceQuota
+  # that has no room for a surge Pod, accepting that PlatformAgent writes will
+  # be rejected (under failurePolicy: Fail) or unvalidated (under
+  # failurePolicy: Ignore) during the rollout.
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
     # not configurable: minAvailable is the shape that deadlocks node drains,
     # and the audit SOP this project ships rules it out at every replica count
     # (obtainability_audit_sop.md 3.3).
+    enabled: true
+  # Spread this workload's pods across nodes — the canonical home for this
+  # argument; litellm.topologySpread and githubMinter.topologySpread defer here.
+  #
+  # Renders nothing at replicaCount 1, which is the operator's default, so this
+  # knob only does anything on an install that raised it. A constraint over a
+  # single pod is satisfied by construction.
+  #
+  # At two or more replicas it renders maxSkew: 1 over kubernetes.io/hostname
+  # with whenUnsatisfiable: ScheduleAnyway. A PodDisruptionBudget does not cover
+  # this: maxUnavailable: 1 stalls a *drain* that would take every replica, but
+  # a node that fails takes whatever is on it, and without a constraint nothing
+  # keeps two replicas off one node. obtainability_audit_sop.md 3.8 is the
+  # source for both the hostname key and ScheduleAnyway — DoNotSchedule leaves
+  # the second replica Pending forever on a pool that cannot satisfy the skew,
+  # which is worse than the co-location it would prevent.
+  #
+  # Set to false where the scheduler is already constrained by something the
+  # chart cannot see and the hint would fight it.
+  topologySpread:
     enabled: true
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
@@ -164,9 +200,10 @@ telemetry:
   # appended by the exporters. A gRPC-only collector (port 4317) will not work.
   otlpEndpoint: ""
   # The namespace the NetworkPolicy opens OTLP egress to. Derived from otlpEndpoint when
-  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it explicitly for
-  # any endpoint that is not a cluster-local Service name, or the render fails rather
-  # than emit a policy that blocks the collector you just configured.
+  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it for an
+  # in-cluster collector whose host does not (an IP literal, a bare Service name).
+  # Leave it empty for an external endpoint, which then has to be a public host on
+  # port 443 — the chart README's "Telemetry" section says why.
   collectorNamespace: ""
 
 litellm:
@@ -217,7 +254,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.96.2
+    tag: v1.98.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -260,19 +297,75 @@ litellm:
     # and the audit SOP this project ships rules it out at every replica count
     # (obtainability_audit_sop.md 3.3).
     enabled: true
+  topologySpread:
+    # Renders maxSkew: 1 over kubernetes.io/hostname at the default
+    # replicaCount of 2, same rationale as operator.topologySpread.
+    enabled: true
+  # The memory request is sized from a week of this gateway's own Cloud
+  # Monitoring history on the reference install, not from a round number: p50
+  # 870Mi, p95 978Mi, peak 1098Mi per replica across six pod generations. At
+  # the 512Mi it used to ask for, steady-state use was ~1.9x the request, which
+  # is not a burst Burstable QoS absorbs — the scheduler under-books every node
+  # the gateway lands on, and kubelet ranks Burstable pods for eviction by
+  # exactly that overage, so the model gateway was first out under any node
+  # pressure. 1536Mi is the audit's ceil(peak x 1.3), rounded to a whole
+  # multiple of 512Mi.
+  #
+  # CPU stays at 100m: the same week puts this gateway's 5-minute peak at 118m,
+  # above its request rather than below it, so it is sized correctly and the
+  # 500m limit is what absorbs the spike.
   resources:
     requests:
       cpu: 100m
-      memory: 512Mi
+      memory: 1536Mi
     limits:
       cpu: 500m
       memory: 2Gi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
-  # disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
+  # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
+  # dynamically by the operator with cluster-discovered DNS VIPs. When either
+  # is false, setting networkPolicy: true renders the static template copy.
+  # Moving a live release from operator-managed back to the static copy needs
+  # a handoff first (chart README, "Handing litellm-policy back to Helm"):
+  # Helm refuses to adopt an object the operator has labelled as its own.
+  # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
   # helm template/lint cannot catch its absence: a non-GKE install fails at
   # apply time.
   networkPolicy: true
   podMonitoring: true
+  # Redaction of every request body the gateway forwards to a provider. Off by
+  # default: on, the ConfigMap also carries the shared redactor module and a
+  # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
+  # the built-in credential patterns plus the rules below over messages,
+  # embeddings input and completion prompts before the provider sees them.
+  # Request bodies only: responses, tool results on disk and chat egress are
+  # not covered. The concepts/inference-gateway page on the site owns the
+  # model, including why a pseudonymised identifier is one the agent can no
+  # longer act on.
+  redaction:
+    enabled: false
+    # IPv4 and IPv6 literals. action: pseudonym replaces each with a stable
+    # [ip:<12 hex>] token salted from SESSION_KV_SALT in the credentials
+    # Secret (a missing salt still redacts, with a per-pod salt); mask
+    # replaces each with [REDACTED_IP]; "off" leaves IP literals alone. Quote
+    # off: YAML reads the bare word as a boolean, and the chart refuses that
+    # rather than guessing. allowCidrs lists networks the model must still
+    # see, in CIDR form.
+    ip:
+      action: pseudonym
+      allowCidrs: []
+    # Operator rules, applied in order after the IP rules. Each has a name
+    # (starting with a letter or digit, then letters, digits, `_`, `.`, `-`),
+    # exactly one of `pattern` (a Python regular expression) or `literal` (an
+    # exact string), both non-empty text, and an action of mask (default,
+    # [REDACTED_<NAME>] with the name upper-cased and punctuation folded to
+    # `_`) or pseudonym ([<name>:<12 hex>]). The render fails on a name,
+    # action or source it cannot accept; a pattern that does not compile stops
+    # the gateway pod at startup rather than forwarding requests unredacted.
+    #   - name: cluster-name
+    #     literal: prod-eu-1
+    #     action: pseudonym
+    rules: []
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
@@ -294,6 +387,19 @@ hindsight:
       repository: ghcr.io/vectorize-io/hindsight-api
       tag: "0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812"
       pullPolicy: IfNotPresent
+    # Rollout strategy for the hindsight-api Deployment.
+    #
+    # maxUnavailable: 0 is the zero-downtime shape: it holds the existing Pod
+    # until the replacement passes readiness checks (which includes model loading
+    # and can take up to the 5-minute startupProbe budget). This makes the surge
+    # Pod mandatory.
+    #
+    # Set maxUnavailable to 1 on installs with strict namespace ResourceQuota
+    # that lack room for a surge Pod, accepting that long-term memory recall
+    # will be offline during the rollout.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
     # Recall is CPU-bound on the in-process cross-encoder reranker; see the
     # template before raising these — more CPU has been measured to buy
     # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
@@ -305,12 +411,12 @@ hindsight:
         cpu: "4"
         memory: 4Gi
   postgresql:
-    # Upstream publishes only a floating `latest`; the digest is the real pin.
-    # The images.json entry is named hindsight-postgresql, which is where a
-    # mirror holds the copy.
+    # Keep in step with images.json (`make mirror-images` copies from it), where
+    # the entry is named hindsight-postgresql and carries the constraints on
+    # this tag — the pg15 line among them. Read them there before changing it.
     image:
-      repository: docker.io/ankane/pgvector
-      tag: "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8"
+      repository: docker.io/pgvector/pgvector
+      tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
       pullPolicy: IfNotPresent
     resources:
       requests:
@@ -368,10 +474,21 @@ githubMinter:
     tag: v2.7.1-amd64
     pullPolicy: IfNotPresent
   replicaCount: 2
+  # Sized from a week of the reference install's Cloud Monitoring history at
+  # 5-minute resolution: this minter peaks at 0.71m of CPU and 12.17Mi of
+  # memory per replica. It is a Go binary that wakes to sign a token and goes
+  # back to sleep, so the old 100m/128Mi reserved roughly 140x the CPU and 10x
+  # the memory it has ever used, on every node both replicas land on.
+  #
+  # 50m/64Mi is the smallest request the cost audit's own resize rule will
+  # write (`ceil(peak x 2)` clamped up to that floor), and both dimensions have
+  # to move: the audit reports a controller over-requested on either dimension,
+  # so shrinking CPU alone would have left the finding open on memory at 9% of
+  # request. The limits are untouched, so a burst still has 500m to reach into.
   resources:
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 50m
+      memory: 64Mi
     limits:
       cpu: 500m
       memory: 256Mi
@@ -379,6 +496,10 @@ githubMinter:
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. Deliberately not
     # configurable, same rationale as operator.podDisruptionBudget.
+    enabled: true
+  topologySpread:
+    # Renders maxSkew: 1 over kubernetes.io/hostname at the default
+    # replicaCount of 2, same rationale as operator.topologySpread.
     enabled: true
 
 # The logging sidecar the operator injects into every agent pod. The chart
@@ -390,9 +511,31 @@ fluentBit:
     repository: docker.io/fluent/fluent-bit
     tag: "5.1.1"
 
+# The shell sandbox StatefulSet the operator renders beside every agent pod.
+# Same shape as fluentBit above and for the same reason: the chart never renders
+# the workload itself, it passes the reference to the operator as
+# AGENT_SANDBOX_IMAGE, but the pin has to live somewhere the mirror can be
+# pointed at. Unlike the credential broker — which the operator derives from the
+# agent image by swapping the trailing name — the sandbox is a separate
+# repository built from deploy/sandbox, so it has to be named.
+agentSandbox:
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
+    tag: "" # defaults to Chart.appVersion
+
 platformAgent:
   enabled: true
   name: platform-agent
+  # Annotations to add to the PlatformAgent custom resource metadata. The
+  # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
+  # "PlatformAgent annotations"). Two of them the chart also derives from
+  # values: litellm.networkPolicy=false stamps
+  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false", and
+  # telemetry.collectorNamespace stamps
+  # kubeagents.x-k8s.io/otlp-collector-namespace. When the chart stamps a key,
+  # an entry here that disagrees with it fails the render; otherwise the entry
+  # passes through untouched.
+  annotations: {}
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
@@ -416,6 +559,40 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Unsupported switches. Nothing under here carries a compatibility promise:
+    # a field may change meaning, change default, or be removed between
+    # releases, and an install that sets one is expected to re-check it at every
+    # upgrade. The CRD says the same in ExperimentalSpec.
+    experimental:
+      # The agent's shell runs in a pod of its own (#737 Part B), reached over
+      # SSH with the keypair in credentials.secretName.
+      shellSandbox:
+        # Not a toggle. The operator refuses `false` with
+        # Degraded/ShellSandboxCannotBeDisabled, and this chart fails at
+        # template time rather than installing something that will sit
+        # Degraded. Leave it null; set it true only to say so explicitly.
+        enabled: null # always on
+        # Overrides the sandbox image for this agent only. Empty takes the
+        # operator's AGENT_SANDBOX_IMAGE, which this chart sets from the
+        # top-level agentSandbox block — so a mirrored install needs the mirror
+        # pointed at that block, not at this key.
+        image: ""
+        # Runs the sandbox pod under a sandboxed container runtime — `gvisor`
+        # on GKE. Empty leaves the node's default runtime, which is what every
+        # install renders today.
+        #
+        # Separate from deployment.availability.runtimeClassName, and
+        # deliberately: the agent pod holds WAL-mode SQLite, which gVisor
+        # corrupts, and the sandbox pod holds none. This is the field that lets
+        # an install put a user-space kernel between the model's code and the
+        # node without doing the same to the agent.
+        #
+        # On Standard, needs a node pool created with `--sandbox type=gvisor`;
+        # the gke-cluster module's enable_gvisor_node_pool creates one.
+        # Autopilot ships the RuntimeClass natively. Either way the operator
+        # reports Degraded rather than leaving the pod Pending if the named
+        # class does not exist.
+        runtimeClassName: ""
     # Execution limits per agent persona. Empty omits the field so CRD/Hermes
     # defaults apply. When plugins.stockoutInvestigator.enabled=true, the chart
     # automatically applies tuning (maxInProgress: 3, platform.maxTurns: 200,
@@ -451,19 +628,25 @@ platformAgent:
       #
       # Autopilot ships the RuntimeClass natively (GKE 1.27.4-gke.800 and
       # later). A Standard cluster needs the sandbox node pool that the
-      # gke-cluster module's enable_gvisor_node_pool creates; without it the
-      # operator refuses to write the agent Deployment and reports
-      # RuntimeClassNotFound on the PlatformAgent. Set "" to omit the field and
-      # run on the standard container runtime.
+      # gke-cluster module's enable_gvisor_node_pool creates. Note that on GKE
+      # the RuntimeClass object itself is a cluster addon and is present either
+      # way -- what a Standard cluster without the pool lacks is a node
+      # carrying sandbox.gke.io/runtime=gvisor, which is the thing the operator
+      # checks. Set "" to omit the field and run on the standard container
+      # runtime.
       #
       # The Terraform composition always passes this explicitly (from
       # agent_runtime_class, which install.sh derives from --gvisor), so this
       # default is what a direct `helm install` gets -- and what a `helm
       # upgrade` of a release that never set the key adopts, since Helm merges
-      # the new chart's defaults. That upgrade path fails quietly where the
-      # RuntimeClass is missing: the operator stops before reconciling the
-      # workload, so the previous unsandboxed Deployment keeps running while
-      # .status says Degraded. See the chart README's Usage section.
+      # the new chart's defaults. On that upgrade path the operator stops
+      # before reconciling the workload rather than replacing a running agent
+      # with a Pod that cannot be scheduled: the previous unsandboxed
+      # Deployment keeps running and .status says Degraded, with reason
+      # RuntimeClassNotFound where the object is absent and
+      # RuntimeClassUnschedulable where it exists but no node matches it. On a
+      # first install there is nothing to protect, so the workload is written
+      # and its Pod waits Pending. See the chart README's Usage section.
       runtimeClassName: "gvisor"
     # Extra environment for the agent container, applied after the operator's own
     # values so it overrides them. Telemetry is the case this exists for, though
@@ -549,6 +732,37 @@ platformAgent:
     #       clusterName: my-cluster
     #       serviceAccountEmail: ka-my-cluster-1a2b3c4d@my-project.iam.gserviceaccount.com
     scopedServiceAccounts: []
+    # Gives the credential proxy a GCP identity that does not come from the
+    # metadata server, which is what lets it run beside the shell sandbox.
+    #
+    # GKE resolves Workload Identity by POD IP, so every container in a pod
+    # shares one cloud identity: the broker's pod and the gateway's pod both run
+    # as the annotated KSA, so anything with execution in the gateway can mint
+    # the GSA's token straight from 169.254.169.254, with no policy layer in
+    # between. Federation replaces that with a projected token mounted into the
+    # broker's pod alone, whose credential source is a file rather than the
+    # metadata server. The shell sandbox pod is already unbound and needs none
+    # of this.
+    #
+    # Set both fields or neither — the operator reads a half-filled block as
+    # absent, and the chart refuses it outright. Leaving them empty is
+    # supported: the broker then reads the metadata server as the ServiceAccount
+    # the gateway also runs as, which is the gap federation closes.
+    #
+    # NOTHING CREATES THE POOL. Neither this chart, the Terraform modules, nor
+    # the provisioning scripts run the three gcloud commands; they are in
+    # docs/designs/agent-shell-sandboxing.md#setting-up-the-pool.
+    workloadIdentityFederation:
+      # The pool provider's full resource name, exactly as STS wants it as `aud`:
+      #   //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+      # A mismatch is rejected at exchange time, not at admission, so it shows up
+      # as a proxy that starts and then fails every credentialed command.
+      audience: ""
+      # The GSA the federated principal impersonates — the same one
+      # serviceAccountAnnotations names, since it already holds the agent's
+      # roles. The federated principal needs only roles/iam.workloadIdentityUser
+      # on it.
+      serviceAccountEmail: ""
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /
@@ -575,6 +789,19 @@ platformAgent:
     #   - identity hashing falls back to a per-pod random salt with a warning.
     # Upgrading an install that predates these keys is the case that hits this:
     # add them to the existing Secret (upgrade.sh backfills them additively).
+    #
+    # Two further keys belong to the shell sandbox (#737 Part B) and are the one
+    # pair the chart cannot generate for you — sprig can make an ed25519 private
+    # key but cannot encode its public half in authorized_keys form:
+    #   SANDBOX_SSH_PRIVATE_KEY  the agent dials the sandbox with it
+    #   SANDBOX_SSH_PUBLIC_KEY   copied into the <name>-shell-authorized-keys
+    #                            Secret the sandbox mounts
+    # Supply both or neither. The installer scripts and
+    # terraform/examples/full-install generate them, so only a bare `helm
+    # install` has to; without them the sandbox has no way to authenticate the
+    # agent and stays unusable. Rotating them locks the agent out until the
+    # sandbox pod restarts, so an existing pair is carried forward rather than
+    # regenerated. See docs/designs/agent-shell-sandboxing.md#key-management.
     create: false
     data: {}
   # spec.networkPolicy on the PlatformAgent CR, passed through verbatim. Empty
@@ -585,8 +812,8 @@ platformAgent:
   #
   #   networkPolicy:
   #     enabled: true              # false stops generation and deletes the
-  #                                # operator-owned <name>-gateway-netpol and
-  #                                # <name>-fqdn-netpol
+  #                                # operator-managed <name>-gateway-netpol,
+  #                                # <name>-fqdn-netpol and litellm-policy
   #     dnsClusterIPs: ["10.96.0.10"]
   #     metadataDaemon:
   #       endpoint: "169.254.169.252"  # "" suppresses the post-NAT rule

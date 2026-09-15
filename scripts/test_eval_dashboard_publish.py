@@ -20,6 +20,7 @@ trap body around it -- lifted out of the real file, rather than grepping for
 guards, so it fails if the fail-safe is weakened by any future edit.
 """
 
+import json
 import pathlib
 import re
 import subprocess
@@ -49,6 +50,7 @@ def run_hook(
     pull_number: str = "",
     artifacts: str = "",
     timeout_s: str = "",
+    rc_commit_sha: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -64,6 +66,7 @@ def run_hook(
             f'SCRIPT_DIR="{script_dir}"',
             f'export JOB_TYPE="{job_type}"',
             f'export PULL_NUMBER="{pull_number}"',
+            f'export RC_COMMIT_SHA="{rc_commit_sha}"',
             # Always pinned: the suite itself runs under Prow, where a real
             # $ARTIFACTS is set, and the hook copies its log there.
             f'export ARTIFACTS="{artifacts}"',
@@ -163,6 +166,29 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 )
                 self.assert_skipped_once(result, code, "PULL_NUMBER=1043")
 
+    def test_a_release_candidate_run_never_publishes(self):
+        """An RC eval is a periodic with no PULL_NUMBER -- the exact shape the
+        two gates above let through. It measures a candidate rather than main's
+        history, so publishing from one would overwrite the dashboard everyone
+        reads with a run about a different artefact."""
+        marker = (
+            "import pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    job_type="periodic",
+                    rc_commit_sha="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe",
+                )
+                self.assert_skipped_once(result, code, "RC_COMMIT_SHA=")
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            self.assertEqual(list(dash.glob("*.ran")), [])
+
     def test_missing_collect_py_skips_fast_and_preserves_the_exit_code(self):
         """This PR may merge before the siblings that add scripts/eval_dashboard/."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +255,34 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     result.stdout,
                 )
                 self.assertNotIn(SKIP, result.stdout)
+
+    def test_a_bucket_target_renders_with_the_public_url(self):
+        """A bucket target is the published site, read from
+        storage.cloud.google.com, which redirects to a locked domain that
+        serves one object: without <base href> every relative link on the
+        page is dead there. This hook publishes to the same bucket as
+        hack/ci-dashboard-refresh.sh, so it has to pass the same flag, or a
+        run of it replaces good pages with unnavigable ones until the next
+        15-minute refresh. A local target keeps relative links."""
+        collect_ok = """\
+            import json, pathlib, sys
+            out = sys.argv[sys.argv.index("--out") + 1]
+            pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+            """
+        record_argv = (
+            "import json, pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
+        )
+        for target, expected in (("gs://kube-agents-dashboards/evals/", True), ("/tmp/local-site", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_hack = dashboard_stubs(pathlib.Path(tmp), collect_ok)
+                dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+                (dash / "render.py").write_text(record_argv)
+                result = run_hook(0, fake_hack, target=target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = json.loads((dash / "render.py.argv").read_text())
+                self.assertEqual("--public-url" in argv, expected, f"{target}: {argv}")
+                self.assertNotIn("", argv, "no empty argument from an unset array")
 
     def test_zero_collected_runs_skip_instead_of_publishing_empty(self):
         """The evidence_store lesson: an unreadable source is not an empty

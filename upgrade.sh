@@ -28,10 +28,23 @@ C_RESET="\033[0m"
 # Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
 BAKED_RELEASE_VERSION=""
 
+# Where the upgrade engine is fetched from when this script runs outside a
+# checkout. install.sh and uninstall.sh carry the same URL, each needing it
+# before it has a checkout to read it from; tests/test_install_script.py pins
+# the three equal.
+KUBE_AGENTS_REPO_URL="https://github.com/gke-labs/kube-agents.git"
+
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
 PARAM_NON_INTERACTIVE="false"
 PARAM_DRY_RUN="false"
+# --plan and --dry-run are both previews and are deliberately not the same one.
+# --dry-run answers offline, from configuration alone, and never contacts the
+# install. --plan answers from the install's real Terraform state, so it needs
+# credentials and it is the only one of the two that can tell you an
+# environment has drifted from the composition on main.
+PARAM_PLAN="false"
+PARAM_KEEP_IMAGE_TAG="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -98,11 +111,17 @@ Usage: ./upgrade.sh [OPTIONS]
 Options:
   --upgrade-mode, -m MODE  Upgrade mode: full, harness, operator (Default: full)
   --non-interactive, -y    Automated execution mode (no interactive prompts)
+  --plan                   Report what a full upgrade would change, against the
+                           install's real Terraform state. Changes nothing.
+                           Exit 0 = in sync, 2 = there are changes, 1 = error.
   --dry-run                Preview upgrade plan and configuration state without touching cloud resources
   --project-id ID          GCP Target Project ID
   --cluster-name NAME      GKE Target Cluster Name
   --region REGION          GKE GCP Region
   --image-tag TAG          Validated immutable release tag or full commit SHA (required)
+  --keep-image-tag         Upgrade everything except the images, leaving them on
+                           the tag the install already serves. Use instead of
+                           --image-tag, not alongside it.
   --help, -h               Show this help message
 
 Examples:
@@ -111,6 +130,10 @@ Examples:
 
   # Dry-run upgrade preview
   ./upgrade.sh --dry-run --upgrade-mode=full
+
+  # What has this install drifted from? Holds the image tag at the one
+  # Terraform state records, so the report is composition drift, not image lag.
+  ./upgrade.sh --plan
 EOF
 }
 
@@ -174,7 +197,7 @@ random_hex_32() {
 # A fresh install generates these (the composition's random_password
 # resources), and the harness/operator fast paths never touch
 # platform-agent-secrets — `helm upgrade
-# --reuse-values` re-tags images and nothing else, so a Secret from an old
+# --reset-then-reuse-values` re-tags images and nothing else, so a Secret from an old
 # enough install keeps missing the keys until something adds them. The
 # operator marks both Secret references optional, so
 # a Secret without the keys yields containers without the variables rather than
@@ -189,7 +212,7 @@ random_hex_32() {
 SESSION_KV_KEYS_PATCHED="false"
 backfill_session_kv_keys() {
   local namespace="$1"
-  local secret_name="platform-agent-secrets"
+  local secret_name="$PLATFORM_AGENT_SECRET"
 
   if ! kubectl get secret "$secret_name" -n "$namespace" >/dev/null 2>&1; then
     print_warning "Secret '$secret_name' not found in '$namespace'; skipping the Session KV key backfill."
@@ -215,6 +238,143 @@ backfill_session_kv_keys() {
   fi
 }
 
+# Add the shell sandbox's SSH keypair to an install that predates it.
+#
+# Same additive contract as the Session KV backfill above and for a sharper
+# reason: the sandbox copies authorized_keys into place once at startup, so
+# replacing a keypair that is already in use locks the agent out of its own
+# shell until that pod restarts. An existing pair is therefore never rewritten,
+# and a half-written pair (one key present, the other missing) is treated as
+# absent rather than patched around — a private key whose public half was lost
+# authenticates nothing.
+#
+# Only platform-agent-secrets is written here. The sandbox mounts a Secret of
+# its own, <name>-shell-authorized-keys, and the chart renders that one from
+# whatever public half it finds in platform-agent-secrets — so the step 4 helm
+# upgrade below picks the pair up on its own. Writing it here too would create
+# the object without Helm's ownership metadata, and that same helm upgrade would
+# then refuse to adopt it. The sandbox must not mount platform-agent-secrets
+# itself; see docs/designs/agent-shell-sandboxing.md#key-management.
+#
+# Set when this run wrote the pair, so the caller can roll the agent: the
+# private half reaches the gateway pod through a Secret volume that an init
+# container copies into place once at startup, so a pod that started before the
+# backfill keeps the empty directory it was given until it restarts.
+SANDBOX_KEYS_PATCHED="false"
+
+# How long step 5 waits for the sandbox and the credential proxy. Longer than
+# the gateway's because the sandbox is a StatefulSet with a ReadWriteOnce
+# volume: the new pod cannot attach until the old one has detached, so its
+# rollout serialises where a Deployment's overlaps.
+SANDBOX_ROLLOUT_TIMEOUT="180s"
+
+backfill_sandbox_ssh_key() {
+  local namespace="$1"
+  local secret_name="$PLATFORM_AGENT_SECRET"
+
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    print_warning "ssh-keygen not found; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+  if ! kubectl get secret "$secret_name" -n "$namespace" >/dev/null 2>&1; then
+    print_warning "Secret '$secret_name' not found in '$namespace'; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+
+  local existing_private existing_public
+  existing_private="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PRIVATE_KEY}' 2>/dev/null || echo "")"
+  existing_public="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PUBLIC_KEY}' 2>/dev/null || echo "")"
+  if [ -n "$existing_private" ] && [ -n "$existing_public" ]; then
+    print_info "The shell sandbox keypair is already present; leaving it untouched."
+    return 0
+  fi
+
+  print_info "Generating the missing shell sandbox SSH keypair into Secret '$secret_name'..."
+  local key_dir old_umask
+  old_umask="$(umask)"
+  umask 077
+  key_dir="$(mktemp -d)"
+  umask "$old_umask"
+  if ! ssh-keygen -q -t ed25519 -N '' -C "kube-agents-shell-sandbox" -f "$key_dir/id_ed25519"; then
+    rm -rf "$key_dir"
+    print_warning "ssh-keygen failed; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+
+  # Patching `data` with base64 rather than `stringData` with the raw key, which
+  # is what the Session KV backfill above does: a PEM contains newlines, and
+  # this patch is built by string interpolation into JSON. base64's alphabet
+  # needs no escaping, so there is nothing here for a newline to break. `tr`
+  # because macOS base64 has no -w0.
+  local priv_b64 pub_b64
+  priv_b64="$(base64 < "$key_dir/id_ed25519" | tr -d '\n')"
+  pub_b64="$(base64 < "$key_dir/id_ed25519.pub" | tr -d '\n')"
+  rm -rf "$key_dir"
+  kubectl patch secret "$secret_name" -n "$namespace" --type=merge \
+    -p "{\"data\":{\"SANDBOX_SSH_PRIVATE_KEY\":\"$priv_b64\",\"SANDBOX_SSH_PUBLIC_KEY\":\"$pub_b64\"}}" >/dev/null
+
+  SANDBOX_KEYS_PATCHED="true"
+  print_success "Shell sandbox keypair backfilled into '$secret_name'; the upgrade below renders the sandbox's authorized_keys from it."
+}
+
+matches_release_bundle_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local bundle_file="${repo_dir}/.release-bundle"
+
+  if [ -f "$bundle_file" ]; then
+    local bundle_version bundle_tag
+    bundle_version="$(grep -E "^version=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    bundle_tag="$(grep -E "^tag=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    if [ -n "$bundle_version" ] && { [ "$bundle_version" = "$expected_ref" ] || [ "$bundle_tag" = "$expected_ref" ]; }; then
+      echo "$bundle_version"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# The two refusals that do not need a ref to make sense: an unversioned source
+# directory, and a dirty one. Split out of verify_local_source_ref because a
+# tagless run still applies this checkout's Terraform and charts to a live
+# install -- so skipping the ref COMPARISON, which is the only part a missing
+# tag actually makes impossible, must not take these with it. Without this,
+# `--keep-image-tag` would apply uncommitted local edits to an environment and
+# say nothing, which is the invisible drift #1117 exists to end.
+#
+# The previews are warned rather than refused. --dry-run and --plan change
+# nothing, and a plan of what the working tree WOULD apply is a reasonable thing
+# to want from a tree that is mid-edit; refusing it would take away the one
+# command that answers "what have I changed here".
+verify_local_source_clean() {
+  local repo_dir="$1" preview="false"
+  if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    preview="true"
+  fi
+
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+      return 0
+    fi
+    if [ "$preview" = "true" ]; then
+      print_warning "Cannot verify the source directory because '$repo_dir' is not a Git worktree."
+      return 0
+    fi
+    print_error "Refusing to upgrade from an unversioned source directory: $repo_dir"
+    return 1
+  fi
+
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    if [ "$preview" = "true" ]; then
+      print_warning "This preview is using uncommitted source changes; a real upgrade would require a clean checkout."
+      return 0
+    fi
+    print_error "Refusing to upgrade from a dirty checkout: its Terraform, charts and scripts match no commit, so what this run would apply exists nowhere else. Commit or stash, or use --plan to preview."
+    return 1
+  fi
+  print_success "Verified the upgrade sources are a clean checkout of $(git -C "$repo_dir" rev-parse --short HEAD)."
+}
+
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
@@ -223,6 +383,11 @@ verify_local_source_ref() {
     # In official stamped release archives (unpacked tarball/zip outside Git),
     # BAKED_RELEASE_VERSION is stamped during release automation.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      local bundle_version=""
+      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+        print_success "Verified upgrade sources match official release bundle ${bundle_version}."
+        return 0
+      fi
       print_success "Verified upgrade sources match baked official release ${BAKED_RELEASE_VERSION}."
       return 0
     fi
@@ -262,6 +427,8 @@ parse_args() {
       --upgrade-mode=*|-m=*) PARAM_UPGRADE_MODE="${1#*=}"; shift ;;
       --upgrade-mode|-m) PARAM_UPGRADE_MODE="$2"; shift 2 ;;
       --non-interactive|-y) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --plan) PARAM_PLAN="true"; shift ;;
+      --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -293,11 +460,50 @@ EOF
   print_success "Upgrade report written to: $report_file"
 }
 
+# Runs lifecycle.sh from the composition directory with the install's Terraform
+# state coordinates in the environment.
+#
+# One function rather than the same subshell written out at each call site: the
+# plan and the apply must not be able to come to disagree about which state they
+# are talking to. It also keeps `cd` and the two exports from leaking into the
+# rest of the run -- and keeps shellcheck's SC2030/SC2031 quiet, which matters
+# because CI runs a bare `shellcheck upgrade.sh` and fails on info severity.
+run_lifecycle() {
+  local composition_dir="$1"
+  shift
+  (
+    cd "$composition_dir" || return 1
+    KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
+    KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+    export KUBE_AGENTS_STATE_BUCKET KUBE_AGENTS_STATE_PREFIX
+    ./lifecycle.sh "$@"
+  )
+}
+
 main() {
   parse_args "$@"
   print_banner
 
-  if [ -z "$PARAM_IMAGE_TAG" ]; then
+  # --image-tag may be omitted, and for a plan it usually should be. The tag is
+  # then read off the running install further down, which separates the two
+  # things a run could be about: an install whose IMAGES are behind main
+  # (visible, expected, and what the redeploy workflows exist to fix) and one
+  # whose INFRASTRUCTURE is behind main (invisible — #1117).
+  #
+  # An UPGRADE can ask for the same thing, but only by saying so:
+  # --keep-image-tag means "converge everything except the images". That is
+  # what a scheduled reconcile of autopush wants, because autopush tracks
+  # main's tip through GHCR publishes and pinning it to whichever commit the
+  # reconcile ran from would roll its images BACKWARDS to that commit.
+  #
+  # A flag rather than "empty means keep", because empty already means
+  # something: it is the shape of a CI job whose IMAGE_TAG variable did not
+  # resolve, and that has to stay the hard error it has always been.
+  if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_KEEP_IMAGE_TAG" = "true" ]; then
+    print_info "--keep-image-tag: this run keeps the tag the install is already serving."
+  elif [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
+    print_info "No --image-tag given; the plan will use the tag this install is already running."
+  elif [ -z "$PARAM_IMAGE_TAG" ]; then
     if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       print_error "--image-tag is required; use a validated release tag or full commit SHA."
       exit 1
@@ -305,31 +511,65 @@ main() {
     if [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
       printf '%b' "  ${C_CYAN}Target image tag (validated release tag or full commit SHA): ${C_RESET}" >/dev/tty
       read -r PARAM_IMAGE_TAG </dev/tty
+      # A bare Enter is still the empty tag this arm exists to reject, and
+      # nothing further down catches it: validate_immutable_ref, whose first
+      # branch rejects an empty ref, runs only when a tag is present. Without
+      # this, pressing Enter would skip verify_local_source_ref and silently
+      # become --keep-image-tag.
+      if [ -z "$PARAM_IMAGE_TAG" ]; then
+        print_error "--image-tag is required; use a validated release tag or full commit SHA. To upgrade everything except the images, pass --keep-image-tag."
+        exit 1
+      fi
     else
       print_error "--image-tag is required when no interactive terminal is available (e.g. curl | bash)."
       exit 1
     fi
   fi
-  validate_immutable_ref "$PARAM_IMAGE_TAG"
+  if [ -n "$PARAM_IMAGE_TAG" ] && [ "$PARAM_KEEP_IMAGE_TAG" = "true" ]; then
+    print_error "--keep-image-tag and --image-tag ask for opposite things. Pass one."
+    exit 1
+  fi
+  if [ -n "$PARAM_IMAGE_TAG" ]; then
+    validate_immutable_ref "$PARAM_IMAGE_TAG"
+  fi
 
   case "$PARAM_UPGRADE_MODE" in
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
 
+  # A tagless run cannot fetch its own engine — there is no tag to fetch — and
+  # cannot compare the checkout against a ref it was not given. Both are things
+  # the tag makes possible rather than things the run needs.
+  #
+  # What the tag does NOT excuse is the state of the checkout itself: a tagless
+  # run still applies this directory's Terraform and charts to a live install,
+  # so verify_local_source_clean runs either way and only the ref comparison is
+  # conditional.
   local script_dir repo_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
     repo_dir="$script_dir"
-    verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    if [ -n "$PARAM_IMAGE_TAG" ]; then
+      verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    else
+      verify_local_source_clean "$repo_dir"
+    fi
   elif [ -f "$(pwd)/scripts/installer/installer_common.sh" ]; then
     repo_dir="$(pwd)"
-    verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    if [ -n "$PARAM_IMAGE_TAG" ]; then
+      verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    else
+      verify_local_source_clean "$repo_dir"
+    fi
+  elif [ -z "$PARAM_IMAGE_TAG" ]; then
+    print_error "--plan and --keep-image-tag have to run from a kube-agents checkout: without --image-tag there is no ref to fetch the engine at."
+    exit 1
   else
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
     print_info "Fetching the upgrade engine for '${PARAM_IMAGE_TAG}'..."
-    git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
+    git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$repo_dir"
     git -C "$repo_dir" fetch --depth=1 origin "$PARAM_IMAGE_TAG"
     git -C "$repo_dir" checkout --detach FETCH_HEAD
     verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
@@ -405,11 +645,17 @@ main() {
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
 
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
+    print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
+    exit 1
+  fi
+
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Upgrade Plan Preview"
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
     echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}/*:${PARAM_IMAGE_TAG}"
-    echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into 'platform-agent-secrets' only if absent (existing values are never rewritten)"
+    echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into '${PLATFORM_AGENT_SECRET}' only if absent (existing values are never rewritten)"
+    echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate the shell sandbox SSH keypair into '${PLATFORM_AGENT_SECRET}' and '${PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET}' only if absent"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
@@ -469,9 +715,66 @@ main() {
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project" $GKE_DNS_ENDPOINT_FLAG
 
-  local target_namespace="${NAMESPACE:-kubeagents-system}"
-  print_step "3. Reconciling Pod-Scoped Session Keys"
-  backfill_session_kv_keys "$target_namespace"
+  local target_namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+
+  if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
+    # A PLAN's reference point is Terraform state, not the cluster, so the tag
+    # it plans at has to be the one the last apply RECORDED. The two differ by
+    # design on these environments: the redeploy workflows move the running tag
+    # with `helm upgrade --reset-then-reuse-values` and never run Terraform, so
+    # autopush's cluster advances with every push to main while state stays
+    # where the last reconcile left it.
+    #
+    # Planning at the running tag would therefore render an image_tag into
+    # terraform.tfvars that state does not have, helm_release.kube_agents would
+    # plan an in-place update, and the daily drift report would open on image
+    # lag every day main has moved — the exact thing reading the tag off the
+    # cluster was meant to keep OUT of the report, and an issue that never
+    # reaches the clean plan that closes it.
+    PARAM_IMAGE_TAG="$(tf_state_image_tag)"
+    if [ -n "$PARAM_IMAGE_TAG" ]; then
+      print_success "Planning at the tag this install's Terraform state records: ${PARAM_IMAGE_TAG}"
+    else
+      # No state, or state written before this composition had the output.
+      # Falling back to the cluster keeps the plan possible; it just cannot
+      # promise the image tag is out of it, so say so rather than let a reader
+      # take an image-lag diff for infrastructure drift.
+      print_warning "This install's Terraform state records no image tag, so the plan falls back to the tag the cluster is running. Any difference between the two will appear in the plan as a change to helm_release.kube_agents. The first apply records it and later plans are clean."
+    fi
+  fi
+
+  if [ -z "$PARAM_IMAGE_TAG" ]; then
+    PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"
+    if [ -z "$PARAM_IMAGE_TAG" ]; then
+      print_error "Could not read the running image tag from deployment/${PLATFORM_AGENT_DEPLOYMENT} in '${target_namespace}'."
+      print_info "Pass --image-tag to name one instead."
+      exit 1
+    fi
+    # Validated like any other, because this one is applied like any other. It
+    # reaches terraform.tfvars and the composition, so an install that happens
+    # to be serving a mutable ref — `:latest` from a hand-rolled redeploy —
+    # must not have that ref written into the configuration by an unattended
+    # run. Reading the tag off the cluster rather than off a flag is not a
+    # reason to trust it any further.
+    validate_immutable_ref "$PARAM_IMAGE_TAG"
+    print_success "Using the tag this install is running: ${PARAM_IMAGE_TAG}"
+  fi
+
+  if [ "$PARAM_PLAN" = "true" ]; then
+    # Both backfills PATCH a live Secret when a key is absent, which a plan may
+    # not do. Skipping them costs the plan nothing: what they would add is not
+    # Terraform-managed and so appears in no plan either way.
+    print_info "Plan mode: skipping the Session KV backfill and the shell sandbox key backfill, which would patch the live Secret."
+  else
+    print_step "3. Reconciling Pod-Scoped Session Keys"
+    backfill_session_kv_keys "$target_namespace"
+    # Rolls the agent on the same terms as the Session KV keys, and for the same
+    # reason: the sandbox StatefulSet the operator renders mounts the public half,
+    # and the gateway pod stages the private half from a Secret volume in an init
+    # container that runs once. An install that gains the pair without a restart
+    # gains a sandbox it cannot ssh into.
+    backfill_sandbox_ssh_key "$target_namespace"
+  fi
 
   # Helm never touches the crds/ directory on upgrade — that is Helm's own
   # documented behaviour, and the Terraform helm provider inherits it — so CRD
@@ -483,31 +786,87 @@ main() {
     kubectl apply --server-side --force-conflicts -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
   }
 
-  # The chart-only fast path: a mode that moves no GCP resource re-tags one
-  # image on the live release and leaves the rest of the values as they are.
-  # The regenerated tfvars carry the same new tag, so the next full
+  # The chart-only fast path: a mode that moves no GCP resource re-tags the
+  # images it owns on the live release and leaves the rest of the values as
+  # they are. The regenerated tfvars carry the same new tag, so the next full
   # `terraform apply` agrees with the release instead of reverting it.
+  #
+  # Takes every key it must move in one `helm upgrade`, not one call per key:
+  # two sequential upgrades leave the release briefly holding a new agent
+  # against an old sandbox, and the second one's reused values would have to
+  # re-read what the first wrote.
+  #
+  # --reset-then-reuse-values, not --reuse-values. --reuse-values renders this
+  # checkout's chart against only the previous release's values, so any key the
+  # chart gained since that release is simply absent: upgrading a pre-split
+  # install this way hits a nil pointer in operator-deployment.yaml, or renders
+  # the sandbox image as ":<tag>" and leaves the StatefulSet unable to start.
+  # Resetting first takes the checkout's defaults for the new keys and re-applies
+  # the release's own overrides on top, which is what the redeploy workflows
+  # already do for the same reason.
   helm_retag() {
-    local set_key="$1"
-    helm upgrade kube-agents "${repo_dir}/charts/kube-agents" \
-      --namespace "$target_namespace" --reuse-values \
-      --set "${set_key}=${PARAM_IMAGE_TAG}" --wait --timeout 10m
+    local set_args=()
+    local set_key
+    for set_key in "$@"; do
+      set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
+    done
+    helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
+      --namespace "$target_namespace" --reset-then-reuse-values \
+      "${set_args[@]}" --wait --timeout 10m
   }
 
   # The release guard runs before the tfvars generation on purpose: a
   # pre-Terraform install deserves this message, not whatever the generator
   # trips over first (its vars.sh may lack the credentials the generator
   # recovers from the live Secret).
-  if ! helm status kube-agents -n "$target_namespace" >/dev/null 2>&1; then
-    print_error "No Helm release 'kube-agents' in namespace '$target_namespace'."
+  if ! helm status "$KUBE_AGENTS_HELM_RELEASE" -n "$target_namespace" >/dev/null 2>&1; then
+    print_error "No Helm release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '$target_namespace'."
     print_info "This install predates the Terraform + Helm engine. Upgrade it with the release that installed it (curl the matching versioned upgrade.sh), or re-install with install.sh to adopt the new engine."
     exit 1
   fi
-
+  # Recover from zombie locks left behind by interrupted or timed-out Helm runs
+  if [ "$PARAM_PLAN" != "true" ]; then
+    ensure_clean_helm_release "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
+  else
+    # In plan mode, do not mutate state with a rollback, but warn if release is stuck
+    local current_helm_status
+    current_helm_status="$(helm_release_status "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"
+    if [[ "$current_helm_status" =~ ^pending- ]]; then
+      print_warning "Helm release '${KUBE_AGENTS_HELM_RELEASE}' is currently in '${current_helm_status}'. Note: rollback is skipped in plan mode."
+    fi
+  fi
   # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
+
+  if [ "$PARAM_PLAN" = "true" ]; then
+    print_step "4. Planning (read-only)"
+    print_info "Comparing this checkout's composition against the install's Terraform state."
+    local plan_status=0
+    run_lifecycle "${repo_dir}/terraform/examples/full-install" \
+      plan -detailed-exitcode || plan_status=$?
+
+    # terraform's -detailed-exitcode contract: 0 no changes, 1 error, 2 changes.
+    # It is passed through as this script's own exit code so a caller can act on
+    # it without parsing the plan text.
+    case "$plan_status" in
+      0)
+        print_success "In sync: a full upgrade at ${PARAM_IMAGE_TAG} would change nothing."
+        write_report "PLAN_IN_SYNC"
+        ;;
+      2)
+        print_warning "Drift: this install differs from the composition in this checkout."
+        print_info "The plan above lists every difference. 'terraform apply' is what closes them; ./upgrade.sh --upgrade-mode=full is the supported way to run one."
+        write_report "PLAN_DRIFT"
+        ;;
+      *)
+        print_error "The plan could not be produced (exit ${plan_status})."
+        write_report "PLAN_FAILED"
+        ;;
+    esac
+    exit "$plan_status"
+  fi
 
   case "$PARAM_UPGRADE_MODE" in
     operator)
@@ -519,7 +878,11 @@ main() {
 
     harness)
       print_step "4. Upgrading Platform Agent Deployment & Identity"
-      helm_retag "platformAgent.deployment.image.tag"
+      # The sandbox moves with the agent: both are built from this repository
+      # at the same commit, and the shell the agent reaches over ssh is the
+      # half that runs the new tools. Retagging the agent alone leaves the
+      # StatefulSet on the previous image.
+      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 
@@ -533,55 +896,71 @@ main() {
       # Refuse up front instead and name the two ways out.
       if grep -q '^enable_github_minter = true$' \
         "${repo_dir}/terraform/examples/full-install/terraform.tfvars" 2>/dev/null; then
-        minter_enabled_version="$({ gcloud kms keys versions list \
-          --key "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
-          --keyring "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
-          --location "$(derive_kms_location "${REGION}")" --project "${PROJECT_ID}" \
-          --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true; } | head -1)"
+        minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
+          "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "${REGION}")" "${PROJECT_ID}")"
         if [ -z "$minter_enabled_version" ]; then
           print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key has no ENABLED version — the apply would wait on a minter that can never become ready."
           print_info "Import the App key with install.sh (which runs the import before its apply), or unset GITHUB_APP_ID in install.env to upgrade without the minter."
           exit 1
         fi
       fi
+      # Enabling the minter or switching to Vertex through install.env plans a
+      # new fixed-name GSA on an install that has been running without one, so
+      # the 409 check install.sh runs before its apply runs here too.
+      check_service_account_ownership || exit 1
       # A full terraform apply against the regenerated tfvars: both image tags
       # move, and every setting recorded in install.env is re-rendered — the successor
       # of the old path's re-render of the CR from saved state.
-      (
-        cd "${repo_dir}/terraform/examples/full-install"
-        export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
-        export KUBE_AGENTS_STATE_PREFIX
-        KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
-        ./lifecycle.sh apply -auto-approve -input=false
-      )
+      run_lifecycle "${repo_dir}/terraform/examples/full-install" \
+        apply -auto-approve -input=false
       print_success "Full atomic upgrade completed successfully!"
       ;;
   esac
 
   # An operator-mode upgrade rolls the controller manager and nothing else, so a
   # Secret patched above would sit unread until some later harness upgrade —
-  # with the watcher dead in the meantime. The other two modes re-render the
-  # agent Deployment and pick the keys up on their own rollout.
+  # with the watcher dead, or the sandbox unreachable, in the meantime. The
+  # other two modes re-render the agent Deployment and pick the keys up on their
+  # own rollout.
   local restarted_agent="false"
-  if [ "$SESSION_KV_KEYS_PATCHED" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
-    if kubectl get deployment platform-agent-gateway -n "$target_namespace" >/dev/null 2>&1; then
-      print_info "Restarting the Platform Agent so it reads the newly added Session KV keys..."
-      kubectl rollout restart deployment/platform-agent-gateway -n "$target_namespace"
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ] &&
+    { [ "$SESSION_KV_KEYS_PATCHED" = "true" ] || [ "$SANDBOX_KEYS_PATCHED" = "true" ]; }; then
+    if kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
+      print_info "Restarting the Platform Agent so it reads the newly added Secret keys..."
+      kubectl rollout restart "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace"
       restarted_agent="true"
     else
-      print_warning "Session KV keys were added but Deployment 'platform-agent-gateway' was not found in '$target_namespace'; restart the agent yourself so it reads them."
+      print_warning "Secret keys were added but Deployment '${PLATFORM_AGENT_DEPLOYMENT}' was not found in '$target_namespace'; restart the agent yourself so it reads them."
     fi
   fi
 
   print_step "5. Post-Upgrade Health Verification"
-  kubectl get ns kubeagents-system >/dev/null
+  kubectl get ns "$target_namespace" >/dev/null
   if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
-    # kube-agents-controller-manager, not kubeagents-: the chart prefixes the
-    # operator Deployment with the release name.
-    kubectl rollout status deployment/kube-agents-controller-manager -n kubeagents-system --timeout=120s
+    kubectl rollout status "deployment/${KUBE_AGENTS_OPERATOR_DEPLOYMENT}" -n "$target_namespace" --timeout=120s
+  fi
+  if { [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; } && \
+     [ -n "$PARAM_IMAGE_TAG" ] && [ -f "${repo_dir}/scripts/confirm_agent_image.sh" ]; then
+    if kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
+      "${repo_dir}/scripts/confirm_agent_image.sh" "$target_namespace" "$PLATFORM_AGENT_DEPLOYMENT" "$PARAM_IMAGE_TAG"
+    fi
   fi
   if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
-    kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=120s
+    kubectl rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s
+  fi
+  # A healthy gateway is not a working install. The agent runs no command in its
+  # own pod: every shell command goes over ssh to the sandbox StatefulSet, and
+  # every credentialed one through the proxy. Verifying only the gateway
+  # reported an upgrade that succeeded while the agent could not run kubectl.
+  #
+  # Guarded on the object existing, because the operator creates both and an
+  # operator-mode upgrade can reach here before its PlatformAgent has
+  # reconciled. A missing object is that, not a failed rollout.
+  if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET" -n "$target_namespace" >/dev/null 2>&1; then
+    kubectl rollout status "statefulset/${PLATFORM_AGENT_SHELL_STATEFULSET}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+  fi
+  if kubectl get deployment "$PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
+    kubectl rollout status "deployment/${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
   fi
   print_success "Upgraded deployments verified healthy."
 

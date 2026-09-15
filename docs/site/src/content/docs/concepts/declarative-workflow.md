@@ -22,10 +22,10 @@ The agent invokes this skill whenever an SOP or on-request task decides "propose
 
 1. Runs `"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON. The path is spelled from `$HERMES_HOME` because the skill is reached from a kanban card as well as from a cron turn, and only a cron turn starts in the profile directory.
 2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
-3. Runs the same helper with `submit --workspace … --branch … --title … --body …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`.
+3. Runs the same helper with `submit --workspace … --branch … --title … --body-file …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`. The description travels over a file under `/opt/data/scratch` rather than argv: a pull request body is full of backticks, and inside the double quotes the agent would write around it bash expands them.
 4. The script prints the PR URL to stdout; the agent posts it to Chat.
 
-The lease in step 1 is what keeps concurrent agents apart: a Pod runs six audit crons alongside every kanban worker, and they used to share one working tree. `submit` refuses outright if the workspace it is handed belongs to another lease, and the credential proxy refuses tree-mutating `git` anywhere outside a leased directory — see [Credential isolation](/kube-agents/reference/credential-isolation/), with [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) canonical for the layout.
+The lease in step 1 is what keeps concurrent agents apart: a Pod runs nine audit crons alongside every kanban worker, and they used to share one working tree. `submit` refuses outright if the workspace it is handed belongs to another lease, and the credential proxy refuses tree-mutating `git` anywhere outside a leased directory — see [Credential isolation](/kube-agents/reference/credential-isolation/), with [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) canonical for the layout.
 
 Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks pushes to the protected branches `main`, `master`, and `production`. The push is `--force-with-lease`, so re-submitting after review feedback updates the existing PR branch but will not overwrite one somebody else has moved.
 
@@ -56,10 +56,15 @@ Source: [`agents/platform/skills/fleet-audit/`](https://github.com/gke-labs/kube
 The agent's only output is a validated `findings.json` — one entry per deviation, each carrying the literal read-only command that proves it and a `recommendation` (action, rationale, risk). `audit_report.py` does the rest:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
-# … the agent inspects the fleet read-only and writes findings.json …
-./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <path>
+python3 ./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
+# … a collector reads the fleet, and the agent writes findings.json from its manifest …
+python3 ./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> \
+  --findings-file <path> --manifest-file <manifest>
 ```
+
+`--manifest-file` is not optional. `finish` refuses to publish without it (or an explicit
+`--no-collector-manifest <why>`), because the manifest is what every cross-check between the
+model's claims and the fleet's actual state is run against.
 
 What it publishes has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff.
 
@@ -79,7 +84,7 @@ The branch name is the only join key between a finding and its PR — nothing is
 
 Promotion is hybrid:
 
-- **Automatic** when the finding is `critical`, its remediation is a `manifest`, and there is no _live_ pull request on its branch — capped at five auto-promotions per run, with any withheld findings named in the ledger as awaiting an explicit request.
+- **Automatic** when the finding is graded `critical` or `major`, its remediation is a `manifest`, and there is no _live_ pull request on its branch — capped at five auto-promotions per run, with any withheld findings named in the ledger as awaiting an explicit request. A `minor` manifest is withheld too, and unlike a capped one it stays withheld until someone asks: defence-in-depth the ledger goes on offering rather than work that arrives unrequested.
 - **On request** otherwise. Someone with write access on the repo comments `/remediate <finding-id>` — or `/remediate all` — on the ledger issue, and the next run opens the PRs and replies with the links. Only `manifest` findings are promotable: naming a `gcloud` or `manual` finding gets one reply explaining that its fix is a command to run, not a file to merge. A command from an author without write access gets one reply and nothing else.
 
 Every request gets exactly one answer and the answer is never silence, because a command that vanished is indistinguishable from an audit that has not run yet. An acknowledgement names each target and what became of it — the PR's URL, already open with its labels re-asserted and its diff untouched, superseded by a human close, or queued for a retry — rather than a count. A refusal says which of the reasons applies, and a request the parser cannot honour at all (the command mid-sentence rather than on its own line, or with no target after it) gets a reply carrying the correct syntax and the ids that would have worked. A `/remediate` inside a code span is prose about the command, not an attempt at it — which is how the harness avoids answering its own comments. Each answer is recorded behind a hidden marker keyed on the triggering comment, so a standing request is answered once rather than every morning.
@@ -95,11 +100,11 @@ The last two states are the same event seen from opposite sides: a fix PR that i
 
 Three properties follow from the script owning the artefacts rather than the model:
 
-- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open a seventh stream. The agent never calls `gh issue create` itself.
-- **A computable delta.** The issue body carries a hidden `<!-- audit-findings: [...] -->` block; the next run diffs finding ids against it. Stability is not asked of the model: the id is derived in code from `(check, cluster, namespace, object)` and any `id` in the findings file is discarded, so the same problem keeps the same id without anyone remembering to make it so. A second hidden line stamps which identity scheme minted the ids, and a run that reads a block from a different scheme withholds `resolved` for one run rather than reporting a renamed finding as a fixed one.
+- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open an unregistered stream. The agent never calls `gh issue create` itself.
+- **A computable delta.** Each run keeps the finding ids it published on the agent's own volume, and the next run diffs against that store. The issue body carries the same ids in a hidden `<!-- audit-findings: [...] -->` block, with a second hidden line stamping which identity scheme minted them — the published, machine-readable copy of the run rather than the harness's own memory. Stability is not asked of the model: the id is derived in code from `(check, cluster, namespace, object)` and any `id` in the findings file is discarded, so the same problem keeps the same id without anyone remembering to make it so. The store is trusted only on three equalities — it was written for the ledger this run found, under the identity scheme the code still uses, and for the same repository, since an unattended run walks `managed_repos` in sequence and issue numbers are per-repository, so the first two can match across two different repos' findings. A store that is missing or fails any of the three makes the previous run unknowable, so the run publishes its findings with no delta claim at all rather than announcing every live finding as new. That costs one run's delta annotation, and the same run's own store write restores it.
 - **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
 
-The `agent:audit` label is also what keeps the two issue-writing watchdogs apart: the `github-issue-resolver` poll query excludes it, so it never tries to "resolve" an audit ledger.
+The `agent:audit` label is also what keeps the issue-writing jobs apart: the `github-issue-resolver` poll query excludes it, and `agent:delivery-watch` with it, so it never tries to "resolve" an audit ledger or the chat-delivery ledger.
 
 `fleet-audit` shares `submit-suggestion`'s guardrails: same Minty token path, the same refusal of `git add .` / `git add -A`, and the same hard block on force-pushing `main`, `master`, or `production`.
 

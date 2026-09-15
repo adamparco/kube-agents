@@ -24,13 +24,13 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).
 - **Branch location.** Push PR branches to your fork, not to the upstream repository.
 - **PR template.** Use [`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/gke-labs/kube-agents/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Don't use `--fill` with `gh pr create` — it bypasses the template.
-- **Live validation.** Every PR describes how the change was exercised against a real, running installation. See [Live validation](#live-validation) below.
+- **Live validation.** Every PR describes how the change was exercised against a real, running installation. See [Live validation](#live-validation) below. For a change to what an agent does, that means an eval case seen red against `main` and green three times against the branch ([`.agents/rules/eval_driven_development.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/rules/eval_driven_development.md)).
 - **Self-review.** Every PR arrives already reviewed by its author, and says what that review found. See [Self-review](#self-review) below.
 
 ## Local validation
 
 Before pushing, run the checks CI enforces. This section is about running the tests; for deciding
-where a new one belongs, `docs/testing-map.md` maps the nine test homes to their runners.
+where a new one belongs, `docs/testing-map.md` maps the ten test homes to their runners.
 
 - **Prettier** on changed Markdown and YAML (what the `Prettier Check` CI job enforces — it checks changed `.md`/`.yaml`/`.yml` files):
 
@@ -66,10 +66,22 @@ where a new one belongs, `docs/testing-map.md` maps the nine test homes to their
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
 
+- **A2A module** (if you touched `a2a/`):
+
+  ```bash
+  cd a2a && go vet ./... && go test -race ./...   # the conformance suite uses an embedded JetStream server, no cluster needed
+  # The CI job additionally installs the envtest binaries and the nats CLI; without them the
+  # auth callout's API-server and CLI cases skip and the run still reports green. To match it:
+  #   KUBEBUILDER_ASSETS="$(make -C ../k8s-operator -s envtest-path)" go test -race ./...
+  # The path is relative to a2a/, which is where the cd above leaves you. Get it wrong and make
+  # fails, the substitution yields empty, and the cases skip exactly as if you had not set it.
+  # docs/testing-map.md is canonical for which suite runs where.
+  ```
+
 - **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
 
   ```bash
-  make test-integration   # just this tier, for working on a seam; CI reaches it through `make test-python`
+  make test-integration   # just this tier, for working on a seam; CI reaches it through the PYTHON_TEST_DIRS sweep
   ```
 
   Real components wired together with the agent replaced by a fake — no cluster, no model. The tier is in `PYTHON_TEST_DIRS`, so `make test-python` runs it and the Run Python Unit Tests job gates on it; the target above is the fast loop for one tier while you work on a seam. Install a Go toolchain first if you want an honest answer — the injector seam compiles the real Go event-watcher client, and without `go` on `PATH` its four tests skip and the run still prints `OK`. `tests/integration/README.md` states the tier's contract.
@@ -156,5 +168,7 @@ AI agents working in this repository have a further obligation: after opening a 
 ## Where to file issues
 
 Bug reports, feature requests, and questions: [github.com/gke-labs/kube-agents/issues](https://github.com/gke-labs/kube-agents/issues).
+
+If your GitHub account cannot open an issue here, use the [feedback form](/kube-agents/feedback/) instead. It needs no account and files a public issue on your behalf, labelled `external-feedback`. The usual reason is an enterprise-managed GitHub account, which cannot interact with any repository outside its own enterprise; GitHub reports that as a restriction on this repository, but the repository itself is open. How the form works is in [`scripts/feedback_form/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/feedback_form/README.md).
 
 The [`github-repo-watcher` poller](/kube-agents/concepts/autonomous-watchdogs/#pollers-file-cards-watchdogs-deliver-reports) checks open issues every 10 minutes, and the agent may (within tight guardrails) triage or respond to one automatically. Human review still gates any resolution.

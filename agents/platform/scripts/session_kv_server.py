@@ -14,13 +14,14 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 from contextlib import closing
 
 import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import findings_queue
 
 # Configure logging
 logging.basicConfig(
@@ -448,10 +449,14 @@ def init_db() -> None:
                 )
                 """
             )
+            findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
 
 def cleanup_old_records(conn: sqlite3.Connection) -> None:
+    # `findings` and `queue_publications` are deliberately absent: a backlog
+    # with a TTL is not a backlog, and a `dismissed` row that ages out is one
+    # the next sweep re-offers. Their lifecycle is `state`, not age.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -810,6 +815,16 @@ def enabled_chat_platforms() -> list[str]:
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
 
+    "Enabled" is not "addressable", and the difference costs a run record rather
+    than a delivery. The operator renders `<P>_HOME_CHANNEL` with whatever the CR
+    holds, which the provisioning template leaves as `""`, so a platform can be
+    enabled here with no channel named in the environment. That is not a reason
+    to drop it — `hermes send` addressed with a bare platform name resolves the
+    channel from Hermes' own config, and `_slack_home_channel` covers the
+    `/sethome` case — but when it genuinely cannot be addressed the leg fails,
+    the run is still a 200, and the platform is named in the route's
+    `undelivered` field. Read that rather than reading `relay`.
+
     This is the third copy of this question in the tree, and the copies should
     converge rather than a fourth being added: `platform_mcp_server
     .get_enabled_platforms` is still keyed on the absent SLACK_BOT_TOKEN (#735
@@ -1011,8 +1026,23 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
     each leg keeps its own thread whatever the top-level fields say.
     """
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            with conn:
+        # isolation_level=None hands transaction control to us, as in
+        # `_charge_alert_quota`, so the BEGIN IMMEDIATE below is the real thing
+        # rather than sqlite3's implicit deferred transaction.
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            # IMMEDIATE takes the write lock before the read, because this row
+            # is read-modify-written rather than updated in place. Two calls
+            # racing on one session is the designed case and not a corner: the
+            # paragraph above describes a relayed report calling this once per
+            # enabled platform for the same session id. Under a deferred
+            # transaction sqlite3 opens nothing until the UPDATE, so both calls
+            # would read `platform_threads` before either wrote it back and
+            # whichever committed second would drop the other's entry -- leaving
+            # a map that names one platform when two answered. Nothing notices
+            # until a leg that failed once stays unthreaded for the rest of the
+            # day.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 row = conn.execute(
                     "SELECT metadata FROM session_metadata WHERE session_id = ?",
                     (session_id,)
@@ -1040,6 +1070,10 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
                         (json.dumps(meta), session_id)
                     )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
     except Exception as exc:
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
 
@@ -1336,8 +1370,8 @@ def trigger_agent_troubleshooter(
         # never the follow-up. `_post_initial_alert` also lands here when the
         # send succeeded but returned no parseable `message_id`, so the record
         # says the delivery is unconfirmed rather than certainly lost — the
-        # honest reading, and the safe direction for a report whose failure
-        # mode is false reassurance.
+        # honest reading, and the safe direction for a report whose failure mode
+        # is false reassurance.
         mark_delivery_failed(
             event_row_id,
             f"no message id from {' or '.join(repr(p) for p in platforms)}; "
@@ -1420,6 +1454,13 @@ _LABEL_TOKEN_RE = re.compile(
     r"|###\s*(?:System|Instruction):",
     re.IGNORECASE,
 )
+
+# A platform name as the registry spells one: `slack`, `google_chat`. Used to
+# filter `also_delivered_to`, whose entries are compared against the names
+# `enabled_chat_platforms` returns and are never rendered anywhere. Anything that
+# does not match is dropped rather than scrubbed into something that might
+# accidentally match a real platform and suppress a delivery.
+_PLATFORM_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}", re.IGNORECASE)
 
 
 def _sanitize_label(value: str) -> str:
@@ -1815,23 +1856,53 @@ def relay_cron_report(
     title: str,
     report: str,
     truncation_notice: str = "",
-) -> tuple[str | None, bool, list[str]]:
+    also_delivered_to: Sequence[str] = (),
+) -> tuple[str | None, str, list[str]]:
     """Hand a specialist's finished report to the Chat Agent, then post its reply.
+
+    The report goes to every platform :func:`enabled_chat_platforms` names, each
+    into its own thread, because "the home channel" on a dual-platform install is
+    two channels and picking one silently dropped the other.
+
+    Minus `also_delivered_to`, which is how the fan-out avoids double-posting.
+    The relay is one leg of the job's `deliver` value, not the whole of it:
+    `deliver: "chat"` is relay-only, but `deliver: "all"` asks the scheduler to
+    post the raw report to every home channel *and* routes a leg through here,
+    so fanning out unconditionally puts two copies in each channel — the raw one
+    from the scheduler and the composed one from here. The caller names the
+    platforms the scheduler is handling itself and this function skips them, so
+    a channel gets the composed report or the raw one, never both.
+
+    The subtraction only ever removes a strict subset. `also_delivered_to` says
+    what the scheduler *intends* to deliver — it is built from which home
+    channels resolve in the cron child, and a channel that resolves can still
+    fail on the send. Honouring a set that covers every platform would therefore
+    trade a duplicate for silence, so where the subtraction would empty the list
+    this fans out to all of them instead. Two copies of a report is a nuisance;
+    none is a missed audit.
+
+    The set comes from the cron child rather than from this process because only
+    the child knows what `deliver` actually resolved to. `all` expands over the
+    platforms with a home channel *in that child*, and `home_target_env` rebuilds
+    those from the root `config.yaml` — an install whose config carries `slack:
+    {}` drops Slack from the expansion silently. Deciding here, from this
+    process's environment, would subtract a leg the scheduler never sent and
+    leave that channel with nothing at all.
 
     Returns `(error, degraded, undelivered)`. `error` is None when the report
     reached at least one chat platform, else a short description of what went
     wrong; the caller turns that into a non-2xx and the string ends up in the
     job's `last_delivery_error` — see :func:`submit_cron_report`.
 
-    `undelivered` names the enabled platforms this report did not reach while
-    another one did. The send fans out — every platform
-    :func:`enabled_chat_platforms` resolves gets the report, because a
-    dual-platform install has two audiences and delivering to one of them is
-    how #1094 lost seven days of governance output to a Slack leg that had no
-    home channel and no connection. A partial failure is a 200: the report is
-    in a channel and a re-run would post it twice to the platform that already
-    has it. It is not silent either — the caller puts this list in the response
-    body, from where the relay adapter writes it to `last_delivery_error`.
+    `undelivered` names the platforms this report did not reach while another one
+    did. Delivering to one audience of two is how #1094 lost seven days of
+    governance output to a Slack leg that had no home channel and no connection.
+    A partial failure is a 200: the report is in a channel and a re-run would
+    post it twice to the platform that already has it. It is not silent either —
+    the caller puts this list in the response body, from where the relay adapter
+    writes it to `last_delivery_error`. Platforms subtracted by
+    `also_delivered_to` are not in it: the scheduler is posting there itself, so
+    they are skipped rather than missed.
 
     `degraded` is the half that a boolean-or-nothing return used to swallow. The
     Chat Agent's turn can fail while the send still succeeds, and posting the raw
@@ -1845,6 +1916,14 @@ def relay_cron_report(
     :func:`_unrelayed_notice`, and once in this return value, which the caller
     puts in the response body.
 
+    It is the reason, not a bool: a clause saying what degraded, empty when
+    nothing did, so a caller testing it for truth reads exactly as it did when it
+    was a bool. The caller returns it as `relay_detail`, which is what saves
+    every consumer from hardcoding a sentence about a cause it cannot see. It
+    carries the CAUSE and never a platform name — the platforms live in
+    `undelivered`, and folding them into both made the two consumers print the
+    same fact twice.
+
     Ordering is deliberate. The turn runs before the send so that what reaches
     chat is the Chat Agent's message rather than a placeholder it later talks
     around; the routing registration and the incident store happen after the
@@ -1852,7 +1931,37 @@ def relay_cron_report(
     report is posted unrelayed — a scheduled finding that reached a real problem
     should not be lost because the front door was busy.
     """
-    platforms = enabled_chat_platforms()
+    # Floored at the full set, so a wrong sibling list cannot silence the report:
+    # `handled` is what the scheduler said it would post, never proof that it
+    # did.
+    all_targets = enabled_chat_platforms()
+    handled = {str(name).strip().lower() for name in also_delivered_to if str(name).strip()}
+    remaining = [p for p in all_targets if p not in handled]
+    platforms = remaining or all_targets
+    if len(platforms) < len(all_targets):
+        logger.info(
+            f"Relay for {profile}/{job_id}: skipping "
+            f"{', '.join(sorted(set(all_targets) - set(platforms)))} — the job's own deliver "
+            f"value posts the raw report there"
+        )
+    elif not remaining:
+        logger.info(
+            f"Relay for {profile}/{job_id}: the job's deliver value claims every platform "
+            f"({', '.join(sorted(handled))}); relaying anyway rather than risk sending nothing"
+        )
+    elif handled:
+        # `remaining == all_targets` with a non-empty `handled` is the third
+        # case, and it read as the second: the subtraction removed nothing, so
+        # the branch above logged "claims every platform (telegram)" about a
+        # value that claimed one platform this install does not run. Which is
+        # the interesting one -- a deliver value naming a platform that is not
+        # enabled here posts nowhere, and the log said the opposite.
+        logger.info(
+            f"Relay for {profile}/{job_id}: the job's deliver value names "
+            f"{', '.join(sorted(handled))}, none of which this install has enabled "
+            f"({', '.join(sorted(all_targets))}); relaying to all of them"
+        )
+
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
     headers = {"Content-Type": "application/json"}
     token = _gateway_api_token()
@@ -1867,12 +1976,23 @@ def relay_cron_report(
     message = _run_relay_turn(
         api_url, session_id, report, _build_relay_instructions(profile, job_id, title), headers
     )
-    degraded = message is None
-    if degraded:
+    unrelayed = message is None
+    if unrelayed:
         # Degraded, and say so in the channel rather than in a log nobody reads:
         # the report is the point, the Chat Agent's framing is the polish.
         logger.warning(f"Relay for {profile}/{job_id}: posting the raw report, unrelayed")
         message = _unrelayed_notice(profile, job_id) + report
+
+    # The reason `relay_detail` carries, composed here because this is the only
+    # place that knows it. It names the cause and no platform: an undelivered leg
+    # is reported by name in `undelivered`, and saying it in both made the two
+    # consumers print the same fact twice.
+    degraded = (
+        "the Chat Agent turn failed, so the channel has the raw report marked "
+        "[unrelayed] rather than a composed message"
+        if unrelayed
+        else ""
+    )
 
     if truncation_notice:
         # After the turn, never before it. Appended to the report it would be
@@ -1990,6 +2110,23 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     profile = _sanitize_label(str(request_data.get("profile") or "")) or "platform"
     title = _sanitize_label(str(request_data.get("title") or ""))
 
+    # Which platforms the scheduler is posting this same report to itself, so the
+    # fan-out can skip them. Absent on a payload from an older relay plugin,
+    # which then behaves as it did before: the field only ever removes targets,
+    # so a missing one cannot lose a delivery. Not a label — these are matched
+    # against platform names, never rendered — so it takes a name-shaped subset
+    # rather than `_sanitize_label`.
+    raw_handled = request_data.get("also_delivered_to") or []
+    also_delivered_to = (
+        [
+            name.strip().lower()
+            for name in raw_handled
+            if isinstance(name, str) and _PLATFORM_NAME_RE.fullmatch(name.strip())
+        ]
+        if isinstance(raw_handled, list)
+        else []
+    )
+
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id field is required")
     if not report:
@@ -2001,7 +2138,7 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
 
     try:
         error, degraded, undelivered = relay_cron_report(
-            session_id, profile, job_id, title, report, truncation_notice
+            session_id, profile, job_id, title, report, truncation_notice, also_delivered_to
         )
     except Exception as exc:  # never leak a stack trace into last_delivery_error
         logger.exception(f"Relay for {profile}/{job_id} raised")
@@ -2011,15 +2148,21 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     # 200, because the report is in the channel and the run did its job. `relay`
     # is what tells the scheduler which of the two deliveries it got, so a job
     # whose front door has been down all week is visible without reading logs.
-    # `undelivered` is the same idea one platform down: a fan-out that reached
+    # `relay_detail` says *why* it degraded, so no consumer has to hardcode a
+    # sentence about a cause it cannot see; `relay` stays a two-value verdict so
+    # the callers that only branch on it need no change at all.
+    # `undelivered` is a separate idea one platform down: a fan-out that reached
     # one audience and missed another is a delivery, and still something the run
-    # record has to carry. `truncated` is the third: the human sees the
-    # `[truncated]` line in the channel, and without this the agent that wrote
-    # the report — the one that could have split it — is told only "accepted".
+    # record has to carry. It is a list of names and `relay_detail` never repeats
+    # them, so the two fields do not say the same thing twice. `truncated` is the
+    # third: the human sees the `[truncated]` line in the channel, and without
+    # this the agent that wrote the report — the one that could have split it —
+    # is told only "accepted".
     return {
         "status": "delivered",
         "session_id": session_id,
         "relay": "degraded" if degraded else "ok",
+        "relay_detail": degraded,
         "undelivered": ",".join(undelivered),
         "truncated": "true" if truncation_notice else "",
     }
@@ -2374,6 +2517,123 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
         if limit > 0
     }
     return {"day": day, "severities": severities}
+
+
+# --------------------------------------------------------------------------
+# The findings queue: docs/designs/inventory-findings-queue.md §6.1.
+#
+# HTTP rather than MCP tools alone because the event watcher is a first-class
+# writer (§5.1) and it is Go. `findings_queue` holds the schema, the rubric and
+# the ordering; these routes are the transport, and the MCP tools in
+# platform_mcp_server.py are a wrapper over them.
+# --------------------------------------------------------------------------
+
+
+def _findings_write(operation, *args, **kwargs) -> Any:
+    """Run one queue operation in a transaction, mapping its errors to status."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            # BEGIN IMMEDIATE, as the alert ceiling above does and for the same
+            # reason: every operation here reads a row before deciding what to
+            # write. Under a deferred transaction two sources registering the
+            # same finding both read "absent" and both INSERT, and the loser's
+            # entire batch dies on the UNIQUE constraint.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = operation(conn, *args, **kwargs)
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+            return result
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except findings_queue.FindingNotFound as exc:
+        raise HTTPException(status_code=404, detail=f"no finding {exc.args[0]!r}") from None
+    except sqlite3.OperationalError as exc:
+        # `database is locked`, once the 5s budget is spent. Retryable, and 503
+        # says so; a 500 would tell the caller its payload was the problem.
+        raise HTTPException(status_code=503, detail=f"the findings queue is busy: {exc}") from None
+
+
+@app.post("/v1/findings", dependencies=[Depends(verify_api_key)])
+def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Upsert a batch of findings under §5.2's per-state rules.
+
+    `scope` is how a source says its run was complete for one cluster, which is
+    the only condition under which absence may lower a row's confidence. A
+    partial run must omit it: a sweep that died halfway looks exactly like a
+    fleet that got healthier.
+    """
+    return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
+
+
+@app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
+def get_ranked_findings() -> Dict[str, Any]:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        return {"findings": findings_queue.ranked_findings(conn)}
+
+
+@app.get("/v1/findings", dependencies=[Depends(verify_api_key)])
+def get_findings(
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+) -> Dict[str, Any]:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"findings": findings}
+
+
+@app.post("/v1/findings/{finding_id}/surfaced", dependencies=[Depends(verify_api_key)])
+def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    body = body or {}
+    return _findings_write(
+        findings_queue.mark_surfaced,
+        finding_id,
+        str(body.get("chat_id") or ""),
+        str(body.get("thread_id") or ""),
+    )
+
+
+@app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])
+def patch_finding(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """The three human transitions (§3.2), the early end of a snooze, and PR reconciliation."""
+    return _findings_write(findings_queue.patch_finding, finding_id, body)
+
+
+@app.post("/v1/findings/expire-snoozes", dependencies=[Depends(verify_api_key)])
+def expire_finding_snoozes() -> Dict[str, Any]:
+    """Return every finding whose `snoozed_until` has lapsed to `surfaced` (§3.2)."""
+    return {"expired": _findings_write(findings_queue.expire_snoozes)}
+
+
+@app.post("/v1/findings/{finding_id}/verified", dependencies=[Depends(verify_api_key)])
+def record_finding_verification(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """§7.4's three outcomes: still_failing, resolved, unverifiable."""
+    return _findings_write(
+        findings_queue.record_verification,
+        finding_id,
+        str(body.get("outcome") or ""),
+        str(body.get("observed") or ""),
+        body.get("rubric"),
+        bool(body.get("object_missing")),
+    )
+
+
+@app.get("/v1/findings/publication/{publisher}", dependencies=[Depends(verify_api_key)])
+def get_queue_publication(publisher: str) -> Dict[str, Any]:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = findings_queue.get_publication(conn, publisher)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"no publication row for {publisher!r}")
+    return row
+
+
+@app.put("/v1/findings/publication/{publisher}", dependencies=[Depends(verify_api_key)])
+def put_queue_publication(publisher: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    return _findings_write(findings_queue.put_publication, publisher, body)
 
 
 init_db()

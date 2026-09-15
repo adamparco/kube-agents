@@ -1,18 +1,25 @@
 name: "Nightly: Pipeline"
 
 # Builds a nightly environment from nothing, runs the full E2E matrix on it,
-# promotes the candidate to staging if the matrix passes, and destroys the
-# environment again.
+# and — if the matrix passes — promotes the candidate to staging by creating
+# and pushing a staging tag (`staging_<ts>_<sha>`), before destroying the
+# nightly environment again.
 #
-# Nothing in it touches the RC environment. The three jobs that touch a cluster —
-# deploy, the matrix, teardown — bind `nightly` and take the
+# Pushing the staging tag triggers `Staging: Deploy` (staging-deploy.yml), which
+# atomically reconciles the Terraform composition, Helm release, and container
+# images together from that single validated commit. Autopush is similarly
+# kept current through atomic deploys in autopush-deploy.yml when images are
+# published to GHCR.
+#
+# Nothing in it touches the RC environment. The three jobs that touch the
+# nightly cluster — deploy, the matrix, teardown — bind `nightly` and take the
 # `nightly-environment` lock, so none of them queues behind or races the
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
-# taking the lock; step 4 only pushes a Git tag, so it does neither.
+# taking the lock; the promotion only pushes a Git tag, so it does neither.
 #
-# Dispatch-only on purpose: turning the schedule on is its own decision and its
-# own reviewable change. Exercise it by hand against the nightly project until it
-# is boring, then add `cron: "0 2 * * *"`.
+# Dispatch-only on purpose: scheduled execution is owned by nightly-scheduler.yml
+# so that a daily tick with nothing to promote produces no pipeline run at all.
+# Candidate overrides (`rc_tag`) are accepted for manual dispatches.
 
 permissions:
   contents: read
@@ -28,7 +35,8 @@ on:
         type: string
 
 # Distinct from the `nightly-environment` lock the called workflows take. That
-# one is acquired and released three times over — by steps 2, 3 and 5 — so a
+# one is acquired and released three times over — by the deploy, the matrix and
+# the teardown, whatever their step numbers happen to be — so a
 # workflow pointed at the `nightly` environment can interleave in a gap. This
 # group is held for the whole run, and it is what keeps the only thing that
 # drives the environment end to end, another nightly, out of those gaps.
@@ -150,16 +158,11 @@ jobs:
       timeout_minutes: 120
     secrets: inherit
 
-  step-4-promote-to-staging:
-    name: Step 4 - Promote Candidate to Staging
+  step-4-create-staging-tag:
+    name: Step 4 - Create Staging Tag
     needs: [step-1-resolve-candidate, step-3-run-e2e-matrix]
     # The implicit success() on `needs` is the gate: a red matrix promotes
     # nothing and leaves staging where it is.
-    #
-    # skip_promotion — the candidate already carries a staging tag — is checked on
-    # the STEPS below rather than here. A skipped job skips everything that
-    # `needs` it, and step 5 needs this one, so gating the job would strand a GKE
-    # cluster on every night whose candidate was already promoted.
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
@@ -168,15 +171,26 @@ jobs:
     permissions:
       contents: write
     steps:
-      # RELEASE_BOT_TOKEN, not GITHUB_TOKEN. A tag pushed with the default token
-      # triggers no workflow, so staging-redeploy-*.yml would never start and
-      # the promotion would go green having deployed nothing.
+      # Dedicated GitHub App token (kube-agents-release-bot), not GITHUB_TOKEN.
+      # A tag pushed with the default token triggers no workflow, so staging-deploy.yml
+      # would never start and the promotion would go green having deployed nothing.
+      # The App token also bypasses repository tag-protection rulesets.
+      - name: Generate Release Bot Token
+        if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
+        id: release-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Checkout repository
         if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+          token: ${{ steps.release-token.outputs.token }}
 
       - name: Tag the candidate for staging
         if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
@@ -201,13 +215,12 @@ jobs:
     # below adds to that check rather than replacing it — an `always()` here would
     # remove it and start destroying the environments this exists to preserve.
     #
-    # `step-4-promote-to-staging` is deliberately absent from the list. Its only
-    # failure modes are credential ones — an expired RELEASE_BOT_TOKEN, a rejected
+    # `step-4-create-staging-tag` is deliberately absent from the list. Its only
+    # failure modes are credential ones — an invalid GitHub App key or ID, a rejected
     # push — which leave nothing on the cluster worth looking at, and depending on
-    # it would strand a GKE cluster that nothing else reclaims: this pipeline has
-    # no schedule, so there is no next run to clean up after it. Running the two
-    # concurrently is safe, because step 4 touches no GCP resource and this job
-    # holds the nightly-environment lock.
+    # it would needlessly strand a GKE cluster until the next run reclaims it:
+    # running the two concurrently is safe, because step 4 touches no GCP resource
+    # and this job holds the nightly-environment lock.
     needs: [step-1-resolve-candidate, step-2-deploy-env, step-3-run-e2e-matrix]
     if: |
       github.repository == 'gke-labs/kube-agents' &&

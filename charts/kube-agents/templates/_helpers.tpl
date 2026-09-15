@@ -124,7 +124,7 @@ The trailing segment is a stand-in for the real rule. mirror_images.sh names
 each destination after the images.json entry's .name, and a chart cannot read
 images.json at render time, so this reproduces it by convention rather than by
 lookup. An image whose inventory name differs from its trailing segment
-(hindsight-postgresql is docker.io/ankane/pgvector) cannot use this helper —
+(hindsight-postgresql is docker.io/pgvector/pgvector) cannot use this helper —
 kube-agents.thirdPartyImage below takes the real name explicitly. Check 3c in
 hack/check-image-inventory.sh fails the build when a rendered mirror name is
 not an inventory name, which is what keeps the shortcut safe.
@@ -153,7 +153,7 @@ digest and all.
 `name` is the images.json entry name, which is what mirror_images.sh names the
 destination; it defaults to the repository's trailing segment, the common case
 where the two agree. Passing it explicitly is what lets an image like
-hindsight-postgresql (docker.io/ankane/pgvector) render correctly under a
+hindsight-postgresql (docker.io/pgvector/pgvector) render correctly under a
 mirror.
 
 Takes a dict: {repository, tag, name (optional), root (the root context)}.
@@ -206,12 +206,21 @@ it has to be right when the policy is applied. So it comes from telemetry.collec
 when given, and otherwise from the endpoint host, which is a cluster-local Service name in
 the case this feature exists for (<svc>.<ns>.svc.cluster.local, or the shortened <svc>.<ns>).
 
-Anything else — an external vendor endpoint, a bare hostname — fails the render, but only
-when litellm.otel is on. Silently falling back to gke-managed-otel would emit a policy that
-blocks the very collector the user just configured, and the symptom would be zero spans
-with a green install. With litellm.otel off (the default) there is no LiteLLM exporter for
-the policy to block, so failing the whole install over an egress rule nothing uses would
-punish a user who only meant to repoint the agents.
+Anything else — an external vendor endpoint, a bare hostname — has no namespace to open,
+and what the static policy does then follows the operator's dynamic copy. With
+litellm.otel on, this renders "" and the caller emits no OTLP rule: the exporter goes out
+over the port-443 rule, and a made-up namespaceSelector would open 4317/4318 to a
+namespace nothing exports to. With litellm.otel off (the default) there is no LiteLLM
+exporter, and the rule keeps the shipping gke-managed-otel default rather than changing
+a policy over an egress rule nothing uses.
+
+The host is parsed the way the operator's otlpCollectorNamespace (k8s-operator,
+platformagent_manifests.go) parses the same value when it builds the dynamic policy —
+exact lowercase scheme prefixes, cut at the first "/", then at the first ":" — so the two
+renders reach the same verdict about the same endpoint.
+
+Only the static litellm-policy render calls this. On the default install the operator
+owns the policy and resolves the namespace at reconcile time from the CR.
 */}}
 {{- define "kube-agents.otlpCollectorNamespace" -}}
 {{- if .Values.telemetry.collectorNamespace -}}
@@ -232,8 +241,6 @@ gke-managed-otel
 {{- index $parts 1 -}}
 {{- else if not .Values.litellm.otel -}}
 gke-managed-otel
-{{- else -}}
-{{- fail (printf "telemetry.otlpEndpoint %q does not name an in-cluster Service, so the LiteLLM NetworkPolicy cannot tell which namespace to allow egress to. Set telemetry.collectorNamespace, or set litellm.networkPolicy=false if the policy is managed elsewhere." .Values.telemetry.otlpEndpoint) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -323,6 +330,54 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+topologySpreadConstraints for a multi-replica workload this chart owns.
+
+Renders nothing below two replicas, so the operator gets the field only if
+someone raises operator.replicaCount. A constraint over a single pod is
+satisfied by construction, and printing it would leave a reader working out that
+it means nothing. Hindsight has no call site at all for the same reason taken
+further: both its workloads carry a literal `replicas: 1` with no value behind
+it, so a call there could never render and would read as coverage it does not
+have.
+
+The chart shipped PDBs and a default replicaCount of 2 for litellm and
+github-token-minter without this, and the Workload Reliability Audit in this
+repository found both on 2026-09-06: "replicas=2, no topologySpreadConstraints
+or podAntiAffinity". The PDB does not cover the gap it names. maxUnavailable: 1
+stalls a *drain* that would take both replicas, but a node that fails takes
+whatever is on it, and nothing was keeping the two pods apart.
+
+ScheduleAnyway, not DoNotSchedule — obtainability_audit_sop.md 3.8 calls that
+mandatory, and the reason is the shape of the clusters this chart installs into.
+A pool that cannot satisfy maxSkew: 1 leaves the second replica Pending
+indefinitely, which is worse than the co-location this exists to avoid.
+
+kubernetes.io/hostname and not the zone key, for the same section's reason: the
+loss this guards against is a node going away under a drain or a repair, and a
+zonal cluster has one zone to spread across.
+
+The selector is the workload's own and is passed in rather than derived, as
+already-rendered YAML rather than a dict so the operator can hand over
+`kube-agents.operatorSelectorLabels` verbatim instead of a second copy of it. A
+labelSelector that does not match the pods the constraint is attached to counts
+some other population and skews against it; these selectors are also immutable
+once the Deployment exists, so the caller is the only thing that knows the right
+answer. Keep each call in step with its Deployment's spec.selector, the way
+pdb.yaml's selectors already have to be.
+*/}}
+{{- define "kube-agents.topologySpreadConstraints" -}}
+{{- if and .enabled (gt (int .replicas) 1) -}}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        {{- .selectorLabels | nindent 8 }}
+{{- end }}
+{{- end }}
+
+{{/*
 Admission-webhook object names, mirroring k8s-operator/config/webhook and
 config/certmanager.
 
@@ -353,4 +408,56 @@ wrong Service.
 
 {{- define "kube-agents.webhookConfigurationPrefix" -}}
 {{ .Release.Name }}-{{ .Release.Namespace }}
+{{- end }}
+
+{{/*
+Validates and resolves a Deployment's rollingUpdate fenceposts, returning a
+YAML map with `maxSurge` and `maxUnavailable`. Callers parse the output with
+`| fromYaml`.
+
+Both fenceposts at zero leaves the Deployment no way to make progress and
+the API server rejects it ("may not be 0 when maxSurge is 0"), so fail
+the render rather than the apply. See values.yaml's rollingUpdate blocks.
+
+A fencepost with no usable value takes the given default (defaultSurge,
+defaultUnavailable) and renders explicitly. "No usable value" has to mean
+the empty string as well as nil/invalid: `--set <scope>.maxUnavailable=` and
+a values file's `maxUnavailable: ""` both reach here as an empty string,
+which is a perfectly good `kind` and so survives a nil test. Rendering
+either through would emit `maxUnavailable:` with nothing after it, and
+Kubernetes then applies its own 25% default.
+
+Both fields are IntOrString, which is what makes the zero test awkward:
+`int` is cast.ToInt and reads "25%" as 0, so it would refuse a pair of
+perfectly good percentages, while a list of literal spellings misses
+"0.0". Compare numerically with the percent sign stripped — "0%"
+resolves to 0 on the cluster, so it is the same misconfiguration spelled
+differently. `float64` is cast.ToFloat64, which reports anything it
+cannot parse as 0, so the numeric test is gated on both values actually
+being numeric: without that, `maxSurge: abc` is refused as a zero and
+the message names the wrong problem. Non-numeric input is left to the
+API server, which is where it was rejected before this guard existed.
+
+Takes a dict: {rollingUpdate, defaultSurge, defaultUnavailable, scope}.
+*/}}
+{{- define "kube-agents.rollingUpdateFenceposts" -}}
+{{- $ru := .rollingUpdate | default dict -}}
+{{- $surge := $ru.maxSurge -}}
+{{- $unavail := $ru.maxUnavailable -}}
+{{- $defaultSurge := .defaultSurge -}}
+{{- if kindIs "invalid" $defaultSurge }}{{- $defaultSurge = 1 }}{{- end -}}
+{{- $defaultUnavail := .defaultUnavailable -}}
+{{- if kindIs "invalid" $defaultUnavail }}{{- $defaultUnavail = 0 }}{{- end -}}
+{{- if or (kindIs "invalid" $surge) (eq (toString $surge) "") }}{{- $surge = $defaultSurge }}{{- end -}}
+{{- if or (kindIs "invalid" $unavail) (eq (toString $unavail) "") }}{{- $unavail = $defaultUnavail }}{{- end -}}
+{{- $surgeNum := trimSuffix "%" (trim (toString $surge)) -}}
+{{- $unavailNum := trimSuffix "%" (trim (toString $unavail)) -}}
+{{- $numeric := "^[0-9]+(\\.[0-9]+)?$" -}}
+{{- if and (regexMatch $numeric $surgeNum) (regexMatch $numeric $unavailNum) -}}
+{{- if and (eq (float64 $surgeNum) 0.0) (eq (float64 $unavailNum) 0.0) -}}
+{{- fail (printf "%s: maxSurge (%v) and maxUnavailable (%v) may not both be zero — the Deployment would have no way to make progress, and the API server rejects it." .scope $surge $unavail) -}}
+{{- end -}}
+{{- end -}}
+maxSurge: {{ $surge }}
+maxUnavailable: {{ $unavail }}
 {{- end }}

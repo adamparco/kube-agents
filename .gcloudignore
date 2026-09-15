@@ -24,6 +24,16 @@ node_modules/
 .venv/
 venv/
 k8s-operator/bin/
+# `terraform init` writes provider plugins here -- 436M across
+# `examples/full-install` and `modules/kube-agents-iam` on a tree that has run
+# the installer. `.gitignore` already covers it, but gcloud reads `.gitignore`
+# only when no `.gcloudignore` exists, so it has to be repeated. Left out, the
+# source upload grows from ~50M to ~490M, which is enough to make the
+# Enterprise Certificate Proxy fail every `gcloud builds submit` with
+# "Failed to forward request" while short API reads keep working.
+.terraform/
+*.tfstate
+*.tfstate.*
 
 # Local configuration files (except tracked default .env)
 .env
