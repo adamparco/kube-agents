@@ -129,6 +129,66 @@ webhooks:
       service:
         name: {{ include "kube-agents.webhookServiceName" . }}
         namespace: {{ .Release.Namespace }}
+        path: /validate-kubeagents-x-k8s-io-v1alpha1-approvalroster
+    failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
+    name: vapprovalroster.kb.io
+    rules:
+      - apiGroups:
+          - kubeagents.x-k8s.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - approvalrosters
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: {{ include "kube-agents.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-kubeagents-x-k8s-io-v1alpha1-changepolicy
+    failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
+    name: vchangepolicy.kb.io
+    rules:
+      - apiGroups:
+          - kubeagents.x-k8s.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - changepolicies
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: {{ include "kube-agents.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-kubeagents-x-k8s-io-v1alpha1-fleetfreeze
+    failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
+    name: vfleetfreeze.kb.io
+    rules:
+      - apiGroups:
+          - kubeagents.x-k8s.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - fleetfreezes
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: {{ include "kube-agents.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
         path: /validate-kubeagents-x-k8s-io-v1alpha1-platformagent
     failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
     name: vplatformagent.kb.io
@@ -143,5 +203,25 @@ webhooks:
           - DELETE
         resources:
           - platformagents
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: {{ include "kube-agents.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-kubeagents-x-k8s-io-v1alpha1-undorequest
+    failurePolicy: {{ .Values.operator.webhooks.failurePolicy }}
+    name: vundorequest.kb.io
+    rules:
+      - apiGroups:
+          - kubeagents.x-k8s.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - undorequests
     sideEffects: None
 {{- end }}

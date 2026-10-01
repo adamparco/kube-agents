@@ -1,0 +1,491 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: changepolicies.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    categories:
+      - kube-agents
+    kind: ChangePolicy
+    listKind: ChangePolicyList
+    plural: changepolicies
+    shortNames:
+      - cp
+    singular: changepolicy
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - description: Agents bound
+          jsonPath: .status.agentsMatched
+          name: Rules
+          type: integer
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description:
+            ChangePolicy is a cluster-scoped, stricter-only addition to the
+            risk classifier's rule table.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: ChangePolicySpec is the policy body.
+              properties:
+                agentSelector:
+                  description:
+                    AgentSelector chooses which agents this policy applies
+                    to. Omitted ⇒ every agent.
+                  properties:
+                    scopes:
+                      description: |-
+                        Scopes restricts the policy to agents at or beneath these scopes. Empty matches every scope.
+
+                        "At or beneath": a policy naming project `p` binds the platform agent for `p` and every
+                        cluster-admin and developer-team agent under it. Anything else would make a fleet-wide policy
+                        require one entry per namespace, and the entry nobody remembered to add is the gap.
+                      items:
+                        description: |-
+                          ScopeSpec identifies where an agent operates. Per-tier required fields (06 §1.2):
+                          platform → projectId; cluster-admin → projectId+clusterName; developer-team →
+                          projectId+clusterName+namespace. Together with tier it forms the identity key the cardinality
+                          webhook and the RBAC render overlay derive from.
+                        properties:
+                          clusterName:
+                            description:
+                              ClusterName is the target cluster (cluster-admin
+                              and developer-team tiers).
+                            type: string
+                          namespace:
+                            description:
+                              Namespace is the target namespace and the pod's
+                              placement namespace (developer-team tier only).
+                            type: string
+                          projectId:
+                            description:
+                              ProjectID is the GCP project the agent is scoped
+                              to (all tiers).
+                            type: string
+                        type: object
+                      maxItems: 64
+                      type: array
+                    tiers:
+                      description:
+                        Tiers restricts the policy to these tiers. Empty
+                        matches every tier.
+                      items:
+                        description: |-
+                          AgentTier is the persona / containment level of an agent. It is the tier discriminator the whole
+                          tier model, the (tier, scope) cardinality webhook, and the pre-created RBAC render overlay key on.
+                          Immutable after creation (06 §1.1).
+                        enum:
+                          - platform
+                          - cluster-admin
+                          - developer-team
+                        type: string
+                      maxItems: 3
+                      type: array
+                      x-kubernetes-list-type: set
+                  type: object
+                rules:
+                  description: Rules are additional rows in the classifier's rule table.
+                  items:
+                    description: |-
+                      ChangeRule is one row of the rule table, in exactly the shape the code floor uses.
+
+                      The sameness is the design. A customer's policy is not a second, weaker language the broker
+                      interprets differently; it is more rows in the table the floor already is, matched by the same
+                      matcher and combined by the same Max. There is no field here that can lower a class.
+                    properties:
+                      class:
+                        description:
+                          Class is this rule's contribution. Omitted means
+                          the rule contributes only a cap.
+                        enum:
+                          - elevated
+                          - gated
+                          - "+1"
+                        type: string
+                      id:
+                        description: |-
+                          ID appears in `classification.reasons[].rule` and in the audit event, so it is what a human
+                          sees when this rule is why they were asked. Unique within the policy, and distinct from every
+                          code-floor rule ID.
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      maxObjects:
+                        description: |-
+                          MaxObjects is a blast-radius cap. It may only LOWER the effective cap: the broker takes the
+                          minimum across sources, so a number above the code ceiling is accepted, stored, listed — and
+                          never wins. Admission warns rather than refuses, because refusing would make the guarantee
+                          look like it lives in the webhook, and it does not.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      reason:
+                        description: |-
+                          Reason is shown VERBATIM to the human deciding whether to approve, at the moment they are
+                          deciding, probably on a phone. Required, because a gate whose reason is blank teaches the
+                          approver that the reasons are not worth reading.
+                        maxLength: 512
+                        minLength: 1
+                        type: string
+                      when:
+                        description:
+                          When is the match predicate. Omitted means "every
+                          operation".
+                        properties:
+                          direction:
+                            description:
+                              Direction is the security direction; `loosen`
+                              is what gates. Empty means `any`.
+                            enum:
+                              - loosen
+                              - tighten
+                              - any
+                            type: string
+                          excludeKinds:
+                            description:
+                              ExcludeKinds are never matched, applied AFTER
+                              Kinds.
+                            items:
+                              description: |-
+                                KindRefSpec is a group+kind pair. `group: ""` is core.
+
+                                A struct rather than a `group/kind` string because the string form has three spellings for a core
+                                kind — `Secret`, `/Secret`, `v1/Secret` — and the third one carries a version this field does not
+                                have. Two of the three would have to be accepted and one silently ignored.
+                              properties:
+                                group:
+                                  description: Group is the API group, empty for core.
+                                  maxLength: 253
+                                  type: string
+                                kind:
+                                  description:
+                                    Kind is the object kind, matched case-sensitively
+                                    because Kubernetes kinds are.
+                                  maxLength: 253
+                                  minLength: 1
+                                  type: string
+                              required:
+                                - kind
+                              type: object
+                            maxItems: 128
+                            type: array
+                          fieldPaths:
+                            description: |-
+                              FieldPaths fire when the change touches any of them. DOTTED relaxed JSONPath — the
+                              kubectl/client-go dialect — e.g. `spec.template.spec.containers[*].image`.
+
+                              NOT a JSON Pointer. `/spec/replicas` is rejected at admission with
+                              `expected a dotted field path, not a JSON Pointer` (06 §4.2), because it is otherwise a
+                              perfectly well-formed dotted path with a single segment literally named `/spec/replicas`, and
+                              a rule that matches nothing is indistinguishable from a rule that found nothing.
+                            items:
+                              maxLength: 512
+                              type: string
+                            maxItems: 64
+                            type: array
+                            x-kubernetes-list-type: set
+                          kinds:
+                            description: Kinds are the target kinds. Empty matches any.
+                            items:
+                              description: |-
+                                KindRefSpec is a group+kind pair. `group: ""` is core.
+
+                                A struct rather than a `group/kind` string because the string form has three spellings for a core
+                                kind — `Secret`, `/Secret`, `v1/Secret` — and the third one carries a version this field does not
+                                have. Two of the three would have to be accepted and one silently ignored.
+                              properties:
+                                group:
+                                  description: Group is the API group, empty for core.
+                                  maxLength: 253
+                                  type: string
+                                kind:
+                                  description:
+                                    Kind is the object kind, matched case-sensitively
+                                    because Kubernetes kinds are.
+                                  maxLength: 253
+                                  minLength: 1
+                                  type: string
+                              required:
+                                - kind
+                              type: object
+                            maxItems: 128
+                            type: array
+                          labelSelector:
+                            description: |-
+                              LabelSelector is matched against the LIVE target object, not the desired state.
+
+                              The distinction is the whole of V-GAT-022. A payload asserting
+                              `kube-agents/environment: production` is a claim by the thing being classified; matching on it
+                              would let an agent choose its own risk class by writing a label. Live state is the only thing
+                              the classifier believes, and a `create` therefore never matches a live-object selector — there
+                              is no live object yet to carry the label.
+                            properties:
+                              matchExpressions:
+                                description:
+                                  matchExpressions is a list of label selector
+                                  requirements. The requirements are ANDed.
+                                items:
+                                  description: |-
+                                    A label selector requirement is a selector that contains values, a key, and an operator that
+                                    relates the key and values.
+                                  properties:
+                                    key:
+                                      description:
+                                        key is the label key that the selector
+                                        applies to.
+                                      type: string
+                                    operator:
+                                      description: |-
+                                        operator represents a key's relationship to a set of values.
+                                        Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: |-
+                                        values is an array of string values. If the operator is In or NotIn,
+                                        the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                        the values array must be empty. This array is replaced during a strategic
+                                        merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  required:
+                                    - key
+                                    - operator
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                  map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                  operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          namespaceSelector:
+                            description:
+                              NamespaceSelector matches the target namespace's
+                              labels.
+                            properties:
+                              matchExpressions:
+                                description:
+                                  matchExpressions is a list of label selector
+                                  requirements. The requirements are ANDed.
+                                items:
+                                  description: |-
+                                    A label selector requirement is a selector that contains values, a key, and an operator that
+                                    relates the key and values.
+                                  properties:
+                                    key:
+                                      description:
+                                        key is the label key that the selector
+                                        applies to.
+                                      type: string
+                                    operator:
+                                      description: |-
+                                        operator represents a key's relationship to a set of values.
+                                        Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: |-
+                                        values is an array of string values. If the operator is In or NotIn,
+                                        the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                        the values array must be empty. This array is replaced during a strategic
+                                        merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  required:
+                                    - key
+                                    - operator
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                  map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                  operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          namespaces:
+                            description:
+                              Namespaces matches the TARGET's namespace by
+                              name. Empty matches any.
+                            items:
+                              maxLength: 253
+                              type: string
+                            maxItems: 256
+                            type: array
+                            x-kubernetes-list-type: set
+                          ownedByLowerTier:
+                            description: |-
+                              OwnedByLowerTier exists here only so that setting it can be REFUSED with an explanation.
+
+                              It is a code-floor field: ownership is computed from the Agent hierarchy by the V-6 predicate,
+                              never declared. Leaving the field out of the schema instead would let the API server prune it
+                              silently, and a policy author who wrote it would get a rule that matches strictly more than
+                              what they wrote, with no error anywhere. A field that is present and rejected is a
+                              conversation; a field that is absent and pruned is a surprise.
+                            type: boolean
+                            x-kubernetes-validations:
+                              - message:
+                                  "when.ownedByLowerTier is code-floor only: ownership
+                                  is computed from the Agent hierarchy, not declared by
+                                  a policy"
+                                rule: self == false
+                          verbs:
+                            description:
+                              Verbs are the envelope ops this rule matches.
+                              Empty matches any.
+                            items:
+                              description: |-
+                                ChangeVerb is an Action Envelope `op` value. The enum is closed and mirrors the envelope's own:
+                                a rule naming a verb the envelope cannot carry matches nothing, and matching nothing is how a
+                                gate stops gating without anyone noticing.
+                              enum:
+                                - create
+                                - apply
+                                - patch
+                                - delete
+                                - scale
+                                - cloud
+                              type: string
+                            maxItems: 6
+                            type: array
+                            x-kubernetes-list-type: set
+                        type: object
+                    required:
+                      - id
+                      - reason
+                    type: object
+                    x-kubernetes-validations:
+                      - message:
+                          a rule that contributes neither a class nor a maxObjects
+                          matches operations and then does nothing, which reads in a policy
+                          review as a control that is present
+                        rule: has(self.class) || has(self.maxObjects)
+                  maxItems: 256
+                  minItems: 1
+                  type: array
+              required:
+                - rules
+              type: object
+            status:
+              description: ChangePolicyStatus reports what the policy actually binds.
+              properties:
+                agentsMatched:
+                  description: |-
+                    AgentsMatched is how many Agent CRs this policy currently binds. Written by the controller so
+                    a human can tell a policy that covers the fleet from one whose selector matches nothing —
+                    which is by far the likelier mistake, and is invisible otherwise.
+                  format: int32
+                  type: integer
+                conditions:
+                  description: Conditions follow the standard Kubernetes convention.
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                observedGeneration:
+                  description:
+                    ObservedGeneration is the spec generation this status
+                    was computed from.
+                  format: int64
+                  type: integer
+              type: object
+          required:
+            - spec
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

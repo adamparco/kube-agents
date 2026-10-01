@@ -131,6 +131,12 @@ var requiredPermissions = []requiredPermission{
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/finalizers"}, Verbs: []string{"update"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agents"}, Verbs: rbacWriteVerbs},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agents/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agents/finalizers"}, Verbs: []string{"update"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"actionrecords"}, Verbs: []string{"get", "list", "watch", "update", "patch", "delete"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"actionrecords/status", "approvalrosters/status", "changepolicies/status", "fleetfreezes/status", "undorequests/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"approvalrosters", "changepolicies", "fleetfreezes", "undorequests"}, Verbs: rbacReadVerbs},
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
@@ -165,6 +171,8 @@ var requiredPermissions = []requiredPermission{
 	// than the marker declares and reports a shortfall that is not real.
 	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles"}, Verbs: []string{"bind"}, Name: a2aAuthDelegatorRole},
 	{Group: "authentication.k8s.io", Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
+	{Group: "authorization.k8s.io", Resources: []string{"subjectaccessreviews"}, Verbs: []string{"create"}},
+	{Group: "cert-manager.io", Resources: []string{"certificates"}, Verbs: rbacWriteVerbs},
 	{Group: "apiextensions.k8s.io", Resources: []string{"customresourcedefinitions"}, Verbs: rbacReadVerbs},
 }
 
