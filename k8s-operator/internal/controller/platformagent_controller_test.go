@@ -18,12 +18,18 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -49,6 +55,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -61,8 +68,19 @@ func setupScheme() *runtime.Scheme {
 }
 
 func defaultTestNetpolProfile() netpolProfile {
-	return netpolProfile{DNSClusterIP: defaultDNSClusterIP, MetadataDaemonIP: metadataDaemonIP}
+	return netpolProfile{
+		Generated:            true,
+		DNSClusterIPs:        []string{defaultDNSClusterIP},
+		DNSSource:            netpolSourceDefault,
+		MetadataDaemonIP:     metadataDaemonIP,
+		MetadataDaemonPort:   metadataDaemonDefaultPort,
+		MetadataDaemonSource: netpolSourceDefault,
+	}
 }
+
+// ssaApplyInterceptor is the shorter name the credential-broker tests use for
+// the fake client's Server-Side Apply support. One aliases the other.
+func ssaApplyInterceptor() interceptor.Funcs { return fakeServerSideApplyInterceptors() }
 
 // fakeServerSideApplyInterceptors returns interceptor.Funcs to handle Server-Side Apply (SSA) in the controller-runtime fake client.
 func fakeServerSideApplyInterceptors() interceptor.Funcs {
@@ -185,7 +203,20 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	authC, found := findContainer(dep.Spec.Template.Spec, "agent-api-auth")
+	if !found {
+		t.Errorf("expected Deployment to contain the agent-API front door")
+	} else if authC.RestartPolicy == nil || *authC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("the front door must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+	}
+
+	// The credential runtime is a Deployment of its own, reconciled alongside.
+	brokerDep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-credential-proxy", Namespace: "test-ns"}, brokerDep); err != nil {
+		t.Errorf("failed to get the credential broker Deployment: %v", err)
+	} else if _, found := findContainer(brokerDep.Spec.Template.Spec, "envoy-credential-proxy"); !found {
+		t.Errorf("the broker Deployment does not run the credential runtime")
+	}
 
 	// Service
 	svc := &corev1.Service{}
@@ -273,25 +304,132 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		UID:        agent.UID,
 		Controller: ptr.To(true),
 	}
-	objects := []client.Object{
-		agent,
+	removed := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+	}
+	// The credential proxy's own Deployment and Service carry these names again,
+	// so the cleanup has to leave them alone; deleting them tore down the pod the
+	// same reconcile had just applied.
+	live := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	// The metadata-deny NetworkPolicy is a guardrail this controller does not
+	// create, so deleting it is out of bounds and it belongs on the survivor
+	// side of this test, not the deleted side. Owned here on purpose: an owner
+	// reference is the one thing that would have made deleting it defensible,
+	// and it must survive even so.
+	guardrail := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}}
+
+	objects := append([]client.Object{agent, guardrail}, removed...)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objects, live...)...).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.deleteLegacyCredentialIsolationResources(context.Background(), agent); err != nil {
 		t.Fatalf("deleteLegacyCredentialIsolationResources failed: %v", err)
 	}
-	for _, object := range objects[1:] {
+	for _, object := range removed {
 		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)
 		if !errors.IsNotFound(err) {
 			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
 		}
+	}
+	for _, object := range live {
+		if err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object); err != nil {
+			t.Errorf("expected credential proxy %T %s to survive the legacy cleanup, got %v",
+				object, object.GetName(), err)
+		}
+	}
+	surviving := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(guardrail), surviving); err != nil {
+		t.Errorf("the metadata-deny NetworkPolicy is a guardrail the controller does not create; it must survive a reconcile, got %v", err)
+	}
+}
+
+// TestReconcileDoesNotDeleteTheMetadataDenyGuardrail runs a full Reconcile
+// rather than the cleanup helper alone, so the assertion holds no matter which
+// step of Reconcile a future change wires the deletion into.
+//
+// The unowned case is the one that was a live bug rather than only a doctrinal
+// one. The operator stopped creating this policy, so a copy applied by hand —
+// which the security documentation tells an operator to do — is owned by
+// nobody, hit the IsControlledBy guard, and returned "refusing to delete
+// unowned legacy *v1.NetworkPolicy" from every reconcile. The cleanup runs
+// after the workload and before updateStatusReady, so the CR's status stopped
+// tracking reality while the agent itself kept running. Both cases are checked
+// here because the fix has to be "the name is off the list", not "the guard
+// got friendlier".
+func TestReconcileDoesNotDeleteTheMetadataDenyGuardrail(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		owned bool
+	}{
+		{name: "applied by the operator in an earlier release", owned: true},
+		{name: "applied by hand, owned by nobody", owned: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-agent",
+					Namespace:  "test-ns",
+					UID:        types.UID("agent-uid"),
+					Finalizers: []string{platformAgentFinalizer},
+				},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{
+						ProjectID:   "proj",
+						Location:    "us-central1",
+						ClusterName: "cluster",
+					},
+				},
+			}
+			policy := &networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-agent-sandbox-metadata-deny",
+					Namespace: "test-ns",
+				},
+			}
+			if tc.owned {
+				policy.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion: agentv1alpha1.GroupVersion.String(),
+					Kind:       "PlatformAgent",
+					Name:       agent.Name,
+					UID:        agent.UID,
+					Controller: ptr.To(true),
+				}}
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, policy).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
+			if err := cl.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
+				t.Fatalf("Reconcile deleted the metadata-deny NetworkPolicy; a controller must not delete a guardrail it did not create: %v", err)
+			}
+
+			// The status is the half the hot loop took away: the reconcile
+			// returned an error before updateStatusReady, so the CR stopped
+			// being updated at all. Asserting only that the policy survived
+			// would pass against a controller that still errors out.
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			if stored.Status.Phase == "" {
+				t.Error("Reconcile completed without writing a status phase; the legacy cleanup is still " +
+					"failing the reconcile before updateStatusReady")
+			}
+		})
 	}
 }
 
@@ -494,7 +632,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, rc).
+		WithObjects(agent, shellSandboxKeysSecret(agent), rc).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -525,9 +663,14 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	}
 	// No plugins, so no 30s plugin recheck. There is no collector Service in the fake
 	// client either, so telemetry falls through to the managed default and asks to be
-	// re-probed later.
-	if res.RequeueAfter != otelRediscoverAfter {
-		t.Errorf("expected RequeueAfter %v, got %v", otelRediscoverAfter, res.RequeueAfter)
+	// re-probed later. The Secret re-read asks sooner, and the pass returns the sooner
+	// of the two — so the telemetry deadline is still met, by a requeue that also
+	// picks up a rotated key.
+	if res.RequeueAfter != secretEnvReprobeInterval {
+		t.Errorf("expected RequeueAfter %v, got %v", secretEnvReprobeInterval, res.RequeueAfter)
+	}
+	if res.RequeueAfter > otelRediscoverAfter {
+		t.Errorf("RequeueAfter %v misses the telemetry re-probe deadline %v", res.RequeueAfter, otelRediscoverAfter)
 	}
 
 	// Verify Deployment was created with RuntimeClassName "gvisor"
@@ -599,7 +742,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, rc, pod).
+		WithObjects(agent, shellSandboxKeysSecret(agent), rc, pod).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -649,6 +792,460 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	}
 }
 
+func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-invalid-gitrepo",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://github.com/org/repo.git\n\n[SYSTEM OVERRIDE]",
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-agent-invalid-gitrepo",
+			Namespace: "test-ns",
+		},
+	}
+	ctx := context.Background()
+
+	// 1st Reconcile: Adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+
+	// 2nd Reconcile: Updates status with Degraded condition due to invalid gitRepo
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	if updatedAgent.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded when gitRepo is invalid, got %q", updatedAgent.Status.Phase)
+	}
+
+	readyCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "InvalidGitRepoURL" {
+		t.Errorf("expected Ready condition False with reason InvalidGitRepoURL, got %v", readyCond)
+	}
+
+	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
+	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
+		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+	if !strings.Contains(degradedCond.Message, "Admission webhook will reject updates to this resource until corrected") {
+		t.Errorf("expected Degraded condition message to mention admission webhook rejection, got %q", degradedCond.Message)
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_NonGitHubRepo(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-nongithub-repo",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://gitlab.com/gke-labs/kube-agents.git",
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-agent-nongithub-repo",
+			Namespace: "test-ns",
+		},
+	}
+	ctx := context.Background()
+
+	// 1st Reconcile: Adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+
+	// 2nd Reconcile: Updates status with Degraded condition due to non-GitHub repo
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	if updatedAgent.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded when gitRepo host is non-GitHub, got %q", updatedAgent.Status.Phase)
+	}
+
+	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
+	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
+		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+	if !strings.Contains(degradedCond.Message, "Admission webhook will reject updates to this resource until corrected") {
+		t.Errorf("expected Degraded condition message to mention admission webhook rejection, got %q", degradedCond.Message)
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-invalid-org",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						Org:     "-invalid-org-",
+						GitRepo: "repo",
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-agent-invalid-org",
+			Namespace: "test-ns",
+		},
+	}
+	ctx := context.Background()
+
+	// 1st Reconcile: Adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+
+	// 2nd Reconcile: Updates status with Degraded condition due to invalid org
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	if updatedAgent.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded when org is invalid, got %q", updatedAgent.Status.Phase)
+	}
+
+	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
+	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
+		t.Fatalf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+	// The problem list names only the org, so the message has to say that
+	// the repository on that forge is withheld too.
+	if !strings.Contains(degradedCond.Message, "nor is the repository on a refused forge") {
+		t.Errorf("Degraded message does not say the repository on the refused forge is withheld: %q", degradedCond.Message)
+	}
+}
+
+// One refused entry beside accepted ones degrades the CR, but the accepted
+// ones — the gitops repository included — are still seeded, so the message must
+// not say GitOps is disabled.
+func TestPlatformAgentReconciler_Reconcile_OneRefusedEntryKeepsItsNeighbours(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-one-refused", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "gke-labs"}},
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+						{Forge: "github", Repository: "docs", Namespace: "platform_team", Role: agentv1alpha1.RepositoryRoleContext},
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidGitRepoURL {
+		t.Fatalf("expected Degraded True/InvalidGitRepoURL, got %v", degraded)
+	}
+	if strings.Contains(degraded.Message, "GitOps disabled") || !strings.Contains(degraded.Message, "refused entries are not seeded") ||
+		strings.Contains(degraded.Message, "no managed repository") {
+		t.Errorf("Degraded message must say only the refused entries are left out, got %q", degraded.Message)
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gitops-state", Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("failed to get gitops-state ConfigMap: %v", err)
+	}
+	if !strings.Contains(cm.Data["managed_repos"], "https://github.com/gke-labs/infra") {
+		t.Errorf("the accepted gitops repository must still be seeded, managed_repos = %q", cm.Data["managed_repos"])
+	}
+	if strings.Contains(cm.Data["context_repos"], "docs") {
+		t.Errorf("the refused context repository must not be seeded, context_repos = %q", cm.Data["context_repos"])
+	}
+}
+
+// A refused gitops repository keeps the accepted managed ones out of
+// managed_repos too, and the problem list names none of them, so the message
+// has to say it.
+func TestPlatformAgentReconciler_Reconcile_ARefusedGitOpsRepositorySaysManagedAreWithheld(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gitops-refused", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "gke-labs"}},
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "github", Repository: "in fra", Role: agentv1alpha1.RepositoryRoleGitOps},
+						{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Reason != conditionReasonInvalidGitRepoURL {
+		t.Fatalf("expected Degraded InvalidGitRepoURL, got %v", degraded)
+	}
+	if !strings.Contains(degraded.Message, "no managed repository is seeded while the gitops repository is refused") {
+		t.Errorf("Degraded message does not say the managed repositories are withheld: %q", degraded.Message)
+	}
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gitops-state", Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("failed to get gitops-state ConfigMap: %v", err)
+	}
+	if strings.Contains(cm.Data["managed_repos"], "apps") {
+		t.Errorf("managed_repos = %q; the managed repository must be withheld", cm.Data["managed_repos"])
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_CorruptManagedRepos(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-corrupt-repos",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://github.com/gke-labs/kube-agents.git",
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-corrupt-repos-gitops-state",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/foo/bar"},]`,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, cm, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-agent-corrupt-repos",
+			Namespace: "test-ns",
+		},
+	}
+	ctx := context.Background()
+
+	// 1st Reconcile: Adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+
+	// 2nd Reconcile: Updates status with Degraded condition due to corrupt managed_repos
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	if updatedAgent.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded when managed_repos is corrupt, got %q", updatedAgent.Status.Phase)
+	}
+
+	readyCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "CorruptManagedRepos" {
+		t.Errorf("expected Ready condition False with reason CorruptManagedRepos, got %v", readyCond)
+	}
+
+	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
+	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "CorruptManagedRepos" {
+		t.Errorf("expected Degraded condition True with reason CorruptManagedRepos, got %v", degradedCond)
+	}
+	if !strings.Contains(degradedCond.Message, "Corrupt managed_repos in ConfigMap") {
+		t.Errorf("expected Degraded condition message to mention corrupt managed_repos, got %q", degradedCond.Message)
+	}
+
+	// Verify recovery: correct the ConfigMap and reconcile again
+	cmToUpdate := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, cmToUpdate); err != nil {
+		t.Fatalf("failed to get cm: %v", err)
+	}
+	cmToUpdate.Data["managed_repos"] = `[{"type":"github","url":"https://github.com/foo/bar"}]`
+	if err := cl.Update(ctx, cmToUpdate); err != nil {
+		t.Fatalf("failed to update cm: %v", err)
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after fix failed: %v", err)
+	}
+
+	recoveredAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, recoveredAgent); err != nil {
+		t.Fatalf("failed to get recovered agent: %v", err)
+	}
+
+	if recoveredAgent.Status.Phase == "Degraded" {
+		t.Errorf("expected Status.Phase not to be Degraded after fixing managed_repos, got %q", recoveredAgent.Status.Phase)
+	}
+	recoveredDegradedCond := meta.FindStatusCondition(recoveredAgent.Status.Conditions, "Degraded")
+	if recoveredDegradedCond != nil {
+		t.Errorf("expected Degraded condition to be cleared, got %v", recoveredDegradedCond)
+	}
+}
+
 func findAPIServerEgressRule(netpol *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
 	if netpol == nil {
 		return nil
@@ -685,7 +1282,7 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	if netpol.Name != "test-agent-gateway-netpol" {
 		t.Errorf("expected Name 'test-agent-gateway-netpol', got %s", netpol.Name)
 	}
@@ -699,14 +1296,26 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.PolicyTypes) != 2 {
 		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
 	}
-	if len(netpol.Spec.Ingress) != 1 {
-		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
 	}
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules (DNS, GCP Metadata port 80/8080, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter), got %d", len(netpol.Spec.Egress))
+	// The collector's rule: the watcher's metrics port alone, from the
+	// gke-gmp-system namespace and nothing narrower, matching the LiteLLM
+	// policy's scrape rule for the same collector.
+	scrape := netpol.Spec.Ingress[1]
+	if len(scrape.Ports) != 1 || scrape.Ports[0].Port == nil || scrape.Ports[0].Port.IntVal != 9095 {
+		t.Errorf("expected the collector ingress rule to admit port 9095 alone, got %v", scrape.Ports)
+	}
+	if len(scrape.From) != 1 || scrape.From[0].NamespaceSelector == nil ||
+		scrape.From[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "gke-gmp-system" ||
+		scrape.From[0].PodSelector != nil {
+		t.Errorf("expected the collector ingress rule to admit every pod in gke-gmp-system, got %v", scrape.From)
+	}
+	if len(netpol.Spec.Egress) != 12 {
+		t.Errorf("expected 12 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -724,17 +1333,26 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		return nil
 	}
 
+	// 5 peers: the kube-dns and node-local-dns selectors, the NodeLocal DNSCache
+	// link-local address, the Cloud DNS resolver at 169.254.169.254, and the one
+	// resolved ClusterIP.
 	ruleDNS := findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["k8s-app"] == "kube-dns"
 	})
-	if ruleDNS == nil || len(ruleDNS.To) != 4 {
-		t.Errorf("expected 4 peers in DNS egress rule")
+	if ruleDNS == nil || len(ruleDNS.To) != 5 {
+		t.Errorf("expected 5 peers in DNS egress rule")
+	}
+	if findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+	}) == nil {
+		t.Error("the DNS rule does not name 169.254.169.254, so a Cloud DNS for GKE cluster " +
+			"cannot resolve and every named destination below becomes unreachable")
 	}
 	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
 	})
 	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
-		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80/8080)")
+		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80)")
 	}
 	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
 	// address as well as the link-local one even when the cluster has no nodes.
@@ -776,6 +1394,15 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if ruleMinter == nil || ruleMinter.To[0].PodSelector == nil || ruleMinter.To[0].PodSelector.MatchLabels["app"] != "github-token-minter" {
 		t.Errorf("expected GitHub Token Minter egress rule to match app 'github-token-minter'")
 	}
+	// Both labels, not just the name: the postgresql pod carries
+	// app.kubernetes.io/name=hindsight too, and the database is meant to be
+	// reachable from the API pod alone (hindsight/networkpolicy.yaml).
+	ruleHindsight := findEgressRule(8888, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app.kubernetes.io/name"] == "hindsight"
+	})
+	if ruleHindsight == nil || ruleHindsight.To[0].PodSelector.MatchLabels["app.kubernetes.io/component"] != "api" {
+		t.Errorf("expected Hindsight egress rule on 8888 to match the api component, not every hindsight pod")
+	}
 }
 
 func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
@@ -793,9 +1420,9 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
-	if len(netpol.Spec.Ingress) != 1 {
-		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+	if len(netpol.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 2 {
 		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))
@@ -813,18 +1440,21 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "")
-	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
+	// Expected 11 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
-	// 2. GCP WI / Metadata server (80, 8080)
+	// 2. GCP WI / Metadata server (80)
 	// 3. GKE WI Host Network Daemon (988)
 	// 4. LiteLLM Gateway (80, 4000, 8080)
 	// 5. vLLM Gemma Server (80, 8000)
 	// 6. Kubernetes API Server (443, 6443, 8443)
 	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
 	// 8. GitHub Token Minter (8080)
-	if len(netpol.Spec.Egress) != 8 {
-		t.Errorf("expected 8 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 9. Hindsight memory API (8888)
+	// 10. The shell sandbox's sshd (2222)
+	// 11. The credential broker, which hosts the chat relay (8765)
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -843,13 +1473,13 @@ func TestBuildNetworkPolicy_CustomAPIHost(t *testing.T) {
 		},
 	}
 
-	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
+	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
 	ruleIPv4 := findAPIServerEgressRule(netpolIPv4)
 	if ruleIPv4 == nil || len(ruleIPv4.To) == 0 || ruleIPv4.To[0].IPBlock == nil || ruleIPv4.To[0].IPBlock.CIDR != "10.0.0.5/32" {
 		t.Errorf("expected IPv4 CIDR '10.0.0.5/32', got %v", ruleIPv4)
 	}
 
-	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, defaultTestNetpolProfile(), false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, defaultTestNetpolProfile(), false, "", false)
 	ruleIPv6 := findAPIServerEgressRule(netpolIPv6)
 	if ruleIPv6 == nil || len(ruleIPv6.To) == 0 || ruleIPv6.To[0].IPBlock == nil || ruleIPv6.To[0].IPBlock.CIDR != "fd00::1/128" {
 		t.Errorf("expected IPv6 CIDR 'fd00::1/128', got %v", ruleIPv6)
@@ -923,7 +1553,7 @@ func TestBuildNetworkPolicy_InvalidAPIHost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			netpol := buildNetworkPolicy(agent, tt.apiHosts, defaultTestNetpolProfile(), false, "")
+			netpol := buildNetworkPolicy(agent, tt.apiHosts, defaultTestNetpolProfile(), false, "", false)
 			rule := findAPIServerEgressRule(netpol)
 			if rule == nil {
 				t.Fatalf("API server egress rule (port 6443) not found in netpol")
@@ -949,8 +1579,8 @@ func TestBuildNetworkPolicy_Idempotent(t *testing.T) {
 		},
 	}
 
-	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
-	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "")
+	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
+	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, defaultTestNetpolProfile(), false, "", false)
 	if !reflect.DeepEqual(np1.Spec, np2.Spec) {
 		t.Errorf("buildNetworkPolicy is not idempotent: consecutive calls produced different specs")
 	}
@@ -963,7 +1593,7 @@ func TestBuildNetworkPolicy_ExternalHTTPSExceptList(t *testing.T) {
 			Namespace: "test-ns",
 		},
 	}
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
 	var httpsRule *networkingv1.NetworkPolicyEgressRule
 	for i := range netpol.Spec.Egress {
@@ -1029,7 +1659,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 1. IPv4 dynamic DNS clusterIP
-	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "34.118.224.10", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolGKE := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"34.118.224.10"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleGKE := findDNSEgressRule(netpolGKE)
 	if dnsRuleGKE == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolGKE")
@@ -1046,7 +1676,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 2. IPv6 dynamic DNS clusterIP
-	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "2001:db8::10", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolIPv6 := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"2001:db8::10"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleIPv6 := findDNSEgressRule(netpolIPv6)
 	if dnsRuleIPv6 == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolIPv6")
@@ -1063,7 +1693,7 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	}
 
 	// 3. Fallback when invalid or empty
-	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIP: "invalid-ip", MetadataDaemonIP: metadataDaemonIP}, false, "")
+	netpolFallback := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"invalid-ip"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
 	dnsRuleFallback := findDNSEgressRule(netpolFallback)
 	if dnsRuleFallback == nil {
 		t.Fatalf("DNS egress rule (port 53) not found in netpolFallback")
@@ -1078,6 +1708,108 @@ func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
 	if !foundFallback {
 		t.Errorf("expected fallback 10.96.0.10/32 for invalid DNS clusterIP")
 	}
+
+	// 4. Dual-stack: both ClusterIPs reach the port-53 rule.
+	// TestResolveNetpolProfile/DiscoveryKubeDNS_DualStack proves the resolver returns
+	// two addresses; without this case nothing checked that both survive into the
+	// policy, so a read of dnsIPs[0] would leave a dual-stack cluster with IPv4-only
+	// DNS egress and a green suite.
+	netpolDualStack := buildNetworkPolicy(agent, nil, netpolProfile{DNSClusterIPs: []string{"10.96.0.10", "2001:db8::10"}, MetadataDaemonIP: metadataDaemonIP}, false, "", false)
+	dnsRuleDualStack := findDNSEgressRule(netpolDualStack)
+	if dnsRuleDualStack == nil {
+		t.Fatalf("DNS egress rule (port 53) not found in netpolDualStack")
+	}
+	wantDualStack := map[string]bool{"10.96.0.10/32": false, "2001:db8::10/128": false}
+	for _, peer := range dnsRuleDualStack.To {
+		if peer.IPBlock == nil {
+			continue
+		}
+		if _, ok := wantDualStack[peer.IPBlock.CIDR]; ok {
+			wantDualStack[peer.IPBlock.CIDR] = true
+		}
+	}
+	for cidr, found := range wantDualStack {
+		if !found {
+			t.Errorf("expected %s in DNS egress peers for a dual-stack kube-dns", cidr)
+		}
+	}
+}
+
+// The two branches buildNetworkPolicy grew for spec.networkPolicy, tested where
+// they are implemented. TestResolveNetpolProfile covers the profile they read;
+// nothing covered the policy they build, so deleting either append would have
+// shipped green.
+func TestBuildNetworkPolicy_ProfileDrivenRules(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	t.Run("AdditionalEgressIsAppended", func(t *testing.T) {
+		profile := defaultTestNetpolProfile()
+		tcp := corev1.ProtocolTCP
+		port := intstr.FromInt32(5432)
+		profile.AdditionalEgress = []networkingv1.NetworkPolicyEgressRule{{
+			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &port}},
+			To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "10.200.0.0/16"},
+			}},
+		}}
+
+		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+		found := false
+		for _, rule := range netpol.Spec.Egress {
+			for _, peer := range rule.To {
+				if peer.IPBlock != nil && peer.IPBlock.CIDR == "10.200.0.0/16" {
+					found = true
+					if len(rule.Ports) != 1 || rule.Ports[0].Port.IntValue() != 5432 {
+						t.Errorf("additional egress rule lost its ports: %+v", rule.Ports)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("profile.AdditionalEgress was not appended to the generated policy")
+		}
+	})
+
+	t.Run("EmptyMetadataDaemonIPSuppressesRule3", func(t *testing.T) {
+		profile := defaultTestNetpolProfile()
+		profile.MetadataDaemonIP = ""
+		profile.MetadataDaemonSource = netpolSourceSuppressed
+
+		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+		for _, rule := range netpol.Spec.Egress {
+			for _, p := range rule.Ports {
+				if p.Port != nil && p.Port.IntValue() == 988 {
+					t.Fatalf("rule 3 (port 988) survived metadataDaemon.endpoint suppression")
+				}
+			}
+		}
+
+		// The pre-DNAT rule 2 is a separate rule and must NOT go with it.
+		withDaemon := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+		if len(netpol.Spec.Egress) != len(withDaemon.Spec.Egress)-1 {
+			t.Errorf("suppression removed %d rules, want exactly 1", len(withDaemon.Spec.Egress)-len(netpol.Spec.Egress))
+		}
+		found80 := false
+		for _, rule := range netpol.Spec.Egress {
+			for _, p := range rule.Ports {
+				if p.Port != nil && p.Port.IntValue() == 80 {
+					for _, peer := range rule.To {
+						if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
+							found80 = true
+						}
+					}
+				}
+			}
+		}
+		if !found80 {
+			t.Errorf("rule 2 (link-local metadata on port 80) was removed along with rule 3")
+		}
+	})
 }
 
 func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
@@ -1088,18 +1820,13 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 		},
 	}
 
-	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "")
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
-	// The pre-NAT targets belong on 80 and 8080.
+	// The pre-NAT target belongs on port 80.
 	got80 := egressCIDRsForPort(netpol, 80)
 	want80 := []string{"169.254.169.254/32"}
 	if !reflect.DeepEqual(got80, want80) {
 		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
-	}
-
-	got8080 := egressCIDRsForPort(netpol, 8080)
-	if !reflect.DeepEqual(got8080, want80) {
-		t.Errorf("expected port 8080 metadata peers %v, got %v", want80, got8080)
 	}
 
 	// Port 988 is the post-DNAT destination on Dataplane V1, carrying the metadata
@@ -1112,6 +1839,113 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 	if !reflect.DeepEqual(got988, want988) {
 		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
 	}
+
+	// Every port the metadata server is reachable on, across all egress rules. 8080 —
+	// the pre-NAT ALTS handshaker port — must not be among them: Dataplane V2 evaluates
+	// policy pre-NAT at the socket layer, so pairing 8080 with the link-local address
+	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
+	// to the platform goldens, which are snapshots that `go test -update` re-blesses
+	// from whatever the code emits.
+	//
+	// 53 is on the list and is not a credential port: under Cloud DNS for GKE the node
+	// answers DNS at this address, and the DNS rule names it for that and nothing else.
+	// This assertion is the guard on that — a change that widened the DNS rule to carry
+	// 80, or the port-80 rule to carry 53, fails here rather than in review.
+	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
+	wantPorts := []int32{53, 80, 988}
+	if !reflect.DeepEqual(gotPorts, wantPorts) {
+		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	}
+}
+
+func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	profile := defaultTestNetpolProfile()
+	profile.MetadataDaemonPort = 1988
+
+	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+
+	got1988 := egressCIDRsForPort(netpol, 1988)
+	want1988 := []string{
+		"169.254.169.252/32",
+		"169.254.169.254/32",
+	}
+	if !reflect.DeepEqual(got1988, want1988) {
+		t.Errorf("expected custom metadata daemon peers %v, got %v", want1988, got1988)
+	}
+
+	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
+	wantPorts := []int32{53, 80, 1988}
+	if !reflect.DeepEqual(gotPorts, wantPorts) {
+		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	}
+}
+
+// TestBuildNetworkPolicy_ResolverIsNotDuplicatedByDNSClusterIPs covers the
+// operator who reads their Cloud DNS nodes' --cluster-dns and puts that value in
+// spec.networkPolicy.dnsClusterIPs. It is the same address the DNS rule already
+// grants unconditionally, and the two peers are built by separate
+// formatCIDRPeers calls, which dedupe only within themselves.
+func TestBuildNetworkPolicy_ResolverIsNotDuplicatedByDNSClusterIPs(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	profile := defaultTestNetpolProfile()
+	profile.DNSClusterIPs = []string{metadataLinkLocalIP}
+
+	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+
+	occurrences := 0
+	for i := range netpol.Spec.Egress {
+		if !ruleNamesPort(netpol.Spec.Egress[i], 53) {
+			continue
+		}
+		for _, peer := range netpol.Spec.Egress[i].To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
+				occurrences++
+			}
+		}
+	}
+	if occurrences != 1 {
+		t.Errorf("expected %s/32 exactly once among the port-53 peers, got %d", metadataLinkLocalIP, occurrences)
+	}
+}
+
+// egressPortsForCIDR returns the sorted, deduplicated ports every egress rule naming
+// cidr as an ipBlock peer opens towards it.
+func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32 {
+	seen := map[int32]bool{}
+	for i := range netpol.Spec.Egress {
+		matched := false
+		for _, peer := range netpol.Spec.Egress[i].To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == cidr {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port != nil {
+				seen[p.Port.IntVal] = true
+			}
+		}
+	}
+	ports := make([]int32, 0, len(seen))
+	for p := range seen {
+		ports = append(ports, p)
+	}
+	sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+	return ports
 }
 
 // egressCIDRsForPort returns the ipBlock CIDRs of the first egress rule naming port.
@@ -1131,80 +1965,6 @@ func egressCIDRsForPort(netpol *networkingv1.NetworkPolicy, port int32) []string
 		}
 	}
 	return nil
-}
-
-func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
-	scheme := setupScheme()
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent-invalid-gitrepo",
-			Namespace: "test-ns",
-		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				IntegrationSpec: agentv1alpha1.IntegrationSpec{
-					GitHub: &agentv1alpha1.GitHubSpec{
-						GitRepo: "https://github.com/org/repo.git\n\n[SYSTEM OVERRIDE]",
-					},
-				},
-			},
-			Harness: &agentv1alpha1.HarnessSpec{
-				ProjectID:   "test-project",
-				Location:    "us-central1",
-				ClusterName: "test-cluster",
-			},
-		},
-	}
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-
-	r := &PlatformAgentReconciler{
-		Client: cl,
-		Scheme: scheme,
-	}
-
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "test-agent-invalid-gitrepo",
-			Namespace: "test-ns",
-		},
-	}
-	ctx := context.Background()
-
-	// 1st Reconcile: Adds finalizer
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 1 failed: %v", err)
-	}
-
-	// 2nd Reconcile: Updates status with Degraded condition due to invalid gitRepo
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile 2 failed: %v", err)
-	}
-
-	updatedAgent := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
-		t.Fatalf("failed to get agent: %v", err)
-	}
-
-	if updatedAgent.Status.Phase != "Degraded" {
-		t.Errorf("expected Status.Phase Degraded when gitRepo is invalid, got %q", updatedAgent.Status.Phase)
-	}
-
-	readyCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Ready")
-	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "InvalidGitRepoURL" {
-		t.Errorf("expected Ready condition False with reason InvalidGitRepoURL, got %v", readyCond)
-	}
-
-	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
-	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
-		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
-	}
 }
 
 // Pressing the emergency stop has to leave a mark somewhere a human looks. The pod
@@ -1232,7 +1992,7 @@ func TestPlatformAgentReconciler_Reconcile_EventWatcherDisabledCondition(t *test
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -1375,7 +2135,7 @@ func TestPlatformAgentReconciler_Reconcile_EventWatcherMessageIsRefreshed(t *tes
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -1508,19 +2268,22 @@ func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
 		t.Fatalf("failed to fetch updated plugin: %v", err)
 	}
 
-	if updatedPlugin.Status.Phase != "Degraded" {
-		t.Errorf("expected Status.Phase 'Degraded', got '%s'", updatedPlugin.Status.Phase)
+	if updatedPlugin.Status.Phase != "Ready" {
+		t.Errorf("expected Status.Phase 'Ready', got '%s'", updatedPlugin.Status.Phase)
 	}
 
 	cond := meta.FindStatusCondition(updatedPlugin.Status.Conditions, "Ready")
 	if cond == nil {
 		t.Fatalf("expected 'Ready' status condition to be set")
 	}
-	if cond.Status != metav1.ConditionFalse {
-		t.Errorf("expected condition Status False, got %s", cond.Status)
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected condition Status True, got %s", cond.Status)
 	}
-	if cond.Reason != "ImageVolumeUnsupported" {
-		t.Errorf("expected condition Reason 'ImageVolumeUnsupported', got '%s'", cond.Reason)
+	if cond.Reason != "Applied" {
+		t.Errorf("expected condition Reason 'Applied', got '%s'", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "init container") {
+		t.Errorf("expected condition Message to mention init container staging, got '%s'", cond.Message)
 	}
 }
 
@@ -1613,11 +2376,52 @@ func TestUpdatePluginStatuses_DuplicatePluginName(t *testing.T) {
 
 type fakeVersionDiscovery struct {
 	discovery.DiscoveryInterface
-	ver *version.Info
+	ver       *version.Info
+	groups    *metav1.APIGroupList
+	resources map[string]*metav1.APIResourceList
 }
 
 func (f *fakeVersionDiscovery) ServerVersion() (*version.Info, error) {
 	return f.ver, nil
+}
+
+func (f *fakeVersionDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	if f.groups != nil {
+		return f.groups, nil
+	}
+	if f.resources != nil {
+		groupsMap := make(map[string][]metav1.GroupVersionForDiscovery)
+		for gvStr := range f.resources {
+			parts := strings.Split(gvStr, "/")
+			if len(parts) == 2 {
+				group := parts[0]
+				version := parts[1]
+				groupsMap[group] = append(groupsMap[group], metav1.GroupVersionForDiscovery{
+					GroupVersion: gvStr,
+					Version:      version,
+				})
+			}
+		}
+		var groups []metav1.APIGroup
+		for gName, gvList := range groupsMap {
+			groups = append(groups, metav1.APIGroup{
+				Name:             gName,
+				Versions:         gvList,
+				PreferredVersion: gvList[0],
+			})
+		}
+		return &metav1.APIGroupList{Groups: groups}, nil
+	}
+	return &metav1.APIGroupList{}, nil
+}
+
+func (f *fakeVersionDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if f.resources != nil {
+		if rl, ok := f.resources[groupVersion]; ok {
+			return rl, nil
+		}
+	}
+	return &metav1.APIResourceList{GroupVersion: groupVersion}, nil
 }
 
 func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
@@ -1669,6 +2473,39 @@ func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
 	}
 	if isImageVolumeSupported(dc35, agentDisableAnnot) {
 		t.Errorf("expected annotation override 'false' to force isImageVolumeSupported to false even on K8s 1.35")
+	}
+
+	// 5. Server version >= 1.35 on GKE Standard returns true (natively supported even with auto.gke.io allowlists)
+	dcGKEStandard := &fakeVersionDiscovery{
+		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
+		resources: map[string]*metav1.APIResourceList{
+			"auto.gke.io/v1": {
+				GroupVersion: "auto.gke.io/v1",
+				APIResources: []metav1.APIResource{{Name: "workloadallowlists"}},
+			},
+		},
+	}
+	if !isImageVolumeSupported(dcGKEStandard, agent) {
+		t.Errorf("expected isImageVolumeSupported to return true on GKE Standard >= 1.35")
+	}
+
+	// 6. GKE Autopilot returns false (falls back to initContainer staging)
+	dcGKEAutopilot := &fakeVersionDiscovery{
+		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
+		resources: map[string]*metav1.APIResourceList{
+			"auto.gke.io/v1": {
+				GroupVersion: "auto.gke.io/v1",
+				APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+			},
+		},
+	}
+	if isImageVolumeSupported(dcGKEAutopilot, agent) {
+		t.Errorf("expected isImageVolumeSupported to return false on GKE Autopilot (falls back to initContainer staging)")
+	}
+
+	// 7. Annotation override "true" on GKE Autopilot forces isImageVolumeSupported to true
+	if !isImageVolumeSupported(dcGKEAutopilot, agentEnableAnnot) {
+		t.Errorf("expected annotation override 'true' to force isImageVolumeSupported to true on GKE Autopilot")
 	}
 }
 
@@ -1770,6 +2607,10 @@ type countingDiscovery struct {
 func (c *countingDiscovery) ServerVersion() (*version.Info, error) {
 	c.calls++
 	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func (c *countingDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	return &metav1.APIGroupList{}, nil
 }
 
 func TestImageVolumeSupported_CachesDiscovery(t *testing.T) {
@@ -1957,7 +2798,7 @@ func TestUpdatePluginStatuses_NoWriteWhenUnchanged(t *testing.T) {
 		t.Errorf("expected no second status write (resourceVersion %s), got %s", rvFirst, afterSecond.ResourceVersion)
 	}
 
-	// A genuine change must still be written.
+	// A genuine change (message updated to reflect init container staging) must still be written.
 	changed := afterSecond.DeepCopy()
 	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{changed}, false /* imageVolumeSupported */)
 	var afterThird agentv1alpha1.AgentPlugin
@@ -1965,10 +2806,10 @@ func TestUpdatePluginStatuses_NoWriteWhenUnchanged(t *testing.T) {
 		t.Fatalf("get after third: %v", err)
 	}
 	if afterThird.ResourceVersion == rvFirst {
-		t.Errorf("expected a status write when the plugin degrades, resourceVersion unchanged at %s", rvFirst)
+		t.Errorf("expected a status write when the condition changes, resourceVersion unchanged at %s", rvFirst)
 	}
-	if afterThird.Status.Phase != "Degraded" {
-		t.Errorf("expected Phase 'Degraded', got '%s'", afterThird.Status.Phase)
+	if afterThird.Status.Phase != "Ready" {
+		t.Errorf("expected Phase 'Ready', got '%s'", afterThird.Status.Phase)
 	}
 }
 
@@ -1985,6 +2826,10 @@ func (f *flakyDiscovery) ServerVersion() (*version.Info, error) {
 		return nil, fmt.Errorf("apiserver unreachable")
 	}
 	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func (f *flakyDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	return &metav1.APIGroupList{}, nil
 }
 
 func TestImageVolumeSupported_TransientFailureIsNotCached(t *testing.T) {
@@ -2087,6 +2932,212 @@ func TestUpdatePluginStatuses_ImagePullFailureIsReported(t *testing.T) {
 	}
 	if good.Status.Phase != "Ready" {
 		t.Errorf("expected unaffected plugin to stay Ready, got %q", good.Status.Phase)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailureIsReported(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	failingPlugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "failstage", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/plugin:v1"},
+	}
+	healthyPlugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "okstage", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/plugin:v2"},
+	}
+
+	stagingContainerName := buildPluginStagingContainerName("failstage")
+	okContainerName := buildPluginStagingContainerName("okstage")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: stagingContainerName,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1,
+							Reason:   "Error",
+						},
+					},
+				},
+				{
+					Name: okContainerName,
+					State: corev1.ContainerState{
+						Running: &corev1.ContainerStateRunning{},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(failingPlugin, healthyPlugin, pod).
+		WithStatusSubresource(failingPlugin, healthyPlugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{failingPlugin, healthyPlugin}, false)
+
+	var bad, good agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: "failstage", Namespace: "test-ns"}, &bad); err != nil {
+		t.Fatalf("get bad plugin: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "okstage", Namespace: "test-ns"}, &good); err != nil {
+		t.Fatalf("get good plugin: %v", err)
+	}
+
+	if bad.Status.Phase != "Degraded" {
+		t.Errorf("expected failing staging plugin Phase 'Degraded', got %q", bad.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(bad.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "staging init container exited with code 1") {
+		t.Errorf("expected exit code 1 in condition message, got %q", cond.Message)
+	}
+	if good.Status.Phase != "Ready" {
+		t.Errorf("expected healthy staging plugin Phase 'Ready', got %q", good.Status.Phase)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailure_MissingShell(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "scratchplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "example.com/scratch:v1"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: buildPluginStagingContainerName(plugin.Name),
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "CrashLoopBackOff",
+							Message: "back-off 10s restarting failed container",
+						},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 127,
+							Reason:   "ContainerCannotRun",
+							Message:  "OCI runtime exec failed: exec: \"/bin/sh\": stat /bin/sh: no such file or directory",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, pod).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false)
+
+	var result agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &result); err != nil {
+		t.Fatalf("get plugin: %v", err)
+	}
+
+	if result.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got %q", result.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(result.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "may be outdated or missing /bin/sh") {
+		t.Errorf("expected diagnostic message indicating missing /bin/sh, got %q", cond.Message)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailure_RunContainerError_MissingShell(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "badplugin", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "target-agent",
+			Image:    "registry.k8s.io/pause:3.9",
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: buildPluginStagingContainerName(plugin.Name),
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "RunContainerError",
+							Message: "OCI runtime start failed: starting container: creating process: failed to load /bin/sh: no such file or directory",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, pod).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false)
+
+	var result agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &result); err != nil {
+		t.Fatalf("get plugin: %v", err)
+	}
+
+	if result.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got %q", result.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(result.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "may be outdated or missing /bin/sh") {
+		t.Errorf("expected diagnostic message indicating missing /bin/sh, got %q", cond.Message)
 	}
 }
 
@@ -2299,6 +3350,104 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 	}
 }
 
+func TestReconcileGitopsStateConfigMap(t *testing.T) {
+	scheme := setupScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	r := &PlatformAgentReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+
+	// 1. Initial reconcile should create the configmap
+	err := r.reconcileGitopsStateConfigMap(ctx, agent)
+	if err != nil {
+		t.Fatalf("unexpected error during reconcile: %v", err)
+	}
+
+	// Verify creation
+	var cm corev1.ConfigMap
+	cmKey := client.ObjectKey{Name: "test-agent-gitops-state", Namespace: "test-ns"}
+	if err := fakeClient.Get(ctx, cmKey, &cm); err != nil {
+		t.Fatalf("failed to get created ConfigMap: %v", err)
+	}
+
+	// 2. Modify the configmap locally (simulation of agent writing to it)
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	cm.Data["managed_repos"] = `[{"type":"github","url":"some-repo"}]`
+	if err := fakeClient.Update(ctx, &cm); err != nil {
+		t.Fatalf("failed to update ConfigMap: %v", err)
+	}
+
+	// 3. Second reconcile should retain existing data
+	err = r.reconcileGitopsStateConfigMap(ctx, agent)
+	if err != nil {
+		t.Fatalf("unexpected error during second reconcile: %v", err)
+	}
+
+	var verifyCM corev1.ConfigMap
+	if err := fakeClient.Get(ctx, cmKey, &verifyCM); err != nil {
+		t.Fatalf("failed to get ConfigMap after second reconcile: %v", err)
+	}
+	if verifyCM.Data["managed_repos"] != `[{"type":"github","url":"some-repo"}]` {
+		t.Errorf("expected ConfigMap to retain its data, but got %v", verifyCM.Data)
+	}
+
+	// 4. Updating the CR's GitOps repository adds it to the existing ConfigMap,
+	// first rather than last: agent-side consumers fall back to the first
+	// managed entry for the GitOps repository, so appending would leave the
+	// previous first entry answering for it.
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			GitHub: &agentv1alpha1.GitHubSpec{
+				Org:     "test-org",
+				GitRepo: "new-repo",
+			},
+		},
+	}
+	err = r.reconcileGitopsStateConfigMap(ctx, agent)
+	if err != nil {
+		t.Fatalf("unexpected error during third reconcile: %v", err)
+	}
+	if err := fakeClient.Get(ctx, cmKey, &verifyCM); err != nil {
+		t.Fatalf("failed to get ConfigMap after third reconcile: %v", err)
+	}
+	expectedMergedJSON := `[{"type":"github","url":"https://github.com/test-org/new-repo"},{"type":"github","url":"some-repo"}]`
+	if verifyCM.Data["managed_repos"] != expectedMergedJSON {
+		t.Errorf("expected ConfigMap to contain merged repos, but got %v", verifyCM.Data["managed_repos"])
+	}
+
+	// 5. Unparseable managed_repos in ConfigMap should log warning and degrade gracefully without erroring out
+	verifyCM.Data["managed_repos"] = `[invalid-json-text`
+	if err := fakeClient.Update(ctx, &verifyCM); err != nil {
+		t.Fatalf("failed to update ConfigMap with unparseable data: %v", err)
+	}
+
+	err = r.reconcileGitopsStateConfigMap(ctx, agent)
+	if err != nil {
+		t.Errorf("expected graceful degradation (nil error) when managed_repos contains unparseable JSON, got: %v", err)
+	}
+
+	var unparseableVerifyCM corev1.ConfigMap
+	if err := fakeClient.Get(ctx, cmKey, &unparseableVerifyCM); err != nil {
+		t.Fatalf("failed to get ConfigMap after unparseable reconcile: %v", err)
+	}
+	if unparseableVerifyCM.Data["managed_repos"] != `[invalid-json-text` {
+		t.Errorf("expected ConfigMap to preserve unparseable data, but got %v", unparseableVerifyCM.Data["managed_repos"])
+	}
+}
+
 func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -2333,7 +3482,7 @@ func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -2372,6 +3521,7 @@ func TestCleanupAgentRBAC_ReconcilePreservesActiveRBACAndDeletesLegacy(t *testin
 	leaderBindingName := "kubeagents:leader:test-ns:test-agent"
 	legacyRoleName := "kubeagents:explorer:test-ns:test-agent"
 	legacyBindingName := "kubeagents-legacy-binding"
+
 	activeMinimalRole := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: minimalRoleName,
@@ -2657,7 +3807,7 @@ func TestReconcileNetworkPolicy_DynamicDiscovery(t *testing.T) {
 		APIServerCIDROverride: "198.51.100.0/24,203.0.113.1/32",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2750,7 +3900,7 @@ func TestReconcileNetworkPolicy_CustomEgressCIDRsAnnotation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2815,7 +3965,7 @@ func TestReconcileNetworkPolicy_RejectOverlyBroadCIDR(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2868,7 +4018,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -2946,7 +4096,7 @@ func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
 
 	// 3. Verify disabling annotation deletes FQDNNetworkPolicy
 	delete(agent.Annotations, AnnotationEnableFQDNNetworkPolicy)
-	err = r.reconcileNetworkPolicy(ctx, agent, "")
+	err = r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy after disabling FQDN failed: %v", err)
 	}
@@ -2992,7 +4142,7 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3004,8 +4154,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 12 {
+		t.Errorf("expected 12 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -3056,7 +4206,7 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false)
 	if err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
@@ -3067,8 +4217,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 12 {
+		t.Errorf("expected 12 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 
@@ -3106,7 +4256,7 @@ func TestReconcileNetworkPolicy_TruncateMaxCIDRs(t *testing.T) {
 		APIServerIP: "10.96.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3159,7 +4309,7 @@ func TestReconcileNetworkPolicy_PrivateIPOverlap(t *testing.T) {
 		APIServerIP: "172.16.0.1",
 	}
 
-	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+	if err := r.reconcileNetworkPolicy(ctx, agent, r.resolveNetpolProfile(ctx, agent), "", false); err != nil {
 		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
 	}
 
@@ -3384,5 +4534,2373 @@ func TestClearForeignPDBBudgetField_LeavesAgreeingBudgetAlone(t *testing.T) {
 	}
 	if err := r.clearForeignPDBBudgetField(ctx, buildPlatformPDB(missing)); err != nil {
 		t.Fatalf("expected NotFound to be tolerated, got %v", err)
+	}
+}
+
+// fqdnNetworkPolicyObject builds the unstructured FQDNNetworkPolicy the operator owns
+// for an agent. The GVK is not in the scheme -- the CRD is GKE Dataplane V2's -- which is
+// the reason the disabled path reads it as unstructured and why it is worth covering
+// separately from the typed NetworkPolicy beside it.
+func fqdnNetworkPolicyObject(namespace, name string, owner *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.gke.io",
+		Version: "v1alpha1",
+		Kind:    "FQDNNetworkPolicy",
+	})
+	u.SetNamespace(namespace)
+	u.SetName(name)
+	if owner != nil {
+		u.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1",
+			Kind:       "PlatformAgent",
+			Name:       owner.Name,
+			UID:        owner.UID,
+			Controller: ptr.To(true),
+		}})
+	}
+	return u
+}
+
+func TestReconcileNetworkPolicy_Disabled_DeletesOwnedOnly(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			UID:       types.UID("1234-5678"),
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+					Enabled: ptr.To(false),
+				},
+			},
+		},
+	}
+
+	// 1. Owned NetworkPolicy (should be deleted)
+	ownedNetpol := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-netpol",
+			Namespace: "test-ns",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "kubeagents.x-k8s.io/v1alpha1",
+					Kind:       "PlatformAgent",
+					Name:       agent.Name,
+					UID:        agent.UID,
+					Controller: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, ownedNetpol).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	// Created through the client rather than seeded with WithObjects: the
+	// FQDNNetworkPolicy GVK is not in the scheme, and Create is the path that
+	// registers it, the same one the reconciler takes on the enabled path.
+	ownedFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", agent)
+	if err := cl.Create(ctx, ownedFQDN); err != nil {
+		t.Fatalf("failed to seed owned FQDNNetworkPolicy: %v", err)
+	}
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: cl,
+		Scheme:    scheme,
+	}
+
+	profile := r.resolveNetpolProfile(ctx, agent)
+	if profile.Generated {
+		t.Fatalf("expected profile.Generated=false when enabled=false")
+	}
+
+	if err := r.reconcileNetworkPolicy(ctx, agent, profile, "", false); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	checkNetpol := &networkingv1.NetworkPolicy{}
+	err := cl.Get(ctx, types.NamespacedName{Name: ownedNetpol.Name, Namespace: ownedNetpol.Namespace}, checkNetpol)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected owned NetworkPolicy to be deleted, got err=%v", err)
+	}
+
+	// 2. Owned FQDNNetworkPolicy (should be deleted). The docs promise enabled:false
+	// removes both policies the operator owns; without this the FQDN half could stop
+	// matching its owner reference and keep domain filtering on for an agent whose
+	// policy management was switched off, with the suite green.
+	checkFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", nil)
+	err = cl.Get(ctx, types.NamespacedName{Name: ownedFQDN.GetName(), Namespace: ownedFQDN.GetNamespace()}, checkFQDN)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected owned FQDNNetworkPolicy to be deleted, got err=%v", err)
+	}
+
+	// 3. Non-owned NetworkPolicy with same name (should NOT be deleted)
+	foreignNetpol := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-netpol",
+			Namespace: "test-ns",
+		},
+	}
+	clForeign := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, foreignNetpol).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	foreignFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", nil)
+	if err := clForeign.Create(ctx, foreignFQDN); err != nil {
+		t.Fatalf("failed to seed foreign FQDNNetworkPolicy: %v", err)
+	}
+
+	rForeign := &PlatformAgentReconciler{
+		Client:    clForeign,
+		APIReader: clForeign,
+		Scheme:    scheme,
+	}
+
+	if err := rForeign.reconcileNetworkPolicy(ctx, agent, profile, "", false); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	err = clForeign.Get(ctx, types.NamespacedName{Name: foreignNetpol.Name, Namespace: foreignNetpol.Namespace}, checkNetpol)
+	if err != nil {
+		t.Errorf("expected unowned/foreign NetworkPolicy to be preserved, got err=%v", err)
+	}
+
+	// 4. Non-owned FQDNNetworkPolicy with the same name (should NOT be deleted).
+	checkForeignFQDN := fqdnNetworkPolicyObject("test-ns", "test-agent-fqdn-netpol", nil)
+	err = clForeign.Get(ctx, types.NamespacedName{Name: foreignFQDN.GetName(), Namespace: foreignFQDN.GetNamespace()}, checkForeignFQDN)
+	if err != nil {
+		t.Errorf("expected unowned/foreign FQDNNetworkPolicy to be preserved, got err=%v", err)
+	}
+}
+
+func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+					DNSClusterIPs: []string{"10.200.0.10"},
+					MetadataDaemon: &agentv1alpha1.MetadataDaemonSpec{
+						Endpoint: "169.254.169.245",
+					},
+				},
+			},
+		},
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{
+			ReadyReplicas: 1,
+		},
+	}
+
+	// The other two workloads Ready depends on. This test is about what the
+	// NetworkPolicy status fields say, so it wants the phase to reach Ready — and
+	// since the credential-broker split that takes all three, because a gateway on
+	// its own is an agent that can run no command. readSplitWorkloads reads them.
+	shell := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-shell",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+	broker := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-credential-proxy",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 1},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, dep, shell, broker).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: cl,
+		Scheme:    scheme,
+	}
+
+	profile := r.resolveNetpolProfile(ctx, agent)
+	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
+	if err != nil {
+		t.Fatalf("updateStatusReady failed: %v", err)
+	}
+	if phase != "Ready" {
+		t.Errorf("got phase %q, want Ready", phase)
+	}
+
+	if !agent.Status.NetworkPolicy.Generated {
+		t.Errorf("expected Status.NetworkPolicy.Generated to be true")
+	}
+	if agent.Status.NetworkPolicy.DNSClusterIPsSource != "Spec" {
+		t.Errorf("got DNSClusterIPsSource %q, want Spec", agent.Status.NetworkPolicy.DNSClusterIPsSource)
+	}
+	if !reflect.DeepEqual(agent.Status.NetworkPolicy.DNSClusterIPs, []string{"10.200.0.10"}) {
+		t.Errorf("got DNSClusterIPs %v, want [10.200.0.10]", agent.Status.NetworkPolicy.DNSClusterIPs)
+	}
+	if agent.Status.NetworkPolicy.MetadataDaemonIP != "169.254.169.245" {
+		t.Errorf("got MetadataDaemonIP %q, want 169.254.169.245", agent.Status.NetworkPolicy.MetadataDaemonIP)
+	}
+	if agent.Status.NetworkPolicy.MetadataDaemonPort != metadataDaemonDefaultPort {
+		t.Errorf("got MetadataDaemonPort %d, want %d", agent.Status.NetworkPolicy.MetadataDaemonPort, metadataDaemonDefaultPort)
+	}
+	if agent.Status.NetworkPolicy.MetadataDaemonIPSource != "Spec" {
+		t.Errorf("got MetadataDaemonIPSource %q, want Spec", agent.Status.NetworkPolicy.MetadataDaemonIPSource)
+	}
+}
+
+// TestReconcileNetworkPolicy_StatusReporting_Disabled covers the one state
+// status.networkPolicy.generated exists to express.
+//
+// Generated deliberately carries no omitempty: encoding/json drops a false bool
+// under omitempty, so a disabled agent would serialise as `networkPolicy: {}` and
+// an operator asking "is the operator managing my policy?" would get silence.
+// That choice is defended by a comment in common_types.go and by nothing else --
+// re-adding omitempty during a cleanup looks like tidying up next to the field's
+// five omitempty neighbours, and every existing assertion is on Generated == true,
+// which omitempty does not touch. The JSON check below is the tripwire.
+//
+// The DNS and metadata assertions cover the same reconcile's early return:
+// resolveNetpolProfile bails before either ladder runs when enabled is false, so a
+// Spec pin that is set here must still report nothing.
+func TestReconcileNetworkPolicy_StatusReporting_Disabled(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				NetworkPolicy: &agentv1alpha1.NetworkPolicySpec{
+					Enabled: ptr.To(false),
+					// Set, and must still not be reported: the early return
+					// precedes the DNS ladder.
+					DNSClusterIPs: []string{"10.200.0.10"},
+					MetadataDaemon: &agentv1alpha1.MetadataDaemonSpec{
+						Endpoint: "169.254.169.245",
+					},
+				},
+			},
+		},
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{
+			ReadyReplicas: 1,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, dep).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: cl,
+		Scheme:    scheme,
+	}
+
+	profile := r.resolveNetpolProfile(ctx, agent)
+	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
+		t.Fatalf("updateStatusReady failed: %v", err)
+	}
+
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}, stored); err != nil {
+		t.Fatalf("failed to read the agent back: %v", err)
+	}
+
+	netpol := stored.Status.NetworkPolicy
+	if netpol.Generated {
+		t.Errorf("got Status.NetworkPolicy.Generated=true, want false for enabled=false")
+	}
+	if len(netpol.DNSClusterIPs) != 0 {
+		t.Errorf("got DNSClusterIPs %v, want none: the DNS ladder never runs when generation is off", netpol.DNSClusterIPs)
+	}
+	if netpol.DNSClusterIPsSource != "" {
+		t.Errorf("got DNSClusterIPsSource %q, want empty", netpol.DNSClusterIPsSource)
+	}
+	if netpol.MetadataDaemonIP != "" {
+		t.Errorf("got MetadataDaemonIP %q, want empty", netpol.MetadataDaemonIP)
+	}
+	if netpol.MetadataDaemonIPSource != "" {
+		t.Errorf("got MetadataDaemonIPSource %q, want empty", netpol.MetadataDaemonIPSource)
+	}
+
+	// The whole point of the missing omitempty: the key has to survive encoding.
+	encoded, err := json.Marshal(netpol)
+	if err != nil {
+		t.Fatalf("failed to marshal NetworkPolicyStatus: %v", err)
+	}
+	if got := string(encoded); !strings.Contains(got, `"generated":false`) {
+		t.Errorf("encoded status is %s, want it to carry \"generated\":false -- omitempty on Generated would erase the one state this field reports", got)
+	}
+}
+
+// TestABrokenNativeSidecarIsReportedDegraded guards the status path against the
+// container-list split the native sidecar introduced.
+//
+// The credential proxy is an init container now, so it reports into
+// InitContainerStatuses. When it cannot start, the kubelet never creates the app
+// containers at all and ContainerStatuses is empty -- so a status check that reads
+// only the app list finds nothing wrong, PodScheduled is True, and the CR sits in
+// Provisioning saying it is waiting for replicas while the pod is in
+// Init:CrashLoopBackOff. That is the pod's worst failure reported as silence, and
+// it is the failure this whole change makes more likely to matter, since a proxy
+// that will not start now blocks the entire pod rather than one container.
+func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			// Exactly the shape the kubelet produces: the sidecar is stuck and no
+			// app container was ever created.
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				// A preceding init container that is merely waiting its turn.
+				// Measured on a cluster: this is what the list actually looks
+				// like, and reporting this entry names no fault.
+				Name: "sandbox-credential-cleanup",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason: "PodInitializing",
+				}},
+			}, {
+				Name: "envoy-credential-proxy",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+			// Not empty while the pod is stuck in Init -- the kubelet fills this
+			// in with placeholders, which is why the old code reported
+			// PodInitializing rather than nothing at all.
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded -- a pod stuck in Init reports as healthy", phase)
+	}
+	if reason != "ImagePullBackOff" {
+		t.Errorf("reason = %q, want ImagePullBackOff", reason)
+	}
+	if !strings.Contains(message, "envoy-credential-proxy") {
+		t.Errorf("message does not name the failing container: %q", message)
+	}
+}
+
+func TestInitContainerPluginStagingFailureReportsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "stage-custom-plugin",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "CrashLoopBackOff",
+					Message: "back-off 10s restarting failed container=stage-custom-plugin",
+				}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 127,
+						Message:  "exec /bin/sh: no such file or directory",
+					},
+				},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded", phase)
+	}
+	if reason != "CrashLoopBackOff" {
+		t.Errorf("reason = %q, want CrashLoopBackOff", reason)
+	}
+	if !strings.Contains(message, "stage-custom-plugin") || !strings.Contains(message, "missing /bin/sh") {
+		t.Errorf("message does not diagnose missing /bin/sh: %q", message)
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						Org: "test-org",
+					},
+				},
+			},
+		},
+	}
+
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "github-token-minter-config",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			"default.yaml":          "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'default-repo'\n",
+			"unmanaged-static.yaml": "version: 'minty.abcxyz.dev/v2'\n",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	ctx := context.Background()
+
+	// 0. Sync with empty managed_repos on fresh ConfigMap — should be a no-op and preserve unmanaged-static.yaml
+	err := r.syncGithubTokenMinterConfigMap(ctx, agent, "", "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with empty repos failed: %v", err)
+	}
+
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if _, exists := updatedCM.Data["unmanaged-static.yaml"]; !exists {
+		t.Errorf("expected unmanaged-static.yaml to be preserved when managed_repos is empty")
+	}
+
+	// 1. Sync with managed_repos JSON: repo-1 and repo-2
+	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
+	}
+
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+
+	// Verify repo-1.yaml and repo-2.yaml were created and scoped to all managed repos in org
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
+		t.Errorf("expected repo-1.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-1.yaml"])
+	}
+	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
+		t.Errorf("expected repo-2.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-2.yaml"])
+	}
+
+	// Verify unmanaged-static.yaml was NOT pruned
+	if _, exists := updatedCM.Data["unmanaged-static.yaml"]; !exists {
+		t.Errorf("expected unmanaged-static.yaml to be preserved as it is not operator-managed")
+	}
+
+	// Verify default.yaml was preserved
+	expectedDefault := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'default-repo'\n"
+	if updatedCM.Data["default.yaml"] != expectedDefault {
+		t.Errorf("expected default.yaml to be preserved, got %q", updatedCM.Data["default.yaml"])
+	}
+
+	// Verify annotation tracks operator-managed keys
+	expectedAnn := "repo-1.yaml,repo-2.yaml"
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != expectedAnn {
+		t.Errorf("expected annotation %q, got %q", expectedAnn, ann)
+	}
+
+	// 2. Remove repo-2 from managed_repos
+	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
+	}
+
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+
+	// Verify repo-1.yaml exists and repo-2.yaml was pruned because it was operator-managed
+	if _, exists := updatedCM.Data["repo-1.yaml"]; !exists {
+		t.Errorf("expected repo-1.yaml to remain present")
+	}
+	if _, exists := updatedCM.Data["repo-2.yaml"]; exists {
+		t.Errorf("expected repo-2.yaml to be pruned after removal from managed_repos")
+	}
+	// Verify unmanaged-static.yaml is STILL present
+	if _, exists := updatedCM.Data["unmanaged-static.yaml"]; !exists {
+		t.Errorf("expected unmanaged-static.yaml to remain untouched")
+	}
+
+	expectedAnnAfter := "repo-1.yaml"
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != expectedAnnAfter {
+		t.Errorf("expected annotation %q, got %q", expectedAnnAfter, ann)
+	}
+
+	// 3. Sync with managed_repos including a cross-org repo (other-org/other-repo) — should skip creating other-repo.yaml
+	err = r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap failed with cross-org repo: %v", err)
+	}
+
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+
+	if _, exists := updatedCM.Data["repo-1.yaml"]; !exists {
+		t.Errorf("expected repo-1.yaml to remain present")
+	}
+	if _, exists := updatedCM.Data["other-repo.yaml"]; exists {
+		t.Errorf("expected cross-org other-repo.yaml to be skipped")
+	}
+
+	// 4. Sync with empty Org but GitRepo set — should infer primaryOrg from GitRepo and skip cross-org repos
+	agentInferred := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-inferred", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						Org:     "",
+						GitRepo: "test-org/main-repo",
+					},
+				},
+			},
+		},
+	}
+	err = r.syncGithubTokenMinterConfigMap(ctx, agentInferred, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/forbidden-org/forbidden-repo"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with inferred org failed: %v", err)
+	}
+
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+
+	if _, exists := updatedCM.Data["forbidden-repo.yaml"]; exists {
+		t.Errorf("expected cross-org forbidden-repo.yaml to be skipped when primaryOrg is inferred from GitRepo")
+	}
+
+	// 5. The only github forge has a namespace GitHub refuses. Its primary org
+	// is empty, which would accept every organisation, so the sync must leave
+	// the policies as they were rather than widen them to other-org.
+	before := updatedCM.DeepCopy()
+	agentBadForge := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-bad-forge", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test_org"}},
+				},
+			},
+		},
+	}
+	err = r.syncGithubTokenMinterConfigMap(ctx, agentBadForge, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with an invalid forge failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if _, exists := updatedCM.Data["other-repo.yaml"]; exists {
+		t.Errorf("an invalid forge namespace must not turn the org scope off, got other-repo.yaml")
+	}
+	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+		t.Errorf("an invalid forge namespace must leave the policies as they were, got %v", updatedCM.Data)
+	}
+
+	// 6. A valid github forge with no namespace, whose only repository the agent
+	// writes to is refused: nothing accepted is left to read the organisation
+	// from, so the sync must again leave the policies alone.
+	agentRefusedRepo := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-refused-repo", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub}},
+					Repositories: []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "test-org/in fra", Role: agentv1alpha1.RepositoryRoleGitOps}},
+				},
+			},
+		},
+	}
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agentRefusedRepo, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with a refused repository failed: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+	if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+		t.Errorf("a refused write repository must leave the policies as they were, got %v", updatedCM.Data)
+	}
+
+	// 7. A refusal must not move the organisation to what validation left
+	// standing either: another forge's namespace, or a managed repository's
+	// organisation. Either would scope the sync to other-org and prune the
+	// policy of test-org's repository, which was working. Nor may a
+	// declaration that does not resolve at all widen it: an empty organisation
+	// would render a policy for other-org's repository.
+	for name, integration := range map[string]agentv1alpha1.IntegrationSpec{
+		"both spellings at once": {
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org", GitRepo: "repo-1"},
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org"}},
+		},
+		"a typo in the gitops forge's namespace": {
+			Forges: []agentv1alpha1.ForgeSpec{
+				{Name: "ours", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "test-org_"},
+				{Name: "upstream", Provider: agentv1alpha1.GitProviderGitHub, Namespace: "other-org"},
+			},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "ours", Repository: "repo-1", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "upstream", Repository: "other-repo", Role: agentv1alpha1.RepositoryRoleContext},
+			},
+		},
+		"a typo in the gitops repository": {
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: agentv1alpha1.GitProviderGitHub}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "test-org/repo 1", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "other-org/other-repo", Role: agentv1alpha1.RepositoryRoleManaged},
+			},
+		},
+	} {
+		agentMoved := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent-moved", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: integration},
+			},
+		}
+		if err := r.syncGithubTokenMinterConfigMap(ctx, agentMoved, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/other-org/other-repo"}]`, ""); err != nil {
+			t.Fatalf("%s: syncGithubTokenMinterConfigMap failed: %v", name, err)
+		}
+		if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+			t.Fatalf("%s: failed to get updated ConfigMap: %v", name, err)
+		}
+		if !reflect.DeepEqual(updatedCM.Data, before.Data) {
+			t.Errorf("%s must leave the policies as they were, got %v", name, updatedCM.Data)
+		}
+	}
+
+	// 8. An integration block with no forge declaration at all -- chat only --
+	// resolves to nil, and the sync must still run.
+	agentChatOnly := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-chat-only", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{Slack: &agentv1alpha1.SlackSpec{}},
+		},
+	}
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agentChatOnly, `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap with a chat-only integration failed: %v", err)
+	}
+}
+
+// Each refused repository adds a problem that can quote up to 2048 characters,
+// and the CRD caps a condition message at 32768: the list must be bounded or
+// the whole status write fails.
+func TestGitProblemListIsBounded(t *testing.T) {
+	var problems []error
+	for i := 0; i < 64; i++ {
+		problems = append(problems, fmt.Errorf("integration.repositories[%d].repository: %s", i, strings.Repeat("c", 4000)))
+	}
+	got := gitProblemList(stderrors.Join(problems...))
+	if len(got) > hostPathDroppedEntryBudget+64 {
+		t.Errorf("gitProblemList is %d characters, want at most about %d", len(got), hostPathDroppedEntryBudget)
+	}
+	if !strings.Contains(got, "repositories[0]") || !strings.Contains(got, "more") {
+		t.Errorf("gitProblemList must name the first problem and count the rest, got %q", got[:200])
+	}
+	if one := gitProblemList(stderrors.New("integration.github.gitRepo: bad")); one != "integration.github.gitRepo: bad" {
+		t.Errorf("a single problem must be listed as it is, got %q", one)
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						Org: "test-org",
+					},
+				},
+			},
+		},
+	}
+
+	// Pre-rendered ConfigMap as shipped by Helm chart / Kustomize template: contains default.yaml AND repo-1.yaml
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "github-token-minter-config",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			"default.yaml": "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n",
+			"repo-1.yaml":  "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	// Reconcile with managed_repos containing repo-1 and repo-2
+	err := r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`, "")
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
+	}
+
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+
+	// Verify repo-1.yaml was adopted and updated to include both repos
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
+		t.Errorf("expected pre-rendered repo-1.yaml to be updated with all repos, got %q", updatedCM.Data["repo-1.yaml"])
+	}
+
+	// Verify managed keys annotation includes both repo-1.yaml and repo-2.yaml
+	expectedAnn := "repo-1.yaml,repo-2.yaml"
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != expectedAnn {
+		t.Errorf("expected annotation %q, got %q", expectedAnn, ann)
+	}
+}
+
+// The base template as the chart renders it since the read scope was added: a
+// write scope and a read scope, both listing the primary repository. Written
+// with sigs.k8s.io/yaml in mind -- the read-only rendering re-marshals it with
+// sorted keys, so the expectations below are built from a parse rather than
+// from a string.
+const minterTemplateWithReadScope = `version: 'minty.abcxyz.dev/v2'
+rule:
+  if: "assertion.iss == 'https://accounts.google.com'"
+scope:
+  platform-agent-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'write'
+      pull_requests: 'write'
+      issues: 'write'
+  platform-agent-read-scope:
+    rule:
+      if: "assertion.email in ['agent@example.iam.gserviceaccount.com']"
+    repositories:
+      - 'default-repo'
+    permissions:
+      contents: 'read'
+`
+
+// parsedMinterPolicy unmarshals a rendered policy so a test can assert on its
+// structure rather than on the key order sigs.k8s.io/yaml chose.
+func parsedMinterPolicy(t *testing.T, rendered string) map[string]interface{} {
+	t.Helper()
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatalf("rendered policy does not parse: %v\n%s", err, rendered)
+	}
+	return doc
+}
+
+func minterPolicyScopes(t *testing.T, rendered string) map[string]interface{} {
+	t.Helper()
+	scopes, ok := parsedMinterPolicy(t, rendered)["scope"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("rendered policy has no scope map:\n%s", rendered)
+	}
+	return scopes
+}
+
+func TestRenderReadOnlyPolicy(t *testing.T) {
+	rendered, ok := renderReadOnlyPolicy(minterTemplateWithReadScope, []string{"tf-live", "tf-modules"})
+	if !ok {
+		t.Fatal("expected the template with a read scope to render")
+	}
+	doc := parsedMinterPolicy(t, rendered)
+	if doc["version"] != "minty.abcxyz.dev/v2" {
+		t.Errorf("expected version to be carried over, got %v", doc["version"])
+	}
+	if rule, _ := doc["rule"].(map[string]interface{}); rule["if"] != "assertion.iss == 'https://accounts.google.com'" {
+		t.Errorf("expected the top-level rule to be carried over, got %v", doc["rule"])
+	}
+	scopes := minterPolicyScopes(t, rendered)
+	if len(scopes) != 1 {
+		t.Fatalf("expected exactly the read scope, got %v", scopes)
+	}
+	readScope, ok := scopes["platform-agent-read-scope"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected platform-agent-read-scope, got %v", scopes)
+	}
+	if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
+		t.Errorf("expected the context repositories, got %s", got)
+	}
+	if got := fmt.Sprint(readScope["permissions"]); got != "map[contents:read]" {
+		t.Errorf("expected contents: read alone, got %s", got)
+	}
+	if rule, _ := readScope["rule"].(map[string]interface{}); rule["if"] != "assertion.email in ['agent@example.iam.gserviceaccount.com']" {
+		t.Errorf("expected the scope rule to be carried over, got %v", readScope["rule"])
+	}
+	if strings.Contains(rendered, "write") {
+		t.Errorf("a read-only policy must not carry a write permission:\n%s", rendered)
+	}
+
+	// Stable across calls: the sync compares rendered content to decide whether
+	// to update, so a rendering that moved between reconciles would write on
+	// every pass.
+	again, _ := renderReadOnlyPolicy(minterTemplateWithReadScope, []string{"tf-live", "tf-modules"})
+	if again != rendered {
+		t.Errorf("rendering is not stable:\n%s\n---\n%s", rendered, again)
+	}
+
+	// A template that predates the read scope renders nothing.
+	for name, template := range map[string]string{
+		"write scope only": "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n",
+		"no scope map":     "version: 'minty.abcxyz.dev/v2'\n",
+		"not yaml":         "{{{",
+		"empty":            "",
+	} {
+		if _, ok := renderReadOnlyPolicy(template, []string{"tf-live"}); ok {
+			t.Errorf("%s: expected no rendering", name)
+		}
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data:       map[string]string{"default.yaml": minterTemplateWithReadScope},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	key := client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}
+	updatedCM := &corev1.ConfigMap{}
+
+	managed := `[{"type":"github","url":"https://github.com/test-org/gitops"}]`
+
+	// 1. A context repository renders a read-only key; the managed one keeps the write rendering.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	contextScopes := minterPolicyScopes(t, updatedCM.Data["tf-live.yaml"])
+	if _, hasWrite := contextScopes["platform-agent-scope"]; hasWrite || len(contextScopes) != 1 {
+		t.Errorf("expected tf-live.yaml to carry the read scope alone, got %v", contextScopes)
+	}
+	readScope := contextScopes["platform-agent-read-scope"].(map[string]interface{})
+	if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live]" {
+		t.Errorf("expected tf-live.yaml to list the context repositories, got %s", got)
+	}
+	if got := fmt.Sprint(readScope["permissions"]); got != "map[contents:read]" {
+		t.Errorf("expected contents: read, got %s", got)
+	}
+	managedScopes := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])
+	if _, hasWrite := managedScopes["platform-agent-scope"]; !hasWrite {
+		t.Errorf("expected gitops.yaml to keep the write scope, got %v", managedScopes)
+	}
+	if got := fmt.Sprint(managedScopes["platform-agent-scope"].(map[string]interface{})["repositories"]); got != "[gitops]" {
+		t.Errorf("expected the managed policy to list managed repositories only, got %s", got)
+	}
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml,tf-live.yaml" {
+		t.Errorf("expected both keys tracked, got %q", ann)
+	}
+	if updatedCM.Data["default.yaml"] != minterTemplateWithReadScope {
+		t.Errorf("default.yaml must not be rewritten")
+	}
+
+	// 2. A second reconcile with the same lists changes nothing.
+	before := updatedCM.ResourceVersion
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if updatedCM.ResourceVersion != before {
+		t.Errorf("expected an unchanged ConfigMap to be left alone")
+	}
+
+	// 3. A repository in both lists is managed: write rendering, and absent from the read list.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed,
+		`[{"type":"github","url":"https://github.com/test-org/gitops"},{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if _, hasWrite := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])["platform-agent-scope"]; !hasWrite {
+		t.Errorf("a repository in both lists must keep its write policy")
+	}
+	readScope = minterPolicyScopes(t, updatedCM.Data["tf-live.yaml"])["platform-agent-read-scope"].(map[string]interface{})
+	if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live]" {
+		t.Errorf("expected the managed repository to stay out of the read-only list, got %s", got)
+	}
+
+	// 4. Removing the context entry prunes its key; a cross-org entry never renders one.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed,
+		`[{"type":"github","url":"https://github.com/other-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if _, exists := updatedCM.Data["tf-live.yaml"]; exists {
+		t.Errorf("expected tf-live.yaml pruned once the same-org entry is gone")
+	}
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml" {
+		t.Errorf("expected only the managed key tracked, got %q", ann)
+	}
+
+	// 5. Context entries alone, with no managed repository, still render.
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, "",
+		`[{"type":"github","url":"https://github.com/test-org/tf-live"},{"type":"github","url":"https://github.com/test-org/tf-modules"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if err := cl.Get(ctx, key, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	for _, name := range []string{"tf-live.yaml", "tf-modules.yaml"} {
+		readScope = minterPolicyScopes(t, updatedCM.Data[name])["platform-agent-read-scope"].(map[string]interface{})
+		if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
+			t.Errorf("%s: expected every same-org context repository, got %s", name, got)
+		}
+	}
+	if _, exists := updatedCM.Data["gitops.yaml"]; exists {
+		t.Errorf("expected gitops.yaml pruned once unregistered")
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_ContextReposNeedTheReadScope(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	// A default.yaml from before the read scope existed.
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data: map[string]string{
+			"default.yaml": "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'gitops'\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent,
+		`[{"type":"github","url":"https://github.com/test-org/gitops"}]`,
+		`[{"type":"github","url":"https://github.com/test-org/tf-live"}]`); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if _, exists := updatedCM.Data["tf-live.yaml"]; exists {
+		t.Errorf("a template without the read scope must render no context policy; a write policy for a context repository would be worse than none")
+	}
+	if _, exists := updatedCM.Data["gitops.yaml"]; !exists {
+		t.Errorf("the managed rendering must be unaffected")
+	}
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml" {
+		t.Errorf("expected only the managed key tracked, got %q", ann)
+	}
+}
+
+// A repository named `default` has a policy key equal to the base template's.
+// Rendering it would overwrite default.yaml -- with the read-only policy for a
+// context entry, after which the next reconcile derives every managed policy
+// from a template with no write scope. Neither list may claim that key.
+func TestSyncGithubTokenMinterConfigMap_NeverClaimsTheBaseTemplate(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data:       map[string]string{"default.yaml": minterTemplateWithReadScope},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	key := client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}
+	managed := `[{"type":"github","url":"https://github.com/test-org/gitops"}]`
+
+	for _, lists := range []struct {
+		name, managed, context string
+	}{
+		{"context repository named default", managed, `[{"type":"github","url":"https://github.com/test-org/default"}]`},
+		{"managed repository named default", `[{"type":"github","url":"https://github.com/test-org/gitops"},{"type":"github","url":"https://github.com/test-org/default"}]`, ""},
+	} {
+		t.Run(lists.name, func(t *testing.T) {
+			// Two reconciles: the second is the one that would read an
+			// overwritten template.
+			for i := 0; i < 2; i++ {
+				if err := r.syncGithubTokenMinterConfigMap(ctx, agent, lists.managed, lists.context); err != nil {
+					t.Fatalf("sync %d failed: %v", i, err)
+				}
+			}
+			updatedCM := &corev1.ConfigMap{}
+			if err := cl.Get(ctx, key, updatedCM); err != nil {
+				t.Fatalf("get failed: %v", err)
+			}
+			if updatedCM.Data["default.yaml"] != minterTemplateWithReadScope {
+				t.Errorf("default.yaml was rewritten:\n%s", updatedCM.Data["default.yaml"])
+			}
+			if _, ok := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])["platform-agent-scope"]; !ok {
+				t.Errorf("gitops.yaml lost its write scope: %s", updatedCM.Data["gitops.yaml"])
+			}
+			if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != "gitops.yaml" {
+				t.Errorf("expected only gitops.yaml tracked, got %q", ann)
+			}
+		})
+	}
+}
+
+func TestReconcileGitopsStateConfigMap_SyncsContextRepos(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org", GitRepo: "test-org/gitops"},
+				},
+			},
+		},
+	}
+	// The gitops-state ConfigMap as an administrator leaves it: the seeded
+	// managed_repos and a hand-added context_repos.
+	stateCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/test-org/gitops"}]`,
+			"context_repos": `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`,
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "github-token-minter-config", Namespace: "test-ns"},
+		Data:       map[string]string{"default.yaml": minterTemplateWithReadScope},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, stateCM, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	scopes := minterPolicyScopes(t, updatedCM.Data["tf-live.yaml"])
+	if _, ok := scopes["platform-agent-read-scope"]; !ok || len(scopes) != 1 {
+		t.Errorf("expected the reconcile to render tf-live.yaml read-only, got %v", scopes)
+	}
+	if _, ok := minterPolicyScopes(t, updatedCM.Data["gitops.yaml"])["platform-agent-scope"]; !ok {
+		t.Errorf("expected the reconcile to render gitops.yaml with the write scope")
+	}
+	// The reconcile does not touch context_repos itself.
+	state := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "test-agent-gitops-state", Namespace: "test-ns"}, state); err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if state.Data["context_repos"] != stateCM.Data["context_repos"] {
+		t.Errorf("context_repos must be left as the administrator wrote it, got %q", state.Data["context_repos"])
+	}
+}
+
+// An unrecognized spec.mode can only reach the reconciler through version skew
+// (enum validation rejects it at admission — the fake client, like a newer CRD
+// with an older binary, does not). The contract from the mode spec: Degraded
+// with reason ModeNotRecognized, today's stack still rendered, and a requeue.
+func TestSyncGithubTokenMinterConfigMap_UnparseableListLeavesTheConfigMapAlone(t *testing.T) {
+	// A hand-edited list that is not JSON must skip the sync, as it did before
+	// context_repos was read: an error that read as "no repositories" would
+	// prune every operator-tracked policy and break every write until the
+	// JSON is repaired.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	const trackedPolicy = "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
+	const trackedReadPolicy = "version: minty.abcxyz.dev/v2\nscope:\n  platform-agent-read-scope:\n    permissions:\n      contents: read\n    repositories:\n    - tf-live\n"
+	const trackedKeys = "repo-1.yaml,tf-live.yaml"
+	validManaged := `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	validContext := `[{"type":"github","url":"https://github.com/test-org/tf-live"}]`
+
+	cases := []struct {
+		name         string
+		managedRepos string
+		contextRepos string
+	}{
+		{name: "malformed managed_repos", managedRepos: "[{", contextRepos: validContext},
+		{name: "malformed context_repos", managedRepos: validManaged, contextRepos: "[{"},
+		{name: "both malformed", managedRepos: "[{", contextRepos: "not json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			minterCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "github-token-minter-config",
+					Namespace:   "test-ns",
+					Annotations: map[string]string{AnnotationManagedMinterKeys: trackedKeys},
+				},
+				Data: map[string]string{
+					"default.yaml": minterTemplateWithReadScope,
+					"repo-1.yaml":  trackedPolicy,
+					"tf-live.yaml": trackedReadPolicy,
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+
+			if err := r.syncGithubTokenMinterConfigMap(ctx, agent, tc.managedRepos, tc.contextRepos); err != nil {
+				t.Fatalf("syncGithubTokenMinterConfigMap returned an error for an unparseable list: %v", err)
+			}
+
+			got := &corev1.ConfigMap{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+				t.Fatalf("failed to get ConfigMap: %v", err)
+			}
+			if got.Data["repo-1.yaml"] != trackedPolicy {
+				t.Errorf("repo-1.yaml changed under an unparseable list: got %q", got.Data["repo-1.yaml"])
+			}
+			if got.Data["tf-live.yaml"] != trackedReadPolicy {
+				t.Errorf("tf-live.yaml changed under an unparseable list: got %q", got.Data["tf-live.yaml"])
+			}
+			if got.Data["default.yaml"] != minterTemplateWithReadScope {
+				t.Errorf("default.yaml changed under an unparseable list")
+			}
+			if ann := got.Annotations[AnnotationManagedMinterKeys]; ann != trackedKeys {
+				t.Errorf("ownership annotation changed under an unparseable list: got %q, want %q", ann, trackedKeys)
+			}
+			if got.ResourceVersion != minterCM.ResourceVersion {
+				t.Errorf("the ConfigMap was written (resourceVersion %s -> %s); an unparseable list must skip the sync", minterCM.ResourceVersion, got.ResourceVersion)
+			}
+		})
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_AnUnreadableEntryKeepsEveryTrackedPolicy(t *testing.T) {
+	// repo-x's entry is a spelling an earlier release rewrote and this one
+	// refuses. Nothing says which tracked policy it was, so the sync must not
+	// prune -- here that would revoke repo-x's working policy -- while it still
+	// adds the policy for a repository it can read.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	const trackedPolicy = "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-x'\n"
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{
+			"default.yaml": minterTemplateWithReadScope,
+			"repo-x.yaml":  trackedPolicy,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	managed := `[{"type":"github","url":"ssh://git@github.com:test-org/repo-x"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, ""); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+		t.Fatalf("failed to get ConfigMap: %v", err)
+	}
+	if got.Data["repo-x.yaml"] != trackedPolicy {
+		t.Errorf("repo-x.yaml was pruned or rewritten while an entry could not be read: got %q", got.Data["repo-x.yaml"])
+	}
+	if !strings.Contains(got.Annotations[AnnotationManagedMinterKeys], "repo-x.yaml") {
+		t.Errorf("repo-x.yaml dropped from the ownership annotation: %q", got.Annotations[AnnotationManagedMinterKeys])
+	}
+	if _, ok := got.Data["repo-1.yaml"]; !ok {
+		t.Error("repo-1.yaml was not added; an unreadable entry must stop only the pruning")
+	}
+}
+
+// A credential in a hand-written entry stays out of the operator's log, from
+// an entry it cannot read and from one it reads but skips for its organisation.
+func TestMinterBareReposLogsNoEntryValue(t *testing.T) {
+	const secret = "ghp_notarealtoken"
+	var logged strings.Builder
+	logger := funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{Verbosity: 1})
+	repos := `[{"type":"github","url":"https://x:` + secret + `@github.com:test-org/held"},` +
+		`{"type":"github","url":"https://x:` + secret + `@github.com/other-org/app"},` +
+		`{"type":"gitlab","url":"https://x:` + secret + `@gitlab.com/g/p"},` +
+		`{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if !slices.Equal(bare, []string{"repo-1"}) || !slices.Equal(unreadable, []string{"managed_repos[0]"}) {
+		t.Errorf("minterBareRepos() = (%v, %v), expected ([repo-1], [managed_repos[0]])", bare, unreadable)
+	}
+	if strings.Contains(logged.String(), secret) {
+		t.Errorf("log quotes an entry's credential:\n%s", logged.String())
+	}
+}
+
+// The unreadable entries are named by list and index, so the message is
+// bounded whatever the ConfigMap holds; past minterHeldEntriesShown it counts
+// the rest.
+func TestMinterHeldMessageNamesEntriesByPosition(t *testing.T) {
+	msg := minterHeldMessage("held-gitops-state", []string{"managed_repos[0]", "managed_repos[3]", "context_repos[1]", "context_repos[2]"})
+	for _, want := range []string{"managed_repos[0]", "managed_repos[3]", "context_repos[1]", "and 1 more"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, expected it to contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "context_repos[2]") {
+		t.Errorf("message = %q names more than %d entries", msg, minterHeldEntriesShown)
+	}
+}
+
+// The agent reads a URL through urlsplit, which drops a query and a fragment,
+// does not check a port and allowlists no scheme, so it uses these entries. The minter counts
+// them too, rather than holding every policy for an entry that works.
+func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
+	repos := `[{"type":"github","url":"https://github.com/test-org/repo-q?ref=main"},` +
+		`{"type":"github","url":"https://github.com/test-org/repo-f#main"},` +
+		`{"type":"github","url":"https://x@github.com:99999/test-org/repo-p?a#b"},` +
+		// urlsplit's hostname ends at the first colon, whatever follows it.
+		`{"type":"github","url":"https://github.com:abc/test-org/repo-a"},` +
+		`{"type":"github","url":"https://github.com:owner/test-org/repo-o"},` +
+		// urlsplit deletes tabs and line breaks before it splits.
+		`{"type":"github","url":"https://github.com/test-org/repo-t\t?x"},` +
+		`{"type":"github","url":"git+ssh://git@github.com/test-org/re\npo-n"},` +
+		// The agent's bound counts code points, not bytes.
+		`{"type":"github","url":"git+ssh://` + strings.Repeat("é", 200) + `@github.com/test-org/repo-u"},` +
+		// urlsplit allowlists no scheme.
+		`{"type":"github","url":"git+ssh://git@github.com/test-org/repo-g"},` +
+		`{"type":"github","url":"file://github.com/test-org/repo-l"},` +
+		// One segment once the slot is gone, which the agent skips too.
+		`{"type":"github","url":"https://github.com:test-org/one"},` +
+		// Dropping the query leaves no repository, as it does for the agent.
+		`{"type":"github","url":"https://github.com?x=/test-org/gone"},` +
+		// A `#` ends the authority, so the host is evil.example either way.
+		`{"type":"github","url":"https://evil.example#@github.com/test-org/evil"},` +
+		// No host, and over the agent's length bound: the agent skips both.
+		`{"type":"github","url":"file:///github.com/test-org/nohost"},` +
+		`{"type":"github","url":"https://github.com/test-org/long?` + strings.Repeat("x", agentRepoRefMaxLength) + `"},` +
+		// A bracket without its pair in the netloc is an invalid IPv6 URL to
+		// urlsplit, wherever it sits.
+		`{"type":"github","url":"https://[x@github.com/test-org/open"},` +
+		`{"type":"github","url":"git+ssh://a]b@github.com/test-org/close"},` +
+		`{"type":"github","url":"https://[TOKEN]@github.com/test-org/paired"}]`
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if want := []string{"repo-a", "repo-f", "repo-g", "repo-l", "repo-n", "repo-o", "repo-p", "repo-q", "repo-t", "repo-u"}; !slices.Equal(bare, want) {
+		t.Errorf("bare = %v, expected %v", bare, want)
+	}
+	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]", "managed_repos[15]", "managed_repos[16]", "managed_repos[17]"}; !slices.Equal(unreadable, want) {
+		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// TestReconcile_ARefusedDeclarationHoldsGitHubOrgAndLogsNoValue drives the
+// reconcile wiring TestARefusedGitHubScopeKeepsTheLiveGitHubOrg cannot: the
+// held organisation reaches the applied gateway, and the warning names the
+// refused field without writing its token to the log.
+func TestReconcile_ARefusedDeclarationHoldsGitHubOrgAndLogsNoValue(t *testing.T) {
+	scheme := setupScheme()
+	const secret = "ghp_notarealtoken"
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "https://x:" + secret + "@github.com:gke-labs/infra"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	live := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gateway", Namespace: "test-ns"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: appNamePlatformAgent,
+				Env:  []corev1.EnvVar{{Name: "GITHUB_ORG", Value: "gke-labs"}},
+			}},
+		}}},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, live, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+	for range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile() = %v", err)
+		}
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(live), dep); err != nil {
+		t.Fatalf("get gateway: %v", err)
+	}
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
+		t.Errorf("applied GITHUB_ORG = %q, expected the held gke-labs", got)
+	}
+	if strings.Contains(logged.String(), secret) {
+		t.Errorf("reconcile log quotes the refused value's credential:\n%s", logged.String())
+	}
+	if !strings.Contains(logged.String(), "integration.github.gitRepo") {
+		t.Errorf("reconcile log does not name the refused field:\n%s", logged.String())
+	}
+}
+
+func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
+	// The hold keeps repo-x's policy, which is right, but a revocation that
+	// silently does not happen has to be on the status: Degraded names the
+	// entry while Ready keeps what the workload says, and fixing the entry
+	// clears it.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	// A hand-written clone URL with a credential, in a spelling this release
+	// refuses. The blank entry ahead of it is dropped, and must not shift the
+	// index the message names it by.
+	const secret = "ghp_notarealtoken"
+	const unreadable = "https://x:" + secret + "@github.com:test-org/repo-y"
+	state := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":""},{"type":"github","url":"` + unreadable + `"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`,
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{"default.yaml": minterTemplateWithReadScope, "repo-x.yaml": "tracked"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, state, minterCM, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	ctx := context.Background()
+	reconcile := func() *agentv1alpha1.PlatformAgent {
+		t.Helper()
+		for range 2 {
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile() = %v", err)
+			}
+		}
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatalf("get agent: %v", err)
+		}
+		return got
+	}
+
+	got := reconcile()
+	degraded := meta.FindStatusCondition(got.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonMinterPruningHeld {
+		t.Fatalf("Degraded = %v, expected True/%s", degraded, conditionReasonMinterPruningHeld)
+	}
+	if !strings.Contains(degraded.Message, "managed_repos[1]") {
+		t.Errorf("Degraded message %q does not name the held entry by its position", degraded.Message)
+	}
+	if strings.Contains(degraded.Message, secret) {
+		t.Errorf("Degraded message %q quotes the entry's credential", degraded.Message)
+	}
+	if ready := meta.FindStatusCondition(got.Status.Conditions, "Ready"); ready == nil || ready.Reason == conditionReasonMinterPruningHeld {
+		t.Errorf("Ready = %v; the hold is reported on Degraded only", ready)
+	}
+	if got.Status.Phase == "Degraded" {
+		t.Error("phase is Degraded; the workload is not")
+	}
+
+	fixed := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(state), fixed); err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	fixed.Data["managed_repos"] = `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := cl.Update(ctx, fixed); err != nil {
+		t.Fatalf("update state: %v", err)
+	}
+	got = reconcile()
+	if degraded := meta.FindStatusCondition(got.Status.Conditions, "Degraded"); degraded != nil {
+		t.Errorf("Degraded = %v after the entry was fixed, expected none", degraded)
+	}
+	minter := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(minterCM), minter); err != nil {
+		t.Fatalf("get minter: %v", err)
+	}
+	if _, ok := minter.Data["repo-x.yaml"]; ok {
+		t.Error("repo-x.yaml was not pruned once every entry read")
+	}
+}
+
+func TestSyncGithubTokenMinterConfigMap_AnotherForgesEntryDoesNotHoldPruning(t *testing.T) {
+	// A gitlab-typed entry is not an unreadable GitHub spelling: repo-x left
+	// managed_repos, so its tracked policy is pruned as it would be without
+	// the gitlab entry, and the entry gets no policy of its own.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{
+			"default.yaml": minterTemplateWithReadScope,
+			"repo-x.yaml":  "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-x'\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	managed := `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"gitlab","url":"https://gitlab.com/test-org/project"}]`
+	contextRepos := `[{"type":"gitlab","url":"https://gitlab.com/test-org/docs"}]`
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managed, contextRepos); err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, got); err != nil {
+		t.Fatalf("failed to get ConfigMap: %v", err)
+	}
+	if _, ok := got.Data["repo-x.yaml"]; ok {
+		t.Error("repo-x.yaml survived: a gitlab-typed entry held the pruning")
+	}
+	if _, ok := got.Data["repo-1.yaml"]; !ok {
+		t.Error("repo-1.yaml was not added")
+	}
+	for _, key := range []string{"project.yaml", "docs.yaml"} {
+		if _, ok := got.Data[key]; ok {
+			t.Errorf("%s was rendered for a gitlab-typed entry", key)
+		}
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// 1st reconcile adds the finalizer, 2nd does the work.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("expected 30s requeue while mode is unrecognized, got %v", result.RequeueAfter)
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatal("expected a Ready condition")
+	}
+	if cond.Reason != "ModeNotRecognized" {
+		t.Errorf("expected reason ModeNotRecognized, got %q", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "quantum") {
+		t.Errorf("condition message must name the unrecognized value, got %q", cond.Message)
+	}
+
+	// Fail-closed means the dark stack stays dark AND today's stack still renders:
+	// the cluster keeps running what it ran, with the skew visible in status.
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
+		t.Errorf("today's Deployment should still be rendered under an unrecognized mode: %v", err)
+	}
+
+	// Correcting the mode clears the Degraded phase on the next reconcile.
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to refetch agent: %v", err)
+	}
+	updated.Spec.Mode = nil
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase == "Degraded" {
+		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
+	}
+}
+
+type mockAutopilotDiscovery struct {
+	discovery.DiscoveryInterface
+	serverVersionErr  error
+	serverVersionInfo *version.Info
+	serverGroupsErr   error
+	serverGroupsList  *metav1.APIGroupList
+	resourcesErr      map[string]error
+	resourcesList     map[string]*metav1.APIResourceList
+}
+
+func (m *mockAutopilotDiscovery) ServerVersion() (*version.Info, error) {
+	if m.serverVersionErr != nil {
+		return nil, m.serverVersionErr
+	}
+	if m.serverVersionInfo != nil {
+		return m.serverVersionInfo, nil
+	}
+	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func (m *mockAutopilotDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	if m.serverGroupsErr != nil {
+		return nil, m.serverGroupsErr
+	}
+	if m.serverGroupsList != nil {
+		return m.serverGroupsList, nil
+	}
+	return &metav1.APIGroupList{}, nil
+}
+
+func (m *mockAutopilotDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if m.resourcesErr != nil {
+		if err, ok := m.resourcesErr[groupVersion]; ok {
+			return nil, err
+		}
+	}
+	if m.resourcesList != nil {
+		if rl, ok := m.resourcesList[groupVersion]; ok {
+			return rl, nil
+		}
+	}
+	return nil, errors.NewNotFound(schema.GroupResource{Group: "auto.gke.io", Resource: "resource"}, groupVersion)
+}
+
+func TestIsGKEAutopilot(t *testing.T) {
+	tests := []struct {
+		name            string
+		dc              discovery.DiscoveryInterface
+		wantIsAutopilot bool
+		wantDetermined  bool
+	}{
+		{
+			name:            "nil discovery client",
+			dc:              nil,
+			wantIsAutopilot: false,
+			wantDetermined:  false,
+		},
+		{
+			name: "transient error on ServerGroups",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsErr: fmt.Errorf("connection refused"),
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  false,
+		},
+		{
+			name: "non-autopilot cluster without auto.gke.io",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{Name: "apps", Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "apps/v1", Version: "v1"}}},
+					},
+				},
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  true,
+		},
+		{
+			name: "autopilot cluster with v1beta1 allowlistedworkloads",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1beta1", Version: "v1beta1"},
+							},
+						},
+					},
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v1beta1": {
+						GroupVersion: "auto.gke.io/v1beta1",
+						APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+					},
+				},
+			},
+			wantIsAutopilot: true,
+			wantDetermined:  true,
+		},
+		{
+			name: "autopilot cluster with v1 allowlistedworkloads",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+							},
+						},
+					},
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v1": {
+						GroupVersion: "auto.gke.io/v1",
+						APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+					},
+				},
+			},
+			wantIsAutopilot: true,
+			wantDetermined:  true,
+		},
+		{
+			name: "gke standard with auto.gke.io but lacking allowlistedworkloads",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+							},
+						},
+					},
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v1": {
+						GroupVersion: "auto.gke.io/v1",
+						APIResources: []metav1.APIResource{{Name: "workloadallowlists"}},
+					},
+				},
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  true,
+		},
+		{
+			name: "transient error on ServerResourcesForGroupVersion propagates undetermined",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+							},
+						},
+					},
+				},
+				resourcesErr: map[string]error{
+					"auto.gke.io/v1": fmt.Errorf("503 Service Unavailable"),
+				},
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  false,
+		},
+		{
+			name: "not found on first version falls back to next version",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+								{GroupVersion: "auto.gke.io/v2", Version: "v2"},
+							},
+						},
+					},
+				},
+				resourcesErr: map[string]error{
+					"auto.gke.io/v1": errors.NewNotFound(schema.GroupResource{Group: "auto.gke.io", Resource: "resource"}, "v1"),
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v2": {
+						GroupVersion: "auto.gke.io/v2",
+						APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+					},
+				},
+			},
+			wantIsAutopilot: true,
+			wantDetermined:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotIsAutopilot, gotDetermined := isGKEAutopilot(tc.dc)
+			if gotIsAutopilot != tc.wantIsAutopilot || gotDetermined != tc.wantDetermined {
+				t.Errorf("isGKEAutopilot() = (%v, %v), want (%v, %v)",
+					gotIsAutopilot, gotDetermined, tc.wantIsAutopilot, tc.wantDetermined)
+			}
+		})
+	}
+}
+
+// TestSameManagedRepoComparesIdentityNotSpelling covers the dedup that decides
+// whether the seeded GitOps repository is already in the state ConfigMap. A
+// string comparison made `https://github.com/gke-labs/kube-agents.git` and
+// `git@github.com:gke-labs/kube-agents.git` two entries for one repository, and
+// the agent then held two write locks on the same remote.
+func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
+	seeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitHub,
+		URL:  "https://github.com/gke-labs/kube-agents",
+	}
+	same := []string{
+		"https://github.com/gke-labs/kube-agents",
+		"https://github.com/gke-labs/kube-agents.git",
+		"git@github.com:gke-labs/kube-agents.git",
+		"ssh://git@github.com/gke-labs/kube-agents",
+		"http://github.com/gke-labs/kube-agents",
+		"gke-labs/kube-agents",
+		"github.com/gke-labs/kube-agents",
+		// The agent trims the separator run after a lifted host, so this is
+		// the seeded repository to it too.
+		"github.com//gke-labs/kube-agents",
+		"HTTPS://GitHub.com/gke-labs/kube-agents",
+	}
+	for _, url := range same {
+		t.Run(url, func(t *testing.T) {
+			existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitHub, URL: url}
+			if !sameManagedRepo(existing, seeded) {
+				t.Errorf("sameManagedRepo(%q, %q) = false, expected true", url, seeded.URL)
+			}
+		})
+	}
+
+	different := []agentv1alpha1.ManagedRepoEntry{
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/gke-labs/other"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/other/kube-agents"},
+		// GitHub folds case, but the agent's `--repo` allowlists compare the
+		// spelling, so this entry does not stand in for the declared one.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/GKE-Labs/Kube-Agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "GKE-Labs/kube-agents"},
+		// A different forge is a different repository however the paths line up,
+		// and an unresolvable spelling must not collapse into the seeded entry.
+		{Type: "gitlab", URL: "https://gitlab.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "not a url at all"},
+		// The agent reads a GitHub entry only on github.com, so another spelling
+		// of the host is not the seeded repository: it is one the agent skips.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://www.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh://git@ssh.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "www.github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "ssh.github.com/gke-labs/kube-agents"},
+		// The agent matches the type exactly, so this entry is one it skips even
+		// though the URL is the seeded one byte for byte.
+		{Type: "GitHub", URL: "https://github.com/gke-labs/kube-agents"},
+		// git and this parser read the host after the last `@`, the agent after
+		// the first, so it reads this one as host `b@github.com` and skips it.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "a@b@github.com:gke-labs/kube-agents"},
+		// The provider drops the user before lifting a schemeless host; the
+		// agent lifts only a bare `github.com/`, so it skips this one.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "git@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "x-access-token@github.com//gke-labs/kube-agents"},
+		// An empty user, or a colon ahead of the `@`, is no user the agent
+		// reads: it takes `@github.com` or `:x@github.com` as the host.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "@github.com:gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: ":x@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: ":@github.com/gke-labs/kube-agents"},
+		// The agent refuses a value over 256 characters before it parses it, so
+		// a long credential in the userinfo makes an entry it skips.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://x-access-token:" + strings.Repeat("t", 240) + "@github.com/gke-labs/kube-agents"},
+		// U+0130 lowers to `i` under Unicode case mapping, but it is another
+		// host on the wire, and the agent's str.lower() does not fold it.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://gİthub.com/gke-labs/kube-agents"},
+		// urlsplit refuses a bracket without its pair, the userinfo included.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://[x@github.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://a]b@github.com/gke-labs/kube-agents"},
+		// Paired, the agent still refuses it: the host must then be an
+		// address literal.
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://[TOKEN]@github.com/gke-labs/kube-agents"},
+	}
+	for _, existing := range different {
+		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {
+			if sameManagedRepo(existing, seeded) {
+				t.Errorf("sameManagedRepo(%+v, %q) = true, expected false", existing, seeded.URL)
+			}
+		})
+	}
+}
+
+func TestClusterImageVolumeSupport_TransientFailureFailsClosedWithoutCaching(t *testing.T) {
+	// When K8s >= 1.35 but isGKEAutopilot suffers a transient error, clusterImageVolumeSupport
+	// must return supported=false, determined=false (fails closed and not cached).
+	dc := &mockAutopilotDiscovery{
+		serverVersionInfo: &version.Info{Major: "1", Minor: "35"},
+		serverGroupsList: &metav1.APIGroupList{
+			Groups: []metav1.APIGroup{
+				{
+					Name:     "auto.gke.io",
+					Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "auto.gke.io/v1", Version: "v1"}},
+				},
+			},
+		},
+		resourcesErr: map[string]error{
+			"auto.gke.io/v1": fmt.Errorf("timeout"),
+		},
+	}
+
+	supported, determined := clusterImageVolumeSupport(dc)
+	if supported || determined {
+		t.Errorf("clusterImageVolumeSupport() = (%v, %v), want (false, false) on transient discovery failure", supported, determined)
+	}
+}
+
+func TestGetDeploymentStatusDetails_TerminatingPodSkipped(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	now := metav1.Now()
+	// Terminating pod with exit code 143 (SIGTERM)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test-agent-gateway-old",
+			Namespace:         "test-ns",
+			Labels:            map[string]string{"app": "test-agent-gateway"},
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"kubernetes.io/dummy"},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "platform-agent",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 143,
+					Reason:   "Error",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	// Terminating pod must be skipped, leaving default phase Provisioning.
+	if phase == "Degraded" {
+		t.Errorf("getDeploymentStatusDetails returned Degraded for a terminating pod")
+	}
+}
+
+func TestGetDeploymentStatusDetails_NonStagingTerminatedIgnored(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	// Active pod with non-staging container terminated (not yet restarted into waiting)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "platform-agent",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 143,
+					Reason:   "Error",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	// Non-staging container terminated should not trigger Degraded in getDeploymentStatusDetails.
+	if phase == "Degraded" {
+		t.Errorf("getDeploymentStatusDetails returned Degraded for non-staging terminated container")
+	}
+}
+
+func TestGetDeploymentStatusDetails_StagingInitTerminatedReportsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	// Active pod where stage-custom-plugin init container terminated with code 127
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "stage-custom-plugin",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 127,
+					Reason:   "Error",
+					Message:  "exec /bin/sh: no such file or directory",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	if phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", phase)
+	}
+	if reason != "Error" {
+		t.Errorf("expected reason Error, got %q", reason)
+	}
+	if !strings.Contains(message, "stage-custom-plugin") || !strings.Contains(message, "missing /bin/sh") {
+		t.Errorf("expected message diagnosing missing /bin/sh, got %q", message)
+	}
+}
+
+// TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded: the A2A gateway
+// gates Ready (readSplitWorkloads), so its pod faults have to be nameable too.
+// Unscanned, this shape reported "Waiting for Deployment test-agent-a2a-gateway
+// to become ready" for as long as the fault lasted -- the same sentence the
+// deliberate callout hold produces and the same one a slow scheduler produces,
+// so nothing on the CR told an operator which of the three they had.
+func TestGetDeploymentStatusDetails_A2AGatewayFaultReportsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To(string(ModeNext))},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-a2a-gateway-7d9f-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-a2a-gateway"},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "gateway",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded -- a gateway that cannot pull its image is a fault, not provisioning", phase)
+	}
+	if reason != "ImagePullBackOff" {
+		t.Errorf("reason = %q, want ImagePullBackOff", reason)
+	}
+	if !strings.Contains(message, "test-agent-a2a-gateway-7d9f-abc") {
+		t.Errorf("message does not name the faulting pod: %q", message)
+	}
+}
+
+// TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall keeps the
+// dark stack dark, and matches the gate readSplitWorkloads uses. A today install
+// renders no A2A gateway; a pod left behind by a mode flip, or one frozen by
+// version skew, must not turn that CR Degraded for a workload this install does
+// not claim to run.
+func TestGetDeploymentStatusDetails_A2AGatewayNotScannedOnATodayInstall(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-a2a-gateway-7d9f-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-a2a-gateway"},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "gateway",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "ImagePullBackOff",
+					Message: "Back-off pulling image",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase == "Degraded" {
+		t.Errorf("phase = Degraded (reason %q) -- a today install has no A2A gateway to be degraded by", reason)
+	}
+}
+
+// TestReconcileGitopsStateMergesBothListsKeepingUnmodelledFields covers the
+// seeding of context repositories into an existing ConfigMap. The merge used
+// to re-marshal the whole list through ManagedRepoEntry, which models only
+// type and url; on context_repos that would silently strip the `ref` an
+// administrator pinned, the first time the CR declared one more repository.
+func TestReconcileGitopsStateMergesBothListsKeepingUnmodelledFields(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+					{Forge: "github", Repository: "kubernetes/kubernetes", Role: agentv1alpha1.RepositoryRoleContext},
+				},
+			}},
+		},
+	}
+	const pinned = `{"type":"github","url":"https://github.com/gke-labs/docs","ref":"release"}`
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			// Already present under another spelling: must not be appended twice.
+			"managed_repos": `[{"type":"github","url":"git@github.com:gke-labs/infra.git"}]`,
+			"context_repos": `[` + pinned + `]`,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, cm).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileGitopsStateConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	if want := `[{"type":"github","url":"git@github.com:gke-labs/infra.git"}]`; got.Data["managed_repos"] != want {
+		t.Errorf("managed_repos = %s, expected it untouched: %s", got.Data["managed_repos"], want)
+	}
+	want := `[` + pinned + `,{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`
+	if got.Data["context_repos"] != want {
+		t.Errorf("context_repos = %s, expected %s", got.Data["context_repos"], want)
+	}
+}
+
+// A GitOps repository the list lacks goes first. The entries carry no role and
+// the agent falls back to the first managed entry for its GitOps repository,
+// so appending would leave the previous one answering for it.
+func TestReconcileGitopsStatePutsANewGitOpsRepositoryFirst(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "order-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+					{Forge: "github", Repository: "infra-v2", Role: agentv1alpha1.RepositoryRoleGitOps},
+				},
+			}},
+		},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "order-agent-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/gke-labs/infra"}]`,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, cm).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileGitopsStateConfigMap() = %v", err)
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"type":"github","url":"https://github.com/gke-labs/infra-v2"},` +
+		`{"type":"github","url":"https://github.com/gke-labs/infra"},` +
+		`{"type":"github","url":"https://github.com/gke-labs/apps"}]`
+	if got.Data["managed_repos"] != want {
+		t.Errorf("managed_repos = %s, expected %s", got.Data["managed_repos"], want)
+	}
+
+	// Once present it is never moved: the order is the administrator's.
+	if err := r.reconcileGitopsStateConfigMap(context.Background(), agent); err != nil {
+		t.Fatalf("second reconcileGitopsStateConfigMap() = %v", err)
+	}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Data["managed_repos"] != want {
+		t.Errorf("second reconcile changed managed_repos to %s", got.Data["managed_repos"])
+	}
+}
+
+// TestARefusedGitHubScopeKeepsTheLiveGitHubOrg covers an upgrade from a release
+// that accepted a spelling this one refuses. The minter keeps its policies
+// while the declaration is refused; the gateway keeps its GITHUB_ORG the same
+// way, so the pod neither rolls nor loses the agent's cross-organisation guard.
+func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
+	scheme := setupScheme()
+	agentWith := func(gitRepo string) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{
+						GitHub: &agentv1alpha1.GitHubSpec{GitRepo: gitRepo},
+					},
+				},
+			},
+		}
+	}
+	live := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: appNamePlatformAgent,
+				Env:  []corev1.EnvVar{{Name: "GITHUB_ORG", Value: "gke-labs"}},
+			}},
+		}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(live).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	for _, refused := range []string{
+		"https://github.com:gke-labs/infra",
+		"ssh://git@github.com:gke-labs/infra",
+	} {
+		agent := agentWith(refused)
+		held, err := r.heldGitHubOrg(ctx, agent)
+		if err != nil || held != "gke-labs" {
+			t.Errorf("%s: heldGitHubOrg() = %q, %v, expected the live gke-labs", refused, held, err)
+		}
+		dep := buildDeployment(agent, "", "", "", "", nil, renderOptions{heldGitHubOrg: held})
+		if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "gke-labs" {
+			t.Errorf("%s: rendered GITHUB_ORG = %q, expected the held gke-labs", refused, got)
+		}
+	}
+
+	// A declaration that names the organisation renders its own, whatever
+	// the live pod carries.
+	accepted := agentWith("https://github.com/other-org/infra")
+	if held, _ := r.heldGitHubOrg(ctx, accepted); held != "" {
+		t.Errorf("heldGitHubOrg() = %q for an accepted declaration, expected nothing held", held)
+	}
+	dep := buildDeployment(accepted, "", "", "", "", nil, renderOptions{})
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), "GITHUB_ORG"); got != "other-org" {
+		t.Errorf("rendered GITHUB_ORG = %q, expected other-org", got)
+	}
+
+	// Nothing live holds nothing.
+	empty := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
+	if held, err := empty.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); held != "" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v with no live gateway, expected nothing", held, err)
+	}
+
+	// A storage switch renders the other workload kind while the old one still
+	// runs: the old one is what holds the value.
+	switched := agentWith("https://github.com:gke-labs/infra")
+	switched.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
+		Storages: []agentv1alpha1.StorageSpec{{
+			Name:        "gateway-data",
+			MountPath:   "/srv/gateway-data",
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		}},
+	}
+	if !useStatefulSet(switched) {
+		t.Fatal("test setup: the switched agent does not select a StatefulSet")
+	}
+	if held, err := r.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v across a storage switch, expected the live gke-labs", held, err)
+	}
+
+	// A read that fails is returned, never taken for "nothing live": the render
+	// would drop the variable, and the next pass would read the loss back.
+	failing := &PlatformAgentReconciler{Scheme: scheme, Client: interceptor.NewClient(cl, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			return errors.NewServiceUnavailable("apiserver is restarting")
+		},
+	})}
+	if held, err := failing.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); err == nil {
+		t.Errorf("heldGitHubOrg() = %q with a failing read, expected an error", held)
 	}
 }

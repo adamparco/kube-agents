@@ -18,6 +18,16 @@
 
 _An SRE asks for a fleet self-health check; the agent answers in the thread. An illustrative replay — the names and figures are examples. It runs live at the top of the [documentation site](https://gke-labs.github.io/kube-agents/)._
 
+## 💬 Five things to ask it
+
+Each of these is a single chat message. The agent answers in the thread from read-only reads of the fleet, the GCP projects it monitors, and the linked GitOps repositories, and it recommends changes without applying them.
+
+1. **"Which clusters are behind their release channel, and what would block upgrading them?"** — Every cluster's control-plane and node-pool versions against the channel default, with what would stop the upgrade named: drain-blocking PodDisruptionBudgets, maintenance exclusions, and node-pool version skew. Name a target version and it also scans the GitOps manifests for the `apiVersions` that version removes. ([`fleet-upgrade-verification`](agents/platform/skills/fleet-upgrade-verification/SKILL.md))
+2. **"Which workloads request far more CPU and memory than they use?"** — Live `kubectl top` readings compared with each workload's requests, so the answer names the over-requested controllers in resource units; a stock install has no billing export to price them. ([`gke-cost-analysis`](agents/platform/skills/gke-cost-analysis/SKILL.md))
+3. **"Design a Standard cluster for 32 A100s in us-central1. Check quota and live obtainability, and give me a ComputeClass fallback. Design only."** — Quota and capacity are checked separately, each against live `gcloud` evidence, and the design names the fallback tiers that change the workload's GPU class or interconnect characteristics. ([`capacity-obtainability`](agents/platform/skills/capacity-obtainability/SKILL.md), [`gke-compute-classes`](agents/platform/skills/gke-compute-classes/SKILL.md))
+4. **"Something in the `payments` namespace on `prod-east` stopped making progress without erroring. Find it."** — The work is delegated to the Cluster Agent for that cluster, which looks for controllers whose `observedGeneration` lags, progress conditions that stopped advancing, repeating warning events, and references to objects that do not exist. ([`gke-stall-detection`](agents/cluster/skills/gke-stall-detection/SKILL.md))
+5. **"`checkout` on `prod-east` has been crash-looping since this morning. What happened?"** — The Cluster Agent for that cluster fixes the time window, reads the container's exit codes and the events around them, tells an OOM kill from an application crash, and proposes the manifest correction without applying it. ([`gke-workload-troubleshooting`](agents/cluster/skills/gke-workload-troubleshooting/SKILL.md))
+
 ---
 
 ## ⚡ Try it now
@@ -25,37 +35,48 @@ _An SRE asks for a fleet self-health check; the agent answers in the thread. An 
 The fastest, zero-friction way to install `kube-agents` in **Google Cloud Shell** or your terminal:
 
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-_(Or via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+_Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
 
-This interactive installer guides you through GCP authentication, project selection, GKE Standard cluster setup, chat integrations (Google Chat & Slack), and LLM model provider credentials.
+This interactive installer (recommended for initial setup) guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials. Sensible defaults are detected from your `gcloud` context, requiring minimal input.
 
 ### 🤖 AI Agent & Automation Usage
 
-AI Agents and CI/CD pipelines can invoke `install.sh` non-interactively using CLI flags or `--dry-run` inspection:
+For automated environments, CI/CD pipelines, and AI Agents where no interactive TTY is available, invoke the release installer with `--non-interactive` and CLI flags:
 
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
-  --project-id="my-gcp-project" \
-  --cluster-name="platform-agent" \
-  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
+  --gcp-project-id="my-gcp-project" \
+  --gke-cluster-name="platform-agent-host" \
+  --gcp-region="us-central1" \
   --model-provider="gemini" \
   --permission-set="read-only"
 ```
 
-Or delegate setup directly to your AI coding agent:
+Or give this prompt to an AI coding assistant. It needs no checkout of this repository, and tells the assistant to confirm the target with you and show you the `--dry-run` summary before it creates any cloud resources:
 
 ```text
-"Using kube-agents/INSTALL.md provision k8s agentic harness and create platform agent"
+Install the latest official release of kube-agents (github.com/gke-labs/kube-agents) into my GCP project.
+Follow INSTALL.md from that release tag — do not invent installer URLs, namespaces, or model names.
+First inspect my gcloud project and existing GKE clusters and confirm the target, cluster, model provider,
+and credential with me. Run install.sh with --dry-run and show me its printed summary before you change anything.
+Only run the real install after I say yes.
 ```
 
-Prefer to drive the engine by hand? From an authenticated `gcloud`, run a repository checkout's installer — or the Terraform composition it wraps:
+The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation). An assistant working in a checkout of this repository also picks up the [`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill, which covers the same install.
+
+Prefer to drive the engine by hand? Unpack `kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended), or clone the repository at an official release tag if a Git checkout is needed:
 
 ```bash
+curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VERSION>/kube-agents-<RELEASE_VERSION>.tar.gz | tar -xz
+cd kube-agents-<RELEASE_VERSION>
 ./install.sh                                              # the interview, then one terraform apply
+# or, if a Git checkout is needed instead:
+# git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
+# cd kube-agents && ./install.sh
 # or, with your own terraform.tfvars:
 cd terraform/examples/full-install && ./lifecycle.sh apply
 ```
@@ -82,9 +103,9 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 `kube-agents` is designed for enterprise fleets where agents must be powerful _and_ provably contained:
 
 - **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
-- **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
+- **Credential isolation** — model-authored code runs in a shell sandbox pod that holds no API keys or tokens; an Envoy credential broker in a pod of its own injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
-- **Kernel-level sandboxing** — agent workloads can run under a gVisor RuntimeClass (GKE Sandbox).
+- **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox) by default; `--enable-gvisor=false` opts out.
 - **GitOps-only mutations** — infrastructure changes are proposed as pull requests for human review.
 
 Exactly what is _enforced_ on which plane — Kubernetes RBAC, GCP IAM, and the GitOps path each answer differently — is set out in [Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do). Read that before granting the agent access to a production project.
@@ -135,7 +156,9 @@ Walkthrough: [Architecture](https://gke-labs.github.io/kube-agents/overview/arch
 
 ## 🤝 Contributing
 
-Contributions are welcome. See [docs/contributing.md](docs/contributing.md) for CLA requirements and the [contributing guide](https://gke-labs.github.io/kube-agents/contributing/) for PR hygiene, commit conventions, and the local checks CI enforces. Repository conventions for AI coding agents are in [AGENTS.md](AGENTS.md).
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the CLA and where the contributor workflow is documented. Repository conventions for AI coding agents are in [AGENTS.md](AGENTS.md).
+
+Bug reports and feature requests go in [issues](https://github.com/gke-labs/kube-agents/issues). If your GitHub account cannot open one here, use the [feedback form](https://gke-labs.github.io/kube-agents/feedback), which files it for you.
 
 ## Disclaimer
 

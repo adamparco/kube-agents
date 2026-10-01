@@ -174,8 +174,11 @@ RBAC at runtime. Consequences:
     **convention the render overlay stamps** on the pre-created identity manifests (§3,
     [06](06-api-and-data-contracts.md) §2) — the overlay stamps the **`kube-agents/tier` label** on the
     agent SA **and** its `Role`/`ClusterRole`, names the SA `<tier>-agent`, and places it in
-    `kubeagents-system` (or the team namespace). (The **controller mints no RBAC**, so it cannot be the
-    labeler; the overlay is.)
+    `kubeagents-system` (or the team namespace). (The controller does mint RBAC — `reconcileRBAC` creates the
+    agent's `kubeagents:minimal:*` ClusterRole and binding, and its two namespaced Roles — but it
+    stamps only the `app.kubernetes.io/*` labels and never `kube-agents/tier`, so it is not the
+    labeler and its objects are outside the first policy's selector. Assuming it minted none is
+    what let the second policy be written so that it denied the controller's own binding.)
   - a **second `ValidatingAdmissionPolicy` governs `(Cluster)RoleBinding`s by their bound _subject_** —
     not by a label the author controls. `matchConstraints` on `roles`/`clusterroles` alone never see
     bindings, so a `ClusterRoleBinding` of a namespace-tier SA to a cluster-wide role would otherwise be
@@ -233,8 +236,8 @@ bounded by access control + read-only, not eliminated per request.
 **Routing does not grant authority.** The ChatOps gateway ([05](05-system-architecture.md) C15) may
 route a message to any tier — by slash command, `@<tier>-<scope>` handle, or NL inference
 ([02](02-agent-personas.md) §2.4) — but _reaching_ an agent is gated by that agent's own
-`AllowedUsers` allowlist, checked **before** dispatch. The NL router is model output and is therefore
-**never** an authorization signal (§1); worst-case a mis-route lands on an agent the human is already
+`AllowedUsers` allowlist, checked **before** dispatch. NL resolution is model output (the conversation's
+session agent's, never a model in the gateway) and is therefore **never** an authorization signal (§1); worst-case a mis-route lands on an agent the human is already
 allowlisted for, still bounded by that agent's read-only, tier-scoped ceiling. So routing changes
 _which_ trusted-human entrypoint a message reaches, never _what_ authority it carries. (The gateway is
 v1-compatible: it enforces the existing trusted-human allowlist and adds no per-request
@@ -246,7 +249,13 @@ the requester's own identity (`SubjectAccessReview` for K8s, `testIamPermissions
 Troubleshooter for GCP) and down-scope the agent's effective authority to **agent scope ∩ requester
 permissions** (closing the confused-deputy gap), enforced by an authorization gateway/broker **outside
 the LLM loop** with per-run downscoped tokens. Contract sketch: [06](06-api-and-data-contracts.md)
-§2a. **Not in v1.**
+§2a. **Not in v1.** One half of that mechanism was later measured and does not hold: GCP-layer
+credential attenuation does not reach Kubernetes object authorization, so "down-scope the agent's
+effective authority with per-run tokens" has no GCP mechanism behind it, and
+[09](09-capability-envelope.md) §1 carries the replacement for it. The measurement says nothing
+about the requester-permission _check_ — asking whether a human holds a permission is a query, not
+an attenuation — so `SubjectAccessReview` and `testIamPermissions` stand, and so does the contract
+sketch above. This section stays canonical for the requirement.
 
 ---
 
@@ -385,7 +394,7 @@ iterates until all pass:
   an agent identity is **forbidden**; the only successful mutation is a merged PR actuated by CI/CD.
 - **Trusted-human access:** an unauthenticated or non-`AllowedUsers` request to an agent entrypoint is
   **refused** — including when addressed through the ChatOps gateway by slash command, `@handle`, or
-  NL routing (the gateway checks the **target** agent's allowlist before dispatch; a mis-route never
-  bypasses it).
+  NL routing (the gateway checks the **target** agent's allowlist before dispatch, and when a session
+  delegates, when it mints the child task; a mis-route never bypasses it).
 - **Egress default-deny:** from an agent pod, only allowlisted endpoints (inference, cloud APIs,
   GitHub, MCP grounding) are reachable; the cloud metadata server and arbitrary hosts are **not**.

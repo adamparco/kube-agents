@@ -10,6 +10,7 @@ test that the audit's untracked manifests survive a reattach runs real git
 against a local bare repository.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -265,6 +266,108 @@ class TestEnsureWorkspace(WorkspaceTestCase):
         self.assertEqual(self.calls[0][:3], ["git", "config", "user.name"])
 
 
+class TestEnsureScratchWorkspace(WorkspaceTestCase):
+    """The same lease, with no clone in it.
+
+    What the content-passing path hands the agent. Two things have to hold at
+    once and they pull in opposite directions: there must be no `.git` here,
+    and the lease bookkeeping — the path, the marker, the reaper — has to be
+    the same as the clone path's, because `start` and `finish` find each other
+    by that path and the reaper is what stops abandoned trees accumulating.
+    """
+
+    def scratch(self, repo="acme/fleet", **kwargs):
+        kwargs.setdefault("lease", LEASE)
+        kwargs.setdefault("root", self.root)
+        return gitops_workspace.ensure_scratch_workspace(repo, **kwargs)
+
+    def test_it_hands_back_a_directory_with_no_repository_in_it(self):
+        target = self.scratch()
+        self.assertTrue(target.is_dir())
+        self.assertFalse((target / ".git").exists())
+
+    def test_it_runs_no_git_at_all(self):
+        # Not an incidental property. This function takes no runner precisely
+        # so that there is nowhere for a git call to be added later without
+        # someone noticing; the signature is the assertion and this is the
+        # regression test for it.
+        with patch.object(gitops_workspace, "subprocess") as forbidden:
+            self.scratch()
+        forbidden.run.assert_not_called()
+
+    def test_the_path_is_the_one_the_clone_path_would_have_used(self):
+        # `start` and `finish` are separate processes and exchange no state, so
+        # a scratch tree at a different path is a `finish` that finds none of
+        # the manifests `start`'s agent wrote.
+        self.assertEqual(
+            self.scratch(),
+            gitops_workspace.workspace_path("acme/fleet", self.root, lease=LEASE),
+        )
+
+    def test_it_stamps_the_lease_marker(self):
+        target = self.scratch(owner="fleet-audit:compliance-audit")
+        record = gitops_workspace.read_lease(target.parent)
+        self.assertEqual(record["lease"], LEASE)
+        self.assertEqual(record["repo"], "acme/fleet")
+        self.assertEqual(record["owner"], "fleet-audit:compliance-audit")
+
+    def test_it_reaps_abandoned_leases_on_the_way_in(self):
+        stale = gitops_workspace.lease_dir(self.root, "t_gone")
+        gitops_workspace.write_lease(stale, "t_gone", "acme/fleet")
+        marker = stale / gitops_workspace.LEASE_FILENAME
+        old = time.time() - 30 * 24 * 3600
+        os.utime(marker, (old, old))
+
+        self.scratch()
+        self.assertFalse(stale.exists())
+
+    def test_reset_empties_the_tree_and_the_default_leaves_it_alone(self):
+        target = self.scratch()
+        manifest = target / "clusters/prod/netpol.yaml"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("kind: NetworkPolicy\n", encoding="utf-8")
+
+        self.scratch(reset=False)
+        self.assertTrue(manifest.is_file(), "finish deleted the fix it was about to send")
+
+        self.scratch(reset=True)
+        self.assertFalse(manifest.exists(), "start must hand the audit a clean tree")
+
+    def test_a_clone_left_by_the_other_mode_is_not_deleted_mid_stream(self):
+        """A fleet that arms the broker between `start` and `finish`.
+
+        `start` cloned, the agent wrote its manifests into the clone, and then
+        `finish` came back in content mode and found a `.git` here. Clearing it
+        would take the manifests with it — the same data loss `reset=False`
+        exists to prevent on the clone path. Nothing here runs git, so the
+        leftover `.git` is inert for the one run it survives.
+        """
+        target = self.ensure()
+        manifest = target / "clusters/prod/netpol.yaml"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("kind: NetworkPolicy\n", encoding="utf-8")
+
+        self.assertEqual(self.scratch(reset=False), target)
+        self.assertTrue(manifest.is_file())
+
+    def test_a_lease_cannot_climb_out_of_the_root(self):
+        # Same rule as the clone path, asserted separately because this is a
+        # second entry point into the same lease layout.
+        for lease in ("../../etc", "a/../..", "/etc", "..", "."):
+            with self.subTest(lease=lease):
+                try:
+                    target = self.scratch(lease=lease)
+                except ValueError:
+                    continue
+                self.assertEqual(target.parent.parent, self.root)
+
+    def test_a_malformed_repository_is_refused(self):
+        for repo in ("fleet", "", "acme/"):
+            with self.subTest(repo=repo):
+                with self.assertRaises(ValueError):
+                    self.scratch(repo)
+
+
 class TestWorkspaceLock(WorkspaceTestCase):
     def test_the_lock_is_best_effort_not_a_reason_to_skip_the_audit(self):
         # A read-only or absent PVC must cost a retry, not the day's audit.
@@ -384,21 +487,11 @@ class TestAgentHome(WorkspaceTestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(gitops_workspace.agent_home(), "/opt/data")
             self.assertEqual(gitops_workspace.default_root(), "/opt/data/gitops")
-            self.assertEqual(
-                gitops_workspace.default_settings_path(), "/opt/data/SETTINGS.md"
-            )
 
-    def test_a_custom_agent_home_moves_the_root_and_the_settings_file(self):
-        # `spec.harness.hermes.agentHome` sets PLATFORM_AGENT_HOME on the agent
-        # and CREDENTIAL_PROXY_WORKSPACE_ROOT on the sidecar to the same value.
-        # A clone under a hardcoded /opt/data would be outside the sidecar's
-        # workspace root, and every git in it refused.
+    def test_a_custom_agent_home_moves_the_root(self):
         with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": "/srv/agent/"}, clear=True):
             self.assertEqual(gitops_workspace.agent_home(), "/srv/agent")
             self.assertEqual(gitops_workspace.default_root(), "/srv/agent/gitops")
-            self.assertEqual(
-                gitops_workspace.default_settings_path(), "/srv/agent/SETTINGS.md"
-            )
 
     def test_the_root_defaults_are_resolved_per_call_not_at_import(self):
         # The signatures take None rather than a constant evaluated at import,
@@ -438,6 +531,17 @@ class TestResolveBaseBranch(WorkspaceTestCase):
         self.origin_head = "origin/main"
         with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release"}):
             self.assertEqual(self.resolve(), "release")
+
+    def test_credential_proxy_base_branch_override_beats_gitops_base_and_remote(self):
+        self.origin_head = "origin/main"
+        with patch.dict(
+            os.environ,
+            {
+                "CREDENTIAL_PROXY_BASE_BRANCH": "custom-cred-base",
+                "GITOPS_BASE_BRANCH": "gitops-base",
+            },
+        ):
+            self.assertEqual(self.resolve(), "custom-cred-base")
 
     def test_no_clone_yet_falls_back_without_running_git(self):
         self.assertEqual(
@@ -514,6 +618,60 @@ class TestResolveBaseBranch(WorkspaceTestCase):
             ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(target), check=True
         )
         self.assertEqual(head.stdout.strip(), "master")
+
+    def test_a_real_empty_repository_raises_gitops_repo_empty(self):
+        if shutil.which("git") is None:  # pragma: no cover
+            self.skipTest("git is not on PATH")
+
+        def real(cmd, *, cwd=None, check=True):
+            return subprocess.run(
+                cmd, cwd=cwd, check=check, capture_output=True, text=True
+            )
+
+        origin = seed_empty_origin(self.tmp_path, branch="main")
+        with self.assertRaises(gitops_workspace.GitOpsRepoEmpty) as ctx:
+            gitops_workspace.ensure_workspace(
+                "acme/fleet", real, lease=LEASE, root=self.root, remote_url=str(origin), reset=True
+            )
+        self.assertIn("has no commits on any branch", str(ctx.exception))
+
+    def test_ensure_workspace_raises_gitops_repo_empty_on_unborn_remote(self):
+        def runner(cmd, *, cwd=None, check=True):
+            self.calls.append(list(cmd))
+            if cmd[:2] == ["git", "clone"]:
+                (Path(cmd[-1]) / ".git").mkdir(parents=True, exist_ok=True)
+            if cmd[1:2] == ["symbolic-ref"]:
+                return CompletedProcess(cmd, 1, "", "")
+            if cmd[1:3] == ["rev-parse", "--verify"]:
+                return CompletedProcess(cmd, 1, "", "")
+            if cmd[1:3] == ["rev-list", "-n"]:
+                return CompletedProcess(cmd, 0, "", "")
+            return CompletedProcess(cmd, 0, "", "")
+
+        with self.assertRaises(gitops_workspace.GitOpsRepoEmpty) as ctx:
+            gitops_workspace.ensure_workspace(
+                "acme/fleet", runner, lease=LEASE, root=self.root, reset=True
+            )
+        self.assertIn("has no commits on any branch", str(ctx.exception))
+
+    def test_ensure_workspace_raises_runtime_error_when_branch_missing_but_repo_has_commits(self):
+        def runner(cmd, *, cwd=None, check=True):
+            self.calls.append(list(cmd))
+            if cmd[:2] == ["git", "clone"]:
+                (Path(cmd[-1]) / ".git").mkdir(parents=True, exist_ok=True)
+            if cmd[1:2] == ["symbolic-ref"]:
+                return CompletedProcess(cmd, 0, "origin/main\n", "")
+            if cmd[1:3] == ["rev-parse", "--verify"]:
+                return CompletedProcess(cmd, 1, "", "")
+            if cmd[1:3] == ["rev-list", "-n"]:
+                return CompletedProcess(cmd, 0, "abc12345\n", "")
+            return CompletedProcess(cmd, 0, "", "")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            gitops_workspace.ensure_workspace(
+                "acme/fleet", runner, lease=LEASE, root=self.root, reset=True
+            )
+        self.assertIn("has no remote branch origin/main", str(ctx.exception))
 
 
 class TestReaper(WorkspaceTestCase):
@@ -595,54 +753,719 @@ class TestReaper(WorkspaceTestCase):
 
 
 class TestResolveRepo(WorkspaceTestCase):
-    def settings(self, text):
-        path = self.tmp_path / "SETTINGS.md"
-        path.write_text(text, encoding="utf-8")
-        return str(path)
-
-    def test_the_operator_written_line_is_parsed(self):
-        path = self.settings(
-            "# GKE Scope Configuration\n"
-            "- **Git Repo:** https://github.com/acme/fleet.git\n"
+    def test_configmap_resolution_succeeds(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/from-configmap\\"}]"}}',
+            stderr="",
         )
-        self.assertEqual(gitops_workspace.resolve_repo(path), "acme/fleet")
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(gitops_workspace.resolve_repo(), "acme/from-configmap")
 
-    def test_an_ssh_remote_is_parsed(self):
-        path = self.settings("- **Git Repo:** git@github.com:acme/fleet.git\n")
-        self.assertEqual(gitops_workspace.resolve_repo(path), "acme/fleet")
-
-    def test_the_unset_placeholder_is_not_a_repository(self):
-        # The operator writes the literal `None` when the CR omits the repo.
-        path = self.settings("- **Git Repo:** None\n")
-        self.assertIsNone(gitops_workspace.repo_from_settings(path))
-
-    def test_a_missing_settings_file_is_not_an_error_on_its_own(self):
-        absent = str(self.tmp_path / "absent.md")
-        self.assertIsNone(gitops_workspace.repo_from_settings(absent))
+    def test_configmap_full_url_resolution_succeeds(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/from-url\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(gitops_workspace.resolve_repo(), "acme/from-url")
 
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: "acme/from-remote"
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
+        # `cwd=None`, the real signature of `get_current_git_repo`: the
+        # workspace branch of `resolve_repo` calls it as `(cwd=...)` inside a
+        # bare `except Exception: pass`, so a zero-arg stub raising TypeError
+        # there would be swallowed and this fallback reached for a reason other
+        # than the one it exercises. That branch is not taken here, but the
+        # stub should not be what decides that.
+        module.get_current_git_repo = lambda cwd=None: "acme/from-remote"
+        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(
-                gitops_workspace.resolve_repo(str(self.tmp_path / "absent.md")),
+                gitops_workspace.resolve_repo(),
                 "acme/from-remote",
             )
 
-    def test_both_sources_failing_names_both_sources(self):
-        missing = str(self.tmp_path / "absent.md")
-        module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: None
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
-            with self.assertRaises(RuntimeError) as caught:
-                gitops_workspace.resolve_repo(missing)
-        self.assertIn(missing, str(caught.exception))
-        self.assertIn("origin remote", str(caught.exception))
+    def test_raises_when_configmap_read_fails(self):
+        with patch("gitops_workspace.get_managed_github_repos", side_effect=RuntimeError("kubectl failed: Forbidden")):
+            with self.assertRaises(RuntimeError) as ctx:
+                gitops_workspace.resolve_repo()
+            self.assertIn("kubectl failed: Forbidden", str(ctx.exception))
 
-    def test_the_settings_path_is_operator_overridable(self):
-        path = self.settings("- **Git Repo:** acme/fleet\n")
-        with patch.dict(os.environ, {"GITOPS_SETTINGS": path}):
-            self.assertEqual(gitops_workspace.repo_from_settings(), "acme/fleet")
+    def test_get_managed_repo_entries_parses_structured_json(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/repo1\\"}, {\\"type\\": \\"gitlab\\", \\"url\\": \\"https://gitlab.com/acme/repo2\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(
+                gitops_workspace.get_managed_repo_entries(),
+                [
+                    {"type": "github", "url": "https://github.com/acme/repo1"},
+                    {"type": "gitlab", "url": "https://gitlab.com/acme/repo2"},
+                ],
+            )
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(),
+                ["acme/repo1"],
+            )
+
+    def test_get_managed_repo_entries_reads_from_mounted_file(self):
+        state_file = self.tmp_path / "managed_repos"
+        state_file.write_text(
+            json.dumps([
+                {"type": "github", "url": "https://github.com/acme/file-repo1"},
+                {"type": "gitlab", "url": "https://gitlab.com/acme/file-repo2"},
+            ]),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_managed_repo_entries(),
+                [
+                    {"type": "github", "url": "https://github.com/acme/file-repo1"},
+                    {"type": "gitlab", "url": "https://gitlab.com/acme/file-repo2"},
+                ],
+            )
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(),
+                ["acme/file-repo1"],
+            )
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_handles_empty_mounted_file(self):
+        state_file = self.tmp_path / "managed_repos_empty"
+        state_file.write_text("   \n", encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_handles_invalid_json_in_file(self):
+        state_file = self.tmp_path / "managed_repos_invalid"
+        state_file.write_text("not-json", encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_handles_malformed_json_list_in_file(self):
+        state_file = self.tmp_path / "managed_repos_malformed_list"
+        state_file.write_text("[invalid-json-content", encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_treats_a_mounted_dir_with_no_key_as_empty(self):
+        mount = self.tmp_path / "gitops-mount"
+        mount.mkdir()
+        state_file = mount / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_falls_back_when_the_mount_is_absent(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/repo1\\"}]"}}',
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run", return_value=fake_cm) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(),
+                ["acme/repo1"],
+            )
+            mock_run.assert_called_once()
+
+    def test_get_managed_repo_entries_bounds_the_kubectl_fallback(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(["kubectl"], 30)
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_repo_entries()
+            self.assertIn("Timed out", str(caught.exception))
+            self.assertEqual(
+                mock_run.call_args.kwargs["timeout"],
+                gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Context repositories — read for declared intent, never written
+# --------------------------------------------------------------------------- #
+
+
+class TestContextRepos(WorkspaceTestCase):
+    """`context_repos` is a second key in the same ConfigMap, and a different list.
+
+    The property every test here protects: a repository registered for
+    context is one the audit may *read*, and nothing that decides what the
+    agent may *write* — `get_managed_github_repos`, and through it the
+    broker's push gate and `resolve_repo` — ever sees it.
+    """
+
+    CONTEXT = '[{"type": "github", "url": "https://github.com/acme/terraform-live"}]'
+    MANAGED = '[{"type": "github", "url": "https://github.com/acme/fleet"}]'
+
+    def mount(self, **keys):
+        """A projected ConfigMap: one file per key under one directory."""
+        mount = self.tmp_path / "gitops-mount"
+        mount.mkdir(exist_ok=True)
+        for key, value in keys.items():
+            (mount / key).write_text(value, encoding="utf-8")
+        return mount / "managed_repos"
+
+    def test_the_key_is_read_from_the_file_beside_managed_repos(self):
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=self.CONTEXT)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_context_repo_entries(),
+                [{"type": "github", "url": "https://github.com/acme/terraform-live"}],
+            )
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+            )
+            mock_run.assert_not_called()
+
+    def test_a_mount_without_the_key_is_a_known_empty_list(self):
+        state_file = self.mount(managed_repos=self.MANAGED)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ) as mock_run:
+            self.assertEqual(gitops_workspace.get_context_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_context_github_repos(), [])
+            # Absent key on a present mount is "nothing registered", not
+            # "unreadable": no kubectl round trip, same as the managed key.
+            mock_run.assert_not_called()
+
+    def test_the_kubectl_fallback_reads_the_same_configmap_key(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout=json.dumps(
+                {"data": {"managed_repos": self.MANAGED, "context_repos": self.CONTEXT}}
+            ),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run", return_value=fake_cm
+        ) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+            )
+            mock_run.assert_called_once()
+            self.assertEqual(mock_run.call_args.args[0][:3], ["kubectl", "get", "configmap"])
+
+    def test_a_configmap_with_no_context_key_answers_empty(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout=json.dumps({"data": {"managed_repos": self.MANAGED}}),
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run", return_value=fake_cm
+        ):
+            self.assertEqual(gitops_workspace.get_context_repo_entries(), [])
+
+    def test_a_context_repository_never_enters_the_managed_list(self):
+        # The safety property. A context repo in the file and no managed repo
+        # at all: the managed answer stays empty, so the broker's push gate
+        # refuses it and the resolver does not pick it as the GitOps target.
+        state_file = self.mount(managed_repos="[]", context_repos=self.CONTEXT)
+        module = type(sys)("github_token_refresh")
+        module.get_current_git_repo = lambda cwd=None: None
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ), patch.dict(sys.modules, {"github_token_refresh": module}):
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/terraform-live"])
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            with self.assertRaises(RuntimeError):
+                gitops_workspace.resolve_repo()
+
+    def test_the_gitops_repo_may_also_be_a_context_repo(self):
+        # Registering the GitOps repo for context is allowed and changes
+        # nothing about what may be written: both lists carry it, on their
+        # own terms.
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=self.MANAGED)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/fleet"])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+
+    def test_malformed_context_json_is_an_empty_list_not_a_crash(self):
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos="{not a list}")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ) as mock_run:
+            self.assertEqual(gitops_workspace.get_context_repo_entries(), [])
+            mock_run.assert_not_called()
+
+    def test_the_context_file_sits_beside_whatever_path_names_the_managed_file(self):
+        # One environment variable locates both keys: the operator projects
+        # the whole ConfigMap as a directory, so the second key is a sibling.
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": "/mnt/state/managed_repos"}):
+            self.assertEqual(
+                gitops_workspace._state_key_path(gitops_workspace.CONTEXT_REPOS_KEY),
+                Path("/mnt/state/context_repos"),
+            )
+            self.assertEqual(
+                gitops_workspace._state_key_path(gitops_workspace.MANAGED_REPOS_KEY),
+                Path("/mnt/state/managed_repos"),
+            )
+
+    def test_a_skipped_context_entry_names_the_list_it_came_from(self):
+        """The skip warning says which ConfigMap key holds the entry, so an
+        administrator fixing it edits the right list."""
+        state_file = self.mount(
+            managed_repos=self.MANAGED,
+            context_repos='[{"type": "gitlab", "url": "https://gitlab.com/acme/live"}]',
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(gitops_workspace.get_context_github_repos(), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("context_repos", joined)
+        self.assertIn("no provider for type 'gitlab'", joined)
+        self.assertNotIn("managed_repos repository", joined)
+
+    def test_a_ref_on_a_context_entry_is_kept_and_handed_over_beside_the_slug(self):
+        context = (
+            '[{"type": "github", "url": "https://github.com/acme/terraform-live", '
+            '"ref": "release-2026"}, '
+            '{"type": "github", "url": "https://github.com/acme/notes"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [
+                    {"repo": "acme/terraform-live", "ref": "release-2026"},
+                    {"repo": "acme/notes", "ref": None},
+                ],
+            )
+            # The slug list every other caller reads is unchanged by the pin.
+            self.assertEqual(
+                gitops_workspace.get_context_github_repos(),
+                ["acme/terraform-live", "acme/notes"],
+            )
+
+    def test_a_ref_with_an_at_sign_after_the_first_character_is_kept(self):
+        # `release@2026` is a branch name git accepts: only the sequence `@{`
+        # and the lone name `@` are refused, and both stay refused below.
+        for good in ("release@2026", "deploy@eu", "team/x@y"):
+            with self.subTest(ref=good):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": good}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    self.assertTrue(gitops_workspace.is_valid_ref(good))
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repo_entries(),
+                        [{"repo": "acme/terraform-live", "ref": good}],
+                    )
+
+    def test_a_ref_that_is_not_a_branch_name_is_refused_and_marks_the_entry(self):
+        # A leading dash is an option to `git`; the rest are shapes a ref
+        # cannot take — `foo.lock/bar` among them, a `.lock` component git
+        # refuses in the middle of a name as it does at the end, and `+`,
+        # which git accepts and the shape check does not. The entry keeps
+        # its slug and carries the refused value under `refused_ref` in place
+        # of a `ref`, so the declared-intent search skips the repository
+        # rather than reading its default branch in the pin's place.
+        for bad in ("-rf", "--upload-pack=x", "a..b", "trailing/", "x.lock", "foo.lock/bar", "a/.b", "with space", "a@{1}", "@", "@release", "release/2026+hotfix"):
+            with self.subTest(ref=bad):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": bad}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": bad}],
+                        )
+                    # The raw entry carries the refused value, never as `ref`.
+                    self.assertEqual(
+                        gitops_workspace.get_context_repo_entries(),
+                        [{"type": "github", "url": "https://github.com/acme/terraform-live", "refused_ref": bad}],
+                    )
+                    # The slug list every other caller reads still names the
+                    # repository: it is owed, and the ledger names it as not
+                    # searched.
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(bad), joined)
+                self.assertIn("skips this repository", joined)
+                self.assertNotIn("reading HEAD", joined)
+
+    def test_an_empty_ref_is_refused_rather_than_read_as_no_pin(self):
+        # `"ref": ""` is what a template with an unset variable emits, and
+        # the pin it lost is exactly the one the default branch must not
+        # stand in for. It is refused like any value that is not a branch
+        # name: the entry carries it under `refused_ref`, the repository is
+        # skipped and owed, and the ledger names it until the key is removed
+        # or filled. Only an absent key reads the default branch.
+        for empty in ("", "   "):
+            with self.subTest(ref=repr(empty)):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": empty}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": empty}],
+                        )
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(empty), joined)
+        # An absent key is the one spelling of "no pin".
+        context = json.dumps([{"type": "github", "url": "https://github.com/acme/terraform-live"}])
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "acme/terraform-live", "ref": None}],
+            )
+
+    def test_a_null_ref_is_refused_rather_than_read_as_no_pin(self):
+        # `"ref": null` is what a JSON-emitting template writes for an unset
+        # variable, at least as often as `""`, and the value it stands in
+        # for is the same lost pin. The key is present, so it is not the
+        # absent key that means "no pin": the entry carries the JSON
+        # spelling under `refused_ref`, the repository is skipped and owed,
+        # and the ledger names it until the key is removed or filled.
+        context = '[{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": null}]'
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(
+                    gitops_workspace.get_context_github_repo_entries(),
+                    [{"repo": "acme/terraform-live", "ref": None, "refused_ref": "null"}],
+                )
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["acme/terraform-live"])
+        joined = "\n".join(logs.output)
+        self.assertIn("Refusing ref", joined)
+        self.assertIn("'null'", joined)
+        self.assertIn("skips this repository", joined)
+
+    def test_a_ref_that_is_not_a_string_is_refused_rather_than_spelt_as_a_branch(self):
+        # `"ref": 123` or `"ref": false` is a template that emitted the wrong
+        # type, not a branch named `123` or `False`; `str()` on the value
+        # would have passed both through the shape check as pins. Only a
+        # string is a candidate, and the refused value keeps its JSON
+        # spelling in the warning and on the entry, as `null` does.
+        for raw, spelling in ((123, "123"), (False, "false"), (["main"], '["main"]')):
+            with self.subTest(ref=spelling):
+                context = json.dumps(
+                    [{"type": "github", "url": "https://github.com/acme/terraform-live", "ref": raw}]
+                )
+                state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+                with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+                    with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                        self.assertEqual(
+                            gitops_workspace.get_context_github_repo_entries(),
+                            [{"repo": "acme/terraform-live", "ref": None, "refused_ref": spelling}],
+                        )
+                    self.assertEqual(
+                        gitops_workspace.get_context_github_repos(), ["acme/terraform-live"]
+                    )
+                joined = "\n".join(logs.output)
+                self.assertIn("Refusing ref", joined)
+                self.assertIn(repr(spelling), joined)
+
+    def test_a_non_github_entry_is_skipped_from_the_entries_too(self):
+        context = (
+            '[{"type": "gitlab", "url": "https://gitlab.com/acme/live", "ref": "main"}, '
+            '{"type": "github", "url": "https://github.com/acme/notes", "ref": "docs"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(
+                    gitops_workspace.get_context_github_repo_entries(),
+                    [{"repo": "acme/notes", "ref": "docs"}],
+                )
+        self.assertIn("no provider for type 'gitlab'", "\n".join(logs.output))
+
+    def test_a_ref_on_a_managed_entry_is_not_a_thing(self):
+        # Only the context list carries a branch pin: the managed list is what
+        # the push gate and the resolver read, and a pin there would claim
+        # something nothing downstream honours.
+        managed = '[{"type": "github", "url": "https://github.com/acme/fleet", "ref": "release"}]'
+        state_file = self.mount(managed_repos=managed, context_repos=self.CONTEXT)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_managed_repo_entries(),
+                [{"type": "github", "url": "https://github.com/acme/fleet"}],
+            )
+
+    def test_the_first_entry_for_a_slug_wins_ref_included(self):
+        context = (
+            '[{"type": "github", "url": "https://github.com/acme/live", "ref": "a"}, '
+            '{"type": "github", "url": "https://github.com/acme/live", "ref": "b"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "acme/live", "ref": "a"}],
+            )
+
+    def test_a_case_variant_duplicate_is_the_same_slug_and_keeps_the_first_ref(self):
+        # The readers key on the lowercased slug, so a second entry that
+        # differed only in case would overwrite the first's ref with its own:
+        # a pinned entry followed by an unpinned spelling read the repository
+        # at its default branch, and a refused pin followed by one was read
+        # rather than skipped.
+        context = (
+            '[{"type": "github", "url": "https://github.com/Acme/Live", "ref": "release-2026"}, '
+            '{"type": "github", "url": "https://github.com/acme/live"}]'
+        )
+        state_file = self.mount(managed_repos=self.MANAGED, context_repos=context)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_context_github_repo_entries(),
+                [{"repo": "Acme/Live", "ref": "release-2026"}],
+            )
+            self.assertEqual(gitops_workspace.get_context_github_repos(), ["Acme/Live"])
+
+    def test_the_managed_list_keeps_two_spellings_of_one_slug_as_its_readers_compare_them(self):
+        # The fold above is the context list's: its readers key on the
+        # lowercased slug. The managed list's readers compare the spelling
+        # exactly (the `--repo` allowlists in `audit_report.py`,
+        # `submit_suggestion.py` and `pr_conversation.py`, the token scope
+        # in `github_token_refresh.py`), so folding that list would refuse
+        # a `--repo` spelt the way its second entry is. It dedups exactly,
+        # as it did before the context list existed.
+        managed = (
+            '[{"type": "github", "url": "https://github.com/Acme/Fleet"}, '
+            '{"type": "github", "url": "https://github.com/acme/fleet"}, '
+            '{"type": "github", "url": "https://github.com/acme/fleet"}]'
+        )
+        state_file = self.mount(managed_repos=managed)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch(
+            "subprocess.run"
+        ):
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(), ["Acme/Fleet", "acme/fleet"]
+            )
+
+    def test_validate_repo_org_matching_primary_org(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
+            self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")
+
+    def test_validate_repo_org_cross_org_raises_value_error(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
+            with self.assertRaises(ValueError) as ctx:
+                gitops_workspace.validate_repo_org("other-org/kube-agents")
+            self.assertIn("Cross-org repository 'other-org/kube-agents' is not supported", str(ctx.exception))
+
+    def test_get_managed_github_repos_filters_github_urls(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/repo1\\"}, {\\"type\\": \\"gitlab\\", \\"url\\": \\"https://gitlab.com/acme/repo2\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(),
+                ["acme/repo1"],
+            )
+
+    def test_get_managed_github_repos_says_why_it_skipped_an_entry(self):
+        """A registered repository the agent will never touch has to be
+        distinguishable from one that was never registered."""
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"gitlab\\", \\"url\\": \\"https://gitlab.com/g/p\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"not a url\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("no provider for type 'gitlab'", joined)
+        self.assertIn("not a GitHub repository URL", joined)
+
+    def test_get_managed_github_repos_survives_an_unparseable_url(self):
+        """One malformed entry skips that entry, not the whole sweep."""
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://[::1/acme/repo\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/good\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertLogs("gitops_workspace", level="WARNING"):
+                self.assertEqual(
+                    gitops_workspace.get_managed_github_repos(), ["acme/good"]
+                )
+
+    def test_extract_github_slug_accepts_only_the_canonical_host(self):
+        """The `hosts=` narrowing is the point: a registration is not a remote."""
+        self.assertEqual(
+            gitops_workspace.extract_github_slug("https://github.com/acme/repo"),
+            "acme/repo",
+        )
+        self.assertEqual(gitops_workspace.extract_github_slug("acme/repo"), "acme/repo")
+        for value in (
+            "https://ssh.github.com/acme/repo",
+            "https://ghe.example.com/acme/repo",
+            "https://gitlab.com/acme/repo",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(gitops_workspace.extract_github_slug(value))
+
+    def test_is_valid_repo_slug_refuses_what_it_would_have_to_rewrite(self):
+        self.assertTrue(gitops_workspace.is_valid_repo_slug("acme/repo"))
+        for value in ("acme/..", "acme/-x", "github.com/acme", " acme/repo ", "/acme/repo/"):
+            with self.subTest(value=value):
+                self.assertFalse(gitops_workspace.is_valid_repo_slug(value))
+
+    def test_get_managed_github_repos_raises_on_kubectl_error(self):
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, ["kubectl"], stderr="Forbidden")):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("Failed to read ConfigMap", str(caught.exception))
+            self.assertIn("Forbidden", str(caught.exception))
+
+    def test_get_managed_github_repos_raises_on_kubectl_missing(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError("kubectl")):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("kubectl binary not found", str(caught.exception))
+
+    def _no_state_file(self):
+        """Point the read past any `/etc/gitops` the host happens to mount.
+
+        Without this the two entry-point tests below take the file path on a
+        machine that has one and never reach `kubectl`, the way the sibling
+        pin on `get_managed_repo_entries` already guards against.
+        """
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        return patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)})
+
+    def test_get_managed_github_repos_bounds_the_kubectl_read(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return CompletedProcess(args=cmd, returncode=0, stdout="{}", stderr="")
+
+        with self._no_state_file(), patch("subprocess.run", side_effect=fake_run):
+            gitops_workspace.get_managed_github_repos()
+        self.assertEqual(
+            captured.get("timeout"), gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS
+        )
+
+    def test_get_managed_github_repos_raises_on_kubectl_timeout(self):
+        with self._no_state_file(), patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["kubectl"], 30),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("Timed out", str(caught.exception))
+
+    def test_get_managed_github_repos_raises_on_invalid_json(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout="invalid-json",
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_github_repos()
+            self.assertIn("Failed to parse ConfigMap", str(caught.exception))
+
+    def test_workspace_lease_marker_resolution_succeeds(self):
+        holder = self.root / "t_lease"
+        gitops_workspace.write_lease(holder, "t_lease", repo="acme/from-lease")
+        workspace = holder / "acme__from-lease"
+        self.assertEqual(
+            gitops_workspace.resolve_repo(workspace=workspace),
+            "acme/from-lease",
+        )
+
+    def test_multiple_repos_under_same_lease_resolve_to_their_respective_repos(self):
+        holder = self.root / "t_lease"
+        # First repo prepared under lease
+        gitops_workspace.write_lease(holder, "t_lease", repo="acme/first-repo")
+        ws_first = holder / "acme__first-repo"
+        # Second repo prepared under same lease, overwriting the lease marker repo
+        gitops_workspace.write_lease(holder, "t_lease", repo="acme/second-repo")
+        ws_second = holder / "acme__second-repo"
+
+        # ws_first resolves to acme/first-repo despite lease marker pointing to second-repo
+        self.assertEqual(
+            gitops_workspace.resolve_repo(workspace=ws_first),
+            "acme/first-repo",
+        )
+        self.assertEqual(
+            gitops_workspace.resolve_repo(workspace=ws_first / "sub" / "dir"),
+            "acme/first-repo",
+        )
+        self.assertEqual(
+            gitops_workspace.resolve_repo(workspace=ws_second),
+            "acme/second-repo",
+        )
+        # Passing holder directly falls back to the lease marker's repo
+        self.assertEqual(
+            gitops_workspace.resolve_repo(workspace=holder),
+            "acme/second-repo",
+        )
+
+    def test_single_repo_in_configmap_succeeds(self):
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/single"]):
+            self.assertEqual(gitops_workspace.resolve_repo(), "acme/single")
+
+    def test_multiple_repos_in_configmap_raises_error(self):
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+            self.assertIn("Multiple repositories configured", str(caught.exception))
+
+    def test_all_sources_failing_raises_runtime_error(self):
+        module = type(sys)("github_token_refresh")
+        module.get_current_git_repo = lambda cwd=None: None
+        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+        self.assertIn("ConfigMap", str(caught.exception))
+        self.assertIn("origin remote", str(caught.exception))
 
 
 def seed_origin(tmp_path: Path, branch: str = "main") -> Path:
@@ -670,6 +1493,17 @@ def seed_origin(tmp_path: Path, branch: str = "main") -> Path:
         ["git", "push", "--quiet", "origin", branch],
     ):
         subprocess.run(cmd, cwd=seed, check=True, capture_output=True)
+    return origin
+
+
+def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
+    """A local bare repository with zero commits."""
+    origin = tmp_path / f"empty_origin_{branch}.git"
+    subprocess.run(
+        ["git", "init", "--quiet", "--bare", f"--initial-branch={branch}", str(origin)],
+        check=True,
+        capture_output=True,
+    )
     return origin
 
 

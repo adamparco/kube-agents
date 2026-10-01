@@ -27,7 +27,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 - [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) — Gemini-only default. Uses `GEMINI_API_KEY`.
 - [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription) — proxies to a personal ChatGPT subscription via OAuth device flow. Useful for demos where you don't want a per-token cost.
 
-To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
+To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `inference-gateway`.
 
 ### Setting the default model
 
@@ -42,7 +42,7 @@ model_list:
 
 Two things have to name that alias, not one. The profile config covers Chat, which resolves the model on every message; sessions created through the agent's HTTP API instead take a model resolved once at gateway startup, and that path reads `API_SERVER_MODEL_NAME`. The operator sets both from the same constant so they cannot drift — if they do, Chat keeps working while every API-created session (autonomous event triage, for one) dies asking LiteLLM for a model it does not serve.
 
-The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `vars.sh` and carried into the chart values). Supported providers and their shipping defaults:
+The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `install.env` and carried into the chart values). Supported providers and their shipping defaults:
 
 | `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
 | ------------------ | ---------------------------- | ------------------------------------------ |
@@ -53,7 +53,7 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
-To change the default on an installed system, re-run `./install.sh` (or its `--menu` panel's model-provider entry followed by **Save & Apply**) — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
+To change the default on an installed system, re-run the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) and use the model-provider entry followed by **Save & Apply** — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
 
 ```bash
 export MODEL_PROVIDER=gemini
@@ -62,6 +62,24 @@ make -C k8s-operator deploy-litellm
 ```
 
 Either way the agent picks up the new model on its next request without any change to its own config.
+
+### Setting the output-token budget
+
+`MODEL_MAX_TOKENS` is the number of output tokens the gateway asks the provider for on a request that names none. Set it in `install.env` or with `--model-max-tokens=N`; it reaches the chart as `litellm.maxTokens` and the Terraform example as `model_max_tokens`, and the chart renders it as `max_tokens` under every `model_list` alias. With `MODEL_PROVIDER=gemini` and `MODEL_MAX_TOKENS=8192` the first alias reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      max_tokens: 8192
+```
+
+The chart is the only path that renders it: the kustomize dev copy above (`make -C k8s-operator deploy-litellm`) carries no `max_tokens`. On an installed system, set the key in `install.env` and re-run `upgrade.sh`, or use `install.sh --menu` and **Save & Apply**, which regenerates from `install.env`; there is no menu entry for it.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. The hosted providers above need no value: the agent's requests carry their own `max_tokens`, and a provider with its own output limit answers a value above it with an error rather than a truncated reply. A self-hosted backend such as vLLM, SGLang, TGI or llama.cpp admits a request only if the prompt and `max_tokens` together fit its served window, so a request that asks for more output than the window holds is refused before the model runs. Set the value below that window, leaving the prompt the room it needs.
+
+The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.9.14`) does not send `max_tokens` on agent turns, so this value is the one the agent's requests get, the same as a direct call to the gateway's `/v1/chat/completions` that omits the field. Images built on `v2026.8.19` and earlier sent their own `max_tokens` on every request; on those the client's value won for agent turns and only a request that omitted the field took the configured one.
 
 ### Prompt caching
 
@@ -88,23 +106,55 @@ The system prompt takes the 1h tier because it is the largest static span, every
 
 Nothing here is provider-specific. Non-Anthropic backends drop the markers in their provider transforms — Gemini and Gemma routes answer normally with unchanged token counts — and Gemini's own implicit caching, which needs no markers at all, is unaffected. Leaving the block in place on a Gemini install costs nothing and means switching to `MODEL_PROVIDER=anthropic` doesn't quietly switch caching off.
 
+### Redaction at the gateway
+
+Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs. `litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`, and the hook rewrites `messages[].content` (strings and `text` parts), each assistant message's `tool_calls[].function.arguments` (parsed, so a key name such as `password` counts as it does in a mapping), embeddings `input` and completion `prompt` before LiteLLM calls the provider. The rendered default config does not change while the value is off.
+
+Three layers run, in this order:
+
+1. **The built-in credential patterns**, always on: GCP API keys and OAuth tokens, PEM private keys, bearer and basic auth values, GitHub, OpenAI, Anthropic and Slack tokens, AWS access key IDs, JWTs, the password in a URL (`scheme://user:password@host`, unless it holds `,`, `;`, a quote or an unencoded `/`, `?` or `#`), secret-shaped key/value pairs (a block scalar's lines included), container env entries whose name is secret-shaped (in YAML and in JSON), Kubernetes Secret `data:` blocks and the `data`/`stringData` objects of JSON that holds a Secret, and e-mail addresses other than service-account principals. These are masked (`[REDACTED_SECRET]`, `[REDACTED_PRIVATE_KEY]`, `[REDACTED_EMAIL]`). A `true`, `false`, `null` or `none` value, or an env reference such as `$(DB_PASSWORD)`, is left as it is under a secret-shaped name, so `automountServiceAccountToken: false` still reads as a boolean. JSON held inside a JSON string, such as the `kubectl.kubernetes.io/last-applied-configuration` annotation in `kubectl get -o json`, is decoded and redacted the same way.
+2. **IP literals**, IPv4 and IPv6, under `litellm.redaction.ip`. `action: pseudonym` (the default) replaces each with `[ip:<12 hex>]`; `mask` replaces each with `[REDACTED_IP]`; `"off"` leaves them alone, and it has to be quoted because YAML reads the bare word as a boolean, which the render refuses. `allowCidrs` lists the networks the model must still see, such as `127.0.0.0/8` or a service range.
+3. **Operator rules** under `litellm.redaction.rules`, each a `name` (a letter or digit, then letters, digits, `_`, `.`, `-`), exactly one of `literal` (an exact string) or `pattern` (a Python regular expression), both non-empty, and an `action` of `mask` (default) or `pseudonym` (`[<name>:<12 hex>]`). A mask marker is the name upper-cased with punctuation folded to `_`, so the `cluster-name` rule below masks as `[REDACTED_CLUSTER_NAME]`.
+
+```yaml
+litellm:
+  redaction:
+    enabled: true
+    ip:
+      action: pseudonym
+      allowCidrs: ["127.0.0.0/8"]
+    rules:
+      - name: cluster-name
+        literal: prod-eu-1
+        action: pseudonym
+      - name: project
+        pattern: "my-proj-[0-9]+"
+```
+
+A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value, keyed by `SESSION_KV_SALT` from the credentials Secret (the same mechanism that pseudonymises chat identities). The same value maps to the same token in every request while the salt holds, so the model can still tell two pods apart and correlate an address across turns; nothing maps a token back. Without the salt the gateway still redacts, with a per-pod salt the redactor warns about, so tokens stop matching across replicas and restarts.
+
+**Pseudonymisation is not reversible, and that limits what the agent can do with a pseudonymised value.** The model never sees `10.0.0.5`; it sees `[ip:3fa9c2d1e0b4]`, and a `kubectl` command or a chat answer it writes from that token names an address that does not exist, so the tool call fails or the answer is useless. Pseudonymise identifiers the agent only needs to reason _about_; keep the ones it must act on in `allowCidrs`, use `off`, or accept that those tasks degrade. Masking has the same limit without the correlation.
+
+What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. It does not touch what the agent writes to disk: conversation logs and the state databases still carry tool output verbatim, and what the image itself redacts on the agent's volume is listed under [Security and IAM](/kube-agents/reference/security-and-iam/#what-leaves-for-the-model-provider). And it does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
+
 ### Vertex AI and Model Garden
 
-`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster.
+`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster. That boundary is a project, not a geography: the default location is the global endpoint, which makes no promise about the region a request is processed in — see the location bullet below.
 
 Two things differ from the API-key providers:
 
 - **Authentication is Workload Identity.** The gateway gets its own service-account pair rather than an API key — see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity). There is no entry in `platform-agent-secrets` for Vertex.
-- **The endpoint is a project and a location.** `VERTEX_PROJECT_ID` and `VERTEX_LOCATION` (defaulting to the install's project and region) become `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` on the gateway pod. A publisher model is only callable from a location that serves it, so a model unavailable in your cluster's region needs `VERTEX_LOCATION` pointed at one that has it — often `global`.
+- **The endpoint is a project and a location.** `VERTEX_PROJECT_ID` and `VERTEX_LOCATION` become `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` on the gateway pod. The project defaults to the install's. The location defaults to `global` in `install.sh`, Terraform, and the chart — not the cluster's region, which need not serve the model you asked for and on a zonal cluster is not a valid Vertex location at all. (The kustomize dev path substitutes `VERTEX_LOCATION` with no fallback, so export it there.) Set `VERTEX_LOCATION` to a region when you have a data-residency requirement, when org policy blocks the global endpoint, or when the model is a Model Garden partner model served only from specific regions. Google's [locations page](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) lists which locations serve which model, and its [data-residency page](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/data-residency) covers what the global endpoint does not guarantee.
+- **A serving project you cannot administer.** With `VERTEX_PROJECT_ID` pointing at another project, the install enables `aiplatform.googleapis.com` there and grants the gateway's service account `roles/aiplatform.user` on it, which needs IAM rights on that project. Set `VERTEX_MANAGE_SERVING_PROJECT=false` (`--vertex-manage-serving-project=false`) when you do not have them: the install still creates the service account and its Workload Identity binding in your project, and you enable the API and make the grant by hand. Choose it at the first install; flipping it later on an install that already manages the two revokes the grant unless you remove them from Terraform state first (the [composition's README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) has the command). [Security and IAM](../reference/security-and-iam.md) covers what that does to the identity's lifecycle.
 
 `MODEL_DEFAULT_NAME` is the Vertex **publisher model ID**, which is not always the same string the provider's own API uses — Model Garden Claude models, for instance, carry an `@`-suffixed version (`claude-sonnet-4-5@20250929`). Check the model's Model Garden card for the exact ID; a wrong one surfaces as a 404 from the gateway rather than a provisioning error.
 
 ```bash
-./install.sh \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --model-provider=vertex_ai \
   --model-default-name=gemini-3.5-flash \
   --vertex-project-id=my-gcp-project \
-  --vertex-location=us-east4   # both Vertex flags optional; default to the install's project/region
+  --vertex-location=us-east4   # both optional: project defaults to the install's, location to "global"
 ```
 
 A re-run against an existing install reconciles the switch in one `terraform apply` — the gateway's IAM pair, its KSA, and the rolled ConfigMap land together.
@@ -146,7 +196,7 @@ Deploy it with `make -C k8s-operator deploy-inference-replay` — it is a develo
 
 ## What the agent doesn't care about
 
-The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
+The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `inference-gateway` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `inference-gateway` Service is repointed at the replay proxy and the original gateway pods are re-exposed through a new `inference-gateway-upstream` Service that the proxy forwards cache misses to. That means:
 
 - Swapping Gemini for Anthropic is a LiteLLM `ConfigMap` change.
 - So is [prompt caching](#prompt-caching) — the breakpoints are injected gateway-side, because only the gateway knows which model they are for.
@@ -156,5 +206,5 @@ The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the 
 ## Where to go next
 
 - [Reference → Examples](/kube-agents/reference/examples/) — the inference example bundles walked through.
-- [Deploy → Kustomize](/kube-agents/deploy/kustomize/) — what the LiteLLM Deployment looks like on disk.
+- [Deploy → Network policies and Service](/kube-agents/deploy/kustomize/#kustomize-for-operator-integrations) — where the LiteLLM Deployment's dev copy lives on disk.
 - [Concepts → Observability](/kube-agents/concepts/observability/) — LLM telemetry export.

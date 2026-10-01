@@ -1,7 +1,7 @@
 """Seam: platform_mcp_server over real stdio, spoken to by a real MCP client.
 
 Every existing test calls the tool functions directly; the transport — the
-JSON-RPC stream FastMCP runs on stdout — was never exercised, and stdout is
+JSON-RPC stream the MCP server runs on stdout — was never exercised, and stdout is
 exactly where this server had a live bug: a bare `print()` on the
 session-metadata failure path wrote prose into the protocol stream, corrupting
 it for the client mid-session. This test spawns the real server process,
@@ -36,6 +36,8 @@ except Exception:  # pragma: no cover - requirements-test always carries mcp
 
 EXPECTED_TOOLS = {
     "verify_gke_cluster",
+    "list_cluster_profiles",
+    "get_cluster_profile_name",
     "list_cc_healthchecks",
     "get_cc_operator_status",
     "get_cc_pod_diagnostics",
@@ -43,6 +45,13 @@ EXPECTED_TOOLS = {
     "audit_log_searcher",
     "send_notification",
     "report_to_chat",
+    "register_findings",
+    "get_findings",
+    "get_ranked_findings",
+    "update_finding",
+    "mark_finding_surfaced",
+    "record_finding_verification",
+    "findings_publication",
 }
 
 

@@ -1,9 +1,38 @@
 #!/bin/sh
 set -e
 
+# The credential sidecar runs as a different user (see the UID constants in the
+# operator's platformagent_manifests.go) and executes the proxied gcloud, git and
+# gh commands against this container's workspace on the shared PVC. It reaches
+# those files through the shared fsGroup, which only helps if what we create is
+# group-writable: a leased GitOps directory this container makes has to be a
+# directory the sidecar can clone into, and a profile home it makes has to be one
+# the sidecar can write a kubeconfig pin into. The kubelet's fsGroup pass fixes up
+# files that already exist at mount time; this fixes up the ones created after.
+umask 0002
+
+# Below the umask and not above it, where the rest of this file's constants would
+# go: tests/test_startup_umask.py asserts that the umask is the first line here
+# that can create a file, and it reads the file rather than running it, so an
+# assignment above the umask reads to it as that line.
+#
+# EXIT_RETRY in deploy/shared/sandbox_mirror.py: the mirror failed in a way the
+# next container start fixes on its own. Step 5.7 warns on it and lets the agent
+# come up; every other non-zero exit there is still fatal. Change both together.
+readonly SANDBOX_MIRROR_RETRY_RC=2
+readonly OTEL_FLAG_DISABLED="--disabled"
+
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
+
+# The WAL-to-DELETE conversion (deploy/shared/sqlite_journal_migrate.py). Named here
+# because two places use it: the owner runs it at step 1.7 and a non-owner waits on
+# its --check below the shared-state gate. The PVC copy is the fallback for an image
+# whose /opt/defaults predates the script, and for the tests, which run these steps
+# against a temporary home.
+SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"
+[ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] || SQLITE_JOURNAL_MIGRATE_SCRIPT="$TARGET_DIR/scripts/sqlite_journal_migrate.py"
 
 # Pre-export AGENT_BROWSER_EXECUTABLE_PATH before running stage2-hook.sh.
 # Why: Upstream stage2-hook.sh scans for Playwright's Chromium binary and
@@ -13,7 +42,8 @@ export INSTALL_DIR="/opt/hermes"
 # By pre-exporting AGENT_BROWSER_EXECUTABLE_PATH here, stage2-hook.sh detects
 # [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] is false and cleanly skips writing to /run/s6/.
 if [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] && [ -d "/opt/hermes/.playwright" ]; then
-    export AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    export AGENT_BROWSER_EXECUTABLE_PATH
 fi
 
 # 1. Execute upstream container initialization natively (inherits 100% of upstream updates)
@@ -152,7 +182,7 @@ if ! agent_owns_shared_state "$@"; then
     # plain manifest, `docker run`, the kustomize bases, a test harness — a missing
     # config.yaml means nobody is coming to write it, and pausing would turn a fast
     # failure into a two-minute one for no possible gain.
-    if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ ! -f "$TARGET_DIR/config.yaml" ]; then
+    if [ -n "${HERMES_MANAGED_DIR:-}" ]; then
         _wait_secs="${AGENT_SHARED_STATE_WAIT_SECS:-120}"
         # A non-numeric value would make the `-lt` below a shell ERROR, and `set -e` is on
         # — so a typo in a knob for waiting would kill the container outright, which is
@@ -164,16 +194,42 @@ if ! agent_owns_shared_state "$@"; then
                 _wait_secs=120
                 ;;
         esac
-        echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
-        _waited=0
-        while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
-            sleep 1
-            _waited=$((_waited + 1))
-        done
-        if [ -f "$TARGET_DIR/config.yaml" ]; then
-            echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
-        else
-            echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+        if [ ! -f "$TARGET_DIR/config.yaml" ]; then
+            echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
+            _waited=0
+            while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ -f "$TARGET_DIR/config.yaml" ]; then
+                echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
+            else
+                echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+            fi
+        fi
+        # The same bounded wait for the owner's step 1.7, the WAL-to-DELETE conversion.
+        # Unlike the config file, this one is real in the shipped image: the owner
+        # converts the databases in place, and a non-owner that opens one mid-switch
+        # holds exactly the concurrent connection the conversion refuses to run under,
+        # so the two would settle into "left in WAL" on every start. --check exits
+        # non-zero only while the managed scope pins `delete` and a governed header
+        # still reads WAL; every other answer, including a script that cannot read the
+        # config, is "nothing to wait for". Same budget, same proceed-anyway ending.
+        if [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            _waited=0
+            while ! "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" --check \
+                    --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" 2>/dev/null; do
+                if [ "$_waited" -ge "$_wait_secs" ]; then
+                    echo "[ENTRYPOINT] WARN: a database under $TARGET_DIR still reads WAL after ${_wait_secs}s with journal_mode=delete pinned; starting '$*' anyway (the owner converts it at its next start)." >&2
+                    break
+                fi
+                [ "$_waited" -gt 0 ] || echo "[ENTRYPOINT] a database under $TARGET_DIR still reads WAL with journal_mode=delete pinned; waiting up to ${_wait_secs}s for the owner's conversion (step 1.7)." >&2
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ "$_waited" -gt 0 ] && [ "$_waited" -lt "$_wait_secs" ]; then
+                echo "[ENTRYPOINT] the WAL-to-DELETE conversion finished after ${_waited}s; continuing." >&2
+            fi
         fi
         unset _wait_secs _waited
     fi
@@ -189,16 +245,14 @@ if ! agent_owns_shared_state "$@"; then
     #
     # Skipping the SETUP is not skipping the cwd. This branch execs ~600 lines above the
     # `cd "$TARGET_DIR"` at the bottom, so without this the handed-over process keeps
-    # whatever directory the container started in — /opt/hermes for the dashboard sidecar.
-    # That is not cosmetic: the credential proxy refuses any cwd outside
-    # CREDENTIAL_PROXY_WORKSPACE_ROOT, which the operator sets to this same $TARGET_DIR,
-    # so every kubectl/gcloud/gh/git call in a non-owner container fails with "working
-    # directory is outside the shared workspace" before it runs. The reasoning for the
-    # cd, and why the cwd is the only lever that reaches every caller, is at the bottom.
+    # whatever directory the container started in — /opt/hermes for the dashboard sidecar,
+    # which is read-only to the runtime user, so every relative path it writes is lost.
+    # The reasoning for the cd, and why the cwd is the only lever that reaches every
+    # caller, is at the bottom.
     # Guarded for the same reason it is there: a non-owner can legitimately start before
     # the owner has created the tree, and that must not abort the container.
     if ! cd "$TARGET_DIR"; then
-        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+        echo "WARN: could not enter $TARGET_DIR; relative paths will resolve against a read-only directory" >&2
     fi
     exec "$@"
 fi
@@ -251,6 +305,62 @@ if [ "$PLATFORM_AGENT_ROLE" = "sidecar" ]; then
 else
     IS_BOOTSTRAP_PRIMARY=1
 fi
+
+# 1.55 Check the image's skill trees against the SHA-256 manifests the build wrote
+# beside them, before anything below propagates one of them.
+#
+# The trees are prompt material: a SKILL.md tells the agent what to do and a
+# skills/*/scripts/*.py runs with the agent's credentials. Until now nothing compared
+# what boots against what was built, so a tree that had been altered — by a previous
+# boot under an older image, by a corrupted layer, by a bad build — was copied to every
+# profile and loaded, indistinguishably from a good one.
+#
+# Here rather than anywhere later because everything that spreads these trees is below:
+# step 2 copies /opt/defaults onto the PVC and sync_profile_skills installs
+# $PLATFORM_TEMPLATE/skills and $CLUSTER_TEMPLATE/skills into each profile. Failing at
+# this line leaves the PVC exactly as the last good boot left it.
+#
+# It is the DETECTION half of the pair; the barrier is that these trees, and the two
+# templates around them, are root-owned in the image while the agent runs as uid 10000
+# (the ownership comment in deploy/docker/Dockerfile has the reasoning, including why
+# the modes are left writable-looking). Read it as "this image's skills are the ones it
+# was built with", not as a runtime sandbox.
+#
+# The manifest, not the script, decides whether the check is mandatory. Both sides are
+# root-owned in the image — the manifest inside the tree it describes, the verifier in
+# /opt/defaults/scripts — so neither is something the runtime user removes, and the
+# FATAL branch below reads as a corrupted or mis-built image rather than as the last
+# thing standing between an agent and a disabled check. It is kept because the
+# alternative to reporting a missing checker is skipping the tree it would have checked:
+# a tree that carries a manifest is verified or the container does not start. A tree
+# with no manifest beside it is one no manifesting build produced (agent-base ships
+# /opt/hermes/skills and never reaches the platform stage) and is skipped, which is also
+# what makes this a no-op on a developer host.
+#
+# Fail-closed, which is a deliberate departure from the WARN-and-continue that every
+# other step here uses. Those steps degrade to a stale file; this one degrades to
+# running instructions nobody can account for, which is the whole thing it exists to
+# report. The blast radius is bounded on the other side: the manifest ships in the same
+# image layer as the files it covers and the build asserts it is complete, so a mismatch
+# is never a version skew between the two — it is the image having changed since it was
+# built. There is deliberately no env-var override; a bypass switch would be readable to
+# exactly the caller this is meant to be honest with.
+SKILL_PROVENANCE_SCRIPT="/opt/defaults/scripts/verify_skills_provenance.py"
+for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do
+    [ -f "$_tree/skills_manifest.sha256" ] || continue
+    if [ ! -f "$SKILL_PROVENANCE_SCRIPT" ] || [ ! -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+        echo "FATAL: $_tree carries a build-time manifest but nothing here can check it ($SKILL_PROVENANCE_SCRIPT or $INSTALL_DIR/.venv/bin/python3 is missing); refusing to start" >&2
+        exit 1
+    fi
+    # The script names the specific difference on stderr; this only says what the
+    # container did about it.
+    if ! "$INSTALL_DIR/.venv/bin/python3" "$SKILL_PROVENANCE_SCRIPT" \
+        --manifest "$_tree/skills_manifest.sha256" --dir "$_tree"; then
+        echo "FATAL: $_tree does not match the manifest baked beside it at build time; refusing to start" >&2
+        exit 1
+    fi
+done
+unset _tree
 
 # 1.6 Serialise everything below that writes to $TARGET_DIR.
 #
@@ -305,6 +415,34 @@ if command -v flock >/dev/null 2>&1; then
     fi
 fi
 
+# 1.7 Convert the SQLite databases on this volume out of WAL, once, when the operator
+# has pinned `database.journal_mode: delete` in the managed scope.
+#
+# The operator pins it whenever the agent pod has a runtime class (renderConfigYAML in
+# platformagent_manifests.go): under gVisor the volume is a 9p gofer mount that accepts
+# WAL and then corrupts it, and two databases went that way in three days (#610).
+# Hermes honours the pin for a database it creates, but never downgrades one whose
+# header already reads WAL — apply_wal_with_fallback returns an on-disk WAL database
+# before it consults the setting, because a live downgrade under a concurrent opener
+# destroys committed-but-uncheckpointed frames. So a volume that ran in WAL before the
+# pin, which is every install this was written for, needs one conversion, and it has
+# to happen HERE: after the lock above, so one container does it, and before step 2,
+# because everything below opens a database somewhere (the cron reconcile, the kanban
+# board, the session store). The non-owner's wait below the shared-state gate is the
+# other half: a sidecar holds off opening a database until this has run.
+#
+# The script checkpoints each database with TRUNCATE first and switches only when
+# SQLite reports the switch took. A database another process holds open is left as it
+# is and logged, and the next start retries; nothing here can make a file worse than
+# WAL already left it. Best-effort: the gate is in the script (no pin, no conversion),
+# so an image started without the operator — compose, a plain manifest, the kustomize
+# bases — runs a no-op, and a host without the venv skips the step outright.
+if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" \
+        --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" \
+        || echo "WARN: the WAL-to-DELETE conversion did not finish (exit $?); a database still in WAL is converted at the next start" >&2
+fi
+
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
 if [ -d "/opt/defaults" ]; then
     mkdir -p "$TARGET_DIR"
@@ -338,8 +476,13 @@ fi
 # service address is not in this file at all — the operator derives it from the
 # agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
 # when the file is silent. That is why no `api_url` key belongs here.
+#
+# The onboarding prompts are in this list because bootstrap_onboarding reads the PVC
+# copy ahead of the image's, and the first-install-hello eval cases grade the greeting
+# they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
+        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
@@ -365,6 +508,27 @@ if [ -d "/opt/defaults/scripts" ]; then
     mkdir -p "$TARGET_DIR/scripts"
     cp -rf /opt/defaults/scripts/. "$TARGET_DIR/scripts/" \
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
+fi
+
+# 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.
+#
+# Why: Hermes caches tool definitions from `mcp_servers` in `<profile>/cache/mcp_schema_cache.json`
+# so lazy startup can register tools without spawning subprocesses on every turn.
+# However, Hermes keys the cache entry only on `config_fingerprint` (command/args/url),
+# which does not change when an image update modifies the contents of a local script
+# (e.g. platform_mcp_server.py or router_server.py).
+# When an upgraded container image starts over an existing PVC, the stale cached tool list
+# shadows newly added or modified tools indefinitely (Issue #854).
+# Dropping local server entries forces Hermes to re-discover tools on first connect.
+# Remote servers (e.g. developer_knowledge, gke) are preserved to avoid unnecessary
+# network round-trips.
+INVALIDATE_MCP_SCRIPT="/opt/defaults/scripts/invalidate_mcp_cache.py"
+[ -f "$INVALIDATE_MCP_SCRIPT" ] || INVALIDATE_MCP_SCRIPT="$TARGET_DIR/scripts/invalidate_mcp_cache.py"
+if [ -f "$INVALIDATE_MCP_SCRIPT" ]; then
+    PYTHON="python3"
+    [ -x "$INSTALL_DIR/.venv/bin/python3" ] && PYTHON="$INSTALL_DIR/.venv/bin/python3"
+    "$PYTHON" "$INVALIDATE_MCP_SCRIPT" "$TARGET_DIR" \
+        || echo "WARN: could not invalidate local MCP schema caches; upgraded tools may not be discovered" >&2
 fi
 
 # Where the operator mounts its per-profile overlay ConfigMap (the operator's
@@ -501,6 +665,99 @@ if added:
 PYEOF
 }
 
+# Make a live config.yaml send the User-Agent its image template sends on every remote
+# MCP server the two have in common, and change nothing else. $1 = the template, $2 =
+# the live file.
+#
+# The header is image-owned state inside files the fill above cannot reach: `args` is
+# a list, and the fill recurses only where both sides are mappings, so a live list
+# keeps the string it was scaffolded with. That is right for everything else a list
+# holds and wrong for this one value, which the API teams serving the endpoints key
+# dashboards on (deploy/shared/defaults/config.yaml carries the rationale). Left
+# alone, a PVC upgraded onto a new image sends the new build's version in the old
+# header shape from every cluster profile, and from the platform profile at the front
+# door, for as long as the volume lives — while a fresh install sends the new one.
+#
+# Two things in the live file are matched, and nothing else is read: the server, by
+# name, so a server the template does not ship is left as it is; and inside its args
+# the value after a `--header` token that names User-Agent, which becomes the
+# template's. A profile scaffolded before the header existed has no such pair, and
+# gets the template's inserted where the template carries it, so the proxy invocation
+# keeps the same shape. Identity, overlays, timeouts, every other arg: untouched.
+#
+# A caller reports its own failure, as with the fill: only it knows which profile.
+repair_remote_mcp_user_agent() {
+    "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" <<'UAEOF'
+import os
+import sys
+
+import yaml
+
+HEADER_FLAG = "--header"
+HEADER_NAME = "user-agent"
+TMP_SUFFIX = ".user-agent.tmp"
+
+template_path, live_path = sys.argv[1], sys.argv[2]
+
+
+def load(path):
+    with open(path) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def header_slot(args):
+    # Index of the User-Agent value: the arg after a `--header` token whose name is
+    # User-Agent. Header names are case-insensitive (RFC 9110 §5.1), so compare folded.
+    for i in range(len(args) - 1):
+        if args[i] == HEADER_FLAG and isinstance(args[i + 1], str):
+            name, sep, _ = args[i + 1].partition(":")
+            if sep and name.strip().lower() == HEADER_NAME:
+                return i + 1
+    return None
+
+
+template, live = load(template_path), load(live_path)
+if not isinstance(template, dict) or not isinstance(live, dict):
+    print("[ENTRYPOINT] User-Agent repair skipped: not a mapping", file=sys.stderr)
+    raise SystemExit(0)
+
+template_servers, live_servers = template.get("mcp_servers"), live.get("mcp_servers")
+if not isinstance(template_servers, dict) or not isinstance(live_servers, dict):
+    raise SystemExit(0)
+
+repaired = []
+for name, template_server in template_servers.items():
+    live_server = live_servers.get(name)
+    if not isinstance(template_server, dict) or not isinstance(live_server, dict):
+        continue
+    template_args, live_args = template_server.get("args"), live_server.get("args")
+    if not isinstance(template_args, list) or not isinstance(live_args, list):
+        continue
+    template_slot = header_slot(template_args)
+    if template_slot is None:
+        continue
+    wanted = template_args[template_slot]
+    live_slot = header_slot(live_args)
+    if live_slot is None:
+        at = min(template_slot - 1, len(live_args))
+        live_args[at:at] = [HEADER_FLAG, wanted]
+        repaired.append(name)
+    elif live_args[live_slot] != wanted:
+        live_args[live_slot] = wanted
+        repaired.append(name)
+
+if repaired:
+    # Atomic, for the fill's reason and one more: a torn write of a cluster profile's
+    # config.yaml loses `cluster_identity`, and the reconciler then scaffolds a
+    # duplicate it can never prune.
+    tmp_path = live_path + TMP_SUFFIX
+    with open(tmp_path, "w") as fh:
+        yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
+    os.replace(tmp_path, live_path)
+    print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+UAEOF
+}
+
 # Fresh volume: lay the image's copy down before anything can read it, so neither the
 # gateway nor the dashboard sidecar comes up against a missing config, falls back to
 # Hermes' built-in defaults, and saves those over the top.
@@ -580,6 +837,74 @@ for expected in ("model.default", "model.base_url", "model.api_mode"):
 print(f"managed scope: {len(keys)} pinned config keys from {managed_scope.get_managed_dir()}")
 '; then
     echo "WARN: $MANAGED_DIR/config.yaml did not load as a managed scope (unparseable, or missing the model keys) — hermes fails open, so the agent is running UNPINNED" >&2
+fi
+
+# The same assertion for the ONE key in the managed .env that is not about chat, and the
+# only one whose absence takes the whole API surface down rather than degrading a feature.
+#
+# What it is guarding against, and why it needs guarding at all (issue #786). Hermes'
+# Docker stage2 hook — step 1 above, upstream's, in every container — generates a strong
+# random API_SERVER_KEY into $TARGET_DIR/.env whenever that file does not already carry
+# one, and load_hermes_dotenv applies that file with override=True. Before the operator
+# pinned this key, the gateway therefore authenticated against a value invented at boot
+# inside the pod that nothing else knew: `os.environ["API_SERVER_KEY"]`, the Secret, the
+# credential proxy's AGENT_API_UPSTREAM_KEY and the container's own startup probe all
+# presented the sentinel and all got 401. The managed .env is applied last of everything,
+# so pinning API_SERVER_KEY there is what makes the whole pod agree — but managed scope
+# fails open, so an absent or unmounted pin restores the broken state silently.
+#
+# It is checked HERE, before `exec`, rather than left to the container's startup probe.
+# The probe (agentAPIProbe in platformagent_manifests.go) does catch the failure — it
+# curls an authenticated route with $API_SERVER_KEY and the pod never goes Ready — but a
+# probe reports THAT something is wrong, not WHICH of the several things it could be. One
+# line naming the missing pin turns a CrashLoopBackOff into a diagnosis.
+#
+# Reads the file with grep rather than asking Hermes: this is the operator's rendered
+# text, and the point is to check what was MOUNTED, not what some library would resolve.
+# Comparing values, not just presence, because the two renders sit in different files in
+# different languages and agreeing is the entire property.
+#
+# Report, never exit, for the reason the block above gives.
+#
+# A function taking its inputs as arguments, so the tests can run the shipped definition
+# rather than a copy of it (tests/test_docker_entrypoint.py).
+warn_unless_api_key_is_pinned() {
+    _wuakip_managed_env="$1"
+    _wuakip_key="$2"
+
+    if [ ! -f "$_wuakip_managed_env" ]; then
+        echo "WARN: no managed $_wuakip_managed_env — API_SERVER_KEY is NOT pinned, so Hermes' stage2 hook may have generated a different key into $TARGET_DIR/.env and every authenticated call to this agent's API will 401 (issue #786)" >&2
+        return 0
+    fi
+    # -x and -F together: a line that merely CONTAINS the value is a different pin, and a
+    # key whose value happens to look like a pattern is still just a string.
+    if grep -qxF "API_SERVER_KEY=$_wuakip_key" "$_wuakip_managed_env"; then
+        return 0
+    fi
+    # The two remaining shapes are both broken, but they are NOT broken the same way, and
+    # the difference is which file an operator should go and read. Say which one wins.
+    if grep -q '^API_SERVER_KEY=' "$_wuakip_managed_env"; then
+        # The managed scope is applied last with override=True, so a file that pins some
+        # OTHER value is the value the gateway will accept — and it will then 401 this
+        # container's env, which is what the sidecar, the startup probe and every in-pod
+        # caller present.
+        echo "WARN: $_wuakip_managed_env pins API_SERVER_KEY to a different value than this container's env — the managed file is applied last, so the gateway will accept ITS key and 401 the credential proxy, the startup probe and every in-pod caller (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit the same value as the container env." >&2
+    else
+        # No pin for this key at all: the managed file overrides nothing, so the winner is
+        # $TARGET_DIR/.env — where Hermes' stage2 hook generates a random key that nothing
+        # outside the gateway process knows. This is the pre-fix shape exactly, and it is
+        # what a stale (chat-only) ConfigMap still renders.
+        echo "WARN: $_wuakip_managed_env does not pin API_SERVER_KEY — with no managed pin the PVC's $TARGET_DIR/.env wins, and Hermes' stage2 hook generates a random key there that the credential proxy, the startup probe and every in-pod caller will 401 against (issue #786). Re-render the operator's config ConfigMap; renderManagedEnv must emit API_SERVER_KEY." >&2
+    fi
+    return 0
+}
+
+# Gated on the key being SET as well as on the managed dir, and not only because there is
+# nothing to compare otherwise: an unset API_SERVER_KEY is Hermes' own supported shape —
+# stage2 generates one and the pod is internally consistent — so it is the operator's
+# arrangement, half-applied, that this is looking for.
+if [ -n "$MANAGED_DIR" ] && [ -n "${API_SERVER_KEY:-}" ]; then
+    warn_unless_api_key_is_pinned "$MANAGED_DIR/.env" "$API_SERVER_KEY"
 fi
 
 # The image's own copy of the scaffolder, never the volume's. Step 2 seeds
@@ -754,15 +1079,21 @@ fi
 #     restart. So config.yaml leaves the --items list, and step 2.6b below
 #     back-fills it the way step 2d back-fills the default profile's, with the
 #     same fill-only rule and the same trade: keys the image ADDS still arrive,
-#     keys the file already holds stay as the agent last wrote them. Everything
-#     else here force-syncs either way.
+#     keys the file already holds stay as the agent last wrote them — plus the
+#     same remote MCP User-Agent repair the cluster loop runs, for the one
+#     image-owned value the fill cannot reach. Everything else here force-syncs
+#     either way.
 #   - A cluster config.yaml is identity-stamped at scaffold time with that
 #     cluster's `cluster_identity` block (project/cluster/location), so it is
 #     runtime state. Overwriting it from the template would strip the record
 #     cluster_agent_reconcile.py matches a profile to its cluster by, and the
 #     reconciler would then scaffold a duplicate profile it can never prune.
 #     (KUBECONFIG is not in this file — it is pinned in the profile's .env by
-#     cluster_agent_profile.py:_pin_kubeconfig_env.)
+#     cluster_agent_profile.py:_pin_kubeconfig_env.) The two image-owned values
+#     inside it are repaired in place instead, in the cluster loop below: the
+#     retired `memory.provider` key is dropped, and the remote MCP User-Agent is
+#     set to the template's, so an upgraded volume sends the same header a fresh
+#     one does.
 #
 # Profile identity is NOT at risk either way: `hermes profile create` records the
 # name and description in profiles/<name>/profile.yaml, a separate file that no
@@ -888,9 +1219,13 @@ fi
 # is otherwise frozen at whatever version first created the PVC — a helper script
 # fixed months ago is still the broken one on every upgraded cluster.
 #
-# Skills are wholly image-owned (nothing writes runtime state under them; the
-# cluster overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the
-# same way), so this is a whole-directory REPLACE rather than a copy-over: a
+# Skills are wholly image-owned (nothing durable lives under them: the cluster
+# overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the same
+# way, the image's skill_manage gate refuses a write that would touch a shipped
+# skill and its file tools refuse any write under the tree --
+# deploy/docker/patches/skill_manage_image_owned.py -- and a skill the
+# agent authors under a new name is discarded by this replace, deliberately),
+# so this is a whole-directory REPLACE rather than a copy-over: a
 # skill deleted from the image has to actually disappear, or a retired procedure
 # stays loadable forever. That is also why this still runs for the platform
 # profile even though step 2.6 just listed `skills` in its --items: the
@@ -915,9 +1250,20 @@ fi
 # not exist, and a profile with no skills at all is worse than one with stale
 # ones — `hermes` reports "Unknown skill(s)" and the worker exits 1. So a failure
 # there puts the original back rather than leaving the gap.
+#
+# $3 is an OPTIONAL second source directory, overlaid onto the staged copy
+# before the swap. It exists for the A2A skill (step 2.6a-bis's gate decides
+# whether to pass it), and it goes through here rather than writing into the
+# live directory afterwards for the reason the staging exists at all: a
+# non-staged writer that lands in another replica's swap window recreates
+# $_dst holding only ITS files, which sends the other pod down the
+# "reappeared during the swap" arm below and leaves the shared profile with
+# no real skills at all. Composed here, the whole tree — template plus
+# overlay — is still installed by one rename.
 sync_profile_skills() {
     _src="$1/skills"
     _dst="$2/skills"
+    _overlay="${3:-}"
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
@@ -940,6 +1286,7 @@ sync_profile_skills() {
     #
     # $_src is NOT shared: it is the read-only image template inside this container,
     # so only the destination side needs this.
+    # shellcheck disable=SC3028 # the next two lines fall back to hostname and $$ where HOSTNAME is unset
     _tag="${HOSTNAME:-}"
     [ -n "$_tag" ] || _tag="$(hostname 2>/dev/null || true)"
     [ -n "$_tag" ] || _tag="$$"
@@ -979,6 +1326,17 @@ sync_profile_skills() {
         return 0
     fi
 
+    # The optional overlay, onto the staging tree only. A failure here is the
+    # same class as a failed stage: abandon the swap and keep what the profile
+    # already has, rather than installing a half-composed tree.
+    if [ -n "$_overlay" ] && [ -d "$_overlay" ]; then
+        if ! cp -a "$_overlay"/. "$_new"/ 2>/dev/null; then
+            rm -rf "$_new" 2>/dev/null || true
+            echo "WARN: could not stage the $_overlay overlay for $2; the profile keeps its existing copy" >&2
+            return 0
+        fi
+    fi
+
     if [ -e "$_dst" ] && ! mv "$_dst" "$_old" 2>/dev/null; then
         rm -rf "$_new" 2>/dev/null || true
         echo "WARN: could not move the existing skills aside in $2; the profile keeps its existing copy" >&2
@@ -1013,9 +1371,93 @@ sync_profile_skills() {
     rm -rf "$_old" 2>/dev/null || true
     return 0
 }
+# 2.6a-bis The A2A topics skill, overlaid into the platform profile only when
+# this install runs the next stack. The skill ships OUTSIDE the platform
+# template (/opt/a2a-template, see the Dockerfile) so that 2.6a's replace
+# never installs it on a today install: the mode switch's promise is that a
+# normal install cannot tell the feature exists, and a skill file in the
+# template would break it on day one. It rides 2.6a's staging as the overlay
+# argument rather than being copied in afterwards — see the note on $3 — so
+# the composed tree lands in one rename. A flip back to today self-cleans:
+# the next boot stages the template alone and renames that over the profile.
+#
+# The gate asks runtime_mode.py, the one agent-side reader the mode spec
+# allows. The mode rides the managed .env, which Hermes applies at load time
+# — it is NOT in this shell's environment — so the helper hands the managed
+# file to Python and lets runtime_mode read it from there.
+#
+# Parsed as the strict KEY=value lines renderManagedEnv writes, never sourced:
+# `.` in a shell would execute anything a value with a space grew, and this
+# script is pid 1.
+#
+# os.environ is CLEARED first, so the managed file is the only thing that can
+# answer. Without that the inherited container env would be a second delivery
+# path for the mode — an AgentPlugin's spec.env is copied into the container
+# verbatim — and the spec's whole point is that one delivery path means one
+# answer. Clearing also keeps this file from naming the key a third time,
+# which is what the grep rule forbids.
+#
+# Exit meanings: 0 next, 1 today (or no managed scope at all — a compose or
+# `docker run` start, not a fault), 2 the managed scope exists but its .env
+# could not be read or the reader is missing. Only 0 overlays; 2 warns,
+# because on an operator-managed install that is a real fault the skill's
+# silent absence would otherwise hide. Guarded like 2.6a: nothing here ever
+# kills the boot.
+a2a_mode_probe() {
+    [ -n "${HERMES_MANAGED_DIR:-}" ] || return 1
+    "$INSTALL_DIR/.venv/bin/python3" - "$HERMES_MANAGED_DIR/.env" <<'A2A_PYEOF'
+import os, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        lines = f.readlines()
+except OSError:
+    sys.exit(2)
+
+os.environ.clear()
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, _, value = line.partition("=")
+    key = key.strip()
+    # An empty key is not a pin and os.environ refuses it; skipping keeps a
+    # malformed line from being reported as an unreadable file.
+    if key:
+        os.environ[key] = value.strip()
+
+try:
+    sys.path.insert(0, "/opt/defaults/scripts")
+    import runtime_mode
+except Exception:
+    # A missing or broken reader is not "today" — it is an image fault, and
+    # exit 2 is what says so instead of a bare traceback read as a decision.
+    sys.exit(2)
+
+sys.exit(0 if runtime_mode.is_next() else 1)
+A2A_PYEOF
+}
+
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform"
+    # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
+    # is a return value here, not a failure.
+    a2a_overlay=""
+    if [ -d /opt/a2a-template/skills ]; then
+        a2a_probe_rc=0
+        a2a_mode_probe || a2a_probe_rc=$?
+        case $a2a_probe_rc in
+            0)
+                a2a_overlay=/opt/a2a-template/skills
+                echo "Next stack: overlaying the A2A topics skill into the platform profile"
+                ;;
+            2)
+                echo "WARN: the managed scope has no readable .env; treating the mode as today and skipping the A2A skill overlay" >&2
+                ;;
+        esac
+    fi
+    sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform" "$a2a_overlay"
 fi
+
 # 2.6 (continued), for the cluster profiles: personas from the template, skills through
 # the helper defined just above, and one targeted config repair. Kept after 2.6a only
 # because it is the caller — everything here belongs to 2.6's force-sync, not to it.
@@ -1045,6 +1487,25 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         if [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
                 || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
+        fi
+        # Second targeted self-heal, same file, same reason it is not force-synced: the
+        # User-Agent the profile's remote MCP calls carry is image-owned, and lives in
+        # an arg list that neither the force-sync nor a fill-only merge reaches. Without
+        # this, every cluster onboarded before an image changed the header keeps
+        # sending the old one for the life of the volume, while the platform profile
+        # and every newly onboarded cluster send the new one — two header shapes from
+        # one build, on a value the API teams key dashboards on. The helper writes
+        # only when the value differs, so a profile already current is not rewritten.
+        if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
+            repair_remote_mcp_user_agent "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
+                || echo "WARN: failed to repair the remote MCP User-Agent in $d/config.yaml; this cluster agent keeps sending the header it was scaffolded with" >&2
+        fi
+        # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
+        # cron store if one exists on the PVC.
+        if [ -f "$d/cron/jobs.json" ] && [ -w "$d/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+                "$SCAFFOLD" --backfill-cron "$d/cron/jobs.json" \
+                || echo "WARN: failed to backfill risk tier in $d/cron/jobs.json" >&2
         fi
     done
 fi
@@ -1091,6 +1552,13 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
         backfill_config_from_template \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
             || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
+        # The fill leaves lists alone, so the one image-owned value inside one — the
+        # remote MCP User-Agent — is repaired in place, exactly as the cluster loop
+        # above does for its profiles. Force-synced, flag off, the file already
+        # carries it; this is the front door taking the same repair.
+        repair_remote_mcp_user_agent \
+            "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
+            || echo "WARN: could not repair the remote MCP User-Agent in profiles/platform/config.yaml; the front door keeps sending the header it was scaffolded with" >&2
     else
         echo "[ENTRYPOINT] profiles/platform/config.yaml is missing; seeding it from the image template." >&2
         cp "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
@@ -1238,7 +1706,10 @@ fi
 # Both values come from the operator's env. The endpoint matters because hermes_otel does
 # NOT read OTEL_EXPORTER_OTLP_ENDPOINT — its backend URL is baked into the image, so
 # without this sweep a customer-configured collector would show up in the pod env and in
-# .status.telemetry while every span still went to the GKE managed collector.
+# .status.telemetry while every span still went to the GKE managed collector. Likewise,
+# when telemetry is disabled (OTEL_SDK_DISABLED=true or HERMES_OTEL_ENABLED=false), passing
+# --disabled turns off hermes_otel and clears backends so spans are not exported to an
+# unresolvable default.
 #
 # Every profile carries its own copy of the plugin config (profile_scaffold copytrees
 # /opt/defaults/plugins), so otel_config sweeps them all, deriving each from the pristine
@@ -1252,11 +1723,18 @@ fi
 # this far. The step-1.5 gate now stops that container much earlier; this guard is what
 # keeps a non-primary owner (an HA replica) from repeating the damage.
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/otel_config.py" ]; then
+    OTEL_EXTRA_ARGS=""
+    hermes_otel_val=$(printf '%s' "${HERMES_OTEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    otel_sdk_val=$(printf '%s' "${OTEL_SDK_DISABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [ "$hermes_otel_val" = "false" ] || { [ "$hermes_otel_val" != "true" ] && [ "$otel_sdk_val" = "true" ]; }; then
+        OTEL_EXTRA_ARGS="$OTEL_FLAG_DISABLED"
+    fi
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" "$TARGET_DIR/scripts/otel_config.py" \
         --hermes-home "$TARGET_DIR" \
         --service-name "${OTEL_SERVICE_NAME:-}" \
         --endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
         --defaults-plugins /opt/defaults/plugins \
+        $OTEL_EXTRA_ARGS \
         || echo "WARN: could not update the OpenTelemetry plugin config; traces may go to the image default" >&2
 fi
 
@@ -1269,8 +1747,36 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
     OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
     mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    # shellcheck disable=SC3013 # -ef is implemented by dash and busybox ash, the shells this image runs
     if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
         ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
+    fi
+fi
+
+# 4b. Copy the managed terminal settings into every profile's .env, then check with Hermes
+# that each profile's scheduled runs resolve the ssh backend. The terminal scope a cron job
+# runs under ignores the managed config, so without the copy it falls back to Hermes'
+# default local backend; terminal_env_pin.py says why .env is the place. A key in a
+# profile's config.yaml that outranks the copy is deleted, as Hermes' own save does.
+# Cluster profiles scaffolded after start-up are pinned by cluster_agent_profile.py.
+#
+# FATAL, unlike the managed-scope assertion above: the operator configures one terminal
+# for every agent run, and a profile whose scheduled runs resolve another is misconfigured.
+# A profile whose .env took the copy but whose config.yaml Hermes cannot read or parse is
+# only reported: its scheduled runs fail until the file is fixed.
+# With HERMES_MANAGED_DIR set, the operator's marker as for the managed-scope assertion, a
+# managed config that is missing, unreadable, not ssh, or holds a value .env cannot carry
+# is fatal too; elsewhere (compose, `docker run`, the kustomize bases) it copies only a
+# terminal block it finds.
+# Primary only, under the bootstrap lock, for the same shared-PVC reason as step 4.
+# Run from the image, not the PVC copy the agent can write. The `-f` guard skips only on
+# a host: every image copies the file to this path, and the platform build check runs it
+# from here.
+TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
+    if ! "$INSTALL_DIR/.venv/bin/python3" "$TERMINAL_ENV_PIN_SCRIPT" --hermes-home "$TARGET_DIR" --sweep; then
+        echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
+        exit 1
     fi
 fi
 
@@ -1282,6 +1788,22 @@ if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     flock -u 9 2>/dev/null || true
     exec 9>&-
 fi
+
+# 4.5 The scratch directory scripts stage files in — the fleet audit's findings
+# JSON, and the `gh --body-file` payloads github_scan_gate._post_body hands to
+# the credential sidecar. The audit's own bodies no longer come through here:
+# they travel on stdin (audit_report.BODY_STDIN), which is where the remaining
+# body-file caller should end up too.
+# Created HERE, deterministically and under this script's umask-0002 discipline
+# (the header comment on the #955 UID split), rather than lazily by whichever
+# process reaches it first with whatever umask it happens to carry: the sandbox
+# (uid 10000) writes these files and the sidecar (uid 10001) reads them through
+# the shared fsGroup, which only works if the directory is group-accessible.
+# The chmod also repairs a long-lived PVC where a pre-#955 process already
+# created it too tight; guarded because an already-correct dir owned by the
+# peer uid may refuse the chmod, and that is fine.
+mkdir -p "$TARGET_DIR/scratch"
+chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
 
 # 5. Start background microservices (FastAPI proxy)
 #
@@ -1301,12 +1823,10 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/session_kv_ser
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 127.0.0.1 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
-# 5.5. The default kubectl context is NOT established here. `gcloud` in this
-# container is the credential-proxy shim, so get-credentials would execute in
-# the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
-# outright, because the steps above run from a working directory outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT (step 6 moves into it, but only for the agent
-# process it execs). The sidecar bootstraps its own context from
+# 5.5. The default kubectl context is NOT established here. There is no `gcloud`
+# in this container at all as of #737 — not the binary and not the shim — and
+# before that the shim would have run get-credentials in the sidecar and written
+# the sidecar's kubeconfig, not ours. The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
 # request. The k8s-event-watcher does not need a copy either: it runs inside the
@@ -1364,16 +1884,92 @@ if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; t
     ) &
 fi
 
-# 6. Execute primary process from inside the shared workspace.
+# 5.7. Mirror the profile layout into the shell sandbox, and move the model's
+# existing files across the first time.
 #
-# The image inherits WORKDIR /opt/hermes from the upstream base, and every
-# credentialed CLI in this container (kubectl, gcloud, gh, git) is a PATH shim
-# for credential_proxy_client.py. That client posts `"cwd": os.getcwd()` on
-# every request unconditionally, and the proxy refuses any cwd outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT — which the operator sets to this same
-# $TARGET_DIR. Launched from /opt/hermes, therefore, a plain `kubectl version
-# --client` fails with "working directory is outside the shared workspace"
-# before it runs, purely because of where the process was started.
+# The shell, the file tools and execute_code all run in the sandbox pod now, so
+# two things that used to be true stopped being true on the day that landed.
+# Paths under $TARGET_DIR/profiles/<name> no longer resolve for a file tool —
+# the sandbox has the machine home and nothing below it — and everything the
+# model had already written to $TARGET_DIR became invisible to it while staying
+# on the volume. The script's docstring covers what crosses and what does not.
+#
+# Here rather than in the sandbox's own entrypoint because the profile list is
+# on this pod's PVC and cluster profiles are created at runtime; the sandbox
+# cannot enumerate what it has never seen. cluster_agent_profile.py calls the
+# same script with --skeleton-only when it scaffolds one, so a profile created
+# between restarts does not wait for the next one.
+#
+# Foreground, and fatal on EXIT_FATAL only. It was neither, and the reason it
+# was both is sound as far as it goes: the sandbox is a separate StatefulSet
+# with no start ordering against this Deployment, so "not up yet" is an ordinary
+# outcome rather than an error. What that misses is that the script already
+# draws the distinction. A sandbox that never answers inside --wait returns 0
+# and leaves the marker unwritten, so the next start retries; the fatal exits
+# are a --remote-root that is not the sandbox's volume, and a transfer that ran
+# and failed. Neither is survivable and neither is transient, so backgrounding
+# them bought nothing but silence: the agent came up healthy, the model's files
+# were still on this volume where its shell can no longer see them, and the sole
+# trace was a WARN line in a log file nobody reads. That happened on a live
+# upgrade — ten cluster profile homes, every one Permission denied — and it was
+# found by hand, days later.
+#
+# Fatal on *those* and not on everything non-zero, which is the correction. The
+# layout push and the marker write both reach a filesystem uid 1000 owns, so the
+# model can make either fail — and while any non-zero exit landed here, that was
+# a way for a prompt injection to CrashLoopBackOff this container permanently,
+# with no path back because the thing that would repair it is the thing that is
+# down. Those two now return EXIT_RETRY and warn instead.
+#
+# Exiting non-zero here is what makes it visible, and it needs no privilege the
+# agent does not have. The kubelet restarts the container, CrashLoopBackOff
+# follows, and getDeploymentStatusDetails in the operator already scans the
+# gateway pod's container statuses for a waiting reason and writes it into the
+# CR: phase Degraded, Ready=False, and a message naming this container. The
+# tail below puts the cause in `kubectl logs`, which is where the CR sends you.
+#
+# The cost is startup latency in the one case that blocks — a sandbox that is
+# slow rather than absent — bounded by --wait at 180s. The startupProbe budget
+# is agentAPIProbe(10, 60), 600s, and progressDeadlineSeconds is 1200, so the
+# wait fits with room over. The copy itself runs once: it is guarded by a marker
+# on the sandbox's own volume, so a fresh sandbox PVC gets a fresh copy and every
+# later start skips it and re-pushes only the layout.
+#
+# Gated on IS_BOOTSTRAP_PRIMARY: every replica can reach the sandbox, and two
+# tar streams extracting into the same directory would race. --skip-old-files
+# makes that lossless rather than harmful, but there is no reason to run it
+# twice.
+SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"
+[ -f "$SANDBOX_MIRROR_SCRIPT" ] || SANDBOX_MIRROR_SCRIPT="$TARGET_DIR/scripts/sandbox_mirror.py"
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SANDBOX_MIRROR_SCRIPT" ]; then
+    echo "Mirroring the profile layout into the shell sandbox..."
+    SANDBOX_MIRROR_RC=0
+    HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
+        >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1 || SANDBOX_MIRROR_RC=$?
+    if [ "$SANDBOX_MIRROR_RC" = "$SANDBOX_MIRROR_RETRY_RC" ]; then
+        echo "WARN: the shell sandbox mirror did not finish, in a way the next start retries. Nothing has been lost -- the copy either has not run or has already landed. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+    elif [ "$SANDBOX_MIRROR_RC" != "0" ]; then
+        echo "FATAL: the shell sandbox migration failed. The model's files are still on this pod's volume, where its shell cannot reach them, so this container is refusing to start rather than come up looking healthy with the agent's work missing. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+        exit 1
+    fi
+fi
+
+# 6. Execute primary process from inside the agent's own directory.
+#
+# The image inherits WORKDIR /opt/hermes from the upstream base, which is
+# read-only to the runtime user, so a process left there writes every relative
+# path into a directory it cannot write and loses every one it can. $TARGET_DIR
+# is the writable home on the PVC.
+#
+# This used to be a credential rule as well: every CLI in this container was a
+# credential-proxy shim, the client posted `"cwd": os.getcwd()` on every
+# request, and the proxy refused any cwd outside its workspace root — so a plain
+# `git status` launched from /opt/hermes failed before it ran. #737 took the
+# shims out of this image entirely, so what is left is the write-path reason
+# above, which is enough on its own.
 #
 # The cwd is the only lever that reaches every caller. Hermes resolves the
 # terminal and execute_code working directories from a ladder that ends at
@@ -1388,7 +1984,7 @@ fi
 # one. $TARGET_DIR is created in step 2 and written throughout, so the warning
 # is a canary for a broken mount rather than an expected path.
 if ! cd "$TARGET_DIR"; then
-    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+    echo "WARN: could not enter $TARGET_DIR; relative paths will resolve against a read-only directory" >&2
 fi
 
 exec "$@"

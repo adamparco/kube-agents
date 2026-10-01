@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """One private git clone per concurrent operation, so agents stop stomping.
 
 The pod does not run in a checkout. `hermes run` starts an agent in its profile
@@ -10,7 +10,7 @@ Why the clone is *leased*
 -------------------------
 The first version of this file put every repository at one flat path, a pure
 function of `owner/name`. That is exactly one working tree for the whole pod,
-and the pod runs many agents at once: six audit crons, plus every kanban worker
+and the pod runs many agents at once: the audit crons, plus every kanban worker
 the dispatcher spawns, plus whatever the operator is doing interactively. In the
 incident that prompted this design, the `submit-suggestion` skill ran
 `git checkout -b …` and `git push -f` inside the tree a fleet audit was midway
@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import subprocess
@@ -59,7 +60,32 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
+import repo_ref
+
 DEFAULT_AGENT_HOME = "/opt/data"
+
+# The two keys of the `<agent>-gitops-state` ConfigMap this module reads.
+#
+# `managed_repos` is the list the agent may *write* to: the credential
+# broker's push gate (`credential_proxy.repository_is_managed`), `resolve_repo`
+# below, and the operator's token-minter policy all read it, so an entry there
+# is a repository the harness can open pull requests against.
+#
+# `context_repos` is the list the agent may only *read* — Terraform or GitOps
+# repositories consulted for declared intent before an audit reports a
+# finding. It is a separate key, and nothing in this module merges it into the
+# managed list, which is what makes a context repository read-only by
+# construction: the push gate and the resolver never see it. It has three
+# readers. Two read it for a read-only grant — the operator renders a
+# `contents: read` minter policy per entry, and the broker's content-mode clone
+# presents the token minted from it (`repository_role` in credential_proxy.py,
+# consulted by no write path) — and the fleet-audit helper (`audit_report.py
+# start`) reads it to tell the SOP which repositories to search. A `role: context` marker
+# inside `managed_repos` would instead be flattened by `_parse_repos_json` into
+# a writable entry. The operator's reconcile leaves keys it does not own alone,
+# so a hand-added `context_repos` survives it.
+MANAGED_REPOS_KEY = "managed_repos"
+CONTEXT_REPOS_KEY = "context_repos"
 
 
 def agent_home() -> str:
@@ -105,42 +131,53 @@ LEASE_FILENAME = ".lease"
 # somehow straddles the TTL loses its untracked manifests and re-clones, which
 # is the same outcome a crashed run already had.
 DEFAULT_LEASE_TTL_HOURS = 24.0
-
-def default_settings_path() -> str:
-    """`<agent home>/SETTINGS.md`.
-
-    Written by the operator at provisioning time, so it is present from the
-    first second of the pod's life — unlike a clone, which is what makes it the
-    only usable repository source before anything has been cloned. Derived from
-    `agent_home` for the same reason `default_root` is: on a deployment that
-    moved its home, a hardcoded path is simply a file that is not there, and
-    `resolve_repo` then falls through to a git remote that does not exist yet.
-    """
-    return str(Path(agent_home()) / "SETTINGS.md")
-
-
 # The branch a pull request targets when nothing better can be determined —
 # which is only when there is no clone to ask yet. See `resolve_base_branch`.
 DEFAULT_BASE_BRANCH = "main"
 
-# Tolerates the operator's Markdown bullet and bold markers, and the literal
-# `None` when the CR leaves it unset.
-SETTINGS_REPO_RE = re.compile(r"^\s*[-*]?\s*\**Git Repo:\**\s*(\S+)\s*$", re.M)
+
+class GitOpsRepoEmpty(RuntimeError):
+    """Raised when a GitOps repository has no commits on any branch."""
+
 
 _LEASE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_LEASE_CHARS = 64
 
+LOGGER = logging.getLogger(__name__)
+
+#: The `type` on a `managed_repos` entry that this agent has a provider for.
+#: The operator only ever authors this value, but `parseManagedRepoEntries`
+#: round-trips whatever it finds, so an administrator editing the ConfigMap by
+#: hand — the unregistration path, described in the comment on
+#: `platformagent_controller.go`'s repository reconcile — can put another one
+#: there.
+GITHUB_REPO_TYPE = "github"
+
+#: The optional `ref` on a `context_repos` entry: the branch the declared-intent
+#: search reads instead of the remote's HEAD. Held to the shape of a git branch
+#: name and, above all, never allowed to begin with `-`, because the value is
+#: handed to `inspect_repository.py clone --ref` and from there to `git`, where
+#: a leading dash is an option. An entry whose `ref` fails the shape keeps its
+#: URL and carries the refused value under `refused_ref` instead, with a
+#: warning; the declared-intent search then skips the repository rather than
+#: reading its default branch, because the pin exists so that a curated branch
+#: is what silences a posture, and the default branch is where anyone with
+#: ordinary write access lands a note. The slug stays in every list, so the
+#: ledger names the repository as one not searched until the entry is fixed.
+CONTEXT_REF_KEY = "ref"
+CONTEXT_REF_REFUSED_KEY = "refused_ref"
+_REF_SHAPE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]{0,254}\Z")
+# `@` is admitted after the first character: `release@2026` is a branch name
+# git accepts, and a lone `@`, which it does not, fails the first class.
+# `git check-ref-format`'s rules, the ones the shape regex above leaves open:
+# no `..`, no component starting with `.`, no empty component, no `@{`, and
+# no component ending in `.lock` — `.lock/` catches one in the middle, the
+# suffix below one at the end; `git clone --branch foo.lock/bar` exits 128,
+# so refusing it here names the reason on the entry instead of at the clone.
+_REF_FORBIDDEN_SUBSTRINGS = ("..", "/.", "//", "@{", ".lock/")
+_REF_FORBIDDEN_SUFFIXES = ("/", ".", ".lock")
+
 Runner = Callable[..., object]
-
-
-def settings_path() -> str:
-    return (
-        os.environ.get("GITOPS_SETTINGS")
-        or os.environ.get("FLEET_AUDIT_SETTINGS")
-        or default_settings_path()
-    )
-
-
 # One `git symbolic-ref` per clone per process, keyed by workspace path. The
 # answer cannot change while a process runs, and the call is not free: `git`
 # here is a shim that POSTs to the sidecar, so every repeat is an HTTP round
@@ -161,23 +198,27 @@ def resolve_base_branch(
 ) -> str:
     """The branch a pull request should target, for *this* repository.
 
-    Hardcoding `main` was wrong in a quiet way. This harness clones whatever
-    repository `SETTINGS.md` names, and a fleet whose GitOps repo still calls
+    Hardcoding `main` was wrong in a quiet way. This harness clones the target
+    GitOps repository, and a fleet whose GitOps repo still calls
     its trunk `master` got `origin/main` — a ref that does not resolve. Every
     remediation branch then failed at checkout, and the audit reported the fix
     it could not push as a fix the model never wrote.
 
     Resolution order:
 
-    1. `GITOPS_BASE_BRANCH`. For a repository whose default branch is not the
-       branch the fleet deploys from — a `release` line, say. Nothing this
-       function can observe would tell it that, so an operator has to.
+    1. `CREDENTIAL_PROXY_BASE_BRANCH` or `GITOPS_BASE_BRANCH`. For a repository
+       whose default branch is not the branch the fleet deploys from — a `release`
+       line, say. Nothing this function can observe would tell it that, so an operator
+       has to.
     2. `origin/HEAD` in the clone. `git clone` sets it from the default the
        remote advertises, which is the right answer for every ordinary
        repository, and it costs one `symbolic-ref`.
     3. `main`, when there is no clone to ask yet.
     """
-    override = os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    override = (
+        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
+        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    )
     if override:
         return override
     if workspace is None:
@@ -511,6 +552,9 @@ def ensure_workspace(
     until the remediation branch stages them, so a `git clean -fd` on the way
     into `finish` deletes every fix the audit just produced and the run reports
     them all as "the file was never written".
+
+    Raises `GitOpsRepoEmpty` if the target repository has zero commits on any
+    branch, preventing dispatch runs from crashing on raw git fatal errors.
     """
     root = Path(root if root is not None else default_root())
     lease = sanitize_lease(lease)
@@ -544,12 +588,85 @@ def ensure_workspace(
     # the clone, and the clone is what the lines above just established.
     base_branch = base_branch or resolve_base_branch(target, runner)
 
+    # An empty repository has no commits on any branch, so origin/<base_branch>
+    # cannot exist. Probe before checkout rather than dying on raw git fatal output.
+    ref_check = runner(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base_branch}"],
+        cwd=str(target),
+        check=False,
+    )
+    if getattr(ref_check, "returncode", 1) != 0:
+        all_commits = runner(
+            ["git", "rev-list", "-n", "1", "--all"],
+            cwd=str(target),
+            check=False,
+        )
+        if (
+            getattr(all_commits, "returncode", 1) != 0
+            or not (getattr(all_commits, "stdout", "") or "").strip()
+        ):
+            raise GitOpsRepoEmpty(
+                f"{repo} has no commits on any branch; the audit cannot open a remediation branch"
+            )
+        raise RuntimeError(f"{repo} has no remote branch origin/{base_branch}")
+
     runner(["git", "reset", "--hard", "--quiet"], cwd=str(target), check=False)
     runner(["git", "clean", "-fdq"], cwd=str(target), check=False)
     runner(
         ["git", "checkout", "-B", base_branch, f"origin/{base_branch}"],
         cwd=str(target),
     )
+    return target
+
+
+def ensure_scratch_workspace(
+    repo: str,
+    *,
+    lease: str,
+    root: str | Path | None = None,
+    reset: bool = False,
+    owner: str | None = None,
+) -> Path:
+    """The same leased path as `ensure_workspace`, with no clone in it.
+
+    What a caller gets is a directory and nothing else: no `.git`, no remote, no
+    checkout. It is for the content-passing path, where the repository lives in
+    the broker and the agent's side of the exchange is a pile of files it wrote.
+    Removing the clone is the point — a `.git` the agent can write is where a
+    filter driver, an alias or a hook path would have to be defined for the
+    known code-execution routes through the credential container to work, and
+    an agent that never has one cannot define any of them.
+
+    Everything else about the lease is unchanged, deliberately. The path is the
+    same function of repository and lease, so `start` and `finish` still find
+    each other with no lookup state; the marker is still written, so the reaper
+    still collects the directory when the stream stops running; and the reap
+    still happens here, so a fleet that migrates does not leave its old clones
+    behind forever.
+
+    `reset` empties the directory. Same rule as the clone path: only the command
+    that runs *before* the agent writes anything may ask for it.
+    """
+    root = Path(root if root is not None else default_root())
+    lease = sanitize_lease(lease)
+    holder = lease_dir(root, lease)
+    target = workspace_path(repo, root, lease=lease)
+
+    with workspace_lock(root):
+        root.mkdir(parents=True, exist_ok=True)
+        reap_stale_leases(root, keep={lease})
+        write_lease(holder, lease, repo, owner=owner)
+
+    # `reset` is the only thing that deletes, including when what is there is a
+    # clone left by the directory path. A stream whose broker was armed between
+    # `start` and `finish` finds one, and clearing it then would delete the
+    # manifests the agent wrote in between — the same data loss `reset=False`
+    # exists to prevent on the clone path. Nothing runs `git` here, so an
+    # unwanted `.git` sitting in the directory for one run is inert; the next
+    # `start` takes it away.
+    if reset and target.exists():
+        _remove_tree(target)
+    target.mkdir(parents=True, exist_ok=True)
     return target
 
 
@@ -604,54 +721,380 @@ def configure_identity(
     runner(["git", "config", "user.email", email], cwd=str(target))
 
 
-def repo_from_settings(path: str | None = None) -> str | None:
-    """The target repository as `owner/name`, from SETTINGS.md, or None.
+def is_valid_repo_slug(repo: str) -> bool:
+    """Validate that repo is formatted as owner/name without path traversal or flag injection."""
+    return repo_ref.is_github_slug(repo)
 
-    This is the only repo source that works before the clone exists, which is
-    why it is tried first. `github-issue-resolver/scripts/resolver.py` reads the
-    same line; the skills agree by construction rather than by coincidence.
+
+def validate_repo_org(repo: str) -> str:
+    """Validate that repository slug belongs to the configured primary GitHub organization if set."""
+    primary_org = os.environ.get("GITOPS_ORG") or os.environ.get("GITHUB_ORG")
+    if primary_org and repo and "/" in repo:
+        owner = repo.split("/", 1)[0]
+        if owner.lower() != primary_org.lower():
+            raise ValueError(
+                f"Cross-org repository {repo!r} is not supported. Platform Agent minter is bound to organization {primary_org!r}."
+            )
+    return repo
+
+
+def extract_github_slug(entry: str) -> str | None:
+    """Extracts 'owner/repo' slug from a raw URL or shorthand if it refers to GitHub.
+
+    The host set is narrowed to `GITHUB_CANONICAL_HOST` rather than every
+    spelling a git remote can carry, because this reads a *registered*
+    repository URL rather than a clone URL.
+
+    The accepted *syntax* is wider than the four literal prefixes this
+    replaced, and deliberately so: `ssh://`, `git://` and any other scheme,
+    userinfo, a `?query` or `#fragment`, and `GitHub.com` in any casing all now
+    resolve. Each of them still names `github.com/owner/name` — the host is
+    parsed, so a scheme cannot redirect it elsewhere — so the widening changes
+    the spellings an administrator may write, not which repository an entry
+    resolves to.
     """
+    return repo_ref.try_github_slug(
+        entry, hosts=frozenset({repo_ref.GITHUB_CANONICAL_HOST})
+    )
+
+
+DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+# How long `_read_state_key`'s ConfigMap fallback read waits on the API server
+# before giving up.
+# One namespaced GET against an in-cluster endpoint, so this is not a budget so
+# much as a ceiling on a call that has no other one: unbounded, an API server
+# that accepts the connection and then stops talking hangs the caller forever
+# rather than failing it, and nothing between this call and whatever deadline
+# encloses the run would report that as a read failure.
+GITOPS_STATE_READ_TIMEOUT_SECONDS = 30
+
+
+def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict[str, str]]:
+    """Parse a JSON list of `{type, url}` repository entries under ConfigMap key `key`.
+
+    Both keys share one shape and one parser. What they do not share is a
+    caller: nothing hands a `context_repos` list to anything that gates a
+    write, and keeping the parser ignorant of which list it is parsing is
+    what keeps that true — there is no field it could read to promote one.
+    """
+    repos_str = repos_str.strip()
+    if not repos_str:
+        return []
+    entries: list[dict[str, str]] = []
+    if repos_str.startswith("["):
+        try:
+            parsed = json.loads(repos_str)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        url = str(item.get("url", "")).strip()
+                        repo_type = str(item.get("type", "")).strip()
+                        if url and repo_type:
+                            entry = {"type": repo_type, "url": url}
+                            ref, refused = _context_ref(item, url, key)
+                            if ref:
+                                entry[CONTEXT_REF_KEY] = ref
+                            elif refused is not None:
+                                entry[CONTEXT_REF_REFUSED_KEY] = refused
+                            entries.append(entry)
+        except json.JSONDecodeError as err:
+            LOGGER.warning("Failed to decode %s JSON: %s", key, err)
+            return []
+    else:
+        LOGGER.warning("%s JSON does not start with '[': %r", key, repos_str)
+        return []
+    return entries
+
+
+def is_valid_ref(ref: object) -> bool:
+    """True for a value shaped like a git branch name that cannot read as a flag."""
+    if not isinstance(ref, str) or not _REF_SHAPE_RE.match(ref):
+        return False
+    if any(part in ref for part in _REF_FORBIDDEN_SUBSTRINGS):
+        return False
+    return not ref.endswith(_REF_FORBIDDEN_SUFFIXES)
+
+
+def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None]:
+    """`(ref, refused)`: the entry's `ref` when it is a branch name, else the value refused.
+
+    Only a `context_repos` entry may carry one: the managed list is what the
+    push gate and the resolver read, and a branch pin there would be a claim
+    about where fixes land that nothing downstream honours. A refused value
+    is returned rather than dropped, with a warning naming it, so the caller
+    can mark the entry and the declared-intent search can skip the repository
+    instead of reading its default branch in the pin's place.
+    """
+    if CONTEXT_REF_KEY not in item or key != CONTEXT_REPOS_KEY:
+        return None, None
+    # Only an absent key means "no pin". A `null`, empty or blank value is
+    # refused with the rest: each is what a template with an unset variable
+    # emits, and the pin it lost is the one the default branch must not
+    # stand in for. Only a string is a candidate at all: `123` or `false` is
+    # a template that emitted the wrong type, not a branch named `123` or
+    # `False`, which `str()` would have made of it. A refused value that is
+    # not a string is named by its JSON spelling, `null` and `false` rather
+    # than `None` and `False`, because JSON is what the administrator wrote.
+    raw = item[CONTEXT_REF_KEY]
+    if isinstance(raw, str) and is_valid_ref(raw.strip()):
+        return raw.strip(), None
+    refused = raw if isinstance(raw, str) else json.dumps(raw)
+    LOGGER.warning(
+        "Refusing ref %r on %s repository %r: not a git branch name; the "
+        "declared-intent search skips this repository rather than reading "
+        "its default branch.",
+        refused,
+        key,
+        url,
+    )
+    return None, refused
+
+
+def _state_key_path(key: str) -> Path:
+    """Where ConfigMap key `key` lands on disk.
+
+    `GITOPS_STATE_PATH` names the `managed_repos` file. The operator projects
+    the whole ConfigMap as a directory (`gitopsStateDir` in
+    `platformagent_manifests.go`), so every other key is a sibling file under
+    the same parent — `/etc/gitops/context_repos` beside
+    `/etc/gitops/managed_repos` — and one environment variable locates both.
+    """
+    state_file = Path(os.environ.get("GITOPS_STATE_PATH", DEFAULT_GITOPS_STATE_PATH))
+    if key == MANAGED_REPOS_KEY:
+        return state_file
+    return state_file.parent / key
+
+
+def _read_state_key(key: str) -> list[dict[str, str]]:
+    """Read one repository list from the mounted state file, else from the ConfigMap via kubectl."""
+    state_file = _state_key_path(key)
+    if state_file.is_file():
+        try:
+            content = state_file.read_text(encoding="utf-8")
+            return _parse_repos_json(content, key)
+        except Exception:
+            pass
+    elif state_file.parent.is_dir():
+        # The mount is there and the key is not, which is what kubelet projects
+        # for a ConfigMap with no data: an install with nothing registered. That
+        # is a known-empty list, not an unreadable one, and the two get
+        # different answers from callers that gate on the list. Falling through
+        # to kubectl here would turn it into the unreadable one -- the broker
+        # pod has no context of its own to pass, so the fallback fails and every
+        # gated call answers 503 instead of refusing the repository.
+        return []
+
+    cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
+    ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
+    cmd = ["kubectl", "get", "configmap", cfg_name, "-n", ns, "-o", "json"]
+    context = os.environ.get("KUBE_CONTEXT_NAME", "").strip()
+    if context:
+        cmd.extend(["--context", context])
+    cwd = agent_home() if Path(agent_home()).is_dir() else None
     try:
-        text = Path(path or settings_path()).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = SETTINGS_REPO_RE.search(text)
-    if not match:
-        return None
-    url = match.group(1).strip().strip("/")
-    if url.lower() in {"none", "null", ""}:
-        return None
-    url = re.sub(r"^https?://(www\.)?github\.com/", "", url)
-    url = re.sub(r"^git@github\.com:", "", url)
-    url = re.sub(r"\.git$", "", url)
-    parts = [p for p in url.split("/") if p]
-    if len(parts) < 2:
-        return None
-    return f"{parts[-2]}/{parts[-1]}"
+        cm_res = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=GITOPS_STATE_READ_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("kubectl binary not found in PATH") from e
+    except subprocess.TimeoutExpired as e:
+        # Same RuntimeError as every other failure here, because every caller
+        # already handles one and none of them can do anything with a distinct
+        # type: a list that cannot be read is a list that cannot be read.
+        raise RuntimeError(
+            f"Timed out after {GITOPS_STATE_READ_TIMEOUT_SECONDS}s reading ConfigMap "
+            f"{cfg_name} in namespace {ns}"
+        ) from e
+    except subprocess.CalledProcessError as e:
+        err_msg = (e.stderr or e.stdout or "").strip()
+        raise RuntimeError(
+            f"Failed to read ConfigMap {cfg_name} in namespace {ns}: {err_msg} (exit code {e.returncode})"
+        ) from e
+
+    try:
+        raw_stdout = cm_res.stdout if isinstance(cm_res.stdout, (str, bytes, bytearray)) else "{}"
+        cm = json.loads(raw_stdout)
+        if not isinstance(cm, dict):
+            raise RuntimeError(f"ConfigMap JSON is not an object: {cm}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Failed to parse ConfigMap {cfg_name} JSON output: {e}"
+        ) from e
+
+    repos_str = (cm.get("data") or {}).get(key, "")
+    return _parse_repos_json(repos_str, key)
 
 
-def resolve_repo(settings: str | None = None) -> str:
-    """Resolve the GitOps repository as `owner/name`, without needing a clone.
+def get_managed_repo_entries() -> list[dict[str, str]]:
+    """Reads managed repos from the mounted state file or falls back to ConfigMap via kubectl."""
+    return _read_state_key(MANAGED_REPOS_KEY)
 
-    Order matters. The git remote used to be the only source, and it cannot
-    work on this path: the audit crons start in the agent's profile directory,
-    which is not a working tree, so `git config --get remote.origin.url`
-    returned nothing and the run died before it could clone anything. SETTINGS.md
-    is written by the operator at provisioning time and is present from the
-    first second of the pod's life.
+
+def get_context_repo_entries() -> list[dict[str, str]]:
+    """The `context_repos` list: repositories read for declared intent, never written.
+
+    Same file-then-kubectl resolution as `get_managed_repo_entries`, and the
+    same known-empty answer when the mount is present without the key. The
+    result is *not* folded into the managed list anywhere — see the key
+    constants at the top of the file for why that separation is the whole
+    safety property.
     """
-    settings = settings or settings_path()
-    repo = repo_from_settings(settings)
-    if repo:
-        return repo
+    return _read_state_key(CONTEXT_REPOS_KEY)
+
+
+def _github_entries(
+    entries: list[dict[str, str]], key: str, *, fold_case: bool
+) -> list[dict]:
+    """The GitHub entries in `entries` as `{repo, ref}`, in order, one per slug.
+
+    An entry naming a forge this agent cannot drive is logged rather than
+    dropped in silence. It is still skipped — there is one provider — but this
+    is the point at which a `type` becomes a choice of provider rather than a
+    filter, and the silent version made a registered repository the agent will
+    never touch indistinguishable from one that was never registered. `key`
+    names the list in the warning, because both ConfigMap keys come through
+    here and an administrator fixing the entry needs to know which one.
+
+    `ref` is the entry's branch pin or None. The first entry for a slug wins,
+    ref included: two entries for one repository on two branches is one
+    repository read once, at the branch the first names. With `fold_case`
+    the slugs are compared case-folded, as GitHub compares them, so
+    `Acme/Live` and `acme/live` are one entry too: the context list's readers
+    key on the lowercased slug, and a second entry that survived here would
+    hand them the last ref, not the first. The managed list passes False and
+    dedups on the spelling, because its readers compare the spelling exactly
+    (the `--repo` allowlists, the token scope): folding it would refuse a
+    `--repo` spelt the way an entry it dropped was.
+    """
+    res: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        url = entry.get("url", "")
+        if entry.get("type") != GITHUB_REPO_TYPE:
+            LOGGER.warning(
+                "Skipping %s repository %r: no provider for type %r.",
+                key,
+                url,
+                entry.get("type"),
+            )
+            continue
+        slug = extract_github_slug(url)
+        if not slug:
+            LOGGER.warning(
+                "Skipping %s repository %r: not a GitHub repository URL.", key, url
+            )
+            continue
+        seen_as = slug.lower() if fold_case else slug
+        if seen_as not in seen:
+            seen.add(seen_as)
+            out = {"repo": slug, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)}
+            if entry.get(CONTEXT_REF_REFUSED_KEY) is not None:
+                out[CONTEXT_REF_REFUSED_KEY] = entry[CONTEXT_REF_REFUSED_KEY]
+            res.append(out)
+    return res
+
+
+def _github_slugs(
+    entries: list[dict[str, str]], key: str, *, fold_case: bool
+) -> list[str]:
+    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates."""
+    return [entry["repo"] for entry in _github_entries(entries, key, fold_case=fold_case)]
+
+
+def get_managed_github_repos() -> list[str]:
+    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
+
+    Two spellings of one slug are two entries here, as they were before the
+    context list existed: every reader of this list compares the spelling.
+    """
+    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False)
+
+
+def get_context_github_repos() -> list[str]:
+    """The GitHub `owner/name` slugs under `context_repos`, in ConfigMap order.
+
+    A slug that also appears in `managed_repos` is returned here too: the
+    caller asked which repositories to read for intent, and the GitOps repo
+    is one of them. Nothing goes the other way — this list never reaches
+    `resolve_repo` or `get_managed_github_repos`.
+    """
+    return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
+
+
+def get_context_github_repo_entries() -> list[dict]:
+    """The `context_repos` GitHub entries as `[{repo, ref}]`, in ConfigMap order.
+
+    The same list as `get_context_github_repos` with each slug's branch pin
+    beside it (None when the entry has none), for the one caller that passes
+    the pin on to a clone. An entry whose pin was refused carries it under
+    `refused_ref` instead, and that caller skips the repository. Same skip
+    rule, same warning, same one-way relationship to the managed list.
+    """
+    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
+
+
+def resolve_repo(workspace: str | Path | None = None) -> str:
+    """Resolve the GitOps repository as `owner/name`.
+
+    Order:
+    1. Workspace path clone decoding (if a leased workspace directory is provided).
+    2. Workspace lease record (fallback if workspace is the lease holder directory).
+    3. Git remote origin of workspace (if workspace is provided).
+    4. ConfigMap state ($GITOPS_STATE_CONFIGMAP).
+    5. Local git remote origin fallback (for local development/inside clone).
+    """
+    if workspace is not None:
+        try:
+            workspace_p = Path(workspace).resolve()
+            holder = lease_holder(workspace_p)
+            if holder is not None:
+                try:
+                    rel = workspace_p.relative_to(holder.resolve())
+                    if rel.parts:
+                        clone_segment = rel.parts[0]
+                        if "__" in clone_segment:
+                            owner, sep, name = clone_segment.partition("__")
+                            if owner and name:
+                                return f"{owner}/{name}"
+                except ValueError:
+                    pass
+                record = read_lease(holder)
+                if record and record.get("repo"):
+                    return record["repo"]
+        except Exception:
+            pass
+
+        try:
+            from github_token_refresh import get_current_git_repo
+
+            repo = get_current_git_repo(cwd=str(workspace))
+            if repo and "/" in repo:
+                return repo
+        except Exception:
+            pass
+
+    managed = get_managed_github_repos()
+    if len(managed) == 1:
+        return managed[0]
+    elif len(managed) > 1:
+        raise RuntimeError(
+            f"Multiple repositories configured in ConfigMap ({', '.join(managed)}): "
+            "please specify the target repository explicitly (e.g. via --repo <owner/repo>)."
+        )
 
     from github_token_refresh import get_current_git_repo
 
     repo = get_current_git_repo()
     if not repo or "/" not in repo:
         raise RuntimeError(
-            f"Could not resolve the target repository as owner/name: no usable "
-            f"'Git Repo:' line in {settings} and no origin remote in {Path.cwd()}"
+            f"Could not resolve the target repository as owner/name: "
+            f"no repos in ConfigMap ($GITOPS_STATE_CONFIGMAP), "
+            f"and no origin remote in {Path.cwd()}"
         )
     return repo
 

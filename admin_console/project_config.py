@@ -64,49 +64,121 @@ def is_valid_region(value: str) -> bool:
     return bool(REGION_PATTERN.fullmatch(value.strip()))
 
 
-def region_for_location(value: str) -> str:
-    """Return the enclosing region for a valid GCP region or zone."""
-    location = value.strip()
-    return re.sub(r"-[a-z]$", "", location)
-
-
 def is_valid_namespace(value: str) -> bool:
     return bool(NAMESPACE_PATTERN.fullmatch(value.strip()))
 
 
-def _parse_assignment_value(raw_value: str) -> str:
-    """Parse shell quoting without evaluating substitutions or sourcing code."""
+_REFERENCE = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _expand(value: str, scope: dict[str, str]) -> str:
+    """Substitute `$VAR` and `${VAR}` from keys the file has already set.
+
+    The installers load this file with `set -a; . install.env; set +a`, and
+    install.env.example advertises shell syntax -- so `CLUSTER_NAME=${PROJECT_ID}-host`
+    is legal and the installers resolve it. Reading it literally instead fails
+    silently: the literal is rejected by CLUSTER_NAME_PATTERN below and the
+    portal shows no cluster scope, which is indistinguishable from an install
+    that never set one.
+
+    `scope` is the allowlisted keys resolved so far, in file order, so only
+    those can be referenced. That is narrower than the shell, which would also
+    expand from its own environment and from any other assignment in the file;
+    both are deliberate. Reading the environment would make the answer depend on
+    who ran the portal, and keeping non-allowlisted values out of `scope` keeps
+    the API keys and tokens install.env also holds out of this function entirely.
+
+    A reference `scope` cannot resolve is left as written rather than dropped.
+    The literal then fails validation exactly as it did before this expansion
+    existed, so an unresolvable value degrades to the old behaviour instead of
+    turning a discovered install into an undiscovered one.
+
+    `scripts/live_test_lease.py` carries the same expansion for install.env;
+    change both together.
+    """
+
+    def substitute(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return scope.get(name, match.group(0))
+
+    return _REFERENCE.sub(substitute, value)
+
+
+def _parse_assignment_value(raw_value: str, scope: dict[str, str]) -> str:
+    """Parse shell quoting and `$VAR` references without sourcing code."""
     try:
         words = shlex.split(raw_value, comments=False, posix=True)
     except ValueError:
         return ""
-    return words[0] if len(words) == 1 else ""
+    if len(words) != 1:
+        return ""
+    # Single quotes suppress expansion in the shell, so they suppress it here.
+    # Testing the raw value rather than the parsed one is what keeps that true:
+    # shlex has already removed the quotes by the time `words` exists.
+    if "'" in raw_value:
+        return words[0]
+    return _expand(words[0], scope)
 
 
-def load_provisioned_target(vars_path: Path) -> DeploymentTarget | None:
-    """Read the non-secret deployment coordinates allowlist from vars.sh.
+# `export` is optional rather than required or rejected. install.env is a
+# hand-authored dotenv (`K=V`), which is the spelling install.env.example
+# advertises and the only one the installers write, but the installers source
+# it, so `export K=V` is equally valid shell and a hand-edited file may well
+# carry it. Requiring `export` would match nothing in the documented spelling
+# and return None, which the portal reads as "no provisioned target" and
+# silently falls back to the query parameter and the persisted connection
+# rather than failing -- so getting this wrong fails quietly. Accepting the
+# optional prefix costs nothing and keeps both spellings readable.
+_ASSIGNMENT = re.compile(
+    r"^\s*(?:export\s+)?(PROJECT_ID|CLUSTER_NAME|REGION|NAMESPACE)=(.*)$"
+)
 
-    The provision state is shell code and may contain secrets. It must never be
-    sourced by the portal. Only fixed assignment names and validated values are
-    accepted here.
+
+def _read_assignments(path: Path) -> dict[str, str]:
+    """The allowlisted assignments in one file, or {} if it cannot be read.
+
+    `scope` is the context `_expand` resolves `$VAR` against: every accepted
+    assignment is added to it as the file is walked, so a later line can
+    reference an earlier one, which is the order the shell resolves them in.
     """
-    if not vars_path.is_file():
-        return None
-
     values: dict[str, str] = {}
+    scope: dict[str, str] = {}
+    if not path.is_file():
+        return values
     try:
-        lines = vars_path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return None
-
-    assignment = re.compile(
-        r"^\s*export\s+(PROJECT_ID|CLUSTER_NAME|REGION|NAMESPACE)=(.*)$"
-    )
+        return values
     for line in lines:
-        match = assignment.fullmatch(line)
+        match = _ASSIGNMENT.fullmatch(line)
         if not match or match.group(1) not in STATE_KEYS:
             continue
-        values[match.group(1)] = _parse_assignment_value(match.group(2).strip())
+        value = _parse_assignment_value(match.group(2).strip(), scope)
+        values[match.group(1)] = value
+        scope[match.group(1)] = value
+    return values
+
+
+def load_provisioned_target(install_env_path: Path) -> DeploymentTarget | None:
+    """Read the non-secret deployment coordinates allowlist from install.env.
+
+    install.env is the single source of provisioned state: it is the input the
+    installers read, so it is what the portal must agree with. The generated
+    `k8s-operator/scripts/vars.sh` that preceded it is deliberately not
+    consulted -- no release since 0.4.0 has created one (upgrade.sh 0.4.0-0.6.0
+    only kept an existing one's coordinates current, and nothing does now), so
+    a copy found today is stale state that would offer a cluster the installers
+    are no longer pointed at.
+
+    The file may contain secrets and it is shell-ish. It is never sourced by
+    the portal. Only fixed assignment names and validated values are accepted
+    here.
+    """
+    values = _read_assignments(install_env_path)
+    if not values:
+        return None
 
     project_id = values.get("PROJECT_ID", "")
     cluster_name = values.get("CLUSTER_NAME", "")

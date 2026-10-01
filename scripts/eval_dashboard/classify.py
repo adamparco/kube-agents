@@ -1,0 +1,950 @@
+#!/usr/bin/env python3
+"""Classify one smoke-test run: which of its failures are the gate's and
+which are the pull request's.
+
+The gate comment on a pull request, the dashboard's PR view
+(``run.html#build=<id>``) and the incident brief all answer the same
+question about a red run -- "is this mine?" -- and they must answer it the
+same way, so the rules live here once. ``classify_run`` is the whole
+interface::
+
+    classify_run(run, runs, health_at=None, now=None, admitted=None) -> {
+        "build": str, "pr": int|None, "headline": str, "lede": str,
+        "verdict": "red" | "green" | "infra",
+        "cases": [{"case", "outcome", "cls", "also_failing_prs",
+                   "pass_rate_30d", "reason", "excerpt", "rep_n", "do",
+                   "admitted", "reps"}],
+        "matches_incident": bool,
+        # run-level detail: "setup_death", "storm_reps", "ceiling_reps", "cls", "do"
+    }
+
+The first line of keys is the contract other callers rely on; the rest is
+additive detail the pages show.
+
+``run`` and ``runs`` are data.json shapes (SCHEMA.md); ``health_at`` is the
+health.json document in force when the run finished (state, condition,
+failing_cases are read; anything else is ignored); ``now`` anchors the
+30-day pass rate and defaults to the run's finish. Every rule below is a
+module constant with the incident it was tuned on; the vocabulary
+(``shared_break`` / ``storm`` / ``setup_deaths`` / ``lost_pods``, storm-classified
+repetitions, collapsed cases) is the CI health adjudicator's, restated here
+so this module has no dependency beyond the standard library.
+
+Per failed admitted case, in priority order:
+
+* ``shared`` -- the same case failed every graded repetition on runs of at
+  least SHARED_MIN_OTHER_PRS other pull requests that finished inside
+  [start - SHARED_WINDOW_BEFORE, finish], or the health verdict names it.
+  The 2026-09-07/08 crashloop outage (#1269, #1278) is the shape.
+* ``storm`` -- the run lost at least STORM_RUN_SIGNATURE_REPS repetitions
+  to 429s or empty records, or the verdict says storm (#1225, #1214).
+* ``only-this-pr`` -- the case passed on the last ONLY_PR_MIN_OTHER_RUNS
+  runs of other pull requests inside ONLY_PR_WINDOW and failed here.
+* ``None`` -- nothing above fits; the page says it cannot tell.
+
+An ungraded case (outcome ``infra``) is ``storm`` under the same storm
+tests, or ``delegation-ceiling`` when every one of its ungraded repetitions
+carries the scorer's DELEGATION_CEILING_MARKER: the harness's delegation
+wait ran out with the worker still running (#1874). Ceiling repetitions
+are outside the storm count and every pass-rate denominator.
+
+``setup`` is a run-level class: no tasks, a FAILURE verdict, under
+SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
+at any duration, with a NodeNotReady pod event or no build log at all
+(``is_lost_pod``, #1478) -- shares the class with its own headline and
+``do``. A conflicted merge (``is_merge_conflict``, #1608) is the same shape
+again and is neither: it is the branch's own, so it is ``red`` and the
+``do`` is a rebase rather than a retest. None of the three has cases to
+classify. ``deadline-kill`` (``is_deadline_kill``, #1894) is the fourth
+run-level class -- a FAILURE with no eval verdict that ran to the job's
+timeout -- and the one that may carry cases: the harness records each case
+as it finishes (#1875), so the cases graded before Prow stopped the run are
+classified and shown, under the kill's headline and ``do``.
+
+``runs`` may carry the nightly periodic's runs beside the presubmit's
+(SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
+presubmit only: a nightly has no pull request, so it is never "another PR"
+for the shared rule, never one of the passes the only-this-PR rule needs,
+and never in the 30-day pass rate. What it is good for is separate and
+additive: ``nightly_failed_recent`` per case says whether the newest
+nightly run inside NIGHTLY_RECENT_WINDOW of this run also failed the case
+outright -- evidence the case is broken on main, which is the reader's
+next question after "is this mine?".
+
+Only stdlib, plus the sibling ``tiers`` module.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+
+try:
+    from . import tiers
+except ImportError:  # imported by path (render.py run as a script)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import tiers
+try:
+    import eval_rosters
+except ImportError:  # run as a script: scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import eval_rosters
+
+# --- Shared break (#1269, #1278; #1171 a week earlier) -----------------------
+# Other pull requests' runs are looked at when they finished inside this
+# long before the run started, up to the run's own finish: the same six
+# hours the adjudicator's shared-break rule uses.
+SHARED_WINDOW_BEFORE = timedelta(hours=6)
+# A case collapsing on this many *other* distinct pull requests is shared.
+# Two others plus this run is the adjudicator's three-PR floor.
+SHARED_MIN_OTHER_PRS = 2
+
+# --- Only this PR (#913's image-tag failures; the adjudicator's PR-caused rule) --
+# The case must have passed on this many of the most recent other-PR runs
+# that graded it, all inside ONLY_PR_WINDOW before this run's finish.
+ONLY_PR_MIN_OTHER_RUNS = 3
+ONLY_PR_WINDOW = timedelta(hours=24)
+
+# --- Storm (#1225, #1097, #1214) -----------------------------------------------
+# A run carrying at least this many storm-classified repetitions is inside
+# the storm (the adjudicator's STORM_RUN_SIGNATURE_REPS); fewer are
+# background noise on any day.
+STORM_RUN_SIGNATURE_REPS = 5
+# The harness's own never-ran phrasings (bench/kube_agents_bench/scoring.py),
+# the same list the adjudicator matches; before #1184 these were graded `fail`.
+STORM_REASON_RE = re.compile(
+    r"KUBE_AGENTS_INFRA_FAILURE"
+    r"|no agent ever ran"
+    r"|trajectory is empty"
+    r"|not evidence of a real agent run"
+    r"|exhausted its retries without reaching the agent"
+    r"|died provisioning, before any agent ran"
+    r"|http 429"
+    r"|RESOURCE_EXHAUSTED"
+    r"|rate.?limit",
+    re.IGNORECASE,
+)
+
+# --- Delegation ceiling (#1874) -----------------------------------------------
+# The marker bench/kube_agents_bench/scoring.py leads a repetition's reason
+# with when the harness's delegation wait ran out before the worker delivered
+# anything: the record holds the front door's acknowledgement alone. The
+# scorer grades it `infra`, but it is not a storm rep -- the agent ran and its
+# worker was still going when the eval stopped watching -- so it is counted
+# apart: out of the storm signature and out of every pass-rate denominator.
+# test_eval_dashboard_classify.py reads the literal out of the scorer so the
+# two cannot drift.
+DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
+
+# --- Setup death (#1172, #1176) -----------------------------------------------
+# Zero tasks, concluded FAILURE, and over inside this long: the run died at
+# clone or deploy before any case ran (the adjudicator's setup-death rule).
+SETUP_DEATH_MAX_DURATION = timedelta(minutes=5)
+# health.py's rule 3d (#1894): a FAILURE with no verdict that lasted the job's
+# timeout was killed by Prow, not by the eval. Copied from health.py, which
+# owns them; the timeout is the presubmit's decoration_config in oss-test-infra.
+PROW_JOB_TIMEOUT = timedelta(minutes=360)
+DEADLINE_KILL_MARGIN = timedelta(minutes=15)
+
+# --- Pass rate ---------------------------------------------------------------
+# The per-case pass rate the PR view quotes is over runs started inside
+# this many days before `now`, run-level events excluded as on the Cases
+# page (a broken run's failures are the run's, not the cases').
+PASS_RATE_DAYS = 30
+RUN_EVENT_FAIL_FRACTION = 0.8
+# Repetition results the collector writes (SCHEMA.md); anything else is
+# "not measured".
+REP_RESULTS = ("pass", "fail", "infra")
+# The four kinds `rep_kind` sorts repetitions into. `storm` is a repetition
+# the harness could not grade; `ceiling` is one it stopped watching (above).
+REP_PASS = "pass"
+REP_FAIL = "fail"
+REP_STORM = "storm"
+REP_CEILING = "ceiling"
+# Memo bounds for the per-run derivations and the 30-day pass rates.
+RUN_CACHE_MAX = 4096
+RATE_CACHE_MAX = 8
+
+# --- The nightly beside the verdict ---------------------------------------------
+# The newest nightly run that graded the case and finished within this long
+# of the run being classified, on either side: a night is one build, so two
+# days always covers the nearest one when the periodic is running at all.
+NIGHTLY_RECENT_WINDOW = timedelta(days=2)
+
+# --- Vocabulary shared with health.json ---------------------------------------
+STATE_GREEN = "GREEN"
+CONDITION_SHARED_BREAK = "shared_break"
+CONDITION_STORM = "storm"
+CONDITION_SETUP_DEATHS = "setup_deaths"
+CONDITION_LOST_PODS = "lost_pods"
+CONDITION_DELEGATION_CEILING = "delegation_ceiling"
+CONDITION_DEADLINE_KILL = "deadline_kill"
+# The pod event health.py's rule 3b reads (runs[].pod_last_event).
+POD_EVENT_NODE_NOT_READY = "NodeNotReady"
+RUN_SUCCESS = "SUCCESS"
+RUN_FAILURE = "FAILURE"
+RUN_ABORTED = "ABORTED"
+
+OUTCOME_PASSED = "passed"
+OUTCOME_PARTIAL = "partial"
+OUTCOME_FAILED = "failed"
+OUTCOME_INFRA = "infra"
+CLS_SHARED = "shared"
+CLS_ONLY_THIS_PR = "only-this-pr"
+CLS_STORM = "storm"
+CLS_CEILING = "delegation-ceiling"
+CLS_SETUP = "setup"
+CLS_DEADLINE = "deadline-kill"
+VERDICT_RED = "red"
+VERDICT_GREEN = "green"
+VERDICT_INFRA = "infra"
+
+# --- Roster -------------------------------------------------------------------
+# Only an admitted case reds a pull request (AGENTS.md, "The behavioural
+# presubmit gate"); a hold-out failing is reported but never blamed. Read
+# from the checkout's hack/eval/blocking-roster.txt; when the file is missing
+# every case counts as admitted, which over-reports rather than hides.
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+BLOCKING_ROSTER_FILE = eval_rosters.BLOCKING_ROSTER_FILE
+
+# The grader prefixes every reason with its score; the reader wants the
+# check name and what was missing.
+REASON_SCORE_PREFIX_RE = re.compile(r"^VerificationCorrectness=\S+ \(floor [^)]*\) -- ")
+
+# --- What to do, per class. Plain words; the reader is deciding whether to
+# type /retest. ---------------------------------------------------------------
+DO_SHARED = "Nothing. This failure is the gate's; retest once the brief says it is healthy again."
+DO_STORM = "Retest after the storm clears; a run started inside it loses repetitions to 429s."
+DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the problem."
+DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
+DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
+DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
+DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
+# The outage's recovering hold: other PRs' runs are finishing, so a kill
+# arriving now may be the branch, and it holds the gate out of GREEN.
+DO_DEADLINE_KILL_RECOVERING = "Read the build log before retesting. Other PRs' runs are finishing, so this kill may be the branch: a change that hangs the eval ends this way, and each kill holds the gate out of GREEN."
+DO_MERGE_CONFLICT = "Rebase on main and push. A retest re-runs the same conflicted merge."
+DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
+DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
+DO_PASSED = ""
+
+UTC = timezone.utc
+
+
+# --------------------------------------------------------------------------- #
+# data.json access (tolerant of absent optional fields)
+# --------------------------------------------------------------------------- #
+
+
+def parse_iso(value) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def run_tasks(run: dict) -> list[dict]:
+    return [t for t in run.get("tasks") or [] if isinstance(t, dict)]
+
+
+def task_reps(task: dict) -> list[dict]:
+    """The task's repetitions, or one synthetic rep from its single result
+    (SCHEMA.md: an absent ``reps`` means unknown, not empty)."""
+    reps = [r for r in task.get("reps") or [] if isinstance(r, dict)] if isinstance(task.get("reps"), list) else []
+    if reps:
+        return reps
+    result = str(task.get("result") or "").lower()
+    if result in REP_RESULTS:
+        return [{"result": result, "reason": None}]
+    return []
+
+
+def rep_kind(rep: dict) -> str:
+    """'pass' | 'fail' | 'storm' | 'ceiling' -- the adjudicator's kinds. A storm
+    rep is one the harness could not grade: an infra verdict, or a fail whose
+    reason is a never-ran phrasing. A ceiling rep is one the harness stopped
+    watching with the worker still running (its reason leads with
+    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm."""
+    result = str(rep.get("result") or "").lower()
+    if result == "pass":
+        return REP_PASS
+    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+        return REP_CEILING
+    if result == "infra":
+        return REP_STORM
+    if STORM_REASON_RE.search(rep.get("reason") or ""):
+        return REP_STORM
+    return REP_FAIL
+
+
+def rep_counts(task: dict) -> dict:
+    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0}
+    for rep in task_reps(task):
+        kind = rep_kind(rep)
+        counts["infra" if kind == REP_STORM else kind] += 1
+    return counts
+
+
+def outcome_of(counts: dict) -> str | None:
+    """passed (every graded rep passed), partial, failed (every graded rep
+    failed), infra (nothing graded: storm or ceiling reps only), None (no
+    reps at all)."""
+    if counts["pass"] and counts["fail"]:
+        return OUTCOME_PARTIAL
+    if counts["fail"]:
+        return OUTCOME_FAILED
+    if counts["pass"]:
+        return OUTCOME_PASSED
+    if counts["infra"] or counts.get("ceiling"):
+        return OUTCOME_INFRA
+    return None
+
+
+# Per-run derivations are asked for once per (run, other run) pair when a
+# whole data.json is classified; memoized by object identity, bounded.
+_RUN_CACHE: dict[int, tuple[dict, dict]] = {}
+
+
+def _run_facts(run: dict) -> dict:
+    """{outcomes: {case: outcome}, collapsed: set, storm: int, ceiling: int} for a run."""
+    key = id(run)
+    hit = _RUN_CACHE.get(key)
+    if hit is not None and hit[0] is run:
+        return hit[1]
+    outcomes = {}
+    counts_by_case = {}
+    storm = 0
+    ceiling = 0
+    for task in run_tasks(run):
+        counts = rep_counts(task)
+        name = str(task.get("name"))
+        counts_by_case[name] = counts
+        outcomes[name] = outcome_of(counts)
+        storm += counts["infra"]
+        ceiling += counts["ceiling"]
+    started = parse_iso(run.get("started"))
+    facts = {
+        "outcomes": outcomes,
+        "counts": counts_by_case,
+        "collapsed": {c for c, o in outcomes.items() if o == OUTCOME_FAILED},
+        "storm": storm,
+        "ceiling": ceiling,
+        "started": started,
+        "finished": parse_iso(run.get("finished")) or started,
+    }
+    if len(_RUN_CACHE) >= RUN_CACHE_MAX:
+        _RUN_CACHE.clear()
+    _RUN_CACHE[key] = (run, facts)
+    return facts
+
+
+def collapsed_cases(run: dict) -> set[str]:
+    """Cases that failed every graded repetition (the adjudicator's collapse)."""
+    return _run_facts(run)["collapsed"]
+
+
+def storm_reps(run: dict) -> int:
+    return _run_facts(run)["storm"]
+
+
+def ceiling_reps(run: dict) -> int:
+    """Repetitions the harness stopped watching at its delegation ceiling
+    (#1874); apart from `storm_reps`, never inside it."""
+    return _run_facts(run)["ceiling"]
+
+
+def run_length(run: dict) -> timedelta | None:
+    """duration_s, else finish - start (the collector falls back the same
+    way when the log has no verdict line)."""
+    seconds = run.get("duration_s")
+    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+        return timedelta(seconds=seconds)
+    start, finish = parse_iso(run.get("started")), parse_iso(run.get("finished"))
+    if start and finish and finish >= start:
+        return finish - start
+    return None
+
+
+def is_lost_pod(run: dict) -> bool:
+    """health.py's rule 3b unit: a zero-task FAILURE whose pod's last event
+    was NodeNotReady or that has no build log at all (SCHEMA.md, optional
+    run fields; absent is unknown and never one)."""
+    return (
+        not run_tasks(run)
+        and str(run.get("result") or "").upper() == RUN_FAILURE
+        and (run.get("pod_last_event") == POD_EVENT_NODE_NOT_READY or run.get("has_build_log") is False)
+    )
+
+
+def is_merge_conflict(run: dict) -> bool:
+    """A zero-task FAILURE the collector recorded as a clone that could not
+    merge the pull request into its base (SCHEMA.md, `merge_conflict`)."""
+    return not run_tasks(run) and str(run.get("result") or "").upper() == RUN_FAILURE and run.get("merge_conflict") is True
+
+
+def is_deadline_kill(run: dict) -> bool:
+    """health.py's rule 3d unit: a FAILURE with no eval verdict that ran to
+    the job's deadline. Tasks or not: since #1875 a killed run may carry the
+    cases that finished before Prow stopped it."""
+    length = run_length(run)
+    # The key has to be there: a record from before the collector wrote it
+    # is unknown, not "no verdict" (SCHEMA.md), as health.Run reads it.
+    return (
+        str(run.get("result") or "").upper() == RUN_FAILURE
+        and "eval_verdict" in run
+        and run.get("eval_verdict") is None
+        and not is_lost_pod(run)
+        and not is_merge_conflict(run)
+        and length is not None
+        and length >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+    )
+
+
+def _deadline_verdict(base: dict, condition: str | None, cases: list[dict], holding: bool = False) -> dict:
+    """The kill's verdict. `holding`: the deadline-kill outage is in its
+    recovering hold, so this kill is not part of a wave -- the same reading
+    the gate comment gives it -- and it is not the incident's."""
+    graded = f"{len(cases)} case(s) finished before that; the rest were never graded." if cases else "Nothing was graded."
+    live = condition == CONDITION_DEADLINE_KILL and not holding
+    recovering = condition == CONDITION_DEADLINE_KILL and holding
+    tail = (
+        " Other PRs are being killed the same way right now." if live
+        else " The gate's deadline-kill outage is recovering; this kill holds it back, and with other PRs' runs finishing it may be the branch." if recovering
+        else ""
+    )
+    return dict(
+        base,
+        headline=f"Prow killed this run at its {int(PROW_JOB_TIMEOUT.total_seconds() // 60)}-minute deadline.",
+        lede=f"The run outlived the job's timeout before the eval reached a verdict. {graded}{tail}",
+        verdict=VERDICT_INFRA,
+        setup_death=False,
+        cls=CLS_DEADLINE,
+        do=DO_DEADLINE_KILL_RECOVERING if recovering else DO_DEADLINE_KILL,
+        cases=cases,
+        matches_incident=live,
+    )
+
+
+def is_setup_death(run: dict) -> bool:
+    length = run_length(run)
+    return (
+        not run_tasks(run)
+        and str(run.get("result") or "").upper() == RUN_FAILURE
+        and not is_lost_pod(run)
+        and not is_merge_conflict(run)
+        and length is not None
+        and length < SETUP_DEATH_MAX_DURATION
+    )
+
+
+def is_run_event(run: dict) -> bool:
+    graded = [o for o in _run_facts(run)["outcomes"].values() if o in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED)]
+    return bool(graded) and graded.count(OUTCOME_FAILED) / len(graded) >= RUN_EVENT_FAIL_FRACTION
+
+
+def run_start(run: dict) -> datetime | None:
+    return _run_facts(run)["started"]
+
+
+def run_finish(run: dict) -> datetime | None:
+    return _run_facts(run)["finished"]
+
+
+def clean_reason(reason: str | None) -> str:
+    return REASON_SCORE_PREFIX_RE.sub("", reason or "").strip()
+
+
+def reason_rep(task: dict) -> dict | None:
+    """The repetition whose reason the pages show: the first graded failure
+    with a reason, else the first rep of any kind with one; None when no
+    rep carries a reason."""
+    graded = [r for r in task_reps(task) if rep_kind(r) == "fail" and r.get("reason")]
+    other = [r for r in task_reps(task) if r.get("reason")]
+    for rep in graded + other:
+        return rep
+    return None
+
+
+def first_reason(task: dict) -> str:
+    """The first graded failure's reason, else the first storm rep's."""
+    rep = reason_rep(task)
+    return clean_reason(rep.get("reason")) if rep else ""
+
+
+def _has_excerpt(rep: dict) -> bool:
+    return isinstance(rep.get("excerpt"), str) and bool(rep["excerpt"].strip())
+
+
+def shown_rep(task: dict) -> dict | None:
+    """The one repetition a case row is about: the rep whose reason
+    ``first_reason`` shows, else -- when no rep carries a reason -- the
+    first with an excerpt. Its reason, its words and its transcript link
+    then all belong to the same run of the agent."""
+    rep = reason_rep(task)
+    if rep:
+        return rep
+    for candidate in task_reps(task):
+        if _has_excerpt(candidate):
+            return candidate
+    return None
+
+
+def shown_rep_n(task: dict) -> int | None:
+    """The 1-based number of :func:`shown_rep`, so a page links that
+    repetition's transcript and not rep 1's. None when there is no shown
+    rep or it has no number (a synthetic rep from a single result); the
+    pages then link rep 1 as they always did."""
+    rep = shown_rep(task)
+    n = rep.get("n") if rep else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+
+def excerpt_of(task: dict) -> str | None:
+    """A report excerpt, when the collector recorded one (additive, optional):
+    ``tasks[].excerpt``, else the ``excerpt`` of :func:`shown_rep`, so the
+    quote and the check beside it come from the same run of the agent: a rep
+    that said nothing quotes nothing, and another rep's words never stand
+    in. Never invented."""
+    if isinstance(task.get("excerpt"), str) and task["excerpt"].strip():
+        return task["excerpt"].strip()
+    rep = shown_rep(task)
+    return rep["excerpt"].strip() if rep and _has_excerpt(rep) else None
+
+
+# --------------------------------------------------------------------------- #
+# Roster
+# --------------------------------------------------------------------------- #
+
+_ROSTER_CACHE: dict[str, frozenset | None] = {}
+
+
+def admitted_cases(roster_file: pathlib.Path = BLOCKING_ROSTER_FILE) -> frozenset | None:
+    """The blocking roster from hack/eval/blocking-roster.txt; None when unreadable."""
+    key = str(roster_file)
+    if key not in _ROSTER_CACHE:
+        roster = None
+        try:
+            names = eval_rosters.parse_blocking_roster(roster_file.read_text())
+            if names:
+                roster = frozenset(names)
+        except OSError:
+            roster = None
+        _ROSTER_CACHE[key] = roster
+    return _ROSTER_CACHE[key]
+
+
+# --------------------------------------------------------------------------- #
+# Pass rates
+# --------------------------------------------------------------------------- #
+
+# Keyed by the list's identity and memoized with the list itself, as
+# _RUN_CACHE is: the reference keeps the id from being reused by another
+# list, and the identity check on a hit is the guard if it ever is.
+_RATE_CACHE: dict[tuple, tuple[list, dict]] = {}
+
+
+def case_pass_rates(runs: list[dict], now: datetime) -> dict[str, float | None]:
+    """{case: pass / (pass + fail)} over runs started inside PASS_RATE_DAYS
+    before `now`, run-level events excluded; None when nothing graded."""
+    key = (id(runs), len(runs), now)
+    hit = _RATE_CACHE.get(key)
+    if hit is not None and hit[0] is runs:
+        return hit[1]
+    since = now - timedelta(days=PASS_RATE_DAYS)
+    tally: dict[str, list[int]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        started = run_start(run)
+        if started is None or not (since <= started <= now) or is_run_event(run):
+            continue
+        for name, counts in _run_facts(run)["counts"].items():
+            bucket = tally.setdefault(name, [0, 0])
+            bucket[0] += counts["pass"]
+            bucket[1] += counts["fail"]
+    rates = {case: (p / (p + f) if p + f else None) for case, (p, f) in tally.items()}
+    if len(_RATE_CACHE) >= RATE_CACHE_MAX:
+        _RATE_CACHE.clear()
+    _RATE_CACHE[key] = (runs, rates)
+    return rates
+
+
+# The tier split of a runs list, memoized like _RATE_CACHE: the filtered
+# lists have to be the SAME objects from one classify_run to the next, or
+# the pass-rate memo keyed on their identity misses on every run of a
+# whole data.json.
+_TIER_CACHE: dict[tuple, tuple[list, list, list]] = {}
+
+
+def split_tiers(runs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(presubmit runs, nightly runs) of `runs`, stable across calls."""
+    key = (id(runs), len(runs))
+    hit = _TIER_CACHE.get(key)
+    if hit is not None and hit[0] is runs:
+        return hit[1], hit[2]
+    gate = tiers.presubmit_runs(runs)
+    nightly = tiers.nightly_runs(runs)
+    if len(_TIER_CACHE) >= RATE_CACHE_MAX:
+        _TIER_CACHE.clear()
+    _TIER_CACHE[key] = (runs, gate, nightly)
+    return gate, nightly
+
+
+def nightly_failed_recent(case: str, run: dict, nightly: list[dict]) -> bool | None:
+    """Whether the newest nightly run within NIGHTLY_RECENT_WINDOW of `run`
+    that graded `case` failed it on every graded repetition. None when no
+    nightly graded it in the window (or the run has no finish time). A night
+    that was a run-level event -- nearly everything failed -- says nothing
+    about one case and is skipped, as the pages skip it in per-case rates."""
+    finish = run_finish(run)
+    if finish is None:
+        return None
+    newest = None
+    for other in nightly:
+        when = run_finish(other)
+        if when is None or abs(when - finish) > NIGHTLY_RECENT_WINDOW or is_run_event(other):
+            continue
+        outcome = _run_facts(other)["outcomes"].get(case)
+        if outcome not in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED):
+            continue
+        if newest is None or when > newest[0]:
+            newest = (when, outcome)
+    return None if newest is None else newest[1] == OUTCOME_FAILED
+
+
+# --------------------------------------------------------------------------- #
+# The rules
+# --------------------------------------------------------------------------- #
+
+
+def _other_pr_runs(run: dict, runs: list[dict]) -> list[dict]:
+    pr = run.get("pr")
+    return [
+        r
+        for r in runs
+        if isinstance(r, dict) and r is not run and r.get("build_id") != run.get("build_id") and (pr is None or r.get("pr") != pr) and run_tasks(r)
+    ]
+
+
+def shared_prs(case: str, run: dict, others: list[dict]) -> set:
+    """Other pull requests on whose runs `case` collapsed inside the shared
+    window: finished in [start - SHARED_WINDOW_BEFORE, finish]."""
+    start, finish = run_start(run), run_finish(run)
+    if start is None or finish is None:
+        return set()
+    low = start - SHARED_WINDOW_BEFORE
+    prs = set()
+    for other in others:
+        when = run_finish(other)
+        if when is None or not (low <= when <= finish):
+            continue
+        if case in collapsed_cases(other):
+            prs.add(other.get("pr"))
+    return prs
+
+
+def passed_elsewhere(case: str, run: dict, others: list[dict]) -> bool:
+    """The last ONLY_PR_MIN_OTHER_RUNS other-PR runs inside ONLY_PR_WINDOW
+    that graded `case` all passed it outright."""
+    finish = run_finish(run)
+    if finish is None:
+        return False
+    low = finish - ONLY_PR_WINDOW
+    graded = []
+    for other in others:
+        when = run_finish(other)
+        if when is None or not (low <= when <= finish):
+            continue
+        outcome = _run_facts(other)["outcomes"].get(case)
+        if outcome in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED):
+            graded.append((when, outcome))
+    graded.sort()
+    recent = graded[-ONLY_PR_MIN_OTHER_RUNS:]
+    return len(recent) >= ONLY_PR_MIN_OTHER_RUNS and all(o == OUTCOME_PASSED for _, o in recent)
+
+
+def _health_fields(health_at: dict | None) -> tuple[str | None, str | None, set]:
+    if not isinstance(health_at, dict):
+        return None, None, set()
+    state = str(health_at.get("state") or "").upper() or None
+    condition = health_at.get("condition") if isinstance(health_at.get("condition"), str) else None
+    cases = health_at.get("failing_cases")
+    named = {str(c) for c in cases} if isinstance(cases, list) else set()
+    if state == STATE_GREEN or state is None:
+        return state, None, set()
+    return state, condition, named
+
+
+def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset | None, health_at: dict | None, rates: dict, run_storm: bool, nightly: list[dict] = ()) -> dict:
+    name = str(task.get("name"))
+    counts = rep_counts(task)
+    outcome = outcome_of(counts)
+    is_admitted = admitted is None or name in admitted
+    _, condition, named = _health_fields(health_at)
+    cls = None
+    also = 0
+    do = DO_PASSED
+    if outcome == OUTCOME_FAILED:
+        prs = shared_prs(name, run, others)
+        also = len(prs)
+        if name in named or also >= SHARED_MIN_OTHER_PRS:
+            cls = CLS_SHARED
+        elif run_storm or condition == CONDITION_STORM:
+            cls = CLS_STORM
+        elif passed_elsewhere(name, run, others):
+            cls = CLS_ONLY_THIS_PR
+        do = {CLS_SHARED: DO_SHARED, CLS_STORM: DO_STORM, CLS_ONLY_THIS_PR: DO_ONLY_THIS_PR}.get(cls, DO_UNCLEAR)
+        if not is_admitted:
+            do = DO_HELD_OUT
+    elif outcome == OUTCOME_INFRA:
+        if counts["ceiling"] and not counts["infra"]:
+            # Every ungraded rep hit the delegation ceiling: the eval's wait,
+            # not the storm's 429s, and never the pull request's.
+            cls = CLS_CEILING
+            do = DO_CEILING
+        elif run_storm or condition == CONDITION_STORM:
+            cls = CLS_STORM
+            do = DO_STORM
+    return {
+        "case": name,
+        "outcome": outcome,
+        "cls": cls,
+        "also_failing_prs": also,
+        "pass_rate_30d": rates.get(name),
+        "reason": first_reason(task) if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL, OUTCOME_INFRA) else "",
+        "excerpt": excerpt_of(task),
+        "rep_n": shown_rep_n(task),
+        "do": do,
+        # Additive detail the pages show; the keys above are the contract.
+        "admitted": is_admitted,
+        "reps": counts,
+        "nightly_failed_recent": nightly_failed_recent(name, run, nightly),
+    }
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: bool) -> tuple[str, str, str]:
+    """(headline, lede, verdict) for a run that recorded tasks."""
+    gate = [c for c in cases if c["admitted"] and c["outcome"] in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED)]
+    held = [c for c in cases if not c["admitted"]]
+    held_failed = [c for c in held if c["outcome"] == OUTCOME_FAILED]
+    failed = [c for c in gate if c["outcome"] == OUTCOME_FAILED]
+    n = len(gate)
+    held_note = (
+        f" {_plural(len(held_failed), 'held-out case')} also failed; held-out cases do not block."
+        if held_failed
+        else ""
+    )
+    if not gate:
+        ungraded = [c for c in cases if c["outcome"] == OUTCOME_INFRA]
+        if ungraded and all(c["cls"] == CLS_CEILING for c in ungraded):
+            return (
+                "Nothing was graded: every repetition hit the delegation ceiling with its worker still running.",
+                "The harness stopped waiting before any worker delivered; that is the eval's wait, not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
+        if ungraded:
+            return (
+                "Nothing was graded: every repetition was lost before the agent ran.",
+                "That is the quota storm's shape, not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
+        return ("No gate case ran in this build.", held_note.strip() or "Check the build log.", VERDICT_INFRA)
+    if failed and str(run.get("result") or "").upper() == RUN_SUCCESS:
+        # Prow's verdict is the gate's: a green run with collapsed cases is
+        # one the gate excused (infra-excluded repetitions, a roster older
+        # than this checkout's). Report it green and say what failed.
+        return (
+            f"Prow passed this run; {_plural(len(failed), 'gate case')} failed every graded repetition.",
+            "The gate counted it green, so nothing here blocks the PR. The failures are listed for the record." + held_note,
+            VERDICT_GREEN,
+        )
+    if not failed and str(run.get("result") or "").upper() == RUN_FAILURE:
+        # Red without a collapsed gate case: an absolute rule tripped (a
+        # forbidden mutation, a verifier error, an inconsistent record) or
+        # the log was cut short. The build log has it; the cases do not.
+        return (
+            "The run is red, but no gate case failed outright.",
+            "An absolute rule tripped or the log was cut short; the build log has the reason, the case list does not." + held_note,
+            VERDICT_RED,
+        )
+    if not failed and str(run.get("result") or "").upper() == RUN_ABORTED:
+        # Since the fan-out grades each case as it finishes, a run a newer
+        # push superseded carries the blocks of the cases graded before Prow
+        # stopped it. They are real; "all n passed" is not, since the rest
+        # never got their turn.
+        return (
+            "Aborted before it finished.",
+            f"Usually a newer push superseded this run; {_plural(n, 'gate case')} had been graded by then, and the next run carries the verdict."
+            + held_note,
+            VERDICT_INFRA,
+        )
+    if not failed:
+        partial = [c for c in gate if c["outcome"] == OUTCOME_PARTIAL]
+        lede = (
+            f"{_plural(len(partial), 'case')} passed on a retry (some repetitions failed); the gate counts that as a pass."
+            if partial
+            else "Every gate case passed on every repetition."
+        )
+        return (f"All {n} gate cases passed.", lede + held_note, VERDICT_GREEN)
+    theirs = [c for c in failed if c["cls"] in (CLS_SHARED, CLS_STORM)]
+    yours = [c for c in failed if c["cls"] == CLS_ONLY_THIS_PR]
+    unclear = [c for c in failed if c["cls"] is None]
+    f = len(failed)
+    what = "the outage" if (incident and has_incident) else "failures on other PRs"
+    if len(theirs) == f:
+        head = f"{f} of {n} gate cases failed. None of them look like your PR."
+        lede = f"{'All ' if f > 1 else ''}{_plural(f, 'failure')} match{'' if f > 1 else 'es'} {what}. Your other {n - f} gate cases passed."
+        return head, lede + held_note, VERDICT_INFRA
+    if len(yours) == f:
+        head = (
+            f"1 of {n} gate cases failed, and it looks like your PR."
+            if f == 1
+            else f"{f} of {n} gate cases failed, and they look like your PR."
+        )
+        lede = f"{'This case passes' if f == 1 else 'These cases pass'} on other PRs' recent runs and failed here."
+        return head, lede + held_note, VERDICT_RED
+    if not yours:
+        head = f"{f} of {n} gate cases failed. We can't tell yet whether {'it is' if f == 1 else 'they are'} your PR."
+        if theirs:
+            head = f"{len(theirs)} of {f} failures match {what}; {len(unclear)} {'is' if len(unclear) == 1 else 'are'} unexplained so far."
+        lede = "Nothing on other PRs matches the unexplained failure yet; read its transcript."
+        return head, lede + held_note, VERDICT_RED
+    yours_text = f"{len(yours)} {'is' if len(yours) == 1 else 'are'} only on your PR"
+    if not theirs:
+        head = f"{len(yours)} of {f} failures {'is' if len(yours) == 1 else 'are'} only on your PR; {len(unclear)} {'is' if len(unclear) == 1 else 'are'} unexplained."
+    elif unclear:
+        head = f"{len(theirs)} of {f} failures match {what}; {yours_text} and {len(unclear)} unexplained."
+    else:
+        head = f"{len(theirs)} of {f} failures match {what}; {yours_text}."
+    lede = "Fix the ones marked only your PR; the rest clear with the gate."
+    return head, lede + held_note, VERDICT_RED
+
+
+def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now: datetime | None = None, admitted: frozenset | None = None) -> dict:
+    """See the module docstring. `admitted` overrides the roster read from
+    the checkout (tests, and a replay over history when the roster moved)."""
+    if admitted is None:
+        admitted = admitted_cases()
+    finish = run_finish(run)
+    anchor = now or finish or datetime.now(UTC)
+    state, condition, named = _health_fields(health_at)
+    has_incident = state is not None and state != STATE_GREEN
+    # The hysteresis hold after an incident: the state is kept, the rule has
+    # stopped firing (health.json `recovering`). Read for the deadline kill,
+    # whose reading turns on whether a wave is live.
+    holding = has_incident and isinstance(health_at, dict) and bool(health_at.get("recovering"))
+    build = str(run.get("build_id") or "")
+    base = {"build": build, "pr": run.get("pr"), "cases": [], "matches_incident": False}
+
+    tasks = run_tasks(run)
+    if not tasks:
+        result = str(run.get("result") or "").upper()
+        length = run_length(run)
+        minutes = int(length.total_seconds() // 60) if length is not None else None
+        if is_lost_pod(run):
+            when = f" {minutes} minutes in" if minutes is not None else ""
+            node = run.get("pod_node")
+            return dict(
+                base,
+                headline=f"The build node running this job went away{when}.",
+                lede=f"The Prow build cluster lost {node if node else 'the node'} mid-run; nothing was graded and nothing about this change is implied."
+                + ("" if condition != CONDITION_LOST_PODS else " Other PRs lost their runs the same way right now."),
+                verdict=VERDICT_INFRA,
+                setup_death=False,
+                cls=CLS_SETUP,
+                do=DO_LOST_POD,
+                matches_incident=condition == CONDITION_LOST_PODS,
+            )
+        if is_deadline_kill(run):
+            return _deadline_verdict(base, condition, [], holding)
+        if is_merge_conflict(run):
+            return dict(
+                base,
+                headline="The branch would not merge into main, so nothing ran.",
+                lede="clonerefs hit a conflict merging this pull request into its base; the gate never started and nothing about the change is implied.",
+                verdict=VERDICT_RED,
+                setup_death=False,
+                cls=CLS_ONLY_THIS_PR,
+                do=DO_MERGE_CONFLICT,
+            )
+        if is_setup_death(run):
+            return dict(
+                base,
+                headline="The run died during setup, before any case ran.",
+                lede="A clone or deploy failure on the leased project; the agent was never started." + ("" if condition != CONDITION_SETUP_DEATHS else " Other PRs are dying the same way right now."),
+                verdict=VERDICT_INFRA,
+                setup_death=True,
+                cls=CLS_SETUP,
+                do=DO_SETUP,
+                matches_incident=condition == CONDITION_SETUP_DEATHS,
+            )
+        if result == RUN_ABORTED:
+            return dict(base, headline="Aborted before it finished.", lede="Usually a newer push superseded this run; the next one carries the verdict.", verdict=VERDICT_INFRA, setup_death=False, cls=None, do="")
+        if result == RUN_SUCCESS:
+            # hack/ci-eval-pr.sh step 0: an inert push is revalidated against
+            # the branch's earlier green and exits before the eval matrix.
+            return dict(base, headline="Green without running the cases.", lede="Only inert paths changed since this branch's last green run, so the gate revalidated that run instead of spending another.", verdict=VERDICT_GREEN, setup_death=False, cls=None, do="")
+        when = f" {minutes} minutes in" if minutes is not None else ""
+        return dict(
+            base,
+            headline=f"The run failed before any case ran{when}.",
+            lede="Check the build log: a broken image build or deploy on this branch looks like this.",
+            verdict=VERDICT_RED,
+            setup_death=False,
+            cls=None,
+            do="Read the build log; the failure is before the eval loop.",
+        )
+
+    # The gate's runs are what every rule compares against; the nightly's
+    # only feed the per-case nightly_failed_recent note.
+    gate, nightly = split_tiers(runs)
+    others = _other_pr_runs(run, gate)
+    rates = case_pass_rates(gate, anchor)
+    run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
+    # The delegation-ceiling wave's run signature is the storm's (health.py
+    # aliases the thresholds): five ceiling reps tie a run to a declared wave.
+    run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS
+    cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
+    cases = [c for c in cases if c["outcome"] is not None]
+    if is_deadline_kill(run):
+        # #1875: the cases that finished before Prow stopped it are recorded,
+        # the verdict never was. The kill is the run's class; the cases stay
+        # on the page for what they are worth.
+        return dict(_deadline_verdict(base, condition, cases, holding), storm_reps=storm_reps(run), ceiling_reps=ceiling_reps(run))
+
+    failed_names = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}
+    if condition == CONDITION_SHARED_BREAK:
+        matches = bool(failed_names & named)
+    elif condition == CONDITION_STORM:
+        matches = run_storm
+    elif condition == CONDITION_DELEGATION_CEILING:
+        matches = run_ceiling
+    elif condition == CONDITION_SETUP_DEATHS:
+        matches = False
+    else:
+        matches = False
+    headline, lede, verdict = headline_for(cases, run, matches, has_incident)
+    return dict(
+        base,
+        headline=headline,
+        lede=lede,
+        verdict=verdict,
+        cases=cases,
+        matches_incident=matches,
+        setup_death=False,
+        cls=None,
+        do="",
+        storm_reps=storm_reps(run),
+        ceiling_reps=ceiling_reps(run),
+    )

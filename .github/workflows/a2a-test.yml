@@ -1,0 +1,162 @@
+name: A2A Module Tests
+
+# Unit and conformance tests for the a2a/ Go module. The conformance suite
+# runs against an embedded JetStream server (a test-only dependency), so this
+# job needs no cluster and no credentials.
+#
+# The auth callout suite additionally wants a real Kubernetes API server, which
+# `setup-envtest` provides as a pair of local binaries - still no cluster, no
+# kubelet and no credentials. It is what makes the audience binding testable at
+# all: a token minted and validated by a real API server is the only way that
+# assertion is about Kubernetes rather than about a stub this repository also
+# wrote. Those tests SKIP when KUBEBUILDER_ASSETS is unset, so without this step
+# they would run nowhere and the job would still report green. The nats CLI the
+# step below installs is the same shape of dependency with the same failure
+# mode. Both are checked before the tests run, because these are the only two
+# things this job arms that a test quietly does without.
+#
+# The trigger arrangement is k8s-operator-test.yml's, for the reasons its
+# header comment gives: on a pull request the job always starts and the
+# `Detect changes` step decides whether to test, so the check can be required
+# without blocking unrelated changes; on a push to main the `paths:` filter
+# decides instead, so a run that tested nothing is never recorded as a green
+# run. Keep the `paths:` list and the `a2a:` filter below identical.
+on:
+  pull_request:
+    branches: [main, "release/**"]
+  push:
+    branches: [main]
+    paths:
+      - "a2a/**"
+      - ".github/workflows/a2a-test.yml"
+      # This job runs `make -C k8s-operator envtest-path`, so it depends on
+      # that Makefile as surely as on its own sources.
+      - "k8s-operator/Makefile"
+  workflow_dispatch:
+
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run A2A Module Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            a2a:
+              - "a2a/**"
+              - ".github/workflows/a2a-test.yml"
+              - "k8s-operator/Makefile"
+
+      - name: Set up Go
+        if: steps.filter.outputs.a2a == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "a2a/go.mod"
+          cache: true
+          cache-dependency-path: "a2a/go.sum"
+
+      # This job fetches the same envtest binaries as the operator's, through
+      # envtest-path, and on the same unretried path that failed a pull request
+      # containing no Go (#1603). Same key as k8s-operator-test.yml, so the two
+      # jobs share one entry -- across runs, not within one: both start
+      # concurrently on a pull request touching k8s-operator/Makefile, and on a
+      # run where the entry does not yet exist both miss and both fetch. The
+      # version is read from the Makefile that declares it rather than copied.
+      - name: Resolve the pinned envtest Kubernetes version
+        if: steps.filter.outputs.a2a == 'true'
+        id: envtest
+        # Assigned before it is written, so a failing make fails this step
+        # rather than writing an empty value into the key, and
+        # --no-print-directory so an inherited -w cannot make it a multi-line
+        # one. See the twin step in k8s-operator-test.yml.
+        run: |
+          version="$(make -C k8s-operator -s --no-print-directory envtest-k8s-version)"
+          if [ -z "$version" ]; then
+            echo "::error::envtest-k8s-version printed nothing; the cache key would carry no version."
+            exit 1
+          fi
+          echo "k8s-version=$version" >> "$GITHUB_OUTPUT"
+
+      # Restore everywhere, save only on main -- k8s-operator-test.yml's restore
+      # step carries the budget reasoning for both.
+      - name: Restore cached envtest binaries
+        if: steps.filter.outputs.a2a == 'true'
+        id: envtest-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: k8s-operator/bin/k8s
+          key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}
+
+      # The provision Job hands the nats CLI a ServiceAccount token in the
+      # password field, and whether that works is a fact about the CLI rather
+      # than about our client library - so the test that covers the one product
+      # client authenticating through the callout needs the real binary. A Go
+      # install, no container.
+      - name: Install the nats CLI
+        if: steps.filter.outputs.a2a == 'true'
+        run: go install github.com/nats-io/natscli/nats@v0.4.0
+
+      - name: Run Tests
+        if: steps.filter.outputs.a2a == 'true'
+        # envtest-path installs the binaries if absent and prints the path, so
+        # the Kubernetes version stays declared once, in k8s-operator/Makefile.
+        run: |
+          ASSETS="$(make -C k8s-operator -s envtest-path)"
+          # Guarded, because the failure this prevents is silent. Every test
+          # that needs a real API server skips when KUBEBUILDER_ASSETS is unset
+          # or wrong, and the job still reports green - so an empty or
+          # multi-line value here would quietly un-arm the envtest-backed
+          # tests the step above exists to arm.
+          if [ ! -x "$ASSETS/kube-apiserver" ]; then
+            echo "::error::envtest-path gave '$ASSETS', which holds no kube-apiserver. The envtest-backed tests would skip and this job would pass regardless."
+            exit 1
+          fi
+          # The same guard for the other tool this job installs, and the same
+          # reason. natscli_test.go resolves the binary from $NATS_CLI or, if
+          # that is unset, from PATH, and SKIPS when it finds neither - so an
+          # install that landed anywhere other than the directory the tests
+          # look in un-arms its three tests and the job still reports green.
+          # Resolved the way `go install` resolves it, GOBIN first, and handed
+          # to the tests by name below: the guard and the tests then agree on
+          # one file rather than on a PATH they each work out separately.
+          GO_BIN_DIR="$(go env GOBIN)"
+          [ -n "$GO_BIN_DIR" ] || GO_BIN_DIR="$(go env GOPATH)/bin"
+          NATS_CLI="$GO_BIN_DIR/nats"
+          if [ ! -x "$NATS_CLI" ]; then
+            echo "::error::the nats CLI install did not produce an executable at '$NATS_CLI'. The three CLI-backed tests would skip and this job would pass regardless."
+            exit 1
+          fi
+          cd a2a
+          go vet ./...
+          KUBEBUILDER_ASSETS="$ASSETS" NATS_CLI="$NATS_CLI" PATH="$GO_BIN_DIR:$PATH" go test -race ./...
+
+      # The one writer; see the twin step in k8s-operator-test.yml.
+      - name: Save envtest binaries to the cache
+        if: >-
+          steps.filter.outputs.a2a == 'true'
+          && github.event_name == 'push'
+          && github.ref == 'refs/heads/main'
+          && steps.envtest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: k8s-operator/bin/k8s
+          key: envtest-${{ runner.os }}-${{ steps.envtest.outputs.k8s-version }}

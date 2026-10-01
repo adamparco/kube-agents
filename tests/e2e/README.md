@@ -10,8 +10,8 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 └───────┬─────────────────────────────────┬───────────────────────▲───────┘
         │ 1. Post prompt message          │ 2. Publish Chat Event │
         │    (Service Account WIF)        │    with Thread ID     │ 5. Polls & asserts
-        │                                 │    (Service Account)  │    response (OTA User)
-        ▼                                 ▼                       │
+        │                                 │    (Service Account)  │    response (SA app auth;
+        ▼                                 ▼                       │    OTA user on a denial)
 ┌──────────────────────┐      ┌──────────────────────┐            │
 │  Google Chat API     │      │    Pub/Sub Topic:    │            │
 │(spaces.messages.create)     │ platform-agent-events│            │
@@ -31,25 +31,29 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 ### 1. Hybrid Auth Model & Google Chat API Restrictions
 
 - **Service Account (WIF Keyless Authentication)**:
-  Used to post the initial thread message (`spaces.messages.create`) and trigger Pub/Sub (`pubsub.projects.topics.publish`).
+  Used to post the initial thread message (`spaces.messages.create`), trigger Pub/Sub (`pubsub.projects.topics.publish`), and, as the first choice, to poll space messages (`spaces.messages.list`).
 - **Owned Test Account (OTA User Credentials)**:
-  Used to poll and read space messages (`spaces.messages.list`).
-  _Why OTA User Credentials?_ By Google Chat API security policy, Service Accounts using `chat.bot` or `chat.messages.readonly` are **strictly forbidden** from calling `spaces.messages.list` (returns HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`). Using a dedicated OTA (Owned Test Account) user credential enables 100% automated message verification in CI without using personal developer accounts.
+  The fallback for polling space messages when the service account is denied.
+
+_Why two credentials for reading?_ A service account calls `spaces.messages.list` only under app authentication with the `chat.app.messages.readonly` scope, and every `chat.app.*` scope needs a one-time approval by a Google Workspace administrator. The `chat.bot` scope is not accepted for that call (HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`), and `chat.messages.readonly` is a user-authentication scope that is not accepted from a service account, which is what the OTA user credential is for. Under app authentication the call returns only public messages in the space; the bot's thread reply is one. Until the approval exists the API answers 403 `The administrator must grant the app the required OAuth authorization scope for this action`, so `tests/e2e/gchat_poller.py` polls with the runner's own credentials first and switches to the OTA user credential on a 400/401/403 from the API or a refused token mint (a DM answers an app-auth read with 400 `DMs are not supported for methods requiring app authentication with administrator approval`; the CI space is not a DM). The run prints which credential read the space (`Space messages were read with: …`) and, on a fallback, the denial that caused it, so a CI log shows whether app authentication works under the organisation's policy. A denial with no OTA configured fails the test at once with the remedy rather than polling to the timeout.
+
+Approving the scope takes more than the Admin console, per Google's [app-authentication guide](https://developers.google.com/workspace/chat/authenticate-authorize-chat-app). In the Chat app's GCP project (the one the E2E service account lives in): create a **Google Workspace Marketplace-compatible OAuth client** from the service account's _Advanced settings_; enable the **Google Workspace Marketplace SDK** and, under _App Configuration_, set visibility **Private**, installation **Individual + admin install**, integration **Chat app**, list `https://www.googleapis.com/auth/chat.app.messages.readonly` under OAuth scopes, and save the draft. A Workspace administrator then grants the app that scope ([Set up authorization for Chat apps](https://support.google.com/a?p=chat-app-auth)). The app must be a member of the space. Once the log shows the space read with the service account across runs, the OTA steps in sections 3 to 5 below and the three OTA secrets (`E2E_CHAT_CLIENT_ID`, `E2E_CHAT_CLIENT_SECRET`, `E2E_CHAT_REFRESH_TOKEN`) can go; `E2E_CHAT_SPACE_ID` still names the space.
 
 ### 2. Why Hybrid Pub/Sub Triggering is Required
 
 - **Google Chat API Event Suppression**: Google Chat API does not generate Pub/Sub interaction events for messages posted programmatically via `spaces.messages.create` to prevent infinite bot loops.
 - **Hybrid Test Flow**:
-  1. **Step 1**: Test runner posts a prompt via Service Account WIF to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
-  2. **Step 2**: Test runner constructs a valid Google Chat event payload referencing the real Thread ID and authorized test identity (`TEST_USER_EMAIL`), publishing it directly to Pub/Sub topic `platform-agent-chat-events`.
-  3. **Step 3**: **Hermes Agent** in GKE receives the Pub/Sub event, computes a well-known, predictable answer that can be validated deterministically, and posts the reply into the real space thread.
-  4. **Step 4**: Test runner polls the thread via `poll_chat_service` using the OTA User credentials (`chat.messages.readonly`) and asserts the expected response.
+  1. **Pre-Flight (when `kubectl` is reachable)**: Waits up to `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `900`s) for `deployment/platform-agent-gateway` in `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`) to finish any rolling restart before posting.
+  2. **Step 1**: Test runner posts a prompt via Service Account WIF to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
+  3. **Step 2**: Test runner constructs a valid Google Chat event payload referencing the real Thread ID and authorized test identity (`TEST_USER_EMAIL`), publishing it directly to Pub/Sub topic `platform-agent-chat-events`.
+  4. **Step 3**: **Hermes Agent** in GKE receives the Pub/Sub event, computes a well-known, predictable answer that can be validated deterministically, and posts the reply into the real space thread.
+  5. **Step 4**: Test runner polls the thread via `chat_poller` (service-account app auth first, OTA user credentials on a denial) and asserts the expected response.
 
 ---
 
 ## 🛠️ Complete GCP Project & CI Setup Checklist
 
-To configure a new or existing GCP project for running this E2E test suite in CI/CD, complete the following 4 setup sections:
+To configure a new or existing GCP project for running this E2E test suite in CI/CD, complete the following setup sections:
 
 ### 1. Enable Required GCP APIs
 
@@ -84,6 +88,8 @@ _What this script provisions:_
 _(To teardown CI IAM resources when no longer needed, run `./tests/e2e/scripts/teardown_ci_iam.sh --gcp_project <GCP_PROJECT_ID> --git_project <GITHUB_OWNER/REPO>`)._
 
 ### 3. Setup Owned Test Account (OTA) & Google Chat Space
+
+The OTA steps in sections 3 to 5 configure the fallback read credential. They are needed until the service account's `chat.app.messages.readonly` scope is approved ("Hybrid Auth Model" above) and the run log shows the space read with it. The space itself is needed either way.
 
 1. **Create OTA Account**: Create or configure a dedicated test account (e.g. `kube-agents-e2e-verifier@gmail.com`).
 2. **Activate Google Chat**: Open Chrome Incognito, log in as the test account, and navigate to `https://chat.google.com` to accept initial setup.
@@ -137,10 +143,10 @@ pip install -r tests/e2e/requirements.txt
 
 ### Step 2: Authenticate GCP ADC for Local Execution
 
-> **Note on Local Runs**: When running locally without `E2E_CHAT_*` environment variables, the test runner automatically falls back to your personal `gcloud` ADC credentials. You can run the test locally against any GCP project and target Google Chat Space without requiring OTA user credentials!
+> **Note on Local Runs**: Locally the poller reads the space with your personal `gcloud` ADC first, which is user authentication, so the login below asks for `chat.messages.readonly`; set the `E2E_CHAT_*` variables only if you want the OTA fallback as well. The run's `Space messages were read with:` line then names user credentials rather than a service account, so a local run says nothing about app authentication.
 
 ```bash
-source k8s-operator/scripts/vars.sh
+set -a; . install.env; set +a
 export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 
 gcloud auth application-default set-quota-project "$PROJECT_ID"
@@ -148,6 +154,8 @@ gcloud auth application-default login --scopes="https://www.googleapis.com/auth/
 ```
 
 ### Step 3: Run pytest
+
+Optional cluster pre-flight environment variables: `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`), `KUBE_CONTEXT`, and `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `900`).
 
 ```bash
 pytest tests/e2e/gchat_agent_test.py -v -s
@@ -195,14 +203,15 @@ This test suite performs a 17-step end-to-end verification of the `AgentPlugin` 
 
 ### Environment variables:
 
-| Variable          | Required | Purpose                                                                              |
-| ----------------- | -------- | ------------------------------------------------------------------------------------ |
-| `KUBE_CONTEXT`    | Yes      | `kubectl` context of the target cluster.                                             |
-| `NAMESPACE`       | Yes      | Namespace holding the operator and `PlatformAgent`.                                  |
-| `REGISTRY`        | Yes      | Registry prefix for the operator and plugin images.                                  |
-| `IMAGE_BUILDER`   | No       | `docker` (default) or `crane`. See below.                                            |
-| `CRANE_BIN`       | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`. |
-| `TARGET_PLATFORM` | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.          |
+| Variable              | Required | Purpose                                                                                                               |
+| --------------------- | -------- | --------------------------------------------------------------------------------------------------------------------- |
+| `KUBE_CONTEXT`        | Yes      | `kubectl` context of the target cluster.                                                                              |
+| `NAMESPACE`           | Yes      | Namespace holding the operator and `PlatformAgent`.                                                                   |
+| `REGISTRY`            | Yes      | Registry prefix for the operator and plugin images.                                                                   |
+| `IMAGE_BUILDER`       | No       | `docker` (default) or `crane`. See below.                                                                             |
+| `CRANE_BIN`           | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`.                                  |
+| `TARGET_PLATFORM`     | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.                                           |
+| `OPERATOR_DEPLOYMENT` | No       | Deployment name for the operator. Defaults to auto-discovery via label `app.kubernetes.io/name=kube-agents-operator`. |
 
 ### Choosing an image builder
 
@@ -243,7 +252,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ### 17-Step Verification Workflow:
 
-1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys the operator Deployment (discovered via label `app.kubernetes.io/name=kube-agents-operator`, or overridden with `OPERATOR_DEPLOYMENT`).
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
 3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
 4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.
@@ -251,7 +260,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 6. **Remove AgentPlugin CR**: Deletes the `AgentPlugin` CR and waits for rollout.
 7. **Verify Log Silence**: Confirms unique plugin log output stops appearing in replacement pod logs.
 8. **Verify ConfigMap Cleanup**: Confirms plugin entry is removed from `plugins.enabled` in `config.yaml`.
-9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
+9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped in favor of `emptyDir` volume and `stage-<plugin>` init-container staging, `AgentPlugin.status.phase` remains `Ready`, and condition `Ready` sets `Reason: Applied` with message noting staging via init container.
 10. **Orphaned `agentRef` Reporting**: Creates an `AgentPlugin` whose `agentRef` names no `PlatformAgent`. Verifies `status.phase` becomes `Degraded` with `Reason: AgentNotFound`, and that the plugin still never reaches `plugins.enabled`.
 11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
 12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file **and restarts the operator** — re-applying the CRD alone does not revive the informer, which keeps retrying with growing backoff, so later steps would race that recovery. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
@@ -263,9 +272,48 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ---
 
+## 🔒 Credential Isolation E2E (`tests/e2e/operator/credential_isolation_e2e_test.py`)
+
+Asserts, at runtime, the credential boundary between the sandbox and the credential broker. The operator's Go tests assert the _inputs_ — `shareProcessNamespace` left unset, split UIDs, broker-private volumes — and a rendered manifest cannot tell you what the kernel actually shows one container about another. This closes that gap and there is no way to close it without a cluster, so there is no CI job for it.
+
+Unlike the AgentPlugins suite it is **read-only and safe to run against a cluster you care about**: no image build, no registry, no writes. It runs `id` and reads `/proc` and `/proc/self/mounts`.
+
+### Prerequisites
+
+- Active `kubectl` context with `exec` permission on the agent namespace.
+- A running agent Pod in the **sidecar layout**, which is what the operator renders today. If the broker is ever in a Pod of its own the suite exits without running, rather than passing vacuously — the containers are then in different Pods and there is no shared process namespace to check.
+
+### Environment variables
+
+| Variable       | Required | Purpose                                    |
+| -------------- | -------- | ------------------------------------------ |
+| `KUBE_CONTEXT` | Yes      | `kubectl` context of the target cluster.   |
+| `NAMESPACE`    | Yes      | Namespace holding the `PlatformAgent` Pod. |
+
+### Execution
+
+```bash
+KUBE_CONTEXT="gke_my-project_europe-west1_ka-dev-mgmt" \
+NAMESPACE="kubeagents-system" \
+python3 tests/e2e/operator/credential_isolation_e2e_test.py
+```
+
+### What it checks
+
+1. **PID 1 is each container's own entrypoint**, not the Pod infra (`pause`) process — the first observable consequence of `shareProcessNamespace: true`.
+2. **The broker is actually running the credential proxy.** Checked _before_ the scan below, because a crash-looping broker and an invisible broker produce the same empty result.
+3. **No broker process appears in the agent container's `/proc`** — the second observable consequence, asserted separately because a CRI quirk could mask either one alone. Paired with a positive control requiring the scan to have returned _some_ process, so an empty result cannot be mistaken for isolation.
+4. **No `/proc/<pid>/environ` the agent can read carries the broker's environment.** The consequence stated directly rather than inferred, so it catches a credential-holding process this file does not know to look for by name. Also paired with a positive control: the identical command is run in the broker container, where a hit is guaranteed, and is required to find one. This is the only check whose external tool (`grep`) is exercised nowhere else, and an absence-of-output assertion cannot otherwise tell "nothing to find" from "nothing ran".
+5. **The two containers run as different users** (10000 and 10001). Reading another process's environ needs ptrace-level access, which the kernel grants on a UID match; splitting the UIDs removes that even if the shared namespace ever returns.
+6. **The agent mounts neither the broker's HOME nor its backend socket directory.** Asserted against the agent's mount table, not against whether the directory exists: an empty directory of the same name passes either way, and it is the mount that decides whether the bytes are shared. `kubectl` reads `$HOME/.kube/kuberc` with no flag at all and a kuberc can set `as`, so a writable broker HOME is caller-supplied impersonation through a file.
+
+---
+
 ## 🤖 Running in GitHub Actions (CI)
 
-The workflow file [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) is triggered manually via `workflow_dispatch` (or via GitHub CLI / Web UI).
+Three workflows run this suite. [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) and [`.github/workflows/e2e-manual-runner.yml`](../../.github/workflows/e2e-manual-runner.yml) are triggered by hand via `workflow_dispatch` (or via GitHub CLI / Web UI). The third is [`.github/workflows/e2e-run.yml`](../../.github/workflows/e2e-run.yml), which runs nothing on its own — it is the reusable job that calls `scripts/release/execute_e2e_tests.sh`, and both pipelines delegate to it. [`.github/workflows/rc-release-pipeline.yml`](../../.github/workflows/rc-release-pipeline.yml) calls it unattended and `step-4-tag-validated` depends on the result, so a break here stops the release-candidate tag within three hours. That pipeline carries no schedule of its own: [`.github/workflows/rc-scheduler.yml`](../../.github/workflows/rc-scheduler.yml) runs three-hourly and dispatches it only when there is a new candidate, so a tick with nothing to do leaves no run behind to be mistaken for a passing one. [`.github/workflows/staging-promotion-pipeline.yml`](../../.github/workflows/staging-promotion-pipeline.yml) calls it too, gating the nomination that starts the release-candidate eval, which in turn gates the staging promotion — dispatched daily by [`.github/workflows/staging-promotion-scheduler.yml`](../../.github/workflows/staging-promotion-scheduler.yml) whenever a validated candidate exists that the workflows can drive, or run manually via `workflow_dispatch`. Whether that candidate has already been nominated or promoted does not decide the dispatch: it is a separate output (`skip_promotion`) that the pipeline reads to skip the tagging steps, so the matrix runs on quiet nights too.
+
+Each caller splits its suites into a gate and tolerated coverage. `blocking_suite` fails the run; `optional_suites`, a comma-separated list run by `scripts/release/run_optional_e2e_suites.sh`, reports and does not. The split is evidence rather than preference: a suite gates a promotion once it has passed on a real cluster, and runs as optional coverage until then. The RC pipeline gates on `gchat` and tolerates `rc`; the staging promotion pipeline gates on `rc` — the subset the RC pipeline exercises every three hours — and tolerates `gchat`, `agent-plugin` and `stockout-full`, which between them cover every file the `nightly` suite adds. Per-suite filters such as `STOCKOUT_SCENARIOS` are declared in the suite's `env_vars` in `e2e_config.yaml`, not passed from the workflow, because one workflow input cannot carry a different value for each suite in a list.
 
 ### Triggering Workflow via GitHub CLI (`gh`):
 
@@ -278,5 +326,5 @@ gh workflow run .github/workflows/e2e-gchat-test.yml \
 
 ### Authentication in CI:
 
-1. **Service Account via WIF**: Authenticates `github-actions-e2e@kube-agents-autopush.iam.gserviceaccount.com` for keyless message creation and Pub/Sub publishing.
-2. **OTA User Credentials & Target Space via Secrets**: Uses `E2E_CHAT_REFRESH_TOKEN`, `E2E_CHAT_CLIENT_ID`, `E2E_CHAT_CLIENT_SECRET`, and `E2E_CHAT_SPACE_ID` secrets for space resolution and response polling.
+1. **Service Account via WIF**: Authenticates `github-actions-e2e@kube-agents-autopush.iam.gserviceaccount.com` for keyless message creation, Pub/Sub publishing, and the first attempt at reading the space back.
+2. **OTA User Credentials & Target Space via Secrets**: `E2E_CHAT_SPACE_ID` names the space; `E2E_CHAT_REFRESH_TOKEN`, `E2E_CHAT_CLIENT_ID` and `E2E_CHAT_CLIENT_SECRET` supply the fallback credential for response polling when the service account is denied `spaces.messages.list`.

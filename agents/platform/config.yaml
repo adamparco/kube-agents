@@ -84,6 +84,10 @@ mcp_servers:
       # block names, so if the operator's path ever moves, an undeclared
       # variable would leave the server reading a database nothing writes.
       SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
+      # The data root the Cluster Agent profiles live under, for list_cluster_profiles
+      # and get_cluster_profile_name. HERMES_HOME above is the platform profile's own
+      # home in a worker, a level too deep to see the other profiles.
+      PLATFORM_AGENT_HOME: "${PLATFORM_AGENT_HOME}"
   # A remote MCP endpoint, proxied over stdio by mcp-remote. The explicit
   # timeout is a backstop: unpatched, mcp-remote drops the request id when the
   # remote answers non-2xx, so the client parks for the whole 300s default.
@@ -94,10 +98,25 @@ mcp_servers:
   # The whole entry is redundant with the shared defaults — the build-time merge
   # unions the two — but repeating it here keeps this file from reading as if
   # gke were the one server without these settings.
+  #
+  # `--header User-Agent: …` names this product, the build it came from and its
+  # execution mode, so the API team serving the endpoint can attribute the traffic;
+  # deploy/shared/defaults/config.yaml carries the full rationale, including
+  # where the version and the mode come from. That merge unions the two arg lists, so this
+  # copy has to stay character-identical to the one there. Drift does not
+  # produce two headers, which is the intuitive guess and the wrong one: the
+  # union dedups, so the repeated `--header` token collapses and the divergent
+  # VALUE survives alone, as a bare positional after the URL. mcp-remote reads
+  # that second positional as its optional callback port, parses it to NaN and
+  # ignores it — leaving one header, silently the shared-defaults one, whatever
+  # this file says. tests/test_remote_mcp_user_agent.py checks the merged argv
+  # for exactly that shape.
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30
@@ -116,10 +135,10 @@ mcp_servers:
 # inject_memory_provider_tools() bails unless it is listed, and that injection is
 # the only path by which the provider's tools reach the model. It is on both keys
 # because a kanban worker resolves its toolsets from `cli`
-# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db.py) while the API server
-# path uses `api_server`; a specialist reached either way must see the same
-# memory. Which tools that actually yields is decided by the provider — under
-# `memory.read_only` below it is the two read tools and nothing else.
+# (_resolve_worker_cli_toolsets in hermes_cli/kanban_db_dispatch.py) while the
+# API server path uses `api_server`; a specialist reached either way must see
+# the same memory. Which tools that actually yields is decided by the provider
+# — under `memory.read_only` below it is the two read tools and nothing else.
 #
 # The toolset also surfaces Hermes' own built-in `memory` tool (MEMORY.md /
 # USER.md), whose check_fn is unconditional. It is inert here for the same reason
@@ -152,11 +171,17 @@ toolsets:
   - kanban
 
 # Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrow: the cost audit runs ten checks against every cluster and the
-# drift audit nineteen, plus enumeration, the SOP read, and the publish harness.
-# Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
-# a `timed_out` kanban event, though the run was actively heartbeating and no
-# clock ran out. 250 is roughly triple the observed near-miss.
+# audits outgrew when each ran its checks cluster by cluster: three separate runs
+# died on `Iteration budget exhausted (90/90)` — reported as a `timed_out` kanban
+# event, though the run was actively heartbeating and no clock ran out. Most
+# streams, cost and drift among them, now run one collector script that reads
+# the whole fleet in a single call, so a clean run costs the SOP read, the
+# collector, the recommendations and the publish harness. What still scales
+# with the fleet is the Compute Engine and networking audits, which have no
+# collector yet, and the by-hand fallback the SOPs prescribe for every cluster
+# or project a collector marks `unreachable` or `gate-failed` — a bad day on a
+# large fleet is the old per-cluster loop over part of it. 250, roughly triple
+# the observed near-miss, is kept as headroom for those paths.
 #
 # This belongs here rather than in the operator's generated root config because
 # both ways an audit can start read *this* file and not the root one: a cron run
@@ -170,8 +195,10 @@ agent:
 # Per-turn web_search ceiling. Hermes defaults to 50, and the docstring on that
 # default is right about interactive sessions: fifty searches in one turn is
 # pathological. It is not right about a kanban worker. Those are spawned
-# non-goal-mode, so `chat -q` gives the whole card exactly one turn, and the
-# per-turn cap is really a per-card research budget.
+# non-goal-mode — triage cards by instruction (`_build_agent_query` rule 4 in
+# `scripts/session_kv_server.py`, #656), everything else by the tool's default —
+# so `chat -q` gives the whole card exactly one turn, and the per-turn cap is
+# really a per-card research budget.
 #
 # Card t_d3efabef ("Evaluate Config Connector Setup Patterns") hit that ceiling
 # on all four of its runs — 208 searches, 173 of them successful, 38 minutes,

@@ -1,7 +1,9 @@
 """Tests for the platform-agent-gateway rollout budgets.
 
-The companion to test_hindsight_probes.py, for the Deployment the redeploy
-workflows actually gate on. The same three numbers have to stay in the same
+The companion to test_hindsight_probes.py, for the Deployment upgrade.sh
+actually gates on -- and for scripts/release/wait_for_gke_readiness.sh,
+which waits on the same Deployments after the RC environment is provisioned and
+is bound by the same rule. The same three numbers have to stay in the same
 order:
 
     startupProbe budget  <  rollout gate  <  progressDeadlineSeconds
@@ -28,8 +30,31 @@ import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MANIFESTS_GO = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
-_AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
-_INTEGRATIONS_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-integrations.yml"
+_UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
+_READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
+# Where the front doors' constants for the chart's fixed object names live.
+# upgrade.sh spells a Deployment through one of them ("deployment/${NAME}"),
+# so a gate is matched by the literal name or by any constant that holds it.
+_INSTALLER_COMMON = _ROOT / "scripts" / "installer" / "installer_common.sh"
+
+
+def _deployment_spellings(deployment):
+    """The literal name plus every `readonly X="<name>"` constant that equals it."""
+    constants = re.findall(
+        rf'^readonly (\w+)="{re.escape(deployment)}"$',
+        _INSTALLER_COMMON.read_text(),
+        re.MULTILINE,
+    )
+    return [re.escape(deployment)] + [rf"\$\{{{name}\}}" for name in constants]
+
+
+def rollout_gate_pattern(deployment):
+    """The `kubectl rollout status` line for one Deployment, however it is spelled."""
+    return re.compile(
+        r'kubectl rollout status "?deployment/(?:'
+        + "|".join(_deployment_spellings(deployment))
+        + r')"?\s[^\n]*?--timeout=(\d+)s'
+    )
 
 # What the gate must have over the startupProbe budget, in seconds, for the
 # node scale-up and image pull that precede the container starting at all.
@@ -37,7 +62,7 @@ _INTEGRATIONS_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-inte
 _PULL_ALLOWANCE_SECONDS = 240
 
 # Kubernetes' default when a Deployment does not set progressDeadlineSeconds.
-# The integrations Deployments below rely on it rather than setting their own.
+# Deployments with no explicit progressDeadlineSeconds rely on this default.
 _DEFAULT_PROGRESS_DEADLINE_SECONDS = 600
 
 
@@ -74,10 +99,7 @@ def _gateway_progress_deadline_seconds():
 
 def _rollout_gate_seconds(workflow, deployment):
     """The --timeout on a `kubectl rollout status` for one Deployment."""
-    match = re.search(
-        rf"kubectl rollout status deployment/{re.escape(deployment)}\b[^\n]*?--timeout=(\d+)s",
-        workflow.read_text(),
-    )
+    match = rollout_gate_pattern(deployment).search(workflow.read_text())
     assert match, f"could not find the rollout gate for {deployment} in {workflow.name}"
     return int(match.group(1))
 
@@ -87,7 +109,7 @@ class GatewayRolloutBudgetTest(unittest.TestCase):
 
     def setUp(self):
         self.startup = _gateway_startup_budget_seconds()
-        self.gate = _rollout_gate_seconds(_AGENT_WORKFLOW, "platform-agent-gateway")
+        self.gate = _rollout_gate_seconds(_UPGRADE_SCRIPT, "platform-agent-gateway")
         self.deadline = _gateway_progress_deadline_seconds()
 
     def test_the_gate_covers_the_startup_budget_and_the_image_pull(self):
@@ -123,20 +145,99 @@ class GatewayRolloutBudgetTest(unittest.TestCase):
         )
 
 
-class IntegrationsRolloutGateTest(unittest.TestCase):
-    """The integrations gates rely on the default deadline, so they stay under it."""
+def _readiness_gate_seconds(deployment, variable):
+    """The gate wait_for_gke_readiness.sh applies to one Deployment.
 
-    def test_gates_stay_under_the_default_progress_deadline(self):
-        for deployment in ("litellm", "github-token-minter"):
-            with self.subTest(deployment=deployment):
-                gate = _rollout_gate_seconds(_INTEGRATIONS_WORKFLOW, deployment)
-                self.assertLess(
-                    gate,
-                    _DEFAULT_PROGRESS_DEADLINE_SECONDS,
-                    f"{deployment} sets no progressDeadlineSeconds, so it runs on the "
-                    f"{_DEFAULT_PROGRESS_DEADLINE_SECONDS}s default; a {gate}s gate cannot "
-                    "run its full length. Set an explicit deadline first, as the gateway does",
-                )
+    Two halves, because the script gates through a shell constant rather than a
+    literal: the constant's value, and the fact that this Deployment's `rollout
+    status` is the line that reads it. Asserting only the value would keep
+    passing if the two Deployments were pointed at the same constant again,
+    which is the state this split exists to leave behind.
+    """
+    text = _READINESS_SCRIPT.read_text()
+
+    declared = re.search(rf'readonly {re.escape(variable)}="(\d+)s"', text)
+    assert declared, f"could not find readonly {variable} in {_READINESS_SCRIPT.name}"
+
+    used = re.search(
+        rf"kubectl rollout status deployment/{re.escape(deployment)}\b[^\n]*?"
+        rf'--timeout="\$\{{{re.escape(variable)}\}}"',
+        text,
+    )
+    assert used, f"{deployment}'s rollout status in {_READINESS_SCRIPT.name} does not use {variable}"
+
+    return int(declared.group(1))
+
+
+class ReleaseReadinessGateTest(unittest.TestCase):
+    """The RC pipeline's own gates, which are not the deploy workflows'.
+
+    wait_for_gke_readiness.sh waits on the same two Deployments after the RC
+    environment is provisioned, so it is bound by the same ordering -- but it
+    sat outside this file's scope and ran a single 300s gate for both. That was
+    under the gateway's 605s startupProbe budget, and went unnoticed while the
+    RC provisioned Standard clusters: a fresh Autopilot cluster pays node
+    scale-up and a first image pull before the container starts.
+    """
+
+    def setUp(self):
+        self.startup = _gateway_startup_budget_seconds()
+        self.deadline = _gateway_progress_deadline_seconds()
+        self.gateway_gate = _readiness_gate_seconds(
+            "platform-agent-gateway", "GATEWAY_READINESS_TIMEOUT"
+        )
+        self.litellm_gate = _readiness_gate_seconds("litellm", "LITELLM_READINESS_TIMEOUT")
+
+    def test_the_gateway_gate_covers_the_startup_budget_and_the_image_pull(self):
+        self.assertGreaterEqual(
+            self.gateway_gate,
+            self.startup + _PULL_ALLOWANCE_SECONDS,
+            f"a {self.gateway_gate}s gate leaves "
+            f"{self.gateway_gate - self.startup}s for node scale-up and an image pull on "
+            f"top of a {self.startup}s startupProbe budget; on a fresh Autopilot cluster "
+            "this reds an RC that was still coming up",
+        )
+
+    def test_the_gateway_gate_stays_under_the_progress_deadline(self):
+        self.assertLess(
+            self.gateway_gate,
+            self.deadline,
+            f"a {self.gateway_gate}s gate against a {self.deadline}s progressDeadlineSeconds "
+            "cannot run its full length",
+        )
+
+    def test_the_litellm_gate_stays_under_the_default_progress_deadline(self):
+        # litellm sets no progressDeadlineSeconds of its own, so unlike the
+        # gateway it has the 600s default as its ceiling, not 1200s.
+        self.assertLess(
+            self.litellm_gate,
+            _DEFAULT_PROGRESS_DEADLINE_SECONDS,
+            f"litellm runs on the {_DEFAULT_PROGRESS_DEADLINE_SECONDS}s default deadline; a "
+            f"{self.litellm_gate}s gate cannot run its full length. Set an explicit deadline "
+            "first, as the gateway does",
+        )
+
+    def test_the_two_deployments_do_not_share_one_gate(self):
+        """The ceilings differ by 600s, so one number cannot respect both."""
+        self.assertNotEqual(
+            self.gateway_gate,
+            self.litellm_gate,
+            "a single readiness gate for both Deployments is either under the gateway's "
+            "cold-start cost or over litellm's default progress deadline",
+        )
+
+
+class UpgradeRolloutGateTest(unittest.TestCase):
+    """The upgrade.sh rollout gates stay under default progress deadlines."""
+
+    def test_controller_gate_stays_under_the_default_progress_deadline(self):
+        gate = _rollout_gate_seconds(_UPGRADE_SCRIPT, "kube-agents-controller-manager")
+        self.assertLess(
+            gate,
+            _DEFAULT_PROGRESS_DEADLINE_SECONDS,
+            f"kube-agents-controller-manager runs on the {_DEFAULT_PROGRESS_DEADLINE_SECONDS}s default deadline; "
+            f"a {gate}s gate cannot run its full length.",
+        )
 
 
 if __name__ == "__main__":

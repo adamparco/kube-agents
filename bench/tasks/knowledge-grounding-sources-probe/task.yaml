@@ -1,0 +1,172 @@
+# Knowledge-grounding probe: a pure GKE documentation question, graded on
+# the grounding contract the personas carry (agents/platform/SOUL.md):
+# answer from a knowledge lookup — Developer Knowledge MCP first, through
+# `search_documents` and never `answer_query` (#1765: a 50-a-day project
+# quota shared by every agent in the install), active web_search fallback —
+# and conclude with a `## Sources` section naming the tools queried.
+# deploy/docker/patches/kanban_report_format.py carries the same
+# `## Sources` rule for delegated card reports, so the contract holds
+# whether the front door answers directly or a specialist works the card.
+#
+# Planted defect required: none. The case reads no cluster and depends on no
+# fixture — every check reads the run's transcript, which is why there is no
+# `fixtures:` list (the agent-kanban-smoke precedent). The facts asserted are
+# not planted in a cluster but they are deterministic: the prompt asks for the
+# nodeSelector that selects the Performance compute class in GKE Autopilot,
+# and the one correct key is `cloud.google.com/compute-class` — a grounded
+# answer cannot avoid naming it, and an ungrounded one has to guess it.
+# `Sources` IS a planted noun: the persona and the report-format patch
+# mandate that exact section heading. What the section names is not: the
+# contract says "tools and documentation references", and the persona gives
+# `Developer Knowledge MCP (developerknowledge.googleapis.com)` only as an
+# example, so the citation check below accepts either form.
+#
+# Measured on build 2097362391401500672 (2026-09-08, #945, kube-agents-evals-24),
+# three repetitions: 615s, 715s, 166s, all three naming the nodeSelector key
+# and all three ending in `## Sources`. Two cited "Web Search (<docs URL>)";
+# one cited three documentation titles ("Google Cloud Documentation: Choose
+# compute classes for Autopilot Pods", ...) with no tool name, which the
+# contract permits and the first draft of the citation check -- tool names
+# only -- failed. None of the three cited Developer Knowledge MCP. That is
+# not something this case can assert: the pool projects were provisioned by
+# scripts/provision_ci_pool_project.sh before developerknowledge.googleapis.com
+# joined full-install's service list, the presubmit never re-applies that
+# Terraform, and the persona names web_search as the legitimate fallback when
+# the MCP has no coverage -- so a run that cites web search is the contract
+# holding, not failing. Asserting the MCP by name here would red every
+# pull request on the pool's provisioning date rather than on the diff.
+#
+# What the case CAN assert about the tool choice, since #1746 put the
+# workers' calls in the trajectory: that no worker called `answer_query`.
+# The lookup happens in the platform worker (the front door has no
+# knowledge tools), so the safeguard reads `scope: workers`. The worker
+# reaches an MCP tool through Hermes' `tool_call` wrapper -- the entry is
+# named `tool_call` and the tool invoked sits in its arguments -- and
+# tool_called reads through that wrapper. An attempted call counts whether
+# or not the API answered, so it holds in the pool projects too, where the
+# Developer Knowledge tools ARE listed but every call 403s (the pool's
+# agent identity lacks roles/serviceusage.serviceUsageConsumer for its own
+# project, the grant #945 added to full-install and the pool never got) and
+# the worker falls back to web search. Measured on build 2102459327938826240
+# (#1765, kube-agents-evals-8), rep 1, 221s: tool_search -> tool_describe
+# -> tool_call(mcp__developer_knowledge__search_documents) -> 403 ->
+# web_search x4 -> report; all four checks passed, VerificationCoverage
+# 1.0, so the capture runs in this case's shape. The red on main's personas
+# is a peer build the same day (2102475235713355776, PR #1652, GREEN): its
+# obtainability-pdb-semantics worker spent one
+# mcp__developer_knowledge__answer_query call through the same wrapper. If
+# the capture did not run the check errors rather than passing, which is
+# VerificationCoverage < 1.0.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly -- registered in hack/eval/nightly-cases.txt since
+# 2026-09-09, after one presubmit cycle in TASKS (#945: 2/3 on the build
+# above, then 3/3 on build 2097414338968031232 once the citation check was
+# widened). Held out of presubmit deliberately, not for cost or flake:
+# knowledge grounding is a cross-cutting persona behavior rather than one of
+# the core kube-agents journeys the presubmit gate exists for, so it earns
+# its record in the nightly's full catalog. #1765 gave it a temporary
+# presubmit seat to measure the answer_query safeguard on that pull
+# request's builds (2102459327938826240 and 2102768495748976640), reverted
+# before merge (the incident-triage-oom-event-probe precedent). Cost: one delegation round trip
+# plus one knowledge lookup; measured 166-1602s across six repetitions
+# (median ~600s), so unit_cost_hint in hack/ci-eval-pr.sh carries an entry
+# for it. No tofu, no fleet read.
+id: knowledge-grounding-sources-probe
+name: Grounded GKE knowledge answer cites its sources
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+prompt: >-
+  What compute classes does GKE Autopilot support, and which nodeSelector do
+  I use to run a workload on the Performance compute class?
+expected_output: >-
+  The agent answers from a knowledge lookup rather than training memory: it
+  queries the Developer Knowledge MCP through search_documents (never the
+  quota-limited answer_query; falling back to web search only where the MCP
+  has no coverage), names the cloud.google.com/compute-class nodeSelector
+  key for selecting the Performance compute class, and concludes with a
+  "## Sources" section naming the knowledge tools and documentation sources it
+  queried.
+infrastructure:
+  deployer: noop
+validated: false
+
+# No `domain:` — recorded in KNOWN_NO_DOMAIN (scripts/validate_bench_cases.py):
+# grounded knowledge retrieval is a cross-cutting behavior of every persona,
+# and no docs/designs/domains.yaml row describes it.
+
+# Exact checks. Matching is normalized (lowercased, emphasis stripped) by
+# ReportContainsVerifier, so the phrases below are spelling-insensitive.
+verification_spec:
+  - name: the-answer-names-the-compute-class-selector
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # The one correct nodeSelector key. It is not in the prompt, so an
+      # answer can only carry it by looking it up or knowing it cold — and
+      # the persona forbids acting on unverified recall.
+      required_phrases: ["cloud.google.com/compute-class"]
+  - name: the-answer-cites-its-sources
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The section the persona and kanban_report_format.py mandate for every
+      # knowledge lookup, plus at least one citation in a form the contract
+      # names: a knowledge TOOL (Developer Knowledge MCP first, web search as
+      # the explicit fallback) or a DOCUMENTATION REFERENCE (a GKE docs URL,
+      # or a title prefixed the way the agent writes it). The first draft
+      # listed only the tool names and failed a contract-compliant report
+      # that cited three documentation titles (see the header). A `## Sources`
+      # section with no citation in any of these forms, or no section at
+      # all, is the regression this probe exists to catch.
+      required_phrases: ["Sources"]
+      any_of_phrases:
+        [
+          "Developer Knowledge",
+          "developerknowledge",
+          "web search",
+          "Google Cloud Documentation",
+          "cloud.google.com/kubernetes-engine",
+          "docs.cloud.google.com",
+        ]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # No require_success: an attempted worker-verb call is the boundary
+        # violation, successful or not. Same delegation-boundary safeguard as
+        # chat-routing-fleet-question; a knowledge question needs at most a
+        # kanban_create, never the card-worker verbs.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The Developer Knowledge tool the personas forbid (#1765): 50 calls
+        # a day for the whole project. scope: workers reads the platform
+        # worker's (and any Cluster Agent's) calls, which is where the lookup
+        # happens; no require_success, because the attempt is the spend and
+        # the pool projects' calls 403 anyway. The worker invokes it through
+        # the tool_call wrapper, which tool_called reads through (measured:
+        # the name inside is mcp__developer_knowledge__answer_query). Both
+        # separator spellings, the way scripts/test_integration_contracts.py
+        # registers every MCP tool; the server is a remote proxy, so the
+        # name is allowlisted there (REMOTE_MCP_TOOLS) with its evidence.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

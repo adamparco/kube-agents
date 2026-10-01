@@ -1,0 +1,3582 @@
+#!/usr/bin/env python3
+"""Pre-flight verification for onboarding a GCP project into the CI evaluation pool.
+
+Validates that a project has completed every prerequisite in
+docs/ci-pool-projects.md before it is registered in
+the Boskos resource pool in gke-internal/test-infra.
+
+Registering a project that has not finished onboarding does not fail only that
+project: Boskos hands the half-built lease to some pull request, and that pull
+request's smoke test dies. Run this before the Boskos entry lands.
+
+Usage:
+    python3 scripts/verify_ci_pool_project.py --project-id kube-agents-evals-3
+"""
+
+import argparse
+import base64
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+_ROOT = Path(__file__).resolve().parent.parent
+_UPSTREAM_SLUG = "gke-labs/kube-agents"
+_CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
+_CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
+_FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+# The runner refuses to write kubeconfigs on the caller's own credential unless
+# told to. The fleet check tells it: an operator, even a project owner, holds no
+# token-creator on the reader (roles/owner does not carry
+# iam.serviceAccounts.getAccessToken), and this one-off read of a project the
+# operator owns is not the shared-fleet hazard the refusal exists for. The
+# reader's bindings are checked in check_iam_and_service_accounts instead.
+FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV = "FLEET_ALLOW_RUNNER_CREDENTIAL"
+# The runner's `_FLEET_EXIT_READONLY_UNAVAILABLE`: its credential gate refused
+# this caller before reading anything, whatever the line says. That is about
+# the credential the verifier ran with, never about the project.
+FLEET_EXIT_READONLY_UNAVAILABLE = 3
+_FLEET_CATALOG = _ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
+
+# The checks by id, in the order they run and report: `--checks a,b` selects
+# a subset, `--report` names each one by it, and the hourly pool-state scan
+# (scripts/eval_dashboard/pool_state.py) keys its document on them. The
+# display names stay as they are on the console.
+CHECK_CODEBASE_MAPPING = "codebase_mapping"
+CHECK_PROJECT_AND_APIS = "project_and_apis"
+CHECK_IAM = "iam"
+CHECK_ARTIFACT_REGISTRY = "artifact_registry"
+# The one read outside the project: this project's build identities' reader
+# grant on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT. Its own
+# check so that a caller holding nothing there -- every caller but the Prow
+# runner -- gets an unread check rather than an IAM check with a warning.
+CHECK_WARM_CACHE = "warm_cache"
+CHECK_GKE_AND_STATE = "gke_and_state"
+CHECK_SEEDED_FLEET = "seeded_fleet_fixtures"
+CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
+CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
+CHECK_TOKEN_MINTER = "token_minter"
+# The KMS half of the minter check alone: the key, its versions, its shape,
+# the minter GSA's signing right and its Workload Identity binding, read with
+# gcloud and nothing else. The other half signs a JWT as the App and asks
+# api.github.com who it is, which needs a signer grant on the key and the
+# network; the scan holds neither and asks for this id instead.
+CHECK_TOKEN_MINTER_KMS = "token_minter_kms"
+CHECK_IDS = (
+    CHECK_CODEBASE_MAPPING,
+    CHECK_PROJECT_AND_APIS,
+    CHECK_IAM,
+    CHECK_ARTIFACT_REGISTRY,
+    CHECK_WARM_CACHE,
+    CHECK_GKE_AND_STATE,
+    CHECK_SEEDED_FLEET,
+    CHECK_GITHUB_REPO_AND_APP,
+    CHECK_LEDGER_READ_CREDENTIAL,
+    CHECK_TOKEN_MINTER,
+    CHECK_TOKEN_MINTER_KMS,
+)
+# What a run without --checks does: every check but the KMS half of the
+# minter check, which CHECK_TOKEN_MINTER covers. The one definition, read by
+# run_checks and verify_project alike, so a --report's key set does not depend
+# on which of them decided.
+DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
+# The console name each check reports under, for a result written on its
+# behalf before it ran (a deadline that passed, a blocked toolchain).
+CHECK_DISPLAY_NAMES = {
+    CHECK_CODEBASE_MAPPING: "Codebase GitOps Mapping",
+    CHECK_PROJECT_AND_APIS: "GCP Project & APIs",
+    CHECK_IAM: "Service Accounts & IAM Grants",
+    CHECK_ARTIFACT_REGISTRY: "Artifact Registry Repository",
+    CHECK_WARM_CACHE: "Warm Cache Readers",
+    CHECK_GKE_AND_STATE: "GKE Clusters & Terraform State",
+    CHECK_SEEDED_FLEET: "Seeded Fleet Fixtures",
+    CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
+    CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
+    CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
+    CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
+}
+# The checks that need `gh`: check_toolchain asks for it only when one of
+# these is selected, so a run without it -- the pool-state scan, or a hand
+# run of the minter or ledger checks, which read GitHub over urllib and KMS
+# over gcloud -- is not stopped at the door for a tool no selected check uses.
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
+# The checks that read GCP, and so need a gcloud credential before they run:
+# every check but the mapping, which reads the checkout and the remote ref,
+# and the GitHub check, whose reads are all `gh`.
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING} - GITHUB_CHECKS
+# What the hourly pool-state scan runs: every read-only check on the project.
+# Not the fleet fixtures (the seeded-fleet scan already runs those), not the
+# two GitHub checks (each needs a credential the health bot must not hold),
+# not the mapping (that is about the checkout, not the project), and not the
+# warm-cache check, whose read is in another project the bot holds nothing on.
+POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_TOKEN_MINTER_KMS)
+# --report's document (docs/ci-health.md, "The pool-state scan").
+REPORT_SCHEMA_VERSION = 1
+REPORT_STATUS_PASS = "pass"
+REPORT_STATUS_FAIL = "fail"
+REPORT_STATUS_UNCHECKED = "unchecked"
+# A failing check that named no finding of its own still reports one, under
+# this id, so nothing a check found is lost from the document.
+REPORT_FINDING_FAILED = "failed"
+# The report's field names, read back by scripts/eval_dashboard/pool_state.py.
+REPORT_KEY_NAME = "name"
+REPORT_KEY_STATUS = "status"
+REPORT_KEY_MESSAGE = "message"
+REPORT_KEY_DETAILS = "details"
+REPORT_KEY_WARNINGS = "warnings"
+REPORT_KEY_UNREAD = "unread"
+REPORT_KEY_FINDINGS = "findings"
+FINDING_KEY_ID = "id"
+FINDING_KEY_OBSERVED = "observed"
+FINDING_KEY_REPAIR = "repair"
+# How much of a KMS error the console line keeps.
+KMS_ERROR_TAIL_CHARS = 160
+# gcloud lists what answered and warns about the zones that did not, exit 0:
+# a cluster absent from that list was not seen missing.
+PARTIAL_LISTING_RE = re.compile(r"did not respond|may be incomplete", re.I)
+# A repair the reader has to confirm before running: it takes something away.
+REPAIR_CONFIRM_PREFIX = "# confirm first: "
+# Repairs that are a procedure, by runbook section. None names
+# scripts/provision_ci_pool_project.sh: the scan reads registered projects
+# only, and the runbook's section 8 forbids re-running the script on one (it
+# rotates the api_server_key under a leased run); the hand steps in the
+# sections named are the repair.
+REPAIR_REPOSITORY = "create the repository by hand per docs/ci-pool-projects.md section 4 (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
+REPAIR_CLEANUP_POLICY = "docs/ci-pool-projects.md section 4, Cleanup policy"
+REPAIR_HOST_CLUSTER = "docs/ci-pool-projects.md section 2 by hand, against the project's existing full-install state so its api_server_key is kept (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
+REPAIR_HOST_CMEK = "gcloud container clusters update platform-agent-host --database-encryption-key=<the project's key>, as install.sh does for an existing cluster (docs/ci-pool-projects.md section 2)"
+REPAIR_STATE_BUCKET = "gcloud storage buckets create gs://{project_id}-tf-state --project={project_id} --location=us-central1 --uniform-bucket-level-access && gcloud storage buckets update gs://{project_id}-tf-state --versioning (docs/ci-pool-projects.md section 2; not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
+REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
+# An absent service account. The platform GSA is the full-install
+# composition's; the LiteLLM GSA has a hand repair in the runbook.
+REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
+REPAIR_LITELLM_GSA = "the hand repair in docs/ci-pool-projects.md section 3 (gcloud iam service-accounts create kubeagents-litellm-gsa, roles/aiplatform.user, and its Workload Identity binding)"
+REPAIR_MINTER = "docs/ci-pool-projects.md section 5.2 (the ci-pool-minter composition owns the key)"
+REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinter.kms.keyVersion in charts/kube-agents/values.yaml to an ENABLED one (docs/site/src/content/docs/deploy/token-minter.md)"
+# The one version state `kms keys versions enable` takes; a scheduled or done
+# destruction and a failed or pending import need the rotation repair.
+KMS_VERSION_DISABLED = "DISABLED"
+# hack/ci-deploy.sh's warm cache image lives in the Prow project's `us` repository.
+WARM_CACHE_REPOSITORY_PROJECT = "kube-agents-prow"
+WARM_CACHE_REPOSITORY_LOCATION = "us"
+
+# The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
+# the only place the counts appear, and the script exits 0 whether it wrote
+# every role file or none -- an absent kubeconfig becomes `status: error` on
+# the checks that needed it rather than killing the job, which is what that
+# script is for -- so the numbers are the whole signal. The one exception is
+# exit 3, a read-only credential it could not mint: nothing written, no line.
+_FLEET_SUMMARY = re.compile(
+    r"Seeded-fleet kubeconfigs: (?P<written>\d+) role\(s\) written to \S+, "
+    r"(?P<unresolved>\d+) on clusters that could not be resolved or reached, "
+    r"(?P<unplanted>\d+) whose fixtures were not present"
+)
+
+# Three get-credentials calls and a kubectl probe per fixture object, against
+# clusters in another project. The 120s ceiling the single gcloud calls use is
+# not enough, and a timeout here reads as a missing fleet.
+FLEET_TIMEOUT_SECONDS = 600
+
+# The second half of the fleet check (#1544): hack/fleet-fixture-state.py reads
+# each published role's `state` assertions out of the catalog and says which
+# fixtures are there but not in the shape the cases depend on. It prints one
+# summary line of its own, parsed the same way as the presence line above.
+_FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
+_FLEET_STATE_SUMMARY = re.compile(
+    r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
+    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked"
+)
+# How long the state pass may wait for a fixture to converge before calling it
+# drifted. An operator usually runs this minutes after `tofu apply`, when the
+# crashloop fixture has been scheduled but not yet restarted, and OOMKilled
+# evidence exists only after its first restart; five minutes covers that on a
+# healthy node without turning an onboarding check into a vigil.
+FLEET_STATE_WAIT_SECONDS = 300
+
+# No gcloud or gh call here should take anywhere near this long. The ceiling
+# exists so a hung call fails the run instead of hanging a CI job forever.
+DEFAULT_TIMEOUT_SECONDS = 120
+# What a check that never ran says when --deadline-seconds passed before it:
+# the pool-state scan runs the verifier under its own per-project ceiling and
+# would otherwise lose every finished check's verdict to one hung read.
+DEADLINE_PASSED = "the run's deadline passed before this check"
+# ...and for a command refused inside a check that had started.
+DEADLINE_CUT = "the run's deadline passed"
+# ...and for a deadline that passed before the toolchain probe finished: a
+# ceiling set too low, not a credential that is gone.
+DEADLINE_PASSED_TOOLCHAIN = (
+    "the run's deadline passed before the toolchain check finished; raise --deadline-seconds "
+    "(under the pool-state scan, --project-timeout less its 30 s margin)"
+)
+# What a subset run's banner says instead of the registration verdict.
+SUBSET_NOTE = "The other checks did not run: this is not the registration verdict, which needs a run without --checks."
+# run_cmd's exit for a command it stopped: GNU timeout's, which callers read.
+TIMED_OUT_RC = 124
+# The run's deadline as a time.monotonic() value, set by verify_project from
+# --deadline-seconds and read by run_cmd and _net_timeout: every command after
+# it is cut to the time left (a subprocess returns 124 at once once none is,
+# an HTTP call gets the floor below), so a stall inside a check cannot carry
+# the run past a caller's ceiling either.
+_RUN_DEADLINE: Optional[float] = None
+# The least an HTTP call under the deadline gets: enough to fail fast with a
+# timeout the call sites already read as "unverified", not enough to overrun.
+NET_TIMEOUT_FLOOR_SECONDS = 1.0
+
+REQUIRED_APIS = {
+    # bench/tf/fleet declares google_compute_disk (the planted orphan-pd-* the
+    # cost audit looks for), so the fleet stack depends on Compute directly and
+    # not only transitively through GKE.
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "aiplatform.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "iam.googleapis.com",
+    "cloudkms.googleapis.com",
+}
+
+HOST_CLUSTER = "platform-agent-host"
+EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
+
+# The two states scripts/installer/installer_common.sh accepts in
+# is_valid_cmek_encryption_state(). Its only caller is install.sh's
+# ensure_existing_cluster_cmek(), which -- unless ALLOW_UNENCRYPTED_SECRETS is
+# truthy -- does not reject an unencrypted cluster but rewrites the live control
+# plane to add CMEK, several minutes of in-place update. full-install creates
+# the host cluster encrypted, so a state outside this set is drift, and a
+# name-only check would pass it.
+VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
+
+DEFAULT_GITHUB_APP_ID = 4675512
+
+# The first commit a GitOps repository needs before the broker can open a
+# remediation branch in it: an empty repository has no default branch to
+# resolve a base from (gitops_workspace.GitOpsRepoEmpty). The pool's early
+# projects got this commit from the agent itself, which then held a local
+# clone with the write credential; writes now go through the broker,
+# fast-forward only, so nothing downstream can make it. Provisioning does,
+# and this check fails a project whose repository still has none.
+GITOPS_SEED_FILE = "README.md"
+GITOPS_SEED_MESSAGE = "Initial commit"
+GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
+
+# Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
+# RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
+# minter GSA is kubeagents-github-minter in the kubeagents-system namespace.
+KMS_KEYRING = "github-token-minter-keyring"
+KMS_KEY = "github-token-minter-key"
+KMS_KEY_PURPOSE = "ASYMMETRIC_SIGN"
+KMS_KEY_ALGORITHM = "RSA_SIGN_PKCS1_2048_SHA256"
+MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
+
+# GET /app authenticates as the App itself and echoes back its numeric id, which
+# is what makes it a usable identity probe rather than just a reachability test.
+GITHUB_APP_URL = "https://api.github.com/app"
+
+# The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
+# installation also holds issues: write, for hack/ci-eval-pr.sh's ledger reset),
+# which is not the minter App above. hack/ci-eval-pr.sh mints an installation
+# token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
+# test pins these two to that script, so changing the App there cannot leave
+# this check attesting a credential CI no longer uses.
+LEDGER_APP_ID = 4739812
+LEDGER_INSTALLATION_ID = 157029058
+GITHUB_INSTALLATION_TOKEN_URL = (
+    "https://api.github.com/app/installations/{installation}/access_tokens"
+)
+# What this script's probe mint asks for: the same three reads the eval's
+# grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
+# holds the two equal). An omitted body would mint the installation's whole
+# grant, which since 2026-09-22 includes issues: write on every pool repository
+# for the ledger reset; a read probe has no business holding that.
+LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
+
+# Its private key, read from the cluster rather than the operator's disk: a
+# local copy answers a question nobody asked. `build-kube-agents` is the Prow
+# cluster ALIAS the prowjob names, not a GKE cluster.
+LEDGER_KEY_SECRET = "kube-agents-evals-ledger-app-key"
+LEDGER_KEY_SECRET_ENTRY = "key.pem"
+LEDGER_KEY_NAMESPACE = "test-pods"
+PROW_BUILD_CLUSTER = "kube-agents-prow"
+PROW_BUILD_CLUSTER_ZONE = "us-west1-b"
+PROW_BUILD_CLUSTER_PROJECT = "kube-agents-prow"
+
+# One issue is enough: the question is whether the read is permitted, not what
+# the repository contains. state=all because a repository whose only ledger
+# issue has been closed still has to be readable. Not the call
+# `ledger_issue_contains` makes -- that fetches an issue by number, and a
+# candidate project has none yet -- but the same permission: listing a private
+# repository's issues needs `issues: read`. The installation's repository list
+# needs only `metadata: read`, so it would have passed the evals-6 case.
+GITHUB_ISSUES_URL = "https://api.github.com/repos/{repo}/issues?per_page=1&state=all"
+
+# GitHub rejects an App JWT whose `exp` is more than ten minutes ahead. Building
+# the payload, shelling out to gcloud, and the round trip all elapse between
+# reading the clock and GitHub reading the claim, so exactly 600 sits on the
+# boundary and fails intermittently on skew. Nine minutes leaves the margin.
+JWT_LIFETIME_SECONDS = 540
+JWT_BACKDATE_SECONDS = 60
+
+
+# Roles that carry artifactregistry.repositories.uploadArtifacts. A literal
+# roles/artifactregistry.writer binding is the documented grant and the one
+# provision_ci_pool_project.sh makes, but the pool projects that predate this
+# script have no such binding -- Cloud Build gets upload rights through
+# builds.builder, and the Compute default SA through the editor role GCP grants
+# it by default. Demanding the literal role would fail those projects for a
+# permission they demonstrably hold.
+#
+# roles/owner is deliberately absent. It would satisfy the permission, but a
+# build identity holding owner is a finding in its own right, and listing it
+# here would turn the worst configuration this check could meet into a pass.
+# The same applies to the node account below, which inherits this set through
+# AR_PULLER_ROLES: a node pool running as owner is reported as holding no
+# qualifying pull role, which reads oddly but is the answer we want.
+AR_WRITER_ROLES = {
+    "roles/artifactregistry.writer",
+    "roles/artifactregistry.repoAdmin",
+    "roles/artifactregistry.admin",
+    "roles/cloudbuild.builds.builder",
+    "roles/editor",
+}
+
+# Pushing is not pulling, and the identities are not the same one. The build
+# writes the PR image; the host cluster's NODES read it back to start the
+# operator and agent pods. Checking only the push side passes a project where
+# Cloud Build can push and nothing can pull -- which satisfies every other check
+# here and then fails at the first lease with ImagePullBackOff on the two
+# Deployments the smoke test waits for. That is precisely the "looks
+# provisioned, dies on lease" outcome this script exists to prevent, so the pull
+# side gets its own assertion against the node account specifically.
+#
+# Every role in AR_WRITER_ROLES already confers read on the repository, so the
+# puller set is that set plus the reader role provision_ci_pool_project.sh
+# grants the node account directly.
+AR_PULLER_ROLES = AR_WRITER_ROLES | {"roles/artifactregistry.reader"}
+
+
+# Every other identity this script checks lives inside the pool project. This one
+# does not: the presubmit runs on the build-kube-agents cluster as
+# prowjob-default-sa@kube-agents-prow, leases a project, and reaches in. Nothing
+# in the project's own configuration implies the grant, which is how
+# kube-agents-evals-4 through -6 were provisioned, verified green and registered
+# without it -- until a lease of -6 died on gke-labs/kube-agents#966 with
+# `Required "container.clusters.get" permission(s)`.
+PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
+
+# The nightly periodic (ci-kube-agents-eval-nightly) runs the same
+# hack/ci-eval-pr.sh against a leased project as its own identity, kept apart
+# from the presubmit's so the baseline store can grant it a write the presubmit
+# never holds (docs/designs/eval-scorer.md). Apart in kube-agents-prow, equal in
+# the pool: on 2026-09-16 the second nightly leased kube-agents-evals-10 and
+# died at get-credentials on the same `container.clusters.get` denial as #966,
+# holding no role there at all (gke-labs/kube-agents#1491).
+NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+
+# The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
+# ci-kube-agents-pull-sweep on main) signs the agent's App through each
+# project's copy of the key, so it needs signer on that key and nothing on the
+# project. A project without the grant fails every ten-minute sweep from the
+# first, so the check names the one command that adds it -- the provisioning
+# script must not be re-run on a registered project (docs/ci-pool-projects.md
+# section 8).
+PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+
+# Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
+# as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
+# project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
+# missing grant is reported under its label. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh by scripts/test_verify_ci_pool_project.py.
+RUNNERS = (
+    ("The Prow runner", "a presubmit", PROW_RUNNER_MEMBER),
+    ("The nightly runner", "the nightly periodic", NIGHTLY_RUNNER_MEMBER),
+)
+# The runners by the short name a finding id carries (`iam/prow-runner/missing/<role>`).
+RUNNER_SLUGS = {PROW_RUNNER_MEMBER: "prow-runner", NIGHTLY_RUNNER_MEMBER: "nightly-runner"}
+
+# The one borrower of seeded-fleet-reader that leases no project: the CI health
+# bot's hourly seeded-fleet scan (.github/workflows/ci-health.yml,
+# docs/ci-health.md "The seeded-fleet scan") runs as
+# eval-dashboard-publisher@kube-agents-prow and impersonates the reader in every
+# pool project; on the project itself it holds POOL_STATE_READER_ROLES, below.
+# Without the grant the scan reports the project as "not checked" and fixture
+# drift there goes unseen.
+CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
+
+# The bot's project-level read for its hourly pool-state scan
+# (scripts/eval_dashboard/pool_state.py, which runs POOL_STATE_CHECKS as the
+# bot). Together they cover every read those checks make, and none writes;
+# securityReviewer alone lacks projects.get and the three describes (role
+# definitions read 2026-09-25). The one cross-project read is CHECK_WARM_CACHE,
+# which the scan does not run. Granted by bench/tf/fleet
+# (`pool_state_readers`), kept equal by test, checked below.
+POOL_STATE_READER_ROLES = {
+    "roles/iam.securityReviewer",
+    "roles/container.clusterViewer",
+    "roles/artifactregistry.reader",
+    "roles/cloudkms.viewer",
+    "roles/storage.bucketViewer",
+}
+
+# What a runner loses without the token-creator grant; the bot's loss is
+# different and is spelled out in its own entry below.
+_RUNNER_WITHOUT_TOKEN_CREATOR = (
+    "every run it makes in this project stops at the fleet-credentials step: "
+    "hack/fleet-kubeconfigs.sh refuses to read the fleet on the runner's own "
+    "read-write credential. Re-apply bench/tf/fleet against {project_id}."
+)
+
+# Every member that must hold roles/iam.serviceAccountTokenCreator on the
+# fleet reader, as (label, member, what a missing grant costs and how to repair
+# it): the two runners, then the CI health bot. Kept equal to bench/tf/fleet's
+# `fleet_reader_token_creators` default by scripts/test_verify_ci_pool_project.py.
+FLEET_READER_TOKEN_CREATORS = tuple(
+    (label, member, _RUNNER_WITHOUT_TOKEN_CREATOR) for label, _, member in RUNNERS
+) + (
+    (
+        "The CI health bot",
+        CI_HEALTH_BOT_MEMBER,
+        "its hourly seeded-fleet scan reports {project_id} as not checked and fixture "
+        "drift there goes unseen. Re-apply bench/tf/fleet against {project_id}, or run "
+        "the grant in docs/ci-health.md (The seeded-fleet scan).",
+    ),
+)
+
+# The set kube-agents-evals holds, matched literally rather than by permission.
+# Not minimal -- container.admin subsumes container.developer, viewer subsumes
+# logging.viewer and cloudbuild.builds.viewer -- but the point is that a new
+# project matches one a presubmit has passed on, which a permission-equivalent
+# set would not. Only a missing role fails; extra roles are not reported.
+PROW_RUNNER_ROLES = {
+    "roles/cloudbuild.builds.editor",
+    "roles/cloudbuild.builds.viewer",
+    "roles/container.admin",
+    "roles/container.developer",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/logging.logWriter",
+    "roles/logging.viewer",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/serviceusage.serviceUsageConsumer",
+    "roles/storage.admin",
+    "roles/viewer",
+}
+
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py,
+# two Prow periodics on main; docs/ci-pool-projects.md section 6.2). It
+# re-applies bench/tf/fleet under a Boskos lease, so it holds what that apply
+# needs on the project, list on the state bucket and objectAdmin under its
+# seeded-fleet/ prefix, nothing else. The prefix keeps tofu's own reads off the
+# host cluster's state, which shares the bucket and carries the install's
+# secrets; it is not a fence against the identity, which holds project IAM
+# admin (the stack declares project bindings) and could widen its own grant.
+# What bounds the identity is that only main-only jobs run as it; the
+# presubmit's runner is never granted the job. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
+FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
+FLEET_RECONCILER_ROLES = {
+    "roles/compute.storageAdmin",
+    "roles/compute.viewer",
+    "roles/container.admin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/serviceusage.serviceUsageConsumer",
+}
+# On gs://<project>-tf-state, where the fleet's state lives beside the host
+# cluster's: list on the bucket (`tofu init` lists it, which a grant conditioned
+# on the object name does not cover) and objectAdmin conditioned to the fleet's
+# prefix. Named for the repair text; the bucket's policy is not read here, so
+# the reconcile's own first run is what reports either missing.
+FLEET_RECONCILER_BUCKET_LIST_ROLE = "roles/storage.legacyBucketReader"
+FLEET_RECONCILER_BUCKET_ROLE = "roles/storage.objectAdmin"
+FLEET_RECONCILER_STATE_PREFIX = "seeded-fleet/"
+
+# The agent's own identity, checked in both directions -- a missing role fails
+# and so does an extra one, unlike the Prow runner above. That account is
+# infrastructure and a superset is harmless; this one is the subject under test,
+# where an extra role means a case passed on the grant rather than on the agent.
+# Boskos leases at random, so one over-privileged project flakes whichever pull
+# request happens to draw it.
+#
+# This duplicates `local.read_only_roles` in terraform/examples/full-install,
+# which is what the install passes to the IAM module. A test asserts the two are
+# equal, and that the module's own default matches, so narrowing either fails in
+# CI here rather than failing correctly-provisioned projects weeks later.
+PLATFORM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
+
+# The LiteLLM gateway's identity holds exactly this set and nothing else --
+# it is a network-exposed proxy forwarding attacker-influenceable prompt
+# content, so the set is closed in both directions like the platform GSA's
+# (the site's security-and-iam.md, "The Vertex AI gateway is a separate
+# identity"). Found by the 2026-09-03 pool rollout (#1208): the WI binding
+# check alone let a project pass the verifier and still fail at the model
+# call for want of this grant.
+LITELLM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
+LITELLM_GSA_ROLES = {"roles/aiplatform.user"}
+
+# Neither belongs on a pool project at all. Called out separately because the
+# two checks above scan for one literal member each and would not see these.
+_PUBLIC_MEMBERS = {"allUsers", "allAuthenticatedUsers"}
+
+PLATFORM_GSA_ROLES = {
+    "roles/container.clusterViewer",
+    "roles/container.viewer",
+    "roles/compute.viewer",
+    "roles/monitoring.viewer",
+    "roles/logging.viewer",
+    "roles/iam.serviceAccountUser",
+    "roles/iam.securityReviewer",
+    "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
+}
+
+
+class Finding:
+    """One thing a check found wrong, addressed to whoever repairs it.
+
+    `id` is stable across runs and projects (`iam/platform-gsa/missing/roles/x`),
+    so the pool-state scan can ask "the same finding on the same project as
+    last scan?"; `observed` is the detail line as the console prints it;
+    `repair` is the command, or the runbook section, that closes it. A repair
+    that removes something carries REPAIR_CONFIRM_PREFIX.
+    """
+
+    def __init__(self, id: str, observed: str, repair: str = ""):
+        self.id = id
+        self.observed = observed
+        self.repair = repair
+
+    def as_dict(self) -> dict:
+        return {FINDING_KEY_ID: self.id, FINDING_KEY_OBSERVED: self.observed, FINDING_KEY_REPAIR: self.repair}
+
+
+class CheckResult:
+    def __init__(
+        self,
+        name: str,
+        passed: bool,
+        message: str = "",
+        details: Optional[List[str]] = None,
+        warnings: Optional[List[str]] = None,
+        findings: Optional[List[Finding]] = None,
+        read: Optional[bool] = None,
+    ):
+        self.name = name
+        self.passed = passed
+        self.message = message
+        self.details = details or []
+        # Things this run could not determine, as opposed to things it found
+        # wrong. A token without the scope to read something is a visibility
+        # limit, not a proven misconfiguration, and must not block onboarding.
+        self.warnings = warnings or []
+        # The details, addressed: what a --report reader repairs by id.
+        self.findings = findings or []
+        # Whether this run read anything at all about the item. False is a
+        # check every read of which was refused or skipped; None leaves it to
+        # the message ("Not checked"). --report turns it into `unchecked`.
+        self.read = read
+        # Set by run_checks: which of CHECK_IDS produced this result.
+        self.check_id: Optional[str] = None
+
+
+def _drift(details: List[str], findings: List[Finding], finding_id: str, observed: str, repair: str = "") -> None:
+    """Record one thing found wrong, on the console and in the report alike."""
+    details.append(observed)
+    findings.append(Finding(finding_id, observed, repair))
+
+
+def _project_binding(project_id: str, member: str, role: str, remove: bool = False) -> str:
+    verb = "remove-iam-policy-binding" if remove else "add-iam-policy-binding"
+    prefix = REPAIR_CONFIRM_PREFIX if remove else ""
+    return f'{prefix}gcloud projects {verb} {project_id} --member="{member}" --role={role}'
+
+
+def _account_binding(project_id: str, account: str, member: str, role: str) -> str:
+    return f'gcloud iam service-accounts add-iam-policy-binding {account} --project={project_id} --member="{member}" --role={role}'
+
+
+def run_cmd(
+    cmd: List[str],
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    env: Optional[dict] = None,
+) -> Tuple[int, str, str]:
+    # The deadline note goes before the command, which can be longer than
+    # the 200 characters _unread_reason keeps of a line.
+    cut = False
+    if _RUN_DEADLINE is not None:
+        remaining = _RUN_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            return TIMED_OUT_RC, "", f"timed out after 0s ({DEADLINE_CUT}): {' '.join(cmd)}"
+        if remaining < timeout:
+            timeout = max(1, int(remaining))
+            cut = True
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        # 124 is what GNU timeout(1) reports, so a caller that only looks at the
+        # code still sees a failure rather than a success.
+        note = f" ({DEADLINE_CUT})" if cut else ""
+        return TIMED_OUT_RC, "", f"timed out after {timeout}s{note}: {' '.join(cmd)}"
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+# gcloud ends a denied read with "(or it may not exist)", and means it: the API
+# will not say whether the caller may not see the resource or the resource is
+# not there. Neither can this script, so it must stop asserting the second
+# reading. These patterns cover what gcloud and gh print when the caller is
+# authenticated and unprivileged -- PERMISSION_DENIED from the IAM and Artifact
+# Registry APIs, `code=403` from the container API, `does not have
+# storage.buckets.get access` from GCS, `403 Forbidden` from GitHub.
+_DENIAL_PATTERNS = (
+    re.compile(r"permission[ _]denied", re.I),
+    re.compile(r"denied on resource", re.I),
+    re.compile(r"does not have (?:permission|\S+ access)", re.I),
+    re.compile(r"permission\(s\) for", re.I),
+    re.compile(r"is required to perform this operation", re.I),
+    re.compile(r"(?:httperror|error|code[=: ])\s*403\b", re.I),
+    re.compile(r"403 forbidden", re.I),
+    # gh's own form, which is neither of the two above: `gh: Must have admin
+    # rights to Repository. (HTTP 403)`. The message half varies with the
+    # endpoint and carries no word any of these patterns look for, so without
+    # this one a SAML-unauthorised or under-scoped token reads as a missing
+    # GitHub App installation.
+    re.compile(r"\(http 403\)", re.I),
+    re.compile(r"insufficient authentication scopes", re.I),
+    re.compile(r"resource not accessible", re.I),
+    # kubectl's RBAC denial: `Error from server (Forbidden): secrets "x" is
+    # forbidden: User "y" cannot get resource "secrets" in API group "" in the
+    # namespace "test-pods"`. It carries no status code, so none of the 403
+    # patterns above see it and a refused read of the ledger App key would report
+    # as an absent secret. The second form keeps the quote the API server always
+    # prints: a denial read as absence is the error worth catching, but so is the
+    # reverse -- `_denial_reason` turns a failure into unverified, so a pattern
+    # loose enough to match `cannot find resource` would mask a real one.
+    re.compile(r"error from server \(forbidden\)", re.I),
+    re.compile(r'cannot \w+ resource "', re.I),
+)
+
+# Not refusals, but not reads either. A call that timed out and a credential
+# that expired mid-run both leave the resource unread, and "absent" is as wrong
+# a reading there as it is after a 403 -- `gcloud auth list` reads the local
+# credential store without contacting the network, so an expired refresh token
+# clears check_toolchain and then fails every call that follows it. These stay
+# out of _DENIAL_PATTERNS because the call sites that ask specifically whether a
+# read was *refused* -- the Artifact Registry policy pair -- must keep telling
+# the two apart; _record_unreadable files them the same way because the
+# consequence for the caller is identical.
+# A failed command with no stderr: nothing to match, nothing that says absent.
+NO_OUTPUT_REASON = "the command failed without output (killed, or gone before it could say why)"
+
+_UNREAD_PATTERNS = (
+    re.compile(r"timed out after \d+s", re.I),
+    re.compile(r"invalid_grant", re.I),
+    re.compile(r"problem refreshing your current auth tokens", re.I),
+    re.compile(r"reauthentication (?:required|failed)", re.I),
+    # A retry-later reply, or gcloud's busy credential store, is not absence;
+    # the scan runs seven projects at once, and one wave of 429s would read
+    # as three drifted. gRPC's retryable statuses, as gcloud prints them
+    # (upper case, so a lower-case "unknown" in a message is not one); a
+    # resource named kube-agents-evals-500 does not match.
+    re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"),
+    # A token the API rejected is a credential that expired mid-run, not an
+    # absent resource: gcloud prints the gRPC status, or the HTTP 401 below.
+    re.compile(r"\bUNAUTHENTICATED\b|Request had invalid authentication credentials"),
+    # A separator between the word and the code is required (`code=`, `status:
+    # '`, `HTTP `, `HTTPError (`), so a resource named http500 or code503 is
+    # not a status.
+    re.compile(r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()(?:401|408|429|500|502|503|504)\b", re.I),
+    # A transport failure on the runner -- gcloud never got an answer -- is
+    # not absence either; without this a DNS or TLS blip on one wave became
+    # three `*/failed` findings and a pool-drift issue.
+    # Any gcloud crash: an uncaught exception inside gcloud never returned the
+    # resource's state, whatever its class (a transport error, a full disk, a
+    # credential store it could not open). The phrase is gcloud's own, so a
+    # resource named readtimeout is still an absence.
+    re.compile(
+        r"\bgcloud crashed\b|Temporary failure in name resolution|Name or service not known|Connection reset by peer|Unable to find the server at",
+        re.I,
+    ),
+)
+
+# gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
+# for one the token's scopes do not reach. Only call sites that know a 404
+# cannot mean "absent" may use this; see check_github_repo_and_app.
+_GITHUB_NOT_FOUND = re.compile(r"\b404\b|\bnot found\b", re.I)
+
+# hack/fleet-kubeconfigs.sh reports a cluster it could not reach and a fleet
+# that is not what the catalog describes through the same "unresolved" count,
+# and only its warning text separates them. These four are the second kind: the
+# cluster list came back and what it held was wrong, which is a finding about
+# the project rather than about this run's credential. Their sources are
+# hack/fleet-kubeconfigs.sh lines 406, 411, 215 and 224.
+_FLEET_LOOKED_AND_FOUND_WRONG = re.compile(
+    r"carries no clusters labelled"
+    r"|none resolved to a catalog slot"
+    r"|matches no slot the catalog declares"
+    r"|more than one labelled seeded cluster",
+    re.I,
+)
+
+# ...except that a refused `clusters list` produces the first of those four
+# anyway. hack/fleet-kubeconfigs.sh:370-373 sets `listing=""` when the call is
+# refused, which drives `labelled=0` and emits the byte-identical "carries no
+# clusters labelled" warning at :406 -- so read on its own, that string would
+# fail a healthy project for an operator without container.clusters.list, which
+# is the bug this file is being changed to remove. The refusal path emits this
+# marker first, and it is the only thing separating the two.
+_FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
+
+# The listing is not the only thing that can be refused. A cluster that the
+# listing returned and `get-credentials` would not open is unread for the same
+# reason and to the same effect, and so is one skipped because a temporary file
+# could not be created, or dropped because the file gcloud wrote could not be
+# rewritten to the reader's exec credential (a local fault, not a pool state).
+# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
+#
+# One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
+# role may be excused. Excusing on the *absence* of a "looked and found wrong"
+# warning instead reads absence of evidence as evidence, and there is a path
+# that produces neither: a slot whose cluster kept its name and lost its labels
+# never enters the listing, so no per-cluster warning names it, `labelled`
+# stays non-zero so :406 is silent, something else resolves so :411 is silent,
+# and its roles increment `unresolved` with nothing printed at all.
+_FLEET_UNREACHABLE = re.compile(
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    re.I,
+)
+
+
+def _denial_reason(err: str) -> Optional[str]:
+    """The line of `err` showing the command was refused, or None if it was not.
+
+    None means the failure has some cause other than permissions, so "the
+    resource is absent" is a reading the caller may act on.
+    """
+    text = (err or "").strip()
+    if not text:
+        return None
+    for line in text.splitlines():
+        if any(p.search(line) for p in _DENIAL_PATTERNS):
+            return line.strip()[:200]
+    return None
+
+
+def _unread_reason(err: str) -> Optional[str]:
+    """The line of `err` showing the read did not happen, or None if it did.
+
+    Wider than _denial_reason by the transient causes in _UNREAD_PATTERNS: a
+    refusal, a timeout and an expired credential differ in what the operator
+    should do next, and not at all in what this run may conclude from them.
+    A failure that said nothing at all (a gcloud killed by a signal) is unread
+    too: no line says the resource is absent.
+    """
+    if not (err or "").strip():
+        return NO_OUTPUT_REASON
+    reason = _denial_reason(err)
+    if reason is not None:
+        return reason
+    for line in (err or "").strip().splitlines():
+        if any(p.search(line) for p in _UNREAD_PATTERNS):
+            return line.strip()[:200]
+    return None
+
+
+class Unread(str):
+    """A warning that a read did not happen -- refused, timed out, credential
+    gone -- as opposed to advice about a read that did. --report writes these
+    under `unread`, which is what the pool-state scan's "read in full" asks."""
+
+
+def _record_unreadable(
+    err: str,
+    absent: str,
+    unchecked: str,
+    details: List[str],
+    warnings: List[str],
+) -> bool:
+    """File a non-zero command exit under either absence or visibility.
+
+    Returns True when the command did not read the resource -- refused, timed
+    out, or stopped by a credential that had expired. That is not evidence the
+    resource is missing, so the caller keeps passing and the run exits 2 with
+    the operator told what to confirm by hand. Returns False for every other
+    cause, where "the resource is absent" is the right reading and the caller
+    must fail.
+    """
+    reason = _unread_reason(err)
+    if reason is None:
+        details.append(absent)
+        return False
+    warnings.append(Unread(f"{unchecked}: {reason}"))
+    return True
+
+
+def _partial_summary(items: List[Tuple[str, bool]]) -> str:
+    """A summary naming what this run verified and what it did not, or "".
+
+    Empty means every item was checked and the caller should say so in its own
+    words. Both halves go in otherwise: naming only what was skipped hands the
+    operator a longer manual list than they owe, and naming only what passed is
+    the false assurance the exit-2 state exists to prevent.
+    """
+    verified = [label for label, done in items if done]
+    unchecked = [label for label, done in items if not done]
+    if not unchecked:
+        return ""
+    prefix = f"{', '.join(verified)} verified; " if verified else ""
+    return f"{prefix}{', '.join(unchecked)} not checked"
+
+
+def _load_json(out: str):
+    """Parse command output as JSON, tolerating `gh --jq`'s multi-object form.
+
+    `gh api --jq` emits one JSON value per match, newline-separated, which is not
+    a JSON document. Two matching installations would otherwise raise
+    JSONDecodeError out of a check function and end the run in a traceback
+    instead of a reported failure.
+    """
+    text = out.strip()
+    if not text:
+        raise ValueError("empty output")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        first = text.splitlines()[0]
+        return json.loads(first)
+
+
+def _mapping_function_body(text: str) -> Optional[str]:
+    """The body of gitops_repo_for_project() in this ci-deploy.sh text, or None.
+
+    None separates "this is not a file I can read a mapping out of" from "the
+    mapping is here and this project is not in it". A row search alone cannot
+    tell them apart, and they mean opposite things: the function itself only
+    landed on main on 2026-08-21, so any copy older than that answers "no row"
+    for every project, including ones mapped since.
+    """
+    m = re.search(r"gitops_repo_for_project\(\)\s*\{(.*?)\n\}", text, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def _mapping_row_present(text: str, project_id: str) -> bool:
+    """Does this ci-deploy.sh text carry the project's gitops_repo_for_project() row?
+
+    Three things the pattern has to get right, each of which a looser one gets
+    wrong in the direction of a false pass:
+
+    - The row must start its own line. Unanchored, the pattern matches inside a
+      row commented out with `#` -- and `case` ignores such a row, so a project
+      whose arm was parked behind a comment deploys to whatever the `*)` default
+      names. A longer project id is not the risk here: `kube-agents-evals)` does
+      not occur inside `kube-agents-evals-2)`, because the `)` does not line up.
+    - The repo name must end where it should. `-infra` is a prefix of
+      `-infra-old`, and a row pointing at an archived repository would pass.
+    - `echo` needs whitespace after it. `echogke-agentic/...` is a command no
+      shell resolves, and quoting does not save it -- word splitting runs
+      before quote removal -- so the row reads as mapped and never runs.
+    """
+    body = _mapping_function_body(text)
+    if body is None:
+        return False
+    expected_repo = f"gke-agentic/{project_id}-infra"
+    pattern = (
+        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s+"
+        rf"([\"']){re.escape(expected_repo)}\1|"
+        rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s+{re.escape(expected_repo)}(?=[\s;&|)]|$)"
+    )
+    return re.search(pattern, body, re.MULTILINE) is not None
+
+
+def _upstream_remote() -> Optional[str]:
+    """Name the git remote that points at gke-labs/kube-agents, or None.
+
+    Resolved by URL rather than by convention, because neither conventional
+    name is reliable here. This repository's own rules send contributors'
+    branches to a fork, so `origin` is usually the fork; and `upstream` is
+    taken by an unrelated repository on at least one maintainer's checkout.
+    A hardcoded remote name would read some other repository's main and
+    report the answer with the same confidence as a correct one.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(_ROOT), "remote", "-v"])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] != "(fetch)":
+            continue
+        if _is_upstream_url(parts[1]):
+            return parts[0]
+    return None
+
+
+def _is_upstream_url(url: str) -> bool:
+    """Does this remote URL address gke-labs/kube-agents on GitHub?
+
+    Host and path are both matched, because a suffix test on the slug alone
+    accepts two URLs that are not this repository, and returning either one
+    means reading a stranger's main and reporting the verdict with the same
+    confidence as a correct one:
+
+    - `git@github.com:not-gke-labs/kube-agents` -- any owner ending in the
+      real one, which is a name anybody can register.
+    - `git@example.com:gke-labs/kube-agents` -- the right path on a host that
+      has nothing to do with GitHub, such as an internal mirror.
+
+    Two forms must keep matching, since rejecting one drops the comparison to a
+    warning: a port, which would otherwise parse as the head of the path, and
+    an owner in any casing, because GitHub resolves `GKE-Labs`.
+    """
+    url = url[:-4] if url.endswith(".git") else url
+    m = re.match(r"^(?:[\w.+-]+://)?(?:[^@/]+@)?([^/:]+)(?::\d+)?[:/](.+)$", url)
+    if not m:
+        return False
+    host, path = m.group(1), m.group(2).strip("/")
+    return host.lower() == "github.com" and path.lower() == _UPSTREAM_SLUG
+
+
+def _ref_committed_at(remote: str) -> str:
+    """When the commit behind <remote>/main was authored, as " (fetched at ...)".
+
+    Empty when git will not say. This is the age of the local snapshot, not of
+    main: `git show <remote>/main` reads whatever the last fetch left behind,
+    and a verdict about main drawn from a week-old snapshot is worth exactly
+    as much as the snapshot. Printing the date lets the operator judge that
+    without knowing how the check works.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(_ROOT), "log", "-1", "--format=%cs", f"{remote}/main"])
+    return f" (this checkout's {remote}/main is dated {out.strip()})" if rc == 0 and out.strip() else ""
+
+
+def _mapping_on_upstream_main(project_id: str) -> Tuple[str, Optional[str], str]:
+    """Look for the mapping row on the merge target's ci-deploy.sh.
+
+    Returns (status, remote, detail); status is "present", "absent", or
+    "unknown" when this checkout cannot see the merge target at all.
+    """
+    remote = _upstream_remote()
+    if remote is None:
+        return "unknown", None, f"no git remote points at {_UPSTREAM_SLUG}"
+    ref = f"{remote}/main:hack/ci-deploy.sh"
+    rc, out, err = run_cmd(["git", "-C", str(_ROOT), "show", ref])
+    if rc != 0:
+        first = err.strip().splitlines()[0] if err.strip() else "git show failed"
+        return "unknown", remote, f"could not read {ref} ({first})"
+    if _mapping_function_body(out) is None:
+        return (
+            "unknown",
+            remote,
+            f"{ref} has no gitops_repo_for_project() to read{_ref_committed_at(remote)}, so "
+            "no project reads as mapped there -- the function landed on main on 2026-08-21",
+        )
+    return ("present" if _mapping_row_present(out, project_id) else "absent"), remote, ""
+
+
+def check_codebase_mapping(project_id: str) -> CheckResult:
+    """Verify the hack/ci-deploy.sh mapping row for this project.
+
+    Read twice, from two different files. The local tree is the one the
+    operator is editing; the merge target's is the one that actually runs,
+    because Prow builds an eval run from main plus that run's own pull
+    request rather than from this branch. A row that exists only here is the
+    evals-3 outage with the safety catch removed: the verdict line says the
+    project is provisioned as the prerequisites describe, it is registered,
+    and the next presubmit to lease it exits 1 at ci-deploy.sh's unmapped-
+    project refusal -- taking a share of every open pull request's smoke test
+    with it.
+
+    Missing from main is reported unverified rather than failed. The row is
+    written and about to land, so this is a "not yet" for a human to time,
+    not a misconfiguration; the run's own banner already tells the operator
+    to confirm each unverified item before registering anything.
+
+    "Not yet on main" is only ever claimed about a copy of ci-deploy.sh this
+    check could actually read a mapping out of, and the message carries the
+    date of the snapshot it read. `git show <remote>/main` returns the last
+    fetch, not main, so the alternative is a check that reports every project
+    unmapped whenever a checkout has sat for a while -- which is the warning
+    an operator learns to wave off, and then waves off the real one too.
+    """
+    if not _CI_DEPLOY.exists():
+        return CheckResult("Codebase GitOps Mapping", False, f"Missing {_CI_DEPLOY}")
+
+    text = _CI_DEPLOY.read_text(encoding="utf-8")
+    if _mapping_function_body(text) is None:
+        return CheckResult("Codebase GitOps Mapping", False, "Could not find gitops_repo_for_project() in hack/ci-deploy.sh")
+
+    expected_repo = f"gke-agentic/{project_id}-infra"
+    if not _mapping_row_present(text, project_id):
+        return CheckResult(
+            "Codebase GitOps Mapping",
+            False,
+            f"No mapping for {project_id} in gitops_repo_for_project() in hack/ci-deploy.sh",
+            details=[f"Expected: {project_id}) echo \"{expected_repo}\" ;;"],
+        )
+
+    status, remote, detail = _mapping_on_upstream_main(project_id)
+    if status == "present":
+        return CheckResult(
+            "Codebase GitOps Mapping",
+            True,
+            f"Mapped to {expected_repo} in this checkout and on {remote}/main",
+        )
+    if status == "unknown":
+        return CheckResult(
+            "Codebase GitOps Mapping",
+            True,
+            f"Mapped to {expected_repo} in this checkout; could not read the mapping on {_UPSTREAM_SLUG} main",
+            warnings=[Unread(
+                f"Could not check whether {project_id} is mapped on {_UPSTREAM_SLUG} main: {detail}. "
+                "A presubmit runs main's hack/ci-deploy.sh, not this checkout's -- confirm the row is on "
+                f"main before registering {project_id}."
+            )],
+        )
+    fetch_hint = f"git fetch {remote} main" if remote else "git fetch"
+    return CheckResult(
+        "Codebase GitOps Mapping",
+        True,
+        f"Mapped to {expected_repo} in this checkout, not yet on {remote}/main",
+        warnings=[
+            f"{project_id} is mapped here but not on {_UPSTREAM_SLUG} main{_ref_committed_at(remote)}. A "
+            "presubmit that leases it runs main's hack/ci-deploy.sh and stops at "
+            "gitops_repo_for_project()'s refusal, failing that run. Land the mapping on main before "
+            f"registering {project_id} in Boskos. If it landed since this checkout last fetched, run "
+            f"`{fetch_hint}` and re-run.",
+        ],
+    )
+
+
+def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]:
+    """Verify the project exists, read its number, and check enabled APIs."""
+    name = "GCP Project & APIs"
+    rc, out, err = run_cmd(["gcloud", "projects", "describe", project_id, "--format=json"])
+    if rc != 0:
+        reason = _unread_reason(err)
+        if reason is None:
+            return None, CheckResult(name, False, f"Project describe failed: {err.strip()}")
+        return None, CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[
+                Unread(
+                    f"Could not describe {project_id}, so neither it nor anything derived from its project "
+                    f"number was checked: {reason}. Reading a project needs "
+                    f"resourcemanager.projects.get on it."
+                )
+            ],
+            read=False,
+        )
+
+    try:
+        project_number = _load_json(out).get("projectNumber")
+    except Exception as exc:
+        return None, CheckResult(name, False, f"Failed parsing project description: {exc}")
+
+    rc, out, err = run_cmd([
+        "gcloud", "services", "list",
+        f"--project={project_id}",
+        "--enabled",
+        "--format=value(config.name)",
+    ])
+    if rc != 0:
+        reason = _unread_reason(err)
+        if reason is None:
+            return project_number, CheckResult(name, False, f"Failed listing enabled services: {err.strip()}")
+        return project_number, CheckResult(
+            name,
+            True,
+            f"Project number: {project_number}; enabled APIs not checked",
+            warnings=[
+                Unread(
+                    f"Could not list the enabled services on {project_id}, so the {len(REQUIRED_APIS)} required "
+                    f"API(s) were not checked: {reason}"
+                )
+            ],
+        )
+
+    missing_apis = REQUIRED_APIS - set(out.split())
+    if missing_apis:
+        return project_number, CheckResult(
+            "GCP Project & APIs",
+            False,
+            f"Missing {len(missing_apis)} required API(s)",
+            details=[f"Missing API: {api}" for api in sorted(missing_apis)],
+            findings=[
+                Finding(f"apis/{api}", f"Missing API: {api}", f"gcloud services enable {api} --project={project_id}")
+                for api in sorted(missing_apis)
+            ],
+        )
+
+    return project_number, CheckResult(
+        "GCP Project & APIs", True, f"Project number: {project_number}, all {len(REQUIRED_APIS)} APIs enabled"
+    )
+
+
+def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
+    """Verify Workload Identity, the runners', the reconciler's, the health bot's and the platform GSA's project roles, and the fleet reader's token-creator binding (the cross-project AR reader grants are check_warm_cache_readers)."""
+    details = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    wi_checked = False
+    litellm_checked = False
+    roles_checked = False
+    fleet_reader_checked = False
+    # An account that is not there is one finding; its roles are not N more
+    # with repairs to a member that does not exist.
+    platform_absent = False
+    litellm_absent = False
+
+    gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        gsa_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing GSA or failed reading policy for {gsa_email}",
+            f"Could not read the IAM policy on {gsa_email}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+            platform_absent = True
+            findings.append(Finding("iam/platform-gsa/absent", details[-1], REPAIR_PLATFORM_GSA))
+    else:
+        wi_checked = True
+        try:
+            policy = _load_json(out)
+            expected_member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
+            wi_bound = any(
+                b.get("role") == "roles/iam.workloadIdentityUser" and expected_member in b.get("members", [])
+                for b in policy.get("bindings", [])
+            )
+            if not wi_bound:
+                passed = False
+                _drift(
+                    details, findings, "iam/platform-gsa/workload-identity",
+                    f"Workload Identity user binding missing on {gsa_email} for {expected_member}",
+                    _account_binding(project_id, gsa_email, expected_member, "roles/iam.workloadIdentityUser"),
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {gsa_email}: {exc}")
+
+    # The LiteLLM gateway's own identity, created by the full-install
+    # composition's litellm_vertex_iam module once model_provider is
+    # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
+    # hack/ci-deploy.sh's per-lease helm upgrade annotates the
+    # kubeagents-litellm KSA with this GSA, so a project missing the pair
+    # reds every presubmit it leases at the deploy's model-call gate (#1097).
+    litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        litellm_gsa_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing GSA or failed reading policy for {litellm_gsa_email}",
+            f"Could not read the IAM policy on {litellm_gsa_email}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+            litellm_absent = True
+            findings.append(Finding("iam/litellm-gsa/absent", details[-1], REPAIR_LITELLM_GSA))
+    else:
+        litellm_checked = True
+        try:
+            policy = _load_json(out)
+            expected_member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-litellm]"
+            wi_bound = any(
+                b.get("role") == "roles/iam.workloadIdentityUser" and expected_member in b.get("members", [])
+                for b in policy.get("bindings", [])
+            )
+            if not wi_bound:
+                passed = False
+                _drift(
+                    details, findings, "iam/litellm-gsa/workload-identity",
+                    f"Workload Identity user binding missing on {litellm_gsa_email} for {expected_member}",
+                    _account_binding(project_id, litellm_gsa_email, expected_member, "roles/iam.workloadIdentityUser"),
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {litellm_gsa_email}: {exc}")
+
+    # Read off the project's own policy, which is not the effective one. Two
+    # things it hides from a literal-member scan: a role inherited from an
+    # ancestor (checked 2026-08-26, the pool projects sit directly under the
+    # organization with no folder between), and a binding whose member is a group
+    # holding the GSA. Both make the extra-role check below a floor rather than
+    # the closed set it reads as.
+    rc, out, err = run_cmd(["gcloud", "projects", "get-iam-policy", project_id, "--format=json"])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
+            f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
+            "the seeded-fleet reconciler's roles, "
+            "the platform agent GSA's read-only set and any public binding were not checked",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        roles_checked = True
+        try:
+            policy = _load_json(out)
+            platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+            litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+            runner_held = {member: set() for _, _, member in RUNNERS}
+            reconciler_held = set()
+            platform_held = set()
+            litellm_held = set()
+            bot_held = set()
+            public_held: Dict[str, set] = {}
+            for b in policy.get("bindings", []):
+                members = b.get("members", [])
+                # Reported whatever the condition, unlike the two below: a
+                # condition narrows when the grant applies, not who holds it.
+                if _PUBLIC_MEMBERS.intersection(members):
+                    public_held.setdefault(b.get("role"), set()).update(_PUBLIC_MEMBERS.intersection(members))
+                # A conditional binding grants nothing outside its condition, so
+                # counting it would pass a project the runner still cannot use.
+                # For the platform GSA the same skip is a blind spot rather than
+                # a safe error: container.admin conditioned on `request.time <
+                # 2030` is write access every day until then, and platform_extra
+                # below would not see it. Nothing in this repository grants a
+                # conditional role and the pool projects hold none, so this is a
+                # gap to close before one does rather than a live hole.
+                if b.get("condition"):
+                    continue
+                for _, _, member in RUNNERS:
+                    if member in members:
+                        runner_held[member].add(b.get("role"))
+                if platform_member in members:
+                    platform_held.add(b.get("role"))
+                if litellm_member in members:
+                    litellm_held.add(b.get("role"))
+                if CI_HEALTH_BOT_MEMBER in members:
+                    bot_held.add(b.get("role"))
+                if FLEET_RECONCILER_MEMBER in members:
+                    reconciler_held.add(b.get("role"))
+
+            for label, job, member in RUNNERS:
+                missing = PROW_RUNNER_ROLES - runner_held[member]
+                if missing:
+                    passed = False
+                    observed = (
+                        f"{label} ({member.split(':', 1)[1]}) is missing "
+                        f"{len(missing)} role(s) on {project_id}: {', '.join(sorted(missing))}. "
+                        f"{job[0].upper()}{job[1:]} authenticates as this account after leasing the "
+                        "project, so it will fail on the first gcloud call rather than at registration"
+                    )
+                    details.append(observed)
+                    for role in sorted(missing):
+                        findings.append(Finding(
+                            f"iam/{RUNNER_SLUGS[member]}/missing/{role}",
+                            f"{label} is missing {role} on {project_id}",
+                            _project_binding(project_id, member, role),
+                        ))
+
+            reconciler_missing = FLEET_RECONCILER_ROLES - reconciler_held
+            if reconciler_missing:
+                passed = False
+                details.append(
+                    f"The seeded-fleet reconciler ({FLEET_RECONCILER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"{len(reconciler_missing)} role(s) on {project_id}: {', '.join(sorted(reconciler_missing))}. "
+                    "Its scheduled re-apply of bench/tf/fleet fails here, so the fixtures drift unrepaired; "
+                    f"the grant loop is in docs/ci-pool-projects.md section 3, with {FLEET_RECONCILER_BUCKET_LIST_ROLE} "
+                    f"on the state bucket and {FLEET_RECONCILER_BUCKET_ROLE} under its {FLEET_RECONCILER_STATE_PREFIX} "
+                    "prefix, which this check does not read"
+                )
+                for role in sorted(reconciler_missing):
+                    findings.append(Finding(
+                        f"iam/fleet-reconciler/missing/{role}",
+                        f"The seeded-fleet reconciler is missing {role} on {project_id}",
+                        _project_binding(project_id, FLEET_RECONCILER_MEMBER, role),
+                    ))
+
+            platform_missing = PLATFORM_GSA_ROLES - platform_held
+            platform_extra = platform_held - PLATFORM_GSA_ROLES
+            if platform_missing and not platform_absent:
+                passed = False
+                details.append(
+                    f"The platform agent GSA is missing {len(platform_missing)} role(s) on "
+                    f"{project_id}: {', '.join(sorted(platform_missing))}. The agent under test "
+                    "authenticates as this account, so eval cases on this project fail on a "
+                    "credential the agent lacks rather than on the agent's reasoning"
+                )
+                for role in sorted(platform_missing):
+                    findings.append(Finding(
+                        f"iam/platform-gsa/missing/{role}",
+                        f"The platform agent GSA is missing {role} on {project_id}",
+                        _project_binding(project_id, platform_member, role),
+                    ))
+            if platform_extra:
+                passed = False
+                details.append(
+                    f"The platform agent GSA holds {len(platform_extra)} role(s) on {project_id} "
+                    f"beyond the read-only set: {', '.join(sorted(platform_extra))}. What they "
+                    "grant is not inspected -- the set is closed because the agent is the subject "
+                    "under test and Boskos leases at random, so any project that differs grades "
+                    "differently. Swap them per "
+                    "docs/site/src/content/docs/reference/security-and-iam.md -- re-running the "
+                    "install does not strip roles it no longer grants"
+                )
+                for role in sorted(platform_extra):
+                    findings.append(Finding(
+                        f"iam/platform-gsa/extra/{role}",
+                        f"The platform agent GSA holds {role} on {project_id}, outside the read-only set",
+                        _project_binding(project_id, platform_member, role, remove=True),
+                    ))
+            litellm_missing = LITELLM_GSA_ROLES - litellm_held
+            litellm_extra = litellm_held - LITELLM_GSA_ROLES
+            if litellm_missing and not litellm_absent:
+                passed = False
+                details.append(
+                    f"The LiteLLM gateway GSA is missing {len(litellm_missing)} role(s) on "
+                    f"{project_id}: {', '.join(sorted(litellm_missing))}. The gateway "
+                    "authenticates as this account for every vertex_ai model call, so a "
+                    "lease of this project fails at the deploy's model-call gate rather "
+                    "than at registration"
+                )
+                for role in sorted(litellm_missing):
+                    findings.append(Finding(
+                        f"iam/litellm-gsa/missing/{role}",
+                        f"The LiteLLM gateway GSA is missing {role} on {project_id}",
+                        _project_binding(project_id, litellm_member, role),
+                    ))
+            if litellm_extra:
+                passed = False
+                details.append(
+                    f"The LiteLLM gateway GSA holds {len(litellm_extra)} role(s) on "
+                    f"{project_id} beyond aiplatform.user: {', '.join(sorted(litellm_extra))}. "
+                    "The gateway is a network-exposed proxy forwarding "
+                    "attacker-influenceable prompt content, so its set is closed -- swap "
+                    "them per docs/site/src/content/docs/reference/security-and-iam.md"
+                )
+                for role in sorted(litellm_extra):
+                    findings.append(Finding(
+                        f"iam/litellm-gsa/extra/{role}",
+                        f"The LiteLLM gateway GSA holds {role} on {project_id}, beyond aiplatform.user",
+                        _project_binding(project_id, litellm_member, role, remove=True),
+                    ))
+            if public_held:
+                passed = False
+                details.append(
+                    f"{project_id} grants {len(public_held)} role(s) to allUsers or "
+                    f"allAuthenticatedUsers: {', '.join(sorted(public_held))}. The pool holds "
+                    "an App signing key and every lease's build artifacts, so a public binding "
+                    "reaches further than the one project it is on"
+                )
+                for role, members in sorted(public_held.items()):
+                    findings.append(Finding(
+                        f"iam/public/{role}",
+                        f"{project_id} grants {role} to {', '.join(sorted(members))}",
+                        "\n".join(_project_binding(project_id, member, role, remove=True) for member in sorted(members)),
+                    ))
+            # The pool-state scan's own read on the project. A missing role
+            # costs nothing a run notices: the scan reports the project as not
+            # checked, and drift there goes unseen until it is granted.
+            bot_missing = POOL_STATE_READER_ROLES - bot_held
+            if bot_missing:
+                passed = False
+                details.append(
+                    f"The CI health bot ({CI_HEALTH_BOT_MEMBER.split(':', 1)[1]}) is missing "
+                    f"{len(bot_missing)} role(s) on {project_id}: {', '.join(sorted(bot_missing))}. Its hourly "
+                    "pool-state scan reads the project as this account, so the project scans as not "
+                    "checked and drift there goes unseen. Re-apply bench/tf/fleet against "
+                    f"{project_id}, or run the grant in docs/ci-health.md (The pool-state scan). "
+                    "This reads the project's own policy: a grant on a folder or the organisation, "
+                    "or through a group, is not seen here and shows as missing"
+                )
+                for role in sorted(bot_missing):
+                    findings.append(Finding(
+                        f"iam/pool-state-reader/missing/{role}",
+                        f"The CI health bot is missing {role} on {project_id} (in the project's own policy; a grant above it or through a group is not read here)",
+                        _project_binding(project_id, CI_HEALTH_BOT_MEMBER, role),
+                    ))
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing the IAM policy for {project_id}: {exc}")
+
+    # The runner's permission to borrow the seeded fleet's read-only account.
+    # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
+    # seeded-fleet-reader, writes nothing, and every run that leases the
+    # project stops at its fleet step. (Before it refused, it warned and read the
+    # fleet on the runner's own roles/container.admin, unnoticed across the whole
+    # pool: gke-labs/kube-agents#1051.) bench/tf/fleet now defaults the grant, so
+    # a project failing here was last applied before that default landed and
+    # needs `tofu apply` against its seeded-fleet state.
+    fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        fleet_reader_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing account or failed reading policy for {fleet_reader_email}. Apply "
+            f"bench/tf/fleet in {project_id}: the stack owns this account.",
+            f"Could not read the IAM policy on {fleet_reader_email}, so the Prow runner's "
+            "impersonation grant was not checked (and neither was the account's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+            findings.append(Finding("iam/fleet-reader/absent", details[-1], REPAIR_FLEET_APPLY.format(project_id=project_id)))
+    else:
+        fleet_reader_checked = True
+        try:
+            policy = _load_json(out)
+            token_creators = set()
+            for b in policy.get("bindings", []):
+                if b.get("role") == "roles/iam.serviceAccountTokenCreator":
+                    token_creators.update(b.get("members", []))
+            for label, member, consequence in FLEET_READER_TOKEN_CREATORS:
+                if member not in token_creators:
+                    passed = False
+                    slug = label.lower().removeprefix("the ").replace(" ", "-")
+                    _drift(
+                        details, findings, f"iam/fleet-reader/token-creator/{slug}",
+                        f"{label} ({member.split(':', 1)[1]}) is missing "
+                        f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so "
+                        + consequence.format(project_id=project_id),
+                        _account_binding(project_id, fleet_reader_email, member, "roles/iam.serviceAccountTokenCreator"),
+                    )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
+
+    # The summary must not assert an item a warning above retracts.
+    partial = _partial_summary(
+        [
+            ("the Workload Identity binding", wi_checked),
+            ("the LiteLLM gateway's Workload Identity binding", litellm_checked),
+            ("the runners' and platform GSA project roles", roles_checked),
+            ("the fleet reader's token-creator binding", fleet_reader_checked),
+        ]
+    )
+    if not passed:
+        message = "IAM requirements missing"
+    elif partial:
+        message = partial
+    else:
+        message = (
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
+            "and the fleet reader's token-creator binding verified"
+        )
+
+    return CheckResult(
+        "Service Accounts & IAM Grants",
+        passed,
+        message,
+        details=details,
+        warnings=warnings,
+        findings=findings,
+        read=wi_checked or litellm_checked or roles_checked or fleet_reader_checked,
+    )
+
+
+def check_warm_cache_readers(project_id: str, project_number: str) -> CheckResult:
+    """Verify this project's Cloud Build and Compute SAs hold reader on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT."""
+    details: List[str] = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    prow_checked = False
+    # The warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE to lives in the
+    # `us` multi-region repository of kube-agents-prow, not in us-central1.
+    rc, out, err = run_cmd([
+        "gcloud", "artifacts", "repositories", "get-iam-policy",
+        "kube-agents",
+        f"--project={WARM_CACHE_REPOSITORY_PROJECT}",
+        f"--location={WARM_CACHE_REPOSITORY_LOCATION}",
+        "--format=json",
+    ])
+    if rc != 0:
+        # A cross-project read. The pool project can be perfectly configured
+        # while the caller simply holds nothing on kube-agents-prow, which is
+        # the common case for anyone who is not the Prow service account.
+        if not _record_unreadable(
+            err,
+            f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}",
+            "Could not read the IAM policy on kube-agents-prow's kube-agents repository, so this "
+            "project's Cloud Build and Compute SAs were not checked for reader on the warm cache image",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        prow_checked = True
+        try:
+            policy = _load_json(out)
+            cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
+            compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
+            readers = set()
+            for b in policy.get("bindings", []):
+                if b.get("role") == "roles/artifactregistry.reader":
+                    readers.update(b.get("members", []))
+            warm_cache_grant = (
+                f"gcloud artifacts repositories add-iam-policy-binding kube-agents --project={WARM_CACHE_REPOSITORY_PROJECT} "
+                f'--location={WARM_CACHE_REPOSITORY_LOCATION} --member="{{member}}" --role=roles/artifactregistry.reader'
+            )
+            if cb_sa not in readers:
+                passed = False
+                _drift(
+                    details, findings, "warm_cache/reader/cloudbuild",
+                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
+                    warm_cache_grant.format(member=cb_sa),
+                )
+            if compute_sa not in readers:
+                passed = False
+                _drift(
+                    details, findings, "warm_cache/reader/compute",
+                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
+                    warm_cache_grant.format(member=compute_sa),
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
+
+    if not passed:
+        message = "Warm cache reader grants missing"
+    elif not prow_checked:
+        message = "Not checked: the warm cache repository's policy could not be read"
+    else:
+        message = "Cloud Build and Compute SAs hold reader on the warm cache repository"
+    return CheckResult(
+        "Warm Cache Readers",
+        passed,
+        message,
+        details=details,
+        warnings=warnings,
+        findings=findings,
+        read=prow_checked,
+    )
+
+
+def _host_cluster_node_members(project_id: str, project_number: str) -> Tuple[List[str], Optional[str]]:
+    """IAM members for the accounts platform-agent-host's nodes run as.
+
+    Read off the cluster rather than assumed. A pool created with
+    --service-account runs as that account, and asserting the Compute default SA
+    against such a cluster would report a failure the project does not have. The
+    seeded trio is deliberately not consulted: it runs its own
+    seeded-fleet-nodes account and pulls no kube-agents image.
+
+    One listing carries every cluster's pools, so no location is needed -- the
+    same reason check_gke_and_state lists rather than describes. "default" is
+    what the API returns for a pool that was never given an account, and it
+    means the Compute Engine default SA.
+
+    Returns (members, error). An error means the accounts could not be
+    determined, which is not the same as the nodes being unable to pull.
+    """
+    rc, out, err = run_cmd([
+        "gcloud", "container", "clusters", "list",
+        f"--project={project_id}",
+        "--format=value(name,nodePools[].config.serviceAccount)",
+    ])
+    if rc != 0:
+        return [], f"could not list clusters: {err.strip()[:160]}"
+
+    compute_default = f"{project_number}-compute@developer.gserviceaccount.com"
+    accounts = set()
+    for line in out.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2 or fields[0] != HOST_CLUSTER:
+            continue
+        for sa in fields[1].split(";"):
+            sa = sa.strip()
+            if sa:
+                accounts.add(compute_default if sa == "default" else sa)
+
+    if not accounts:
+        return [], f"{HOST_CLUSTER} not found or reports no node pools"
+    return sorted(f"serviceAccount:{a}" for a in accounts), None
+
+
+def check_artifact_registry(project_id: str, project_number: str, location: str = "us-central1") -> CheckResult:
+    """Verify the project's own Artifact Registry repository, its cleanup policy, and push rights.
+
+    hack/ci-deploy.sh defaults AR_REPO to
+    <location>-docker.pkg.dev/<project>/kube-agents and pushes every PR image
+    there. Without the repository the build has nowhere to land; without a
+    cleanup policy the presubmit images accumulate without bound.
+    """
+    details = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    repo_checked = False
+    repository_repair = REPAIR_REPOSITORY
+    cleanup_repair = REPAIR_CLEANUP_POLICY
+
+    rc, out, err = run_cmd([
+        "gcloud", "artifacts", "repositories", "describe", "kube-agents",
+        f"--location={location}",
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing Artifact Registry repository kube-agents in {location}: {err.strip()[:160]}",
+            f"Could not read the Artifact Registry repository kube-agents in {location}, so neither its "
+            "presence nor its cleanup policy was checked",
+            details,
+            warnings,
+        ):
+            passed = False
+            findings.append(Finding("artifact-registry/repository", details[-1], repository_repair))
+    else:
+        repo_checked = True
+        try:
+            repo = _load_json(out)
+            if repo.get("format") != "DOCKER":
+                passed = False
+                _drift(details, findings, "artifact-registry/format", f"Repository kube-agents has format {repo.get('format')}, expected DOCKER", repository_repair)
+            if not repo.get("cleanupPolicies"):
+                passed = False
+                _drift(details, findings, "artifact-registry/cleanup-policy", f"Repository kube-agents in {location} has no cleanup policy", cleanup_repair)
+            # A dry-run policy reports what it would delete and deletes nothing,
+            # so storage still grows without bound while the policy looks set.
+            if repo.get("cleanupPolicyDryRun"):
+                passed = False
+                _drift(details, findings, "artifact-registry/cleanup-dry-run", "Cleanup policies are in dry-run mode; they will not delete anything", cleanup_repair)
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing Artifact Registry repository: {exc}")
+
+    # All six pool projects build as the Compute Engine default SA (measured
+    # 2026-08-26), but the legacy <number>@cloudbuild SA is accepted too so a
+    # project that defaults the other way is not failed with no remediation. A
+    # grant can sit on the project or on the repository, so both are consulted.
+    build_sas = {
+        f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com",
+        f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com",
+    }
+    writers = set()
+    pullers = set()
+    policy_read = False
+    policy_denials: List[str] = []
+    policy_errors: List[str] = []
+    for cmd in (
+        ["gcloud", "projects", "get-iam-policy", project_id, "--format=json"],
+        [
+            "gcloud", "artifacts", "repositories", "get-iam-policy", "kube-agents",
+            f"--location={location}", f"--project={project_id}", "--format=json",
+        ],
+    ):
+        rc, out, err = run_cmd(cmd)
+        if rc != 0:
+            # _unread_reason, not _denial_reason: policy_denials is the bucket
+            # meaning "do not conclude absence from this", and a timeout earns
+            # that as much as a 403 does. The split with policy_errors survives
+            # because it feeds the "read from a partial policy" wording below,
+            # which is about whether the other policy produced a usable answer.
+            reason = _unread_reason(err)
+            if reason:
+                policy_denials.append(reason)
+            else:
+                policy_errors.append(err.strip()[:160] or f"exit {rc}")
+            continue
+        try:
+            policy = _load_json(out)
+        except Exception as exc:
+            policy_errors.append(f"unparseable policy: {exc}")
+            continue
+        policy_read = True
+        for b in policy.get("bindings", []):
+            role = b.get("role")
+            if role in AR_WRITER_ROLES:
+                writers.update(b.get("members", []))
+            if role in AR_PULLER_ROLES:
+                pullers.update(b.get("members", []))
+
+    node_pull_checked = False
+    push_checked = False
+    if not policy_read:
+        # Nothing is known about push rights either way. Where every attempt was
+        # refused that is a limit of the caller's credential and not a finding
+        # about the project, so it takes the same route as every other denial
+        # here. Where some other cause stopped the read -- an unparseable policy,
+        # a call that failed for a reason that is not permissions -- the check
+        # still fails, because that is not a limit anyone can confirm by hand.
+        if policy_errors:
+            passed = False
+            details.append(
+                f"Could not read any IAM policy granting image push rights on {project_id}: "
+                f"{policy_errors[0]}"
+            )
+        else:
+            warnings.append(Unread(
+                f"Could not read any IAM policy on {project_id}, so image push rights and "
+                f"{HOST_CLUSTER}'s node pull rights were not checked: "
+                f"{policy_denials[0] if policy_denials else 'no policy readable'}"
+            ))
+    else:
+        # A grant found in either policy settles the question; its absence is
+        # settled only when BOTH were read. One policy refused and the other
+        # returning nothing relevant looks identical to no grant anywhere --
+        # and the grants provision_ci_pool_project.sh makes are project-level,
+        # so the refused half is usually the half that holds them.
+        #
+        # `not policy_errors` here and below is always true as the loop stands:
+        # reaching this branch means one of the two policies was read, so the
+        # other contributed at most one of a denial or an error. It is the
+        # condition the branch means rather than the one the arithmetic
+        # currently allows, and stays correct if a third policy source is added.
+        push_ok = bool(build_sas & writers)
+        push_checked = push_ok or not policy_denials
+        if not push_ok and policy_denials and not policy_errors:
+            warnings.append(Unread(
+                f"No role granting image push to {project_id} was found for the Cloud Build or Compute "
+                f"SA, but one of the two IAM policies could not be read, so push rights were not "
+                f"checked: {policy_denials[0]}"
+            ))
+        elif not push_ok:
+            passed = False
+            detail = (
+                f"Neither the Cloud Build SA nor the Compute SA holds a role granting image push on {project_id} "
+                f"(any of: {', '.join(sorted(AR_WRITER_ROLES))}); PR image pushes will fail"
+            )
+            if policy_errors:
+                detail += f" -- read from a partial policy; the other could not be read: {policy_errors[0]}"
+            # The check passes on either builder, so the repair grants both,
+            # as provisioning does; granting one alone can close the finding
+            # while the account that builds still holds nothing.
+            _drift(
+                details, findings, "artifact-registry/push", detail,
+                "\n".join(_project_binding(project_id, member, "roles/artifactregistry.writer") for member in sorted(build_sas)),
+            )
+
+        node_members, node_err = _host_cluster_node_members(project_id, project_number)
+        if node_err:
+            # An unreadable cluster is not a cluster whose nodes cannot pull.
+            # Reporting this as a failure would be the same conflation
+            # check_toolchain exists to remove, so it goes to the operator as an
+            # item to look at and the run exits 2.
+            warnings.append(Unread(
+                f"Could not determine which account {HOST_CLUSTER}'s nodes run as ({node_err}), "
+                "so their pull rights on the kube-agents repository were not checked"
+            ))
+        else:
+            starved = [m for m in node_members if m not in pullers]
+            if starved and policy_denials and not policy_errors:
+                # Same asymmetry as push above: a pull grant this run was
+                # refused sight of reads exactly like one that is not there.
+                warnings.append(Unread(
+                    f"No role granting image pull on {project_id} was found for {HOST_CLUSTER}'s node "
+                    f"account(s) {', '.join(sorted(starved))}, but one of the two IAM policies could not "
+                    f"be read, so node pull rights were not checked: {policy_denials[0]}"
+                ))
+            elif starved:
+                passed = False
+                detail = (
+                    f"{HOST_CLUSTER}'s node account(s) {', '.join(sorted(starved))} hold no role granting "
+                    f"image pull on {project_id} (any of: {', '.join(sorted(AR_PULLER_ROLES))}); the build "
+                    "will push and every pod will land in ImagePullBackOff on the first lease"
+                )
+                if policy_errors:
+                    detail += f" -- read from a partial policy; the other could not be read: {policy_errors[0]}"
+                _drift(
+                    details, findings, "artifact-registry/node-pull", detail,
+                    "\n".join(_project_binding(project_id, member, "roles/artifactregistry.reader") for member in sorted(starved)),
+                )
+            else:
+                node_pull_checked = True
+
+    # The summary must not assert the item the warning above retracts. A line
+    # reading "...and node pull rights" over a warning saying they could not be
+    # checked is the same false assurance the exit-2 code exists to prevent, and
+    # it would be worst on exactly the run where the operator most needs to read
+    # the warning.
+    partial = _partial_summary(
+        [
+            ("the repository and its cleanup policy", repo_checked),
+            ("push rights", push_checked),
+            ("node pull rights", node_pull_checked),
+        ]
+    )
+    if not passed:
+        message = "Artifact Registry not ready"
+    elif partial:
+        message = partial
+    else:
+        message = f"kube-agents ({location}) present with a cleanup policy, push rights, and node pull rights"
+
+    return CheckResult(
+        "Artifact Registry Repository",
+        passed,
+        message,
+        details=details,
+        warnings=warnings,
+        findings=findings,
+        read=repo_checked or policy_read,
+    )
+
+
+def check_gke_and_state(project_id: str) -> CheckResult:
+    """Verify the host cluster, its CMEK state, the trio's names, and the state bucket.
+
+    Names and encryption only. Whether the trio holds the planted fixtures is
+    check_seeded_fleet_fixtures() below, and the two are far apart: an apply
+    that created the clusters and died before the Kubernetes provider ran
+    satisfies every assertion here.
+    """
+    name = "GKE Clusters & Terraform State"
+    details = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    clusters_checked = False
+    bucket_checked = False
+
+    # name and encryption state in one listing: a separate describe would need
+    # the cluster's location, which this call is what would have told us.
+    rc, out, err = run_cmd([
+        "gcloud", "container", "clusters", "list",
+        f"--project={project_id}",
+        "--format=value(name,databaseEncryption.state)",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Failed listing clusters: {err.strip()}",
+            f"Could not list the clusters in {project_id}, so neither the four expected clusters nor "
+            f"{HOST_CLUSTER}'s CMEK state was checked",
+            details,
+            warnings,
+        ):
+            passed = False
+    elif PARTIAL_LISTING_RE.search(err or ""):
+        partial = next((line.strip() for line in err.splitlines() if PARTIAL_LISTING_RE.search(line)), err.strip())
+        warnings.append(Unread(
+            f"Could not list all the clusters in {project_id} ({partial}), so neither the four expected "
+            f"clusters nor {HOST_CLUSTER}'s CMEK state was checked"
+        ))
+    else:
+        clusters_checked = True
+
+    encryption_by_cluster = {}
+    if clusters_checked:
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split()
+            encryption_by_cluster[fields[0]] = fields[1] if len(fields) > 1 else ""
+
+        missing_clusters = EXPECTED_CLUSTERS - set(encryption_by_cluster)
+        if missing_clusters:
+            passed = False
+            details.append(f"Missing GKE cluster(s): {', '.join(sorted(missing_clusters))}")
+            for cluster in sorted(missing_clusters):
+                repair = REPAIR_HOST_CLUSTER if cluster == HOST_CLUSTER else REPAIR_FLEET_APPLY.format(project_id=project_id)
+                findings.append(Finding(f"gke/cluster/{cluster}", f"Missing GKE cluster: {cluster}", repair))
+
+        if HOST_CLUSTER in encryption_by_cluster:
+            state = encryption_by_cluster[HOST_CLUSTER]
+            if state not in VALID_CMEK_STATES:
+                passed = False
+                _drift(
+                    details, findings, "gke/host-cmek",
+                    f"{HOST_CLUSTER} databaseEncryption.state is '{state or 'unset'}', not one of "
+                    f"{', '.join(sorted(VALID_CMEK_STATES))}; full-install creates the host cluster "
+                    "encrypted, so this is drift",
+                    REPAIR_HOST_CMEK,
+                )
+
+    # `buckets describe` needs storage.buckets.get, which `storage ls` does not,
+    # so this is the call most likely to be refused for a caller who can see the
+    # bucket's contents perfectly well.
+    state_bucket = f"gs://{project_id}-tf-state"
+    rc, out, err = run_cmd(["gcloud", "storage", "buckets", "describe", state_bucket])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing Terraform state bucket: {state_bucket}",
+            f"Could not read {state_bucket}, so the Terraform state bucket was not checked",
+            details,
+            warnings,
+        ):
+            passed = False
+            findings.append(Finding("gke/state-bucket", details[-1], REPAIR_STATE_BUCKET.format(project_id=project_id)))
+    else:
+        bucket_checked = True
+
+    if not passed:
+        message = "GKE/state resources missing"
+    elif clusters_checked and bucket_checked:
+        message = f"All 4 clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
+    else:
+        verified = []
+        unchecked = []
+        (verified if clusters_checked else unchecked).append("clusters and CMEK")
+        (verified if bucket_checked else unchecked).append("state bucket")
+        prefix = f"{'; '.join(verified)} present; " if verified else ""
+        message = f"{prefix}{'; '.join(unchecked)} not checked"
+
+    return CheckResult(name, passed, message, details=details, warnings=warnings, findings=findings, read=clusters_checked or bucket_checked)
+
+
+def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
+    """Run hack/fleet-kubeconfigs.sh against the project and require every role.
+
+    A cluster that exists is not a fixture that was planted, and the gap is not
+    hypothetical: an apply that created the trio and failed before the
+    Kubernetes provider ran leaves three clusters that answer every API call
+    and hold none of the objects. check_gke_and_state() passes that project.
+    Nothing then contradicts it until a lease draws the project, runs a fleet
+    scenario, and every check on it reports `status: error` -- by which point
+    the project is registered and a pull request is wearing the result.
+
+    This is the command the runbook told an operator to run by hand and read
+    the counts off. It writes cluster credentials to a temporary directory,
+    which makes it the one check here that is not a read-only gcloud call; the
+    directory goes away with the run.
+    """
+    name = "Seeded Fleet Fixtures"
+    if not _FLEET_KUBECONFIGS.exists():
+        return CheckResult(name, False, f"Missing {_FLEET_KUBECONFIGS}")
+
+    try:
+        catalog = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+        expected = len(catalog.get("roles") or {})
+    except (OSError, ValueError) as exc:
+        return CheckResult(name, False, f"Could not read {_FLEET_CATALOG}: {exc}")
+    if not expected:
+        return CheckResult(name, False, f"{_FLEET_CATALOG} declares no fixture roles")
+
+    # kubectl is absent from check_toolchain() because every other check here is
+    # gcloud or gh. Without it every probe fails, all eight roles report as
+    # unplanted, and the run states a confident and wrong verdict about a fleet
+    # it never looked at.
+    rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
+    if rc == 127:
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(
+                "kubectl is not on PATH, so the planted fixtures were not checked. "
+                f"Install it and re-run, or run {FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV}=1 "
+                f"FLEET_PROJECT_ID={project_id} hack/fleet-kubeconfigs.sh by hand and "
+                "read its summary line."
+            )],
+        )
+
+    with tempfile.TemporaryDirectory(prefix="verify-fleet-") as tmp:
+        # A path INSIDE the temporary directory rather than the directory
+        # itself: the script refuses to rm -rf a directory it did not create,
+        # and it creates this one. TemporaryDirectory still takes the
+        # credentials with it on the way out.
+        target = os.path.join(tmp, "kubeconfigs")
+        env = dict(
+            os.environ,
+            FLEET_PROJECT_ID=project_id,
+            BENCH_FLEET_KUBECONFIG_DIR=target,
+        )
+        # Forced, not defaulted: this check has decided the operator's own
+        # credential is acceptable, and a shell that exports the opt-in blank
+        # or as 0 would otherwise turn a healthy project into exit 3.
+        if not env.get("FLEET_READONLY_SA"):
+            env[FLEET_RUNNER_CREDENTIAL_OPT_IN_ENV] = "1"
+        rc, _, err = run_cmd(
+            ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
+        )
+        presence = _fleet_presence_result(name, project_id, expected, rc, err)
+        match = _FLEET_SUMMARY.search(err)
+        written = int(match.group("written")) if match else 0
+        # A presence verdict that already fails, or one that published no role
+        # at all, is the whole answer: there is nothing whose state could be
+        # read, and a second finding about the same fleet would only blur the
+        # first. Otherwise the state pass runs INSIDE the temporary directory,
+        # because it reads the kubeconfigs the presence pass just wrote.
+        if not presence.passed or not written:
+            return presence
+        rc, _, err = run_cmd(
+            [
+                "python3",
+                str(_FLEET_STATE),
+                "--dir",
+                target,
+                "--project",
+                project_id,
+                "--wait",
+                str(FLEET_STATE_WAIT_SECONDS),
+            ],
+            timeout=FLEET_STATE_WAIT_SECONDS + FLEET_TIMEOUT_SECONDS,
+            env=env,
+        )
+    return _fleet_state_result(name, project_id, expected, presence, rc, err)
+
+
+def _fleet_state_result(
+    name: str, project_id: str, expected: int, presence: CheckResult, rc: int, err: str
+) -> CheckResult:
+    """Fold hack/fleet-fixture-state.py's verdict into the presence result.
+
+    Drift is a finding about the project -- the fixture is there and is not
+    what the cases were written against -- and fails the check with the
+    script's own lines saying which assertion and what it observed. A role the
+    script could not read is unverified, like an unreachable cluster in the
+    presence pass. A script that exited without reporting is unverified if it
+    was refused or timed out and a failure otherwise, because the only other
+    way it exits non-zero is a malformed catalog, which is a repository bug.
+    """
+    match = _FLEET_STATE_SUMMARY.search(err)
+    notes = [line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))]
+    if not match:
+        last = (err.strip().splitlines() or ["no output"])[-1]
+        if rc != 0:
+            # As in the presence half: a silent exit is the project's, not an unread.
+            reason = _unread_reason(err) if err.strip() else None
+            if reason:
+                return CheckResult(
+                    name,
+                    True,
+                    presence.message,
+                    warnings=[
+                        *presence.warnings,
+                        Unread(
+                            f"hack/fleet-fixture-state.py exited {rc} without reading the fixtures, "
+                            f"so nothing is known about their state in {project_id}: {reason}"
+                        ),
+                    ],
+                )
+            return CheckResult(
+                name,
+                False,
+                f"hack/fleet-fixture-state.py exited {rc} without reporting",
+                details=[last],
+            )
+        return CheckResult(
+            name,
+            True,
+            presence.message,
+            warnings=[
+                *presence.warnings,
+                Unread(
+                    "hack/fleet-fixture-state.py printed no summary line, so nothing is known "
+                    f"about the fixtures' state in {project_id}. Last line of its output: {last}"
+                ),
+            ],
+        )
+
+    converged = int(match.group("converged"))
+    drifted = int(match.group("drifted"))
+    unchecked = int(match.group("unchecked"))
+    counts = (
+        f"{converged} role(s) in their designed state, {drifted} drifted, "
+        f"{unchecked} whose state could not be read"
+    )
+    if drifted:
+        return CheckResult(
+            name,
+            False,
+            "Seeded fleet fixtures present but not in their designed state",
+            details=[counts, *notes],
+        )
+    if unchecked:
+        return CheckResult(
+            name,
+            True,
+            f"{unchecked} of {expected} fixture role(s) present, state not checked",
+            warnings=[
+                *presence.warnings,
+                Unread("\n      ".join(
+                    [
+                        (
+                            f"{counts}. Nothing was found out of shape: the reads failed, so "
+                            f"confirm the seeded fleet in {project_id} before registering it."
+                        ),
+                        *notes,
+                    ]
+                )),
+            ],
+        )
+    if presence.warnings:
+        return presence
+    return CheckResult(
+        name, True, f"All {expected} fixture roles planted, reachable and in their designed state"
+    )
+
+
+def _fleet_presence_result(
+    name: str, project_id: str, expected: int, rc: int, err: str
+) -> CheckResult:
+    """The presence half: what hack/fleet-kubeconfigs.sh's summary line says.
+
+    Passes only when every role was written, or when the roles it could not
+    write sit on clusters the script said it could not reach (unverified, with
+    a warning). Every other shape is a finding about the project.
+    """
+    match = _FLEET_SUMMARY.search(err)
+    if not match:
+        last = (err.strip().splitlines() or ["no output"])[-1]
+        if rc != 0:
+            # Exit 3 is the gate, before any read, in every shape it prints,
+            # and its one line is the reason whole; the other codes are unread
+            # only when stderr says why, and a silent exit is the project's
+            # (the script prints a line on every exit path it has, so silence
+            # is a kill or a trip, and either is a finding to look at).
+            reason = last if rc == FLEET_EXIT_READONLY_UNAVAILABLE else (_unread_reason(err) if err.strip() else None)
+            if reason:
+                return CheckResult(
+                    name,
+                    True,
+                    "Not checked",
+                    warnings=[Unread(
+                        f"hack/fleet-kubeconfigs.sh exited {rc} without reading the fleet, so nothing "
+                        f"is known about the fixtures in {project_id}: {reason}"
+                    )],
+                )
+            return CheckResult(
+                name,
+                False,
+                f"hack/fleet-kubeconfigs.sh exited {rc} without reporting",
+                details=[last],
+            )
+        # Exit 0 and no summary means the line moved, not that the fleet is
+        # absent. Saying "no fixtures" here would fail a healthy project on a
+        # change to a string in another file.
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(
+                "hack/fleet-kubeconfigs.sh printed no summary line, so nothing is known "
+                f"about the fixtures in {project_id}. Last line of its output: {last}"
+            )],
+        )
+
+    written = int(match.group("written"))
+    unresolved = int(match.group("unresolved"))
+    unplanted = int(match.group("unplanted"))
+    if written == expected and not unresolved and not unplanted:
+        return CheckResult(name, True, f"All {expected} fixture roles planted and reachable")
+
+    counts = (
+        f"{written}/{expected} role(s) written, {unresolved} on clusters that could not be "
+        f"resolved or reached, {unplanted} whose fixtures were not present"
+    )
+    # The counts say how many; only the warnings say which. Both go in, because
+    # "re-apply the stack" is the wrong advice for a cluster that is there and
+    # unreachable, and the script's own wording is what distinguishes them.
+    notes = [line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))]
+
+    # The script's own two categories are already the distinction this check
+    # needs. A role counted unresolved sits on a cluster this run could not
+    # reach, and nothing was learned about it; a role counted unplanted sits on
+    # a cluster that answered and did not hold the fixture. Only the second is
+    # evidence about the project. A credential without container.clusters.get
+    # fails every resolve and lands here as 0/7 written -- which, read as a
+    # finding, accuses a healthy fleet of being absent.
+    #
+    # "Unresolved" alone is not enough to conclude that, though, because a
+    # cluster that is genuinely absent also fails to resolve. The two are
+    # separable only in the fleet script's own wording, and _FLEET_LOOKED_AND_
+    # FOUND_WRONG is the half that means it read the cluster list and what came
+    # back was not what the catalog describes. Relying instead on
+    # check_gke_and_state to fail the absent case does not work: that check
+    # matches EXPECTED_CLUSTERS by name, while hack/fleet-kubeconfigs.sh
+    # discovers by the environment/managed-by labels and then by slot suffix,
+    # so a cluster that kept its name and lost its label passes there and is
+    # unresolved here.
+    # ...and the one string that undoes that reading is checked first. A refused
+    # `clusters list` reaches here as an empty listing plus its own warning, and
+    # the "no clusters labelled" line follows from the empty listing rather than
+    # from anything the script saw. Where the script says it could not look, no
+    # note it printed afterwards is evidence about the fleet.
+    could_not_look = any(_FLEET_COULD_NOT_LOOK.search(n) for n in notes)
+    looked_and_found_wrong = (
+        []
+        if could_not_look
+        else [n for n in notes if _FLEET_LOOKED_AND_FOUND_WRONG.search(n)]
+    )
+    # Positive evidence, not the lack of contrary evidence. An unresolved role
+    # is excused only where the script said it could not look or could not
+    # reach; a run that looked, reached what it found, and still came up short
+    # is describing the fleet, and the count is the finding.
+    could_not_reach = could_not_look or any(
+        _FLEET_UNREACHABLE.search(n) for n in notes
+    )
+    if unresolved and not unplanted and not looked_and_found_wrong and could_not_reach:
+        return CheckResult(
+            name,
+            True,
+            f"{unresolved} of {expected} fixture role(s) not checked",
+            # One warning, not one per note. report() counts warnings to fill in
+            # "N item(s) could not be checked", and three unreachable clusters
+            # are evidence for a single item -- this project's seeded fleet --
+            # rather than three separate things to go and confirm.
+            warnings=[
+                Unread("\n      ".join(
+                    [
+                        f"{counts}. Nothing was found missing: the clusters carrying those roles could "
+                        f"not be reached, so their fixtures were never checked. Confirm the seeded "
+                        f"fleet in {project_id} before registering it.",
+                        *notes,
+                    ]
+                ))
+            ],
+        )
+    return CheckResult(name, False, "Seeded fleet incomplete", details=[counts, *notes])
+
+
+def gitops_seed_command(repo_slug: str) -> str:
+    """The one `gh api` call that gives an empty GitOps repository its first commit."""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_SEED_FILE} "
+        f"-f message='{GITOPS_SEED_MESSAGE}' "
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_SEED_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
+def check_github_repo_and_app(
+    project_id: str, app_id: int, repo_membership_confirmed: bool = False
+) -> CheckResult:
+    """Verify the GitOps repository exists, is private, and is in the App's installation.
+
+    repo_membership_confirmed records that a human has read the installation's
+    repository list on github.com. The script cannot read that list itself, so
+    without it the membership item stays unverified and the run cannot go green.
+    """
+    details = []
+    warnings: List[str] = []
+    passed = True
+    attested = False
+    repo_slug = f"gke-agentic/{project_id}-infra"
+
+    # Deliberately not routed through _record_unreadable. GitHub answers 404 for
+    # a repository that does not exist and 404 for one the token cannot see, so
+    # treating the second as unverified would make this check unable to report
+    # the first -- and a GitOps repository that was never created is exactly the
+    # onboarding gap it exists to catch. The message names both readings instead.
+    rc, out, err = run_cmd(
+        ["gh", "repo", "view", repo_slug, "--json", "isPrivate,name,defaultBranchRef"]
+    )
+    if rc != 0:
+        passed = False
+        details.append(f"Repository {repo_slug} not found or inaccessible: {err.strip()}")
+    else:
+        try:
+            repo_info = _load_json(out)
+            if not repo_info.get("isPrivate"):
+                passed = False
+                details.append(f"Repository {repo_slug} is not private")
+            # `defaultBranchRef` is null until the repository has a commit. The
+            # broker resolves its base branch from it, so an empty repository
+            # fails every remediation repetition on the project.
+            if repo_info.get("defaultBranchRef") is None:
+                passed = False
+                details.append(
+                    f"Repository {repo_slug} has no commits on any branch, so the broker "
+                    f"cannot open a remediation branch in it. Seed it: {gitops_seed_command(repo_slug)}"
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing gh repo view: {exc}")
+
+    rc, out, err = run_cmd([
+        "gh", "api", "/orgs/gke-agentic/installations",
+        "--jq", f".installations[] | select(.app_id=={app_id}) | {{id, repository_selection}}",
+    ])
+    # An org with no installations answers 200 with an empty list, so rc == 0
+    # and no output really is "the App is not installed" and stays a failure.
+    # A non-zero exit is something else: GET /orgs/{org}/installations needs the
+    # `admin:org` scope and answers 404 -- not 403 -- to a token without it, so
+    # the failure this call site cannot distinguish is a scope gap, and calling
+    # it an uninstalled App names a correctly configured org as the defect.
+    if rc != 0 and (_unread_reason(err) or _GITHUB_NOT_FOUND.search(err or "")):
+        warnings.append(Unread(
+            f"Could not list org gke-agentic's App installations with this token, so App {app_id}'s "
+            "installation was not checked. That endpoint needs the `admin:org` scope and answers 404 "
+            "without it. Re-run with a token carrying that scope, or confirm the installation at "
+            "https://github.com/organizations/gke-agentic/settings/installations"
+        ))
+    elif rc != 0 or not out.strip():
+        passed = False
+        details.append(f"GitHub App {app_id} installation not found on org gke-agentic")
+    else:
+        try:
+            inst = _load_json(out)
+            if inst.get("repository_selection") != "selected":
+                passed = False
+                details.append(
+                    f"GitHub App {app_id} repository_selection must be 'selected' "
+                    f"(got {inst.get('repository_selection')})"
+                )
+
+            # The installation existing says nothing about THIS project's
+            # repository being in it -- app_id and repository_selection are
+            # properties of the installation and read the same for every
+            # project. kube-agents-evals-3 had its repository created on
+            # 2026-08-21 and added to the installation on 2026-08-23; for those
+            # two days a check that stopped here reported success on precisely
+            # what was missing.
+            #
+            # Listing an installation's selected repositories needs a token
+            # authorized to the App itself -- an installation access token, or a
+            # user-to-server token of App 4675512. An operator PAT is neither,
+            # and no OAuth scope converts it into one (GitHub answers 403 and
+            # misreports the cause as a missing `user` scope). We also cannot
+            # mint an installation token here: the App private key is imported
+            # directly into KMS and never leaves it.
+            #
+            # So report this as unverified rather than failed. Refusing to
+            # onboard a project because of a limit in our own credentials would
+            # be a false negative, and the operator can confirm it in one click.
+            inst_id = inst.get("id")
+            rc, out, err = run_cmd([
+                "gh", "api", "--paginate",
+                f"/user/installations/{inst_id}/repositories",
+                "--jq", ".repositories[].full_name",
+            ])
+            if rc != 0 and repo_membership_confirmed:
+                # Recorded as attested, not as checked. The distinction is the
+                # point: the summary line has to keep saying which of the two it
+                # was, or the flag becomes a way to silence the check.
+                attested = True
+            elif rc != 0:
+                warnings.append(Unread(
+                    f"Could not read installation {inst_id}'s repository list with this token "
+                    "(expected: needs a token authorized to the App). "
+                    f"Open https://github.com/organizations/gke-agentic/settings/installations/{inst_id}, "
+                    f"check that {repo_slug} is in the repository list, then re-run with "
+                    "--confirmed-repo-in-app-installation"
+                ))
+            elif repo_slug not in out.split():
+                passed = False
+                details.append(
+                    f"{repo_slug} is not in GitHub App {app_id}'s installation; "
+                    "the minter cannot issue a token for it"
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing GitHub App installation: {exc}")
+
+    if not passed:
+        message = "GitHub configuration incomplete"
+    elif warnings:
+        message = f"Repo {repo_slug} (private); installation membership NOT verified"
+    elif attested:
+        message = f"Repo {repo_slug} (private); membership operator-confirmed, not machine-checked"
+    else:
+        message = f"Repo {repo_slug} (private) is in App {app_id}'s installation"
+
+    return CheckResult(
+        "GitOps Repo & GitHub App Installation",
+        passed,
+        message,
+        details=details,
+        warnings=warnings,
+    )
+
+
+def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
+    """The ledger App's PEM, read out of the build cluster. Returns (pem, reason).
+
+    A None pem always carries a reason. Read from the cluster rather than from a
+    file the operator supplies: the question is whether the key CI mounts can see
+    the repository, and a local copy cannot answer it.
+    """
+    context = f"gke_{PROW_BUILD_CLUSTER_PROJECT}_{PROW_BUILD_CLUSTER_ZONE}_{PROW_BUILD_CLUSTER}"
+    credentials = (
+        f"gcloud container clusters get-credentials {PROW_BUILD_CLUSTER} "
+        f"--zone {PROW_BUILD_CLUSTER_ZONE} --project {PROW_BUILD_CLUSTER_PROJECT}"
+    )
+    rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
+    if rc == 127:
+        return None, "kubectl is not on PATH"
+    rc, out, err = run_cmd(
+        [
+            "kubectl", "--context", context,
+            "-n", LEDGER_KEY_NAMESPACE,
+            "get", "secret", LEDGER_KEY_SECRET,
+            "-o", f"jsonpath={{.data.{LEDGER_KEY_SECRET_ENTRY.replace('.', chr(92) + '.')}}}",
+        ],
+        timeout=timeout,
+    )
+    if rc != 0:
+        unread = _unread_reason(err)
+        if unread:
+            return None, f"the read was refused or did not complete: {unread}"
+        if "context" in err and "does not exist" in err:
+            return None, f"kubeconfig has no context {context}; run `{credentials}`"
+        return None, f"kubectl could not read the secret: {err.strip()[:200]}"
+    if not out.strip():
+        # The secret exists and the entry does not, which kubectl reports as an
+        # empty jsonpath rather than an error.
+        return None, (
+            f"secret {LEDGER_KEY_SECRET} in {LEDGER_KEY_NAMESPACE} has no "
+            f"{LEDGER_KEY_SECRET_ENTRY} entry"
+        )
+    try:
+        return base64.b64decode(out.strip()).decode("ascii"), ""
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, f"the stored {LEDGER_KEY_SECRET_ENTRY} is not a readable PEM ({exc})"
+
+
+def _net_timeout(default: float) -> float:
+    """An HTTP call's timeout under the run's deadline: its own, cut to the
+    time left, never below NET_TIMEOUT_FLOOR_SECONDS."""
+    if _RUN_DEADLINE is None:
+        return default
+    return max(NET_TIMEOUT_FLOOR_SECONDS, min(default, _RUN_DEADLINE - time.monotonic()))
+
+
+def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str, str]:
+    """Trade the App key for an installation token. Returns (token, status, message).
+
+    status is one of {"ok", "failed", "unverified"}, and the token is only ever
+    returned, never logged: it is a live credential for every repository in the
+    installation.
+
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    pins, whatever the App is granted.
+    """
+
+    def _b64(raw: bytes) -> bytes:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+    now = int(time.time())
+    header = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64(
+        json.dumps(
+            {
+                "iat": now - JWT_BACKDATE_SECONDS,
+                "exp": now + JWT_LIFETIME_SECONDS,
+                "iss": str(LEDGER_APP_ID),
+            },
+            separators=(",", ":"),
+        ).encode()
+    )
+    signing_input = header + b"." + payload
+
+    with tempfile.TemporaryDirectory(prefix="verify-ledger-") as tmpdir:
+        key_path = os.path.join(tmpdir, "key.pem")
+        in_path = os.path.join(tmpdir, "jwt.in")
+        sig_path = os.path.join(tmpdir, "jwt.sig")
+        # 0600 inside a 0700 directory. The PEM is the whole credential, and it
+        # is on disk only for the length of one openssl call.
+        with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+            fh.write(pem)
+        with open(in_path, "wb") as fh:
+            fh.write(signing_input)
+        rc, _, err = run_cmd([
+            "openssl", "dgst", "-sha256", "-sign", key_path, "-out", sig_path, in_path
+        ])
+        if rc == 127:
+            return None, "unverified", "openssl is not on PATH, so no JWT could be signed"
+        if rc != 0:
+            return None, "failed", (
+                f"the key in secret {LEDGER_KEY_SECRET} would not sign a JWT: {err.strip()[:200]}"
+            )
+        with open(sig_path, "rb") as fh:
+            signature = fh.read()
+
+    jwt = (signing_input + b"." + _b64(signature)).decode("ascii")
+    request = urllib.request.Request(
+        GITHUB_INSTALLATION_TOKEN_URL.format(installation=LEDGER_INSTALLATION_ID),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {jwt}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "kube-agents-verify-ci-pool-project",
+        },
+        data=json.dumps({"permissions": LEDGER_READ_PERMISSIONS}).encode(),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_net_timeout(timeout)) as response:
+            body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return None, "failed", (
+                f"GitHub rejected a JWT signed by secret {LEDGER_KEY_SECRET} (401). The stored key "
+                f"is not App {LEDGER_APP_ID}'s, which breaks ledger grading on every pool project"
+            )
+        if exc.code == 404:
+            return None, "failed", (
+                f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
+                "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
+            )
+        if exc.code == 422:
+            # The body asked for a permission the installation does not hold.
+            # hack/ci-eval-pr.sh's preflight mint sends the same body and exits
+            # on this answer, so every run on every pool project would stop.
+            wanted = ", ".join(f"{k}: {v}" for k, v in LEDGER_READ_PERMISSIONS.items())
+            return None, "failed", (
+                f"GitHub refused to mint {wanted} for App {LEDGER_APP_ID}'s installation "
+                f"{LEDGER_INSTALLATION_ID} (422): the installation no longer holds one of them. "
+                "hack/ci-eval-pr.sh's preflight mint asks for exactly these and stops the run on "
+                "this answer, so ledger grading is broken pool-wide until an organisation owner "
+                "restores the permission (or accepts a pending permission change) on the installation"
+            )
+        return None, "unverified", (
+            f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of minting a token"
+        )
+    except Exception as exc:  # timeout, DNS, blocked egress, untrusted CA
+        remedy = (
+            "point SSL_CERT_FILE at a CA bundle (/etc/ssl/cert.pem on macOS) and re-run"
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)
+            else "re-run from somewhere with egress to api.github.com"
+        )
+        return None, "unverified", (
+            f"Could not reach api.github.com to mint a token ({type(exc).__name__}: {exc}); {remedy}"
+        )
+
+    # The mint response carries the installation's scope, so the containment
+    # boundary costs no extra call. `all` would still read this project's issues
+    # and pass every check below -- and would also read every other gke-agentic
+    # repository, most of which are not pool infrastructure. Only an explicit
+    # `all` fails: an absent key is GitHub changing its response, not a flip.
+    if body.get("repository_selection") == "all":
+        return None, "failed", (
+            f"App {LEDGER_APP_ID}'s installation {LEDGER_INSTALLATION_ID} is "
+            "repository_selection: all, so it reads every gke-agentic repository rather than the "
+            "pool's. Set it back to `selected` with the -infra repositories listed"
+        )
+
+    token = body.get("token")
+    if not token:
+        return None, "unverified", "GitHub's mint response carried no token"
+    return token, "ok", ""
+
+
+def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckResult:
+    """Verify the credential the eval runner grades ledgers with can read this repo's issues.
+
+    Every other GitHub check here covers the WRITE half: the minter App that lets
+    a run publish its ledger issue. This is the read half, and it is a different
+    App with a different key. `ledger_issue_contains`
+    (bench/kube_agents_bench/verifiers.py) reads the published issue back from
+    the Prow runner, needing `issues: read`; `pull_request_opened` reads a
+    remediation pull request the same way, needing `pull_requests: read`. This
+    check covers the issues half. Nothing in the project implies it, and
+    nothing else here looks at it.
+
+    kube-agents-evals-6 is why this exists. It passed every other check, was
+    registered, and redded the first pull request that leased it: the agent filed
+    the ledger correctly and the grader got a 404 reading it back
+    (gke-labs/kube-agents#994). The provisioning half was verified and the
+    grading half was not, and the grading half is the one that failed.
+
+    Deliberately NOT read through `gh`. The operator running this script is an
+    org member with broad access, so `gh api` answers 200 for a repository the
+    CI credential cannot see -- a pass on precisely the question. Only that
+    credential can answer it, so a key this cannot reach is unverified, never a
+    pass.
+    """
+    name = "Ledger Read Credential"
+    repo_slug = f"gke-agentic/{project_id}-infra"
+
+    pem, reason = _read_ledger_app_key()
+    if pem is None:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
+            f"Not checked: {reason}, so nothing here says whether the eval runner can read "
+            f"{repo_slug}'s issues -- the read that failed on kube-agents-evals-6's first lease. "
+            f"The key is secret {LEDGER_KEY_SECRET} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
+            f"{LEDGER_KEY_NAMESPACE} on cluster {PROW_BUILD_CLUSTER}"
+        )])
+
+    token, status, message = _mint_ledger_token(pem, timeout=timeout)
+    if status == "failed":
+        return CheckResult(name, False, "Ledger issues not readable", details=[message])
+    if token is None:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
+            f"{message}, so the eval runner's access to {repo_slug}'s issues is unknown"
+        )])
+
+    request = urllib.request.Request(
+        GITHUB_ISSUES_URL.format(repo=repo_slug),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "kube-agents-verify-ci-pool-project",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_net_timeout(timeout)) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        # A 403 is two different answers. Rate limiting is a limit of the moment
+        # and leaves the question open; anything else is a token that was just
+        # minted WITH `issues: read` being refused the repository anyway (a
+        # suspended installation, an organisation access setting), which is a
+        # real failure and the one a blanket "403 is unverified" would hide.
+        if exc.code == 403 and (exc.headers or {}).get("x-ratelimit-remaining") == "0":
+            return CheckResult(
+                name,
+                True,
+                "Not checked",
+                warnings=[Unread(
+                    f"GitHub rate-limited the read of {repo_slug}'s issues, so the eval runner's "
+                    "access to them was never established. Re-run when the limit resets"
+                )],
+            )
+        if exc.code == 403:
+            return CheckResult(name, False, "Ledger issues not readable", details=[
+                f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
+                f"(403 {exc.reason}). The token was just minted with `issues: read`, so this is "
+                "not a missing permission: the installation is suspended, or an organisation "
+                "IP allow list or SAML setting blocks App tokens from here. Pool-wide rather than "
+                f"anything about {project_id}; clear it and re-run"
+            ])
+        if exc.code == 404:
+            return CheckResult(name, False, "Ledger issues not readable", details=[
+                f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
+                "repository_selection: selected, so add this repository to it -- see section 5.4 "
+                "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                "exist; the check above settles which.)"
+            ])
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
+            f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of allowing or refusing the "
+            f"read of {repo_slug}'s issues, so the eval runner's access is unknown. Re-run when "
+            "it clears"
+        )])
+    except Exception as exc:  # timeout, DNS, blocked egress, untrusted CA
+        remedy = (
+            "point SSL_CERT_FILE at a CA bundle (/etc/ssl/cert.pem on macOS) and re-run"
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)
+            else "re-run from somewhere with egress to api.github.com"
+        )
+        return CheckResult(name, True, "Not checked", warnings=[Unread(
+            f"Could not reach api.github.com to read {repo_slug}'s issues "
+            f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
+        )])
+
+    return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
+
+
+def _probe_github_app_identity(
+    project_id: str, location: str, version: str, app_id: int, timeout: int = 15
+) -> Tuple[str, str]:
+    """Sign an App JWT with the KMS key and see whether GitHub accepts it as app_id.
+
+    Every other minter check reads configuration. This one is the only evidence
+    that the material imported into KMS is a private key of *this* App: KMS holds
+    opaque bytes, so a PEM belonging to some other App imports cleanly, reports
+    ENABLED, satisfies every attribute check, and fails for the first time at a
+    real push weeks later.
+
+    Returns (status, message) with status in {"ok", "failed", "unverified"}. Only
+    a 401, or an id that is not app_id, is evidence the key is wrong. A timeout,
+    a 5xx, or a blocked egress leaves the question open, which is a different
+    outcome and must not fail a project whose configuration is clean -- the
+    gcloud calls above reach cloudkms.googleapis.com while this one reaches
+    api.github.com, so one can be unreachable while the other is fine.
+    """
+
+    def _b64(raw: bytes) -> bytes:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+    now = int(time.time())
+    header = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64(
+        json.dumps(
+            {"iat": now - JWT_BACKDATE_SECONDS, "exp": now + JWT_LIFETIME_SECONDS, "iss": str(app_id)},
+            separators=(",", ":"),
+        ).encode()
+    )
+    signing_input = header + b"." + payload
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, "jwt.in")
+        sig_path = os.path.join(tmpdir, "jwt.sig")
+        with open(in_path, "wb") as fh:
+            fh.write(signing_input)
+
+        rc, _, err = run_cmd([
+            "gcloud", "kms", "asymmetric-sign",
+            f"--location={location}",
+            f"--keyring={KMS_KEYRING}",
+            f"--key={KMS_KEY}",
+            f"--version={version}",
+            "--digest-algorithm=sha256",
+            f"--input-file={in_path}",
+            f"--signature-file={sig_path}",
+            f"--project={project_id}",
+        ])
+        if rc != 0:
+            # Usually the account running this lacks
+            # cloudkms.cryptoKeyVersions.useToSign on the key. That is a limit of
+            # the credential, not a defect in the project, so it reports as
+            # unchecked -- and there is no manual substitute to offer instead:
+            # whether the bytes in KMS belong to this App is not something anyone
+            # can establish by looking at a console.
+            return "unverified", (
+                f"Could not sign a test JWT with {KMS_KEY} version {version}, so the imported key was "
+                f"never matched against App {app_id}: {err.strip()[:200]}. "
+                f"Signing needs cloudkms.cryptoKeyVersions.useToSign on {KMS_KEY}"
+            )
+        with open(sig_path, "rb") as fh:
+            signature = fh.read()
+
+    # A live installation-grade credential for the App, valid for nine minutes.
+    # It stays in this local and must never reach a detail line, a warning, or
+    # stdout -- including from a future "helpful" addition to an error message.
+    token = (signing_input + b"." + _b64(signature)).decode("ascii")
+    request = urllib.request.Request(
+        GITHUB_APP_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "kube-agents-verify-ci-pool-project",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_net_timeout(timeout)) as response:
+            body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return "failed", (
+                f"GitHub rejected a JWT signed by {KMS_KEY} version {version} (401 Unauthorized). "
+                f"The material in KMS is not a private key of App {app_id}; re-import the correct PEM"
+            )
+        return "unverified", (
+            f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of accepting or rejecting the "
+            f"signature, so the key was never matched against App {app_id}. Re-run when it clears"
+        )
+    except Exception as exc:  # timeout, DNS, blocked egress, untrusted CA, bad body
+        # A python.org build with no CA bundle installed fails here while curl
+        # and gcloud both succeed, so name the fix rather than sending the
+        # operator to look for a firewall that is not there.
+        remedy = (
+            "point SSL_CERT_FILE at a CA bundle (/etc/ssl/cert.pem on macOS) and re-run"
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)
+            else "re-run from somewhere with egress to api.github.com"
+        )
+        return "unverified", (
+            f"Could not reach {GITHUB_APP_URL} to match the KMS key against App {app_id} "
+            f"({type(exc).__name__}: {exc}). Every other minter check passed; {remedy} to close this one"
+        )
+
+    returned_id = body.get("id")
+    if returned_id != app_id:
+        return "failed", (
+            f"The key in KMS authenticated as GitHub App {returned_id}, not {app_id}. A PEM from the "
+            "wrong App was imported; the minter will mint tokens for the wrong installation"
+        )
+    return "ok", f"signature accepted by GitHub as App {app_id} ({body.get('slug') or body.get('name')})"
+
+
+def _chart_pinned_key_version() -> Tuple[Optional[str], str]:
+    """Read githubMinter.kms.keyVersion out of the chart's values.yaml.
+
+    Returns (version, detail); version is None when it cannot be read, and
+    detail then says why. Parsed with a regex rather than a YAML library
+    because this script is deliberately dependency-free -- it is the first
+    thing an operator runs on a fresh machine, and a missing import here
+    would read as an unprovisioned project.
+    """
+    if not _CHART_VALUES.exists():
+        return None, f"missing {_CHART_VALUES}"
+    text = _CHART_VALUES.read_text(encoding="utf-8")
+    block = re.search(r"^githubMinter:\n(?:(?:[ \t].*)?\n)*", text, re.MULTILINE)
+    if not block:
+        return None, "no githubMinter block in the chart values"
+    kms = re.search(r"^  kms:\n(?:(?:    .*)?\n)*", block.group(0), re.MULTILINE)
+    if not kms:
+        return None, "no githubMinter.kms block in the chart values"
+    m = re.search(r"^    keyVersion:\s*[\"']?([^\"'\s#]+)", kms.group(0), re.MULTILINE)
+    if not m:
+        return None, "no githubMinter.kms.keyVersion in the chart values"
+    return m.group(1), ""
+
+
+def check_token_minter(
+    project_id: str, app_id: int = DEFAULT_GITHUB_APP_ID, location: str = "us-central1", probe_app: bool = True
+) -> CheckResult:
+    """Verify the token minter KMS key holds the right App's imported material and the GSA exists.
+
+    `probe_app=False` is the KMS half alone (CHECK_TOKEN_MINTER_KMS): every
+    gcloud read stays, the JWT signed as the App and the call to api.github.com
+    are skipped, so a caller with read-only IAM and no network to GitHub gets
+    a verdict on everything it can see.
+    """
+    details = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    minter_repair = REPAIR_MINTER
+    key = KMS_KEY
+    keyring = KMS_KEYRING
+    enabled_versions: List[str] = []
+    version_states: dict = {}
+    algorithm_ok = False
+    versions_checked = False
+    key_checked = False
+    signer_checked = False
+    sweeper_missing = False
+    gsa_checked = False
+
+    # Which version matters is the chart's business, not KMS's. The pool
+    # deploys through helm: charts/kube-agents/templates/github-minter.yaml
+    # renders cryptoKeyVersions/{{ $m.kms.keyVersion }}, values.yaml pins it,
+    # and hack/ci-deploy.sh's GITHUB_MINTER_ARGS never overrides it -- so the
+    # minter every lease runs signs with that one version and no other. (The
+    # k8s-operator path differs: provision_10_deploy_github_minter.sh resolves
+    # the active version at deploy time, which is where "Minty picks it up"
+    # after a rotation is true. It is not true here.)
+    pinned_version, pin_detail = _chart_pinned_key_version()
+
+    rc, out, err = run_cmd([
+        "gcloud", "kms", "keys", "versions", "list",
+        f"--key={key}",
+        f"--keyring={keyring}",
+        f"--location={location}",
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Cloud KMS key {key} in keyring {keyring} ({location}) not found or error: {err.strip()[:KMS_ERROR_TAIL_CHARS]}",
+            f"Could not list the versions of KMS key {key} in keyring {keyring} ({location}), so whether "
+            "the App PEM has been imported was not checked",
+            details,
+            warnings,
+        ):
+            passed = False
+            findings.append(Finding("token-minter/key", details[-1], minter_repair))
+    else:
+        versions_checked = True
+        try:
+            versions = _load_json(out)
+            # The key existing only proves Terraform ran; the composition creates
+            # it import-only and empty. An ENABLED version is what proves the PEM
+            # was imported, which is the condition EVAL_GITHUB_APP_ID asserts.
+            for v in versions:
+                name = v.get("name", "").rsplit("/", 1)[-1]
+                version_states[name] = v.get("state")
+                if v.get("state") == "ENABLED":
+                    enabled_versions.append(name)
+            if not enabled_versions:
+                passed = False
+                _drift(details, findings, "token-minter/no-enabled-version", f"KMS key {key} has no ENABLED version (PEM import pending via minty)", minter_repair)
+            elif len(enabled_versions) > 1:
+                # Not a failure: every one of them verifies. But only the version
+                # the chart names is ever loaded, so the rest are keys that still
+                # open the door and no longer need to.
+                pin_note = f"only {pinned_version} is deployed" if pinned_version else "only the chart's pinned version is deployed"
+                warnings.append(
+                    f"KMS key {key} has {len(enabled_versions)} ENABLED versions "
+                    f"({', '.join(sorted(enabled_versions))}); {pin_note}, so disable the others"
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing KMS key versions: {exc}")
+
+    # The key being the right shape. A symmetric or wrong-algorithm key would
+    # hold an imported version and report ENABLED just the same, then fail at
+    # the first signature. import_only is what keeps the PEM out of Terraform
+    # state, so losing it is a disclosure regression, not just a config drift.
+    rc, out, err = run_cmd([
+        "gcloud", "kms", "keys", "describe", key,
+        f"--keyring={keyring}",
+        f"--location={location}",
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Failed reading KMS key {key}: {err.strip()[:160]}",
+            f"Could not describe KMS key {key}, so its purpose, algorithm and import-only setting were "
+            "not checked",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        key_checked = True
+        try:
+            key_desc = _load_json(out)
+            purpose = key_desc.get("purpose")
+            algorithm = key_desc.get("versionTemplate", {}).get("algorithm")
+            if purpose != KMS_KEY_PURPOSE:
+                passed = False
+                _drift(details, findings, "token-minter/purpose", f"KMS key {key} purpose is {purpose}, expected {KMS_KEY_PURPOSE}", minter_repair)
+            # Exact, not a substring match on "RSA_SIGN": RS256 means PKCS#1 v1.5
+            # with SHA-256 specifically, so an RSA_SIGN_PSS_* key signs happily
+            # and yields a JWT GitHub cannot verify. Catching it here turns an
+            # opaque 401 from the probe below into a legible message.
+            if algorithm != KMS_KEY_ALGORITHM:
+                passed = False
+                _drift(details, findings, "token-minter/algorithm", f"KMS key {key} algorithm is {algorithm}, expected {KMS_KEY_ALGORITHM}", minter_repair)
+            else:
+                algorithm_ok = True
+            if not key_desc.get("importOnly"):
+                passed = False
+                _drift(
+                    details, findings, "token-minter/import-only",
+                    f"KMS key {key} is not import-only; the App private key could be written from Terraform",
+                    minter_repair,
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing KMS key description: {exc}")
+
+    minter_gsa = f"kubeagents-github-minter-gsa@{project_id}.iam.gserviceaccount.com"
+
+    # Being allowed to ask KMS to sign. Without this the pod reaches the key and
+    # is refused, which looks like a GitHub auth failure rather than an IAM one.
+    rc, out, err = run_cmd([
+        "gcloud", "kms", "keys", "get-iam-policy", key,
+        f"--keyring={keyring}",
+        f"--location={location}",
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Failed reading IAM policy for KMS key {key}: {err.strip()[:160]}",
+            f"Could not read the IAM policy on KMS key {key}, so the minter GSA's and the pull-request "
+            "sweeper's signing rights were not checked",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        signer_checked = True
+        try:
+            signers = set()
+            for b in _load_json(out).get("bindings", []):
+                if b.get("role") == "roles/cloudkms.signerVerifier":
+                    signers.update(b.get("members", []))
+            if f"serviceAccount:{minter_gsa}" not in signers:
+                passed = False
+                _drift(
+                    details, findings, "token-minter/signer/minter",
+                    f"{minter_gsa} lacks roles/cloudkms.signerVerifier on {key}; it cannot sign a JWT",
+                    f"gcloud kms keys add-iam-policy-binding {key} --keyring={keyring} --location={location} "
+                    f'--project={project_id} --member="serviceAccount:{minter_gsa}" --role=roles/cloudkms.signerVerifier',
+                )
+            if PULL_SWEEP_MEMBER not in signers:
+                passed = False
+                sweeper_missing = True
+                _drift(
+                    details, findings, "token-minter/signer/pull-sweeper",
+                    f"{PULL_SWEEP_MEMBER} lacks roles/cloudkms.signerVerifier on {key}; the pull-request "
+                    "sweep cannot sign here. Grant it without re-running the provisioning script: "
+                    f"gcloud kms keys add-iam-policy-binding {key} --keyring={keyring} --location={location} "
+                    f"--project={project_id} --member={PULL_SWEEP_MEMBER} --role=roles/cloudkms.signerVerifier",
+                    f"gcloud kms keys add-iam-policy-binding {key} --keyring={keyring} --location={location} "
+                    f"--project={project_id} --member={PULL_SWEEP_MEMBER} --role=roles/cloudkms.signerVerifier",
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing KMS key IAM policy: {exc}")
+
+    # The pod being allowed to act as the minter GSA. Note this is a different
+    # KSA from the platform agent's, in the same namespace -- checking only the
+    # platform agent's binding would miss a minter that can never authenticate.
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        minter_gsa,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing Minter GSA or failed reading policy for {minter_gsa}",
+            f"Could not read the IAM policy on {minter_gsa}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+            findings.append(Finding("token-minter/minter-gsa/absent", details[-1], REPAIR_MINTER))
+    else:
+        gsa_checked = True
+        try:
+            expected_member = f"serviceAccount:{project_id}.svc.id.goog[{MINTER_KSA}]"
+            bound = any(
+                b.get("role") == "roles/iam.workloadIdentityUser" and expected_member in b.get("members", [])
+                for b in _load_json(out).get("bindings", [])
+            )
+            if not bound:
+                passed = False
+                _drift(
+                    details, findings, "token-minter/minter-gsa/workload-identity",
+                    f"Workload Identity binding missing on {minter_gsa} for {expected_member}",
+                    _account_binding(project_id, minter_gsa, expected_member, "roles/iam.workloadIdentityUser"),
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing Minter GSA policy: {exc}")
+
+    # The version the chart deploys is the one that has to work, so it is the
+    # one probed. Checking the highest ENABLED version instead is the failure
+    # this replaced: rotate as token-minter.md describes -- import v2, disable
+    # v1 -- and that probe greens on v2 while every lease deploys a minter
+    # pinned to the disabled v1, whose readiness probe never succeeds and
+    # whose helm --wait kills the run at fifteen minutes without naming a key.
+    probe_version: Optional[str] = None
+    if pinned_version is None:
+        if enabled_versions:
+            probe_version = sorted(enabled_versions, key=lambda v: int(v) if v.isdigit() else 0)[-1]
+        probed = (
+            f"probed version {probe_version or 'none'} instead"
+            if probe_app
+            else "the key was checked with no version confirmed"
+        )
+        warnings.append(Unread(
+            f"Could not read githubMinter.kms.keyVersion from the chart ({pin_detail}), so the version this "
+            f"project's minter will sign with is unconfirmed; {probed}. "
+            "Confirm the chart's pin names an ENABLED version before registering."
+        ))
+    elif not version_states:
+        pass  # The versions list already failed; a second message restates it.
+    elif pinned_version not in version_states:
+        passed = False
+        _drift(
+            details, findings, "token-minter/pinned-version/missing",
+            f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, which does not exist "
+            f"(present: {', '.join(sorted(version_states)) or 'none'}). Every lease would deploy a minter "
+            "that cannot sign. The pin is read from this checkout, so try `git fetch && git rebase` "
+            "first -- a stale tree reports a version main has already moved past.",
+            REPAIR_MINTER_ROTATION,
+        )
+    elif version_states[pinned_version] != "ENABLED":
+        passed = False
+        state = version_states[pinned_version]
+        # One id whatever the state: an id that moved with it would end an
+        # incident and re-file it as the version went from disabled to
+        # scheduled for destruction to destroyed.
+        _drift(
+            details, findings, "token-minter/pinned-version/not-enabled",
+            f"The chart deploys cryptoKeyVersion {pinned_version} of {key}, whose state is "
+            f"{version_states[pinned_version]}. Every lease would deploy a minter that cannot sign, and "
+            "helm --wait would kill the run at its fifteen-minute timeout without naming the key. "
+            "The pin is read from this checkout, so try `git fetch && git rebase` first -- a stale "
+            "tree reports a version main has already moved past.",
+            f"gcloud kms keys versions enable {pinned_version} --key={key} --keyring={keyring} --location={location} --project={project_id}"
+            if state == KMS_VERSION_DISABLED
+            else REPAIR_MINTER_ROTATION,
+        )
+    else:
+        probe_version = pinned_version
+
+    # Last, and only once the key is known to exist, hold enabled material, and
+    # carry the right algorithm -- a probe against a key already known to be
+    # wrong costs a network round trip to restate what was just reported.
+    probe = ""
+    if probe_app and probe_version and algorithm_ok:
+        status, message = _probe_github_app_identity(project_id, location, probe_version, app_id)
+        if status == "failed":
+            passed = False
+            _drift(details, findings, "token-minter/app-identity", message, minter_repair)
+        elif status == "unverified":
+            # The probe did not run or did not answer: a read that did not
+            # happen, so the report lists it under `unread`.
+            warnings.append(Unread(message))
+        else:
+            probe = f", {message}"
+
+    # The summary must not assert an item a warning above retracts.
+    partial = _partial_summary(
+        [
+            ("the imported key versions", versions_checked),
+            ("the key's purpose, algorithm and import-only setting", key_checked),
+            ("the minter GSA's and the sweeper's signing rights", signer_checked),
+            ("the minter GSA's Workload Identity binding", gsa_checked),
+        ]
+    )
+    signing_version = f" v{probe_version}" if probe_version else ""
+    if not passed and sweeper_missing and len(details) == 1:
+        # The one failed item is the grant a project registered before the
+        # sweep existed never got (5.5). The headline says so, or an operator
+        # scanning it goes looking at the PEM -- and it calls the minter whole
+        # only when every read that would say so happened; a denied read
+        # leaves `details` empty and `partial` naming what went unchecked.
+        sweeper = "the pull-request sweeper lacks signer on the key (the detail has the one-off grant)"
+        if not partial:
+            message = f"Minter provisioned; {sweeper}"
+        else:
+            # The signer row is the minter's alone here: the sweeper's half of
+            # it is the failure, and cannot sit in the "verified" list.
+            rest = _partial_summary(
+                [
+                    ("the imported key versions", versions_checked),
+                    ("the key's purpose, algorithm and import-only setting", key_checked),
+                    ("the minter GSA's signing rights", signer_checked),
+                    ("the minter GSA's Workload Identity binding", gsa_checked),
+                ]
+            )
+            message = f"{sweeper[0].upper()}{sweeper[1:]}; {rest}"
+    elif not passed:
+        message = "Token minter not provisioned / PEM key missing or wrong"
+    elif partial:
+        message = partial
+    else:
+        message = (
+            f"Import-only signing key{signing_version} (the version the chart deploys) ENABLED, "
+            f"minter GSA can sign and be impersonated{probe}"
+        )
+
+    return CheckResult(
+        "Token Minter KMS & GSA",
+        passed,
+        message,
+        details=details,
+        warnings=warnings,
+        findings=findings,
+        read=versions_checked or key_checked or signer_checked or gsa_checked,
+    )
+
+
+def run_checks(
+    project_id: str,
+    app_id: int = DEFAULT_GITHUB_APP_ID,
+    location: str = "us-central1",
+    repo_membership_confirmed: bool = False,
+    checks: Optional[List[str]] = None,
+    deadline: Optional[float] = None,
+) -> List[CheckResult]:
+    """Run the checks named in `checks` (DEFAULT_CHECKS by default) and return
+    the results in CHECK_IDS order, each tagged with its id. Prints nothing,
+    so tests can assert on objects. `deadline` is a time.monotonic() value:
+    a check not started by then is recorded as not checked (an Unread), so a
+    caller with its own ceiling keeps every verdict the run did reach.
+    """
+    wanted = list(checks) if checks is not None else list(DEFAULT_CHECKS)
+    results: List[CheckResult] = []
+
+    def add(check_id: str, result: CheckResult) -> None:
+        if check_id in wanted:
+            result.check_id = check_id
+            results.append(result)
+
+    def due() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
+    def run(check_id: str, thunk) -> None:
+        if check_id not in wanted:
+            return
+        if due():
+            add(check_id, CheckResult(CHECK_DISPLAY_NAMES.get(check_id, check_id), True, "Not checked", warnings=[Unread(DEADLINE_PASSED)], read=False))
+        else:
+            add(check_id, thunk())
+
+    run(CHECK_CODEBASE_MAPPING, lambda: check_codebase_mapping(project_id))
+
+    dependents = (
+        (CHECK_IAM, "Service Accounts & IAM Grants", lambda number: check_iam_and_service_accounts(project_id, number)),
+        (CHECK_ARTIFACT_REGISTRY, "Artifact Registry Repository", lambda number: check_artifact_registry(project_id, number, location)),
+        (CHECK_WARM_CACHE, "Warm Cache Readers", lambda number: check_warm_cache_readers(project_id, number)),
+    )
+    needs_project_number = {check_id for check_id, _, _ in dependents}.intersection(wanted)
+    if CHECK_PROJECT_AND_APIS in wanted or needs_project_number:
+        if due():
+            for check_id in (CHECK_PROJECT_AND_APIS, *needs_project_number):
+                run(check_id, lambda: None)
+        else:
+            project_number, proj_check = check_project_and_apis(project_id)
+            add(CHECK_PROJECT_AND_APIS, proj_check)
+            # The reason the project read failed travels with the dependents,
+            # so a skip names its cause on its own line -- in a --checks subset
+            # without the project check, and in the scan's document, whose
+            # blind-scan reason is the commonest not-checked line.
+            why = proj_check.message
+            if project_number:
+                for check_id, _, thunk in dependents:
+                    run(check_id, lambda thunk=thunk: thunk(project_number))
+            elif proj_check.passed:
+                # The project number is missing because reading the project was refused,
+                # not because the project is wrong. Failing the two checks that need it
+                # would put the conflation straight back, one level up.
+                cause = next(iter(proj_check.warnings), "")
+                for check_id, skipped, _ in dependents:
+                    add(check_id, CheckResult(
+                        skipped,
+                        True,
+                        "Not checked",
+                        warnings=[Unread(f"Not checked: {project_id}'s project number could not be read" + (f" ({cause})" if cause else ""))],
+                        read=False,
+                    ))
+            else:
+                # The project read failed outright (a describe error that is
+                # neither a refusal nor a transient): the dependents read
+                # nothing, and say so, rather than failing on a read they
+                # never made. The project check itself carries the failure,
+                # and is reported even when it was not selected: a subset run
+                # against a project that does not exist is a failure, not a
+                # run with something left to confirm by hand.
+                if CHECK_PROJECT_AND_APIS not in wanted:
+                    proj_check.check_id = CHECK_PROJECT_AND_APIS
+                    results.append(proj_check)
+                for check_id, skipped, _ in dependents:
+                    add(check_id, CheckResult(
+                        skipped,
+                        True,
+                        "Not checked",
+                        warnings=[Unread(f"Not checked: {project_id}'s project number could not be determined" + (f" ({why})" if why else ""))],
+                        read=False,
+                    ))
+
+    run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
+    run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))
+    run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
+    run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
+    if CHECK_TOKEN_MINTER in wanted:
+        run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
+    elif CHECK_TOKEN_MINTER_KMS in wanted:
+        run(CHECK_TOKEN_MINTER_KMS, lambda: check_token_minter(project_id, app_id, location, probe_app=False))
+    return sorted(results, key=lambda result: CHECK_IDS.index(result.check_id))
+
+
+def _finite_seconds(text: str) -> float:
+    """argparse type: a finite, non-negative number of seconds. `float` alone
+    admits nan and inf, which int() then raises on at the first command."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds")
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite, non-negative number of seconds")
+    return value
+
+
+def parse_checks(spec: Optional[str]) -> Optional[List[str]]:
+    """`--checks a,b` as a list in CHECK_IDS order; None means every check.
+    An unknown id raises ValueError naming the ones there are."""
+    if spec is None:
+        return None
+    asked = [item.strip() for item in spec.split(",") if item.strip()]
+    unknown = sorted(set(asked) - set(CHECK_IDS))
+    if unknown:
+        raise ValueError(f"unknown check(s) {', '.join(unknown)}; the checks are {', '.join(CHECK_IDS)}")
+    if not asked:
+        raise ValueError(f"--checks names no check; the checks are {', '.join(CHECK_IDS)}")
+    if CHECK_TOKEN_MINTER in asked and CHECK_TOKEN_MINTER_KMS in asked:
+        raise ValueError(f"{CHECK_TOKEN_MINTER} covers {CHECK_TOKEN_MINTER_KMS}; name one of them")
+    return [check_id for check_id in CHECK_IDS if check_id in asked]
+
+
+def report_status(check: CheckResult) -> str:
+    """pass | fail | unchecked for --report. `unchecked` is a check that read
+    nothing about its item this run -- every read refused, or skipped for a
+    project number that could not be read -- as opposed to one that read
+    some of it and could not read the rest, which is a pass with warnings."""
+    if not check.passed:
+        return REPORT_STATUS_FAIL
+    if check.read is False or (check.read is None and check.message.startswith("Not checked")):
+        return REPORT_STATUS_UNCHECKED
+    return REPORT_STATUS_PASS
+
+
+def report_document(project_id: str, checks: List[CheckResult], now: Optional[datetime] = None) -> dict:
+    """What --report writes: one record per check, by id, with its findings.
+
+    A failing check that named no finding of its own gets one under
+    REPORT_FINDING_FAILED carrying its message and details, so the document
+    never says less than the console did.
+    """
+    out: Dict[str, dict] = {}
+    for check in checks:
+        check_id = check.check_id or check.name
+        status = report_status(check)
+        findings = [finding.as_dict() for finding in check.findings]
+        if status == REPORT_STATUS_FAIL and not findings:
+            # A failing check that named no finding still reports one. A
+            # failing detail beside named findings is not matched against
+            # them: the checks write aggregate details and per-item findings,
+            # so a text match would file a `failed` beside every real drift.
+            observed = "; ".join([check.message, *check.details]).strip("; ")
+            findings = [Finding(f"{check_id}/{REPORT_FINDING_FAILED}", observed).as_dict()]
+        out[check_id] = {
+            REPORT_KEY_NAME: check.name,
+            REPORT_KEY_STATUS: status,
+            REPORT_KEY_MESSAGE: check.message,
+            REPORT_KEY_DETAILS: list(check.details),
+            REPORT_KEY_WARNINGS: list(check.warnings),
+            REPORT_KEY_UNREAD: [w for w in check.warnings if isinstance(w, Unread)],
+            REPORT_KEY_FINDINGS: findings,
+        }
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "project": project_id,
+        "generated_at": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(timespec="seconds"),
+        "checks": out,
+    }
+
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+# Distinct from both: nothing was found wrong, but something outage-causing
+# could not be read. Registering on the strength of that is the mistake this
+# script exists to prevent, so it does not get to share an exit code with a
+# clean run.
+EXIT_UNVERIFIED = 2
+# argparse exits 2 on a bad command line, which would be indistinguishable from
+# a run that completed with unverified items -- a typo in a flag would read as
+# "nothing failed, go confirm these by hand". 64 is EX_USAGE from sysexits.h.
+#
+# Python itself also exits 2 when the script path does not exist, and that one
+# cannot be fixed from in here: it happens before this file is read. A caller
+# that must tell the two apart has to check the path exists first.
+EXIT_USAGE = 64
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser that exits EXIT_USAGE rather than argparse's own 2."""
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+
+def report(project_id: str, checks: List[CheckResult], selected: Optional[Sequence[str]] = None) -> int:
+    """The console verdict. `selected` is the --checks selection when one was
+    given: a subset's banner names what ran and says it is not the whole."""
+    print("\n" + "=" * 80)
+    print(f" Pre-flight Onboarding Verification: {project_id}")
+    print("=" * 80 + "\n")
+
+    all_passed = True
+    unverified = 0
+    for c in checks:
+        icon = "✓" if c.passed else "❌"
+        if c.passed and c.warnings:
+            icon = "?"
+        print(f"[{icon}] {c.name}: {c.message}")
+        if not c.passed:
+            all_passed = False
+            for d in c.details:
+                print(f"    - {d}")
+        for w in c.warnings:
+            unverified += 1
+            print(f"    ? {w}")
+
+    subset = sorted(selected) if selected is not None and set(selected) != set(DEFAULT_CHECKS) else None
+    print("\n" + "-" * 80)
+    if not all_passed:
+        print(f"PRE-FLIGHT CHECK FAILED. Do NOT register {project_id} in Boskos until the above are resolved.")
+        status = EXIT_FAILED
+    elif unverified:
+        if subset:
+            print(
+                f"MANUAL VERIFICATION REQUIRED. Nothing failed among the {len(subset)} selected check(s) "
+                f"({', '.join(subset)}), but {unverified} item(s) could not be checked automatically. {SUBSET_NOTE}"
+            )
+        else:
+            print(
+                f"MANUAL VERIFICATION REQUIRED. Nothing failed, but {unverified} item(s) could not be checked "
+                f"automatically. Confirm each one above before registering {project_id} in Boskos."
+            )
+        status = EXIT_UNVERIFIED
+    else:
+        if subset:
+            print(f"ALL {len(subset)} SELECTED CHECK(S) PASSED ({', '.join(subset)}) on {project_id}. {SUBSET_NOTE}")
+        else:
+            print(f"ALL CHECKS PASSED. Project {project_id} is provisioned as the prerequisites describe.")
+        status = EXIT_OK
+    print("-" * 80 + "\n")
+    return status
+
+
+def check_toolchain(needs_gh: bool = True, needs_gcloud: bool = True) -> List[str]:
+    """Reasons the checks below cannot be trusted, before any of them run.
+
+    `needs_gh` is whether a selected check reads GitHub (GITHUB_CHECKS): the
+    pool-state scan's identity has no `gh` credential and asks for none of
+    those checks, so demanding one would stop it at the door for nothing.
+    `needs_gcloud` is the same for GCP (GCP_CHECKS): `--checks
+    codebase_mapping` alone reads no GCP and runs without a credential.
+
+    A missing binary or no credential at all would leave every check reporting
+    its resource as unreadable, which is exit 2 and a screenful of warnings
+    naming resources when the real answer is one line about the toolchain. Catch
+    those here and say that instead.
+
+    Two cases get past this and are caught per-check by _record_unreadable(),
+    which files them the same way for the same reason. A credential that is
+    present and holds no IAM on the project being verified is invisible here by
+    definition. So is one that has expired: `gcloud auth list` reads the local
+    credential store without contacting the network, so a revoked refresh token
+    still prints as ACTIVE and only the calls that follow fail.
+    """
+    blockers = []
+    if needs_gcloud:
+        # An empty active-account list is exit 0 with no output, not an error, so
+        # the logged-out case has to be read off stdout rather than the return code.
+        rc, out, err = run_cmd(["gcloud", "auth", "list", "--format=value(account)", "--filter=status:ACTIVE"])
+        if rc == 127:
+            blockers.append("gcloud is not on PATH; every GCP check would report its resource as absent")
+        elif rc == TIMED_OUT_RC and DEADLINE_CUT in err:
+            # Cut by the run's deadline; a probe that ran out its own ceiling
+            # falls through and is named as the stall it was.
+            blockers.append(f"{DEADLINE_PASSED_TOOLCHAIN} ({err.strip()})")
+        elif rc != 0:
+            blockers.append(f"gcloud auth list failed: {err.strip()}")
+        elif not out.strip():
+            blockers.append("gcloud has no active credential; every GCP check would report its resource as absent")
+
+    if needs_gh:
+        rc, _, err = run_cmd(["gh", "auth", "status"])
+        if rc == 127:
+            blockers.append("gh is not on PATH; every GitHub check would report its resource as absent")
+        elif rc == TIMED_OUT_RC and DEADLINE_CUT in err:
+            blockers.append(f"{DEADLINE_PASSED_TOOLCHAIN} ({err.strip()})")
+        elif rc != 0:
+            blockers.append(f"gh is not authenticated: {err.strip()}")
+    return blockers
+
+
+def verify_project(
+    project_id: str,
+    app_id: int = DEFAULT_GITHUB_APP_ID,
+    location: str = "us-central1",
+    repo_membership_confirmed: bool = False,
+    checks: Optional[List[str]] = None,
+    report_path: Optional[Path] = None,
+    deadline_seconds: Optional[float] = None,
+) -> int:
+    global _RUN_DEADLINE
+    selected = checks if checks is not None else list(DEFAULT_CHECKS)
+    deadline = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    _RUN_DEADLINE = deadline
+    blockers = check_toolchain(
+        needs_gh=bool(GITHUB_CHECKS.intersection(selected)), needs_gcloud=bool(GCP_CHECKS.intersection(selected))
+    )
+    if blockers:
+        print("\n" + "=" * 80)
+        print(f" Pre-flight Onboarding Verification: {project_id}")
+        print("=" * 80 + "\n")
+        for b in blockers:
+            print(f"[?] {b}")
+        print(
+            f"\nMANUAL VERIFICATION REQUIRED. Nothing was checked, so nothing is known "
+            f"about {project_id}. Fix the above and re-run.\n"
+        )
+        if report_path is not None:
+            # Nothing ran, so nothing is reported: a document with no checks
+            # is the scan's "not checked", with the blockers as the reason --
+            # reads that did not happen, so the report lists them under unread.
+            results = [
+                CheckResult(CHECK_DISPLAY_NAMES.get(check_id, check_id), True, "Not checked", warnings=[Unread(b) for b in blockers], read=False)
+                for check_id in selected
+            ]
+            for result, check_id in zip(results, selected):
+                result.check_id = check_id
+            _write_report(report_path, project_id, results)
+        return EXIT_UNVERIFIED
+    results = run_checks(project_id, app_id, location, repo_membership_confirmed, checks, deadline)
+    status = report(project_id, results, selected=checks)
+    if report_path is not None:
+        # After the console verdict: an unwritable path must not throw a
+        # completed run away or turn its exit code into "do not register".
+        _write_report(report_path, project_id, results)
+    return status
+
+
+def _write_report(report_path: Path, project_id: str, results: List[CheckResult]) -> None:
+    try:
+        report_path.write_text(json.dumps(report_document(project_id, results), indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"\n[?] --report {report_path} could not be written ({exc}); the verdict above stands", file=sys.stderr)
+
+
+def main() -> int:
+    parser = _Parser(
+        description="Verify CI pool project prerequisites before Boskos registration.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit codes:\n"
+            "  0  every prerequisite checked and passed\n"
+            "  1  a prerequisite failed -- do not register this project\n"
+            "  2  nothing failed, but something could not be checked automatically\n"
+            " 64  bad command line. Note that Python exits 2, not 64, when the\n"
+            "     script path itself does not exist -- that happens before this\n"
+            "     file runs, so a caller must check the path separately.\n"
+        ),
+    )
+    parser.add_argument("--project-id", required=True, help="GCP project ID to verify (e.g. kube-agents-evals-3)")
+    parser.add_argument("--app-id", type=int, default=DEFAULT_GITHUB_APP_ID, help="GitHub App ID (default: 4675512)")
+    parser.add_argument("--location", default="us-central1", help="GCP region/location (default: us-central1)")
+    parser.add_argument(
+        "--confirmed-repo-in-app-installation",
+        action="store_true",
+        help=(
+            "Record that you have opened the GitHub App's installation settings page on github.com and "
+            "seen gke-agentic/<project>-infra in its repository list. This script cannot read that list "
+            "itself -- doing so needs a token authorized to the App, which an operator PAT cannot be -- so "
+            "without this flag that one item reports as unverified and the run exits 2. Pass it only after "
+            "actually looking; the URL is printed in the warning. The summary still marks the item "
+            "operator-confirmed rather than machine-checked."
+        ),
+    )
+    parser.add_argument(
+        "--checks",
+        help=(
+            "Comma-separated check ids to run instead of every check: "
+            + ", ".join(CHECK_IDS)
+            + ". The hourly pool-state scan asks for "
+            + ",".join(POOL_STATE_CHECKS)
+            + "."
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help=(
+            "Also write the results as JSON here: one record per check, by id, with a stable id, "
+            "what was observed and the repair for every finding (docs/ci-health.md, The pool-state scan). "
+            "The console output is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=_finite_seconds,
+        help=(
+            "Stop starting checks this many seconds in; a check not started by then is reported as not "
+            "checked. For a caller with its own ceiling (the pool-state scan), so one hung read does not "
+            "cost the report every verdict the run did reach."
+        ),
+    )
+    args = parser.parse_args()
+    try:
+        checks = parse_checks(args.checks)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return verify_project(
+        args.project_id, args.app_id, args.location, args.confirmed_repo_in_app_installation, checks, args.report,
+        args.deadline_seconds,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

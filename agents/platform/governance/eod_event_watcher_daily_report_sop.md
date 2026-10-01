@@ -17,8 +17,8 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every enabled entry on the roster does bar
-`gcp-networking-fabric-audit`. That routes the report through the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
+bar the two on `"all"`. That routes the report through the
 Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
 [relay design](../../../docs/designs/cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
@@ -37,8 +37,23 @@ sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target alwa
 relay is always attempted. The home channel is needed one hop later, where the Session KV server
 posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
 chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
-there is none the send fails and the roster entry records
-`last_delivery_error: "composed but not delivered to google_chat"`. The value is set either by the
+there is none the send fails and the roster entry records a `last_delivery_error` that nests three
+layers of wrapping — the relay's own words inside the route's 502 detail inside the plugin's report
+of it, so grep for a fragment rather than the whole string:
+
+```
+chat relay answered HTTP 502: chat relay failed: composed but not delivered to google_chat
+```
+
+On an install with more than one chat platform enabled the send fans out to all of them, so one
+platform missing a home channel costs the recap only that audience. The run is then a delivery, and
+the entry records:
+
+```
+chat relay partial: the report did not reach slack. Delivered — do not re-run to resend.
+```
+
+The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
 `GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
@@ -64,7 +79,11 @@ in UTC so it agrees with the clock the scheduler ticked on.
 Every number comes from one table: `intercepted_events` in `session_kv.db`
 (`/var/lib/kube-agents/session/session_kv.db`), written by the `session_kv_server.py` REST bridge on
 port 8699. It holds one row per event the watcher forwarded, with `notified` recording whether that
-event was announced in chat. [`../docs/session_management.md`](../docs/session_management.md) is
+event was announced in chat. It has a second writer — the drift detector's `gitops-drift` injects
+land in the same table under `reason = 'OutOfBandChange'` — and the generator excludes those rows
+before it counts anything, so every number below is still the watcher's alone. That exclusion is
+load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
+drift record is not an event the watcher forwarded. [`../docs/session_management.md`](../docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage

@@ -98,8 +98,9 @@ flowchart TB
 > On the event-triage path the row is written by the delivery itself: the kanban notifier posts the
 > completed card's report into the thread and keys it to that thread in the same step
 > (`deploy/docker/patches/kanban_notifier.py`). It decides from the report rather than from the card —
-> a `What to do` heading with a lettered option under it — because nothing in the subscription row still
-> says the card came from event triage by the time the notifier reads it.
+> a `What to do` heading with either a lettered option or the `To authorize:` call to action under it —
+> because nothing in the subscription row still says the card came from event triage by the time the
+> notifier reads it.
 
 ## What qualifies as a domain
 
@@ -149,8 +150,12 @@ incident rather than forty.
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
 
-> **Honest state:** the envelope is still k8s-shaped — `reason`, `namespace`, `kind_of_object`, `name`,
-> `message`. Generalizing it is part of the work of landing the second source, not a box already ticked.
+> **Honest state:** the event envelope is still k8s-shaped — `reason`, `namespace`, `kind_of_object`,
+> `name`, `message`. The second source did not generalize it; it landed alongside it. The drift
+> detector sends its own `kind: gitops-drift` envelope with its own fields, and the inject route
+> dispatches on `kind` rather than reconciling the two. So the pattern a third domain now follows is
+> "add a kind and a branch", which works and does not scale — a shared envelope is still owed, and is
+> now a refactor of two producers rather than a design decision about one.
 
 ---
 
@@ -172,12 +177,12 @@ CREATE TABLE session_metadata (        CREATE TABLE incidents (
 **`session_metadata`** maps a session to its chat thread, so a reply in that thread routes back to the
 same session instead of starting a new one.
 
-**`incidents`** keeps the first triage report per thread — the one carrying the fix options.
+**`incidents`** keeps the first triage report per thread — the one carrying the proposed fix.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
 knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
 a Platform Agent posts into a thread; and the kanban notifier, when it delivers a card whose result carries
-remediation options into one. Only the last of those is on the event-triage path, and it is the only one
+a fix a reply could authorise into one. Only the last of those is on the event-triage path, and it is the only one
 that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
 event-triage card from an ordinary one by the time it runs, so the artifact is the test.
 
@@ -256,6 +261,13 @@ Format the report you pass to `kanban_complete`'s `result` exactly like this —
 - **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix,
   or name one directly with **'apply Option A'** / **'apply Option B'**.
 
+The prompt says separately that with exactly one option the section is unlettered instead — a
+lettered label asks the reader to pick from a list of one — so that `What to do` reads:
+
+## What to do
+- **Proposed fix (<Action Title>):** <1-sentence GitOps fix>
+- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.
+
 **Who acts on this:**
 A human reads your options and the agent that holds the GitOps write path opens the Pull
 Request ... the fix ships as a Pull Request against the GitOps repository, and nothing is
@@ -291,7 +303,9 @@ written to the live cluster directly.
   written" from "the user replied in the wrong thread". The prompt also tells the agent that this
   bullet is the call to action rather than another
   option, because it sits in the same list as Option A and Option B and gets numbered alongside them
-  otherwise.
+  otherwise. The bullet carries a second job on the single-option shape: with no lettered option
+  under the heading, it is what `kanban_notifier.actionable_report` recognises a report by, so
+  reword it and those reports stop earning the row they invite a reply to.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
@@ -310,8 +324,11 @@ Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 **So a new domain supplies two things: a skill and a judgment prompt.** The skill is _how to investigate_;
 the prompt is _what to decide and how to say it_.
 
-> **Honest state:** `_build_agent_query()` is hardcoded k8s-event-shaped, so today a second domain means
-> a second query builder. Making it pluggable is the same piece of work as generalizing the envelope.
+> **Honest state:** this is what the second domain actually cost. `_build_agent_query()` is hardcoded
+> k8s-event-shaped, so drift got a second query builder and a second card body rather than a plugged-in
+> prompt, dispatched on `kind` at the top of the function. Making it pluggable is still the same piece
+> of work as generalizing the envelope, and there are now two implementations to fold in rather than
+> one to parameterize.
 
 ---
 
@@ -359,9 +376,14 @@ than a live write, a new domain inherits reviewability and rollback for free.
 
 The GKE-events path is live end to end:
 
-- **Detection** — `k8s-event-watcher` streams warning events in real time (`OOMKilled`,
-  `CrashLoopBackOff`, `FailedScheduling`, `Evicted`, ~12 reasons total), with namespace deny/allow rules
-  and a flapping guard.
+- **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
+  rules and a flapping guard. The deployed watcher gates on seven reasons, which
+  `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
+  `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
+  `OOMKilled`. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  `FailedScheduling` and `Evicted` — applies only when `--reason` is left unset, so it does not
+  describe an install. `Decide` matches the wire reason exactly and before canonicalization, so a
+  reason absent from that list produces nothing at all: no session, no card, no report.
 - **Dedup** — a 24h rolling window collapses repeats and related reasons into one incident.
 - **Session + routing** — one session per incident, SQLite-backed, posted to the right chat thread and
   recorded with the platform that thread lives on, with the triage report stored for follow-up replies.
@@ -407,6 +429,18 @@ optional enrichment, never a prerequisite. It has a full design doc and a comple
 `managedFields` gives field-level ownership, the audit log gives the principal, and the two-signal join
 separates a human out-of-band change from CI and from controller churn (~99% noise reduction with two
 static filters).
+
+The adapter is now built end to end — ingestion, classification, the `managedFields` join across
+every cluster the Platform Agent has onboarded, and the inject itself — and the daemon routes the
+kind to its own chat alert and its own triage card. The agent images now carry the detector and the
+credential proxy's entrypoint starts it, so what an install still needs is
+`spec.harness.driftDetector.enabled` set on its `PlatformAgent` and the `drift-pubsub` Terraform
+module applied. Only the first is a start gate: without it the detector ships and does not run,
+while enabling it without the module gives a detector that runs and retries a pull that cannot
+succeed. Either way no drift is detected. The provisioning is a flag:
+`terraform/examples/full-install` instantiates the module when `enable_drift_pubsub` is set. The CR
+field is the half it leaves alone, and reaches the chart through `extra_helm_values`, which the
+installer front doors do not expose — an install.sh install sets it on the `PlatformAgent` itself.
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously

@@ -20,7 +20,7 @@ model:
   provider: custom
   model: model-default
   default: model-default
-  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
 # MCP Servers configuration. Read-only diagnostics surface only.
@@ -36,10 +36,17 @@ mcp_servers:
   # Cluster-agent kanban workers are fresh processes per card and were paying
   # both proxy spawns at boot whether or not the card touched an MCP tool. See
   # the fuller note in agents/platform/config.yaml.
+  #
+  # `--header User-Agent: …` names this product, the build it came from and its
+  # execution mode, so the API team serving the endpoint can attribute the traffic;
+  # deploy/shared/defaults/config.yaml carries the full rationale. The string is
+  # the same one the Platform Agent sends, character for character.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
       - "https://developerknowledge.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30
@@ -48,6 +55,8 @@ mcp_servers:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30

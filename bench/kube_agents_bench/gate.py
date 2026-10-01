@@ -1,0 +1,1118 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""``bench-gate``: the presubmit's verdict, moved out of the shell.
+
+Three subcommands, one per side of the loop. ``bench-gate case`` grades one
+task's repetitions and writes a JSON hand-off; ``bench-gate suite`` reads those
+hand-offs and decides the job's exit status; ``bench-gate record`` turns the
+same hand-offs into appended lines in the baseline store. The split exists
+because the shell loop already knows how to run a task and diff the results
+directory — those are genuinely shell concerns — while the ladder, the collapse
+rule and the aggregate are not, and were previously four inline ``python3 -c``
+heredocs that no test could reach.
+
+THE LOOP CLOSES THROUGH ``record``. Everything the gate compares against comes
+from lines that a run on ``main`` appended, so without a writer the store stays
+empty and the two quality rungs never arm. ``record`` is that writer, and it
+refuses to run where ``PULL_NUMBER`` is set: a pull request may read the
+baseline it is judged against and may never move it.
+
+EXIT CODES. ``case`` exits 0 whenever it produced a verdict, including a
+blocking one: the loop must keep going so the summary covers every task, and
+the blocking flag rides in the JSON. It exits 2 when it could not grade at all
+(an unreadable task file, a bad flag). ``suite`` exits 0 green, 1 red, and 2
+when the run could not be evaluated: an admitted case lost every repetition
+to infrastructure, or every case did, so the run cannot certify green and
+has no finding against the change either. That is the same code ``case``
+uses for "could not grade", and for the same reason -- could not check is
+not a pass -- and it is distinct from 1 so the shell, the artifact and the
+dashboards can say "rerun when the environment is healthy" instead of
+"debug the change". ``suite`` also exits 1 on what it cannot read -- a case
+result the loop never wrote, a store that will not parse -- because those
+are the job's failures, not the environment's, and must not read as weather.
+``record`` exits 0 unless it was asked to write somewhere it cannot — it is
+bookkeeping, and bookkeeping must never be the reason a merge to main reds.
+
+ONE RUN, SEVERAL CALLS. Since the shell grades each case inside its fan-out,
+the moment the case's last repetition finishes, ``record`` is called once per
+case during the run and once more after it for whatever the fan-out left. The
+``--recorded-manifest`` file is what keeps that idempotent: every append is
+noted there as (case, version key), and a later call that names the same pair
+skips it and says so, so a case recorded in a lane is never appended again by
+the pass after the fan-out. ``--lines-out`` appends for the same reason. And a
+run the Prow deadline ends before its suite step gets a table anyway: the
+shell's EXIT trap runs ``suite --partial NOTE`` over the cases graded by then,
+which banners the markdown and marks the JSON ``partial: true`` so nothing
+downstream reads it as the run's verdict: hack/ci-eval-rc.sh's driver does
+not let a partial JSON turn an exit 2 into NOT RUN.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import sys
+from collections.abc import Collection, Sequence
+from pathlib import Path
+from typing import Any
+
+from kube_agents_bench.baselines import (
+    ADMITTED_BY_RECORD,
+    RECORD_WOULD_ADMIT,
+    RECORD_WOULD_DEMOTE,
+    AdmissionBar,
+    BaselineRecord,
+    BaselineStore,
+    StoreUnreachable,
+    VersionKey,
+    admission_mode,
+    append_record,
+    load_versions,
+    utc_now,
+)
+from kube_agents_bench.cases import CaseSpecError, load_case
+from kube_agents_bench.scoring import (
+    DEFAULT_AGGREGATE_MARGIN,
+    DEFAULT_AGGREGATE_MIN_SCORED,
+    DEFAULT_CORRECTNESS_FLOOR,
+    DEFAULT_JUDGED_MARGIN,
+    DEFAULT_JUDGED_METRICS,
+    MISSING,
+    NOT_APPLICABLE_PHRASE,
+    REP_OUTCOME_NOT_APPLICABLE,
+    SUITE_OUTCOME_GREEN,
+    SUITE_OUTCOME_NOT_EVALUATED,
+    SUITE_OUTCOME_RED,
+    Rung,
+    grade_case,
+    grade_suite,
+    load_run,
+)
+
+__all__ = ["main"]
+
+_DEFAULT_BASELINE_DIR = "baselines"
+
+#: What ``suite`` exits when the run could not be evaluated (see the module
+#: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
+#: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
+#: verdict. 0 green and 1 red are the literals they have always been.
+SUITE_EXIT_NOT_EVALUATED = 2
+
+#: The build-log word for a case the inject lane could not grade (rung
+#: NOT_GRADED_ON_TRANSPORT): every objective check set aside as not
+#: applicable on the record's transport. Beside PASSED, FAILED, UNSTABLE and
+#: RESOURCE_PREPARATION_FAILED, and distinct from all four on purpose.
+LABEL_NOT_GRADED_ON_TRANSPORT = "NOT_GRADED_ON_TRANSPORT"
+
+#: The verdict headline per outcome, the first thing the markdown says.
+SUITE_HEADLINES = {
+    SUITE_OUTCOME_GREEN: "GREEN",
+    SUITE_OUTCOME_RED: "RED",
+    SUITE_OUTCOME_NOT_EVALUATED: "NOT EVALUATED",
+}
+
+#: Set to one of these (case-insensitive) and the suite aggregate may red the
+#: job. Unset, the aggregate rule still runs and is still reported -- it just
+#: cannot block. Advisory is the default because arming is a Prow-config
+#: decision and not this module's: the margin was measured on 2026-09-29
+#: (:data:`kube_agents_bench.scoring.DEFAULT_AGGREGATE_MARGIN`, and the
+#: sizing note in docs/designs/eval-scorer.md), so the flip is one
+#: ``EVAL_AGGREGATE_ARMED=1`` line in the presubmit's job config, and the
+#: unset default is what a laptop run and every test see.
+AGGREGATE_ARMED_ENV = "EVAL_AGGREGATE_ARMED"
+_TRUTHY = frozenset({"1", "true", "yes"})
+
+#: The verdict table's two evidence columns, shown together once a store is
+#: configured OR the record holds a full window for any case this run --
+#: which covers evidence landed by hand into the checked-in directory with no
+#: store configured. "Admitted by" names who decided; "Record says" is the
+#: store's own verdict on the case (would-admit, would-demote, collecting,
+#: stale, none), which in roster mode is the one thing the verdict says about
+#: the evidence and what a roster edit cites. With an empty store the columns
+#: could only ever read "bootstrap"/"none" and "none" -- exactly what the
+#: BOOTSTRAP_ADMITTED list already says -- and leaving them out then keeps the
+#: store-unset verdict byte-identical to what the presubmit produced before.
+ADMISSION_COLUMN = "Admitted by"
+ADMISSION_CELL_NONE = "none"
+ADMISSION_CELL_RECORD_REFUSED = "record: not admitted"
+#: An admitted case whose hand-off predates `admission_source` (hand-authored).
+ADMISSION_CELL_UNKNOWN = "--"
+RECORD_COLUMN = "Record says"
+#: A hand-off that predates `record_verdict`.
+RECORD_CELL_UNKNOWN = "--"
+
+# How much of the agent's final report the build log quotes per failing
+# repetition. The dashboard's Brief shows it as "what the agent saw" beside
+# the grader's reason; the collector (scripts/eval_dashboard/collect.py)
+# caps at the same figure, so the two never disagree about the cut.
+REPORT_EXCERPT_MAX_CHARS = 300
+
+# What must not reach the log line: C0 and C1 controls and DEL (a captured
+# kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
+# which a JSON `\ud8xx` escape in results.json turns into a str that print()
+# cannot encode -- and an exception there would end `bench-gate case` before
+# its hand-off is written.
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _judged_metrics() -> tuple[str, ...]:
+    """Which judged metrics rung 6 gates on, from the environment."""
+    raw = os.environ.get("EVAL_JUDGED_METRICS", "")
+    parts = tuple(p for p in raw.replace(",", " ").split() if p)
+    return parts or DEFAULT_JUDGED_METRICS
+
+
+def _store_location(args: argparse.Namespace) -> str:
+    """Where the evidence lives. A directory, or ``gs://bucket/prefix``.
+
+    ``--baseline-dir`` still holds VERSIONS.json even when evidence has moved
+    to GCS, and that split is deliberate: the fleet and verifiers integers are
+    hand-declared, reviewed configuration, not measured data, and configuration
+    belongs where it gets reviewed.
+    """
+    return (
+        getattr(args, "baseline_store", None)
+        or os.environ.get("EVAL_BASELINE_STORE")
+        or args.baseline_dir
+    )
+
+
+def _store_configured(args: argparse.Namespace) -> bool:
+    """Whether a store was named, by flag or by ``EVAL_BASELINE_STORE``.
+
+    False means the gate is reading the checked-in default, which ships empty
+    -- the presubmit's state until the Prow config exports the variable.
+    """
+    return bool(
+        getattr(args, "baseline_store", None) or os.environ.get("EVAL_BASELINE_STORE")
+    )
+
+
+def _aggregate_armed() -> bool:
+    """Whether the suite aggregate may red the job. See :data:`AGGREGATE_ARMED_ENV`."""
+    return os.environ.get(AGGREGATE_ARMED_ENV, "").strip().lower() in _TRUTHY
+
+
+def _record_decided(cases: list[dict[str, Any]]) -> bool:
+    """Whether the store held a full window for any case this run.
+
+    In record mode that is a case the record admitted or refused; in roster
+    mode it is a case the record WOULD have, which is just as worth a column.
+    The ``admission_source`` check covers a hand-off written before
+    ``record_verdict`` existed.
+    """
+    return any(
+        c.get("record_verdict") in (RECORD_WOULD_ADMIT, RECORD_WOULD_DEMOTE)
+        or c.get("admission_source") == ADMITTED_BY_RECORD
+        for c in cases
+    )
+
+
+def _load_store(
+    location: str, *, only: Collection[str]
+) -> tuple[BaselineStore | None, str | None, str | None]:
+    """``(store, fatal_reason, degraded_reason)`` -- exactly one of the last two.
+
+    ``only`` is the cases this command will ask about, and it is required
+    rather than optional: on GCS the store costs one listing plus a read per
+    case, the gate loads it once per graded case, and no caller here has ever
+    wanted a case it did not name. The store remembers the scope and raises on
+    a lookup outside it, so narrowing it here cannot quietly turn a passing
+    case into an unscreened one.
+
+    Three failure classes, deliberately not treated alike.
+
+    Bytes that arrived and will not parse are FATAL. A store that will not
+    parse is never read as an empty store: empty means "nothing admitted, the
+    aggregate is advisory", which is a legitimate green, and a corrupt file
+    reaching that state would silently disarm the gate.
+
+    A store that cannot be REACHED degrades to advisory with a banner. The
+    trade is real and worth stating: a sustained outage quietly loosens the
+    gate. It is still the right way round, because a network blip redding every
+    pull request is the exact failure mode that gets a gate switched off, and
+    that is what this whole design exists to avoid.
+    """
+    try:
+        return BaselineStore.load(location, only=only), None, None
+    except ValueError as exc:
+        return None, str(exc), None
+    except StoreUnreachable as exc:
+        # Scoped like the successful read, so an unreachable store answers
+        # "no evidence" for the cases in scope and still refuses the rest.
+        return BaselineStore({}, scope=only), None, f"{location} unreachable: {exc}"
+
+
+def _bootstrap_admitted() -> frozenset[str]:
+    """Cases that keep blocking through the transition, from the environment.
+
+    Whitespace- or comma-separated, so the shell can write either.
+    """
+    raw = os.environ.get("BOOTSTRAP_ADMITTED", "")
+    return frozenset(part for part in raw.replace(",", " ").split() if part)
+
+
+def _label(case: dict[str, Any]) -> str:
+    """The build-log word for a case verdict.
+
+    Four labels, not two, because the rate rules create a state a two-label
+    scheme cannot say. UNSTABLE is a case that failed repetitions -- but not
+    all of them, or not with the screening evidence to red a merge. Calling
+    that PASSED would report a case as passing on a run where it passed
+    nothing, which is the sort of quiet lie that gets a gate switched off.
+
+    FAILED and RESOURCE_PREPARATION_FAILED keep their historical spellings:
+    people and scripts grep build logs for both. NOT_GRADED_ON_TRANSPORT is
+    the inject lane's fifth word (#2039): the case ran and was read, and
+    every objective check it declares was set aside as not applicable on
+    that transport, so neither PASSED, UNSTABLE nor the infrastructure word
+    is true of it. The dashboard's collector does not know the word yet
+    (#2008); a line it cannot parse is left out rather than misread.
+    """
+    rung = int(case.get("rung") or Rung.GREEN)
+    if rung == int(Rung.INFRA):
+        return "RESOURCE_PREPARATION_FAILED"
+    if rung == int(Rung.NOT_GRADED_ON_TRANSPORT):
+        return LABEL_NOT_GRADED_ON_TRANSPORT
+    if case.get("blocking"):
+        return "FAILED"
+    scored = int(case.get("scored") or 0)
+    if case.get("expected_fail"):
+        # Failing is the declared intent, so neither PASSED nor UNSTABLE fits.
+        return "EXPECTED_FAIL"
+    if scored and int(case.get("passes") or 0) == scored:
+        return "PASSED"
+    return "UNSTABLE"
+
+
+def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
+    """The agent's final report as one build-log line, or "" when it said nothing.
+
+    Control characters and lone surrogates become spaces and whitespace is
+    collapsed to single spaces, so the line is one printable line whatever
+    the report held; ``<`` is dropped, so a report can neither forge the
+    log's ``<<< finished`` marker nor open a tag in anything that renders
+    the log as HTML; anything past ``limit`` is cut, with an ellipsis in the
+    last position to say so.
+    """
+    flat = " ".join(_UNPRINTABLE.sub(" ", str(text or "")).replace("<", "").split())
+    if len(flat) > limit:
+        return flat[: limit - 1].rstrip() + "…"
+    return flat
+
+
+def _cmd_case(args: argparse.Namespace) -> int:
+    try:
+        spec = load_case(args.task)
+    except CaseSpecError as exc:
+        print(f"Task {args.task} Result: [FAILED] {exc}", file=sys.stderr)
+        return 2
+
+    # The shell knows the deployer too (it echoes it into the log). Prefer the
+    # task file, which is parsed properly, and accept the flag as an override
+    # for the local-run case where someone is testing a variant.
+    deployer = args.deployer or spec.deployer
+    if deployer != spec.deployer:
+        spec = dataclasses.replace(spec, deployer=deployer)
+
+    run_dirs: list[str | None] = [
+        None if d == MISSING else d for d in (args.result or [])
+    ]
+
+    # The version key comes off the first repetition that produced a readable
+    # record. All repetitions of one case run on the same software, so any of
+    # them answers; taking the first readable one tolerates a lead-off infra
+    # failure without losing the key.
+    key: VersionKey | None = None
+    admission_reason = "no readable record, so no version key"
+    try:
+        versions = load_versions(Path(args.baseline_dir) / "VERSIONS.json")
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
+        return 2
+
+    for run_dir in run_dirs:
+        record = load_run(run_dir) if run_dir else None
+        if record is None or record.empty_record:
+            continue
+        key = VersionKey.from_run(
+            setup_id=record.setup_id,
+            scoring_version=record.scoring_version,
+            judge_model=args.judge_model or os.environ.get("JUDGE_MODEL"),
+            versions=versions,
+        )
+        break
+
+    store, fatal, degraded = _load_store(_store_location(args), only={spec.case_id})
+    if fatal or store is None:
+        print(f"Task {spec.case_id} Result: [FAILED] {fatal}", file=sys.stderr)
+        return 2
+    if degraded:
+        print(f"WARNING: baseline store {degraded}", file=sys.stderr)
+        print("WARNING: grading with no baseline; nothing can be admitted.", file=sys.stderr)
+
+    # Who decides: the roster (default) or the record. A misspelled mode is
+    # exit 2, like a bad VERSIONS.json -- defaulting would make a typo look
+    # like a working switch. The shell validates it too, before any task
+    # runs, so this is the second guard rather than the one that fires.
+    try:
+        mode = admission_mode()
+    except ValueError as exc:
+        print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
+        return 2
+
+    bar = AdmissionBar.from_env()
+    decision = store.admission(
+        spec.case_id, key, bar=bar, bootstrap=_bootstrap_admitted(), mode=mode
+    )
+    admitted, admission_reason = decision.admitted, decision.reason
+
+    # Rung 6's comparator. None whenever the store has nothing at this key,
+    # which is every BOOTSTRAP_ADMITTED case until the nightly has appended
+    # something for it: admitted by fiat with no measured judged mean to be
+    # compared against, so the judged rung stays quiet. A listed case with a
+    # partial window (`collecting`) does have a mean at the key, and rung 6
+    # compares against it -- fewer runs behind it than a full window, but
+    # measured on main, which is what the rung asks for.
+    evidence = store.evidence_for(spec.case_id, key, min_runs=bar.min_runs)
+    baseline_judged = evidence.judged_means if evidence else None
+
+    verdict = grade_case(
+        spec,
+        list(run_dirs),
+        admitted=admitted,
+        correctness_floor=args.correctness_floor,
+        baseline_judged=baseline_judged,
+        judged_margin=args.judged_margin,
+        judged_metrics=_judged_metrics(),
+    )
+
+    payload = verdict.to_dict()
+    payload["admission_reason"] = admission_reason
+    # Who decided (record, bootstrap or neither), under which mode, and what
+    # the record says regardless (would-admit, would-demote, collecting,
+    # stale, none). The suite renders the first and last per case once a
+    # store is configured or the record holds a full window for any case, so
+    # a reader can tell a case the evidence would admit from one it would
+    # demote -- which in roster mode is what a roster edit cites.
+    payload["admission_source"] = decision.source
+    payload["admission_mode"] = mode
+    payload["record_verdict"] = decision.record
+    payload["version_key"] = key.to_dict() if key else None
+    payload["baseline_judged"] = baseline_judged
+    payload["baseline_runs"] = evidence.runs if evidence else 0
+    payload["baseline_passes"] = evidence.passes if evidence else 0
+    # The shell used to grep this out of the task file itself and echo it; it
+    # is reported here instead so there is one parser, not two that can
+    # disagree about which task provisions infrastructure.
+    payload["deployer"] = spec.deployer
+    payload["label"] = _label(payload)
+
+    # The one-line log the presubmit has always printed, in the same shape so
+    # anyone grepping build logs for "Result:" keeps finding them.
+    print(f"Task {spec.case_id} Result: [{payload['label']}] {verdict.reason}")
+    print(f"  deployer: {spec.deployer}")
+    for rep in verdict.reps:
+        judged = " ".join(f"{k}={v}" for k, v in sorted(rep.judged.items()))
+        print(f"  rep {rep.index}: {rep.outcome} -- {rep.reason}" + (f" [{judged}]" if judged else ""))
+        # The agent's own words, one line under the grading line of every
+        # repetition that did not pass, so the dashboard can quote the report
+        # beside the check that failed. A pass needs no quote; an empty
+        # report (a transport failure's, typically) prints nothing rather
+        # than an empty line. Its own shape -- `rep N report:` -- so nothing
+        # that greps for `rep N:` matches it.
+        excerpt = _report_excerpt(rep.report) if rep.outcome != "pass" else ""
+        if excerpt:
+            print(f"  rep {rep.index} report: {excerpt}")
+    print(f"  admission: {admission_reason}")
+    # stderr, not stdout: this is the one line that says the judged rung is
+    # quieter than the configuration claims, and it must survive a reader who
+    # only greps for "Result:".
+    for note in verdict.notes:
+        print(f"WARNING: {spec.case_id}: {note}", file=sys.stderr)
+
+    if args.json_out:
+        out = Path(args.json_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    return 0
+
+
+def _admitted_by(case: dict[str, Any]) -> str:
+    """The admission column's cell: who admitted the case, or who refused."""
+    source = case.get("admission_source")
+    if case.get("admitted"):
+        # A hand-authored hand-off may predate the field; say so rather than guess.
+        return str(source or ADMISSION_CELL_UNKNOWN)
+    if source == ADMITTED_BY_RECORD:
+        return ADMISSION_CELL_RECORD_REFUSED
+    return ADMISSION_CELL_NONE
+
+
+def _record_says(case: dict[str, Any]) -> str:
+    """The record column's cell: the store's own verdict on the case."""
+    return str(case.get("record_verdict") or RECORD_CELL_UNKNOWN)
+
+
+def _markdown(
+    verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
+) -> str:
+    not_evaluated = verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
+    lines = [
+        "## Evaluation verdict",
+        "",
+        f"**{SUITE_HEADLINES[verdict.outcome]}**",
+        "",
+    ]
+    if not_evaluated:
+        # The banner says what to do, because the headline alone invites the
+        # wrong action: a pull request author who sees a red job debugs the
+        # change, and there is nothing in this run about the change to debug.
+        if verdict.not_evaluated:
+            named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
+            banner = (
+                "> **NOT EVALUATED — rerun when the environment is healthy.** "
+                f"{named}: every repetition was excluded as infrastructure, so this "
+                "run evaluated nothing about the case and cannot certify green. "
+                "This is not a finding against the change under test: do not debug "
+                "the change for it; rerun once the eval environment is healthy."
+            )
+        else:
+            # Nothing was lost: every case the run had was set aside by the
+            # inject lane (#2039), so there is no environment to wait on and
+            # no change to debug -- the lane's roster is what to look at.
+            named = ", ".join(f"`{case_id}`" for case_id in verdict.not_graded)
+            banner = (
+                "> **NOT EVALUATED — nothing on this transport could be graded.** "
+                f"{named}: every objective check is not applicable on this "
+                "transport, so this run graded nothing and cannot certify green. "
+                "This is not a finding against the change under test and not "
+                "an environment failure: the lane's roster is what to fix."
+            )
+        lines += [banner, ""]
+    if verdict.pass_rate is not None:
+        rate = f"{verdict.pass_rate:.1%}"
+        if verdict.baseline_rate is not None:
+            rate += f" (main: {verdict.baseline_rate:.1%}, margin {verdict.margin:.1%})"
+        else:
+            rate += " (no baseline at the current version key -- advisory)"
+        lines += [f"Admitted-case pass rate: {rate}", ""]
+    for note in getattr(verdict, "notes", None) or []:
+        lines += [f"_{note}_", ""]
+    if verdict.reasons:
+        heading = "Why it cannot report green" if not_evaluated else "Why it is red"
+        lines += [f"### {heading}", ""]
+        lines += [f"- {r}" for r in verdict.reasons]
+        lines += [""]
+    extra_header = f" {ADMISSION_COLUMN} | {RECORD_COLUMN} |" if admission_column else ""
+    extra_rule = " --- | --- |" if admission_column else ""
+    lines += [
+        f"| Case | Domain | Verdict |{extra_header} Passes | Detail |",
+        f"| --- | --- | --- |{extra_rule} --- | --- |",
+    ]
+    for case in cases:
+        rung = Rung(int(case.get("rung") or Rung.GREEN))
+        # `label` is written by `case`; recompute for a hand-authored file.
+        mark = case.get("label") or _label(case)
+        scored = case.get("scored") or 0
+        # A verifier's reason can contain a pipe (a required-phrase list, a
+        # kubectl selector), which would silently split the table cell.
+        detail = str(case.get("reason") or "").replace("|", "\\|")
+        extra_cell = (
+            f" {_admitted_by(case)} | {_record_says(case)} |" if admission_column else ""
+        )
+        lines.append(
+            f"| `{case.get('case')}` | {case.get('domain') or '--'} | {mark} "
+            f"(rung {int(rung)}) |{extra_cell} {case.get('passes')}/{scored} | {detail} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _read_case_results(paths: list[str]) -> list[dict[str, Any]] | str:
+    """The per-case hand-offs, or the one-line reason they could not be read."""
+    cases: list[dict[str, Any]] = []
+    for path in paths or []:
+        p = Path(path)
+        if not p.is_file():
+            # A per-case file the loop never wrote means the loop died partway.
+            # Louder than a missing entry in a table: it is unaccounted work.
+            return f"missing case result {p}"
+        try:
+            cases.append(json.loads(p.read_text(encoding="utf-8")))
+        except ValueError as exc:
+            return f"unreadable case result {p}: {exc}"
+    return cases
+
+
+def _baseline_rate(
+    cases: list[dict[str, Any]], store: BaselineStore, bar: AdmissionBar
+) -> float | None:
+    """Main's pass rate over the same admitted cases this run graded.
+
+    Pooled across cases rather than averaged over them, so a case with twenty
+    runs of evidence weighs more than one with three -- the same weighting
+    ``grade_suite`` applies to the pull request's own side of the comparison.
+    Both sides therefore answer the same question, which is the only way the
+    difference between them means anything.
+
+    Only cases with evidence at their own version key contribute. A case
+    admitted by ``BOOTSTRAP_ADMITTED`` with nothing at the key counts toward
+    the pull request's rate and not toward main's; that skews the comparison,
+    and the honest fix is to screen the case rather than to invent a baseline
+    for it. A listed case with a partial window (``collecting``) contributes
+    what it has: fewer runs, weighted accordingly, but measured on main.
+
+    Returns None when no admitted case has any evidence, which makes the
+    aggregate advisory and says so.
+
+    A case the inject lane could not grade (rung NOT_GRADED_ON_TRANSPORT,
+    #2039) is out of the pull request's side already -- its ``scored`` is 0
+    -- and is left out of main's side here for the same reason: the version
+    key carries no transport, so main's api-lane evidence for it would be
+    pooled against a run that graded nothing of it, moving the comparison
+    for nothing.
+    """
+    passes = runs = 0
+    for case in cases:
+        if not case.get("admitted"):
+            continue
+        if int(case.get("rung") or Rung.GREEN) == int(Rung.NOT_GRADED_ON_TRANSPORT):
+            continue
+        raw_key = case.get("version_key")
+        if not isinstance(raw_key, dict):
+            continue
+        evidence = store.evidence_for(
+            str(case.get("case") or ""),
+            VersionKey.from_dict(raw_key),
+            min_runs=bar.min_runs,
+        )
+        if evidence is None:
+            continue
+        passes += evidence.passes
+        runs += evidence.runs
+    return (passes / runs) if runs else None
+
+
+def _cmd_suite(args: argparse.Namespace) -> int:
+    cases = _read_case_results(args.case_result)
+    if isinstance(cases, str):
+        print(f"::error::{cases}", file=sys.stderr)
+        return 1
+
+    # The graded cases and no others. `_baseline_rate` below walks this same
+    # list, so the scope and the questions are built from one source.
+    store, fatal, degraded = _load_store(
+        _store_location(args), only={str(c.get("case") or "") for c in cases}
+    )
+    if fatal or store is None:
+        print(f"::error::{fatal}", file=sys.stderr)
+        return 1
+
+    # An explicit --baseline-rate wins, for a local run or a what-if. Otherwise
+    # the number comes from the store, which is the whole point: the aggregate
+    # rule was a flag nothing supplied, and so never fired.
+    baseline_rate = args.baseline_rate
+    if baseline_rate is None:
+        baseline_rate = _baseline_rate(cases, store, AdmissionBar.from_env())
+
+    verdict = grade_suite(
+        cases,
+        baseline_rate=baseline_rate,
+        margin=args.margin,
+        min_scored=args.min_scored,
+        armed=_aggregate_armed(),
+    )
+
+    # BOOTSTRAP_ADMITTED is hand-edited in hack/eval/blocking-roster.txt, and a
+    # misspelling there does not fail -- it silently un-arms the case it was
+    # written to keep blocking. `crashloop-debug` for
+    # `cluster-agent-crashloop-debug` reads as a working entry and gates
+    # nothing. This is the same silent-disarm class the corrupt-store exit 2
+    # exists to close, arriving through configuration rather than data, so it
+    # is reported the same way: loudly, and in the markdown rather than only
+    # in a log line nobody reads on a green run.
+    #
+    # A warning rather than a red. The name might belong to a case that is
+    # legitimately absent from this run -- not in the presubmit file, or filtered
+    # -- and redding the job for naming a case it did not run would make the
+    # variable unusable for the transition it exists to cover.
+    unknown = sorted(_bootstrap_admitted() - {str(c.get("case")) for c in cases})
+
+    # Per-case notes, deduplicated. A misspelled EVAL_JUDGED_METRICS name is
+    # one configuration mistake, not one per case, and repeating it fourteen
+    # times in the banner is how a reader learns to skip banners.
+    case_notes = sorted({n for c in cases for n in (c.get("notes") or [])})
+
+    text = _markdown(
+        verdict,
+        cases,
+        admission_column=_store_configured(args) or _record_decided(cases),
+    )
+    # The banner goes in the markdown, not only in the log. A degraded read
+    # silently loosens the gate, and the one thing that must not happen is a
+    # green nobody knows was measured against nothing.
+    banners = []
+    if args.partial:
+        # First, above every other banner: a table the shell's EXIT trap
+        # wrote for a run that never reached its own suite step is not that
+        # run's verdict, whatever the headline below it says about the cases
+        # it does cover.
+        banners.append(
+            "> **PARTIAL — not this run's verdict.** "
+            f"{args.partial}. Only the cases graded before the run ended are "
+            "in the table below; the headline and the aggregate cover those "
+            "cases alone, and this table gates nothing."
+        )
+    if unknown:
+        print(
+            f"WARNING: BOOTSTRAP_ADMITTED names no graded case: {unknown}",
+            file=sys.stderr,
+        )
+        banners.append(
+            "> **WARNING — `BOOTSTRAP_ADMITTED` names no graded case.** "
+            f"`{'`, `'.join(unknown)}` matched nothing this run graded. If "
+            "that is a typo, the case it was meant to keep blocking is not "
+            "blocking."
+        )
+    for note in case_notes:
+        print(f"WARNING: {note}", file=sys.stderr)
+        banners.append(f"> **WARNING — judged rung degraded.** {note}")
+    if degraded:
+        banners.append(
+            f"> **WARNING — baseline unavailable.** {degraded}\n>\n"
+            "> Nothing could be admitted, so collapse and judged-regression were "
+            "not evaluated and the aggregate below is advisory. This verdict is "
+            "weaker than a normal one."
+        )
+    for case_id, dropped in sorted(getattr(store, "truncated", {}).items()):
+        banners.append(
+            f"> **NOTE — truncated read.** `{case_id}`: the {dropped} oldest "
+            "record(s) were not read. Admission uses the newest evidence, so "
+            "this does not change the verdict."
+        )
+    if banners:
+        text = "\n\n".join(banners) + "\n\n" + text
+    print(text)
+    if args.markdown_out:
+        out = Path(args.markdown_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    if args.json_out:
+        doc = verdict.to_dict()
+        if args.partial:
+            doc["partial"] = True
+            doc["partial_note"] = args.partial
+        out = Path(args.json_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+
+    if verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED:
+        return SUITE_EXIT_NOT_EVALUATED
+    return 0 if verdict.green else 1
+
+
+def _record_for_case(
+    case: dict[str, Any], *, commit: str | None, recorded_at: str
+) -> tuple[str, BaselineRecord] | str:
+    """One case hand-off folded into one appendable line, or why it was skipped.
+
+    A skip returns a string. Skipping is normal and frequent -- most of what a
+    run produces is not evidence about reliability -- so it is reported rather
+    than raised.
+    """
+    case_id = str(case.get("case") or "").strip()
+    if not case_id:
+        return "a case result carries no case id"
+
+    raw_key = case.get("version_key")
+    if not isinstance(raw_key, dict) or not raw_key.get("setup_id"):
+        # No key means no readable record in any repetition. There is nothing
+        # to file this under, and filing it under a partial key would create a
+        # bucket that a real run can never match.
+        return f"{case_id}: no version key on this run, so nothing to file it under"
+
+    reps = [r for r in (case.get("reps") or []) if isinstance(r, dict)]
+    # A repetition the inject lane touched (#2039) is not this store's
+    # evidence -- whether it was set aside whole (outcome `not_applicable`)
+    # or graded with one of its checks set aside (a `pass` or `fail` whose
+    # `not_applicable_checks` is non-empty, the captured agent-kanban-smoke
+    # shape). The record is main's api-lane record, filed at a version key
+    # that carries no transport; a 3/3 line graded on half the case's
+    # objectives would sit beside it as if comparable, and admission reads
+    # it. BaselineRecord has no column that could carry the outcome without
+    # dropping it. Skip the case, saying so.
+    set_aside = sum(
+        1
+        for r in reps
+        if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE or r.get("not_applicable_checks")
+    )
+    if set_aside:
+        return (
+            f"{case_id}: {set_aside} of {len(reps)} repetition(s) {NOT_APPLICABLE_PHRASE} "
+            "(whole, or one of its checks); not recorded, the store holds api-lane evidence only"
+        )
+    scored = [r for r in reps if r.get("outcome") in ("pass", "fail")]
+    if not scored:
+        return (
+            f"{case_id}: no repetition produced a pass or a fail "
+            f"({len(reps)} repetition(s) blocked or hit infrastructure)"
+        )
+
+    return case_id, BaselineRecord(
+        key=VersionKey.from_dict(raw_key),
+        runs=len(scored),
+        passes=sum(1 for r in scored if r.get("outcome") == "pass"),
+        recorded_at=recorded_at,
+        commit=commit,
+        judged=case.get("judged_means") or None,
+        blocked=sum(1 for r in reps if r.get("outcome") == "blocked"),
+        infra=sum(1 for r in reps if r.get("outcome") == "infra"),
+    )
+
+
+def _manifest_key(case_id: str, key: dict[str, Any] | None) -> tuple[str, str]:
+    """What one manifest line identifies: the case and its version key, the
+    key in a canonical spelling so two dicts that mean the same key compare
+    equal whatever order they were written in."""
+    return case_id, json.dumps(key or {}, sort_keys=True)
+
+
+def _read_manifest(path: Path) -> dict[tuple[str, str], str]:
+    """(case, key) -> where it was written, for everything this run has
+    recorded so far. Absent means nothing yet. A line that will not parse is
+    skipped rather than fatal: the manifest is a memo the writer keeps for
+    itself, and a half-written last line (a kill mid-append) must cost at
+    most one duplicate, never the whole record step."""
+    seen: dict[tuple[str, str], str] = {}
+    if not path.is_file():
+        return seen
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or not entry.get("case"):
+            continue
+        key = entry.get("key") if isinstance(entry.get("key"), dict) else None
+        seen[_manifest_key(str(entry["case"]), key)] = str(entry.get("written_to") or "")
+    return seen
+
+
+def _note_in_manifest(path: Path, case_id: str, record: BaselineRecord, written_to: str) -> None:
+    """One line, appended and flushed right after the store append it
+    describes, so a later call in the same run sees it even if this process
+    is killed a moment later."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "case": case_id,
+        "recorded_at": record.recorded_at,
+        "key": record.key.to_dict(),
+        "written_to": written_to,
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def _cmd_record(args: argparse.Namespace) -> int:
+    """Append this run's evidence to the baseline store. Main only.
+
+    Unconditional on the verdict, deliberately. A red run on main is exactly
+    the evidence that de-admits a case that has stopped working, and a store
+    that only ever recorded good days would drift its bar upward until nothing
+    could clear it and nothing could ever fall back below it.
+    """
+    if os.environ.get("PULL_NUMBER") and not args.force:
+        # The invariant, enforced where it cannot be edited away by one line of
+        # shell: a pull request does not move the baseline it is judged against.
+        print(
+            "::error::refusing to record a baseline with PULL_NUMBER set "
+            f"({os.environ['PULL_NUMBER']}): only runs on main append",
+            file=sys.stderr,
+        )
+        return 2
+
+    if os.environ.get("RC_COMMIT_SHA") and not args.force:
+        # Same invariant, second way in. A release-candidate eval is a periodic
+        # with no PULL_NUMBER, so the check above lets it through, and a record
+        # written from one is indistinguishable afterwards: VersionKey names the
+        # setup, the scoring version, the judge and the two content versions,
+        # and nothing about which build produced the sample. The candidate would
+        # then be judged non-inferior to a window it had just moved.
+        print(
+            "::error::refusing to record a baseline with RC_COMMIT_SHA set "
+            f"({os.environ['RC_COMMIT_SHA']}): a release candidate is measured "
+            "against main's window, not added to it",
+            file=sys.stderr,
+        )
+        return 2
+
+    cases = _read_case_results(args.case_result)
+    if isinstance(cases, str):
+        print(f"::error::{cases}", file=sys.stderr)
+        return 1
+
+    recorded_at = args.recorded_at or utc_now()
+    commit = args.commit or None
+    written: list[str] = []
+    # What this run already appended, when the shell records case by case
+    # (module docstring, "one run, several calls"). Without the flag every
+    # call is the only call, as before.
+    manifest = Path(args.recorded_manifest) if args.recorded_manifest else None
+    already = _read_manifest(manifest) if manifest else {}
+
+    for case in cases:
+        outcome = _record_for_case(case, commit=commit, recorded_at=recorded_at)
+        if isinstance(outcome, str):
+            print(f"  skipped {outcome}")
+            continue
+        case_id, record = outcome
+        ident = _manifest_key(case_id, record.key.to_dict())
+        if ident in already:
+            print(
+                f"  already recorded {case_id} this run -> {already[ident] or 'the store'}; "
+                "not appended again"
+            )
+            continue
+        try:
+            path, line = append_record(_store_location(args), case_id, record)
+        except (OSError, StoreUnreachable) as exc:
+            print(f"::error::cannot append to the baseline store: {exc}", file=sys.stderr)
+            return 2
+        if manifest is not None:
+            _note_in_manifest(manifest, case_id, record, path)
+            already[ident] = path
+        written.append(line)
+        print(
+            f"  recorded {case_id}: {record.passes}/{record.runs} -> {path}"
+            + (f" (+{record.blocked} blocked)" if record.blocked else "")
+            + (f" (+{record.infra} infra)" if record.infra else "")
+        )
+
+    if not written:
+        print("No baseline lines were appended: this run produced no evidence.")
+
+    if args.lines_out:
+        # The same lines, somewhere a CI artefact collector can reach them.
+        # The store lives in git and this job cannot push, so the appended file
+        # dies with the workspace; the artefact is how the evidence survives
+        # long enough for someone to land it. Automating that push is its own
+        # change, with its own credential argument. Appended, not rewritten:
+        # a run that records case by case calls this once per case, and the
+        # artefact is the whole run's lines.
+        out = Path(args.lines_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write("".join(f"{line}\n" for line in written))
+
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bench-gate",
+        description="Grade devops-bench runs against the rate-based eval gate.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    case = sub.add_parser("case", help="grade one task's repetitions")
+    case.add_argument("--task", required=True, help="path to bench/tasks/<id>/task.yaml")
+    case.add_argument(
+        "--deployer",
+        default=None,
+        help="override the task file's infrastructure.deployer",
+    )
+    case.add_argument(
+        "--result",
+        action="append",
+        default=[],
+        metavar="RUN_DIR",
+        help=f"a run directory, or the literal {MISSING}; repeat once per repetition",
+    )
+    case.add_argument("--json-out", default=None, help="write the case hand-off here")
+    case.add_argument(
+        "--baseline-dir",
+        default=_DEFAULT_BASELINE_DIR,
+        help="directory holding VERSIONS.json, and the default evidence location "
+        "(default: %(default)s)",
+    )
+    case.add_argument(
+        "--baseline-store",
+        default=None,
+        help="where evidence is read/written: a directory or gs://bucket/prefix. "
+        "Defaults to $EVAL_BASELINE_STORE, then --baseline-dir.",
+    )
+    case.add_argument(
+        "--judge-model",
+        default=None,
+        help="judge model for the version key (default: $JUDGE_MODEL)",
+    )
+    case.add_argument(
+        "--correctness-floor",
+        type=float,
+        default=_env_float(
+            "DETERMINISTIC_CORRECTNESS_FLOOR", DEFAULT_CORRECTNESS_FLOOR
+        ),
+        help="VerificationCorrectness a repetition must meet (default: %(default)s)",
+    )
+    case.add_argument(
+        "--judged-margin",
+        type=float,
+        default=_env_float("EVAL_JUDGED_MARGIN", DEFAULT_JUDGED_MARGIN),
+        help="how far a judged mean may fall below main's (default: %(default)s)",
+    )
+    case.set_defaults(func=_cmd_case)
+
+    suite = sub.add_parser("suite", help="combine case hand-offs into the job verdict")
+    suite.add_argument(
+        "--case-result",
+        action="append",
+        default=[],
+        metavar="JSON",
+        help="a file written by `bench-gate case --json-out`; repeat per case",
+    )
+    suite.add_argument("--markdown-out", default=None)
+    suite.add_argument("--json-out", default=None)
+    suite.add_argument(
+        "--baseline-dir",
+        default=_DEFAULT_BASELINE_DIR,
+        help="directory holding VERSIONS.json, and the default evidence location "
+        "(default: %(default)s)",
+    )
+    suite.add_argument(
+        "--baseline-store",
+        default=None,
+        help="where evidence is read/written: a directory or gs://bucket/prefix. "
+        "Defaults to $EVAL_BASELINE_STORE, then --baseline-dir.",
+    )
+    suite.add_argument(
+        "--baseline-rate",
+        type=float,
+        default=None,
+        help="override main's pass rate; computed from the store if omitted",
+    )
+    suite.add_argument(
+        "--margin",
+        type=float,
+        default=_env_float("EVAL_AGGREGATE_MARGIN", DEFAULT_AGGREGATE_MARGIN),
+        help="non-inferiority margin on the aggregate (default: %(default)s)",
+    )
+    suite.add_argument(
+        "--min-scored",
+        type=int,
+        default=_env_int("EVAL_AGGREGATE_MIN_SCORED", DEFAULT_AGGREGATE_MIN_SCORED),
+        help=(
+            "scored repetitions the aggregate needs before it may block; "
+            "below this it is reported but advisory (default: %(default)s)"
+        ),
+    )
+    suite.add_argument(
+        "--partial",
+        default=None,
+        metavar="NOTE",
+        help=(
+            "this is not the run's verdict: banner the markdown with NOTE and "
+            "mark the JSON partial; for a run the deadline ended before its "
+            "suite step"
+        ),
+    )
+    suite.set_defaults(func=_cmd_suite)
+
+    record = sub.add_parser(
+        "record",
+        help="append this run's evidence to the baseline store (main runs only)",
+    )
+    record.add_argument(
+        "--case-result",
+        action="append",
+        default=[],
+        metavar="JSON",
+        help="a file written by `bench-gate case --json-out`; repeat per case",
+    )
+    record.add_argument(
+        "--baseline-dir",
+        default=_DEFAULT_BASELINE_DIR,
+        help="directory holding VERSIONS.json, and the default evidence location "
+        "(default: %(default)s)",
+    )
+    record.add_argument(
+        "--baseline-store",
+        default=None,
+        help="where evidence is read/written: a directory or gs://bucket/prefix. "
+        "Defaults to $EVAL_BASELINE_STORE, then --baseline-dir.",
+    )
+    record.add_argument(
+        "--commit",
+        default=os.environ.get("PULL_BASE_SHA") or os.environ.get("GIT_COMMIT"),
+        help="the main SHA this evidence was measured on (default: $PULL_BASE_SHA)",
+    )
+    record.add_argument(
+        "--recorded-at",
+        default=None,
+        help="override the UTC stamp; for reproducible local screening runs",
+    )
+    record.add_argument(
+        "--lines-out",
+        default=None,
+        help="also append the appended lines here, for collection as an artefact",
+    )
+    record.add_argument(
+        "--recorded-manifest",
+        default=None,
+        metavar="JSONL",
+        help=(
+            "what this run has recorded so far, one line per case and version "
+            "key; a case already in it is skipped, and every append is added to it"
+        ),
+    )
+    record.add_argument(
+        "--force",
+        action="store_true",
+        help="append even with PULL_NUMBER or RC_COMMIT_SHA set; for tests and local screening",
+    )
+    record.set_defaults(func=_cmd_record)
+
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

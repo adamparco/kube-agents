@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
 import cluster_agent_profile as cap  # noqa: E402
+import terminal_env_pin  # noqa: E402
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -86,6 +87,73 @@ class PinKubeconfigEnvTest(unittest.TestCase):
         self.assertIn(f"KUBECONFIG={kubeconfig}\n", text)
 
 
+class PushSandboxLayoutTest(unittest.TestCase):
+    """The mirror pass step 2e runs so the sandbox has somewhere to write.
+
+    It shells out to another pod's worth of SSH round trips, and it runs on the
+    reconcile path, so the two things worth pinning are that it is bounded and
+    that it cannot take the scaffold down with it.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mirror = self.tmp / "sandbox_mirror.py"
+        self.mirror.write_text("")
+        self._patch(cap, "SANDBOX_MIRROR", self.mirror)
+
+    def _patch(self, obj, attr, value):
+        original = getattr(obj, attr)
+        setattr(obj, attr, value)
+        self.addCleanup(setattr, obj, attr, original)
+
+    def push(self):
+        with redirect_stderr(io.StringIO()) as err:
+            cap._push_sandbox_layout("cluster-one")
+        return err.getvalue()
+
+    def test_the_mirror_call_is_bounded(self):
+        # The reconcile engine calls this once per onboarded cluster. An
+        # unbounded wait on a sandbox that is up but wedged stops the reconcile
+        # for every cluster behind this one, not just this one.
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            self.push()
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], cap.SANDBOX_MIRROR_TIMEOUT_SECONDS
+        )
+        argv = run.call_args.args[0]
+        self.assertIn("--skeleton-only", argv)
+        # Past the mirror's own wait, so this timeout only fires when the
+        # mirror itself is stuck rather than racing it.
+        self.assertLess(
+            float(argv[argv.index("--wait") + 1]), cap.SANDBOX_MIRROR_TIMEOUT_SECONDS
+        )
+
+    def test_a_mirror_that_hangs_does_not_fail_the_scaffold(self):
+        # Without the sandbox layout the new profile's shell starts in the
+        # machine home, which is where it starts anyway. Raising here would
+        # instead leave the cluster unonboarded over a cosmetic difference.
+        timed_out = subprocess.TimeoutExpired(
+            cmd=[str(self.mirror)], timeout=cap.SANDBOX_MIRROR_TIMEOUT_SECONDS
+        )
+        with mock.patch.object(subprocess, "run", side_effect=timed_out):
+            stderr = self.push()
+        self.assertIn("could not push the profile layout", stderr)
+
+    def test_a_mirror_that_exits_non_zero_does_not_fail_the_scaffold(self):
+        failed = subprocess.CalledProcessError(1, [str(self.mirror)], "", "no route")
+        with mock.patch.object(subprocess, "run", side_effect=failed):
+            stderr = self.push()
+        self.assertIn("could not push the profile layout", stderr)
+
+    def test_an_install_without_the_mirror_script_runs_nothing(self):
+        self._patch(cap, "SANDBOX_MIRROR", self.tmp / "absent.py")
+        with mock.patch.object(subprocess, "run") as run:
+            self.push()
+        run.assert_not_called()
+
+
 # --- The runtime scaffold path --------------------------------------------------
 #
 # A cluster profile is created when its cluster is onboarded, which is not a pod start:
@@ -123,6 +191,7 @@ class CreateProfileTest(unittest.TestCase):
         self._patch(cap, "ensure_profile", self._fake_ensure_profile)
         # `gcloud container clusters get-credentials`.
         self.runs = []
+        self.writes_kubeconfig = True
         self._patch(subprocess, "run", self._fake_run)
         # Whether that command needs --dns-endpoint. Patched explicitly rather
         # than left to fall out of the fake above: gke_endpoint reads gcloud's
@@ -132,11 +201,22 @@ class CreateProfileTest(unittest.TestCase):
         # predicate itself is covered in test_gke_endpoint.py.
         self.dns_args = []
         self._patch(cap, "dns_endpoint_args", lambda *a, **k: self.dns_args)
+        # The managed terminal pin needs Hermes, which is not installed here; its own
+        # behaviour is covered in tests/test_terminal_env_pin.py and at image build.
+        self.pinned = []
+        self.pin_error = None
+        self._patch(terminal_env_pin, "pin", self._fake_pin)
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
         setattr(obj, attr, value)
         self.addCleanup(setattr, obj, attr, original)
+
+    def _fake_pin(self, home):
+        self.pinned.append((Path(home), (Path(home) / "USER.md").exists()))
+        if self.pin_error:
+            raise self.pin_error
+        return True
 
     def _fake_ensure_profile(self, name, description, hermes_home):
         home = Path(hermes_home) / "profiles" / name
@@ -146,6 +226,16 @@ class CreateProfileTest(unittest.TestCase):
 
     def _fake_run(self, cmd, **kwargs):
         self.runs.append(cmd)
+        # Real gcloud writes the file its KUBECONFIG names, and the scaffold
+        # checks that it did before calling the profile finished. A fake that
+        # exits 0 without writing is a fake of the failure, not of the success.
+        if (
+            self.writes_kubeconfig
+            and cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]
+        ):
+            path = Path((kwargs.get("env") or {})["KUBECONFIG"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("apiVersion: v1\nkind: Config\n")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     def get_credentials_argv(self):
@@ -169,6 +259,67 @@ class CreateProfileTest(unittest.TestCase):
     def config(self):
         return yaml.safe_load((self.profile / "config.yaml").read_text()) or {}
 
+    def test_a_gcloud_that_wrote_nothing_is_not_a_scaffolded_profile(self):
+        """Exit 0 from gcloud is not the same statement as a credential.
+
+        The command runs in the sandbox and writes there, so this pod cannot
+        see the file either way. Reporting the profile as created leaves every
+        later kubectl failing with an error that names the cluster, and sends
+        whoever reads it to IAM instead of to the pod that never got a
+        kubeconfig.
+        """
+        self.writes_kubeconfig = False
+
+        with self.assertRaises(SystemExit) as caught:
+            self.create()
+
+        self.assertIn("kubeconfig", str(caught.exception))
+        # And the pin that follows it did not happen, so nothing points a
+        # worker at a file that is not there.
+        env_file = self.profile / ".env"
+        self.assertNotIn("KUBECONFIG", env_file.read_text() if env_file.exists() else "")
+
+    def test_pins_the_managed_terminal_before_writing_user_md(self):
+        self.create()
+        self.assertEqual([(self.profile, False)], self.pinned)
+        self.assertTrue((self.profile / "USER.md").exists())
+
+    def test_a_failed_terminal_pin_leaves_the_profile_unfinished(self):
+        """USER.md is what reconcile and the roster read as "finished".
+
+        A re-scaffold starts with the USER.md an earlier run wrote, so a failed pin
+        has to remove it, or the profile keeps counting as usable while its
+        scheduled runs would not use the managed terminal.
+        """
+        self.create()
+        self.pin_error = terminal_env_pin.PinError("Hermes resolves TERMINAL_ENV='local'")
+
+        with self.assertRaises(SystemExit) as caught:
+            self.create()
+
+        self.assertIn(self.name, str(caught.exception))
+        self.assertIn("TERMINAL_ENV='local'", str(caught.exception))
+        self.assertFalse((self.profile / "USER.md").exists())
+
+    def test_the_kubeconfig_is_looked_for_where_kubectl_will_run(self):
+        """With a sandbox the file is on its volume, not on this one."""
+        missing = self.tmp / "nowhere" / "kubeconfig.yaml"
+        with mock.patch.object(cap.sandbox_exec, "sandbox_enabled", return_value=True):
+            probe = subprocess.CompletedProcess(["test"], 0, "", "")
+            with mock.patch.object(cap.sandbox_exec, "run", return_value=probe) as run:
+                self.assertTrue(cap.kubeconfig_landed(missing))
+            self.assertEqual(run.call_args[0][0][1:], ["-s", str(missing)])
+
+            probe = subprocess.CompletedProcess(["test"], 1, "", "")
+            with mock.patch.object(cap.sandbox_exec, "run", return_value=probe):
+                self.assertFalse(cap.kubeconfig_landed(missing))
+
+            # A sandbox that went away between the fetch and the check answers
+            # nothing, which is not the same as answering yes.
+            unavailable = cap.sandbox_exec.SandboxUnavailable("gone")
+            with mock.patch.object(cap.sandbox_exec, "run", side_effect=unavailable):
+                self.assertFalse(cap.kubeconfig_landed(missing))
+
     def test_fetches_credentials_over_the_ip_endpoint_by_default(self):
         self.create()
         self.assertEqual(
@@ -178,6 +329,34 @@ class CreateProfileTest(unittest.TestCase):
                 f"--location={self.LOCATION}",
                 f"--project={self.PROJECT}",
             ],
+        )
+
+    def test_the_credential_fetch_runs_as_the_login_that_owns_the_profile(self):
+        """Step 2e mirrors the profile directory in as `agent:agent` 0755.
+
+        The default `hermes` login is uid 1001 and cannot create a file in it,
+        so a get-credentials that kept the default exits on EACCES and the
+        profile is scaffolded without the kubeconfig every later kubectl reads.
+        The alternative — widening the directory so uid 1001 could write into a
+        tree uid 1000 owns — is what this assertion exists instead of.
+        """
+        original = cap.sandbox_exec.run
+        principals = {}
+
+        def spy(argv, **kwargs):
+            if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                principals["get-credentials"] = kwargs.get(
+                    "principal", cap.sandbox_exec.SANDBOX_PRINCIPAL
+                )
+            return original(argv, **kwargs)
+
+        self._patch(cap.sandbox_exec, "run", spy)
+        self.create()
+
+        self.assertEqual(
+            principals.get("get-credentials"),
+            cap.sandbox_exec.TERMINAL_PRINCIPAL,
+            "get-credentials writes into the agent-owned profile directory",
         )
 
     def test_fetches_credentials_over_the_dns_endpoint_when_detected(self):
@@ -319,9 +498,63 @@ class CreateProfileTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
             os.environ.pop("OTEL_SERVICE_NAME", None)
+            os.environ.pop("OTEL_SDK_DISABLED", None)
+            os.environ.pop("HERMES_OTEL_ENABLED", None)
             self.create()
 
         self.assertEqual(self.plugin_config()["backends"][0]["endpoint"], self.BAKED)
+
+    def test_disabled_telemetry_disables_plugin_and_clears_backends(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"OTEL_SDK_DISABLED": "true", "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
+
+    def test_hermes_otel_enabled_false_disables_plugin(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_OTEL_ENABLED": "false", "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
+
+    def test_hermes_otel_enabled_true_overrides_otel_sdk_disabled(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_OTEL_ENABLED": "true",
+                "OTEL_SDK_DISABLED": "true",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": self.CUSTOM,
+            },
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertTrue(cfg.get("enabled", True))
+        self.assertEqual(cfg["backends"][0]["endpoint"], self.CUSTOM + "/v1/traces")
+
+    def test_disabled_telemetry_handles_mixed_case(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"OTEL_SDK_DISABLED": "TRUE", "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
 
 
 if __name__ == "__main__":

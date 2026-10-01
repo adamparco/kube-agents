@@ -13,8 +13,8 @@ CHART_DIR="${SCRIPT_DIR}/charts/workload-bundle"
 
 # gke_dns_endpoint_flag: the clusters main.tf creates enable external DNS access,
 # so both the credential fetch and the copy-paste hints below must name it.
-# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
-source "${SCRIPT_DIR}/../../scripts/gke_dns_endpoint.sh"
+# shellcheck source=scripts/installer/gke_dns_endpoint.sh
+source "${SCRIPT_DIR}/../../../scripts/installer/gke_dns_endpoint.sh"
 
 # ANSI Colors
 C_CYAN='\033[96m'
@@ -22,7 +22,6 @@ C_GREEN='\033[92m'
 C_YELLOW='\033[93m'
 C_RED='\033[91m'
 C_RESET='\033[0m'
-C_BOLD='\033[1m'
 
 log_info() {
   echo -e "${C_CYAN}INFO: $1${C_RESET}"

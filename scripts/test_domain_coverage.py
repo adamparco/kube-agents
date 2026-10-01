@@ -1,6 +1,6 @@
 """A domain with no blocking scenario is uncovered, not passing.
 
-docs/designs/domains.yaml holds the ten domains and the allowlist of
+docs/designs/domains.yaml holds the domains and the allowlist of
 known-uncovered ones (its header states the rule and where it comes from).
 This test is what makes the rule a build failure:
 
@@ -14,25 +14,27 @@ This test is what makes the rule a build failure:
 Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
 allowlist is the tier-2 progress metric of the testing implementation plan.
 
-Covered means running: a task counts toward its domain only when its spec is
-non-empty AND its path is an active (uncommented) entry in ci-eval-pr.sh's
-TASKS array. A spec-ready task registered commented-out -- the Phase 2
-scenarios awaiting the seeded fleet -- is progress, but it blocks nothing,
-and a domain whose only scenario is dormant is still uncovered. Without this
-distinction the allowlist would have emptied the day the specs were written,
-ten scenarios before any of them ran.
+Covered means able to red every pull request: a task counts toward its domain
+only when its spec is non-empty AND its name is on hack/eval/blocking-roster.txt
+(a subset of the presubmit file by construction). A nightly case, or a
+presubmit seat held out of the roster, cannot red a pull request on a graded
+failure and leaves its domain uncovered. Without this distinction the allowlist would have emptied the day
+the specs were written, ten scenarios before any of them ran.
 """
 
 import pathlib
-import re
+import sys
 import unittest
 
 import yaml
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import eval_rosters  # noqa: E402
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 TASKS_GLOB = "bench/tasks/*/task.yaml"
-EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 
 def load_domains():
@@ -40,24 +42,25 @@ def load_domains():
     return data["domains"], set(data.get("allowlist") or [])
 
 
-def active_task_paths():
-    """Task paths the eval script actually runs: uncommented TASKS entries."""
-    text = EVAL_SCRIPT.read_text()
-    m = re.search(r"^TASKS=\(\n(.*?)^\)$", text, re.M | re.S)
-    if not m:
-        raise AssertionError("TASKS=( ... ) array not found in hack/ci-eval-pr.sh")
-    active = set()
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if line.startswith('"') and line.endswith('"'):
-            # "./tasks/<name>/task.yaml" relative to bench/
-            active.add("bench/" + line.strip('"').lstrip("./"))
-    return active
+def blocking_task_paths():
+    """Task paths that can red a pull request: the entries of hack/eval/blocking-roster.txt.
+
+    The roster is a subset of the presubmit file by construction (the script
+    refuses a roster name outside it; scripts/test_task_registration.py pins
+    it), so a roster case runs on every pull request AND blocks there. A
+    presubmit seat held out of the roster (HELD_OUT_IN_PRESUBMIT in
+    scripts/test_eval_rosters.py) runs without blocking and covers nothing
+    until its roster line lands.
+    """
+    names = eval_rosters.blocking_roster()
+    if not names:
+        raise AssertionError(f"{eval_rosters.BLOCKING_ROSTER_FILE} parsed to no cases")
+    return {f"bench/tasks/{name}/task.yaml" for name in names}
 
 
 def covered_domains():
-    """Domain slugs claimed by an ACTIVE task carrying a non-empty spec."""
-    active = active_task_paths()
+    """Domain slugs claimed by a BLOCKING task carrying a non-empty spec."""
+    active = blocking_task_paths()
     claimed = {}
     for task_file in sorted(REPO_ROOT.glob(TASKS_GLOB)):
         task = yaml.safe_load(task_file.read_text()) or {}

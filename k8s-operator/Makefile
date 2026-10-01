@@ -60,16 +60,49 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest test-python ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+test: manifests generate fmt vet test-python ## Run tests.
+# KUBEBUILDER_ASSETS comes from envtest-path, which installs the binaries if
+# they are absent, so every envtest-asset fetch in this file goes through the
+# retrying macro and this target needs no setup-envtest prerequisite of its
+# own. Dropping it costs the "Setting up envtest binaries..." line and saves a
+# second `use`. (go-install-tool's `go install` of setup-envtest itself is a
+# separate fetch and still has no retry; the module cache usually serves it.)
+#
+# Resolved on a line of its own and then checked, not written as a prefix
+# assignment on the `go test` line: a command substitution in a prefix
+# assignment has its exit status discarded, exactly as the $(shell ...) this
+# replaced did, so a fetch that exhausted its retries would leave
+# KUBEBUILDER_ASSETS empty, skip every envtest-backed test, and still report
+# success. The root Makefile's coverage target resolves it the same way, though
+# it settles for a non-empty check.
+#
+# --no-print-directory because -s suppresses only the directory banners that
+# -C turns on implicitly, not an explicit -w inherited through MAKEFLAGS, and
+# those go to stdout. The check is for the kube-apiserver rather than for a
+# non-empty string for the same reason -- a2a-test.yml makes the same check on
+# the same value -- since a banner-wrapped path is not empty, just wrong.
+#
+# `make -n test` runs this recipe rather than printing it: make executes any
+# recipe line holding $(MAKE) even under -n, so $assets ends up holding the
+# sub-make's printed recipe. The kube-apiserver check then rejects it, which
+# is why `make -n test` errors out instead of reaching `go test`.
+	assets="$$($(MAKE) -s --no-print-directory envtest-path)"; \
+	if [ ! -x "$$assets/kube-apiserver" ]; then \
+		echo "Error: envtest-path gave '$$assets', which holds no kube-apiserver." >&2; \
+		exit 1; \
+	fi; \
+	KUBEBUILDER_ASSETS="$$assets" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: test-python
-# Discovery, not a hand-maintained list. The list version was stale: it named
-# three files and missed test_scoped_sa_pool.py and test_session_kv_server.py,
-# so tests that existed and passed locally were never run by this target.
-test-python: ## Run Python tests.
+# Discovery, not a hand-maintained list, so a new test file beside
+# leader_elect.py runs without an edit here. Only the operator's own Python:
+# the platform scripts suite used to run from this target as well, which made
+# `make verify` run it twice, since the root Makefile's PYTHON_TEST_DIRS sweep
+# already reaches agents/*/scripts. That sweep reaches this directory too, so
+# the leader-elect test runs on every pull request through python-tests.yml
+# and not only when a change touches k8s-operator/**.
+test-python: ## Run the operator's own Python tests (internal/controller).
 	cd internal/controller && python3 -m unittest discover -s . -p 'test_*.py'
-	cd ../agents/platform/scripts && python3 -m unittest discover -s . -p 'test_*.py'
 
 ##@ Build
 
@@ -117,10 +150,40 @@ uninstall: kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | kubectl delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
+# Tags that float. A controller deployed from one is upgraded on its next pod
+# reschedule while the RBAC and CRDs applied beside it stay where they were,
+# and the first verb the newer controller needs that the older ClusterRole
+# lacks becomes an unbounded `Reconciler error` loop (#1009). The supported
+# installers go further (validate_immutable_ref in install.sh allows only a
+# 40-hex commit SHA or a numeric SemVer tag); this is a denylist of the tags
+# that are known to float, deliberately looser so the short SHAs and dev tags
+# a local build uses still deploy, with an escape hatch for a cluster that will
+# be thrown away before the next reschedule.
+MUTABLE_IMAGE_TAGS := latest main master HEAD dev
+ALLOW_MUTABLE_IMG ?=
+
+.PHONY: check-img
+check-img: ## Refuse a mutable image tag in IMG for deploy (ALLOW_MUTABLE_IMG=1 overrides).
+	@ref='$(IMG)'; \
+	case "$$ref" in *@sha256:*) exit 0 ;; esac; \
+	tag="$${ref##*:}"; \
+	case "$$tag" in "$$ref"|*/*) tag="" ;; esac; \
+	mutable=""; \
+	if [ -z "$$tag" ]; then mutable="an untagged reference"; fi; \
+	for t in $(MUTABLE_IMAGE_TAGS); do [ "$$tag" = "$$t" ] && mutable="the floating tag ':$$t'"; done; \
+	if [ -n "$$mutable" ] && [ "$(ALLOW_MUTABLE_IMG)" != "1" ]; then \
+	  echo "ERROR: IMG=$$ref is $$mutable. A controller deployed from it is silently upgraded on its next" >&2; \
+	  echo "       pod reschedule while the ClusterRole and CRDs applied with it stay put, and the newer" >&2; \
+	  echo "       controller then fails every reconcile with 'forbidden' (see issue #1009)." >&2; \
+	  echo "       Deploy an immutable ref instead, e.g. IMG=<registry>/k8s-operator:\$$(git rev-parse HEAD)," >&2; \
+	  echo "       or set ALLOW_MUTABLE_IMG=1 for a cluster you will throw away before then." >&2; \
+	  exit 1; \
+	fi
+
 # The image is pinned in a throwaway copy of config/ so that `kustomize edit`
 # does not rewrite the tracked config/manager/kustomization.yaml.
 .PHONY: deploy
-deploy: kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: kustomize check-img ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R config "$$tmp/config"; \
 	(cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=${IMG}); \
@@ -210,7 +273,7 @@ deploy-github: kustomize ## Deploy GitHub integration.
 
 .PHONY: undeploy-github
 undeploy-github: kustomize ## Undeploy GitHub integration.
-	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$KMS_LOCATION $$GITHUB_ORG $$GITHUB_REPO $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME $$GITHUB_MINTER_IMAGE' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$KMS_LOCATION $$GITHUB_ORG $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME $$GITHUB_MINTER_IMAGE' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 
 
@@ -234,6 +297,16 @@ ENVTEST_VERSION ?= release-0.24
 # ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.36)
 ENVTEST_K8S_VERSION ?= 1.36.0
 
+# The envtest binaries come from GitHub's release-asset CDN, which has bad
+# seconds: two unrelated jobs on #1562 each died on a 504 from it, four minutes
+# apart, neither of them related to the change under test (#1603). Each was a
+# single failed transfer rather than one long outage, which is what a retry
+# absorbs. Four attempts with a doubling delay (5s, 10s, 20s) spends at most 35
+# seconds on that before giving up, so an asset that is genuinely unreachable
+# does not hold a runner.
+ENVTEST_DOWNLOAD_ATTEMPTS ?= 4
+ENVTEST_RETRY_DELAY_SECONDS ?= 5
+
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -244,13 +317,18 @@ controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessar
 $(CONTROLLER_GEN): $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
+.PHONY: envtest-k8s-version
+envtest-k8s-version: ## Print the Kubernetes version the envtest binaries are pinned to.
+	@echo "$(ENVTEST_K8S_VERSION)"
+
+.PHONY: envtest-path
+envtest-path: envtest ## Print the KUBEBUILDER_ASSETS path (installs the binaries if absent).
+	$(call envtest-use)
+
 .PHONY: setup-envtest
 setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
 	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
-	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path || { \
-		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
-		exit 1; \
-	}
+	$(call envtest-use)
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
@@ -265,7 +343,7 @@ define go-install-tool
 @[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
 set -e; \
 package=$(2)@$(3) ;\
-echo "Downloading $${package}" ;\
+echo "Downloading $${package}" >&2 ;\
 rm -f "$(1)" ;\
 GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
@@ -273,12 +351,54 @@ mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
 endef
 
+# envtest-use runs `setup-envtest use` and retries a failed fetch, because the
+# unretried version turned a 504 from GitHub's release-asset CDN into a red
+# check on pull requests whose diff held no Go at all (#1603).
+#
+# Everything except the assets path goes to stderr. .github/workflows/a2a-test.yml
+# captures `make -s envtest-path` into a variable and then checks that what it
+# captured holds a kube-apiserver, so a retry notice on stdout would break that
+# caller rather than inform it.
+#
+# The two tunables are checked before the loop reads them. An empty one gets
+# past `?=` -- an exported empty variable, or `make ... ENVTEST_DOWNLOAD_ATTEMPTS=`
+# -- and `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false: the
+# ceiling never fires and the loop retries forever.
+define envtest-use
+@attempts="$(ENVTEST_DOWNLOAD_ATTEMPTS)"; \
+delay="$(ENVTEST_RETRY_DELAY_SECONDS)"; \
+if ! [ "$$attempts" -ge 1 ] 2>/dev/null || ! [ "$$delay" -ge 0 ] 2>/dev/null; then \
+echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0; got '$$attempts' and '$$delay'." >&2; \
+exit 1; \
+fi; \
+attempt=1; \
+while :; do \
+if $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path; then \
+exit 0; \
+fi; \
+if [ "$$attempt" -ge "$$attempts" ]; then \
+echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION) after $$attempts attempts." >&2; \
+exit 1; \
+fi; \
+echo "envtest download attempt $$attempt of $$attempts failed; retrying in $${delay}s" >&2; \
+sleep "$$delay"; \
+attempt=$$((attempt + 1)); \
+delay=$$((delay * 2)); \
+done
+endef
+
 ##@ Setup & Cleanup
 
 .PHONY: dev-rebuild-agent
+# The script moved to the repository root's scripts/dev/, so the root Makefile
+# owns this target now and this one delegates up. Kept because the target has
+# always been reachable from inside k8s-operator/.
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
-	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
-	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
+	@$(MAKE) -C .. dev-rebuild-agent ARGS="$(ARGS)"
+
+.PHONY: images-check
+images-check: ## Verify images.json matches pins and the chart mirrors cleanly (delegates to root).
+	@$(MAKE) -C .. images-check
 
 ##@ Formatting
 

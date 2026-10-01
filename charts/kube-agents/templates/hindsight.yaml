@@ -39,6 +39,7 @@ spec:
       port: 8888
       targetPort: http
 ---
+{{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.hindsight.api.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "hindsight.api.rollingUpdate") | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,6 +51,11 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $rollingUpdate.maxSurge }}
+      maxUnavailable: {{ $rollingUpdate.maxUnavailable }}
   # 15 minutes, above the default 600s: a cold roll pulls 1.4 GB before the
   # container starts and only then spends the startupProbe budget loading
   # models. k8s-operator/config/integrations/hindsight/api.yaml carries the
@@ -71,7 +77,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       securityContext:
+        runAsNonRoot: true
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.api.image.repository "tag" .Values.hindsight.api.image.tag "root" .) }}
@@ -91,17 +100,23 @@ spec:
               value: "1"
             - name: TRANSFORMERS_OFFLINE
               value: "1"
-            # Extraction and consolidation run through the same LiteLLM gateway
+            # Extraction and consolidation run through the same inference gateway
             # the agents use, so model routing and cost attribution stay in one
-            # place. Short name, not an FQDN: it resolves to LiteLLM in the
-            # release namespace.
+            # place. Short name, not an FQDN: it resolves in the release namespace.
             - name: HINDSIGHT_API_LLM_BASE_URL
-              value: http://litellm/v1
+              value: http://inference-gateway/v1
             - name: HINDSIGHT_API_LLM_MODEL
               value: model-default
             # LiteLLM runs with no master key; the client library insists on a
             # non-empty value, so this is a placeholder rather than a credential.
             - name: HINDSIGHT_API_LLM_API_KEY
+              value: none
+            # Omit `temperature` rather than send a value: a model that refuses
+            # an explicit one answers 400, and the retain surfaces it as
+            # "500 Fact extraction failed" having stored nothing. See the
+            # canonical account in
+            # k8s-operator/config/integrations/hindsight/api.yaml.
+            - name: HINDSIGHT_API_LLM_TEMPERATURE
               value: none
             # Passwordless by design; see POSTGRES_HOST_AUTH_METHOD below.
             # Nothing here is a secret, so nothing here needs a Secret.
@@ -112,12 +127,18 @@ spec:
             # costs". Grouping only — same units, same scores.
             - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
               value: "true"
-          # Recall is CPU-bound on the in-process reranker. Do not raise these
-          # expecting a speedup — that experiment has been run (2/4 vs 500m/2
-          # left latency unchanged on e2-standard-4: hyperthreads share the
-          # vector units this saturates). The request also cannot match the
-          # limit: system daemonsets hold ~1250m of a node's 3920m allocatable,
-          # so a 4-CPU request would leave the pod Pending forever.
+          # The request covers steady state (the API idles near 9m, and the
+          # request is what the scheduler places and Autopilot bills); the
+          # limit is the ceiling recall may burst to on the in-process reranker.
+          # CPU above the request is best-effort, so on a node shared with
+          # other CPU-heavy tenants the request is the number to raise. Do not
+          # raise the limit expecting a speedup — that experiment has been run
+          # (2/4 vs 500m/2 left latency unchanged on e2-standard-4:
+          # hyperthreads share the vector units this saturates). The request
+          # also cannot match the limit: system daemonsets hold ~1250m of a
+          # node's 3920m allocatable, so a 4-CPU request would leave the pod
+          # Pending forever. k8s-operator/config/integrations/hindsight/api.yaml
+          # carries the canonical account.
           resources:
             {{- toYaml .Values.hindsight.api.resources | nindent 12 }}
           securityContext:
@@ -201,15 +222,53 @@ spec:
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}
       {{- end }}
+      # The image's entrypoint starts as root and drops to postgres (uid 999)
+      # itself; starting as 999 skips that path, and 999 is the owner the root
+      # entrypoint already gave every existing data volume. The entrypoint
+      # still runs chmod 700 on $PGDATA on every start, which keeps the data
+      # directory's mode check passing after fsGroup adds group bits, and
+      # OnRootMismatch relabels an existing volume once rather than walking it
+      # on every start. A fresh volume depends on that fsGroup pass: its root
+      # arrives root-owned, and only the kubelet's relabel lets uid 999 create
+      # PGDATA inside it. GKE's Persistent Disk CSI driver applies fsGroup to
+      # ReadWriteOnce volumes; under a StorageClass whose driver reports
+      # fsGroupPolicy None, the entrypoint's mkdir fails with EACCES before
+      # initdb runs, where the old root entrypoint would have chowned the
+      # directory itself. Kept in step with
+      # k8s-operator/config/integrations/hindsight/postgresql.yaml and
+      # asserted by tests/test_workload_security_context.py;
+      # docs/designs/memory.md summarises the posture of both Hindsight pods.
+      # Writable paths
+      # under the read-only root: the run emptyDir at /var/run/postgresql
+      # (socket and pid, used by the entrypoint's temporary init server and
+      # the pg_isready probe), the tmp emptyDir at /tmp, and PGDATA on the
+      # PVC. If a write elsewhere fails, add one more emptyDir at that path
+      # and name it here; do not set readOnlyRootFilesystem: false.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgresql
           # pgvector supplies the vector extension Hindsight's embeddings need.
-          # Pinned by digest in values (from images.json): upstream publishes
-          # only a floating `latest`, so without the pin a pod reschedule can
-          # silently change the database engine. A mirrored install pulls the
-          # copy by tag, because that is what `make mirror-images` pushes.
+          # Pinned by digest in values (from images.json): upstream rebuilds a
+          # version tag in place when the Postgres base is patched, so without
+          # the pin a pod reschedule can move the database to a Postgres minor
+          # nobody chose. A mirrored install pulls the copy by tag, because that
+          # is what `make mirror-images` pushes. Before changing the tag, read
+          # the constraints on it in images.json, which is where they live.
           image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.postgresql.image.repository "tag" .Values.hindsight.postgresql.image.tag "name" "hindsight-postgresql" "root" .) }}
           imagePullPolicy: {{ .Values.hindsight.postgresql.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: postgresql
               containerPort: 5432
@@ -265,6 +324,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""Reject a broken bench case in a second instead of after a cluster lease.
+
+A `task.yaml` mistake costs a full presubmit to discover: provision, deploy,
+run the agent, score, read the log. Most of the mistakes are static. A domain
+slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
+nothing; a fixture role the seeded fleet does not define is a case addressing
+a defect that was never planted; a check with no assertion is a check that
+cannot fail; a case no roster file under `hack/eval/` names never runs; a case with no
+`owner:` has nobody to answer when it flakes; a fixture carrying a real
+address or a credential is a leak the moment it merges. None of those needs a
+cluster to find.
+
+This module is both the library the CI lint calls
+(`scripts/test_task_registration.py`) and the CLI `make bench-case-check`
+runs. One implementation, and the lint asserts that `validate_all()` came back
+empty rather than checking for a hand-listed set of findings, so the fast
+local check and the gating lint cannot drift apart and disagree about what a
+valid case is. A rule added here therefore gates the day it is written, with
+no second edit anywhere. The CLI runs in no workflow; the lint is what reds a
+pull request.
+
+`docs/designs/bench-case-format.md` is the contract these rules enforce,
+`docs/designs/bench-fleet-catalog.md` the fixture half of it, and
+`bench/CONTRIBUTING.md` the submission path the `owner:` and sanitization rules
+come from.
+
+Usage::
+
+    python3 scripts/validate_bench_cases.py                 # every bench case
+    python3 scripts/validate_bench_cases.py path/to/task.yaml [...]
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import importlib.util
+import ipaddress
+import json
+import pathlib
+import re
+import sys
+from typing import Any
+
+import yaml
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import eval_rosters  # noqa: E402
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
+# runs, what the nightly adds. A case is registered by being in one of them.
+PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
+NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The synthetic result key validate_all() reports a broken roster parse under,
+# so a tree whose roster files cannot be read fails loudly instead of calling
+# every case an orphan.
+ROSTER_PARSE_KEY = "<hack/eval rosters>"
+# A FIXTURE_NOT_READY reason must name the issue that plants the fixture.
+ISSUE_REFERENCE = re.compile(r"#\d+")
+DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
+FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
+# The role vocabulary, owned by the catalogue that sits beside the Terraform
+# and is resolved at run time by hack/fleet-kubeconfigs.sh. FIXTURES_FILE adds
+# the day-N gates and the project-scoped fixtures on top of it; it does not get
+# to name a role differently, which fixture_catalog_disagreements() enforces.
+ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
+
+# The `owner:` field, from bench/CONTRIBUTING.md. A GitHub login, bare, or
+# this literal for a case the OWNERS approvers answer for. Bare because the
+# field is a name to look up, not a mention: a task.yaml is quoted into
+# issues and pull-request comments, where a leading at sign pages someone.
+OWNER_MAINTAINERS = "maintainers"
+# GitHub's own login rule: alphanumerics and single interior hyphens, at most
+# 39 characters, so a stray e-mail address or a display name is rejected
+# before a reviewer has to spot it.
+GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+
+# The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
+# contributed case brings with it lives in one of these two trees -- the case
+# directory, and the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
+# put under bench/tf/prebuilt/<stack>/. Nothing else under bench/tf/ is
+# scanned: the shared modules and the seeded fleet are in-house and carry
+# in-house addresses on purpose.
+PREBUILT_DIR = REPO_ROOT / "bench" / "tf" / "prebuilt"
+SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR)
+# Local artefacts of running a stack, never committed and full of real
+# addresses by construction. A path component beginning with a dot
+# (.terraform/, .terraform.lock.hcl) is skipped for the same reason.
+SANITIZER_SKIP_GLOBS: tuple[str, ...] = ("*.tfstate*", "*.tfvars")
+# The per-line escape hatch: the marker, then the reason, on the line that
+# carries the value. A marker with no reason is itself a finding, so the
+# exemption cannot be applied by reflex.
+SANITIZER_ALLOW_MARKER = "sanitizer: allow"
+SANITIZER_ALLOW_RE = re.compile(re.escape(SANITIZER_ALLOW_MARKER) + r"\b(.*)$")
+# The three RFC 5737 documentation ranges are the only IPv4 literals a fixture
+# may carry unescaped. Everything else -- RFC 1918, public, loopback,
+# 0.0.0.0 -- takes the marker, because the check cannot tell a customer's
+# address plan from a fictional one and the marker's reason is where the
+# author says which.
+DOCUMENTATION_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    ipaddress.IPv4Network("192.0.2.0/24"),
+    ipaddress.IPv4Network("198.51.100.0/24"),
+    ipaddress.IPv4Network("203.0.113.0/24"),
+)
+# A dotted quad that is not part of a longer word or a longer dotted number,
+# so `v1.2.3.4` and `1.2.3.4.5` do not match while `at 10.1.2.3.` -- an
+# address ending a sentence in a prompt -- does. Octets over 255 are dropped
+# by the parse in _non_documentation_addresses rather than by the pattern.
+IPV4_LITERAL = re.compile(r"(?<!\w)(?<![0-9]\.)(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?!\w)(?!\.[0-9])")
+# Characters that do not count as a reason after the marker: whitespace, a
+# carriage return on a CRLF line, and the dash or colon an author might put
+# between the marker and the reason.
+SANITIZER_REASON_STRIP = " \t\r-:"
+# The credential shapes, imported from the audit redactor rather than copied
+# so an extension there reaches this check without a second edit. Bearer,
+# key/value and e-mail patterns are deliberately absent: each matches ordinary
+# prose in a prompt ("the token the workload presents", an address in an
+# expected_output), and a check that reds prose is a check that gets escaped
+# by reflex. The env-pair and URL-password patterns are absent too: they match
+# structure (an env list, `scheme://user:pw@`), which a fixture's sample
+# manifests and connection strings carry on purpose, not a token shape. The
+# value is the reader-facing name for the finding.
+REDACTOR_FILE = REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "common" / "redactor.py"
+REDACTOR_CLASS = "AuditRedactor"
+# The name the redactor module is registered under when loaded from its file;
+# distinct from anything a package import would use, so the two cannot collide.
+REDACTOR_MODULE_NAME = "kube_agents_audit_redactor"
+CREDENTIAL_SHAPES: dict[str, str] = {
+    "PRIVATE_KEY_PATTERN": "a private-key block",
+    "GCP_API_KEY_PATTERN": "a GCP API key",
+    "GCP_OAUTH_TOKEN_PATTERN": "a GCP OAuth token",
+    "GITHUB_TOKEN_PATTERN": "a GitHub token",
+    "GITHUB_PAT_PATTERN": "a GitHub fine-grained token",
+    "SLACK_TOKEN_PATTERN": "a Slack token",
+    "JWT_PATTERN": "a JWT",
+    "OPENAI_TOKEN_PATTERN": "an sk- API key",
+    "PREFIXED_SK_TOKEN_PATTERN": "an Anthropic or hyphenated OpenAI key",
+    "AWS_ACCESS_KEY_ID_PATTERN": "an AWS access key id",
+}
+
+# Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.
+# Every entry carries its reason; an entry without one should not survive
+# review. Delete an entry once its case is registered -- staleness is only
+# enforced for cases that no longer exist, because an in-flight branch
+# registering a case must not red main the day it merges.
+KNOWN_UNREGISTERED = {
+    # Provisions its own cluster, so registering it costs every pull request
+    # a second multi-minute provision. Whether it belongs in presubmit or
+    # nightly is a tier decision nobody has made; this entry is the record
+    # that the omission is known rather than accidental.
+    "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+}
+
+# Cases whose fixture does not exist at all, waiting on the issue that plants
+# it. The one state left between "registered" and "excluded on purpose"
+# (decided 2026-09-15 on #1546/#1564): a new case lands in
+# hack/eval/nightly-cases.txt by default and earns a presubmit seat on its
+# record, and the commented-out registration the TASKS array used to carry is
+# retired -- a `#` line in a roster file is a comment, and this validator
+# rejects a case path inside one. A case belongs here only when nothing in the
+# repository can run it yet; a case the agent fails, or that a harness limit
+# blocks, runs in the nightly and shows that on its record. Every reason names
+# the issue; the entry goes when the fixture lands and the case moves to the
+# nightly file in the same pull request.
+FIXTURE_NOT_READY = {
+    "b-0011-gitops": (
+        "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
+        "and its credentials in the pool projects (the case takes the repository, "
+        "the project and the agent host as inputs and CI has none to give), so "
+        "no CI tier can run it yet; run it locally "
+        "with bench/hack/run-gitops-pilot.sh"
+    ),
+    "b-0022b-gitops": (
+        "#1307: the second task through the GitOps fix-cycle stack (gitops_task "
+        "b-0022b); parked for the same reason as b-0011-gitops; run it locally "
+        "with TASK=b-0022b bench/hack/run-gitops-pilot.sh"
+    ),
+    "scope-second-project-denied": (
+        "#1865: needs a second GCP project per pool project, declared in the "
+        "harness install's spec.scope.projects, whose listing the agent's service "
+        "account is denied, as a fixture role of its own; the evaluation fleet has "
+        "one project per install today, so the case cannot be red on main"
+    ),
+    "obtainability-declared-intent-no-finding": (
+        "#1341: needs a second multi-replica workload as a fixture role of its "
+        "own in bench/tf/fleet/fixtures.json (a declaration for checkout-gateway "
+        "would silence the five active cases that grade it) and a knowledge/ "
+        "declaration seeded in each pool project's *-infra repository"
+    ),
+    "vcs-history-only-fact": (
+        "#1253: needs the git-access-ab/r200 branch pushed to every pool "
+        "project's GitOps repository; the dev project carries it, the pool does "
+        "not, so the case fails with the branch absent, which is broken rather "
+        "than red"
+    ),
+    "cluster-agent-stalled-controller-diagnosis": (
+        "#1873: needs the stalled-controller role, a Deployment in seeded-stall "
+        "on seeded cluster A waiting on a ConfigMap that does not exist; no "
+        "fixture role plants a stall today"
+    ),
+    "gitops-drift-noise-filtered-triage": (
+        "#911: needs an audit ingress on the eval install -- a drift-audit "
+        "topic, a subscription and a detector enabled to pull from it, none of "
+        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
+        "classifier and the case files no card at all, which is broken rather "
+        "than red. The umbrella owns it because the gap is the eval install "
+        "not asking for what the composition already builds behind "
+        "enable_drift_pubsub, not a defect anyone has filed separately. The "
+        "case's own header carries the rest: why the sink is the one part of "
+        "the trio it can do without, why #2137 is not a second blocker, and "
+        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
+        "alongside the ingress"
+    ),
+}
+
+# Cases that claim no domain because no row in domains.yaml describes them.
+# "Covers nothing, and we checked" is a real answer; an absent field is not,
+# because a domain with no case reports as uncovered and a case with no slug
+# can stay green for months while the report shows the gap.
+KNOWN_NO_DOMAIN = {
+    "platform-worker-refuses-shipped-skill-edit": (
+        "a skill-governance refusal graded on the worker's card result and on "
+        "its skill_manage calls (none may succeed); reads no fleet, and no "
+        "domains.yaml row describes skill or self-modification governance"
+    ),
+    "vcs-history-only-fact": (
+        "a repository-history question graded on the answer and on the route "
+        "the worker took to it (the version-control verbs, never a credentialed "
+        "clone or gh from the sandbox); no domains.yaml row describes "
+        "repository access"
+    ),
+    "vcs-issue-resolver-triage": (
+        "the github-issue-resolver skill end to end -- poll, claim, "
+        "investigate, transition -- graded on the route the resolver took to "
+        "the forge and on the triage it produced; no domains.yaml row "
+        "describes issue triage, and incident-triage names the event-fired "
+        "autoops journey rather than this one"
+    ),
+    "vcs-review-feedback-read-back": (
+        "a second revision put on an existing proposal's branch and read back "
+        "from the forge before it is described, graded on the route the worker "
+        "took to the read-back; rca-remediation-pr owns the remediation "
+        "journey -- a proposed fix landing as a pull request -- and this case "
+        "proposes no fix"
+    ),
+    "vcs-spent-branch-reuse": (
+        "a second proposal opened under a branch name whose first proposal "
+        "was closed, graded on the branch the pull request came from; like "
+        "vcs-review-feedback-read-back it proposes no fix, and "
+        "rca-remediation-pr owns the remediation journey"
+    ),
+    "gpu-stress-test-diagnosis": (
+        "a chat-prompted post-incident RCA, not the event-fired autoops triage "
+        "that incident-triage names; no domains.yaml row describes it"
+    ),
+    "knowledge-grounding-sources-probe": (
+        "a grounded-knowledge citation probe: a pure GKE documentation "
+        "question graded on the persona's Sources contract; it reads no "
+        "fleet and no domains.yaml row describes knowledge retrieval"
+    ),
+}
+
+# Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
+# hack/ci-eval-pr.sh is transitional -- its own header says the fallback is
+# dead code to delete once every entry in TASKS carries a spec -- so an entry
+# here is a debt with a name on it, not a supported case shape. Each says what
+# would close it.
+KNOWN_JUDGE_ONLY: dict[str, str] = {}
+
+# Which field of each check type carries the assertion. A check whose type is
+# here and none of whose listed fields is populated can only pass, whatever
+# the run did.
+#
+# devops-bench's registry is authoritative and rejects an unknown type at
+# spec-load time; this table is the pre-cluster copy. The first three come
+# from the pinned devops-bench SHA in bench/pyproject.toml, the last three
+# from bench/kube_agents_bench/verifiers.py -- a test re-derives those from
+# the entry-point group so a new local verifier fails here rather than
+# drifting silently.
+#
+# For the first three the named field is also required by the verifier's own
+# pydantic model, so this rule only moves the rejection earlier -- from after a
+# cluster lease to now. The rule earns its keep on the last three, where the
+# field is optional and an empty or blank-stringed list is the shape that
+# actually ships: a check that reads as an assertion and can only pass.
+CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
+    # Upstream, cluster-reading.
+    "resource_property": ("op",),
+    "pod_healthy": ("selector",),
+    "scaling_complete": ("deployment",),
+    # This repository, seeded-fleet-reading: resource_property addressed by
+    # fixture role rather than by kubeconfig, so `op` carries the assertion
+    # for the same reason. See bench/kube_agents_bench/verifiers.py.
+    "fleet_resource_property": ("op",),
+    # This repository, run-reading.
+    "report_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "forbidden_patterns",
+    ),
+    "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    # No field, deliberately: the freshness binding is the assertion and every
+    # field only narrows it. See the empty-tuple rule in _check_assertions.
+    "pull_request_opened": (),
+    # Likewise: "the run wrote to the GitOps repository since it started" is
+    # the assertion, and every field narrows it. The inject lane appends it
+    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # may also declare it.
+    "github_writes": (),
+    "tool_called": ("tool_names",),
+    "worker_commands": ("required_patterns", "forbidden_patterns"),
+    "worker_agents": ("required_agents",),
+    # This repository, agent-disk-reading: the discovery sweep a cron job filed.
+    "bootstrap_fanout": ("require",),
+}
+
+# Check types that read live cluster state. A case using one is asserting on
+# something that has to be there, so it says what: either the seeded-fleet
+# roles it depends on, or `fixtures: []` for a case that plants its own state
+# (its own Terraform stack, its own namespace) and depends on no fixture.
+CLUSTER_READING_TYPES = frozenset(
+    {
+        "resource_property",
+        "pod_healthy",
+        "scaling_complete",
+        # The one type that reads the seeded fleet specifically, so the
+        # `fixtures:` it forces is the list its own fixture_role values
+        # resolve against.
+        "fleet_resource_property",
+    }
+)
+
+# Compound nodes assert nothing themselves; their children do.
+COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
+
+# The entry vocabulary devops-bench's VerificationEntry accepts
+# (verification/spec.py). Every rule below is one devops-bench enforces at
+# spec-load time and this file enforces before a cluster is leased: a spec that
+# fails to parse is not a soft failure, it adds 1.0 to the objective
+# denominator with nothing in the numerator and reds the presubmit.
+ENTRY_ROLES = frozenset({"objective", "safeguard"})
+ENTRY_SEVERITIES = frozenset({"recoverable", "catastrophic"})
+# `hold` is in the model's Literal and then rejected by its own validator, so
+# it is a documented word that no spec may use.
+ENTRY_MODES = frozenset({"converge", "assert"})
+
+# The first-install-hello stack arms the bootstrap_onboarding plugin's eval
+# seam, which greets any turn whose message contains the case's phrase. A
+# phrase outside the case's own prompt is a request nothing answers, and a
+# short one matches other cases' turns. The floor matches the stack's
+# variables.tf validation. A phrase inside another case's prompt greets that
+# case's turn too, since the nightly runs every case against one install.
+GREET_EVAL_STACK = "prebuilt/first-install-hello"
+GREET_EVAL_PHRASE_MIN_LENGTH = 12
+
+
+def _populated(value: Any) -> bool:
+    """Whether an assertion field actually asserts something.
+
+    Truthiness is not enough. `required_phrases: [""]` is a non-empty list, and
+    `"" in text` is true of every text there has ever been, so the check passes
+    whatever the run did -- the exact shape this rule exists to catch. Same for
+    a list of blank strings, and for `required_phrases: ""`.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_populated(item) for item in value)
+    return value is not None and value is not False
+
+
+class CaseError(Exception):
+    """A case file that could not be read at all."""
+
+
+def _load_yaml(path: pathlib.Path) -> Any:
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
+
+
+def known_domains() -> set[str]:
+    """Slugs defined in docs/designs/domains.yaml."""
+    data = _load_yaml(DOMAINS_FILE) or {}
+    return {d["slug"] for d in data.get("domains") or []}
+
+
+def _catalog_roles() -> dict[str, Any]:
+    """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
+    try:
+        data = json.loads(ROLE_CATALOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaseError(f"{ROLE_CATALOG}: could not be parsed as JSON: {exc}") from exc
+    return data.get("roles") or {}
+
+
+def _overlay_fixtures() -> list[dict[str, Any]]:
+    """Entries in docs/designs/fleet-fixtures.yaml."""
+    data = _load_yaml(FIXTURES_FILE) or {}
+    return [f for f in (data.get("fixtures") or []) if isinstance(f, dict)]
+
+
+def known_fixture_roles() -> set[str]:
+    """Every role slug a task.yaml may name.
+
+    bench/tf/fleet/fixtures.json is the vocabulary; the overlay contributes
+    only the roles that have no cluster slot, which a catalogue keyed by slot
+    cannot hold (orphan-disks is project-scoped). Rejecting a slug is not the
+    place to also complain that the two disagree -- that is a repository-level
+    fault, not a fault of the case that happened to name the role, so it is
+    reported once by fixture_catalog_disagreements() instead of once per case.
+    """
+    roles = set(_catalog_roles())
+    roles |= {f["role"] for f in _overlay_fixtures() if f.get("slot") is None and "role" in f}
+    return roles
+
+
+def fixture_catalog_disagreements() -> list[str]:
+    """Ways docs/designs/fleet-fixtures.yaml can drift from the catalogue.
+
+    Both files describe the same planted defects, so the failure to design
+    against is the two of them calling one fixture by two names -- which is
+    exactly what a task.yaml would then do, naming the overlay's slug in
+    `fixtures:` and the catalogue's in a check's `fixture_role:`, in the same
+    file, for the same object.
+    """
+    catalog = _catalog_roles()
+    problems = []
+    for entry in _overlay_fixtures():
+        role, slot = entry.get("role"), entry.get("slot")
+        if not isinstance(role, str):
+            problems.append(f"fleet-fixtures.yaml: {role!r} is not a role slug")
+        elif slot is None:
+            if role in catalog:
+                problems.append(
+                    f"fleet-fixtures.yaml: {role!r} declares no slot, but "
+                    "bench/tf/fleet/fixtures.json gives it slot "
+                    f"{catalog[role].get('cluster_slot')!r}"
+                )
+        elif role not in catalog:
+            problems.append(
+                f"fleet-fixtures.yaml: {role!r} is on slot {slot!r} but "
+                "bench/tf/fleet/fixtures.json, which owns the role "
+                "vocabulary, does not define it"
+            )
+        elif catalog[role].get("cluster_slot") != slot:
+            problems.append(
+                f"fleet-fixtures.yaml puts {role!r} on slot {slot!r}; "
+                "bench/tf/fleet/fixtures.json puts it on "
+                f"{catalog[role].get('cluster_slot')!r}"
+            )
+    return problems
+
+
+def registered_cases() -> set[str] | None:
+    """Case names the eval runs: hack/eval/presubmit-cases.txt and nightly-cases.txt.
+
+    An entry in either file is registered; the presubmit one runs on every
+    pull request, the nightly one every night (EVAL_TIER=nightly in
+    hack/ci-eval-pr.sh). A commented-out path counts for nothing -- that
+    parking state is retired; a case whose fixture does not exist waits in
+    FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
+    comment as a finding.
+
+    The files are read with the same parse the script applies
+    (scripts/eval_rosters.py). Returns None when a file is missing or holds a
+    line that is not a ./tasks/<id>/task.yaml path, so a broken roster fails
+    loudly rather than calling every case an orphan.
+    """
+    names: set[str] = set()
+    for path in ROSTER_FILES:
+        try:
+            names |= set(eval_rosters.case_names(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return None
+    return names
+
+
+def commented_out_registrations() -> dict[str, str]:
+    """Case ids that appear as a case path inside a roster-file comment.
+
+    Keyed by case id, valued by the file. The commented-out registration was
+    the parking state for a case whose fixture or blocker was not ready; it is
+    retired because it was indistinguishable from a case nobody had decided
+    about. A case that cannot run yet is a FIXTURE_NOT_READY entry with its
+    issue; a case that can run is a nightly entry.
+    """
+    found: dict[str, str] = {}
+    for path in ROSTER_FILES:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for name in eval_rosters.commented_out_cases(text):
+            where = path.relative_to(REPO_ROOT).as_posix() if path.is_relative_to(REPO_ROOT) else path.as_posix()
+            found.setdefault(name, where)
+    return found
+
+
+def bench_cases() -> dict[str, pathlib.Path]:
+    """Every case directory under bench/tasks/, by name."""
+    return {p.parent.name: p for p in sorted(TASKS_DIR.glob("*/task.yaml"))}
+
+
+def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
+    """Walk one check subtree, reporting nodes that cannot fail."""
+    if not isinstance(node, dict):
+        problems.append(f"{where}: check node is not a mapping")
+        return
+
+    node_type = node.get("type")
+    if not isinstance(node_type, str) or not node_type:
+        problems.append(f"{where}: check node has no 'type' discriminator")
+        return
+
+    if node_type in COMPOUND_TYPES:
+        children = node.get("checks")
+        if not isinstance(children, list) or not children:
+            problems.append(
+                f"{where}: compound check '{node_type}' has no 'checks' members, "
+                "so it asserts nothing"
+            )
+            return
+        for index, child in enumerate(children):
+            _check_assertions(child, f"{where} > {node_type}[{index}]", problems)
+        return
+
+    fields = CHECK_ASSERTIONS.get(node_type)
+    if fields is None:
+        problems.append(
+            f"{where}: unknown check type {node_type!r}; known types are "
+            f"{sorted(CHECK_ASSERTIONS) + sorted(COMPOUND_TYPES)}. A new "
+            "verifier needs a CHECK_ASSERTIONS entry naming the field that "
+            "carries its assertion."
+        )
+        return
+
+    # Populated rather than present: an empty phrase list, a list of empty
+    # strings and an empty tool-name list are all syntactically fine and all
+    # make the check unfailable, which is the shape this rule exists to catch.
+    # `resource_property`'s `op` is the assertion whatever its value --
+    # `absent` and `exists` say something about the match set rather than about
+    # a value.
+    #
+    # An empty tuple means the assertion is the check itself and no field can
+    # switch it off: `pull_request_opened` fails on a report naming no pull
+    # request and on one naming a previous run's, with nothing configured.
+    if fields and not any(_populated(node.get(field)) for field in fields):
+        problems.append(
+            f"{where}: check '{node_type}' populates none of "
+            f"{list(fields)}, so it can only pass"
+        )
+
+
+def _check_types(node: Any, found: set[str]) -> None:
+    """Every check type used anywhere in one check subtree."""
+    if not isinstance(node, dict):
+        return
+    node_type = node.get("type")
+    if isinstance(node_type, str):
+        found.add(node_type)
+    for child in node.get("checks") or []:
+        _check_types(child, found)
+
+
+def _fixture_roles(node: Any, found: set[str]) -> None:
+    """Every `fixture_role:` named anywhere in one check subtree."""
+    if not isinstance(node, dict):
+        return
+    role = node.get("fixture_role")
+    if isinstance(role, str):
+        found.add(role)
+    for child in node.get("checks") or []:
+        _fixture_roles(child, found)
+
+
+def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) -> None:
+    """The role/severity/mode/weight rules devops-bench applies at spec load."""
+    role = entry.get("role")
+    if role not in ENTRY_ROLES:
+        problems.append(
+            f"{where}: role {role!r} is not one of {sorted(ENTRY_ROLES)}; an "
+            "entry says what it is for before it says anything else"
+        )
+
+    severity = entry.get("severity")
+    if role == "safeguard" and severity is None:
+        problems.append(
+            f"{where}: a safeguard must declare a severity, "
+            f"one of {sorted(ENTRY_SEVERITIES)}"
+        )
+    elif role == "objective" and severity is not None:
+        problems.append(
+            f"{where}: severity {severity!r} on an objective; severity says how "
+            "bad a safeguard tripping is and an objective cannot trip"
+        )
+    elif severity is not None and severity not in ENTRY_SEVERITIES:
+        problems.append(
+            f"{where}: severity {severity!r} is not one of {sorted(ENTRY_SEVERITIES)}"
+        )
+
+    mode = entry.get("mode")
+    if mode is not None and mode not in ENTRY_MODES:
+        problems.append(
+            f"{where}: mode {mode!r} is not one of {sorted(ENTRY_MODES)}"
+            + ("; 'hold' is declared in the model and rejected by it" if mode == "hold" else "")
+        )
+
+    weight = entry.get("weight")
+    if weight is not None and (not isinstance(weight, (int, float)) or weight <= 0):
+        problems.append(f"{where}: weight {weight!r} must be a number greater than 0")
+
+
+def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None) -> list[str]:
+    """Every problem with one case file, as reader-facing sentences."""
+    problems: list[str] = []
+    spec = _load_yaml(path)
+    if not isinstance(spec, dict):
+        return [f"{path}: does not parse to a mapping"]
+
+    # The id key. devops-bench accepts task_id as an alias for id
+    # (tasks/schema.py, from_dict) and prefers id when both are present, so a
+    # file carrying both silently loses the task_id value. One spelling here.
+    if "task_id" in spec:
+        problems.append(
+            "uses the deprecated 'task_id:' key; rename it to 'id:' "
+            "(devops-bench accepts both and prefers 'id', so this is a "
+            "rename with no behaviour change)"
+        )
+    case_id = spec.get("id") or spec.get("task_id")
+    if not case_id:
+        problems.append("declares no 'id:'")
+    elif str(case_id) != name:
+        problems.append(
+            f"id {str(case_id)!r} does not match its directory name {name!r}; "
+            "the directory name is what TASKS, the results file and every "
+            "lint key on"
+        )
+
+    # The domain slug. Coverage is counted per domain, so a case with no slug
+    # is invisible to the count that decides whether a domain is covered.
+    domain = spec.get("domain")
+    if domain is None:
+        if name not in KNOWN_NO_DOMAIN:
+            problems.append(
+                "declares no 'domain:'. Claim a slug from "
+                "docs/designs/domains.yaml, or add a reviewed KNOWN_NO_DOMAIN "
+                "entry in scripts/validate_bench_cases.py saying why no row "
+                "describes this case"
+            )
+    elif not isinstance(domain, str):
+        problems.append(f"claims domain {domain!r}, which is not a slug string")
+    elif domain not in known_domains():
+        problems.append(
+            f"claims domain {domain!r}, which docs/designs/domains.yaml does "
+            "not define"
+        )
+
+    # The owner. Demotion (docs/eval-gate-roster.md) files an issue against a
+    # flaking case, and this field is who that issue goes to. devops-bench
+    # discards the key, so like `domain` it is enforced here or nowhere.
+    owner = spec.get("owner")
+    if owner is None:
+        problems.append(
+            "declares no 'owner:'. Name the GitHub login (without the at sign) "
+            f"that answers when this case flakes, or {OWNER_MAINTAINERS!r} for "
+            "a case the OWNERS approvers own -- see bench/CONTRIBUTING.md"
+        )
+    elif not isinstance(owner, str) or not owner:
+        problems.append(f"'owner:' {owner!r} is not a GitHub login string")
+    elif owner.startswith("@"):
+        problems.append(
+            f"owner {owner!r} carries a leading at sign; write the login bare, "
+            "so a task.yaml quoted into an issue names someone rather than "
+            "paging them"
+        )
+    elif owner != OWNER_MAINTAINERS and not GITHUB_LOGIN.fullmatch(owner):
+        problems.append(
+            f"owner {owner!r} is neither a GitHub login (letters, digits and "
+            "single hyphens, at most 39 characters) nor the literal "
+            f"{OWNER_MAINTAINERS!r}"
+        )
+
+    # The expected-fail marker. bench-gate inverts a marked case's verdict,
+    # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses
+    # anything but a YAML boolean -- after the cluster lease. A quoted "false"
+    # is a string, which is truthy, so a permissive read would flip the case
+    # into expected-fail on a typo; catch the shape here, in a second.
+    if "expected_fail" in spec and not isinstance(spec["expected_fail"], bool):
+        problems.append(
+            f"'expected_fail:' {spec['expected_fail']!r} is not a YAML boolean; "
+            "write a bare true or false. A quoted value is a string, which "
+            "bench-gate refuses at spec-load time, after the lease"
+        )
+
+    # Fixture roles. Cases address the seeded fleet by role, never by cluster
+    # name or project id -- see docs/designs/bench-fleet-catalog.md.
+    fixtures = spec.get("fixtures")
+    if fixtures is not None:
+        if not isinstance(fixtures, list):
+            problems.append("'fixtures:' must be a list of role slugs")
+        else:
+            roles = known_fixture_roles()
+            for role in fixtures:
+                if not isinstance(role, str):
+                    problems.append(
+                        f"names fixture role {role!r}, which is not a slug string"
+                    )
+                elif role not in roles and name not in FIXTURE_NOT_READY:
+                    # A case waiting on its fixture names the role its issue plants.
+                    problems.append(
+                        f"names fixture role {role!r}, which neither "
+                        "bench/tf/fleet/fixtures.json nor "
+                        "docs/designs/fleet-fixtures.yaml defines"
+                    )
+
+    # The verification spec.
+    entries = spec.get("verification_spec")
+    if not entries:
+        if name not in KNOWN_JUDGE_ONLY:
+            problems.append(
+                "carries no 'verification_spec:'. The OutcomeValidity >= 0.7 "
+                "fallback in hack/ci-eval-pr.sh is transitional and a "
+                "judge-only case cannot fail for the reason it was written; "
+                "declare at least one objective naming something the case "
+                "planted, or add a reviewed KNOWN_JUDGE_ONLY entry in "
+                "scripts/validate_bench_cases.py"
+            )
+    elif not isinstance(entries, list):
+        problems.append("'verification_spec:' must be a list of entries")
+    else:
+        seen: set[str] = set()
+        used_types: set[str] = set()
+        used_roles: set[str] = set()
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                problems.append(f"verification_spec[{index}]: entry is not a mapping")
+                continue
+            label = entry.get("name")
+            where = f"verification_spec[{index}]"
+            if not isinstance(label, str) or not label:
+                problems.append(f"{where}: entry has no 'name:'")
+            else:
+                where = f"check {label!r}"
+                if label in seen:
+                    problems.append(f"{where}: duplicate entry name")
+                seen.add(label)
+            _entry_vocabulary(entry, where, problems)
+            if "check" not in entry:
+                problems.append(f"{where}: entry has no 'check:' subtree")
+            else:
+                _check_assertions(entry["check"], where, problems)
+                _check_types(entry["check"], used_types)
+                _fixture_roles(entry["check"], used_roles)
+
+        # The two ways a case names a fixture have to be the same name. A
+        # check's `fixture_role:` is what the runner resolves to a kubeconfig;
+        # `fixtures:` is what a human greps when a cluster is replaced. A case
+        # naming one planted defect `crashloop-workload` in one and something
+        # else in the other reads as depending on two fixtures and is why the
+        # role vocabulary has a single owner -- see fleet-fixtures.yaml's
+        # header and fixture_catalog_disagreements().
+        if isinstance(fixtures, list):
+            undeclared = sorted(used_roles - {f for f in fixtures if isinstance(f, str)})
+            for role in undeclared:
+                problems.append(
+                    f"a check names fixture role {role!r}, which the case's "
+                    "own 'fixtures:' list does not declare"
+                )
+
+        if fixtures is None and used_types & CLUSTER_READING_TYPES:
+            problems.append(
+                "reads live cluster state ("
+                + ", ".join(sorted(used_types & CLUSTER_READING_TYPES))
+                + ") and declares no 'fixtures:'. List the seeded-fleet roles "
+                "it depends on, so the fleet owner replacing a cluster can "
+                "grep for the cases that go quiet, or declare 'fixtures: []' "
+                "for a case that plants its own state"
+            )
+
+        # The presubmit decides whether a case has a spec by grepping for a
+        # `verification_spec:` line with nothing after it (hack/ci-eval-pr.sh,
+        # task_has_spec). A flow-style spec on one line is a valid, loadable
+        # spec that the gate cannot see, so the case drops back to the
+        # judge-only OutcomeValidity fallback without saying so.
+        if not re.search(r"^verification_spec:\s*$", path.read_text(encoding="utf-8"), re.M):
+            problems.append(
+                "declares its 'verification_spec:' inline rather than as a "
+                "block. hack/ci-eval-pr.sh's task_has_spec matches a bare "
+                "'verification_spec:' line, so an inline spec runs its checks "
+                "and is still graded by the judge-only fallback"
+            )
+
+    infrastructure = spec.get("infrastructure")
+    if isinstance(infrastructure, dict) and infrastructure.get("stack") == GREET_EVAL_STACK:
+        variables = infrastructure.get("variables")
+        phrase = variables.get("phrase") if isinstance(variables, dict) else None
+        prompt = spec.get("prompt")
+        if not isinstance(phrase, str) or len(phrase.strip()) < GREET_EVAL_PHRASE_MIN_LENGTH:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                f"shorter than {GREET_EVAL_PHRASE_MIN_LENGTH} characters after "
+                "trimming; the plugin matches it by substring on every turn, so "
+                "a short phrase greets other cases' turns"
+            )
+        elif not isinstance(prompt, str) or phrase not in prompt:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                "that is not a substring of its own 'prompt:', so no turn of "
+                "this case ever gets the greeting"
+            )
+
+    # Registration. hack/ci-eval-pr.sh runs the cases in
+    # hack/eval/presubmit-cases.txt and, on the nightly tier,
+    # hack/eval/nightly-cases.txt -- and only those.
+    if (
+        registered is not None
+        and name not in registered
+        and name not in KNOWN_UNREGISTERED
+        and name not in FIXTURE_NOT_READY
+    ):
+        problems.append(
+            "is registered nowhere and never runs. Add it to "
+            "hack/eval/nightly-cases.txt (where a new case lands; a presubmit "
+            "seat is earned on its record), or, if its fixture does not exist "
+            "yet, add a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py "
+            "naming the issue that plants it, or a reviewed KNOWN_UNREGISTERED "
+            "entry with the reason it must not run"
+        )
+
+    return problems
+
+
+def greet_phrase_collisions(cases: dict[str, pathlib.Path]) -> dict[str, list[str]]:
+    """Cases on the greet stack whose phrase is inside another case's prompt.
+
+    The plugin takes the first request, in file-name order, whose phrase is in
+    the turn's message, so the other case's turn can be greeted with this
+    case's variant. Unreadable files are skipped; validate_case reports them.
+    """
+    phrases: dict[str, str] = {}
+    prompts: dict[str, str] = {}
+    for name, path in cases.items():
+        try:
+            spec = _load_yaml(path)
+        except CaseError:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        if isinstance(spec.get("prompt"), str):
+            prompts[name] = spec["prompt"]
+        infrastructure = spec.get("infrastructure")
+        if isinstance(infrastructure, dict) and infrastructure.get("stack") == GREET_EVAL_STACK:
+            variables = infrastructure.get("variables")
+            phrase = variables.get("phrase") if isinstance(variables, dict) else None
+            if isinstance(phrase, str) and len(phrase.strip()) >= GREET_EVAL_PHRASE_MIN_LENGTH:
+                phrases[name] = phrase.strip()
+    out: dict[str, list[str]] = {}
+    for name, phrase in phrases.items():
+        for other, prompt in prompts.items():
+            if other != name and phrase in prompt:
+                out.setdefault(name, []).append(
+                    f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                    f"that is also inside {other}'s 'prompt:', so {other}'s turn "
+                    "can be greeted by this case's request"
+                )
+    return out
+
+
+def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
+    """Validate specific task.yaml paths, keyed by their directory name.
+
+    Registration is skipped for a path outside bench/tasks/: a file being
+    checked from somewhere else (a fetched pull-request copy, a scratch draft)
+    is not expected to be registered yet, and reporting it would drown the
+    findings that matter.
+    """
+    registered = registered_cases()
+    out: dict[str, list[str]] = {}
+    for path in paths:
+        resolved = path.resolve()
+        in_tree = resolved.parent.parent == TASKS_DIR
+        name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
+        out[name] = validate_case(name, resolved, registered=registered if in_tree else None)
+    return out
+
+
+def validate_all() -> dict[str, list[str]]:
+    """Validate every case under bench/tasks/."""
+    registered = registered_cases()
+    if registered is None:
+        return {
+            ROSTER_PARSE_KEY: [
+                "could not read hack/eval/presubmit-cases.txt and "
+                "hack/eval/nightly-cases.txt as case lists -- a file is missing "
+                "or holds a line that is not a ./tasks/<id>/task.yaml path"
+            ]
+        }
+    if not registered:
+        return {
+            ROSTER_PARSE_KEY: [
+                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt "
+                "parsed to no cases -- either both are empty or this parse has "
+                "drifted"
+            ]
+        }
+    results: dict[str, list[str]] = {}
+    cases = bench_cases()
+    for name, path in cases.items():
+        # One unreadable file must not hide every other case's findings.
+        try:
+            results[name] = validate_case(name, path, registered=registered)
+        except CaseError as exc:
+            results[name] = [str(exc)]
+    for name, problems in greet_phrase_collisions(cases).items():
+        results[name].extend(problems)
+    # The retired parking state: a case path inside a roster-file comment. It
+    # is a finding against the case when the case exists, and against the
+    # roster files when it does not (a comment can name anything).
+    for name, where in commented_out_registrations().items():
+        finding = (
+            f"is commented out in {where}. That parking state is retired: move "
+            "the case to hack/eval/nightly-cases.txt, or, if its fixture does not "
+            "exist yet, to FIXTURE_NOT_READY in scripts/validate_bench_cases.py "
+            "with its issue, and delete the comment"
+        )
+        results.setdefault(name if name in results else ROSTER_PARSE_KEY, []).append(
+            finding if name in results else f"{name} {finding}"
+        )
+    return results
+
+
+def credential_patterns() -> dict[str, re.Pattern[str]]:
+    """The AuditRedactor token shapes this scan applies, by reader-facing name.
+
+    Loaded from the file rather than imported as a package: the redactor sits
+    inside a Hermes plugin tree that is not on sys.path here, and it depends on
+    the standard library alone, so `make bench-case-check` still needs PyYAML
+    and nothing else. A shape named in CREDENTIAL_SHAPES that the class no
+    longer defines is a CaseError rather than a silently narrower scan.
+    """
+    spec = importlib.util.spec_from_file_location(REDACTOR_MODULE_NAME, REDACTOR_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{REDACTOR_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    # Registered before the exec, the way the import system would, and left
+    # there. A module object on its own stopped being enough once the redactor
+    # gained a dataclass: the file carries `from __future__ import annotations`,
+    # so every field annotation reaches dataclasses as a string, and an
+    # unqualified one like `name: str` gets probed for KW_ONLY through
+    # sys.modules[cls.__module__].__dict__ -- unguarded, so a module absent
+    # from sys.modules dies there on None (dataclasses._is_type). The failure
+    # lands inside dataclasses, nowhere near this loader.
+    #
+    # Same shape as _load_redactor in charts/kube-agents/files/
+    # litellm_redaction_callback.py, which loads this same redactor at the
+    # gateway and hit this first; one convention between the two loaders is
+    # worth more than a marginally tidier sys.modules here. Leaving it
+    # registered also keeps the module usable afterwards -- unregistering it
+    # would leave an object whose own annotations no longer resolve, which
+    # breaks at a distance rather than here. REDACTOR_MODULE_NAME is ours
+    # alone (see its definition), so this displaces nothing.
+    sys.modules[REDACTOR_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # any import failure is the finding, whatever its class
+        raise CaseError(f"{REDACTOR_FILE}: could not be imported: {exc}") from exc
+    redactor = getattr(module, REDACTOR_CLASS, None)
+    patterns: dict[str, re.Pattern[str]] = {}
+    for attribute, label in CREDENTIAL_SHAPES.items():
+        pattern = getattr(redactor, attribute, None)
+        if not isinstance(pattern, re.Pattern):
+            raise CaseError(
+                f"{REDACTOR_FILE}: {REDACTOR_CLASS}.{attribute} is not a compiled "
+                "pattern; CREDENTIAL_SHAPES in scripts/validate_bench_cases.py "
+                "names a shape the redactor no longer defines"
+            )
+        patterns[label] = pattern
+    return patterns
+
+
+def _sanitized_files(roots: tuple[pathlib.Path, ...]) -> list[pathlib.Path]:
+    """Every text file the scan reads, in a stable order."""
+    files: list[pathlib.Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if any(fnmatch.fnmatch(path.name, glob) for glob in SANITIZER_SKIP_GLOBS):
+                continue
+            files.append(path)
+    return files
+
+
+def _display(path: pathlib.Path) -> str:
+    """Repository-relative when the path is in the tree, absolute otherwise."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
+    """(offset, literal) for every IPv4 literal outside the RFC 5737 ranges.
+
+    Octets are parsed as integers before the address is built: IPv4Address
+    rejects a leading zero (`010.001.002.003`) as ambiguous, and an author
+    writing one is still writing an address.
+    """
+    found = []
+    for match in IPV4_LITERAL.finditer(text):
+        octets = [int(octet) for octet in match.group(0).split(".")]
+        try:
+            address = ipaddress.IPv4Address(".".join(str(octet) for octet in octets))
+        except ValueError:
+            continue
+        if not any(address in network for network in DOCUMENTATION_NETWORKS):
+            found.append((match.start(), match.group(0)))
+    return found
+
+
+def sanitization_findings(roots: tuple[pathlib.Path, ...] = SANITIZED_ROOTS) -> list[str]:
+    """Lines under `roots` that carry a real-looking address or a credential.
+
+    Every finding is one line of one file: the IPv4 literal outside the
+    documentation ranges, or the credential shape, and the line that holds it.
+    The escape is SANITIZER_ALLOW_MARKER on that same line with a reason after
+    it; the marker alone is reported, whether or not the line matched anything,
+    so the exemption is never applied without saying why. A multi-line match --
+    a private-key block -- is exempted by the marker on its first line.
+
+    Files that do not decode as text are skipped: the scan reads prose and
+    configuration, and a binary fixture is a review question rather than a
+    line to report.
+    """
+    patterns = credential_patterns()
+    findings: list[str] = []
+    for path in _sanitized_files(roots):
+        raw = path.read_bytes()
+        if b"\0" in raw:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        allowed: set[int] = set()
+        # (line, message) so a file's findings read top to bottom whatever
+        # order the patterns found them in.
+        in_file: list[tuple[int, str]] = []
+        for number, line in enumerate(lines, start=1):
+            marker = SANITIZER_ALLOW_RE.search(line)
+            if marker is None:
+                continue
+            if marker.group(1).strip(SANITIZER_REASON_STRIP):
+                allowed.add(number)
+            else:
+                in_file.append(
+                    (
+                        number,
+                        f"'{SANITIZER_ALLOW_MARKER}' with no reason after it; say "
+                        "what the value is and why it is safe to keep",
+                    )
+                )
+        hits: list[tuple[int, str]] = [
+            (offset, f"IPv4 literal {literal} outside the RFC 5737 documentation ranges")
+            for offset, literal in _non_documentation_addresses(text)
+        ]
+        # The credential itself is not echoed: the line number locates it,
+        # and a check that prints what it found would copy a real token into
+        # a CI log.
+        for label, pattern in patterns.items():
+            hits += [(match.start(), label) for match in pattern.finditer(text)]
+        for offset, description in hits:
+            number = text.count("\n", 0, offset) + 1
+            if number in allowed:
+                continue
+            in_file.append(
+                (
+                    number,
+                    f"{description}. A fixture carries no real address or "
+                    "credential; use a documentation-range address or a "
+                    f"placeholder, or append '{SANITIZER_ALLOW_MARKER} <reason>' "
+                    "to the line -- see bench/CONTRIBUTING.md",
+                )
+            )
+        findings += [f"{_display(path)}:{number}: {message}" for number, message in sorted(in_file)]
+    return findings
+
+
+def stale_allowlist_entries() -> list[str]:
+    """Allowlist entries naming a case that no longer exists."""
+    existing = bench_cases()
+    stale = []
+    for label, entries in (
+        ("KNOWN_UNREGISTERED", KNOWN_UNREGISTERED),
+        ("KNOWN_NO_DOMAIN", KNOWN_NO_DOMAIN),
+        ("KNOWN_JUDGE_ONLY", KNOWN_JUDGE_ONLY),
+        ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
+    ):
+        stale += [f"{label}: {name}" for name in sorted(entries) if name not in existing]
+    # A FIXTURE_NOT_READY entry that a roster file also names is a case that
+    # runs: the fixture landed and the entry outlived it.
+    registered = registered_cases() or set()
+    stale += [
+        f"FIXTURE_NOT_READY: {name} (also in a roster file)"
+        for name in sorted(FIXTURE_NOT_READY)
+        if name in registered
+    ]
+    return stale
+
+
+def fixture_not_ready_without_issue() -> list[str]:
+    """FIXTURE_NOT_READY entries whose reason names no issue."""
+    return sorted(name for name, reason in FIXTURE_NOT_READY.items() if not ISSUE_REFERENCE.search(reason))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        type=pathlib.Path,
+        help="task.yaml files to check; defaults to every case under bench/tasks/",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        results = validate_paths(args.paths) if args.paths else validate_all()
+        stale = [] if args.paths else stale_allowlist_entries()
+        # Repository-level, so it runs even when a path subset was named: a
+        # case that names a drifted role is rejected above, but the drift
+        # itself is worth reporting even when no case has hit it yet.
+        drift = fixture_catalog_disagreements()
+        # Over the named cases' own directories when a subset was given, so a
+        # scratch draft outside the tree is scanned with the fixtures beside
+        # it; over both trees otherwise.
+        unsanitized = sanitization_findings(
+            tuple(dict.fromkeys(p.resolve().parent for p in args.paths))
+            if args.paths
+            else SANITIZED_ROOTS
+        )
+    except CaseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    failed = 0
+    for name in sorted(results):
+        problems = results[name]
+        if not problems:
+            continue
+        failed += 1
+        print(f"{name}:")
+        for problem in problems:
+            print(f"  - {problem}")
+
+    for entry in stale:
+        failed += 1
+        print(f"stale allowlist entry, delete it: {entry}")
+
+    for entry in drift:
+        failed += 1
+        print(f"fixture catalogue drift: {entry}")
+
+    for entry in unsanitized:
+        failed += 1
+        print(f"unsanitized fixture: {entry}")
+
+    if failed:
+        print(f"\n{failed} case(s) rejected out of {len(results)} checked.")
+        return 1
+    print(f"{len(results)} bench case(s) OK.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

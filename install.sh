@@ -3,19 +3,79 @@
 # 🤖 Kubernetes Agentic Harness (kube-agents) Zero-Friction Installer
 # ==============================================================================
 # Usage (Interactive):
-#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 #
 # Usage (AI Agents & Non-Interactive Automation):
-#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash -s -- \
-#     --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent"
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+#     --non-interactive --gcp-project-id="my-gcp-project" --gke-cluster-name="platform-agent-host"
 #
 # Designed for Google Cloud Shell, Linux, macOS, and AI Agent harnesses.
 # ==============================================================================
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+INSTALL_SCRIPT_NAME="install.sh"
+
+# ─── Install sources ──────────────────────────────────────────────────────────
+# Where the sources come from when this script runs alone (curl | bash) and
+# where it puts them. upgrade.sh and uninstall.sh carry the same URL for the
+# same reason -- each front door needs it before it has a checkout to read it
+# from -- and tests/test_install_script.py pins the three equal.
+KUBE_AGENTS_REPO_URL="https://github.com/gke-labs/kube-agents.git"
+# A function rather than a constant so that HOME expands only when a clone is
+# needed: a run from a checkout never clones, and HOME is unset in some
+# service environments (a systemd system unit, a container with no passwd
+# entry), where `set -u` would otherwise stop the script on this line.
+kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones its sources under HOME when it does not run from a checkout}"; }
+# A path every kube-agents revision tracks, back to release 0.1.0. An existing
+# clone is moved to the requested release only when its HEAD tracks this file,
+# so a repository that merely shares the directory name is left alone.
+KUBE_AGENTS_CLONE_MARKER="install.sh"
+KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
+# The fetch depth the fresh clone uses, and that a clone which is already
+# shallow (one an earlier install left) keeps; a complete clone is fetched
+# without it so it does not become shallow.
+KUBE_AGENTS_FETCH_DEPTH_OPT="--depth=1"
+# The github-token-minter release whose CLI imports the App key
+# (import_github_pem): the repository the CLI is cloned from, its tag, and the
+# directory the manual recipe names. A git tag, not an image, so it is not in
+# images.json.
+MINTY_CLI_REPO_URL="https://github.com/abcxyz/github-token-minter.git"
+MINTY_CLI_GIT_TAG="v2.7.1"
+MINTY_CLI_MANUAL_CLONE_DIR="/tmp/minty"
+SPINNER_INTERVAL_SECS="0.2"
+
+# Node pool metadata migration dynamic timeout and polling parameters (#1286).
+# GKE rolling node updates cordon, drain, and recreate nodes sequentially (~4-5m
+# per node), so pools with >5 nodes regularly exceed gcloud's hardcoded 30m
+# client wait window. Allow environment overrides so tests can run in milliseconds.
+readonly NODE_POOL_UPDATE_MIN_TIMEOUT_SECS="${NODE_POOL_UPDATE_MIN_TIMEOUT_SECS:-1800}"
+readonly NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS="${NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS:-300}"
+readonly NODE_POOL_UPDATE_EXTENSION_SECS="${NODE_POOL_UPDATE_EXTENSION_SECS:-300}"
+readonly NODE_POOL_UPDATE_MAX_TIMEOUT_SECS="${NODE_POOL_UPDATE_MAX_TIMEOUT_SECS:-7200}"
+readonly NODE_POOL_UPDATE_POLL_INTERVAL_SECS="${NODE_POOL_UPDATE_POLL_INTERVAL_SECS:-15}"
+readonly NODE_POOL_UPDATE_POLL_MAX_RETRIES="${NODE_POOL_UPDATE_POLL_MAX_RETRIES:-3}"
+readonly GKE_OP_STATUS_DONE="DONE"
+readonly GKE_OP_STATUS_RUNNING="RUNNING"
+# What a run records about NetworkPolicy enforcement on the cluster it installs
+# onto: the install report's network_policy_enforcement field carries one of the
+# three values, and the composition stamps the third onto the PlatformAgent as
+# the annotation, so the choice to install without enforcement outlives the
+# terminal (issue #1682).
+readonly NETWORK_POLICY_ENFORCEMENT_ANNOTATION="kubeagents.x-k8s.io/network-policy-enforcement"
+readonly NP_ENFORCEMENT_ENFORCED="enforced"
+readonly NP_ENFORCEMENT_ENABLED_BY_INSTALL="enabled-by-install"
+readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
+# The report field's key, and the value in the report until a run has decided.
+readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
+NETWORK_POLICY_ENFORCEMENT=""
+# Whether note_stale_network_policy_acceptance has spoken this run.
+NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
+
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
-# A function because k8s-operator/scripts/common.sh defines the same variables
+# A function because scripts/installer/common.sh defines the same variables
 # unconditionally: sourcing it would re-enable colour under NO_COLOR or in a pipe,
 # so the installer re-applies its own policy afterwards.
 configure_colors() {
@@ -29,9 +89,22 @@ configure_colors() {
 }
 configure_colors
 
+# Defined here, ahead of everything that reports, because loading install.env
+# below is the first thing this script does and it has to be able to say so.
+# scripts/installer/common.sh defines its own print_* helpers formatted for
+# the state file, so source_provisioning_helpers re-applies these afterwards.
+define_print_helpers() {
+  print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>> $1 <<<${C_RESET}"; }
+  print_success() { echo -e "  ${C_GREEN}✓ $1${C_RESET}"; }
+  print_info() { echo -e "  ${C_CYAN}ℹ $1${C_RESET}"; }
+  print_warning() { echo -e "  ${C_YELLOW}⚠ $1${C_RESET}"; }
+  print_error() { echo -e "  ${C_RED}✗ $1${C_RESET}"; }
+}
+define_print_helpers
+
 # ─── Process Lock File & Error Trap Handling ────────────────────────────────
-LOCK_FILE="/tmp/kube-agents-install.lock"
-if command -v flock >/dev/null 2>&1; then
+LOCK_FILE="${KUBE_AGENTS_LOCK_FILE:-/tmp/kube-agents-install.lock}"
+if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ] && command -v flock >/dev/null 2>&1; then
   if ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
     if ! flock -n 200 2>/dev/null; then
       echo -e "  \033[93m⚠ Another instance of kube-agents installer is currently running. Exiting.\033[0m" >&2
@@ -44,37 +117,340 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n\033[91m\033[1m✗ Error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of install.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+  esac
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
-  if [[ "${vars_file:-}" == *.tmp ]]; then
-    rm -f -- "$vars_file"
+  # A half-written install.env must not be left where the next run would load
+  # it. The real file is only ever moved into place complete.
+  if [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "${INSTALL_ENV_FILE}.tmp" ]; then
+    rm -f -- "${INSTALL_ENV_FILE}.tmp"
+  fi
+  # Same for the tfvars the generator was midway through writing. It is mode
+  # 600 and carries every secret the run was given, and it is named one
+  # character from the file the next reader would open. write_tfvars_from_state
+  # publishes the path while the write is in flight and clears it after the mv.
+  if [ -n "${TFVARS_TMP_FILE:-}" ] && [ -f "${TFVARS_TMP_FILE}" ]; then
+    rm -f -- "${TFVARS_TMP_FILE}"
   fi
   exit "$exit_code"
 }
 trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 
+# Sourced/baked release version. On developer checkouts (main), this is empty.
+# Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
+BAKED_RELEASE_VERSION=""
+
+# ─── Install Defaults (install.defaults.env) ──────────────────────────────────
+# Sourced before the parameter block so the DEFAULT_* values are in scope where
+# the parameters are declared, and no default has to be spelled a second time
+# here. Without `set -a`: these are the project's defaults, not the install's
+# configuration, and they must not enter the environment Terraform sees.
+#
+# Absent when install.sh is downloaded on its own (curl | bash), where there is
+# no checkout yet. That is not fatal — resolve_shared_defaults applies the same
+# values once the workspace step has cloned the repository and sourced
+# installer_common.sh, which reads this same file. Same source either way.
+_install_defaults_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+if [ -n "$_install_defaults_dir" ] && [ -r "${_install_defaults_dir}/install.defaults.env" ]; then
+  # shellcheck source=install.defaults.env disable=SC1091
+  . "${_install_defaults_dir}/install.defaults.env"
+fi
+unset _install_defaults_dir
+
+# ─── Install Configuration Input (install.env) ────────────────────────────────
+# The hand-authored record of what this install is, loaded BEFORE the parameter
+# block below so that every `${VAR:-}` seed in it inherits from the file. That
+# ordering is the whole mechanism: inheriting prior configuration stops being
+# something each flag has to remember to do and becomes the default path.
+#
+# An input the installer reads and does not rewrite. It creates one at the end
+# of a first install, when there is nothing there, and never touches it again:
+# a file the documentation tells you to edit and the next run overwrites is
+# exactly the complaint against vars.sh, whose header said "auto-generated"
+# while INSTALL.md told you to hand-edit it.
+#
+# `set -a` rather than a K=V parser: these values have to reach
+# write_tfvars_from_state and the TF_VAR_* handoff at the end of it, both of
+# which read the environment. A conventional dotenv without `export` would parse
+# and then not travel.
+#
+# Always resolves to a path, whether or not a file is there yet -- a first
+# install has nothing to read, and this is also where the file gets written.
+#
+# The directory is the CHECKOUT the run will end up in, which under
+# `curl … | bash` is not the directory the operator is standing in. There
+# ${BASH_SOURCE[0]} names no file, so a script-relative path resolves to the
+# invocation directory; acquire_source_repo then clones to $HOME/kube-agents
+# and cd's there, and every other front door resolves the file as
+# ${repo_dir}/install.env (default_install_env_file). Freezing the invocation
+# directory here would put the whole configuration -- API_SERVER_KEY and the
+# plaintext model keys included -- where no later run looks: upgrade.sh would
+# take its fail-closed branch, and a re-run of the one-liner would rebuild
+# every PARAM_* from defaults.
+#
+# So resolve the same repo_dir acquire_source_repo will pick, by the same test
+# and in the same order, before the parameter block reads any of it. This has
+# to stay in step with acquire_source_repo; the shared marker file is the
+# coupling, and test_install_script.py pins the pair.
+_resolve_repo_dir_for_state() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
+    printf '%s' "$script_dir"
+  elif [ -f "scripts/installer/installer_common.sh" ]; then
+    pwd
+  else
+    kube_agents_clone_dir
+  fi
+}
+_state_repo_dir="$(_resolve_repo_dir_for_state)"
+
+INSTALL_ENV_FILE="${KUBE_AGENTS_INSTALL_ENV:-}"
+INSTALL_ENV_EXPLICIT="false"
+if [ -n "$INSTALL_ENV_FILE" ]; then
+  INSTALL_ENV_EXPLICIT="true"
+else
+  _install_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+  # An install.env the operator actually put beside the script, or in the
+  # directory they are standing in, still wins -- those are deliberate acts and
+  # predate this resolution. Only when neither is there does the checkout
+  # decide, which is the case that was landing outside it.
+  if [ -n "$_install_env_dir" ] && [ -f "${_install_env_dir}/install.env" ]; then
+    INSTALL_ENV_FILE="${_install_env_dir}/install.env"
+  elif [ -f "install.env" ]; then
+    INSTALL_ENV_FILE="$(pwd)/install.env"
+  else
+    INSTALL_ENV_FILE="${_state_repo_dir}/install.env"
+  fi
+  unset _install_env_dir
+fi
+
+unset _state_repo_dir
+
+# Named apart from installer_common.sh's load_install_env, which this file
+# sources later and which upgrade.sh and uninstall.sh use. The two differ on
+# purpose: that one returns 1 for "no file" so a caller can report it, while
+# this one runs before any helper is available and treats an explicitly named
+# file that is missing as fatal. Sharing a name would leave the later
+# definition silently replacing this one.
+bootstrap_install_env() {
+  local file="${1:-}"
+  # NAMESPACE reaches terraform.tfvars, and it is a name kubectl tooling
+  # commonly exports. An inherited value would put a fresh release into a
+  # namespace the agent's fixed gateway endpoint does not serve, and record
+  # nothing that says why, so it is cleared before the file is read (and
+  # whether or not there is one). Two things may set it after that, both
+  # deliberate acts rather than inherited ones: this file's own key, and
+  # --agent-namespace, which main() exports over the top once parse_args has
+  # run.
+  unset NAMESPACE
+  [ -n "$file" ] || return 0
+  if [ ! -f "$file" ]; then
+    if [ "$INSTALL_ENV_EXPLICIT" = "true" ]; then
+      # Asked for by name and not there. That is a mistake, not a first
+      # install, and continuing would provision from defaults.
+      print_error "KUBE_AGENTS_INSTALL_ENV names '$file', which does not exist." >&2
+      exit 1
+    fi
+    return 0
+  fi
+  # The scope keys render into the PlatformAgent and are recorded only by a
+  # first install, so once this file exists it is the only way in for them,
+  # as load_install_env makes it for upgrade.sh, uninstall.sh and the menu: a
+  # value inherited from the shell would declare a project the file does not
+  # record, applied for this run and dropped again, with its profiles, by the
+  # next run from a clean shell. A first install, which has no file yet, keeps
+  # the environment and records it; a typed --scope-* flag still overrides
+  # for one run and is warned about.
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  # Checked before sourcing: a stray quote would otherwise abort the run through
+  # the ERR trap with a bash parse error and no indication of which file.
+  if ! bash -n "$file" 2>/dev/null; then
+    print_error "Install configuration '$file' is not valid shell and could not be loaded." >&2
+    print_info "Each line is NAME=value; quote any value containing spaces." >&2
+    exit 1
+  fi
+  # Tighten a world- or group-readable configuration before reading it. The
+  # documented way to create one is `cp install.env.example install.env`, and
+  # install.env.example is tracked 100644, so a stock umask 022 leaves the file
+  # 0644 -- and it is where the operator then writes GEMINI_API_KEY,
+  # SLACK_BOT_TOKEN, API_SERVER_KEY and the rest. Nothing else reaches it:
+  # bootstrap_install_env_file returns early once the destination exists, so
+  # its chmod 600 never runs, and save_env_var's is reachable only from the
+  # Day-2 menu. INSTALL.md states flatly that the file is 0600, and the
+  # predecessor vars.sh always was, being installer-created under umask 077.
+  # Announced rather than silent: the permissions of a file the operator owns
+  # are theirs to know about.
+  local mode=""
+  # GNU first, BSD second, and the order is load-bearing. On coreutils `-f` is
+  # --file-system and takes no argument, so `stat -f '%OLp' FILE` prints a
+  # multi-line filesystem block on stdout and exits 1 -- non-empty output on
+  # the failure path, which the `||` chain then concatenates with the real mode
+  # and the warning below prints verbatim. BSD `stat -c` fails with empty
+  # stdout, so putting GNU first costs macOS nothing.
+  mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%OLp' "$file" 2>/dev/null || echo "")"
+  if [ -n "$mode" ] && [ "${mode: -2}" != "00" ]; then
+    if chmod 600 "$file" 2>/dev/null; then
+      print_warning "Tightened permissions on ${file} to 0600 (was ${mode}); it holds credentials." >&2
+    else
+      print_warning "${file} is mode ${mode} and holds credentials; chmod 600 it." >&2
+    fi
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$file"
+  set +a
+  # stderr, not stdout. This runs at source time, before main(), so anything on
+  # stdout here lands in front of whatever the caller went on to capture --
+  # including a function's echoed return value when the test suite sources this
+  # file to exercise one. It is a diagnostic either way, not data.
+  print_success "Loaded install configuration from: ${file}" >&2
+}
+# --help needs nothing either of these loads, and both have side effects a
+# request for the flag list should not pay for: bootstrap_install_env chmods a
+# group-readable install.env, and it exits 1 when KUBE_AGENTS_INSTALL_ENV names
+# a path that is gone -- so a shell still carrying that variable from an earlier
+# run answers `./install.sh --help` with an error about a file nobody asked
+# about. .agents/skills/install-kube-agents/SKILL.md calls this output the
+# authoritative list of flags, so it has to survive a stale environment.
+#
+# Scanned here rather than in parse_args because the loads run at source time,
+# before it. An exact match only: --help-me is not --help, and a value that
+# merely contains the word (--gcp-project-id=help-desk) is not the flag.
+wants_help_only() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h | --help | -\?) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+if ! wants_help_only "$@"; then
+  bootstrap_install_env "$INSTALL_ENV_FILE"
+fi
+
 # ─── Agentic & Automation Parameter States ────────────────────────────────────
 PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
+PARAM_GENERATE_ONLY="${GENERATE_ONLY:-false}"
 PARAM_DRY_RUN="${DRY_RUN:-false}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
 PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
+# Only consulted when this run creates the cluster. Against one that already
+# exists the tfvars generator's live probe decides the shape; see
+# write_tfvars_from_state in scripts/installer/installer_common.sh. Empty
+# means "not chosen yet" — the interview asks, and falls back to
+# installer_common.sh's DEFAULT_CLUSTER_MODE when there is nobody to ask. The
+# shape is deliberately not named here: that table is the one home for it.
+PARAM_CLUSTER_MODE="${CLUSTER_MODE:-}"
 # Left empty on purpose: resolved from installer_common.sh's DEFAULT_* once
 # the installer helpers are sourced, so no default is spelled twice.
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
 PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
+PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
-PARAM_GITOPS_ORG="${GITHUB_ORG:-}"
-PARAM_GITOPS_REPO="${GITHUB_REPO:-}"
-PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
+PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
+PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
+PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
+PARAM_KMS_KEY="${KMS_KEY:-}"
+# Left empty where installer_common.sh owns the default, the way
+# PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
+# helpers are sourced, so no default is spelled twice.
+PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
-PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
-PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
-PARAM_MEMORY="${MEMORY:-file}"
+# The multi-project scope (spec.scope): empty means the management project
+# alone, so there is no default to resolve.
+PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
+PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
+PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
+PARAM_SCOPE_SHARED_VPC_HOSTS="${SCOPE_SHARED_VPC_HOSTS:-}"
+PARAM_SCOPE_METRICS_SCOPES="${SCOPE_METRICS_SCOPES:-}"
+PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
+# Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
+# install.env alone and refuses a flag it would otherwise validate and drop.
+SCOPE_FLAG_PASSED="false"
+# Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
+# fills in install.defaults.env's answer once the helpers are sourced.
+PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
+PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
+# Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
+# string, and that has to survive to the validator in main rather than being
+# silently read back as the default. The default itself comes from
+# install.defaults.env, sourced above — and again through
+# resolve_shared_defaults for the curl | bash case, where there was no checkout
+# to read it from yet.
+#
+# Leaving PARAM_ENABLE_GVISOR *unset* when neither name is set is what makes
+# that second route work. Assigning the empty string here would be
+# indistinguishable from `--enable-gvisor=`: under curl | bash there is no
+# install.defaults.env beside the script, so DEFAULT_ENABLE_GVISOR is unset at
+# this point, and resolve_shared_defaults' own ${PARAM_ENABLE_GVISOR-...} would
+# see a variable already set and leave it empty for the validator to reject.
+if [ -n "${ENABLE_GVISOR+x}" ]; then
+  PARAM_ENABLE_GVISOR="$ENABLE_GVISOR"
+elif [ -n "${DEFAULT_ENABLE_GVISOR+x}" ]; then
+  PARAM_ENABLE_GVISOR="$DEFAULT_ENABLE_GVISOR"
+fi
+# HERMES_DASHBOARD_ENABLED as well as ENABLE_WEBUI: the flag is spelled
+# --enable-hermes-dashboard and the install records the setting under the Hermes name, so
+# a file written from a previous install carries the second spelling and only
+# the second. The same asymmetry applies to MEMORY / MEMORY_PROVIDER below and
+# to GOOGLE_CHAT_ENABLED below.
+PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-${HERMES_DASHBOARD_ENABLED:-}}"
+# MEMORY is the input spelling (file | hindsight | off). MEMORY_PROVIDER is what
+# the install records, so translate it back when that is all there is.
+memory_mode_from_provider() {
+  case "${1:-}" in
+    kube_agents_memory) echo "hindsight" ;;
+    none) echo "off" ;;
+    multiuser_memory) echo "file" ;;
+    *) echo "" ;;
+  esac
+}
+PARAM_MEMORY="${MEMORY:-$(memory_mode_from_provider "${MEMORY_PROVIDER:-}")}"
+PARAM_MEMORY_EXPLICIT="false"
+if [ -n "$PARAM_MEMORY" ]; then
+  PARAM_MEMORY_EXPLICIT="true"
+fi
+PARAM_ALLOWED_USERS="${ALLOWED_USERS:-}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
+PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
+PARAM_MIGRATE_NODE_POOLS_PASSED="false"
+PARAM_ENABLE_NETWORK_POLICY="${ENABLE_NETWORK_POLICY:-}"
+PARAM_ENABLE_NETWORK_POLICY_PASSED="false"
+PARAM_ACCEPT_NO_NETWORK_POLICY="${ACCEPT_NO_NETWORK_POLICY:-}"
+PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="false"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
 # check and the one at the workspace step do not report the same verdict twice.
@@ -85,6 +461,37 @@ PARAM_REGISTRY_PREFIX="${REGISTRY_PREFIX:-}"
 # because widening REGISTRY_PREFIX to cover images its mirror was never given is
 # exactly the failure third_party_registry_prefix() exists to avoid.
 PARAM_THIRD_PARTY_REGISTRY_PREFIX="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+# Seeded from GOOGLE_CHAT_ENABLED so Google Chat inherits the way Slack does.
+# The chat gate reads SLACK_ENABLED out of the loaded configuration; without
+# this seed PARAM_ENABLE_GOOGLE_CHAT would come from the flag alone, and a
+# re-run that did not repeat --enable-google-chat would regenerate
+# google_chat_enabled = false and plan the Pub/Sub topic and subscription away.
+PARAM_ENABLE_GOOGLE_CHAT="${GOOGLE_CHAT_ENABLED:-}"
+PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
+PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
+CLI_CHAT_SUB_NAME=""
+PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
+PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
+PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
+# Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
+# as an empty MODEL_DEFAULT_NAME takes the provider's default model.
+PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
+PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
+# Slack, seeded from the loaded configuration exactly as Google Chat is above,
+# and for the same reason: the chat interview reads these rather than the
+# SLACK_* variables directly, so a --slack-* flag and an install.env key reach
+# it by one route, and a re-run that repeats no flag keeps what the last
+# install recorded rather than clearing it.
+PARAM_ENABLE_SLACK="${SLACK_ENABLED:-}"
+PARAM_SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
+PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
+PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
+PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
+PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
+# bootstrap_install_env clears NAMESPACE before reading
+# install.env, so this seeds from the file alone; --agent-namespace is the
+# other way in.
+PARAM_AGENT_NAMESPACE="${NAMESPACE:-}"
 
 show_help() {
   cat << EOF
@@ -95,30 +502,89 @@ Usage:
 
 Flags for AI Agents & Automation:
   -y, --yes, --non-interactive  Run in non-interactive mode (use flags/defaults)
+  --generate-only               Generate install.env and terraform.tfvars, run
+                                pre-apply checks, print lifecycle commands, and
+                                exit without applying
   --dry-run                     Validate prerequisites & output config/plan without creating resources
-  --project-id=ID               Target GCP Project ID
-  --region=REGION               Target GCP Region (default: k8s-operator/scripts/common.sh
+  --gcp-project-id=ID           Target GCP Project ID
+  --gcp-region=REGION           Target GCP Region (default: install.defaults.env
                                 DEFAULT_REGION, currently us-central1)
-  --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
+  --gke-cluster-name=NAME       GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
+  --gke-cluster-mode=MODE       Shape of a cluster this run creates: autopilot | standard
+                                (default: DEFAULT_CLUSTER_MODE, currently autopilot).
+                                Autopilot clusters are regional. Passing this flag with
+                                autopilot and a zonal --gcp-region is an error; leaving it
+                                unset at a zonal --gcp-region builds Standard instead.
+                                Ignored when installing onto a cluster that already
+                                exists — its live shape wins.
+  --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
+                                (default: DEFAULT_NAMESPACE, currently kubeagents-system).
+                                The chart wires the agent's model-gateway endpoint to this
+                                namespace, so changing it is for CI and second installs
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
-                                (default: gemini)
+                                (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
-  --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
-  --vertex-location=REGION      Vertex AI serving location (default: --region)
+  --model-max-tokens=N          Output tokens the gateway asks the provider for on a
+                                request that names none, for a self-hosted backend
+                                whose prompt and output share one window
+                                (default: DEFAULT_MODEL_MAX_TOKENS, currently 0:
+                                no max_tokens is rendered)
+  --vertex-project-id=ID        GCP project serving Vertex AI models (default: --gcp-project-id)
+  --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
+                                (default: DEFAULT_VERTEX_LOCATION, currently global)
+  --vertex-manage-serving-project=BOOL
+                                Whether the install enables the Vertex AI API in
+                                --vertex-project-id and grants the gateway's service
+                                account roles/aiplatform.user there. Pass false when
+                                that project is one you cannot administer, and enable
+                                the API and make the grant by hand
+                                (default: DEFAULT_VERTEX_MANAGE_SERVING_PROJECT, currently true)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
-  --gitops-org=ORG              GitHub Org/Username for GitOps repo
-  --gitops-repo=REPO            GitOps IaC Repository Name (default: gke-fleet-iac)
-  --permission-set=SET          Agent GCP IAM permission set: read-only | gke-admin | custom
-                                (default: read-only)
+  --gitops-org=ORG              GitHub Org for GitOps repo
+  --gitops-repo=REPO            GitOps IaC Repository Name (default: DEFAULT_GITOPS_REPO,
+                                currently gke-fleet-iac)
+  --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
+  --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
+  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
+                                currently github-token-minter-keyring)
+  --kms-key=KEY                 Cloud KMS Key Name for token minter (default: DEFAULT_KMS_KEY,
+                                currently github-token-minter-key)
+  --permission-set=SET          Agent GCP IAM permission set: read-only | custom
+                                (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
-  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
-  --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
-  --user-profile-enabled=BOOL   Enable user profile persona extensions (default: false)
+  --scope-projects=IDS          GCP projects beyond the install's whose GKE clusters get a
+                                Cluster Agent (space- or comma-separated); the agent's
+                                service account is granted the read roles in each
+  --scope-folders=IDS           Numeric GCP folder IDs; every project beneath, at any depth,
+                                is in scope, the read roles and roles/cloudasset.viewer are
+                                bound on the folder, and the Cloud Asset API is enabled
+  --scope-organizations=IDS     Numeric GCP organisation IDs, bound the same way (wide;
+                                prefer folders)
+  --scope-shared-vpc-hosts=IDS  Shared VPC host project IDs; every attached service project
+                                is in scope, resolved when Terraform plans and granted the
+                                read roles (and roles/compute.viewer in the host, for the lookup)
+  --scope-metrics-scopes=IDS    Metrics Scope scoping-project IDs; every project the scope
+                                monitors is in scope, resolved and granted the same way
+  --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
+                                unmanaged
+  --scope-exclude-clusters=TRIPLES
+                                Clusters to leave unmanaged, each as project/location/cluster
+  --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
+                                (default: DEFAULT_ENABLE_GVISOR, currently true)
+  --enable-hermes-dashboard[=true|false]
+                                Enable Hermes Web UI port 9119 dashboard
+                                (default: DEFAULT_ENABLE_WEBUI, currently false)
+  --enable-gke-backup-plan[=true|false]
+                                Provision a GKE Backup Plan for the cluster
+                                (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
+  --user-profile-enabled=BOOL   Enable user profile persona extensions
+                                (default: DEFAULT_USER_PROFILE_ENABLED,
+                                currently false)
   --memory=MODE                 Long-term agent memory: file | hindsight | off
-                                (default: file)
+                                (default: DEFAULT_MEMORY, currently file)
                                   file      SMALL / PERSONAL deployments, and the default —
                                             it is what every install got before the searchable
                                             store existed, so an upgrade that says nothing
@@ -133,58 +599,293 @@ Flags for AI Agents & Automation:
                                             and a Postgres database into the cluster.
                                   off       nothing is retained between sessions. No memory
                                             provider, and no database to run.
-  --image-tag=TAG               Validated immutable release tag or full commit SHA
-                                (default: this checkout's HEAD; required via curl | bash)
+  --image-tag=TAG               Validated immutable release tag or full commit SHA.
+                                Developer and CI/CD testing only; end users should use
+                                official release installations where image tags are baked in
+                                (default: inferred from baked release, release bundle, or local HEAD)
   --registry-prefix=PATH        Container registry path without a URL scheme, for the images
                                 this project builds (operator, agent, credential proxy, replay
                                 proxy)
   --third-party-registry-prefix=PATH
                                 Registry path holding the mirrored third-party images
                                 (LiteLLM, fluent-bit, the GitHub token minter, Hindsight).
-                                Unset, they follow --registry-prefix when that is set and
-                                stay upstream otherwise. See 'make mirror-images'
+                                Unset, they stay on their upstream registries --
+                                --registry-prefix deliberately does not cover them.
+                                See 'make mirror-images'
   --allow-unverified-source     Provision from a dirty or mismatched checkout (local script edits
                                 are applied even though the deployed image was built elsewhere)
-  --enable-google-chat          Enable Google Chat integration
-  --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat (default: platform-agent-chat-events)
-  --google-chat-mode=MODE       Google Chat output mode: default | debug (default: default)
+  --enable-google-chat[=true|false]
+                                Enable Google Chat integration
+  --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
+                                this requires --slack-bot-token and --slack-app-token
+  --enable-pubsub-platform[=true|false]
+                                Enable Pub/Sub platform adapter AgentPlugin (default: false)
+  --enable-stockout-investigator[=true|false]
+                                Enable GKE Stockout Investigator AgentPlugin (default: false)
+  --google-chat-allowed-users=EMAILS
+                                Comma-separated user emails allowed to talk to the
+                                agent over Google Chat. Empty allows all users
+  --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat
+                                (default: DEFAULT_CHAT_TOPIC_NAME,
+                                currently platform-agent-chat-events)
+  --chat-sub-name=SUB           Pub/Sub subscription name for Google Chat
+                                (default: derived as <topic>-sub when --chat-topic-name
+                                is custom; DEFAULT_CHAT_SUB_NAME on default topic)
+  --google-chat-mode=MODE       Google Chat output mode: default | debug
+                                (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
+  --google-chat-home-channel=SPACE_ID
+                                Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
+  --slack-bot-token=TOKENS      Comma-separated Slack bot tokens (xoxb-...), one per
+                                workspace the agent serves. The relay keys each one by
+                                the team it authenticates as
+  --slack-app-token=TOKEN       Slack socket-mode app-level token (xapp-...)
+  --slack-allowed-users=USERS   Comma-separated Slack user IDs allowed to talk to the
+                                agent. Empty allows all users
+  --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
+  --slack-home-channel-name=NAME
+                                Display name of that channel (e.g. #gke-alerts)
+  --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
+                                GKE_METADATA. Recreates those nodes and restarts every workload on
+                                them, kube-agents' or not. Without it a cluster with legacy pools is
+                                refused unchanged (REFUSED_MISSING_NODE_POOL_MIGRATION); there is no
+                                install without Workload Identity. The cluster's owner decides this.
+  --enable-network-policy       Authorize enabling the legacy Calico NetworkPolicy addon and
+                                enforcement on an existing GKE Standard cluster that has neither it
+                                nor Dataplane V2. May recreate nodes and restart workloads. One of
+                                two answers for such a cluster; the other is below, and without
+                                either the cluster is refused unchanged (REFUSED_MISSING_NETWORK_POLICY).
+                                The cluster's owner decides this.
+  --accept-no-network-policy    Install onto such a cluster without modifying it. Every NetworkPolicy
+                                kube-agents ships is then inert, including the ones that confine the
+                                agent's shell sandbox; the choice is recorded in the install report
+                                and on the PlatformAgent. Mutually exclusive with the flag above.
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
   -h, --help, -?                Show this help message
+
+Configuration file:
+  install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
+  loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
+  carries also beats an exported variable of the same name -- a flag is what
+  overrides a recorded value for one run. Start from install.env.example.
+  Anything it sets is inherited by later runs, so a re-run that omits a flag
+  keeps the value rather than reverting it to the default above.
 EOF
+}
+
+# The value an --enable-* flag carries: `--flag` is true, `--flag=VALUE` is
+# VALUE. The empty string of `--enable-gvisor=` is preserved rather than read
+# back as true, because main's validator has to see it and reject it -- the
+# invariant PARAM_ENABLE_GVISOR's set-ness dance above exists to protect.
+#
+# Defined here and not in scripts/installer/installer_common.sh, where shared
+# installer code belongs: parse_args is the first statement of main(), the
+# workspace step that sources installer_common.sh has not run by then, and
+# under `curl … | bash` there is no checkout to source it from at all. Nothing
+# duplicates it -- install.sh is the only front door with --enable-* toggles.
+flag_bool_value() {
+  case "${1:-}" in
+    *=*) printf '%s' "${1#*=}" ;;
+    *) printf 'true' ;;
+  esac
+}
+
+# Rejects a toggle value that is neither true nor false, naming the flag that
+# carried it. Called from parse_args, on what the caller actually typed, and
+# never on a PARAM_* that install.env or the environment seeded: those are read
+# through is_truthy, which takes True/yes/y/1/on, and the documentation tells
+# operators to hand-write that file. Judging a seeded value here would abort a
+# re-run over a spelling the rest of the pipeline accepts, naming a flag the
+# operator never passed.
+#
+# Empty is rejected rather than waved through as "nobody chose". Only the `=`
+# form can produce it -- the bare flag yields "true" -- so it is always
+# something a caller typed, and it cannot mean "leave the setting alone":
+# PARAM_ENABLE_SLACK and PARAM_ENABLE_GOOGLE_CHAT are seeded from install.env
+# precisely so a re-run that says nothing keeps the integration on, and an empty
+# assignment discards that seed. `${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}`
+# then falls back to the default rather than to the recorded value, so
+# `--enable-slack=` out of a wrapper expanding an unset variable would remove a
+# working relay in silence.
+#
+# Lives beside flag_bool_value for the same reason that one is not in
+# scripts/installer/installer_common.sh.
+validate_bool_flag_value() {
+  local flag="$1" value="${2:-}"
+  if [ -z "$value" ]; then
+    print_error "${flag}= was given an empty value."
+    print_info "Pass ${flag} on its own, or ${flag}=true, or ${flag}=false."
+    exit 1
+  fi
+  if [[ ! "$value" =~ ^(true|false)$ ]]; then
+    print_error "${flag} must be either true or false."
+    exit 1
+  fi
+}
+
+# A scope flag given nothing cannot mean "leave the recorded scope alone" (the
+# flag is what overrides the file for one run) and must not mean "drop every
+# project" in silence: applied, an empty --scope-projects= would revoke the
+# scoped projects' roles and retire their profiles while install.env still
+# named them, and the next upgrade would add them back. Refused, like an empty
+# toggle; the file is where a scope is emptied on purpose.
+require_scope_flag_value() {
+  local flag="$1" value="${2:-}" key
+  # A value that is nothing but separators (`,`, a space) renders the same
+  # empty list an empty value does, so it is refused the same way.
+  [[ "$value" == *[![:space:],]* ]] && return 0
+  case "$flag" in
+    --scope-projects) key="SCOPE_PROJECTS" ;;
+    --scope-folders) key="SCOPE_FOLDERS" ;;
+    --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
+    --scope-shared-vpc-hosts) key="SCOPE_SHARED_VPC_HOSTS" ;;
+    --scope-metrics-scopes) key="SCOPE_METRICS_SCOPES" ;;
+    --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
+  esac
+  print_error "${flag}= was given an empty value."
+  print_info "To clear it, set ${key}= (empty) in install.env and re-run; to keep the recorded value, omit the flag."
+  exit 1
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --generate-only) PARAM_GENERATE_ONLY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
-      --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
-      --region=*) PARAM_REGION="${1#*=}"; shift ;;
-      --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --gcp-region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --gke-cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --gke-cluster-mode=*) PARAM_CLUSTER_MODE="${1#*=}"; shift ;;
+      --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
+      --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
+      --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; shift ;;
+      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
+      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
-      --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
-      --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
-      --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --scope-projects=*)
+        PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
+      --scope-folders=*)
+        PARAM_SCOPE_FOLDERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_FOLDERS"; shift ;;
+      --scope-organizations=*)
+        PARAM_SCOPE_ORGANIZATIONS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_ORGANIZATIONS"; shift ;;
+      --scope-shared-vpc-hosts=*)
+        PARAM_SCOPE_SHARED_VPC_HOSTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_SHARED_VPC_HOSTS"; shift ;;
+      --scope-metrics-scopes=*)
+        PARAM_SCOPE_METRICS_SCOPES="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_METRICS_SCOPES"; shift ;;
+      --scope-exclude-projects=*)
+        PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
+      --scope-exclude-clusters=*)
+        PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
+      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
+      # Validated here and again in main(). The second check is not redundant:
+      # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
+      # ${VAR:-...}, which reads an empty assignment as "unset" and hands back
+      # DEFAULT_ENABLE_WEBUI -- so `--enable-hermes-dashboard=` out of a wrapper
+      # expanding an unset variable arrived at main() as a valid "false" and
+      # took a running dashboard down. Only parse_args still knows the value
+      # came from the command line.
+      --enable-hermes-dashboard|--enable-hermes-dashboard=*)
+        PARAM_ENABLE_WEBUI="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_WEBUI"; shift ;;
       --user-profile-enabled=*) PARAM_USER_PROFILE_ENABLED="${1#*=}"; shift ;;
-      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
+      --enable-gke-backup-plan|--enable-gke-backup-plan=*)
+        PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GKE_BACKUP_PLAN"; shift ;;
+      --enable-pubsub-platform|--enable-pubsub|--enable-pubsub-platform=*|--enable-pubsub=*)
+        PARAM_ENABLE_PUBSUB_PLATFORM="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
+      --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
+        PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
+      # Validated for emptiness here, ahead of resolve_shared_defaults.
+      # PARAM_MEMORY is seeded from MEMORY and resolved with
+      # ${PARAM_MEMORY:-$DEFAULT_MEMORY}, so `--memory=` out of a wrapper
+      # expanding an unset variable would arrive at main() as the well-formed
+      # default ("file") WITH PARAM_MEMORY_EXPLICIT="true" -- replacing a
+      # recorded MEMORY=hindsight and telling write_tfvars_from_state not to
+      # probe the live cluster before planning hindsight-postgresql away.
+      --memory=*)
+        PARAM_MEMORY="${1#*=}"
+        if [ -n "$PARAM_MEMORY" ]; then
+          PARAM_MEMORY_EXPLICIT="true"
+        else
+          print_error "--memory= was given an empty value."
+          print_info "Pass --memory=off, --memory=file, or --memory=hindsight, or omit the flag to keep the recorded setting."
+          exit 1
+        fi
+        shift
+        ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --third-party-registry-prefix=*) PARAM_THIRD_PARTY_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
-      --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
+      --enable-google-chat|--google-chat|--enable-google-chat=*|--google-chat=*)
+        PARAM_ENABLE_GOOGLE_CHAT="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"; shift ;;
+      --enable-slack|--enable-slack=*)
+        PARAM_ENABLE_SLACK="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"; shift ;;
+      --google-chat-allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
+      --slack-bot-token=*) PARAM_SLACK_BOT_TOKEN="${1#*=}"; shift ;;
+      --slack-app-token=*) PARAM_SLACK_APP_TOKEN="${1#*=}"; shift ;;
+      --slack-allowed-users=*) PARAM_SLACK_ALLOWED_USERS="${1#*=}"; shift ;;
+      --slack-home-channel=*) PARAM_SLACK_HOME_CHANNEL="${1#*=}"; shift ;;
+      --slack-home-channel-name=*) PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"; shift ;;
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+      --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
+      --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
+      --migrate-node-pools=*)
+        PARAM_MIGRATE_NODE_POOLS="${1#*=}"
+        PARAM_MIGRATE_NODE_POOLS_PASSED="true"
+        shift
+        ;;
+      --migrate-node-pools)
+        PARAM_MIGRATE_NODE_POOLS="true"
+        PARAM_MIGRATE_NODE_POOLS_PASSED="true"
+        shift
+        ;;
+      --enable-network-policy=*)
+        PARAM_ENABLE_NETWORK_POLICY="${1#*=}"
+        PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --enable-network-policy)
+        PARAM_ENABLE_NETWORK_POLICY="true"
+        PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --accept-no-network-policy=*)
+        PARAM_ACCEPT_NO_NETWORK_POLICY="${1#*=}"
+        PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --accept-no-network-policy)
+        PARAM_ACCEPT_NO_NETWORK_POLICY="true"
+        PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
       -h|--help|-\?|help) show_help; exit 0 ;;
       *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
     esac
@@ -234,32 +935,33 @@ EOF
   printf '%b\n\n' "${C_RESET}"
 }
 
-# Re-applied after sourcing common.sh, which defines its own print_* helpers
-# formatted for the state file.
-define_print_helpers() {
-  print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>> $1 <<<${C_RESET}"; }
-  print_success() { echo -e "  ${C_GREEN}✓ $1${C_RESET}"; }
-  print_info() { echo -e "  ${C_CYAN}ℹ $1${C_RESET}"; }
-  print_warning() { echo -e "  ${C_YELLOW}⚠ $1${C_RESET}"; }
-  print_error() { echo -e "  ${C_RED}✗ $1${C_RESET}"; }
-}
-define_print_helpers
-
-# Minimum tool versions, kept in k8s-operator/scripts/min_versions.sh so the
+# Minimum tool versions, kept in scripts/installer/min_versions.sh so the
 # numbers live in exactly one place. This installer is also downloaded and run
 # on its own, before any checkout exists, so the source is guarded: in that
-# case the workspace step clones the repository and the check runs against the
-# clone's copy.
+# case source_provisioning_helpers re-sources this file out of the clone at
+# step 2, which is what the Go floor at step 12 relies on.
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
-_min_versions="${_script_dir}/k8s-operator/scripts/min_versions.sh"
+_min_versions="${_script_dir}/scripts/installer/min_versions.sh"
 if [ -r "$_min_versions" ]; then
   # CI runs shellcheck without -x, so the source= hint alone still raises
   # SC1091 for a file it was not handed as input.
-  # shellcheck source=k8s-operator/scripts/min_versions.sh disable=SC1091
+  # shellcheck source=scripts/installer/min_versions.sh disable=SC1091
   source "$_min_versions"
 else
+  # Reached when install.sh runs without the repository beside it, which is
+  # the documented `curl … | bash` path. Every require_min_* the script calls
+  # needs an arm here: the calls are unguarded, so a missing one is not a
+  # skipped check but an undefined command, and `set -u`/`|| return 1` turns
+  # that 127 into a failure of whatever was being attempted.
+  #
+  # These stubs hold only until the clone arrives. The gcloud and terraform
+  # floors run at step 1 and so are genuinely unenforceable on this path --
+  # there is no checkout yet to state a number. The Go floor is not: it runs
+  # at step 12, and source_provisioning_helpers has replaced this stub with
+  # the clone's copy by then.
   require_min_gcloud_version() { return 0; }
   require_min_terraform_version() { return 0; }
+  require_min_go_version() { return 0; }
 fi
 unset _min_versions
 
@@ -282,19 +984,208 @@ validate_immutable_ref() {
   fi
 }
 
+# Resolves the shape a run that CREATES a cluster will build, given what the
+# caller asked for ($1, may be empty) and the location ($2). Echoes the mode
+# and nothing else, so the caller can compare and explain.
+#
+# A function rather than an inline `:-` because this one line is what a bare
+# ./install.sh actually builds, and the inline form was untestable: install.sh
+# exports CLUSTER_MODE before the generator ever reads it, so
+# installer_common.sh's own fallback never decides anything for this front
+# door, and a test of that fallback proves nothing about this.
+resolve_creatable_cluster_mode() {
+  local requested="${1:-}" location="${2:-}"
+  if [ -n "$requested" ]; then
+    echo "$requested"
+    return 0
+  fi
+  # A defaulted Autopilot steps aside at a zonal location rather than failing:
+  # nobody asked for Autopilot here, and the alternative is an abort blaming
+  # --gcp-region for a shape the installer chose itself. An explicit
+  # --gke-cluster-mode=autopilot still fails in require_creatable_cluster_mode —
+  # that request is impossible, not merely inconvenient.
+  if [ "${DEFAULT_CLUSTER_MODE}" = "autopilot" ] && ! location_is_region "$location"; then
+    echo "standard"
+    return 0
+  fi
+  echo "${DEFAULT_CLUSTER_MODE}"
+}
+
+# A cluster shape this install can create in this location. is_valid_cluster_mode
+# comes from installer_common.sh, so this runs after the workspace step.
+#
+# The region rule is the gke-cluster module's Autopilot precondition, checked
+# here as well because reaching it costs the whole interview first: a location
+# that only turns out to be wrong at terraform validate has already collected
+# every API key and integration answer.
+require_creatable_cluster_mode() {
+  local mode="${1:-}" location="${2:-}"
+  if ! is_valid_cluster_mode "$mode"; then
+    print_error "--gke-cluster-mode must be either autopilot or standard (got '${mode}')."
+    exit 1
+  fi
+  if [ "$mode" = "autopilot" ] && ! location_is_region "$location"; then
+    print_error "GKE Autopilot clusters are regional: --gcp-region must be a region such as us-central1, not '${location}'."
+    print_info "For a zonal cluster, pass --gke-cluster-mode=standard."
+    exit 1
+  fi
+}
+
+# How GKE writes the shape. bash 3.2, still macOS's /bin/bash, has no ${var^}.
+cluster_mode_label() {
+  case "${1:-}" in
+    autopilot) echo "Autopilot" ;;
+    *) echo "Standard" ;;
+  esac
+}
+
+# A release-line checkout between stamps. A patch is stamped as a child of the
+# line's head, so every backport that lands on release/<X.Y> after a release
+# descends from a stamped commit and carries its BAKED_RELEASE_VERSION, which is
+# the previous release's. True when this is a Git checkout whose HEAD descends
+# from the baked release's commit without being it: unreleased development on
+# the line, whose images are built per commit, so the release's tag is not the
+# tag to default to. Exactly the tag's commit is the release checkout, and a
+# HEAD that is neither is left to verify_local_source_ref, which refuses the
+# mismatch as before. A tag the checkout does not hold reads as "not past": the
+# release's own commit is on the line's history, so a clone of the line brings
+# the tag with it, and a checkout that lacks it is not one of these (the
+# refusal that follows says to fetch the tags). And only when the script that
+# is running is that checkout's own install.sh, carrying the same version: the
+# baked version belongs to the running script, so a release's piped installer
+# keeps its release as the default wherever it runs, whether standing in some
+# other checkout or resolving its sources to a HOME clone that has moved onto
+# a line, and verify_local_source_ref then fetches or refuses as before.
+# The directory this script runs from, when that is a kube-agents checkout;
+# empty under `curl … | bash`, where no file names one (BASH_SOURCE is then
+# empty, `main`, or the interpreter's path, none of which is a file in a
+# checkout). What acquire_source_repo prefers as the sources, so the
+# release-line reads below judge the same tree it will install from, whatever
+# the working directory is.
+script_checkout_dir() {
+  local script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+    printf '%s' "$script_dir"
+  fi
+}
+
+# The release a tree's own install.sh is stamped with, read the way
+# upgrade.sh's release_version_of_source_tree reads it (quotes and whitespace
+# stripped), so the two front doors agree on which trees carry a version.
+# Empty for the plain repository content.
+baked_version_of_tree() {
+  local repo_dir="${1:-.}"
+  grep -m1 -E '^BAKED_RELEASE_VERSION=' "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || echo ""
+}
+
+# What stands between such a tree and being recognised, for the refusals that
+# follow, mirroring checkout_is_past_baked_release's conditions: the release's
+# tag not fetched, or a shallow history the ancestry walk cannot cross (a
+# `--depth 1` clone of the line, which `git fetch --tags` alone does not mend);
+# else a running install.sh that is not the tree's own (piped, or run from
+# elsewhere); else a HEAD that does not descend from the release, which no
+# fetch mends. Printed only for a tree whose own install.sh carries the
+# version; the caller checks that.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" descends="false" line="${BAKED_RELEASE_VERSION%.*}"
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    descends="true"
+  fi
+  # The fetches the predicate's walk would need, and only those: no tag, or a
+  # shallow history the walk could not cross. A shallow clone deep enough to
+  # hold the release needs nothing fetched.
+  if [ -z "$tag_commit" ]; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$descends" != "true" ] && [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  script_dir="$(script_checkout_dir)"
+  local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
+  if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release install.sh, or one run from another directory: only the
+    # checkout's own install.sh recognises a release-line checkout, so that comes
+    # first, with whatever fetch it would also need.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the install.sh running is not this checkout's. If it is a checkout of a release line, run its own ./install.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ "$descends" = "true" ]; then
+    # Recognisable, and asked for the release by name anyway (--image-tag, or
+    # IMAGE_TAG in the shell or install.env, naming the baked version): the
+    # checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; run this checkout's ./install.sh with no --image-tag and IMAGE_TAG unset (in the shell and in install.env) to default to this commit's own images, or ${own_images}."
+  elif [ -n "$remedies" ]; then
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
+  else
+    # Tag present, history complete, the checkout's own script running: HEAD
+    # simply does not descend from the release (a cherry-picked or rebased
+    # stamp). No fetch changes that.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but ${head_commit:0:7} is neither that release's commit nor a descendant of it, so it is not a release-line checkout past it. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
+  fi
+}
+
+checkout_is_past_baked_release() {
+  local repo_dir="${1:-.}" tag_commit head_commit own_dir
+  [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
+  own_dir="$(script_checkout_dir)"
+  [ -n "$own_dir" ] && [ "$own_dir" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
+  [ "$(baked_version_of_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
+  head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  [ "$tag_commit" != "$head_commit" ] || return 1
+  git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
+}
+
 # The image tag doubles as the source ref that verify_local_source_ref checks the
-# checkout against, so HEAD is the natural default: it is an immutable 40-character
-# SHA and it is exactly the revision of the scripts about to run. Empty when the
-# installer runs outside a Git worktree (curl | bash), where the caller must supply one.
+# checkout against. When downloaded as an official release via curl | bash, the baked
+# release tag takes precedence. In local Git checkouts, an exact SemVer release tag or
+# HEAD commit SHA is used as the default.
 default_image_tag() {
   local repo_dir="${1:-.}"
+  # 1. Baked release version takes precedence (for curl | bash from official release URLs),
+  #    except in a checkout of a release line that has moved past that release: there the
+  #    baked version is the previous release's, and the checkout defaults the way a main
+  #    checkout does, to its own HEAD, whose images a merge onto the line built. Returned
+  #    here rather than through step 4, so a directory that happens to be named
+  #    kube-agents-<X.Y.Z> (step 3) cannot hand the release back.
+  #    Judged on the script's own checkout, which is what acquire_source_repo
+  #    installs from, so running one checkout's install.sh from inside another
+  #    resolves the same way as running it from its own directory.
+  if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+    local own_dir
+    own_dir="$(script_checkout_dir)"
+    if [ -n "$own_dir" ] && checkout_is_past_baked_release "$own_dir"; then
+      git -C "$own_dir" rev-parse HEAD 2>/dev/null || echo ""
+      return 0
+    fi
+    echo "$BAKED_RELEASE_VERSION"
+    return 0
+  fi
   # Only a kube-agents checkout may supply the default. Without this guard,
   # running the curl | bash one-liner from inside any unrelated Git repository
   # would offer that repository's HEAD, which then fails at `git fetch` for a
   # ref the kube-agents clone has never heard of.
-  if [ ! -f "${repo_dir}/k8s-operator/scripts/installer_common.sh" ]; then
+  if [ ! -f "${repo_dir}/scripts/installer/installer_common.sh" ]; then
     return 0
   fi
+  # 2. Check if local git repo is checked out at an exact SemVer release tag
+  local exact_tag=""
+  exact_tag="$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")"
+  if [[ "$exact_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    echo "$exact_tag"
+    return 0
+  fi
+  # 3. Check if running inside an unpacked release archive directory (e.g. kube-agents-0.1.0 or kube-agents-0.2.0)
+  local base_dir=""
+  base_dir="$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")"
+  if [[ "$base_dir" =~ ^kube-agents-([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  # 4. Fall back to local HEAD commit SHA for developer iterations
   git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo ""
 }
 
@@ -302,14 +1193,75 @@ default_image_tag() {
 # it the way git does and say where it came from. Empty outside a Git worktree.
 default_image_tag_label() {
   local repo_dir="${1:-.}"
-  if [ ! -f "${repo_dir}/k8s-operator/scripts/installer_common.sh" ]; then
+  local tag
+  tag="$(default_image_tag "$repo_dir")"
+  if [ -z "$tag" ]; then
     return 0
   fi
-  local short=""
-  short="$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo "")"
-  if [ -n "$short" ]; then
-    printf 'local HEAD checkout %s' "$short"
+
+  if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "$tag" = "$BAKED_RELEASE_VERSION" ]; then
+    printf 'official release %s' "$tag"
+  elif [ -n "$(script_checkout_dir)" ] && checkout_is_past_baked_release "$(script_checkout_dir)"; then
+    # Say what the checkout is, since its scripts still name the previous release.
+    printf 'release line %s checkout %s, %s commit(s) past release %s' \
+      "${BAKED_RELEASE_VERSION%.*}" "${tag:0:7}" \
+      "$(git -C "$(script_checkout_dir)" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")" \
+      "$BAKED_RELEASE_VERSION"
+  elif [ "$tag" = "$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")" ]; then
+    printf 'release tag %s' "$tag"
+  elif [[ "$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")" =~ ^kube-agents-${tag}$ ]]; then
+    printf 'release archive %s' "$tag"
+  else
+    printf 'local HEAD checkout %s' "${tag:0:7}"
   fi
+}
+
+# Resolves the image tag to use: honors explicit requested tag first, falls back
+# to the checkout/bundle default without prompting if found, or prompts interactively.
+# Stores the resolved tag in the variable named by $1 rather than echoing it:
+# callers run without a subshell, which prevents ERR trap firing on validation errors
+# and keeps informational diagnostics on standard output.
+resolve_effective_image_tag() {
+  local dest_var="$1"
+  local repo_dir="${2:-}"
+  local requested_tag="${3:-}"
+  printf -v "$dest_var" '%s' ""
+  if [ -n "$requested_tag" ]; then
+    if ! validate_immutable_ref "$requested_tag"; then
+      return 1
+    fi
+    printf -v "$dest_var" '%s' "$requested_tag"
+    return 0
+  fi
+  if [ -z "$repo_dir" ] || [ "$repo_dir" = "." ]; then
+    if [ -f "${repo_dir:-.}/scripts/installer/installer_common.sh" ]; then
+      repo_dir="${repo_dir:-.}"
+    elif [ -n "${_state_repo_dir:-}" ]; then
+      repo_dir="$_state_repo_dir"
+    else
+      repo_dir="$(_resolve_repo_dir_for_state)"
+    fi
+  fi
+  local default_tag=""
+  default_tag="$(default_image_tag "$repo_dir")"
+  if [ -n "$default_tag" ]; then
+    print_info "Using container image tag ($(default_image_tag_label "$repo_dir")): ${C_BOLD}${default_tag}${C_RESET}"
+    printf -v "$dest_var" '%s' "$default_tag"
+    return 0
+  fi
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    print_error "--image-tag is required; use a validated release tag or full commit SHA."
+    return 1
+  fi
+  local prompted_tag=""
+  while true; do
+    prompt_read "Container image tag (validated release tag or full commit SHA)" \
+      prompted_tag "" false ""
+    if validate_immutable_ref "$prompted_tag"; then
+      break
+    fi
+  done
+  printf -v "$dest_var" '%s' "$prompted_tag"
 }
 
 json_escape() {
@@ -322,31 +1274,482 @@ json_escape() {
   printf '%s' "$value"
 }
 
-write_state_var() {
+write_env_var() {
   local destination="$1"
   local var_name="$2"
   local var_value="$3"
-  printf 'export %s=%q\n' "$var_name" "$var_value" >> "$destination"
+  # No `export`: install.env is a conventional dotenv, and install.sh loads it
+  # with `set -a` so the keyword would be redundant. %q still does the quoting,
+  # so a value with spaces or a quote survives the round trip.
+  printf '%s=%q\n' "$var_name" "$var_value" >> "$destination"
 }
 
-# Credentials follow PERSIST_SECRETS_ON_DISK: false keeps them out of
-# vars.sh. Exported for this run either way, so the tfvars generator still
-# sees them; later runs recover them from the live Secret (see
-# write_tfvars_from_state).
-write_secret_state_var() {
+# Credentials follow PERSIST_SECRETS_ON_DISK: false keeps them out of every
+# file the installer writes. They still travel to Terraform for this run as
+# TF_VAR_*, and later runs recover them from the live 'platform-agent-secrets'
+# Secret (see write_tfvars_from_state).
+write_secret_env_var() {
   local destination="$1"
   local var_name="$2"
   local var_value="$3"
-  export "${var_name}=${var_value}"
-  if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
-    write_state_var "$destination" "$var_name" "$var_value"
+  if [ -z "$var_value" ]; then
+    return 0
   fi
+  if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
+    write_env_var "$destination" "$var_name" "$var_value"
+  fi
+}
+
+# Create install.env from what this run resolved, but ONLY when there is no
+# file there. An operator who hand-authored one owns it: rewriting it would
+# discard their comments and their formatting, and re-introduce the exact
+# complaint against vars.sh -- a file the documentation tells you to edit and
+# the next run overwrites.
+#
+# Called after write_tfvars_from_state so the API_SERVER_KEY it records is the
+# one the install settled on: recovered from a live Secret when there was one,
+# freshly minted only when there was not.
+#
+# Derived values are left out by construction. PROJECT_NUMBER and KMS_LOCATION
+# are recomputed wherever they are used, and the cluster shape written here is
+# the one the interview asked for, never the probed TFVARS_CLUSTER_MODE, which
+# write_tfvars_from_state re-derives on every run.
+# The value install.env records for one key, empty when it records none.
+# Reads the file rather than the environment: install.env was sourced at
+# startup into these very names, and the interview has since overwritten them,
+# so the environment no longer remembers what the file said.
+#
+# Always returns 0. A `return 1` for "no such key" would be the natural
+# signature and is the wrong one here: this is called from a command
+# substitution, `set -E` propagates the ERR trap into that subshell, and the
+# trap fires on the non-zero return before the caller's `||` is ever consulted
+# -- printing an abort banner per absent key. Callers test presence separately.
+#
+# The value is unquoted the way sourcing the file would unquote it, because
+# both things that write install.env quote it. write_env_var here and
+# save_env_var in scripts/installer/installer_common.sh both serialise with
+# `printf '%s=%q\n'`, and %q renders the empty string as the two-character
+# literal '' and escapes anything the shell would treat specially -- so
+# `#gke-alerts` is written `\#gke-alerts`. Comparing a quoted recorded value
+# against an unquoted environment one reports every empty key as drifted, and
+# the line the banner prints for each (`KEY=`) changes nothing, so the next run
+# reports them again. That buries the
+# one case the warning exists for.
+#
+# A hand-authored file is the other half of the same problem and the reason
+# this cannot simply re-quote the current value and compare the quoted forms:
+# an operator writes `SLACK_HOME_CHANNEL="#gke-alerts"`, which %q would render
+# `\#gke-alerts`, and the two spellings of one value would not match.
+unquote_shell_value() {
+  local raw="${1:-}"
+  case "$raw" in
+    # Single quotes are literal all the way through, which is also how %q
+    # spells the empty string.
+    "'"*"'")
+      raw="${raw#\'}"
+      printf '%s' "${raw%\'}"
+      return 0
+      ;;
+    '"'*'"')
+      raw="${raw#\"}"
+      raw="${raw%\"}"
+      ;;
+  esac
+  # Outside single quotes a backslash escapes the next character. That is how
+  # %q writes '#', a space, and every other metacharacter.
+  printf '%s' "$raw" | sed 's/\\\(.\)/\1/g'
+}
+
+recorded_install_env_value() {
+  local file="${1:-}" key="${2:-}" line=""
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  # install.env.example tells the operator `export K=V` is harmless, and every
+  # other reader of the file honours that: save_env_var, live_test_lease.py and
+  # project_config.py all skip an optional `export`. Matching it here keeps this
+  # reader in step -- missing the prefix skips the key silently, and in the
+  # direction of no warning at all.
+  # The `${line#*=}` below strips through the first `=`, so the longer prefix
+  # needs nothing further.
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
+  [ -n "$line" ] || return 0
+  line="${line#*=}"
+  unquote_shell_value "$line"
+}
+
+# Say so when an interactive answer changed something the file still records
+# differently.
+#
+# install.env is an input: install.sh creates one when there is none and never
+# rewrites it. The interview, though, still runs in full on every interactive
+# invocation, and its answers go straight into the environment
+# write_tfvars_from_state reads. So an operator who answers "None" at the chat
+# menu gets the Pub/Sub topic destroyed by this apply and re-created by the
+# next run, because the file still says the integration is on. Nothing else
+# tells them: "Left your install configuration as you wrote it" reads as
+# reassurance, and the Day-2 menu's Save & Apply is the only path that writes a
+# key back.
+#
+# A warning rather than a write, deliberately. Making install.sh persist here
+# would contradict the contract stated in install.env.example, INSTALL.md and
+# the chart's CI story -- #1117 renders this file on an ephemeral runner and
+# needs the installer to treat it as read-only. Naming the drift costs nothing
+# and leaves the decision where it belongs.
+#
+# The list is the interview's own settings, not everything the file holds:
+# IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
+# would make this noise. Keep it in step with the interview.
+warn_unrecorded_interview_answers() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  # A non-interactive run typed nothing; its answers came from flags and this
+  # very file, so there is no drift to report that the operator did not author.
+  [ "$PARAM_NON_INTERACTIVE" != "true" ] || return 0
+  has_controlling_tty || return 0
+  [ "$PARAM_DRY_RUN" != "true" ] || return 0
+
+  # A key the file does not carry is not drift: it inherits the default, and
+  # warning about every unset key would bury the ones that matter.
+  #
+  # Two rules decide what belongs in this list, and getting either wrong makes
+  # an entry inert rather than loud:
+  #
+  #   1. The setting must have an interview question. ENABLE_GKE_BACKUP_PLAN and
+  #      GVISOR_POOL_NAME are deliberately kept out of the export block below
+  #      precisely because nothing asks about them, so they cannot drift and
+  #      listing them here would only ever compare a value against itself.
+  #   2. The answer must be readable under the key's own name. Most of the
+  #      interview re-exports into exactly that name, but MEMORY does not: its
+  #      answer lands in PARAM_MEMORY and in MEMORY_PROVIDER, and MEMORY itself
+  #      still holds whatever install.env set at startup. Comparing `$MEMORY`
+  #      would therefore always find them equal and never report the one case
+  #      that matters most -- switching to Hindsight, getting it provisioned,
+  #      and having the next run derive multiuser_memory from the unchanged file
+  #      and tear the Hindsight API and its Postgres back down.
+  local key recorded current drifted=""
+  for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
+    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
+    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
+    recorded="$(recorded_install_env_value "$file" "$key")"
+    case "$key" in
+      MEMORY) current="${PARAM_MEMORY:-}" ;;
+      *) current="${!key:-}" ;;
+    esac
+    [ "$recorded" != "$current" ] || continue
+    drifted="${drifted}${drifted:+ }${key}"
+  done
+  [ -n "$drifted" ] || return 0
+
+  print_warning "This run applied answers that ${file} does not record."
+  print_info "install.env is an input: install.sh reads it and never rewrites it."
+  print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
+  print_info "the file, which will revert what you just changed. Update these keys:"
+  for key in $drifted; do
+    case "$key" in
+      *TOKEN | *_KEY | *SECRET)
+        print_info "  ${key}=<the value you entered>"
+        ;;
+      # Same indirection as the comparison above, for the same reason: printing
+      # ${MEMORY} here would hand the operator the value they just changed away
+      # from, which is worse than printing nothing.
+      MEMORY)
+        print_info "  MEMORY=${PARAM_MEMORY:-}"
+        ;;
+      *)
+        print_info "  ${key}=${!key:-}"
+        ;;
+    esac
+  done
+  print_info "Or re-run './install.sh --menu' and use Save & Apply, which writes them for you."
+}
+
+# The one answer checked on every run, TTY or not, and unlike the interview
+# answers above a missing line counts: an agent-driven install passes
+# --accept-no-network-policy on the command line and never sees a prompt, and
+# if the file does not record it, the next generator run -- upgrade.sh, the
+# Day-2 menu -- emits accept_no_network_policy = false and the module refuses
+# the plan for the very enforcement this install already accepted. Still a
+# warning rather than a write, for the reasons warn_unrecorded_interview_answers
+# gives.
+note_unrecorded_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  # The decision, not the flag: a flag passed against a cluster that already
+  # enforces accepted nothing, and recording it would waive the module's check
+  # for the life of the install.
+  [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ] || return 0
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  ! is_truthy "${recorded:-false}" || return 0
+  print_warning "This run installs without NetworkPolicy enforcement, and ${file} does not record it."
+  print_info "Add ACCEPT_NO_NETWORK_POLICY=true to ${file}. upgrade.sh and the Day-2 menu regenerate from the file, and without the key the next apply is refused for the enforcement this install accepted."
+}
+
+# The converse, so the key retires: a file that still records
+# ACCEPT_NO_NETWORK_POLICY=true once the cluster enforces -- confined later
+# with --enable-network-policy, moved to Dataplane V2, or a created cluster
+# under a copied install.env -- keeps every later upgrade.sh and Day-2 apply
+# emitting accept_no_network_policy = true, and the module's postcondition,
+# the one guard against policies going silently inert again, never fires for
+# that install. Nothing rewrites install.env, so the operator is told once.
+note_stale_network_policy_acceptance() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ "$NETWORK_POLICY_STALE_ACCEPTANCE_NOTED" != "true" ] || return 0
+  case "${NETWORK_POLICY_ENFORCEMENT:-}" in
+    "$NP_ENFORCEMENT_ENFORCED" | "$NP_ENFORCEMENT_ENABLED_BY_INSTALL") ;;
+    *) return 0 ;;
+  esac
+  local recorded
+  recorded="$(recorded_install_env_value "$file" ACCEPT_NO_NETWORK_POLICY 2>/dev/null || true)"
+  is_truthy "${recorded:-false}" || return 0
+  NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="true"
+  print_warning "${file} records ACCEPT_NO_NETWORK_POLICY=true, but cluster '${CLUSTER_NAME:-}' enforces NetworkPolicy now."
+  print_info "Remove that line. While it stays, every later upgrade.sh and Day-2 apply waives the check that would refuse this install if enforcement were ever lost again."
+}
+
+# A flag that beats install.env for a single run, against a file this installer
+# will not rewrite. Says so, because the reversal is silent at both ends: the
+# run that passes the flag looks like it took effect permanently, and the next
+# run that omits it re-reads the file and quietly undoes the change.
+#
+# Only reachable on an existing install.env. A first install records both keys
+# from the same PARAM_*, so there is nothing to warn about there.
+#
+# Fires on -y as well, unlike warn_unrecorded_interview_answers: that one skips
+# non-interactive runs because their answers came from flags and the file, with
+# no third source to surprise anyone. Here the flag IS the surprise, and headless
+# is the route these flags were added for.
+#
+# Pass compare_as_bool=true for a key the rest of the pipeline reads through
+# is_truthy, and both sides are then read the same way. Neither is canonical:
+# install.env is hand-written and render_install_env.sh copies a GitHub variable
+# in verbatim, so the recorded value can be True/yes/on/1 -- and the same PARAM_*
+# is seeded from that value, so on a run that passes no flag the "flag value" is
+# that spelling too. Comparing the two as strings reports a disagreement that
+# does not exist, and the operator gets the destructive consequence line for a
+# reversal that cannot happen: the next run re-reads True, is_truthy accepts it,
+# and nothing changes. NAMESPACE is a string and keeps the literal comparison --
+# `true` is a legal namespace name, and reading a recorded `yes` against a
+# flagged `true` as agreement would drop a warning about a release moving.
+#
+# repeat_on names the routes that accept the flag: --agent-namespace is taken
+# by install.sh, upgrade.sh and --menu; --enable-gke-backup-plan is install.sh-only.
+warn_flag_beats_unrecorded_file_value() {
+  local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}"
+  [ -n "$value" ] || return 0
+  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
+    local recorded
+    recorded="$(recorded_install_env_value "$file" "$key")"
+    if [ "$compare_as_bool" = "true" ]; then
+      if is_truthy "$recorded"; then
+        is_truthy "$value" && return 0
+      else
+        ! is_truthy "$value" && return 0
+      fi
+    else
+      [ "$recorded" != "$value" ] || return 0
+    fi
+    print_warning "${flag}=${value} applies to this run only: ${file} records ${key}=${recorded}."
+  else
+    print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
+  fi
+  print_info "$consequence"
+  # %q, because the scope keys are the first list-valued values through here and
+  # a space-separated one printed bare would not paste back as one assignment.
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${flag} on ${repeat_on}."
+}
+
+bootstrap_install_env_file() {
+  local destination="${1:-}" image_tag="${2:-}"
+  [ -n "$destination" ] || return 0
+  if [ -f "$destination" ]; then
+    print_info "Left your install configuration as you wrote it: ${destination}"
+    warn_unrecorded_interview_answers "$destination"
+    note_unrecorded_network_policy_acceptance "$destination"
+    # The two flags that override a recorded value for one run. This function
+    # never rewrites an existing file, so only a first install can record either
+    # on the operator's behalf.
+    warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
+      "${PARAM_AGENT_NAMESPACE:-}" \
+      "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
+      false \
+      "every later install.sh, upgrade.sh and --menu run"
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_GKE_BACKUP_PLAN --enable-gke-backup-plan \
+      "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" \
+      "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
+      true \
+      "every later install.sh run"
+    # The scope keys: a flag applies its declaration for this run, and the
+    # next full upgrade regenerates from the file, so a project the file does
+    # not name is dropped again, its bindings revoked and its profiles retired.
+    local scope_key scope_flag scope_value
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+      case "$scope_key" in
+        SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
+        SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
+        SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
+        SCOPE_SHARED_VPC_HOSTS) scope_flag="--scope-shared-vpc-hosts"; scope_value="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}" ;;
+        SCOPE_METRICS_SCOPES) scope_flag="--scope-metrics-scopes"; scope_value="${PARAM_SCOPE_METRICS_SCOPES:-}" ;;
+        SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
+        *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
+      esac
+      warn_flag_beats_unrecorded_file_value "$destination" "$scope_key" "$scope_flag" \
+        "$scope_value" \
+        "A later run without it regenerates the scope from the file: a project, folder, organisation, Shared VPC host or Metrics Scope the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
+        false \
+        "every later install.sh run"
+    done
+    return 0
+  fi
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    print_info "Dry-run: not creating ${destination}."
+    return 0
+  fi
+
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  local tmp="${destination}.tmp"
+  {
+    printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it."
+    printf '%s\n' "# Edit it and re-run the installer to change the install."
+    printf '%s\n' "# See install.env.example for every supported key and what it does."
+    printf '%s\n' "#"
+    printf '%s\n' "# Installed at image tag ${image_tag}. IMAGE_TAG is deliberately absent:"
+    printf '%s\n' "# it is chosen per run with --image-tag, not inherited."
+    printf '\n'
+  } > "$tmp"
+  write_env_var "$tmp" PROJECT_ID "${PROJECT_ID:-}"
+  write_env_var "$tmp" CLUSTER_NAME "${CLUSTER_NAME:-}"
+  write_env_var "$tmp" REGION "${REGION:-}"
+  write_env_var "$tmp" CLUSTER_MODE "${CLUSTER_MODE:-}"
+  write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
+  write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
+  write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
+  write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
+  write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
+  write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
+  write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
+  write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
+  write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
+  write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
+  write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
+  write_env_var "$tmp" GOOGLE_CHAT_ENABLED "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
+  write_env_var "$tmp" GOOGLE_CHAT_HOME_CHANNEL "${GOOGLE_CHAT_HOME_CHANNEL:-}"
+  write_env_var "$tmp" GOOGLE_CHAT_MODE "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
+  write_env_var "$tmp" SLACK_ENABLED "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
+  write_secret_env_var "$tmp" SLACK_BOT_TOKEN "${SLACK_BOT_TOKEN:-}"
+  write_secret_env_var "$tmp" SLACK_APP_TOKEN "${SLACK_APP_TOKEN:-}"
+  write_env_var "$tmp" SLACK_ALLOWED_USERS "${SLACK_ALLOWED_USERS:-}"
+  write_env_var "$tmp" SLACK_HOME_CHANNEL "${SLACK_HOME_CHANNEL:-}"
+  write_env_var "$tmp" SLACK_HOME_CHANNEL_NAME "${SLACK_HOME_CHANNEL_NAME:-}"
+  write_secret_env_var "$tmp" API_SERVER_KEY "${API_SERVER_KEY:-}"
+  write_env_var "$tmp" PLATFORM_AGENT_PERMISSION_SET "${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
+  if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_CUSTOM_ROLES "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+  fi
+  # Recorded even when empty: the generator renders the scope block from these
+  # on every run, and a later upgrade.sh that finds no line renders the same
+  # empty block, so the presence of the keys is what tells an operator where
+  # a project is declared.
+  write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_FOLDERS "${SCOPE_FOLDERS:-}"
+  write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
+  write_env_var "$tmp" SCOPE_SHARED_VPC_HOSTS "${SCOPE_SHARED_VPC_HOSTS:-}"
+  write_env_var "$tmp" SCOPE_METRICS_SCOPES "${SCOPE_METRICS_SCOPES:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
+  write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
+  write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
+  write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+  write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
+  write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+  write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
+  write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
+  write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
+  write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
+  write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
+  write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
+  write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  # Recorded only when this run accepted it -- the decision, not the flag: a
+  # flag passed against a cluster that already enforces accepted nothing. The
+  # key is a standing decision about this cluster, and every later generator
+  # run -- upgrade.sh, the Day-2 menu -- must carry it, or it emits
+  # accept_no_network_policy = false and the module refuses the plan this
+  # install already passed.
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    write_env_var "$tmp" ACCEPT_NO_NETWORK_POLICY "true"
+  fi
+
+  write_env_var "$tmp" REGISTRY_PREFIX "${REGISTRY_PREFIX:-}"
+  if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
+    write_env_var "$tmp" THIRD_PARTY_REGISTRY_PREFIX "${THIRD_PARTY_REGISTRY_PREFIX}"
+  fi
+  # Recorded only when this run set one. Almost every install takes the
+  # defaults, and a default copied here would freeze at this release; the
+  # install that did set one (a second install in the project) must keep it,
+  # because losing the line renames -- that is, replaces -- the account.
+  # NAMESPACE is not in that list, and is handled separately below: the
+  # ambient variable must not be frozen, but a flag must be.
+  local identity_key
+  for identity_key in PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_GSA_NAME LITELLM_GSA_NAME GKE_DB_KMS_KEYRING GKE_DB_KMS_KEY; do
+    if [ -n "${!identity_key:-}" ]; then
+      write_env_var "$tmp" "$identity_key" "${!identity_key}"
+    fi
+  done
+  # NAMESPACE, and only when --agent-namespace put it there.
+  #
+  # NAMESPACE itself in the ambient environment is not consulted:
+  # bootstrap_install_env clears it so a stray shell value does not move
+  # the release on the next apply. PARAM_AGENT_NAMESPACE carries only the two
+  # deliberate routes -- this file's own key, and the flag.
+  #
+  # Recorded rather than left to the operator, because the flag is the only one
+  # of those routes that leaves no trace of itself. A second install that
+  # passed it once and omits it next time resolves ${NAMESPACE:-$DEFAULT_NAMESPACE}
+  # back to the default: write_tfvars_from_state then renders the wrong
+  # namespace, the Secret-recovery loop looks for the tokens somewhere they are
+  # not, and lifecycle.sh's guard_release_namespace refuses the install.
+  if [ -n "${PARAM_AGENT_NAMESPACE:-}" ]; then
+    write_env_var "$tmp" NAMESPACE "$PARAM_AGENT_NAMESPACE"
+  fi
+  if ! is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
+    printf '\n%s\n' "# PERSIST_SECRETS_ON_DISK=false: credentials are deliberately absent." >> "$tmp"
+    write_env_var "$tmp" PERSIST_SECRETS_ON_DISK "false"
+  fi
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$destination"
+  umask "$old_umask"
+  print_success "Wrote your install configuration to: ${destination}"
+  print_info "Edit that file and re-run install.sh to change this install. It is never overwritten."
+}
+
+matches_release_bundle_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local bundle_file="${repo_dir}/.release-bundle"
+
+  if [ -f "$bundle_file" ]; then
+    local bundle_version bundle_tag
+    bundle_version="$(grep -E "^version=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    bundle_tag="$(grep -E "^tag=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    if [ -n "$bundle_version" ] && { [ "$bundle_version" = "$expected_ref" ] || [ "$bundle_tag" = "$expected_ref" ]; }; then
+      echo "$bundle_version"
+      return 0
+    fi
+  fi
+  return 1
 }
 
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
-  # The installer runs k8s-operator/scripts/* from this checkout while deploying
+  # The installer runs scripts/installer/* from this checkout while deploying
   # the container image built from $expected_ref, so a mismatch means the cluster
   # gets manifests from one revision and an agent runtime from another. --dry-run
   # touches nothing, and --allow-unverified-source is the explicit opt-out for
@@ -361,6 +1764,19 @@ verify_local_source_ref() {
   fi
 
   if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # In official stamped release archives (unpacked tarball/zip outside Git),
+    # BAKED_RELEASE_VERSION is stamped during release automation.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      local bundle_version=""
+      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+        SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
+        print_success "Verified install sources match official release bundle ${bundle_version}."
+        return 0
+      fi
+      SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
+      print_success "Verified install sources match baked official release ${BAKED_RELEASE_VERSION}."
+      return 0
+    fi
     if [ "$lenient" = "true" ]; then
       print_warning "Cannot verify source/image alignment because '$repo_dir' is not a Git worktree."
       SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
@@ -379,6 +1795,14 @@ verify_local_source_ref() {
       return 0
     fi
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    # Only when the checkout's own install.sh carries the version, the line
+    # checkout_is_past_baked_release draws: the baked version belongs to the
+    # running script, and a release's piped installer standing in some other
+    # checkout that lacks the tag is not a line checkout to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     print_info "Pass --allow-unverified-source to provision anyway."
     return 1
   fi
@@ -389,6 +1813,13 @@ verify_local_source_ref() {
       print_warning "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
     else
       print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+      # The tag is here and HEAD is not it: a line checkout asked for the release
+      # by name (--image-tag with the baked version), one the predicate could not
+      # walk (a shallow clone), or an unrelated commit. Same gate as above.
+      if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+        [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+        release_line_recognition_hint "$repo_dir"
+      fi
       print_info "Pass --allow-unverified-source to provision anyway."
       return 1
     fi
@@ -407,10 +1838,99 @@ verify_local_source_ref() {
 
   SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
   if [ "$unverified" = "true" ]; then
-    print_warning "Continuing with unverified install sources: the cluster will get this checkout's configuration plus the image built from ${expected_ref}."
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      if [ "$PARAM_ALLOW_UNVERIFIED_SOURCE" = "true" ]; then
+        print_warning "Continuing dry run with unverified install sources: preview is continuing (--allow-unverified-source active)."
+      else
+        print_warning "Continuing dry run with unverified install sources: a real installation would refuse this checkout, but preview is continuing."
+      fi
+    else
+      print_warning "Continuing with unverified install sources: the cluster will get this checkout's configuration plus the image built from ${expected_ref}."
+    fi
     return 0
   fi
   print_success "Verified install sources and image ref resolve to commit ${expected_commit}."
+}
+
+# Fetch one ref from KUBE_AGENTS_REPO_URL into a clone, leaving it in FETCH_HEAD.
+# A 40-hex ref is fetched by object name; anything else is a release tag,
+# fetched under its own name so verify_local_source_ref can resolve it. $3 is
+# the depth option or empty: the fresh clone passes it, an existing clone only
+# when it is already shallow.
+fetch_source_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local depth_opt="${3:-}"
+  if [[ "$expected_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    git -C "$repo_dir" fetch ${depth_opt:+"$depth_opt"} "$KUBE_AGENTS_REPO_URL" "$expected_ref"
+  else
+    git -C "$repo_dir" fetch ${depth_opt:+"$depth_opt"} "$KUBE_AGENTS_REPO_URL" "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
+  fi
+}
+
+# Move a clone left by an earlier install (or a plain `git clone`) to the
+# requested ref. Only the curl | bash path calls this: the two arms that run
+# install.sh from a checkout never move it. A clean kube-agents worktree whose
+# HEAD is not already the ref is detached at it, a branch it was on (main, say)
+# being left behind; the ref is fetched first only when the clone does not have
+# it. Every other case prints which one applied and returns 0 so
+# verify_local_source_ref, which runs next, reports it in its own words: a
+# directory that is not the root of a Git worktree or whose HEAD is not a
+# kube-agents revision, a dirty tree, or a fetch or checkout that fails
+# (offline, a tag that does not exist).
+refresh_existing_clone() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local head_commit="" expected_commit="" head_branch="" depth_opt=""
+  # -e "$repo_dir/.git" (a directory, or the file a linked worktree carries)
+  # rules out a plain directory inside a Git-managed HOME, which
+  # --is-inside-work-tree alone would accept and every -C command below would
+  # then act on: HOME itself would be fetched into and detached.
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || [ ! -e "${repo_dir}/.git" ]; then
+    print_info "Using existing repository at $repo_dir as-is: it is not the root of a Git worktree."
+    return 0
+  fi
+  if ! head_commit="$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)"; then
+    print_info "Using existing repository at $repo_dir as-is: it has no commit checked out."
+    return 0
+  fi
+  # ls-tree reads the tree object only, so a blobless clone answers without
+  # fetching a blob.
+  if [ -z "$(git -C "$repo_dir" ls-tree --name-only HEAD -- "$KUBE_AGENTS_CLONE_MARKER" 2>/dev/null)" ]; then
+    print_info "Using existing repository at $repo_dir as-is: its HEAD is not a kube-agents revision (no $KUBE_AGENTS_CLONE_MARKER), so it was not moved."
+    return 0
+  fi
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    print_info "Using existing repository at $repo_dir without modifying local changes: the checkout is dirty, so '$expected_ref' was not fetched into it."
+    return 0
+  fi
+  head_branch="$(git -C "$repo_dir" symbolic-ref --short -q HEAD || true)"
+  if expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+    if [ "$head_commit" = "$expected_commit" ]; then
+      print_info "Using existing repository at $repo_dir: already at '$expected_ref' ($head_commit)."
+      return 0
+    fi
+    print_info "Using existing repository at $repo_dir: it already has '$expected_ref' ($expected_commit); checking it out."
+  else
+    if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      depth_opt="$KUBE_AGENTS_FETCH_DEPTH_OPT"
+    fi
+    print_info "Using existing repository at $repo_dir: fetching '$expected_ref' from $KUBE_AGENTS_REPO_URL..."
+    if ! fetch_source_ref "$repo_dir" "$expected_ref" "$depth_opt"; then
+      print_warning "Could not fetch '$expected_ref' into $repo_dir; the checkout stays at $head_commit."
+      return 0
+    fi
+    expected_commit="FETCH_HEAD"
+  fi
+  if ! git -C "$repo_dir" checkout --detach "$expected_commit"; then
+    print_warning "Could not check out '$expected_ref' in $repo_dir; the checkout stays at $head_commit."
+    return 0
+  fi
+  if [ -n "$head_branch" ]; then
+    print_info "Moved $repo_dir from branch '$head_branch' ($head_commit) to '$expected_ref' (detached HEAD). The branch is left where it was and 'git checkout $head_branch' returns to it; untracked files such as install.env are kept."
+  else
+    print_info "Moved $repo_dir from $head_commit to '$expected_ref' (detached HEAD). 'git checkout $head_commit' returns to the previous revision; untracked files such as install.env are kept."
+  fi
 }
 
 # Put the install sources on disk and return the directory holding them.
@@ -424,20 +1944,20 @@ acquire_source_repo() {
   local resolved_dir=""
   local script_dir=""
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
-  if [ -n "$script_dir" ] && [ -f "${script_dir}/k8s-operator/scripts/installer_common.sh" ]; then
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
     resolved_dir="$script_dir"
     print_success "Using repository directory: $resolved_dir"
-  elif [ -f "k8s-operator/scripts/installer_common.sh" ]; then
+  elif [ -f "scripts/installer/installer_common.sh" ]; then
     resolved_dir="$(pwd)"
     print_success "Using current repository directory: $resolved_dir"
   else
-    resolved_dir="$HOME/kube-agents"
+    resolved_dir="$(kube_agents_clone_dir)"
     if [ -d "$resolved_dir" ]; then
-      print_info "Using existing repository at $resolved_dir without modifying local changes."
+      refresh_existing_clone "$resolved_dir" "$expected_ref"
     else
       print_info "Cloning kube-agents install sources at '$expected_ref' into $resolved_dir..."
-      git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$resolved_dir"
-      git -C "$resolved_dir" fetch --depth=1 origin "$expected_ref"
+      git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$resolved_dir"
+      fetch_source_ref "$resolved_dir" "$expected_ref" "$KUBE_AGENTS_FETCH_DEPTH_OPT"
       git -C "$resolved_dir" checkout --detach FETCH_HEAD
     fi
     cd "$resolved_dir"
@@ -446,34 +1966,173 @@ acquire_source_repo() {
   printf -v "$dest_var" '%s' "$resolved_dir"
 }
 
-# k8s-operator/scripts/installer_common.sh is the source of truth for install
+# scripts/installer/installer_common.sh is the source of truth for install
 # defaults, validation rules, and the terraform.tfvars generator. The installer
 # sources it rather than keeping its own copies, which is how the two drifted
-# apart before (an installer menu defaulting to gke-admin against a read-only
-# default, a us-central1 default against us-east4, a second copy of
+# apart before (an installer menu whose permission-set default disagreed with
+# the provisioner's, a us-central1 default against us-east4, a second copy of
 # derive_kms_location).
 source_provisioning_helpers() {
   local repo_dir="$1"
-  local helper_script="${repo_dir}/k8s-operator/scripts/installer_common.sh"
+  local helper_script="${repo_dir}/scripts/installer/installer_common.sh"
   if [ ! -f "$helper_script" ]; then
     print_error "Cannot find installer helpers at $helper_script."
     exit 1
   fi
-  SCRIPT_DIR="${repo_dir}/k8s-operator/scripts"
-  VARS_FILE="${SCRIPT_DIR}/vars.sh"
+  SCRIPT_DIR="${repo_dir}/scripts/installer"
   # shellcheck source=/dev/null
   source "$helper_script"
   # gke_dns_endpoint_flag, for the credentials fetch before the health checks.
   # shellcheck source=/dev/null
   source "${SCRIPT_DIR}/gke_dns_endpoint.sh"
-  print_success "Loaded installer defaults from k8s-operator/scripts/installer_common.sh"
+  # The version floors. On the `curl … | bash` path the guard near the top of
+  # this file had no file to read them from and armed no-op stubs instead; the
+  # clone has the file, so the real checks replace those stubs here. This is
+  # what makes the Go floor at import_github_pem an actual check on that path
+  # rather than an unconditional `return 0` — it runs at step 12, long after
+  # this step 2. (The gcloud and terraform floors are already past by now:
+  # they run at step 1, before any checkout exists to read a number from.)
+  # shellcheck source=/dev/null
+  source "${SCRIPT_DIR}/min_versions.sh"
+  print_success "Loaded installer defaults from scripts/installer/installer_common.sh"
 }
 
-# Fill in the parameters whose default lives in common.sh. Called once, after
-# sourcing, so a flag or environment variable still wins over the shared default.
+# Fill in the parameters whose default lives in installer_common.sh. Called
+# once, after sourcing, so a flag, an environment variable or an install.env
+# value still wins over the shared default.
+#
+# Every default this installer applies goes through here. The alternative --
+# `${PARAM_X:-false}` at each point of use -- is a second copy of the default
+# living next to the code that reads it, and two copies drift. It also reads
+# as though the value might legitimately be unset at that point, which it
+# cannot be: this runs in step 2, before the interview.
 resolve_shared_defaults() {
+  normalize_gitops_repo_vars
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
+  PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
+  # ${VAR-...}, not ${VAR:-...}: an explicit `--enable-gvisor=` sets it to empty, and
+  # that has to survive to the validator rather than being read as the default.
+  PARAM_ENABLE_GVISOR="${PARAM_ENABLE_GVISOR-$DEFAULT_ENABLE_GVISOR}"
+  PARAM_ENABLE_WEBUI="${PARAM_ENABLE_WEBUI:-$DEFAULT_ENABLE_WEBUI}"
+  PARAM_USER_PROFILE_ENABLED="${PARAM_USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
+  PARAM_MEMORY="${PARAM_MEMORY:-$DEFAULT_MEMORY}"
+  PARAM_ENABLE_GOOGLE_CHAT="${PARAM_ENABLE_GOOGLE_CHAT:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
+  PARAM_GOOGLE_CHAT_MODE="${PARAM_GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
+  PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+  PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
+  PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
+  PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
+  PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
+  PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+}
+
+# Run a command or function in the background, animating a spinner with elapsed
+# time and the command's latest output line. Output is streamed to log_file.
+# Falls back to direct execution when stdout is not a terminal (CI, piped logs).
+# Returns the command's exit status and leaves error presentation to callers.
+run_with_spinner() {
+  local msg="$1"
+  local log_file="$2"
+  shift 2
+
+  if [ ! -t 1 ]; then
+    print_info "$msg..."
+    local rc=0
+    "$@" 2>&1 | tee "$log_file" || rc=${PIPESTATUS[0]}
+    return "$rc"
+  fi
+
+  # Everything the handler reads is given a value before the handler can run,
+  # because `set -u` would otherwise kill it on an unbound variable instead of
+  # letting it restore the cursor and reap the job.
+  local task_pid=0
+  local term_width=0
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local frame=0
+  local started=$SECONDS
+  local status_line=""
+
+  on_spinner_interrupt() {
+    local sig="$1"
+    trap - INT TERM
+    # Reap the children before the job itself. When "$@" is a shell function
+    # bash forks a subshell, so task_pid is that subshell and the process doing
+    # the work -- terraform, for the dry-run caller -- is its child; signalling
+    # only task_pid leaves that child running, detached, against the same
+    # .terraform directory the next run reads. Nothing else will clean it up:
+    # with job control off bash sets SIGINT to SIG_IGN for `&` children and the
+    # disposition survives both fork and exec, so the terminal's own Ctrl-C
+    # never reaches either process.
+    if [ "$task_pid" -ne 0 ]; then
+      pkill -TERM -P "$task_pid" 2>/dev/null || true
+      kill -TERM "$task_pid" 2>/dev/null || true
+    fi
+    tput cnorm 2>/dev/null || true
+    printf '\r%*s\r' "$term_width" ''
+    if [ -s "$log_file" ]; then
+      echo -e "\n  ${C_CYAN}ℹ Interrupted. Command output saved to: ${log_file}${C_RESET}" >&2
+    else
+      rm -f -- "$log_file"
+    fi
+    exit "$sig"
+  }
+
+  # Armed before the job exists, not after. Arming afterwards leaves a window in
+  # which the worker is already running while SIGINT still has its default
+  # disposition here: the shell dies, and the worker -- which inherited SIG_IGN
+  # for SIGINT as a `&` child -- outlives it with nothing left to reap it.
+  trap 'on_spinner_interrupt 130' INT
+  trap 'on_spinner_interrupt 143' TERM
+
+  "$@" >"$log_file" 2>&1 &
+  task_pid=$!
+
+  term_width="$(get_term_width)"
+  # Everything except the status line: two spaces, spinner, message, "(NNNs)",
+  # separators. Keep one column spare so the line never wraps.
+  local status_width=$((term_width - ${#msg} - 15))
+  if [ "$status_width" -lt 10 ]; then
+    status_width=10
+  fi
+  tput civis 2>/dev/null || true
+  while kill -0 "$task_pid" 2>/dev/null; do
+    # Both of these fork a child, and SIGINT from a terminal goes to the whole
+    # foreground group, so on Ctrl-C the child dies of it and the command
+    # reports 130. Unguarded under `set -Ee` that fires the ERR trap, and
+    # on_error exits the shell before bash dispatches the pending INT trap --
+    # so the handler below never runs, the worker is orphaned, the cursor stays
+    # hidden, and the cancellation is recorded as a FAILED install report.
+    # `|| true` keeps errexit out of the loop and leaves the INT trap the only
+    # way out of it.
+    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")" || status_line=""
+    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
+      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$msg" \
+      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
+    frame=$((frame + 1))
+    sleep "$SPINNER_INTERVAL_SECS" || true
+  done
+  tput cnorm 2>/dev/null || true
+  printf '\r%*s\r' "$term_width" ''
+
+  trap - INT TERM
+  local rc=0
+  wait "$task_pid" || rc=$?
+  return "$rc"
+}
+
+# The dry run's Terraform check. At file scope, rather than inside main(), so the
+# test suite can source install.sh and drive this exact function instead of its
+# own copy of the chain -- a copy asserts that the copy short-circuits, which is
+# true of any string. Runs in whatever directory the caller has cd'd into.
+#
+# The && is load-bearing: `terraform validate` against an uninitialised directory
+# reports init's failure as a configuration error, so an unchained pair blames
+# the composition for what is really a provider download that did not happen.
+validate_tf_config() {
+  terraform init -backend=false -input=false &&
+    terraform validate
 }
 
 # Wait for one deployment to roll out, animating a spinner with the elapsed time
@@ -483,54 +2142,67 @@ wait_for_rollout() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
 
-  if [ ! -t 1 ]; then
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s"
-    return $?
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
   fi
 
+  local started=$SECONDS
   local log_file=""
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
-  kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" \
-    >"$log_file" 2>&1 &
-  local kubectl_pid=$!
-
-  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-  local frame=0
-  local started=$SECONDS
-  local status_line=""
-  local term_width=0
-  term_width="$(get_term_width)"
-  # Everything except the kubectl line: two spaces, spinner, name, "(NNNs)",
-  # separators. Keep one column spare so the line never wraps — a wrapped line
-  # cannot be rewritten with \r and would scroll the spinner down the screen.
-  local status_width=$((term_width - ${#deployment} - 15))
-  if [ "$status_width" -lt 10 ]; then
-    status_width=10
-  fi
-  tput civis 2>/dev/null || true
-  while kill -0 "$kubectl_pid" 2>/dev/null; do
-    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")"
-    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
-      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$deployment" \
-      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
-    frame=$((frame + 1))
-    sleep 0.2
-  done
-  tput cnorm 2>/dev/null || true
-  printf '\r%*s\r' "$term_width" ''
 
   local rc=0
-  wait "$kubectl_pid" || rc=$?
+  run_with_spinner "$deployment" "$log_file" \
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
+
+  # Published for the caller's failure message. How long the wait actually ran is
+  # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
+  # different problem from one that used the whole budget, and the timeout
+  # constant cannot tell them apart.
+  ROLLOUT_ELAPSED_SECS=$((SECONDS - started))
+
   if [ "$rc" -eq 0 ]; then
-    print_success "$deployment rolled out in $((SECONDS - started))s"
-  else
-    tail -n 3 "$log_file" | tr -d '\r' | while IFS= read -r line; do
+    print_success "$deployment rolled out in ${ROLLOUT_ELAPSED_SECS}s"
+  elif [ -t 1 ]; then
+    # Only the spinner branch withholds the command's output. The non-TTY branch
+    # of run_with_spinner has already streamed it through tee, so echoing the
+    # tail there prints the same failure twice -- and on stdout, since the 2>&1
+    # that branch needs has already folded kubectl's stderr into it.
+    tail -n 3 "$log_file" 2>/dev/null | tr -d '\r' | while IFS= read -r line; do
       [ -n "$line" ] && print_info "$line"
     done
   fi
   rm -f -- "$log_file"
   return "$rc"
+}
+
+# Wait for a Deployment object to exist, ahead of waiting for it to roll out.
+# `kubectl rollout status` on a Deployment that is not there yet fails
+# immediately rather than waiting, and the operator writes the agent's after the
+# apply returns — later still when it has a RuntimeClass to resolve first. This
+# is the difference between "the operator has not got to it" and "the operator
+# refuses to create it", which is worth the wait to tell apart.
+wait_for_deployment_object() {
+  local deployment="$1"
+  local namespace="$2"
+  local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
+
+  local deadline=$((SECONDS + timeout_secs))
+  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$DEPLOYMENT_POLL_INTERVAL_SECS"
+  done
+  return 0
 }
 
 has_controlling_tty() {
@@ -593,10 +2265,20 @@ prompt_menu() {
   local var_name="${options[${#options[@]}-1]}"
   unset 'options[${#options[@]}-1]'
 
+  # The option an empty answer selects. A caller that has already worked out
+  # which option matches the loaded configuration pre-sets the choice variable,
+  # and pressing enter then keeps that setting instead of reverting it to option
+  # 1. Anything that is not an option number falls back to 1, so a caller that
+  # sets nothing behaves exactly as before.
+  local default_choice="${!var_name:-1}"
+  if ! [[ "$default_choice" =~ ^[0-9]+$ ]] ||
+    [ "$default_choice" -lt 1 ] || [ "$default_choice" -gt "${#options[@]}" ]; then
+    default_choice=1
+  fi
+
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
-    local current_choice="${!var_name:-1}"
-    printf -v "$var_name" '%s' "$current_choice"
-    print_info "Auto-selected option ($var_name): $current_choice"
+    printf -v "$var_name" '%s' "$default_choice"
+    print_info "Auto-selected option ($var_name): $default_choice"
     return 0
   fi
 
@@ -614,7 +2296,7 @@ prompt_menu() {
 
   local choice=""
   while true; do
-    prompt_read "Select an option (1-${#options[@]})" choice "1"
+    prompt_read "Select an option (1-${#options[@]})" choice "$default_choice"
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
       printf -v "$var_name" '%s' "$choice"
       break
@@ -626,6 +2308,15 @@ prompt_menu() {
 
 # How long each deployment gets to report ready in the post-install health check.
 ROLLOUT_TIMEOUT_SECS=300
+
+# How long each deployment gets to exist at all before that check calls it
+# missing. The operator creates the agent Deployment asynchronously and, when a
+# RuntimeClass is asked for, only after that RuntimeClass resolves — retrying on
+# a 30s requeue (validateRuntimeClass in
+# k8s-operator/internal/controller/platformagent_controller.go). Three requeues
+# is the budget: below one, "not yet" and "never" are indistinguishable.
+DEPLOYMENT_APPEAR_TIMEOUT_SECS=90
+DEPLOYMENT_POLL_INTERVAL_SECS=5
 
 # Number of projects listed in the interactive project picker. Accounts with
 # more projects than this can still type an ID that the list does not show.
@@ -738,6 +2429,10 @@ auto_install_tool() {
         # homebrew-core disabled the terraform formula after the licence
         # change; HashiCorp's tap is the supported source.
         brew install hashicorp/tap/terraform || true
+      elif [ "$tool" = "gke-gcloud-auth-plugin" ]; then
+        if command -v gcloud >/dev/null 2>&1; then
+          gcloud components install gke-gcloud-auth-plugin -q || true
+        fi
       else
         brew install "$tool" || true
       fi
@@ -759,10 +2454,22 @@ auto_install_tool() {
         sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
         sudo apt-get install gh -y || true
+      elif [ "$tool" = "gke-gcloud-auth-plugin" ]; then
+        sudo apt-get update >/dev/null 2>&1 || true
+        sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin 2>/dev/null || \
+          sudo apt-get install -y gke-gcloud-auth-plugin 2>/dev/null || \
+          (command -v gcloud >/dev/null 2>&1 && gcloud components install gke-gcloud-auth-plugin -q) || true
+      elif [ "$tool" = "go" ]; then
+        sudo apt-get update >/dev/null 2>&1 || true
+        if ! sudo apt-get install -y golang-go 2>/dev/null; then
+          sudo apt-get install -y golang 2>/dev/null || true
+        fi
       else
         sudo apt-get update >/dev/null 2>&1 || true
         sudo apt-get install -y "$tool" || true
       fi
+    elif command -v gcloud >/dev/null 2>&1 && [ "$tool" = "gke-gcloud-auth-plugin" ]; then
+      gcloud components install gke-gcloud-auth-plugin -q || true
     else
       print_error "Could not auto-install $tool. Package manager not recognized."
     fi
@@ -776,7 +2483,9 @@ auto_install_tool() {
   fi
 }
 
-# Generate Machine-Readable JSON Report for AI Agents
+# Generate Machine-Readable JSON Report for AI Agents. A report written before
+# the interview decided a setting says so -- null for gvisor_enabled, empty for
+# memory_mode -- rather than restating a default the run never applied.
 write_json_report() {
   local status="$1"
   local report_file="/tmp/kube-agents-install-report.json"
@@ -792,17 +2501,20 @@ write_json_report() {
 {
   "status": "$(json_escape "$status")",
   "dry_run": ${PARAM_DRY_RUN},
+  "generate_only": ${PARAM_GENERATE_ONLY},
   "non_interactive": ${PARAM_NON_INTERACTIVE},
   "project_id": "$(json_escape "${project_id:-}")",
   "project_number": "$(json_escape "${project_number:-}")",
   "cluster_name": "$(json_escape "${cluster_name:-}")",
+  "cluster_mode": "$(json_escape "${TFVARS_CLUSTER_MODE:-${cluster_mode:-}}")",
   "region": "$(json_escape "${region:-}")",
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
-  "gvisor_enabled": ${enable_gvisor:-false},
-  "memory_mode": "$(json_escape "${memory_mode:-file}")",
+  "gvisor_enabled": ${enable_gvisor:-null},
+  "memory_mode": "$(json_escape "${memory_mode:-}")",
+  "${NETWORK_POLICY_REPORT_FIELD}": "$(json_escape "${NETWORK_POLICY_ENFORCEMENT:-}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
-  "vars_file": "$(json_escape "${vars_file:-}")",
+  "install_env_file": "$(json_escape "${INSTALL_ENV_FILE:-}")",
   "timestamp": "$(json_escape "$timestamp")"
 }
 EOF
@@ -819,18 +2531,133 @@ tf_compose_dir() {
   echo "${1}/terraform/examples/full-install"
 }
 
+# Evaluates PIPESTATUS after a pipeline guarded with `|| ps=("${PIPESTATUS[@]}")`.
+# Dispatches to on_error with the primary command name instead of the trailing tee.
+handle_pipeline_status() {
+  local primary_cmd="$1"
+  local log_file="$2"
+  local rc_primary="${3:-0}"
+  local rc_tee="${4:-0}"
+
+  if [ "$rc_primary" -ne 0 ]; then
+    on_error "$rc_primary" "$LINENO" "$primary_cmd"
+  elif [ "$rc_tee" -ne 0 ]; then
+    on_error "$rc_tee" "$LINENO" "tee \"$log_file\""
+  fi
+}
+
+# Prints out-of-Terraform prerequisites, lifecycle commands with state bucket
+# and prefix, and post-apply steps when running with --generate-only.
+print_generate_only_handoff() {
+  local repo_dir="$1" project_id="$2" cluster_name="$3" region="$4" tfvars_file="$5"
+  local kms_loc key_resource keyring key minter_keyring minter_key state_bkt state_pfx
+
+  kms_loc="$(derive_kms_location "$region")"
+  keyring="${GKE_DB_KMS_KEYRING:-$DEFAULT_GKE_DB_KMS_KEYRING}"
+  key="${GKE_DB_KMS_KEY:-$DEFAULT_GKE_DB_KMS_KEY}"
+  key_resource="projects/${project_id}/locations/${kms_loc}/keyRings/${keyring}/cryptoKeys/${key}"
+  minter_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  minter_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
+  state_bkt="$(tf_state_bucket)"
+  state_pfx="$(tf_state_prefix)"
+
+  print_step "Generation Complete — Operator Handoff"
+  print_success "Configuration generated and validated without touching GCP resources."
+  echo ""
+  echo -e "  • ${C_CYAN}Install configuration:${C_RESET} ${INSTALL_ENV_FILE}"
+  echo -e "  • ${C_CYAN}Terraform input:${C_RESET} ${tfvars_file}"
+  echo ""
+  echo -e "${C_BOLD}Next steps for the operator to apply manually:${C_RESET}"
+  echo ""
+  echo -e "${C_BOLD}1. Out-of-Terraform prerequisites (run if applicable to your cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}CMEK Database Encryption (pre-existing cluster without CMEK):${C_RESET}"
+  echo -e "    # Note: the two KMS create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${keyring} --location=${kms_loc} --project=${project_id}"
+  echo -e "    gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_loc} --purpose=encryption --project=${project_id}"
+  echo -e "    gcloud beta services identity create --service=container.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keys add-iam-policy-binding ${key} --keyring=${keyring} --location=${kms_loc} \\\\"
+  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\" \\\\"
+  echo -e "      --role=\"roles/cloudkms.cryptoKeyEncrypterDecrypter\" --project=${project_id} --quiet"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --database-encryption-key=${key_resource} --project ${project_id}"
+  echo ""
+  echo -e "  • ${C_CYAN}Workload Identity Pool (pre-existing Standard cluster):${C_RESET}"
+  echo -e "    # Note: Migrating node pools to GKE_METADATA recreates nodes and restarts workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --workload-pool=${project_id}.svc.id.goog"
+  echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
+  echo ""
+  echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" = "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Nothing to run: this run accepted installing without enforcement, and the generated"
+    echo -e "    # terraform.tfvars carries accept_no_network_policy = true. Every NetworkPolicy kube-agents"
+    echo -e "    # ships will be inert, the agent sandbox's included. To enforce instead, run the two commands"
+    echo -e "    # below and set accept_no_network_policy = false (ACCEPT_NO_NETWORK_POLICY in install.env)."
+  else
+    echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  fi
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
+  if [ "${NETWORK_POLICY_ENFORCEMENT:-}" != "$NP_ENFORCEMENT_ABSENT_ACCEPTED" ]; then
+    echo -e "    # Or leave the cluster as it is: accept_no_network_policy = true in terraform.tfvars (what --accept-no-network-policy"
+    echo -e "    # writes) installs without enforcement; every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included."
+  fi
+  echo ""
+  echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
+  echo -e "    # Note: the two create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${minter_keyring} --location=${kms_loc} --project=${project_id}"
+  echo -e "    gcloud kms keys create ${minter_key} --keyring=${minter_keyring} --location=${kms_loc} \\\\"
+  echo -e "      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \\\\"
+  echo -e "      --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+  echo -e "    git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR}"
+  echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
+  echo ""
+  echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  # On an existing install only: first apply the chart's CRDs through the install's own context,"
+  echo -e "  # never the current one. Neither Helm nor lifecycle.sh upgrades them, and a field the served"
+  echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
+  echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
+  echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading APIs the"
+    echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
+    echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
+  fi
+  echo -e "  cd ${repo_dir}/terraform/examples/full-install"
+  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
+  echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
+  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions)"
+  echo -e "  # is replaced by this apply, and the reconcile"
+  echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
+  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
+    echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
+    echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
+    echo -e "  # on the container, and a warning above, if any, says what this identity could not."
+  fi
+  echo ""
+  echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+}
+
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
-# install coordinates from the environment (source vars.sh first).
+# install coordinates from the environment (load install.env first).
 run_lifecycle_apply() {
   local repo_dir="$1"
   local log_file="$2"
+  local -a ps=()
   (
     cd "$(tf_compose_dir "$repo_dir")"
-    export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
+    export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
     export KUBE_AGENTS_STATE_PREFIX
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
     ./lifecycle.sh apply -auto-approve -input=false
-  ) 2>&1 | tee "$log_file"
+  ) 2>&1 | tee "$log_file" || ps=("${PIPESTATUS[@]}")
+
+  # ${ps[@]+"${ps[@]}"}: empty on a clean apply, and macOS's bash 3.2 treats an
+  # empty array expansion as unbound under `set -u`.
+  handle_pipeline_status "./lifecycle.sh apply -auto-approve -input=false" "$log_file" ${ps[@]+"${ps[@]}"}
 }
 
 # CMEK on a pre-existing cluster is the one create-path behaviour Terraform
@@ -855,7 +2682,10 @@ ensure_existing_cluster_cmek() {
     return 0
   fi
 
-  local kms_location keyring="${GKE_DB_KMS_KEYRING:-platform-agent-keyring}" key="${GKE_DB_KMS_KEY:-k8s-secret-encryption-key}"
+  # The same two keys the generator writes into terraform.tfvars as
+  # kms_keyring_name / kms_key_name, so a cluster this step encrypts and one
+  # the gke-cluster module creates never end up on different keys.
+  local kms_location keyring="${GKE_DB_KMS_KEYRING:-$DEFAULT_GKE_DB_KMS_KEYRING}" key="${GKE_DB_KMS_KEY:-$DEFAULT_GKE_DB_KMS_KEY}"
   kms_location="$(derive_kms_location "$region")"
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
@@ -875,6 +2705,186 @@ ensure_existing_cluster_cmek() {
     --database-encryption-key="$key_resource" --project "$project_id" --quiet
 }
 
+# Determines the total node count of a GKE node pool to scale operation timeouts (#1286).
+# Queries Managed Instance Group targetSize values when available (reflecting live
+# autoscaled or resized counts), falling back to initialNodeCount * locations count.
+get_node_pool_node_count() {
+  local project_id="$1" cluster_name="$2" region="$3" pool_name="$4"
+  local describe_out=""
+  describe_out=$(trap - ERR; gcloud container node-pools describe "$pool_name" \
+    --cluster="$cluster_name" --location="$region" --project="$project_id" \
+    --format="value[separator='|'](initialNodeCount,locations.len(),instanceGroupUrls)" 2>/dev/null || true)
+  [ -n "$describe_out" ] || { echo 0; return 0; }
+
+  local init_count="" loc_count="" igm_urls=""
+  IFS='|' read -r init_count loc_count igm_urls <<< "$describe_out" || true
+
+  local total_igm_nodes=0
+  local igm_expected=0
+  local igm_succeeded=0
+  if [ -n "$igm_urls" ]; then
+    local url="" zone="" igm_name="" target_size=""
+    local IFS=';'
+    for url in $igm_urls; do
+      if [[ "$url" =~ /zones/([^/]+)/instanceGroupManagers/([^/;]+) ]]; then
+        igm_expected=$(( igm_expected + 1 ))
+        zone="${BASH_REMATCH[1]}"
+        igm_name="${BASH_REMATCH[2]}"
+        target_size=$(trap - ERR; gcloud compute instance-groups managed describe "$igm_name" \
+          --zone="$zone" --project="$project_id" --format="value(targetSize)" 2>/dev/null || true)
+        if [[ "$target_size" =~ ^[0-9]+$ ]]; then
+          total_igm_nodes=$(( total_igm_nodes + target_size ))
+          igm_succeeded=$(( igm_succeeded + 1 ))
+        fi
+      fi
+    done
+  fi
+
+  if [ "$igm_expected" -gt 0 ] && [ "$igm_succeeded" -eq "$igm_expected" ]; then
+    echo "$total_igm_nodes"
+    return 0
+  fi
+
+  if [[ "$init_count" =~ ^[0-9]+$ ]]; then
+    if [[ ! "$loc_count" =~ ^[0-9]+$ ]] || [ "$loc_count" -lt 1 ]; then
+      loc_count=1
+    fi
+    echo $(( init_count * loc_count ))
+    return 0
+  fi
+
+  echo 0
+}
+
+# Computes the dynamic wait timeout (in seconds) for a node pool update (#1286):
+# max(NODE_POOL_UPDATE_MIN_TIMEOUT_SECS, node_count * NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS).
+calculate_node_pool_update_timeout() {
+  local node_count="${1:-0}"
+  if [[ ! "$node_count" =~ ^[0-9]+$ ]]; then
+    node_count=0
+  fi
+  local scaled=$(( node_count * NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS ))
+  if [ "$scaled" -gt "$NODE_POOL_UPDATE_MIN_TIMEOUT_SECS" ]; then
+    echo "$scaled"
+  else
+    echo "$NODE_POOL_UPDATE_MIN_TIMEOUT_SECS"
+  fi
+}
+
+# Polls a GKE long-running node pool operation until it reaches DONE (#1286),
+# displaying progress while RUNNING/PENDING and extending the wait window up to
+# NODE_POOL_UPDATE_MAX_TIMEOUT_SECS if the operation is still actively RUNNING
+# when the estimated timeout is reached.
+wait_for_gke_node_pool_operation() {
+  local project_id="$1" region="$2" pool_name="$3" op_id="$4" timeout_secs="$5"
+  local elapsed=0
+  local consecutive_errors=0
+  local max_timeout="$NODE_POOL_UPDATE_MAX_TIMEOUT_SECS"
+  if [ "$timeout_secs" -gt "$max_timeout" ]; then
+    max_timeout="$timeout_secs"
+  fi
+
+  print_info "Polling operation '${op_id}' for node pool '${pool_name}' (timeout: ${timeout_secs}s)..."
+
+  while true; do
+    local desc_out="" op_status="" op_detail="" op_status_msg="" op_error_msg=""
+    if desc_out=$(trap - ERR; gcloud container operations describe "$op_id" \
+        --location="$region" --project="$project_id" \
+        --format="value[separator='|'](status,detail,statusMessage,error.message)" 2>/dev/null); then
+      IFS='|' read -r op_status op_detail op_status_msg op_error_msg <<< "$desc_out" || true
+      op_status="${op_status//[[:space:]]/}"
+    fi
+
+    if [ -z "$op_status" ]; then
+      consecutive_errors=$(( consecutive_errors + 1 ))
+      if [ "$consecutive_errors" -ge "$NODE_POOL_UPDATE_POLL_MAX_RETRIES" ]; then
+        print_error "Failed to query status of GKE operation '${op_id}' after ${consecutive_errors} consecutive attempts."
+        return 1
+      fi
+      print_warning "Transient error querying operation '${op_id}' (attempt ${consecutive_errors}/${NODE_POOL_UPDATE_POLL_MAX_RETRIES}); retrying..."
+    else
+      consecutive_errors=0
+      if [ "$op_status" = "$GKE_OP_STATUS_DONE" ]; then
+        local op_err="${op_error_msg:-$op_status_msg}"
+        if [ -n "$op_err" ]; then
+          print_error "GKE operation '${op_id}' for node pool '${pool_name}' finished with error: ${op_err}"
+          return 1
+        fi
+        print_success "Node pool '${pool_name}' metadata migration completed (operation '${op_id}')."
+        return 0
+      fi
+
+      local detail_suffix=""
+      if [ -n "$op_detail" ]; then
+        detail_suffix=" (${op_detail})"
+      fi
+      print_info "Node pool '${pool_name}' migration in progress: status=${op_status}${detail_suffix} (elapsed ${elapsed}s / ${timeout_secs}s)..."
+    fi
+
+    if [ "$elapsed" -ge "$timeout_secs" ]; then
+      if [ "$op_status" = "$GKE_OP_STATUS_RUNNING" ] && [ "$elapsed" -lt "$max_timeout" ]; then
+        timeout_secs=$(( timeout_secs + NODE_POOL_UPDATE_EXTENSION_SECS ))
+        if [ "$timeout_secs" -gt "$max_timeout" ]; then
+          timeout_secs="$max_timeout"
+        fi
+        print_warning "Operation '${op_id}' is still RUNNING after ${elapsed}s; extending wait timeout to ${timeout_secs}s..."
+      else
+        print_error "Timed out after ${elapsed}s waiting for GKE operation '${op_id}' on node pool '${pool_name}' (last status: ${op_status:-unknown})."
+        return 1
+      fi
+    fi
+
+    sleep "$NODE_POOL_UPDATE_POLL_INTERVAL_SECS"
+    elapsed=$(( elapsed + NODE_POOL_UPDATE_POLL_INTERVAL_SECS ))
+  done
+}
+
+# Migrates a legacy GCE_METADATA node pool to GKE_METADATA using async invocation
+# and operation polling with dynamic node-scaled timeout (#1286).
+migrate_node_pool_to_gke_metadata() {
+  local project_id="$1" cluster_name="$2" region="$3" legacy_pool="$4"
+  local node_count timeout_secs op_id
+  node_count="$(get_node_pool_node_count "$project_id" "$cluster_name" "$region" "$legacy_pool")"
+  timeout_secs="$(calculate_node_pool_update_timeout "$node_count")"
+  print_warning "Node pool '${legacy_pool}' (${node_count} node(s)) uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes; timeout: ${timeout_secs}s)..."
+
+  if ! op_id=$(trap - ERR; gcloud container node-pools update "$legacy_pool" \
+      --cluster="$cluster_name" --location="$region" --project="$project_id" \
+      --workload-metadata=GKE_METADATA --async --format="value(name)" --quiet); then
+    print_error "Failed to initiate metadata migration on node pool '${legacy_pool}'."
+    return 1
+  fi
+  op_id="${op_id##*/}"
+  op_id="${op_id//[[:space:]]/}"
+
+  if [ -z "$op_id" ]; then
+    op_id=$({ trap - ERR; gcloud container operations list \
+      --location="$region" --project="$project_id" \
+      --filter="targetLink ~ /clusters/${cluster_name}/nodePools/${legacy_pool}$ AND (status=RUNNING OR status=PENDING)" \
+      --format="value(name)" 2>/dev/null || true; } | head -n1)
+    op_id="${op_id##*/}"
+    op_id="${op_id//[[:space:]]/}"
+  fi
+
+  if [ -n "$op_id" ]; then
+    wait_for_gke_node_pool_operation "$project_id" "$region" "$legacy_pool" "$op_id" "$timeout_secs"
+    return $?
+  fi
+
+  local live_mode=""
+  live_mode=$(trap - ERR; gcloud container node-pools describe "$legacy_pool" \
+    --cluster="$cluster_name" --location="$region" --project="$project_id" \
+    --format="value(config.workloadMetadataConfig.mode)" 2>/dev/null || true)
+  live_mode="${live_mode//[[:space:]]/}"
+  if [ "$live_mode" = "GKE_METADATA" ]; then
+    print_success "Node pool '${legacy_pool}' metadata migration completed."
+    return 0
+  fi
+
+  print_error "Node pool '${legacy_pool}' metadata migration did not produce an operation ID and mode remains '${live_mode:-unknown}'."
+  return 1
+}
+
 # Workload Identity on a pre-existing cluster is the other such behaviour:
 # kube-agents requires the pool (every KSA→GSA binding rides it — without it
 # the pods silently run as the node's service account), and the module's
@@ -884,7 +2894,16 @@ ensure_existing_cluster_cmek() {
 # postcondition backstops installs driven through bare Terraform.
 ensure_existing_cluster_workload_identity() {
   local project_id="$1" cluster_name="$2" region="$3"
-  local pool
+  local pool is_autopilot
+
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null) || is_autopilot="false"
+  if [ "$is_autopilot" = "True" ]; then
+    print_success "Existing cluster '$cluster_name' is GKE Autopilot (Workload Identity enabled natively)."
+    return 0
+  fi
+
   # `trap - ERR` inside the substitution: bash 3.2 (macOS's default, the
   # curl|bash audience) runs the inherited ERR trap in the subshell even
   # though the outer failure is handled, printing a spurious abort banner
@@ -904,18 +2923,96 @@ ensure_existing_cluster_workload_identity() {
   # Enabling the pool does not migrate node pools off the legacy GCE metadata
   # server, and pods on such pools still get the node's service account.
   # Standard-cluster concern: Autopilot pools are managed onto GKE_METADATA
-  # already.
+  # already. Migrating a node pool recreates its nodes and restarts workloads,
+  # so explicit opt-in is required.
   local legacy_pool
+  local legacy_pools=()
   while IFS= read -r legacy_pool; do
     [ -n "$legacy_pool" ] || continue
-    print_warning "Node pool '${legacy_pool}' uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes)..."
-    gcloud container node-pools update "$legacy_pool" \
-      --cluster="$cluster_name" --location="$region" --project="$project_id" \
-      --workload-metadata=GKE_METADATA --quiet
-  done < <(gcloud container node-pools list --cluster="$cluster_name" \
+    legacy_pools+=("$legacy_pool")
+  done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
       --location="$region" --project="$project_id" \
       --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
-    | awk -F',' '$2 != "GKE_METADATA" {print $1}')
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+  if [ "${#legacy_pools[@]}" -gt 0 ]; then
+    if [ -z "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-}}" ]; then
+      if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+        PARAM_MIGRATE_NODE_POOLS="false"
+      else
+        local migrate_choice=""
+        prompt_read "Node pool(s) '${legacy_pools[*]}' use the legacy GCE metadata server; migrating to GKE_METADATA recreates nodes and restarts workloads. Declining ends the install (kube-agents requires Workload Identity). Migrate now? (y/N)" migrate_choice "n"
+        if is_truthy "$migrate_choice"; then
+          PARAM_MIGRATE_NODE_POOLS="true"
+        else
+          PARAM_MIGRATE_NODE_POOLS="false"
+        fi
+      fi
+    fi
+
+    if ! is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+      print_error "Existing cluster '$cluster_name' has node pool(s) '${legacy_pools[*]}' using the legacy GCE metadata server."
+      print_info "kube-agents requires Workload Identity (GKE_METADATA) to authenticate agent and operator pods."
+      print_info "Pods on these pools cannot use Workload Identity and would silently authenticate as the node's default compute service account."
+      print_info "Migrating node pools recreates nodes and restarts workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
+      print_info "Aborting before making any cluster changes. Pass --migrate-node-pools or set MIGRATE_NODE_POOLS=true to authorize."
+      return 1
+    else
+      for legacy_pool in "${legacy_pools[@]}"; do
+        migrate_node_pool_to_gke_metadata "$project_id" "$cluster_name" "$region" "$legacy_pool"
+      done
+    fi
+  fi
+}
+
+# What installing without NetworkPolicy enforcement costs, printed wherever the
+# choice is offered or applied. Precise on purpose: the usual argument for
+# accepting -- "we trust the workloads in this cluster" -- is about the
+# operator's workloads, and the confinement at stake is ours. The shell
+# sandbox is where model-authored commands run, and a NetworkPolicy is the
+# only thing between it and the VPC. An operator who reads this and still
+# says yes has made an informed decision, which is more than an abort-or-
+# enable-Calico fork gives them.
+print_no_network_policy_consequences() {
+  local cluster_name="$1"
+  print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement. The cluster is not modified."
+  print_info "Every NetworkPolicy this install ships is accepted by the API server and enforced by nothing:"
+  print_info "  • the agent pod's ingress restriction and egress confinement (otherwise port 443 outside private ranges, and named in-cluster peers)"
+  print_info "  • the shell sandbox's deny-all policy, which otherwise allows only cluster DNS and the credential proxy"
+  print_info "  • the LiteLLM gateway, GitHub token minter and Hindsight policies"
+  print_info "What is lost is the confinement of kube-agents' own workloads, not of yours: the sandbox that runs model-authored commands can reach anything routable in this VPC. Trusting the workloads already in this cluster is a different decision."
+  print_info "Recorded as ${NETWORK_POLICY_REPORT_FIELD}=${NP_ENFORCEMENT_ABSENT_ACCEPTED} in the install report and as the ${NETWORK_POLICY_ENFORCEMENT_ANNOTATION} annotation on the PlatformAgent. To confine it later, enable Dataplane V2 or the Calico addon on the cluster and re-run the installer."
+}
+
+# The interactive fork for an adopted cluster that enforces no NetworkPolicy.
+# Three answers, and the default is the one that changes nothing: enable
+# Calico (a control-plane update that may recreate nodes), install without
+# enforcement (the cluster is untouched; print_no_network_policy_consequences
+# says what that costs), or stop. Sets the two PARAM_ variables; the caller
+# acts on them. Never reached without a controlling TTY: an agent-driven run
+# has to pass one of the two flags, and the skill tells it to ask first.
+prompt_network_policy_choice() {
+  local cluster_name="$1"
+  local np_choice=""
+  print_warning "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor the legacy Calico addon)."
+  print_info "  e) enable the legacy Calico addon and enforcement now: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents"
+  print_info "  a) install without NetworkPolicy enforcement: the cluster is not modified, and every policy kube-agents ships stays inert, including the ones confining the agent's shell sandbox"
+  print_info "  n) stop here, changing nothing"
+  prompt_read "Choose (e/a/N)" np_choice "n"
+  case "$np_choice" in
+    [Ee])
+      PARAM_ENABLE_NETWORK_POLICY="true"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      ;;
+    [Aa])
+      PARAM_ENABLE_NETWORK_POLICY="false"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="true"
+      ;;
+    *)
+      PARAM_ENABLE_NETWORK_POLICY="false"
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+      ;;
+  esac
 }
 
 # NetworkPolicy enforcement on a pre-existing cluster is the third such
@@ -923,41 +3020,524 @@ ensure_existing_cluster_workload_identity() {
 # minter's, Hindsight's, and the ones the operator generates around the
 # agent — is accepted and silently inert on a cluster with neither Dataplane
 # V2 nor the legacy Calico addon, which is GKE Standard's default shape.
-# Terraform-created clusters always have Dataplane V2; adopted ones get the
-# legacy addon enabled here. The gke-cluster module's postcondition backstops
-# bare-Terraform installs.
+# Clusters created by this repository's gke-cluster module have Dataplane V2;
+# clusters created by other Terraform configurations or pre-existing Standard
+# clusters may have neither Dataplane V2 nor Calico. Such a cluster has three
+# outcomes, and the operator picks: enable the legacy Calico addon
+# (--enable-network-policy, a control-plane update), install without
+# enforcement (--accept-no-network-policy, the cluster untouched and the
+# choice on record), or refuse. The gke-cluster module's postcondition
+# backstops bare-Terraform installs, relaxed by the same variable.
 ensure_existing_cluster_network_policy() {
   local project_id="$1" cluster_name="$2" region="$3"
-  local dp_provider
+  local cluster_info
   # trap - ERR: same bash-3.2 subshell-trap suppression as the Workload
-  # Identity probe above.
-  dp_provider=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+  # Identity probe above. Query status alongside network fields so an
+  # unreadable cluster fails safely rather than attempting mutations.
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
     --location="$region" --project="$project_id" \
-    --format="value(networkConfig.datapathProvider)" 2>/dev/null) || return 0
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    print_error "Could not query NetworkPolicy configuration for existing cluster '$cluster_name'."
+    print_info "Refusing to attempt cluster mutations on unread cluster state."
+    return 1
+  fi
   if [ "$dp_provider" = "ADVANCED_DATAPATH" ]; then
     print_success "Existing cluster '$cluster_name' runs Dataplane V2; NetworkPolicy enforcement is built in."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
-  local legacy_np
-  legacy_np=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
-    --location="$region" --project="$project_id" \
-    --format="value(networkPolicy.enabled)" 2>/dev/null || echo "")
   if [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ]; then
     print_success "Existing cluster '$cluster_name' already enforces NetworkPolicy (legacy Calico addon)."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
     return 0
   fi
+
+  # No prompt here: by the time a run reaches this step the answer was given,
+  # at prompt_existing_cluster_opt_ins or by a flag, and the preflight has
+  # refused a run that has neither. The consequences were stated there too;
+  # this step only says it is proceeding as accepted.
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    print_warning "Installing onto '$cluster_name' WITHOUT NetworkPolicy enforcement, as accepted above. The cluster is not modified."
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    return 0
+  fi
+
+  if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+    print_error "Existing cluster '$cluster_name' has neither Dataplane V2 nor legacy Calico NetworkPolicy."
+    print_info "Enabling Calico may recreate nodes and restart workloads; installing without enforcement leaves the agent sandbox unconfined on the network. The cluster's owner decides which."
+    print_info "Explicit opt-in was not provided (--enable-network-policy or --accept-no-network-policy). Refusing to proceed."
+    return 1
+  fi
+
+  # Two calls, in this order. GKE rejects --enable-network-policy with "The
+  # network policy addon must be enabled before updating the nodes" (HTTP 400)
+  # until the Calico addon is on the control plane, and gcloud puts
+  # --update-addons and --enable-network-policy in the same "exactly one of
+  # these must be specified" argparse group, so they cannot be combined into a
+  # single invocation.
+  #
+  # Unconditional, matching Google's documented procedure. Gating it on
+  # addonsConfig.networkPolicyConfig.disabled looks tempting for the re-run
+  # case — the guard above reads networkPolicy.enabled, so a re-run after the
+  # enforcement call failed arrives here with the addon already on — but that
+  # field cannot express it: GKE omits false booleans from addonsConfig, so
+  # "off" prints True and "on" prints nothing, which is also what a failed
+  # describe prints. A gate that skips on empty reintroduces the 400 the
+  # moment describe fails. Re-enabling an already-enabled addon is a no-op.
+  print_info "Enabling the NetworkPolicy addon on existing cluster '$cluster_name'..."
+  gcloud container clusters update "$cluster_name" --location "$region" \
+    --update-addons=NetworkPolicy=ENABLED --project "$project_id" --quiet
   print_info "Enabling NetworkPolicy enforcement on existing cluster '$cluster_name' (node pools may be recreated; this can take several minutes)..."
   gcloud container clusters update "$cluster_name" --location "$region" \
     --enable-network-policy --project "$project_id" --quiet
   local active_op
-  active_op=$(gcloud container operations list --location="$region" --project="$project_id" \
-    --filter="targetLink:$cluster_name AND status=RUNNING" --format="value(name)" 2>/dev/null | head -n1)
+  active_op=$({ gcloud container operations list --location="$region" --project="$project_id" \
+    --filter="targetLink ~ /clusters/${cluster_name}$ AND status=RUNNING" --format="value(name)" 2>/dev/null || true; } | head -n1)
   if [ -n "$active_op" ]; then
     print_info "Waiting for operation $active_op to complete..."
     gcloud container operations wait "$active_op" --location="$region" --project="$project_id" ||
       print_warning "Operation wait returned non-zero (it may have finished between list and wait); proceeding..."
   fi
   print_warning "Legacy Network Policy enabled. FQDN-based NetworkPolicies stay unsupported without Dataplane V2."
+  NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENABLED_BY_INSTALL"
+}
+
+# Interactively prompts for existing-cluster opt-in mutations before the Step 11 summary
+prompt_existing_cluster_opt_ins() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && has_controlling_tty || return 0
+
+  local is_autopilot
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  [ "$is_autopilot" != "True" ] || return 0
+
+  # Node pool migration opt-in prompt
+  if [ -z "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-}}" ]; then
+    local legacy_pools=() legacy_pool
+    while IFS= read -r legacy_pool; do
+      [ -n "$legacy_pool" ] || continue
+      legacy_pools+=("$legacy_pool")
+    done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+        --location="$region" --project="$project_id" \
+        --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+      | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+    if [ "${#legacy_pools[@]}" -gt 0 ]; then
+      local migrate_choice=""
+      prompt_read "Node pool(s) '${legacy_pools[*]}' use the legacy GCE metadata server; migrating to GKE_METADATA recreates nodes and restarts workloads. Declining ends the install (kube-agents requires Workload Identity). Migrate now? (y/N)" migrate_choice "n"
+      if is_truthy "$migrate_choice"; then
+        PARAM_MIGRATE_NODE_POOLS="true"
+      else
+        PARAM_MIGRATE_NODE_POOLS="false"
+      fi
+    fi
+  fi
+
+  # The NetworkPolicy fork: enable Calico, accept the absence, or stop
+  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ] && \
+     [ -z "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-}}" ]; then
+    local cluster_info
+    cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+    local status="" dp_provider="" legacy_np=""
+    if [ -n "$cluster_info" ]; then
+      IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+    fi
+    if [ -n "$status" ] && [ "$dp_provider" != "ADVANCED_DATAPATH" ] && [ "$legacy_np" != "True" ] && [ "$legacy_np" != "true" ]; then
+      prompt_network_policy_choice "$cluster_name"
+    fi
+  fi
+}
+
+# After the existing-cluster prompt and before install.env is written: carry
+# an "install without NetworkPolicy enforcement" answer into the files.
+#
+# The answer arrives after the generator ran, and the generated tfvars must
+# hold it -- the module's postcondition reads accept_no_network_policy, not
+# the flag -- so regenerate from the same inputs plus the answer. The
+# generator reuses the API_SERVER_KEY it exported on the first pass, so
+# nothing new is minted. Then settle what install.env will record, which is
+# the decision rather than the flag: the flag against a cluster that already
+# enforces accepted nothing, and an unreadable cluster decides nothing (the
+# preflight refuses it a few steps on). The preflight reaches the same answer
+# and prints it; this only settles it before the bootstrap writes the file.
+settle_network_policy_acceptance() {
+  local project_id="$1" cluster_name="$2" region="$3" tfvars_file="$4" image_tag="$5"
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-false}" && ! is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}"; then
+    export ACCEPT_NO_NETWORK_POLICY="true"
+    KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+      write_tfvars_from_state "$tfvars_file" "$image_tag"
+  fi
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    local np_probe=0
+    is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_probe=$?
+    if [ "$np_probe" -eq 1 ]; then
+      NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    fi
+  fi
+}
+
+is_existing_cluster_node_pools_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local is_autopilot
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  [ "$is_autopilot" != "True" ] || return 0
+
+  local legacy_pools=() legacy_pool
+  while IFS= read -r legacy_pool; do
+    [ -n "$legacy_pool" ] || continue
+    legacy_pools+=("$legacy_pool")
+  done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+  [ "${#legacy_pools[@]}" -eq 0 ] || return 1
+  return 0
+}
+
+check_existing_cluster_node_pools_preflight() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local is_autopilot
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  [ "$is_autopilot" != "True" ] || return 0
+
+  local legacy_pools=() legacy_pool
+  while IFS= read -r legacy_pool; do
+    [ -n "$legacy_pool" ] || continue
+    legacy_pools+=("$legacy_pool")
+  done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+  [ "${#legacy_pools[@]}" -gt 0 ] || return 0
+
+  if ! is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+    print_error "Existing cluster '$cluster_name' has node pool(s) '${legacy_pools[*]}' using the legacy GCE metadata server."
+    print_info "kube-agents requires Workload Identity (GKE_METADATA) to authenticate agent and operator pods."
+    print_info "Pods on these pools cannot use Workload Identity and would silently authenticate as the node's default compute service account."
+    print_info "Migrating node pools recreates nodes and restarts workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
+    print_info "Aborting before making any cluster changes. Pass --migrate-node-pools or set MIGRATE_NODE_POOLS=true to authorize."
+    write_json_report "REFUSED_MISSING_NODE_POOL_MIGRATION"
+    exit 1
+  fi
+}
+
+is_existing_cluster_network_policy_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    return 2
+  fi
+  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
+  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
+  return 0
+}
+
+check_existing_cluster_network_policy_preflight() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  # A cluster this run creates comes up on Dataplane V2.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" != "false" ]; then
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
+    return 0
+  fi
+
+  local np_status=0
+  is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
+  if [ "$np_status" -eq 0 ]; then
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ENFORCED"
+    return 0
+  fi
+
+  if [ "$np_status" -eq 2 ]; then
+    print_error "Could not query NetworkPolicy configuration for existing cluster '$cluster_name'."
+    print_info "Failed to read cluster details from GCP. Check cluster name, region, permissions, and network connectivity."
+    write_json_report "FAILED_PREFLIGHT_CLUSTER_UNREADABLE"
+    exit 1
+  fi
+
+  # The third answer: install anyway, on record, without touching the cluster.
+  # The generated tfvars carry accept_no_network_policy = true, which is what
+  # gets the plan past the module's postcondition.
+  if is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+    print_no_network_policy_consequences "$cluster_name"
+    NETWORK_POLICY_ENFORCEMENT="$NP_ENFORCEMENT_ABSENT_ACCEPTED"
+    # The settle step and this preflight each describe the cluster once. If
+    # the first describe failed and this one succeeded, install.env was just
+    # written without the key and nobody said so; the note reads the decision
+    # and the file, so asking it again here closes that gap.
+    note_unrecorded_network_policy_acceptance "$INSTALL_ENV_FILE"
+    return 0
+  fi
+
+  if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+    print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor legacy Calico)."
+    print_info "kube-agents ships NetworkPolicies that isolate the agent's execution sandbox; on this cluster they would be accepted and inert, and the Terraform apply refuses the plan."
+    print_info "Two ways forward, and the cluster's owner chooses:"
+    print_info "  --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon: a control-plane update that may recreate node pools and restart workloads unrelated to kube-agents."
+    print_info "  --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement: the cluster is not modified, and the agent sandbox is unconfined on the network. Recorded in the report and on the PlatformAgent."
+    print_info "Neither was given. Aborting before making any cluster changes."
+    write_json_report "REFUSED_MISSING_NETWORK_POLICY"
+    exit 1
+  fi
+}
+
+# --model-max-tokens: a whole number of tokens, or empty for none. Refused here
+# rather than left to Terraform's type check so the message names the flag; the
+# tfvars generator checks again for the front doors that regenerate from
+# install.env without this interview. Needs installer_common.sh sourced.
+validate_model_max_tokens() {
+  local value="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
+  if [ -n "$value" ] && ! is_non_negative_integer "$value"; then
+    print_error "--model-max-tokens must be a whole number of tokens (0 or empty leaves the gateway default unset), got '${value}'."
+    return 1
+  fi
+}
+
+# Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
+validate_existing_cluster_opt_in_flags() {
+  if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
+     [[ ! "$PARAM_MIGRATE_NODE_POOLS" =~ ^(true|false)$ ]]; then
+    print_error "--migrate-node-pools must be either true or false."
+    exit 1
+  fi
+  if { [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] || [ -n "${PARAM_ENABLE_NETWORK_POLICY:-}" ]; } && \
+     [[ ! "$PARAM_ENABLE_NETWORK_POLICY" =~ ^(true|false)$ ]]; then
+    print_error "--enable-network-policy must be either true or false."
+    exit 1
+  fi
+  if { [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] || [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; } && \
+     [[ ! "$PARAM_ACCEPT_NO_NETWORK_POLICY" =~ ^(true|false)$ ]]; then
+    print_error "--accept-no-network-policy must be either true or false."
+    exit 1
+  fi
+  # Two answers to one question. A run carrying both would enable Calico and
+  # then record that it did not, so it is refused before it reads the cluster
+  # -- unless exactly one came from the command line, in which case the flag
+  # beats the recorded value for this run, as install.env's contract says.
+  # That is the documented "confine it later" path: an install that recorded
+  # ACCEPT_NO_NETWORK_POLICY=true re-run with --enable-network-policy.
+  if [ "${PARAM_ENABLE_NETWORK_POLICY:-}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" = "true" ]; then
+    if [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
+      print_info "--enable-network-policy overrides the ACCEPT_NO_NETWORK_POLICY=true your install configuration records, for this run. Remove that line once Calico is on, or every later upgrade waives the enforcement check."
+      PARAM_ACCEPT_NO_NETWORK_POLICY="false"
+    elif [ "${PARAM_ACCEPT_NO_NETWORK_POLICY_PASSED:-false}" = "true" ] && [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" != "true" ]; then
+      print_info "--accept-no-network-policy overrides the ENABLE_NETWORK_POLICY=true your install configuration records, for this run."
+      PARAM_ENABLE_NETWORK_POLICY="false"
+    else
+      print_error "--enable-network-policy and --accept-no-network-policy are two answers to one question; pass one (as flags, or as ENABLE_NETWORK_POLICY / ACCEPT_NO_NETWORK_POLICY in install.env)."
+      print_info "The first enables the legacy Calico addon on the cluster (may recreate nodes); the second installs without NetworkPolicy enforcement and changes nothing."
+      exit 1
+    fi
+  fi
+}
+
+# Validates that non-interactive minter configuration has either an ENABLED KMS key
+# (Path 2: AOT) or a valid PEM file path (Path 1: automated import) whenever there
+# is an explicit intention to configure the token minter.
+validate_non_interactive_minter_config() {
+  local app_id="$1" pem_path="$2" keyring="$3" key="$4" region="$5" project_id="$6" org="${7:-}"
+  # If neither App ID nor PEM path is provided, the token minter is omitted (optional feature).
+  if [ -z "$app_id" ] && [ -z "$pem_path" ]; then
+    return 0
+  fi
+
+  # Explicit intention to configure minter exists:
+  if [ -n "$pem_path" ] && [ -z "$app_id" ]; then
+    print_error "--github-pem-path was provided, but --github-app-id is missing."
+    print_info "The GitHub token minter requires both a GitHub App ID and an asymmetric signing key."
+    return 1
+  fi
+
+  if [ -n "$app_id" ] && [ -z "$org" ]; then
+    print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but --gitops-org is missing."
+    print_info "The GitHub token minter requires an organization to mint installation access tokens for."
+    return 1
+  fi
+
+  local kms_loc existing_kms_ver=""
+  kms_loc="$(derive_kms_location "$region")"
+  existing_kms_ver="$(kms_key_enabled_version "$key" "$keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+
+  if [ -n "$existing_kms_ver" ]; then
+    return 0
+  fi
+
+  if [ -n "$pem_path" ] && [ ! -f "$pem_path" ]; then
+    print_error "GitHub App private key PEM file does not exist or is not a regular file: '${pem_path}'."
+    return 1
+  fi
+
+  if [ -z "$pem_path" ]; then
+    print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
+    print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    print_info "To install without the token minter, omit --github-app-id."
+    return 1
+  fi
+  return 0
+}
+
+# The half of the PEM decision the early preflight could not make.
+#
+# A .pem deleted after a successful import is the documented end state, not an
+# error: docs/site/src/content/docs/deploy/token-minter.md and
+# .agents/skills/install-kube-agents/SKILL.md both tell the operator to remove
+# it. So a missing file is fatal only when the signing key has no ENABLED
+# version to fall back on.
+#
+# A function rather than a block inside main(), because reaching step 8 costs a
+# live project and a cluster: inverting the ENABLED test below left all 398
+# tests green while it was inline, and no test could reach it to say otherwise.
+#
+# Reads and clears the global PARAM_GITHUB_PEM_PATH instead of echoing a value.
+# The point of resolving it here is that every later consumer in step 8 -- the
+# locals the step copies it into, the interview, the non-interactive validator
+# -- sees one answer, and a captured stdout would leave the global behind.
+#
+# Callers must run this below source_provisioning_helpers: derive_kms_location
+# and kms_key_enabled_version live in installer_common.sh and
+# DEFAULT_KMS_KEYRING in install.defaults.env, and a `curl | bash` run has no
+# copy of either before the clone.
+resolve_missing_pem_against_kms() {
+  local region="$1" project_id="$2"
+
+  if [ -z "$PARAM_GITHUB_PEM_PATH" ] || [ -e "$PARAM_GITHUB_PEM_PATH" ]; then
+    return 0
+  fi
+
+  local pem_keyring pem_key pem_kms_loc pem_enabled_ver=""
+  pem_keyring="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  pem_key="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
+  pem_kms_loc="$(derive_kms_location "$region")"
+  pem_enabled_ver="$(kms_key_enabled_version "$pem_key" "$pem_keyring" "$pem_kms_loc" "$project_id" 2>/dev/null || true)"
+
+  if [ -n "$pem_enabled_ver" ]; then
+    print_info "Cloud KMS key ${pem_keyring}/${pem_key} already has an ENABLED version (${pem_enabled_ver}); ignoring missing local PEM path '${PARAM_GITHUB_PEM_PATH}'."
+    PARAM_GITHUB_PEM_PATH=""
+    return 0
+  fi
+
+  print_error "GitHub App private key PEM file does not exist: '${PARAM_GITHUB_PEM_PATH}'."
+  print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
+  print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  return 1
+}
+
+# Enumerates pending existing-cluster mutations for the pre-flight summary
+summarize_existing_cluster_mutations() {
+  local project_id="$1" cluster_name="$2" region="$3" enable_gvisor="${4:-false}"
+
+  # 1. CMEK database encryption
+  local enc_state
+  enc_state=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(databaseEncryption.state)" 2>/dev/null || echo "")
+  if is_valid_cmek_encryption_state "$enc_state"; then
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_GREEN}Already enabled${C_RESET} ($enc_state)"
+  elif is_truthy "${ALLOW_UNENCRYPTED_SECRETS:-false}"; then
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_YELLOW}Skipped${C_RESET} (ALLOW_UNENCRYPTED_SECRETS=true)"
+  elif [ -z "$enc_state" ]; then
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_YELLOW}Skipped${C_RESET} (could not query cluster encryption state)"
+  else
+    local keyring="${GKE_DB_KMS_KEYRING:-platform-agent-keyring}" key="${GKE_DB_KMS_KEY:-k8s-secret-encryption-key}"
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_YELLOW}Will enable${C_RESET} Cloud KMS encryption on control plane (${keyring}/${key}; non-revertible)"
+  fi
+
+  # 2. Workload Identity & 3. Node pool metadata
+  local is_autopilot pool
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  if [ "$is_autopilot" = "True" ]; then
+    echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_GREEN}Native${C_RESET} (GKE Autopilot)"
+    echo -e "    • ${C_CYAN}Node Pool Metadata:${C_RESET} ${C_GREEN}Managed${C_RESET} (GKE Autopilot)"
+  else
+    pool=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null || echo "")
+    if [ "$pool" = "${project_id}.svc.id.goog" ]; then
+      echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_GREEN}Already enabled${C_RESET} ($pool)"
+    else
+      echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_YELLOW}Will enable${C_RESET} ${project_id}.svc.id.goog on control plane (non-revertible)"
+    fi
+
+    local legacy_pools=() legacy_pool
+    while IFS= read -r legacy_pool; do
+      [ -n "$legacy_pool" ] || continue
+      legacy_pools+=("$legacy_pool")
+    done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+        --location="$region" --project="$project_id" \
+        --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+      | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+    if [ "${#legacy_pools[@]}" -eq 0 ]; then
+      echo -e "    • ${C_CYAN}Node Pool Metadata:${C_RESET} ${C_GREEN}All node pools use GKE_METADATA${C_RESET}"
+    else
+      if is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+        echo -e "    • ${C_CYAN}Node Pool Metadata Migration:${C_RESET} ${C_RED}Will migrate${C_RESET} '${legacy_pools[*]}' to GKE_METADATA (${C_RED}recreates nodes, restarts workloads${C_RESET})"
+      else
+        echo -e "    • ${C_CYAN}Node Pool Metadata Migration:${C_RESET} ${C_RED}Refused${C_RESET} for '${legacy_pools[*]}' (opt-in not provided; pass --migrate-node-pools; install will abort)"
+      fi
+    fi
+  fi
+
+  # 4. NetworkPolicy
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Skipped${C_RESET} (could not query cluster network policy state)"
+  elif [ "$dp_provider" = "ADVANCED_DATAPATH" ]; then
+    echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_GREEN}Built-in${C_RESET} (Dataplane V2)"
+  elif [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ]; then
+    echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_GREEN}Already enabled${C_RESET} (legacy Calico addon)"
+  else
+    if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Will enable${C_RESET} legacy Calico addon & enforcement (${C_YELLOW}may recreate nodes, restart workloads${C_RESET})"
+    elif is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Absent, accepted${C_RESET} (--accept-no-network-policy: cluster unchanged; ${C_YELLOW}every NetworkPolicy kube-agents ships is inert, the agent sandbox included${C_RESET}; recorded on the PlatformAgent)"
+    else
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (opt-in not provided; pass --enable-network-policy or --accept-no-network-policy; install will abort)"
+    fi
+  fi
+
+  # 5. gVisor pool
+  if [ "$is_autopilot" != "True" ] && is_truthy "$enable_gvisor"; then
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (1 e2-standard-4 per zone; new billable capacity)"
+  else
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} None (not requested or native on Autopilot)"
+  fi
 }
 
 # Neither google provider has a field for --managed-otel-scope, so it is set
@@ -978,42 +3558,54 @@ apply_managed_otel_scope() {
 # One-shot import of the GitHub App private key into the minter's KMS signing
 # key, via the Minty CLI. The PEM never enters Terraform state — that is why
 # this is not a Terraform resource. Skipped when a key version is already
-# ENABLED (the import happened on an earlier run) and downgraded to printed
-# instructions when Go is unavailable.
+# ENABLED (the import happened on an earlier run), downgraded to printed
+# instructions when no PEM is provided, and auto-installs Go if missing.
 import_github_pem() {
   local project_id="$1" region="$2"
-  [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
+  [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
   local pem_path="${GITHUB_PEM_PATH:-}"
-  local kms_location keyring="${KMS_KEYRING:-github-token-minter-keyring}" key="${KMS_KEY:-github-token-minter-key}"
+  pem_path="$(expand_tilde_path "$pem_path")"
+  local kms_location keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
   kms_location="$(derive_kms_location "$region")"
 
   local enabled_version
-  enabled_version=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
-    --location "$kms_location" --project "$project_id" \
-    --filter='state=ENABLED' --format='value(name.basename())' 2>/dev/null | head -1 || echo "")
+  enabled_version="$(kms_key_enabled_version "$key" "$keyring" "$kms_location" "$project_id")"
   if [ -n "$enabled_version" ]; then
     print_success "GitHub minter KMS key already has an ENABLED version ($enabled_version); skipping PEM import."
     return 0
   fi
 
-  # Clone the tag and run the CLI from the tree:
-  # `go run github.com/abcxyz/github-token-minter/cmd/minty@v2.7.1`
+  # Clone the tag (MINTY_CLI_GIT_TAG) and run the CLI from the tree:
+  # `go run github.com/abcxyz/github-token-minter/cmd/minty@<tag>`
   # cannot work: the upstream go.mod declares the module without the /v2 suffix
   # its v2 tags require, so Go rejects the version with or without /v2 in the
-  # path. The gcloud-only recovery recipe lives in
-  # k8s-operator/config/integrations/github/README.md.
-  local import_cmd="git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty && cd /tmp/minty && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_location} -key-ring=${keyring} -key=${key} -private-key=@<path-to-pem>"
+  # path. Upstream guide: https://github.com/abcxyz/github-token-minter
+  local import_cmd="git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR} && cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_location} -key-ring=${keyring} -key=${key} -private-key=@<path-to-pem>"
   if [ -z "$pem_path" ] || [ ! -f "$pem_path" ]; then
     print_warning "No GitHub App private key PEM available (GITHUB_PEM_PATH='${pem_path}')."
     print_info "The minter deployment stays unready until the key is imported: ${import_cmd}"
     return 0
   fi
   if ! command -v go >/dev/null 2>&1; then
-    print_warning "Go is not installed, so the App key cannot be imported automatically."
-    print_info "Import it manually: ${import_cmd/<path-to-pem>/$pem_path}"
-    print_info "Without Go, the gcloud-only import recipe is in k8s-operator/config/integrations/github/README.md."
-    return 0
+    print_info "Go is required to build the Minty CLI for initial private key import into Cloud KMS."
+    # Said before the attempt rather than after it. auto_install_tool ends in
+    # `exit 1` when the tool is still missing afterwards, which is what every
+    # host it has no package manager for gets -- and from inside that exit
+    # there is nowhere left to say what to do instead. The run stops either
+    # way: the minter is enabled in the generated configuration, so the
+    # readiness gate after this import refuses the apply without a key. What
+    # the operator loses is the recipe, and only on the path where they need
+    # it most, so print it while there is still a stdout to print it to.
+    print_info "If Go cannot be installed on this host, import the key by hand instead: ${import_cmd/<path-to-pem>/$pem_path}"
+    auto_install_tool "go"
   fi
+  # auto_install_tool judges success by `command -v`, which a Go far too old to
+  # build the CLI answers just as well — and on Debian 12 and Ubuntu 22.04 that
+  # is exactly what its `apt-get install golang-go` leaves behind. Checked here
+  # rather than left to `go run`: that call is wrapped in `retry 6 5` below, so
+  # a toolchain that cannot satisfy the CLI's go.mod costs six attempts and
+  # then advises retrying the same command by hand.
+  require_min_go_version || return 1
   # The ring and key normally come from Terraform, but this import runs
   # BEFORE the apply — the minter Deployment cannot pass readiness without an
   # imported key, and the composition's helm release waits on every
@@ -1023,25 +3615,73 @@ import_github_pem() {
   # after a destroy.
   print_info "Ensuring the minter's KMS keyring and import-only signing key exist..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+
+  # Both creates keep their errors instead of discarding them. Re-running the
+  # installer is the common case and "already exists" is the expected answer to
+  # it, so the output is only surfaced when the resource is missing afterwards —
+  # which is the check that actually matters. Discarding stderr outright is what
+  # hid the bug below; tolerating one specific error would still have hidden a
+  # permission denial, a disabled API or a quota refusal, all of which end the
+  # same way: no key, and an import that fails against something that is not there.
+  #
+  # `trap - ERR` inside each substitution, for the reason spelled out at the
+  # Workload Identity probe above: bash 3.2 runs the inherited ERR trap in the
+  # subshell even though `|| true` handles the failure, so a re-run — where
+  # "already exists" is the expected answer — would print two fatal-looking
+  # abort banners and leave a FAILED install report behind mid-run.
+  local kms_ring_err="" kms_key_err=""
+  kms_ring_err="$(trap - ERR; gcloud kms keyrings create "$keyring" --location="$kms_location" \
+    --project="$project_id" 2>&1)" || true
+
+  # --skip-initial-version-creation is required, not optional: KMS answers
+  # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
+  # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
+  # which is where the key normally comes from.
+  kms_key_err="$(trap - ERR; gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
     --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --import-only --protection-level=software --project="$project_id" 2>/dev/null || true
+    --import-only --skip-initial-version-creation \
+    --protection-level=software --project="$project_id" 2>&1)" || true
+
+  # The assertion, not the create, is what makes a failure visible. Whatever went
+  # wrong above, the import cannot work without this key, and saying so here names
+  # the cause instead of leaving a confusing failure two steps later.
+  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
+    --project="$project_id" >/dev/null 2>&1; then
+    # Deliberately says "could not be confirmed" rather than "does not exist":
+    # describe also fails on an IAM denial for cloudkms.cryptoKeys.get or an API
+    # blip, and asserting absence from that would be stating more than was
+    # established. Whatever the cause, the import cannot safely proceed.
+    print_warning "The minter's KMS signing key ${kms_location}/${keyring}/${key} could not be confirmed to exist."
+    [ -n "$kms_ring_err" ] && print_info "Keyring create said: ${kms_ring_err}"
+    [ -n "$kms_key_err" ] && print_info "Key create said: ${kms_key_err}"
+    print_info "The PEM import needs the keyring and the key, so it is being skipped; the minter deployment stays unready until both exist."
+    # Not the README's import recipe: that one presupposes the key and only covers
+    # loading a PEM into it. What failed here is the creation, so print the two
+    # commands that create it. --skip-initial-version-creation is the one that is
+    # easy to lose and the one KMS refuses an import-only key without.
+    print_info "Create them by hand with:"
+    print_info "  gcloud kms keyrings create ${keyring} --location=${kms_location} --project=${project_id}"
+    print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+    print_info "Then import the PEM following: https://github.com/abcxyz/github-token-minter"
+    return 0
+  fi
 
   print_info "Importing the GitHub App private key into KMS via the Minty CLI..."
   local minty_dir pem_abs
   minty_dir="$(mktemp -d "${TMPDIR:-/tmp}/minty-XXXXXX")"
   pem_abs="$(realpath "$pem_path" 2>/dev/null || echo "$pem_path")"
-  if git clone --quiet --depth 1 --branch v2.7.1 \
-      https://github.com/abcxyz/github-token-minter.git "$minty_dir" &&
+  if git clone --quiet --depth 1 --branch "$MINTY_CLI_GIT_TAG" \
+      "$MINTY_CLI_REPO_URL" "$minty_dir" &&
     (cd "$minty_dir" && retry 6 5 go run ./cmd/minty tools import-pk \
       -project-id="$project_id" -location="$kms_location" -key-ring="$keyring" -key="$key" \
       -private-key=@"$pem_abs"); then
     print_success "GitHub App private key imported into ${keyring}/${key}."
   else
-    print_warning "PEM import failed; the minter deployment stays unready until it succeeds."
+    print_error "PEM import failed: Minty CLI could not import the private key into Cloud KMS (${keyring}/${key})."
     print_info "Retry manually: ${import_cmd/<path-to-pem>/$pem_path}"
-    print_info "If Go itself is the problem (killed compiler, no toolchain), the gcloud-only recipe is in k8s-operator/config/integrations/github/README.md."
+    print_info "See https://github.com/abcxyz/github-token-minter for the upstream troubleshooting guide."
+    rm -rf "$minty_dir"
+    return 1
   fi
   rm -rf "$minty_dir"
 }
@@ -1058,24 +3698,29 @@ run_menu_system() {
 
   local repo_dir
   repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
-  local helper_script="${repo_dir}/k8s-operator/scripts/installer_common.sh"
+  local helper_script="${repo_dir}/scripts/installer/installer_common.sh"
 
   if [ ! -f "$helper_script" ]; then
     print_error "Cannot find installer helpers at $helper_script."
     exit 1
   fi
-  export VARS_FILE="$vars_file"
   # shellcheck disable=SC1090
   source "$helper_script"
 
-  if [ -f "$vars_file" ]; then
-    # shellcheck disable=SC1090
-    if ! source "$vars_file"; then
-      print_error "Configuration state is invalid and could not be loaded: $vars_file"
-      exit 1
-    fi
-  fi
+  # install.env is already loaded at startup; re-apply it here so the panel
+  # always opens on the operator's own input, whatever the sourced helpers
+  # left in the environment.
+  load_install_env "$INSTALL_ENV_FILE" || true
+  # That reload unsets NAMESPACE on its way in, for the reason
+  # bootstrap_install_env does -- so --agent-namespace, which main() applied
+  # before dispatching here, has to be applied again or the panel opens on the
+  # default namespace and its Save & Apply writes tfvars for that one.
+  apply_agent_namespace_override
+  # ...and the memory setting needs normalizing, because install.env spells it
+  # MEMORY while the provisioner reads MEMORY_PROVIDER. Save & Apply generates
+  # tfvars directly, without passing through the parameter block that resolves
+  # this pair on install.sh's own run.
+  normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
   local project_number="${PROJECT_NUMBER:-}"
@@ -1084,26 +3729,48 @@ run_menu_system() {
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
   local vertex_project_id="${VERTEX_PROJECT_ID:-$project_id}"
-  local vertex_location="${VERTEX_LOCATION:-$region}"
+  local vertex_location="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
-  local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-false}"
-  local slack_enabled="${SLACK_ENABLED:-false}"
+  local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
+  local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
+  local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   local allowed_users="${ALLOWED_USERS:-}"
-  local chat_topic_name="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
-  local chat_sub_name="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
-  local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
+  local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+  local chat_sub_name="${CHAT_SUB_NAME:-}"
+  if [ "$google_chat_enabled" = "true" ]; then
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+    fi
+    if [ -n "$state_sub" ]; then
+      chat_sub_name="$state_sub"
+    elif [ -z "$chat_sub_name" ] || [ "$chat_sub_name" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
+  fi
+  local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+  # Not the fresh-install default. The control panel describes an install that
+  # already exists and its Save & Apply re-applies what it displays, so an
+  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
+  # that is what such a cluster is actually running. Defaulting on here would
+  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
+  # pool nobody asked for on the next apply.
   local enable_gvisor="${ENABLE_GVISOR:-false}"
-  local enable_webui="${HERMES_DASHBOARD_ENABLED:-false}"
-  local github_org="${GITHUB_ORG:-}"
-  local github_repo="${GITHUB_REPO:-gke-fleet-iac}"
+  # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
+  # the panel has to read as what an unconfigured install is running. Flipping
+  # that default on would make this show a dashboard nobody deployed, so the
+  # two have to be reconsidered together.
+  local enable_webui="${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
+  local github_org="${GITOPS_ORG:-${GITHUB_ORG:-}}"
+  local github_repo="${GITOPS_REPO:-${GITHUB_REPO:-$DEFAULT_GITOPS_REPO}}"
   local github_app_id="${GITHUB_APP_ID:-}"
   local kms_keyring="${KMS_KEYRING:-}"
   local kms_key="${KMS_KEY:-}"
-  local github_pem_path="${GITHUB_PEM_PATH:-}"
-  local image_tag="${IMAGE_TAG:-}"
+  local image_tag="${PARAM_IMAGE_TAG:-}"
 
   while true; do
     echo -e "\n${C_CYAN}${C_BOLD}"
@@ -1126,7 +3793,7 @@ run_menu_system() {
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
       "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
-      "🗄️ Manage GitOps Repository & GitHub Auth (gke-fleet-iac)" \
+      "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
       "🚪 Exit Control Panel" \
       menu_choice
@@ -1157,6 +3824,8 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
+            prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+              google_chat_home_channel "$google_chat_home_channel"
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -1180,7 +3849,13 @@ run_menu_system() {
             model_provider="vertex_ai"
             prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
             prompt_read "Vertex AI Location" vertex_location "$vertex_location"
-            prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "${model_default_name:-$(default_model_for_provider vertex_ai)}"
+            prompt_read "Vertex Model ID (publisher model, e.g. $(default_model_for_provider vertex_ai))" model_default_name "${model_default_name:-$(default_model_for_provider vertex_ai)}"
+            # Same notice main() prints on the first-install path: switching a
+            # running install to Vertex through this panel lands on the global
+            # endpoint too, and must not do so silently.
+            if [ "$vertex_location" = "global" ]; then
+              print_warning "The global endpoint gives no in-region ML processing guarantee. Set a region above if you have a data-residency requirement."
+            fi
             ;;
           3)
             model_provider="openai"
@@ -1198,78 +3873,112 @@ run_menu_system() {
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
           "read-only — auditing and observability, no GCP write capability (Default)" \
-          "gke-admin — the agent manages GKE lifecycle and node pools directly" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
           1) permission_set="read-only" ;;
-          2) permission_set="gke-admin" ;;
-          3)
+          2)
             permission_set="custom"
             while true; do
               prompt_read "Custom GCP IAM Roles (space- or comma-separated)" custom_roles "$custom_roles"
               [ -n "$custom_roles" ] && break
               print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
             done
+            warn_on_overreaching_custom_roles "$custom_roles"
             ;;
         esac
         ;;
       5)
-        prompt_read "GitHub Org / Username" github_org "$github_org"
+        # An organization, never a login: the minter resolves App installations
+        # at /orgs/{org}/installation, so a personal account deploys cleanly and
+        # then 404s every token request. The fresh-install interview settles
+        # this with github_account_type; this panel does not verify it, so the
+        # least it can do is stop suggesting the value that cannot work.
+        prompt_read "GitHub Organization" github_org "$github_org"
         prompt_read "GitOps Repository Name" github_repo "$github_repo"
         ;;
       6)
         print_step "Saving & Re-applying Configuration State"
-        if [ -z "$image_tag" ]; then
-          prompt_read "Container image tag (validated release tag or full commit SHA)" \
-            image_tag "$(default_image_tag "$repo_dir")" false "$(default_image_tag_label "$repo_dir")"
-        fi
-        validate_immutable_ref "$image_tag"
+        resolve_effective_image_tag image_tag "$repo_dir" "$image_tag" || return 1
+        validate_immutable_ref "$image_tag" || return 1
         verify_local_source_ref "$repo_dir" "$image_tag"
         export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
 
-        save_var PROJECT_ID "$project_id"
-        save_var PROJECT_NUMBER "$project_number"
-        save_var CLUSTER_NAME "$cluster_name"
-        save_var REGION "$region"
-        save_var KMS_LOCATION "$(derive_kms_location "$region")"
-        save_var MODEL_PROVIDER "$model_provider"
-        save_var MODEL_DEFAULT_NAME "$model_default_name"
-        save_var VERTEX_PROJECT_ID "$vertex_project_id"
-        save_var VERTEX_LOCATION "$vertex_location"
-        save_secret_var GEMINI_API_KEY "$gemini_api_key"
-        save_secret_var OPENAI_API_KEY "$openai_api_key"
-        save_secret_var ANTHROPIC_API_KEY "$anthropic_api_key"
-        save_var ALLOWED_USERS "$allowed_users"
-        save_var CHAT_TOPIC_NAME "$chat_topic_name"
-        save_var CHAT_SUB_NAME "$chat_sub_name"
-        save_var GOOGLE_CHAT_ENABLED "$google_chat_enabled"
-        save_var SLACK_ENABLED "$slack_enabled"
-        save_var PLATFORM_AGENT_PERMISSION_SET "$permission_set"
+        # Into install.env, one key at a time, leaving the operator's comments
+        # and ordering alone. This panel is the one place allowed to write
+        # there: "Save & Apply" is an explicit instruction to record a change,
+        # unlike install.sh silently regenerating an input.
+        #
+        # PROJECT_NUMBER, KMS_LOCATION and NO_CONFIRM are deliberately not
+        # written. The first two are derived wherever they are used, and the third
+        # describes an invocation rather than the install.
+        save_env_var PROJECT_ID "$project_id"
+        save_env_var CLUSTER_NAME "$cluster_name"
+        save_env_var REGION "$region"
+        save_env_var MODEL_PROVIDER "$model_provider"
+        save_env_var MODEL_DEFAULT_NAME "$model_default_name"
+        save_env_var VERTEX_PROJECT_ID "$vertex_project_id"
+        save_env_var VERTEX_LOCATION "$vertex_location"
+        save_env_var VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+        save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
+        save_secret_env_var OPENAI_API_KEY "$openai_api_key"
+        save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
+        save_env_var ALLOWED_USERS "$allowed_users"
+        save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
+        save_env_var CHAT_SUB_NAME "$chat_sub_name"
+        save_env_var GOOGLE_CHAT_ENABLED "$google_chat_enabled"
+        save_env_var GOOGLE_CHAT_HOME_CHANNEL "$google_chat_home_channel"
+        save_env_var SLACK_ENABLED "$slack_enabled"
+        save_env_var PLATFORM_AGENT_PERMISSION_SET "$permission_set"
         if [ "$permission_set" = "custom" ]; then
-          save_var PLATFORM_AGENT_CUSTOM_ROLES "$custom_roles"
+          save_env_var PLATFORM_AGENT_CUSTOM_ROLES "$custom_roles"
         fi
-        save_var ENABLE_GVISOR "$enable_gvisor"
-        save_var HERMES_DASHBOARD_ENABLED "$enable_webui"
-        save_var GITHUB_ORG "$github_org"
-        save_var GITHUB_REPO "$github_repo"
-        save_var GITHUB_APP_ID "$github_app_id"
-        save_var KMS_KEYRING "$kms_keyring"
-        save_var KMS_KEY "$kms_key"
-        save_var GITHUB_PEM_PATH "$github_pem_path"
-        save_var NO_CONFIRM "1"
-        print_success "Updated configuration saved to: $vars_file"
+        save_env_var ENABLE_GVISOR "$enable_gvisor"
+        save_env_var HERMES_DASHBOARD_ENABLED "$enable_webui"
+        save_env_var GITOPS_ORG "$github_org"
+        save_env_var GITOPS_REPO "$github_repo"
+        save_env_var GITHUB_APP_ID "$github_app_id"
+        save_env_var KMS_KEYRING "$kms_keyring"
+        save_env_var KMS_KEY "$kms_key"
+        print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
         # reconciles GCP resources and chart values alike, so a Vertex switch
         # lands its IAM, the gateway, and the agent in one pass. When nothing
         # GCP-side moved, the apply is a fast no-op around the Helm upgrade.
-        # shellcheck disable=SC1090
-        source "$vars_file"
-        write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        #
+        # No re-source: save_env_var exports as it writes, so the environment
+        # write_tfvars_from_state reads is already current.
+        #
+        # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER, because run_lifecycle_apply below
+        # is a full apply. This panel is the front door most likely to reach the
+        # generator with no memory answer at all -- normalize_memory_vars returns
+        # immediately when install.env carries no MEMORY line, and --menu is
+        # dispatched before the prerequisite check, so kubectl may not even be
+        # usable -- and an operator reaches it to change a model provider, not to
+        # decide the fate of a database.
+        KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+          write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        # A provider or minter switch is where a new fixed-name GSA is first
+        # planned on an existing install, so the 409 check runs here too.
+        check_service_account_ownership || exit 1
+        # The menu edits no scope key, so the keys are the recorded ones; this
+        # still refuses a re-apply over a scope the CR gained by hand since.
+        # The menu establishes no kubeconfig context of its own, so fetch one
+        # first, as main() does before its summary; the check refuses if the
+        # fetch did not land.
+        GKE_DNS_ENDPOINT_FLAG=""
+        gke_dns_endpoint_flag "$cluster_name" "$REGION" "$PROJECT_ID" || true
+        # shellcheck disable=SC2086
+        gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
+          --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+        refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        check_scope_container_access || exit 1
+        enable_scope_selector_apis "$PROJECT_ID"
+        apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
@@ -1283,11 +3992,68 @@ run_menu_system() {
 }
 
 # ─── Main Installer Procedure ──────────────────────────────────────────────────
+# The Slack token guard. Placed after write_tfvars_from_state rather than in the
+# chat step that asks for Slack, because that generator's Secret-recovery loop is
+# what can still supply the tokens: it reads them off the live
+# '${PLATFORM_AGENT_SECRET}' Secret whenever kubectl's context is this cluster,
+# which covers both PERSIST_SECRETS_ON_DISK=false (their only home by design) and
+# a fresh clone adopting an existing install. A copy in the chat step would
+# refuse those runs before the thing that answers them had run, and it would buy
+# nothing: this still lands before the apply, and before it nothing has been
+# provisioned.
+#
+# Runs on the exported SLACK_* the generator leaves behind, so a re-run that
+# recovers both tokens proceeds and one that recovers neither stops rather than
+# reaching a CrashLooping relay. This applies to interactive and unattended
+# runs alike: if the tokens are still missing after the interview and Secret
+# recovery, proceeding would CrashLoop the relay.
+require_slack_tokens_after_recovery() {
+  is_truthy "${SLACK_ENABLED:-}" || return 0
+  local slack_missing=""
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || slack_missing="${slack_missing} --slack-bot-token (SLACK_BOT_TOKEN)"
+  [ -n "${SLACK_APP_TOKEN:-}" ] || slack_missing="${slack_missing} --slack-app-token (SLACK_APP_TOKEN)"
+  if [ -n "$slack_missing" ]; then
+    print_error "--enable-slack needs a bot token and an app token. Missing:${slack_missing}."
+    print_info "They are not in ${INSTALL_ENV_FILE} (PERSIST_SECRETS_ON_DISK=false keeps them out) and the live '${PLATFORM_AGENT_SECRET}' Secret does not carry them either. Pass them as flags, answer both prompts on an interactive run, or drop --enable-slack."
+    exit 1
+  fi
+}
+
+# The namespace the run installs into, once parse_args has had its say.
+#
+# bootstrap_install_env cleared NAMESPACE before install.env was read so that an
+# inherited variable could not redirect the install; a flag is a
+# deliberate act, so it is allowed back in here. PARAM_AGENT_NAMESPACE empty
+# leaves the variable unset and every reader falls back to DEFAULT_NAMESPACE,
+# exactly as before.
+#
+# A function rather than three lines inside main(), for two reasons: the menu
+# path reloads install.env and so has to re-apply it, and a test can only pin an
+# export it is able to call -- one that re-implements these lines passes just as
+# well after they are deleted.
+apply_agent_namespace_override() {
+  if [ -n "${PARAM_AGENT_NAMESPACE:-}" ]; then
+    export NAMESPACE="$PARAM_AGENT_NAMESPACE"
+  fi
+}
+
 main() {
   parse_args "$@"
+  apply_agent_namespace_override
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_error "--dry-run and --generate-only are different modes and cannot be combined."
+    return 2
+  fi
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    # The menu reloads install.env and reads the scope keys from it alone; a
+    # flag here would be validated and then dropped without a word.
+    if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
+      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      exit 1
+    fi
     run_menu_system
     exit 0
   fi
@@ -1303,34 +4069,60 @@ main() {
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     print_info "Execution Mode: ${C_BOLD}Non-Interactive / AI Agent Automated Mode${C_RESET} 🤖"
+    export CLOUDSDK_CORE_DISABLE_PROMPTS="1"
+  fi
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Execution Mode: ${C_BOLD}Generate-Only Mode (stopping before apply)${C_RESET} 📄"
   fi
 
-  local image_tag="${PARAM_IMAGE_TAG:-}"
-  if [ -z "$image_tag" ]; then
-    local head_sha=""
-    head_sha="$(default_image_tag)"
-    if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
-      if [ -z "$head_sha" ]; then
-        print_error "--image-tag is required; use a validated release tag or full commit SHA."
+  local image_tag=""
+  resolve_effective_image_tag image_tag "." "${PARAM_IMAGE_TAG:-}" || exit 1
+  validate_immutable_ref "$image_tag" || exit 1
+
+  # Local-only checks on the GitHub App private key path. The other half of this
+  # decision — that a missing .pem is harmless once the signing key holds an
+  # ENABLED version, which is the state this installer's own documentation tells
+  # the operator to leave behind — cannot be made here. kms_key_enabled_version
+  # and derive_kms_location arrive with installer_common.sh at step 2, the
+  # keyring and key defaults with resolve_shared_defaults beside it, and the
+  # lookup itself needs an authenticated gcloud and a resolved project and
+  # region, none of which exist this early. It runs at step 8 instead, beside
+  # the only consumer.
+  #
+  # Nor is the path expanded here: expand_tilde_path is in installer_common.sh,
+  # which is not sourced yet either. So a `~/...` value does not match -e below,
+  # falls through this block untouched, and is expanded and judged at step 8.
+  # That costs nothing in practice — a ~ typed on the command line is expanded
+  # by the operator's own shell before install.sh sees it, so what reaches here
+  # is a quoted flag value or a path out of install.env.
+  #
+  # What is left is what the filesystem alone can answer about an already-usable
+  # path. A path that exists but is not a readable regular file is a typo or a
+  # permission problem rather than a deleted key, and no KMS state makes it
+  # right, so it is worth catching before the installer does any work. A path
+  # that is simply absent is not decided here.
+  if [ -n "$PARAM_GITHUB_PEM_PATH" ]; then
+    if [ -e "$PARAM_GITHUB_PEM_PATH" ]; then
+      if [ ! -f "$PARAM_GITHUB_PEM_PATH" ]; then
+        print_error "GitHub App private key PEM path is not a regular file: '${PARAM_GITHUB_PEM_PATH}'."
         exit 1
       fi
-      image_tag="$head_sha"
-      print_info "Defaulting image tag to the checkout's HEAD: ${C_BOLD}${image_tag}${C_RESET}"
-    else
-      prompt_read "Container image tag (validated release tag or full commit SHA)" \
-        image_tag "$head_sha" false "$(default_image_tag_label)"
+      if [ ! -r "$PARAM_GITHUB_PEM_PATH" ]; then
+        print_error "GitHub App private key PEM file is not readable: '${PARAM_GITHUB_PEM_PATH}'."
+        exit 1
+      fi
     fi
   fi
-  validate_immutable_ref "$image_tag"
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"
   # terraform is the install engine (terraform/examples/full-install through
   # lifecycle.sh); kubectl is used by lifecycle.sh and the health checks; helm
   # serves upgrade.sh's fast path; jq and gh remain for the surrounding
-  # tooling. Everything is checked up front rather than discovered halfway
-  # through with the cluster already created.
-  for tool in git gcloud kubectl gh helm jq terraform; do
+  # tooling; gke-gcloud-auth-plugin allows kubectl to authenticate to GKE.
+  # Everything is checked up front rather than discovered halfway through with
+  # the cluster already created.
+  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
@@ -1385,7 +4177,7 @@ main() {
   fi
 
   if [ -z "$project_id" ]; then
-    print_error "No GCP project selected. Re-run with --project-id=<project-id>."
+    print_error "No GCP project selected. Re-run with --gcp-project-id=<project-id>."
     exit 1
   fi
 
@@ -1414,6 +4206,11 @@ main() {
     prompt_read "Target GCP Region" region "${active_region:-$DEFAULT_REGION}"
   fi
 
+  # Checked here as well as after the menu below so a bad --gke-cluster-mode fails
+  # before the rest of the interview, not after it.
+  local cluster_mode="${PARAM_CLUSTER_MODE:-}"
+  [ -z "$cluster_mode" ] || require_creatable_cluster_mode "$cluster_mode" "$region"
+
   # 5. GKE Cluster Selection & Provisioning Strategy
   print_step "5. GKE Cluster Topology & Capacity Setup"
   local cluster_choice=""
@@ -1431,10 +4228,16 @@ main() {
   fi
 
   local cluster_name="${PARAM_CLUSTER_NAME:-}"
+  # Set on the branches where the user has demonstrably asked for a cluster
+  # that does not exist yet, which is the only case --gke-cluster-mode decides.
+  # Picking one out of the discovered list, or naming one with --gke-cluster-name,
+  # does not qualify: the generator probes those and the live shape wins.
+  local ask_cluster_shape="false"
   if [ "$cluster_choice" = "1" ]; then
     if [ -z "$cluster_name" ]; then
       prompt_read "New GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
     fi
+    ask_cluster_shape="true"
   else
     if [ -n "$PARAM_CLUSTER_NAME" ]; then
       cluster_name="$PARAM_CLUSTER_NAME"
@@ -1465,94 +4268,307 @@ main() {
           print_success "Using discovered cluster location: ${C_BOLD}${region}${C_RESET}"
         else
           prompt_read "Existing GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
+          # A name the project's own cluster list did not offer, so it very
+          # likely does not exist and this run creates it.
+          ask_cluster_shape="true"
         fi
       else
         print_warning "No existing GKE clusters found in project '$project_id'."
         prompt_read "Existing GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
+        # Nothing to adopt in this project, so whatever is named here is about
+        # to be created.
+        ask_cluster_shape="true"
       fi
     fi
+  fi
+  # Only when --gke-cluster-mode said nothing: a flag the caller passed is an
+  # answer already, and re-asking would let a mis-keyed menu choice override
+  # it.
+  #
+  # The order comes from resolve_creatable_cluster_mode rather than being
+  # hardcoded, because prompt_menu's enter default is option 1. A fixed
+  # Autopilot-first order makes pressing enter an *explicit* autopilot
+  # request, which the resolver is then right to refuse to demote — so a
+  # zonal interactive install would abort here rather than build Standard.
+  # Deriving the order
+  # keeps the "(Default)" label, the enter key and the resolver saying the
+  # same thing at both kinds of location.
+  if [ -z "$cluster_mode" ] && [ "$ask_cluster_shape" = "true" ] &&
+    [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local mode_choice="" menu_default=""
+    local autopilot_option="Autopilot — Google manages the nodes and you pay per Pod; regional only, and gVisor comes from its built-in RuntimeClass"
+    local standard_option="Standard — you size and pay for the node pool; carries the GKE Sandbox pool for --enable-gvisor, and is the only shape that can be zonal"
+    menu_default="$(resolve_creatable_cluster_mode "" "$region")"
+    if [ "$menu_default" = "autopilot" ]; then
+      prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
+        "${autopilot_option} (Default)" \
+        "${standard_option}" \
+        mode_choice
+      case "$mode_choice" in
+        1) cluster_mode="autopilot" ;;
+        2) cluster_mode="standard" ;;
+      esac
+    else
+      # Zonal location. Autopilot stays on the menu so picking it is still an
+      # explicit request that require_creatable_cluster_mode rejects by name,
+      # rather than a shape that silently turns into something else.
+      prompt_menu "Which shape should the GKE cluster be, if this run creates it?" \
+        "${standard_option} (Default)" \
+        "${autopilot_option} — not available at a zonal location" \
+        mode_choice
+      case "$mode_choice" in
+        1) cluster_mode="standard" ;;
+        2) cluster_mode="autopilot" ;;
+      esac
+    fi
+  fi
+  # Nothing asked, nothing passed: installer_common.sh owns the default, and
+  # resolve_creatable_cluster_mode applies it. Explaining the demotion is the
+  # caller's job so the resolver can echo the mode and nothing else.
+  #
+  # This matters most on the --gke-cluster-name path, where ask_cluster_shape is
+  # false and the check below therefore never runs: a named cluster that does
+  # not exist yet would otherwise be written as autopilot at a zone and
+  # rejected by the module's precondition at terraform validate, after the
+  # whole interview had already been collected.
+  local cluster_mode_requested="$cluster_mode"
+  cluster_mode="$(resolve_creatable_cluster_mode "$cluster_mode" "$region")"
+  # ask_cluster_shape gates the message for the same reason it gates the check
+  # below: on both adoption paths no cluster is created by this run, so the
+  # advice to "pass --gcp-region with a region" would point at a location the
+  # target cluster does not live at. On --gke-cluster-name that is not merely
+  # noise — write_tfvars_from_state probes with --location "$REGION", so
+  # re-running with the suggested region misses the live cluster, takes the
+  # confirmed-NOT_FOUND branch, and creates a second one under -auto-approve.
+  if [ "$ask_cluster_shape" = "true" ] && [ -z "$cluster_mode_requested" ] &&
+    [ "$cluster_mode" != "$DEFAULT_CLUSTER_MODE" ]; then
+    print_info "Location '${region}' is a zone and Autopilot clusters are regional, so a cluster created by this run will be Standard. Pass --gcp-region with a region to get the default Autopilot shape."
+  fi
+
+  # Only where a cluster is about to be created. Adopting a discovered cluster
+  # replaced $region with that cluster's own location, which may be a zone —
+  # and failing an adoption over a location the installer chose itself, for a
+  # shape the generator is about to overrule anyway, blames the wrong input.
+  # The flag/region pair the caller did supply was already checked above.
+  if [ "$ask_cluster_shape" = "true" ]; then
+    require_creatable_cluster_mode "$cluster_mode" "$region"
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
   # 6. Chat & Messaging Platform Integration
   print_step "6. Chat & Messaging Integrations Setup"
+  # The option the loaded configuration already corresponds to. It is a
+  # PRE-SELECTION, not a decision: prompt_menu takes a pre-set choice variable
+  # as its default (install.sh:1076), so enter keeps the current integration
+  # and any other answer changes it. Every other setting reworked here -- the
+  # permission set, gVisor, the Web UI, memory, the model provider -- inherits
+  # this way and still asks.
+  #
+  # SLACK_ENABLED (with SLACK_BOT_TOKEN / SLACK_APP_TOKEN and the other SLACK_*
+  # variables) is the non-interactive spelling of the Slack interview, the same
+  # variables the Day-2 menu reads. Without it Slack would be reachable only
+  # through a controlling tty.
+  #
+  # Read through is_truthy, not string-compared against the lowercase literal.
+  # Every boolean the generator writes goes through hcl_bool -> is_truthy, which
+  # accepts True/yes/y/1/on; these two were the only ones that did not, and
+  # install.env is a file the documentation now tells operators to hand-write.
+  # A string compare against the lowercase literal would read
+  # `GOOGLE_CHAT_ENABLED=True` as off, drop chat_choice to 4 and plan the
+  # Pub/Sub topic away, while upgrade.sh read the same file as enabled. Every
+  # --enable-* toggle is read this way; the ^(true|false)$ validators run in
+  # parse_args, on what a caller typed on the command line, so a hand-written
+  # spelling in install.env never reaches one.
   local chat_choice=""
-  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "${PARAM_ENABLE_GOOGLE_CHAT:-false}" = "true" ] || [ "${SLACK_ENABLED:-false}" = "true" ]; then
-    # SLACK_ENABLED (with SLACK_BOT_TOKEN / SLACK_APP_TOKEN and the other
-    # SLACK_* variables) is the non-interactive spelling of the Slack
-    # interview, the same variables the Day-2 menu reads. Without it Slack
-    # would be reachable only through a controlling tty.
-    if [ "${PARAM_ENABLE_GOOGLE_CHAT:-false}" = "true" ] && [ "${SLACK_ENABLED:-false}" = "true" ]; then
-      chat_choice="3"
-    elif [ "${PARAM_ENABLE_GOOGLE_CHAT:-false}" = "true" ]; then
-      chat_choice="1"
-    elif [ "${SLACK_ENABLED:-false}" = "true" ]; then
-      chat_choice="2"
-    else
-      chat_choice="4"
-    fi
-  else
-    prompt_menu "Select Chat Channel Integration(s):" \
-      "Google Chat (Pub/Sub Event Streaming)" \
-      "Slack (Socket Mode App)" \
-      "Both Google Chat and Slack" \
-      "None (CLI & REST API Gateway only)" \
-      chat_choice
+  if is_truthy "$PARAM_ENABLE_GOOGLE_CHAT" && is_truthy "${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"; then
+    chat_choice="3"
+  elif is_truthy "$PARAM_ENABLE_GOOGLE_CHAT"; then
+    chat_choice="1"
+  elif is_truthy "${PARAM_ENABLE_SLACK:-$DEFAULT_SLACK_ENABLED}"; then
+    chat_choice="2"
   fi
+  # Nothing configured and nobody to ask: "None", as before. Left unset when
+  # there IS someone to ask, so prompt_menu falls back to option 1 for a first
+  # install exactly as it used to.
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    chat_choice="${chat_choice:-4}"
+  fi
+  prompt_menu "Select Chat Channel Integration(s):" \
+    "Google Chat (Pub/Sub Event Streaming)" \
+    "Slack (Socket Mode App)" \
+    "Both Google Chat and Slack" \
+    "None (CLI & REST API Gateway only)" \
+    chat_choice
 
   local google_chat_enabled="false"
   local slack_enabled="false"
   # Empty by default: the allowlist is opt-in, and an unset list allows all users.
-  local allowed_users="${ALLOWED_USERS:-}"
+  # PARAM_ALLOWED_USERS carries both --google-chat-allowed-users and the loaded
+  # ALLOWED_USERS, so an install that had an allowlist keeps it on a re-run that
+  # says nothing.
+  local allowed_users="${PARAM_ALLOWED_USERS:-}"
   local allowed_users_hint=""
   if [ -z "$allowed_users" ]; then
     allowed_users_hint="empty list"
   fi
-  local chat_topic_name="${PARAM_CHAT_TOPIC_NAME:-${CHAT_TOPIC_NAME:-platform-agent-chat-events}}"
-  local chat_sub_name="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
-  local google_chat_mode="${PARAM_GOOGLE_CHAT_MODE:-${GOOGLE_CHAT_MODE:-default}}"
+  local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
+  local chat_sub_name="${PARAM_CHAT_SUB_NAME:-}"
+  local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
     print_error "--google-chat-mode must be either 'default' or 'debug'."
     exit 1
   fi
-  # Seeded from the environment so the non-interactive path can carry the
-  # Slack settings: prompt_read keeps a non-empty current value there, and
-  # prompts with it as the prefill when there is a tty.
-  local slack_bot_token="${SLACK_BOT_TOKEN:-}"
-  local slack_app_token="${SLACK_APP_TOKEN:-}"
-  local slack_allowed_users="${SLACK_ALLOWED_USERS:-}"
-  local slack_home_channel="${SLACK_HOME_CHANNEL:-}"
-  local slack_home_channel_name="${SLACK_HOME_CHANNEL_NAME:-}"
+  local google_chat_home_channel="${PARAM_GOOGLE_CHAT_HOME_CHANNEL:-}"
+  # Seeded from PARAM_SLACK_*, which carry both the --slack-* flags and the
+  # loaded SLACK_* keys, so the non-interactive path can carry the Slack
+  # settings: prompt_read keeps a non-empty current value there.
+  local slack_bot_token="${PARAM_SLACK_BOT_TOKEN:-}"
+  local slack_app_token="${PARAM_SLACK_APP_TOKEN:-}"
+  local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
+  local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
+  local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
+
+  # No Slack token check here. The obvious place for one is this step -- Slack
+  # is asked for here and the relay cannot open a socket without both tokens --
+  # but a refusal here cannot tell "the operator never supplied them" from
+  # "write_tfvars_from_state has not run yet". Its Secret-recovery loop
+  # (installer_common.sh) reads them off the live Secret whenever kubectl's
+  # context is this cluster, which is exactly the fresh-clone adoption case its
+  # own comment names as its reason to exist: no install.env, no tokens on the
+  # command line, and both sitting in the cluster. require_slack_tokens_after_recovery
+  # makes the same check once that loop has had its turn and still before the
+  # apply, so nothing is provisioned either way.
+
+  # One definition for both arms that ask it. Arms 2 and 3 ran identical
+  # copies, and the copies are what drifted: the "pass the current value, not
+  # a bare empty string" fix landed on the GitOps prompts a screen below and
+  # not here.
+  #
+  # Each prompt takes its OWN current value as the default. A bare "" only
+  # looks harmless -- prompt_read keeps a non-empty current value on the
+  # non-interactive path (install.sh:998), but the interactive branch applies
+  # the default argument, and `[ -z "$input_val" ] && [ -n "$default_val" ]`
+  # is false when that default is empty, so it falls through and assigns the
+  # empty string, so a bare "" default clears the tokens, the home channel and
+  # the Slack allowlist. The tokens are usually
+  # rescued by the Secret-recovery loop in installer_common.sh; the allowlist
+  # is not, and an empty slack_allowed_users means every workspace member may
+  # talk to the agent.
+  #
+  # The allowlist also took $allowed_users -- the GOOGLE CHAT list -- which on
+  # arm 3 replaced the Slack allowlist with the Chat one.
+  _prompt_slack_settings() {
+    # A secret must not be echoed back as a visible "[default: xoxb-…]", so the
+    # tokens pass a label instead of letting prompt_read print the value.
+    local bot_hint="" app_hint="" slack_allowed_hint=""
+    [ -n "$slack_bot_token" ] && bot_hint="keep existing"
+    [ -n "$slack_app_token" ] && app_hint="keep existing"
+    # Same shape as allowed_users_hint above: an empty list has to read as a
+    # deliberate choice rather than as a missing default.
+    [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
+    prompt_read "Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)" \
+      slack_bot_token "$slack_bot_token" true "$bot_hint"
+    prompt_read "Slack App Token (xapp-...)" slack_app_token "$slack_app_token" true "$app_hint"
+    prompt_read "Allowed Slack User IDs / Emails (comma-separated)" \
+      slack_allowed_users "$slack_allowed_users" false "$slack_allowed_hint"
+    prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" \
+      slack_home_channel "$slack_home_channel"
+    prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
+      slack_home_channel_name "$slack_home_channel_name"
+  }
+
+  _prompt_google_chat_settings() {
+    prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
+      allowed_users "$allowed_users" false "$allowed_users_hint"
+    prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
+
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+    fi
+
+    local default_sub
+    if [ -n "$state_sub" ]; then
+      default_sub="$state_sub"
+    elif [ -n "${CLI_CHAT_SUB_NAME:-}" ]; then
+      default_sub="$CLI_CHAT_SUB_NAME"
+    elif [ -n "${PARAM_CHAT_SUB_NAME:-}" ] && [ "$PARAM_CHAT_SUB_NAME" != "$DEFAULT_CHAT_SUB_NAME" ]; then
+      default_sub="$PARAM_CHAT_SUB_NAME"
+    else
+      default_sub="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
+    chat_sub_name="$default_sub"
+    prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
+    prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+      google_chat_home_channel "$google_chat_home_channel"
+  }
+
+  # Both chat platforms are opt-in and default off, so this is the common
+  # install, and the terminal is the only way to reach the agent. Printed again
+  # at the end of main(), beside the Google Chat and Slack instructions.
+  #
+  # project_id, region and cluster_name are all set by earlier steps, and
+  # NAMESPACE is exported before the menu runs.
+  _prompt_no_chat_enabled() {
+    print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+
+    # gcloud rejects --dns-endpoint on clusters without an external DNS
+    # endpoint, so print the resolved flag rather than a literal one. Resolved
+    # up here because it can warn on stderr, which would otherwise split the
+    # block below.
+    #
+    # This is step 6 of the interview and the apply that creates the cluster is
+    # step 12, so on a fresh install -- and on every --dry-run and
+    # --generate-only run -- there is nothing to describe yet. That is not a
+    # failure: the helper leaves GKE_DNS_ENDPOINT_FLAG empty and the command
+    # below prints without --dns-endpoint, which is the only command there is
+    # anything to print before the cluster exists. The copy in the completion
+    # banner runs after the apply and resolves the real flag.
+    #
+    # What keeps that miss silent is `trap - ERR` inside the helper's own
+    # describe, not the guard here: bash 3.2 runs the inherited ERR trap in the
+    # substitution's subshell, which nothing on this line can reach. The guard
+    # covers the other half -- a non-zero return from the helper -- and matches
+    # the two get-credentials sites further down. The reset keeps the variable
+    # defined whatever the helper does.
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+
+    echo ""
+    echo -e "${C_CYAN}${C_BOLD}--- [Talking to the Agent from a Terminal] ---${C_RESET}"
+    echo -e "With no chat platform, the terminal is the way in. Point kubectl at the cluster,"
+    echo -e "then open a Hermes session in the agent container:"
+    echo ""
+    # The `:+` keeps the empty flag from leaving a trailing space.
+    echo -e "  ${C_BOLD}gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}${GKE_DNS_ENDPOINT_FLAG:+ ${GKE_DNS_ENDPOINT_FLAG}}${C_RESET}"
+    echo -e "  ${C_BOLD}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -c ${PLATFORM_AGENT_CONTAINER} -- hermes -p ${PLATFORM_AGENT_HERMES_PROFILE}${C_RESET}"
+    echo ""
+    # The pod runs three containers and hosts more than one Hermes profile, so
+    # a command missing -c or -p lands somewhere by accident.
+    echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
+    echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
+    echo ""
+    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+  }
 
   case "$chat_choice" in
     1)
       google_chat_enabled="true"
-      prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
-        allowed_users "$allowed_users" false "$allowed_users_hint"
-      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
+      _prompt_google_chat_settings
       ;;
     2)
       slack_enabled="true"
-      prompt_read "Slack Bot Token (xoxb-...)" slack_bot_token "" true
-      prompt_read "Slack App Token (xapp-...)" slack_app_token "" true
-      prompt_read "Allowed Slack User IDs / Emails (comma-separated)" slack_allowed_users "$allowed_users"
-      prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" slack_home_channel ""
-      prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" slack_home_channel_name ""
+      _prompt_slack_settings
       ;;
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
-        allowed_users "$allowed_users" false "$allowed_users_hint"
-      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
-      prompt_read "Slack Bot Token (xoxb-...)" slack_bot_token "" true
-      prompt_read "Slack App Token (xapp-...)" slack_app_token "" true
-      prompt_read "Allowed Slack User IDs / Emails (comma-separated)" slack_allowed_users "$allowed_users"
-      prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" slack_home_channel ""
-      prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" slack_home_channel_name ""
+      _prompt_google_chat_settings
+      _prompt_slack_settings
       ;;
     4)
-      print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+      _prompt_no_chat_enabled
       ;;
   esac
 
@@ -1567,22 +4583,44 @@ main() {
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
   fi
+  local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
+  validate_model_max_tokens || exit 1
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
-  # two are the only credentials it needs and both default to the install target.
+  # two are the only credentials it needs. The project defaults to the install
+  # target; the location does not, because a model is only callable from a
+  # location that serves it and the cluster's region often is not one — see
+  # DEFAULT_VERTEX_LOCATION in scripts/installer/installer_common.sh.
   local vertex_project_id="${PARAM_VERTEX_PROJECT_ID:-$project_id}"
-  local vertex_location="${PARAM_VERTEX_LOCATION:-$region}"
+  local vertex_location="${PARAM_VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
+  # Loud like --enable-gvisor and --enable-hermes-dashboard, not lenient like the chat booleans:
+  # a typo read as false would silently skip the two serving-project resources,
+  # and the first sign would be the gateway's 403 on its first model call.
+  local vertex_manage_serving_project="${PARAM_VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+  if [[ ! "$vertex_manage_serving_project" =~ ^(true|false)$ ]]; then
+    print_error "--vertex-manage-serving-project must be either true or false."
+    exit 1
+  fi
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
-    detected_gemini_key=$(gcloud secrets versions access latest --secret="gemini-api-key" --project="$project_id" 2>/dev/null || echo "")
+    detected_gemini_key=$(gcloud secrets versions access latest --secret="${GEMINI_API_KEY_SECRET_NAME:-$DEFAULT_GEMINI_API_KEY_SECRET_NAME}" --project="$project_id" --quiet 2>/dev/null || echo "")
   fi
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
   local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    # Pre-set to the provider already configured, so pressing enter keeps it.
+    # Every arm below assigns unconditionally, so an unseeded menu would reset
+    # the configured provider.
     local model_choice=""
+    case "$model_provider" in
+      gemini) model_choice="1" ;;
+      vertex_ai) model_choice="2" ;;
+      openai) model_choice="3" ;;
+      anthropic) model_choice="4" ;;
+    esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
@@ -1590,13 +4628,22 @@ main() {
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
       model_choice
 
+    # A model the install already pins survives a re-run that leaves the
+    # provider alone; changing provider has to take the new provider's default,
+    # because the old model name is not valid for it. An arm that assigned
+    # unconditionally would downgrade a pinned MODEL_DEFAULT_NAME to the
+    # provider default on a re-run that changed nothing.
+    local model_provider_was="$model_provider"
+    local model_name_was="$model_default_name"
     case "$model_choice" in
       1)
         model_provider="gemini"
-        model_default_name="$(default_model_for_provider gemini)"
+        if [ "$model_provider_was" != "gemini" ] || [ -z "$model_name_was" ]; then
+          model_default_name="$(default_model_for_provider gemini)"
+        fi
         local detected_key="${GEMINI_API_KEY:-}"
         if [ -z "$detected_key" ]; then
-          detected_key=$(gcloud secrets versions access latest --secret="gemini-api-key" --project="$project_id" 2>/dev/null || echo "")
+          detected_key=$(gcloud secrets versions access latest --secret="${GEMINI_API_KEY_SECRET_NAME:-$DEFAULT_GEMINI_API_KEY_SECRET_NAME}" --project="$project_id" --quiet 2>/dev/null || echo "")
         fi
         prompt_read "Gemini API Key" gemini_api_key "$detected_key" true
         ;;
@@ -1604,16 +4651,25 @@ main() {
         model_provider="vertex_ai"
         prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
         prompt_read "Vertex AI Location" vertex_location "$vertex_location"
-        prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "$(default_model_for_provider vertex_ai)"
+        local vertex_model_default
+        vertex_model_default="$(default_model_for_provider vertex_ai)"
+        if [ "$model_provider_was" = "vertex_ai" ] && [ -n "$model_name_was" ]; then
+          vertex_model_default="$model_name_was"
+        fi
+        prompt_read "Vertex Model ID (publisher model, e.g. $(default_model_for_provider vertex_ai))" model_default_name "$vertex_model_default"
         ;;
       3)
         model_provider="openai"
-        model_default_name="$(default_model_for_provider openai)"
+        if [ "$model_provider_was" != "openai" ] || [ -z "$model_name_was" ]; then
+          model_default_name="$(default_model_for_provider openai)"
+        fi
         prompt_read "OpenAI API Key" openai_api_key "${OPENAI_API_KEY:-}" true
         ;;
       4)
         model_provider="anthropic"
-        model_default_name="$(default_model_for_provider anthropic)"
+        if [ "$model_provider_was" != "anthropic" ] || [ -z "$model_name_was" ]; then
+          model_default_name="$(default_model_for_provider anthropic)"
+        fi
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
     esac
@@ -1624,8 +4680,25 @@ main() {
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
     vertex_ai)
-      print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-kubeagents-litellm-gsa}@${project_id}.iam.gserviceaccount.com via Workload Identity."
+      print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}@${project_id}.iam.gserviceaccount.com via Workload Identity."
       print_info "Serving ${model_default_name} from projects/${vertex_project_id}/locations/${vertex_location}."
+      if [ "$vertex_manage_serving_project" != "true" ]; then
+        print_info "The install will not touch project ${vertex_project_id}. Enable aiplatform.googleapis.com there and grant roles/aiplatform.user to ${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}@${project_id}.iam.gserviceaccount.com yourself; model calls fail until you do."
+        print_info "If an earlier apply of this install created that grant, remove both serving-project resources from Terraform state before continuing, or this apply revokes it — terraform/examples/full-install/README.md names the two addresses."
+      fi
+      # The literal, not $DEFAULT_VERTEX_LOCATION: this warns about a property
+      # of the global endpoint, not about the default being in effect. Tying it
+      # to the constant would fire with false text if the default ever moved to
+      # a region, and stay silent for an explicit --vertex-location=global.
+      #
+      # An `if` rather than `[ ... ] && ...`: the AND-list form returns non-zero
+      # whenever the test fails, which is a live hazard under this file's
+      # `set -Eeuo pipefail` the moment it becomes the last statement in a
+      # function. The `||` idiom used elsewhere in this case block always
+      # returns 0; the `&&` form does not.
+      if [ "$vertex_location" = "global" ]; then
+        print_warning "The global endpoint gives no in-region ML processing guarantee. Pass --vertex-location=<region> if you have a data-residency requirement."
+      fi
       ;;
     openai)
       [ -n "$openai_api_key" ] || print_warning "No OpenAI API key was provided; the agent will require a credential update before model calls can succeed."
@@ -1637,18 +4710,40 @@ main() {
 
   # 8. GitOps Infrastructure Repository Connection
   print_step "8. GitOps Infrastructure Repository Setup"
-  local github_org="${PARAM_GITOPS_ORG:-}"
-  local github_repo="${PARAM_GITOPS_REPO:-gke-fleet-iac}"
-  # Env fallbacks, not bare empties: the non-interactive path never reaches
-  # the interview prompts below, so GITHUB_APP_ID / GITHUB_PEM_PATH exported
-  # into the run are the only way an automated install can enable the minter.
-  local github_app_id="${GITHUB_APP_ID:-}"
-  local kms_keyring="${KMS_KEYRING:-github-token-minter-keyring}"
-  local kms_key="${KMS_KEY:-github-token-minter-key}"
-  local github_pem_path="${GITHUB_PEM_PATH:-}"
+
+  # A leading ~ survived the early preflight untouched, because the function
+  # that resolves it lives in installer_common.sh and that file was not sourced
+  # yet. Resolved here, ahead of every test and every copy below, so the whole
+  # step judges one real path.
+  if [ -n "$PARAM_GITHUB_PEM_PATH" ]; then
+    PARAM_GITHUB_PEM_PATH="$(expand_tilde_path "$PARAM_GITHUB_PEM_PATH")"
+  fi
+
+  # The half of the PEM decision the early preflight could not make. Called
+  # here because by this point installer_common.sh is sourced,
+  # resolve_shared_defaults has filled the keyring and key, gcloud is
+  # authenticated, and project and region are settled -- step 5 can still
+  # change the region, and it has run. Called before the locals below copy
+  # PARAM_GITHUB_PEM_PATH, so every consumer in this step sees one answer.
+  resolve_missing_pem_against_kms "$region" "$project_id" || exit 1
+
+  local github_org="$PARAM_GITOPS_ORG"
+  local github_repo="$PARAM_GITOPS_REPO"
+  local github_app_id="$PARAM_GITHUB_APP_ID"
+  local kms_keyring="$PARAM_KMS_KEYRING"
+  local kms_key="$PARAM_KMS_KEY"
+  local github_pem_path="$PARAM_GITHUB_PEM_PATH"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    # An install that already names an org has a repository to connect, so
+    # option 2 is what pressing enter should mean. Options 1 and 2 run the same
+    # block, so this only makes the offered wording match the install — what
+    # actually keeps GITOPS_ORG and the minter credentials across a re-run is
+    # that each prompt below defaults to the loaded value.
     local gitops_choice=""
+    if [ -n "$github_org" ]; then
+      gitops_choice="2"
+    fi
     prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
       "Create a NEW GitHub Repository automatically (Recommended)" \
       "Connect an EXISTING GitHub Repository" \
@@ -1665,8 +4760,14 @@ main() {
       detected_gh_org=$(gh api user/orgs -q '.[0].login' 2>/dev/null || echo "")
       print_info "The GitOps repo must belong to a GitHub organization; a personal account cannot"
       print_info "mint tokens. A free organization is enough."
+      # Every default below is the loaded value first, the project default or
+      # the probe second. prompt_read assigns the empty input when its default
+      # is empty, so passing a bare "" here meant pressing enter through the
+      # interview cleared GITHUB_APP_ID and the PEM path on an install that had
+      # them — write_tfvars_from_state's three-way guard then set
+      # enable_github_minter = false and the apply removed the minter.
       while true; do
-        prompt_read "GitHub Organization" github_org "${detected_gh_org}"
+        prompt_read "GitHub Organization" github_org "${github_org:-$detected_gh_org}"
 
         local org_problem=""
         if [ -z "$github_org" ]; then
@@ -1687,44 +4788,152 @@ main() {
         # cluster, node pools and operator are already built. Settle it
         # here, while nothing has been created yet.
         if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
-          print_error "Set GITHUB_ORG to an organization and re-run, or export SKIP_GITHUB_ORG_CHECK=true to bypass this check."
+          print_error "Set GITOPS_ORG to an organization and re-run, or export SKIP_GITHUB_ORG_CHECK=true to bypass this check."
           exit 1
         fi
       done
-      prompt_read "GitOps Repository Name" github_repo "gke-fleet-iac"
+      prompt_read "GitOps Repository Name" github_repo "${github_repo}"
 
       print_info "GitHub access uses the short-lived GitHub App token minter."
-      prompt_read "GitHub App ID" github_app_id ""
-      prompt_read "Cloud KMS Keyring Name" kms_keyring "github-token-minter-keyring"
-      prompt_read "Cloud KMS Key Name" kms_key "github-token-minter-key"
-      prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path ""
+      prompt_read "GitHub App ID (optional, press Enter to skip token minter)" github_app_id "${github_app_id}"
+      if [ -n "$github_app_id" ]; then
+        prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring}"
+        prompt_read "Cloud KMS Key Name" kms_key "${kms_key}"
+
+        local kms_loc existing_kms_ver=""
+        kms_loc="$(derive_kms_location "$region")"
+        existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+        if [ -n "$existing_kms_ver" ]; then
+          print_success "Cloud KMS key ${kms_keyring}/${kms_key} already has an ENABLED version (${existing_kms_ver}); skipping PEM prompt."
+        else
+          while true; do
+            prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path "${github_pem_path}"
+            if [ -z "$github_pem_path" ]; then
+              print_warning "No PEM path entered. The token minter will be deferred unless key version 1 is imported into KMS."
+              break
+            fi
+            github_pem_path="$(expand_tilde_path "$github_pem_path")"
+            if [ -f "$github_pem_path" ]; then
+              break
+            fi
+            print_error "File not found: '${github_pem_path}'. Please enter a valid path to your .pem file, or leave blank to defer."
+          done
+          if [ -n "$github_pem_path" ] && [ -f "$github_pem_path" ]; then
+            if ! command -v go >/dev/null 2>&1; then
+              # Say it now, install it later. This runs inside step 8, which
+              # --dry-run and --generate-only both cross before they exit, and
+              # auto_install_tool exits 1 in the first and `sudo apt-get
+              # install`s in the second. Neither mode imports anything, so
+              # neither has any business refusing over Go or putting a package
+              # on the operator's machine. import_github_pem makes the same
+              # check where the toolchain is actually about to be used.
+              print_warning "Go toolchain ('go') is required to import the GitHub App private key into Cloud KMS via the Minty CLI; the installer will offer to install it when the import runs."
+            fi
+          fi
+        fi
+      else
+        print_info "No GitHub App ID entered; skipping token minter setup."
+        github_pem_path=""
+      fi
+    else
+      # Deliberately not clearing github_org / github_repo / github_app_id /
+      # github_pem_path here. "Skip for now" is the operator declining the
+      # interview, not asking for a teardown, and the four names are exactly
+      # the ones write_tfvars_from_state's three-way guard reads
+      # (scripts/installer/installer_common.sh): emptying them renders
+      # enable_github_minter = false, and the apply then removes a deployed
+      # minter's GSA, its Workload Identity binding, and the chart's
+      # Deployment, Service, NetworkPolicy and KSA — while install.env, which
+      # this run does not rewrite, goes on recording a minter that is gone.
+      #
+      # On a fresh install they are already empty, so the minter is skipped
+      # either way and this arm changes nothing. On a re-run the loaded values
+      # are the whole reason the minter survives. The comment above the
+      # interview prompts makes the same point about empty defaults.
+      if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
+        print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
+      else
+        print_info "GitOps repository connection skipped."
+      fi
+    fi
+  else
+    if [ -n "$github_pem_path" ]; then
+      github_pem_path="$(expand_tilde_path "$github_pem_path")"
+    fi
+
+    validate_non_interactive_minter_config "$github_app_id" "$github_pem_path" "$kms_keyring" "$kms_key" "$region" "$project_id" "$github_org" || exit 1
+
+    if [ -n "$github_app_id" ] && [ -n "$github_pem_path" ]; then
+      local kms_loc existing_kms_ver=""
+      kms_loc="$(derive_kms_location "$region")"
+      existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
+      if [ -z "$existing_kms_ver" ]; then
+        if ! command -v go >/dev/null 2>&1; then
+          # Warning only, for the reason given on the interactive arm above:
+          # step 8 runs before --dry-run and --generate-only exit.
+          print_warning "Go toolchain ('go') is required to import the GitHub App private key into Cloud KMS via the Minty CLI; the installer will install it when the import runs."
+        fi
+      fi
     fi
   fi
 
   # 9. Agent Permissions & Sandbox Isolation Boundary
   print_step "9. Agent Security & Runtime Isolation Boundary"
-  local permission_set="${PARAM_PERMISSION_SET:-read-only}"
-  if ! is_valid_permission_set "$permission_set"; then
-    print_error "Unsupported permission set '$permission_set'. Use read-only, gke-admin, or custom."
-    exit 1
-  fi
+  local permission_set="$PARAM_PERMISSION_SET"
+  # Normalise and keep the normalised value, the way common.sh does. The gate
+  # below normalises its own argument so that every spelling reaches the right
+  # message, but it cannot fix the caller's variable -- and everything
+  # downstream compares against the lowercase literal: the custom-roles check
+  # and the over-reach warning just below, the exported PLATFORM_AGENT_*
+  # pair, and terraform's case-sensitive contains() on permission_set. Passing
+  # `Custom` through raw would clear the gate and then miss all four.
+  permission_set=$(printf '%s' "$permission_set" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  # require_supported_permission_set (installer_common.sh) is the one home for
+  # the accepted vocabulary and for the explanation the removed admin bundle
+  # gets -- a PLATFORM_AGENT_PERMISSION_SET carried in install.env or a CI
+  # environment variable written before the removal lands here.
+  require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
-  # init_var_platform_agent_permission_set in k8s-operator/scripts/common.sh owns
-  # this rule; repeated here only so the run fails at the prompt instead of
-  # partway through the apply.
+  local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
+  local scope_folders="${PARAM_SCOPE_FOLDERS:-}"
+  local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
+  local scope_shared_vpc_hosts="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}"
+  local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
+  local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
+  local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
+  # This rule is also written in init_var_platform_agent_permission_set
+  # (scripts/installer/common.sh), which has no caller left in the repository
+  # -- the numbered provision scripts that used to invoke it went with #797. So
+  # this is the only place it runs, not a duplicate of somewhere it also runs.
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
   fi
-  local enable_gvisor="${PARAM_ENABLE_GVISOR:-false}"
+  if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
+    warn_on_overreaching_custom_roles "$custom_roles"
+  fi
+  # No `:-` fallback: resolve_shared_defaults already applied
+  # DEFAULT_ENABLE_GVISOR with ${VAR-...}, which leaves `--enable-gvisor=` (set, but
+  # empty) empty on purpose so the validator below rejects it instead of
+  # silently reading it as the default.
+  local enable_gvisor="$PARAM_ENABLE_GVISOR"
   if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
-    print_error "--gvisor must be either true or false."
+    print_error "--enable-gvisor must be either true or false."
     exit 1
   fi
-  if [[ ! "${PARAM_ENABLE_WEBUI:-false}" =~ ^(true|false)$ ]]; then
-    print_error "--enable-web-ui must be either true or false."
+  if [[ ! "$PARAM_ENABLE_WEBUI" =~ ^(true|false)$ ]]; then
+    print_error "--enable-hermes-dashboard must be either true or false."
     exit 1
   fi
+  # The remaining --enable-* toggles are checked in parse_args, not here.
+  # flag_bool_value extracts what they carry without checking it, and every
+  # read below goes through is_truthy, where anything that is not "true" is
+  # false -- so `--enable-slack=ture` would provision an install with Slack off
+  # and say nothing. Checking them at the point they are parsed is what keeps
+  # the check on the value a caller typed: by this line the same PARAM_* also
+  # holds whatever install.env seeded, where True/yes/on are spellings the
+  # documentation invites and is_truthy honours.
+  validate_existing_cluster_opt_in_flags
   # An agent that forgets every conversation is the worse default, so memory is
   # on unless it is turned off. The choice decides two things: whether the
   # harness keeps memory at all, and — when it does — whether that costs an
@@ -1735,7 +4944,7 @@ main() {
   # searchable store existed: an upgrade that says nothing about memory keeps
   # the store it already has, and no install grows a Postgres database it never
   # asked for. Enterprise deployments opt in with --memory=hindsight.
-  local memory_mode="${PARAM_MEMORY:-file}"
+  local memory_mode="$PARAM_MEMORY"
   if [[ ! "$memory_mode" =~ ^(off|file|hindsight)$ ]]; then
     print_error "--memory must be one of: off, file, hindsight."
     exit 1
@@ -1746,17 +4955,24 @@ main() {
     # every set, so neither belongs in these labels. read-only leads because it is
     # the documented default and the only set that enforces no cloud-plane writes.
     # See docs/site/src/content/docs/reference/security-and-iam.md.
-    local perm_choice=""
+    # The "(Default)" tag follows the option enter keeps — the seeded one on a
+    # re-run — for the reason the gVisor prompt below gives: a static tag on
+    # option 1 contradicts what an empty answer does once a recorded setting
+    # seeds the choice. The order stays fixed so the option numbers are stable.
+    local perm_choice="" perm_tag_ro=" (Default)" perm_tag_custom=""
+    if [ "$permission_set" = "custom" ]; then
+      perm_choice="2"
+      perm_tag_ro=""
+      perm_tag_custom=" (Default)"
+    fi
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
-      "read-only — auditing and observability, no GCP write capability (Default)" \
-      "gke-admin — the agent manages GKE lifecycle and node pools directly" \
-      "custom — exactly the roles you list, no built-in bundle" \
+      "read-only — auditing and observability, no GCP write capability${perm_tag_ro}" \
+      "custom — exactly the roles you list, no built-in bundle${perm_tag_custom}" \
       perm_choice
 
     case "$perm_choice" in
       1) permission_set="read-only" ;;
-      2) permission_set="gke-admin" ;;
-      3) permission_set="custom" ;;
+      2) permission_set="custom" ;;
     esac
 
     while [ "$permission_set" = "custom" ] && [ -z "$custom_roles" ]; do
@@ -1767,25 +4983,56 @@ main() {
         print_error "The custom permission set needs at least one role, e.g. roles/container.viewer."
       fi
     done
-
-    local gvisor_choice=""
-    prompt_menu "Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?" \
-      "No - Standard Container Runtime (Default)" \
-      "Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)" \
-      gvisor_choice
-
-    if [ "$gvisor_choice" = "2" ]; then
-      enable_gvisor="true"
+    # Repeated rather than moved: the call above runs on the --custom-roles flag
+    # path, which is decided before this prompt exists. An operator who runs
+    # ./install.sh and types the roles in reaches only this one.
+    if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
+      warn_on_overreaching_custom_roles "$custom_roles"
     fi
 
-    local webui_choice=""
-    prompt_menu "Enable Hermes Web UI (Port 9119 Dashboard) for Agent Observability?" \
-      "No - Disabled for reduced attack surface (Default)" \
-      "Yes - Enabled for local browser debugging (port 9119)" \
-      webui_choice
+    # prompt_menu answers an empty line with option 1, so the current value has
+    # to be listed first — otherwise the "(Default)" label contradicts what a
+    # bare Enter actually produces. The value reaching here is the sandbox
+    # unless --enable-gvisor=false said otherwise, so the usual order is Yes first;
+    # the else branch keeps an explicit --enable-gvisor=false from being re-enabled by
+    # someone confirming the prompt. Option 2 is "the other one" either way.
+    local gvisor_choice=""
+    local gvisor_yes="Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)"
+    local gvisor_no="No - Standard Container Runtime"
+    local gvisor_prompt="Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?"
+    if [ "$enable_gvisor" = "true" ]; then
+      prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)" "$gvisor_no" gvisor_choice
+      if [ "$gvisor_choice" = "2" ]; then
+        enable_gvisor="false"
+      fi
+    else
+      prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)" "$gvisor_yes" gvisor_choice
+      if [ "$gvisor_choice" = "2" ]; then
+        enable_gvisor="true"
+      fi
+    fi
 
-    if [ "$webui_choice" = "2" ]; then
-      PARAM_ENABLE_WEBUI="true"
+    # Ordered by the current value, as the gVisor prompt above is: the
+    # "(Default)" tag, the enter key and the resulting value have to agree.
+    # Every branch assigns, so either answer takes effect.
+    local webui_yes="Yes - Enabled for local browser debugging (port 9119)"
+    local webui_no="No - Disabled for reduced attack surface"
+    local webui_prompt="Enable Hermes Web UI (Port 9119 Dashboard) for Agent Observability?"
+    local webui_choice=""
+    if is_truthy "$PARAM_ENABLE_WEBUI"; then
+      prompt_menu "$webui_prompt" "${webui_yes} (Default)" "$webui_no" webui_choice
+      if [ "$webui_choice" = "2" ]; then
+        PARAM_ENABLE_WEBUI="false"
+      else
+        PARAM_ENABLE_WEBUI="true"
+      fi
+    else
+      prompt_menu "$webui_prompt" "${webui_no} (Default)" "$webui_yes" webui_choice
+      if [ "$webui_choice" = "2" ]; then
+        PARAM_ENABLE_WEBUI="true"
+      else
+        PARAM_ENABLE_WEBUI="false"
+      fi
     fi
 
     # The two stores differ in what they cost to run and in how far they scale,
@@ -1794,15 +5041,33 @@ main() {
     # whole on every turn, so it is bounded by the window; Hindsight retrieves only
     # what a question needs, at the price of an API server and a database.
     #
-    # The file store is listed first because prompt_menu's default answer is
-    # always option 1, and this is the one an install should get for saying
-    # nothing — it is what installs got before the searchable store existed, and
-    # it is the only option that adds no services to the cluster.
-    local memory_choice=""
+    # The file store is listed first because it is the one an install should get
+    # for saying nothing — it is what installs got before the searchable store
+    # existed, and it is the only option that adds no services to the cluster.
+    # An install that already chose otherwise seeds its own option below, so
+    # "saying nothing" on a re-run means keeping what is there, not taking the
+    # first entry, so that omitting --memory cannot delete a Hindsight
+    # deployment.
+    # The "(Default)" tag follows the option enter keeps, like the permission-set
+    # prompt above: on a re-run that seeded hindsight or off, a static tag on the
+    # file store would claim enter does something it does not. The order stays
+    # fixed so the option numbers are stable.
+    local memory_choice="" mem_tag_file="" mem_tag_hind="" mem_tag_off=""
+    case "$memory_mode" in
+      file) memory_choice="1" ;;
+      hindsight) memory_choice="2" ;;
+      off) memory_choice="3" ;;
+    esac
+    local memory_seed_choice="$memory_choice"
+    case "$memory_choice" in
+      2) mem_tag_hind=" (Default)" ;;
+      3) mem_tag_off=" (Default)" ;;
+      *) mem_tag_file=" (Default)" ;;
+    esac
     prompt_menu "Should the agent remember things between conversations?" \
-      "Files on the agent's own disk (Default) - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
-      "Searchable store - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
-      "No - Nothing is retained once a session ends" \
+      "Files on the agent's own disk${mem_tag_file} - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
+      "Searchable store${mem_tag_hind} - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
+      "No${mem_tag_off} - Nothing is retained once a session ends" \
       memory_choice
 
     # Every branch assigns, rather than letting option 1 fall through to
@@ -1813,7 +5078,39 @@ main() {
       2) memory_mode="hindsight" ;;
       3) memory_mode="off" ;;
     esac
+    # Not unconditional, which is what it used to be. When nothing stated a
+    # memory mode, resolve_shared_defaults has already put DEFAULT_MEMORY
+    # (`file`) into PARAM_MEMORY, so the seed above is 1 and the "(Default)" tag
+    # sits on the file store because of a project-wide default, not because this
+    # install chose it. prompt_menu returns that same 1 for a bare enter, so
+    # marking it explicit turns "the operator said nothing" into "the operator
+    # chose file" -- and that skips live_hindsight_state in the generator, which
+    # is the whole of what stands between a Hindsight install whose install.env
+    # predates the MEMORY key and an apply that deletes hindsight-postgresql and
+    # its database. That is the population the retirement of vars.sh created:
+    # before it, a pre-0.4.0 checkout seeded this prompt on option 2 from the
+    # MEMORY_PROVIDER that file carried, so enter kept Hindsight.
+    #
+    # Moving off the seeded option is a statement, and so is an install.env or
+    # --memory that set PARAM_MEMORY_EXPLICIT before the interview. What is left
+    # -- accepting the seed when nothing seeded it -- is deliberately read as
+    # "no answer" and handed to the probe. A typed "1" is indistinguishable from
+    # enter here (prompt_menu returns the number either way), so it is read the
+    # same: on a cluster running Hindsight the generator then preserves it and
+    # says so, and the pre-flight summary shows the store the apply will keep
+    # before anything is applied. Losing an argument with the operator that way
+    # costs one re-run with --memory=file; losing it the other way costs the
+    # database.
+    if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
+      PARAM_MEMORY_EXPLICIT="true"
+    fi
   fi
+
+  # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
+  # answer has to travel back. Without it bootstrap_install_env_file would
+  # record MEMORY=file for an install that chose Hindsight, and the next run
+  # would tear down what this one built.
+  PARAM_MEMORY="$memory_mode"
 
   # MEMORY_PROVIDER carries the whole choice — including "no memory at all",
   # which is what `none` means. Everything downstream reads it and nothing else:
@@ -1826,26 +5123,29 @@ main() {
   # alongside whichever provider is chosen — two competing stores in front of one
   # agent. Every provider here replaces it rather than supplementing it. Nothing
   # about memory keys off this flag, so an upgrade cannot read a false left in an
-  # old vars.sh as "this install wanted no memory".
+  # old install.env as "this install wanted no memory".
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
   # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
-  # in k8s-operator/scripts/common.sh.
+  # in scripts/installer/common.sh.
   #
   # `multiuser_memory` is the default provider everywhere it is named with no
   # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
+  # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither
+  # install.env nor --memory), leave MEMORY_PROVIDER empty when calling
+  # write_tfvars_from_state so the generator can preserve a live Hindsight
+  # deployment on an existing cluster before falling back to multiuser_memory.
   local memory_enabled="false"
-  local memory_provider="multiuser_memory"
-  case "$memory_mode" in
-    hindsight) memory_provider="kube_agents_memory" ;;
-    off) memory_provider="none" ;;
-  esac
+  local memory_provider=""
+  if [ "$PARAM_MEMORY_EXPLICIT" = "true" ]; then
+    memory_provider="$(memory_provider_from_mode "$memory_mode")"
+    [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  fi
 
-  print_step "10. Generating Configuration State (k8s-operator/scripts/vars.sh)"
-  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
+  print_step "10. Resolving Install Configuration"
   local registry_prefix="${PARAM_REGISTRY_PREFIX%/}"
   if [ -z "$registry_prefix" ] || [[ "$registry_prefix" == *"://"* ]]; then
     print_error "--registry-prefix must be a non-empty registry path without a URL scheme."
@@ -1858,97 +5158,202 @@ main() {
     exit 1
   fi
 
-  local api_server_key
-  api_server_key="$(openssl rand -hex 16 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  if [ -z "$api_server_key" ]; then
-    print_error "Unable to generate API_SERVER_KEY from a secure random source."
-    exit 1
-  fi
+  # Whatever the loaded configuration carries, and nothing invented here. When
+  # it carries none, write_tfvars_from_state tries the live Secret first and
+  # mints one only if that fails — see KUBE_AGENTS_GENERATE_API_SERVER_KEY,
+  # exported below. Generating one here instead would replace the live Secret
+  # on every re-run and restart the pods holding it.
+  local api_server_key="${API_SERVER_KEY:-}"
 
-  local old_umask
-  old_umask="$(umask)"
-  umask 077
-  local final_vars_file="$vars_file"
-  vars_file="${vars_file}.tmp"
-  printf '%s\n' '# Auto-generated by kube-agents zero-friction installer' > "$vars_file"
-  write_state_var "$vars_file" PROJECT_ID "$project_id"
-  write_state_var "$vars_file" PROJECT_NUMBER "$project_number"
-  write_state_var "$vars_file" CLUSTER_NAME "$cluster_name"
-  write_state_var "$vars_file" REGION "$region"
-  write_state_var "$vars_file" KMS_LOCATION "$(derive_kms_location "$region")"
-  write_state_var "$vars_file" ENABLE_GVISOR "$enable_gvisor"
-  write_state_var "$vars_file" GVISOR_POOL_NAME "gvisor-pool"
-  write_state_var "$vars_file" MODEL_PROVIDER "$model_provider"
-  write_state_var "$vars_file" MODEL_DEFAULT_NAME "$model_default_name"
-  write_state_var "$vars_file" VERTEX_PROJECT_ID "$vertex_project_id"
-  write_state_var "$vars_file" VERTEX_LOCATION "$vertex_location"
-  write_secret_state_var "$vars_file" GEMINI_API_KEY "$gemini_api_key"
-  write_secret_state_var "$vars_file" OPENAI_API_KEY "$openai_api_key"
-  write_secret_state_var "$vars_file" ANTHROPIC_API_KEY "$anthropic_api_key"
-  write_state_var "$vars_file" ALLOWED_USERS "$allowed_users"
-  write_state_var "$vars_file" CHAT_TOPIC_NAME "$chat_topic_name"
-  write_state_var "$vars_file" CHAT_SUB_NAME "$chat_sub_name"
-  write_state_var "$vars_file" GOOGLE_CHAT_ENABLED "$google_chat_enabled"
-  write_state_var "$vars_file" GOOGLE_CHAT_MODE "$google_chat_mode"
-  write_state_var "$vars_file" SLACK_ENABLED "$slack_enabled"
-  write_secret_state_var "$vars_file" SLACK_BOT_TOKEN "$slack_bot_token"
-  write_secret_state_var "$vars_file" SLACK_APP_TOKEN "$slack_app_token"
-  write_state_var "$vars_file" SLACK_ALLOWED_USERS "$slack_allowed_users"
-  write_state_var "$vars_file" SLACK_HOME_CHANNEL "$slack_home_channel"
-  write_state_var "$vars_file" SLACK_HOME_CHANNEL_NAME "$slack_home_channel_name"
-  write_secret_state_var "$vars_file" API_SERVER_KEY "$api_server_key"
-  write_state_var "$vars_file" PLATFORM_AGENT_PERMISSION_SET "$permission_set"
-  if [ "$permission_set" = "custom" ]; then
-    write_state_var "$vars_file" PLATFORM_AGENT_CUSTOM_ROLES "$custom_roles"
-  fi
-  write_state_var "$vars_file" GITHUB_ORG "$github_org"
-  write_state_var "$vars_file" GITHUB_REPO "$github_repo"
-  write_state_var "$vars_file" GITHUB_APP_ID "$github_app_id"
-  write_state_var "$vars_file" KMS_KEYRING "$kms_keyring"
-  write_state_var "$vars_file" KMS_KEY "$kms_key"
-  write_state_var "$vars_file" GITHUB_PEM_PATH "$github_pem_path"
-  write_state_var "$vars_file" MEMORY_ENABLED "$memory_enabled"
-  write_state_var "$vars_file" MEMORY_PROVIDER "$memory_provider"
-  write_state_var "$vars_file" USER_PROFILE_ENABLED "${PARAM_USER_PROFILE_ENABLED:-${USER_PROFILE_ENABLED:-false}}"
-  write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
-  write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
-  # Written only when asked for. An empty value here would be sourced over an
-  # exported one, turning "leave them upstream" from a default into an override
-  # the installer never took a flag for.
-  if [ -n "$third_party_registry_prefix" ]; then
-    write_state_var "$vars_file" THIRD_PARTY_REGISTRY_PREFIX "$third_party_registry_prefix"
-  fi
-  # Bare repository paths on purpose: IMAGE_TAG is scoped to a single pipeline
-  # run and is never persisted here, so the consuming step attaches it with
-  # qualify_image_ref.
+  # Straight into the environment, which is where write_tfvars_from_state and
+  # the TF_VAR_* handoff read from. Nothing is persisted here: install.env is
+  # an input, and a file that is both read as configuration and written as
+  # findings has two answers for one question.
   #
-  # Two images are absent on purpose. REPLAY_IMAGE belongs to the dev-only
-  # inference-replay deploy, whose make target requires it from the caller.
-  # CREDENTIAL_PROXY_IMAGE would pin the sidecar for
-  # every PlatformAgent in the cluster: the operator otherwise derives it from
-  # each CR's own agent image, and a cluster-wide env override beats that
-  # derivation, so a later re-render of the CR at a new tag would leave the
-  # sidecar behind on the tag of the install that wrote this file.
-  write_state_var "$vars_file" OPERATOR_IMAGE "${registry_prefix}/k8s-operator"
-  write_state_var "$vars_file" PLATFORM_AGENT_IMAGE "${registry_prefix}/platform-agent"
-  write_state_var "$vars_file" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-false}"
-  write_state_var "$vars_file" NO_CONFIRM "1"
-  chmod 600 "$vars_file"
-  mv -f -- "$vars_file" "$final_vars_file"
-  vars_file="$final_vars_file"
-  umask "$old_umask"
-  print_success "Configuration saved to: $vars_file"
-
-  # The engine input, generated from the state file just written so the two
-  # can never disagree. Re-sourcing vars.sh is what puts that state in the
-  # environment write_tfvars_from_state reads.
-  # shellcheck disable=SC1090
-  source "$vars_file"
+  # Four values are deliberately absent, because they are derived and a stored
+  # copy can only disagree with the live answer.
+  # PROJECT_NUMBER comes from `gcloud projects describe` and KMS_LOCATION from
+  # derive_kms_location, both re-run every time they are needed; the effective
+  # CLUSTER_MODE and create_cluster come from the generator's own probe of the
+  # live cluster. NO_CONFIRM is gone too: it is a property of this invocation,
+  # set by -y/--non-interactive, not configuration to inherit.
+  export PROJECT_ID="$project_id"
+  export PROJECT_NUMBER="$project_number"
+  export CLUSTER_NAME="$cluster_name"
+  export CLUSTER_MODE="$cluster_mode"
+  export REGION="$region"
+  export ENABLE_GVISOR="$enable_gvisor"
+  # The generator emits it into terraform.tfvars, where the gke-cluster
+  # module's postcondition reads it, defaulting the line to false itself.
+  # Exported only when a flag or install.env set it: the prompt gates read
+  # ${PARAM_...:-${ACCEPT_NO_NETWORK_POLICY:-}}, so an unconditional "false"
+  # here would count as an answer and silence the three-way prompt on every
+  # interactive run.
+  if [ -n "${PARAM_ACCEPT_NO_NETWORK_POLICY:-}" ]; then
+    export ACCEPT_NO_NETWORK_POLICY="$PARAM_ACCEPT_NO_NETWORK_POLICY"
+  fi
+  # No GVISOR_POOL_NAME. It has no flag and no interview question, so anything
+  # exported here would be a constant written over whatever install.env says --
+  # the generator already applies DEFAULT_GVISOR_POOL_NAME when nothing sets it,
+  # which leaves the operator's value free to win.
+  #
+  # ENABLE_GKE_BACKUP_PLAN used to be kept out for that same reason. It has a
+  # flag now, so it is exported when something chose -- the flag, or install.env,
+  # which seeds PARAM_ENABLE_GKE_BACKUP_PLAN. Empty still means nobody chose, and
+  # the generator's DEFAULT_ENABLE_GKE_BACKUP_PLAN decides as it did before.
+  if [ -n "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" ]; then
+    export ENABLE_GKE_BACKUP_PLAN="$PARAM_ENABLE_GKE_BACKUP_PLAN"
+  fi
+  export MODEL_PROVIDER="$model_provider"
+  export MODEL_DEFAULT_NAME="$model_default_name"
+  export MODEL_MAX_TOKENS="$model_max_tokens"
+  export VERTEX_PROJECT_ID="$vertex_project_id"
+  export VERTEX_LOCATION="$vertex_location"
+  export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
+  export GEMINI_API_KEY="$gemini_api_key"
+  export OPENAI_API_KEY="$openai_api_key"
+  export ANTHROPIC_API_KEY="$anthropic_api_key"
+  export ALLOWED_USERS="$allowed_users"
+  export CHAT_TOPIC_NAME="$chat_topic_name"
+  export CHAT_SUB_NAME="$chat_sub_name"
+  export GOOGLE_CHAT_ENABLED="$google_chat_enabled"
+  export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
+  export GOOGLE_CHAT_MODE="$google_chat_mode"
+  export SLACK_ENABLED="$slack_enabled"
+  export SLACK_BOT_TOKEN="$slack_bot_token"
+  export SLACK_APP_TOKEN="$slack_app_token"
+  export SLACK_ALLOWED_USERS="$slack_allowed_users"
+  export SLACK_HOME_CHANNEL="$slack_home_channel"
+  export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"
+  export API_SERVER_KEY="$api_server_key"
+  export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
+  export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
+  export SCOPE_PROJECTS="$scope_projects"
+  export SCOPE_FOLDERS="$scope_folders"
+  export SCOPE_ORGANIZATIONS="$scope_organizations"
+  export SCOPE_SHARED_VPC_HOSTS="$scope_shared_vpc_hosts"
+  export SCOPE_METRICS_SCOPES="$scope_metrics_scopes"
+  export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
+  export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
+  export GITOPS_ORG="$github_org"
+  export GITOPS_REPO="$github_repo"
+  # One release of overlap: the agent runtime and the chart still speak
+  # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
+  # values rather than letting them be a second source of truth.
+  normalize_gitops_repo_vars
+  export GITHUB_APP_ID="$github_app_id"
+  export KMS_KEYRING="$kms_keyring"
+  export KMS_KEY="$kms_key"
+  export GITHUB_PEM_PATH="$github_pem_path"
+  export MEMORY_ENABLED="$memory_enabled"
+  export MEMORY_PROVIDER="$memory_provider"
+  export USER_PROFILE_ENABLED="$PARAM_USER_PROFILE_ENABLED"
+  export HERMES_DASHBOARD_ENABLED="$PARAM_ENABLE_WEBUI"
+  export REGISTRY_PREFIX="$registry_prefix"
+  export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
+  export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  # Exported only when asked for, the way it was only ever persisted when asked
+  # for: an empty value here is an override the installer never took a flag
+  # for, turning "leave the third-party images upstream" from a default into an
+  # instruction.
+  if [ -n "$third_party_registry_prefix" ]; then
+    export THIRD_PARTY_REGISTRY_PREFIX="$third_party_registry_prefix"
+  fi
+  # No *_IMAGE variables. The operator reads OPERATOR_IMAGE and
+  # PLATFORM_AGENT_IMAGE from its own pod environment, where the chart sets both
+  # from values.yaml. The images this install pulls are decided by
+  # REGISTRY_PREFIX above and the image_tag the tfvars generator writes.
 
   local tfvars_file
   tfvars_file="$(tf_compose_dir "$repo_dir")/terraform.tfvars"
-  write_tfvars_from_state "$tfvars_file" "$image_tag"
+  # install.sh is the one front door allowed to mint an API_SERVER_KEY, and only
+  # after the generator has tried the live Secret. upgrade.sh and uninstall.sh
+  # leave this unset so an unfindable key stays an error for them.
+  #
+  # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER: "could not tell whether the cluster runs
+  # Hindsight" has to stop this run rather than fall through to multiuser_memory
+  # and let an apply delete the database. Unconditional, including under
+  # --dry-run and --generate-only, because both of those write this same
+  # tfvars_file in the real composition directory and --generate-only exists
+  # precisely to hand it to `lifecycle.sh apply` -- so a guess here is applied
+  # either way, just later and by someone who did not see the run that made it.
+  # That is why this does not take the warn-under---dry-run shape the coordinate
+  # checks use: those refuse before writing anything.
+  #
+  # Only reachable when nothing stated a memory mode -- PARAM_MEMORY_EXPLICIT is
+  # false, which left MEMORY_PROVIDER empty above -- and never on a cluster that
+  # does not exist yet. uninstall.sh deliberately does not opt in.
+  KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+    write_tfvars_from_state "$tfvars_file" "$image_tag"
+  if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then
+    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"
+    export MEMORY_PROVIDER="$memory_provider"
+    if [ "$memory_provider" = "kube_agents_memory" ]; then
+      memory_mode="hindsight"
+      PARAM_MEMORY="hindsight"
+    fi
+  fi
+  # After the generator, because its Secret-recovery loop is the thing that can
+  # still supply the tokens; before the apply, because a relay without them
+  # CrashLoops.
+  require_slack_tokens_after_recovery
   print_success "Terraform input saved to: $tfvars_file"
+
+  # Before the summary, the confirmation and the dry-run exit alike: a
+  # service account the apply would 409 on is something to know before
+  # answering "proceed", and it costs a describe per account. Read-only.
+  check_service_account_ownership || exit 1
+  # For the same reason, and only for a run that will apply: the apply renders
+  # spec.scope from the keys over the live PlatformAgent, and a scope it
+  # carries that neither the release record nor the keys account for is
+  # refused here, before the operator confirms, the App key is imported or an
+  # adopted cluster is changed, rather than replaced. The context is fetched
+  # here because the generator fetches one only for an adoption; a fetch that
+  # does not land is the check's own refusal. A first install has no cluster
+  # yet and skips this.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
+      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  fi
+  # A declared folder or organisation is bound by the apply with this
+  # identity, in the container itself, and turns on the Asset API in the host
+  # project; both are checked before anything is applied, first install
+  # included, so a container this identity cannot bind or an organisation
+  # policy that forbids the API stops the run rather than failing it partway.
+  # The mode follows the route: a run that will apply is refused, a run that
+  # hands the apply to lifecycle.sh only warns, because that apply often runs
+  # later as a CI or platform identity and the credentials probed here are the
+  # ones at the keyboard. Here the route is known for --generate-only and -y;
+  # an interactive run learns it at the (Y/n/g) prompt below and is checked
+  # there, so the g answer is the same choice as the flag.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      check_scope_container_access || exit 1
+    fi
+  fi
+
+  # Prompt for opt-ins on existing cluster mutations before the summary
+  # checkpoint -- and before install.env is written, so an answer given here
+  # is recorded there.
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
+    settle_network_policy_acceptance "$project_id" "$cluster_name" "$region" "$tfvars_file" "$image_tag"
+  fi
+
+  # Written once, and only when there is nothing there. The probed cluster
+  # shape is deliberately NOT recorded: a file that is read as configuration
+  # and also written as findings has two answers for one question. The probe is
+  # authoritative on every run regardless of what the file says, which is what
+  # stops a hand-written CLUSTER_MODE=standard from planning a live Autopilot
+  # cluster's replacement.
+  bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"
 
   # Pre-Flight Summary & Final Confirmation Checkpoint
   print_step "11. Pre-Flight Configuration Summary"
@@ -1956,7 +5361,13 @@ main() {
   draw_separator
   echo -e "${C_RESET}${C_BOLD}Please review your selections before provisioning begins:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Target Project:${C_RESET} ${C_BOLD}${project_id}${C_RESET} (Project Number: ${project_number:-unknown})"
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE Standard)"
+  # The generator's answer, not the interview's: on an existing cluster it
+  # probed the live shape and the flag had no say.
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    echo -e "  • ${C_CYAN}Existing Cluster Mutations (Adoption):${C_RESET}"
+    summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
+  fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
@@ -1986,16 +5397,74 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
-      terraform init -backend=false -input=false >/dev/null
-      terraform validate >/dev/null
+      local tf_log=""
+      tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
+      local rc=0
+      run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        print_success "Terraform configuration is valid."
+        rm -f -- "$tf_log"
+      else
+        # Only the spinner branch withheld the output; the non-TTY branch already
+        # streamed it through tee, where repeating it doubles the log. The two
+        # messages differ so the non-TTY one does not end on a colon promising
+        # output that never follows. An `if` rather than `[ -t 1 ] &&`, which
+        # under `set -e` would exit the subshell with the test's own status
+        # instead of the validation's.
+        if [ -t 1 ]; then
+          print_error "Terraform validation failed (exit code $rc):"
+          cat "$tf_log" >&2
+        else
+          print_error "Terraform validation failed (exit code $rc); its output is above."
+        fi
+        rm -f -- "$tf_log"
+        exit "$rc"
+      fi
     )
-    print_success "Terraform configuration is valid."
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-      print_info "Previewing the resources a real run would create (terraform plan)..."
-      (
-        cd "$(tf_compose_dir "$repo_dir")"
-        terraform plan -input=false -lock=false
-      )
+      local np_status=0 missing_apis=""
+      is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
+      if [ "$np_status" -eq 2 ]; then
+        print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
+      elif [ "$np_status" -ne 0 ] && ! is_truthy "${PARAM_ACCEPT_NO_NETWORK_POLICY:-${ACCEPT_NO_NETWORK_POLICY:-false}}"; then
+        if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+          print_info "Dry-run: skipping terraform plan because Calico has not yet been applied to the live cluster (a real run enables Calico prior to apply)."
+        else
+          print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' enforces no NetworkPolicy (postcondition would fail)."
+          print_info "A real run will abort unless told which way to go: --enable-network-policy (ENABLE_NETWORK_POLICY=true) enables the legacy Calico addon, a control-plane update that may recreate nodes; --accept-no-network-policy (ACCEPT_NO_NETWORK_POLICY=true) installs without enforcement and leaves the cluster as it is."
+          print_info "To enable enforcement by hand beforehand, run these two commands in this order:"
+          print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --update-addons=NetworkPolicy=ENABLED"
+          print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --enable-network-policy"
+        fi
+      elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then
+        if is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+          print_info "Dry-run: skipping terraform plan because node pool migration to GKE_METADATA has not yet been applied to the live cluster (a real run migrates pools prior to apply)."
+        else
+          print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' has node pool(s) on legacy metadata server."
+          print_info "A real run will abort unless authorized with --migrate-node-pools or MIGRATE_NODE_POOLS=true."
+          print_info "To remediate manually beforehand, update each legacy node pool:"
+          print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
+        fi
+      elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \
+        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then
+        # The plan resolves a declared Shared VPC host or Metrics Scope by
+        # reading APIs a real run enables prior to apply; a dry run enables
+        # nothing, so its plan would be refused for a reason the real run
+        # does not have. A listing that failed runs the plan and lets it speak.
+        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan resolves the declared Shared VPC host or Metrics Scope through it (a real run enables it prior to apply)."
+        print_info "To preview anyway, enable it first: gcloud services enable ${missing_apis} --project=${project_id}"
+      else
+        # Reached with an unenforcing cluster only under --accept-no-network-policy,
+        # whose tfvars carry the variable that passes the module's postcondition.
+        if [ "$np_status" -ne 0 ]; then
+          print_no_network_policy_consequences "$cluster_name"
+        fi
+        print_info "Previewing the resources a real run would create (terraform plan)..."
+        (
+          cd "$(tf_compose_dir "$repo_dir")"
+          terraform plan -input=false -lock=false
+        )
+      fi
     else
       print_warning "No Application Default Credentials; skipping the resource preview (terraform plan)."
       print_info "Run 'gcloud auth application-default login' for a full dry-run preview."
@@ -2005,15 +5474,53 @@ main() {
     exit 0
   fi
 
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+  # Refuse before the confirmation checkpoint and before any cluster mutations
+  # if adopting an existing cluster lacking required node pool migration or NetworkPolicy
+  # without explicit opt-in.
+  #
+  # Generate-only is held to the same bar, for two reasons. The tfvars that mode
+  # exists to produce cannot apply against a cluster enforcing no NetworkPolicy --
+  # the gke-cluster module's postcondition refuses them -- so emitting a handoff
+  # that calls those inputs validated hands the operator a plan already known to
+  # fail. And the refusals name the opt-in flags (--enable-network-policy,
+  # --migrate-node-pools) that the apply needs regardless, so an operator who
+  # wants tfvars for such a cluster gets them by passing what they were going to
+  # have to pass anyway. Running here also keeps --generate-only and the
+  # interactive `g` the same choice, which install-kube-agents/SKILL.md says
+  # they are: this sits above the (Y/n/g) prompt, so both routes cross it.
+  check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
+  check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+  note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
+
+  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
-    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n)" confirm_choice "y"
-    if [[ ! "$confirm_choice" =~ ^[Yy]$ ]]; then
-      print_warning "Provisioning paused by user. Configuration saved to: $vars_file"
-      print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply${C_RESET}"
-      write_json_report "PAUSED"
-      exit 0
-    fi
+    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
+    case "$confirm_choice" in
+      [Yy])
+        # The apply is chosen: the container preflight refuses here, before
+        # step 12 writes anything, as it does above the summary for -y.
+        check_scope_container_access || exit 1
+        ;;
+      [Gg])
+        # The handoff is chosen: the same check only warns, as for the flag.
+        PARAM_GENERATE_ONLY="true"
+        check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+        ;;
+      *)
+        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        write_json_report "PAUSED"
+        exit 0
+        ;;
+    esac
+  fi
+
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
+    check_github_org_is_organization "${GITOPS_ORG:-}"
+    print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
+    write_json_report "GENERATE_ONLY_SUCCESS"
+    exit 0
   fi
 
   # 12. Execute the Terraform Engine
@@ -2021,18 +5528,29 @@ main() {
   print_info "Provisioning GCP APIs, GKE Cluster, cert-manager, Operator, LiteLLM gateway, and Platform Agent..."
 
   # Re-validate the GitOps org before spending an apply on it. The interview
-  # already settled it interactively; this catches a vars.sh edited by hand
+  # already settled it interactively; this catches an install.env edited by hand
   # and the non-interactive flag path. Warns-only when GitHub is unreachable;
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
-  check_github_org_is_organization "${GITHUB_ORG:-}"
+  check_github_org_is_organization "${GITOPS_ORG:-}"
+  # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
+  # reads APIs the apply below is what enables; on a first install they
+  # have to be on before the plan, or it is refused with the API disabled.
+  enable_scope_selector_apis "$project_id"
 
   # The three script behaviours a data source cannot express: CMEK, the
   # Workload Identity pool, and NetworkPolicy enforcement on a cluster that
-  # already exists. All are no-ops when the cluster does not exist yet or is
-  # already configured.
-  ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
-  ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
-  ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+  # already exists. Only run when adopting an existing cluster; a cluster
+  # created by this install already has them configured via Terraform.
+  # NetworkPolicy is verified and applied first so that a refusal or failure
+  # halts before permanent control-plane modifications (Workload Identity, CMEK).
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+    # Calico just went on under --enable-network-policy: a recorded acceptance
+    # is stale from here.
+    note_stale_network_policy_acceptance "$INSTALL_ENV_FILE"
+    ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
+    ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
+  fi
 
   # The App key import sits here — after the dry-run exit and the operator's
   # confirmation (it enables the KMS API, creates permanent key rings, and
@@ -2041,16 +5559,32 @@ main() {
   # pass readiness once the key is imported. The generator enabled the
   # minter on the promise of this import, so a failed one stops the run
   # here rather than wedging the apply.
-  import_github_pem "$project_id" "$region"
+  import_github_pem "$project_id" "$region" || exit 1
   local minter_enabled_version=""
-  minter_enabled_version="$({ gcloud kms keys versions list --key "${KMS_KEY:-github-token-minter-key}" \
-    --keyring "${KMS_KEYRING:-github-token-minter-keyring}" \
-    --location "$(derive_kms_location "$region")" --project "$project_id" \
-    --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true; } | head -1)"
+  minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
+    "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"
   if grep -q '^enable_github_minter = true$' "$tfvars_file" 2>/dev/null && [ -z "$minter_enabled_version" ]; then
     print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key still has no ENABLED version — the apply would wait on a minter that can never become ready."
     print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
     exit 1
+  fi
+
+  # A retry after an apply that died inside the kube-agents release: Helm
+  # refuses to create a release whose name a failed one still holds, and
+  # Terraform, which never recorded it, plans a create. Whenever the cluster
+  # is already there -- adopted, or created by this state on the attempt that
+  # died -- and only for a release no revision of which ever served. The
+  # context is the one fetched before the step-11 summary for the scope check
+  # (with the DNS-endpoint flag step 13 passes, since without it the fetch
+  # fails on a DNS-endpoint-only cluster and the context gate below does not
+  # match); the check itself refuses to look at any other context.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
+    clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+    # A re-run is how INSTALL.md says to change configuration, and Helm never
+    # upgrades CRDs, so the schema is applied here as upgrade.sh applies it
+    # before its own apply; a field the served CRD lacked would otherwise be
+    # pruned from the CR, and stay pruned.
+    apply_crd_upgrades "$repo_dir"
   fi
 
   local provisioning_log
@@ -2072,31 +5606,48 @@ main() {
 
   # 12. Workload & Pod Health Verification Checkpoint
   print_step "13. Verifying Workload & Pod Health"
-  print_info "Verifying deployment rollouts in namespace 'kubeagents-system'..."
+  local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  print_info "Verifying deployment rollouts in namespace '${namespace}'..."
   GKE_DNS_ENDPOINT_FLAG=""
   gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$cluster_name" --location "$region" \
     --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null
-  if ! kubectl get ns kubeagents-system >/dev/null 2>&1; then
-    print_error "Namespace 'kubeagents-system' was not created. Installation is incomplete."
+  local expected_ctx
+  expected_ctx="$(gke_context_name)"
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ "$current_ctx" != "$expected_ctx" ]; then
+    print_error "kubectl current-context ('${current_ctx}') does not match expected cluster context '${expected_ctx}'."
+    print_info "Failed to switch kubectl context to '${expected_ctx}'. Refusing to run health checks on the wrong cluster."
+    exit 1
+  fi
+  if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
+    print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
   fi
   local slow_rollouts=()
-  # kube-agents-controller-manager, not kubeagents-: the chart prefixes the
-  # operator Deployment with the release name.
-  for deployment in kube-agents-controller-manager litellm platform-agent-gateway; do
-    if ! kubectl get deployment "$deployment" -n kubeagents-system >/dev/null 2>&1; then
-      print_error "Expected deployment '$deployment' was not created."
+  for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
+    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS" "$expected_ctx"; then
+      print_error "Expected deployment '$deployment' was not created within ${DEPLOYMENT_APPEAR_TIMEOUT_SECS}s."
+      # platform-agent-gateway is the agent, and the sandbox is the one thing
+      # that stops the operator writing it while leaving everything else
+      # healthy: no gvisor RuntimeClass, no Deployment, and the reason is on the
+      # CR rather than in any of the logs an operator would reach for first.
+      if [ "$deployment" = "$PLATFORM_AGENT_DEPLOYMENT" ] && [ "$enable_gvisor" = "true" ]; then
+        print_info "The agent asks for the ${C_BOLD}gvisor${C_RESET} RuntimeClass; the operator will not create its Deployment until that RuntimeClass exists."
+        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} --context ${expected_ctx} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
+        print_info "Re-run with ${C_BOLD}--enable-gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
+      fi
       exit 1
     fi
     # The agent pulls a large image and waits on LiteLLM before it reports ready,
     # so a couple of minutes is normal. Running past the budget means "still
     # coming up", not "broken": say so and keep the summary below, which carries
     # the chat links and port-forward command.
-    if ! wait_for_rollout "$deployment" kubeagents-system "$ROLLOUT_TIMEOUT_SECS"; then
+    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS" "$expected_ctx"; then
       slow_rollouts+=("$deployment")
-      print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."
+      print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi
   done
   if [ "${#slow_rollouts[@]}" -eq 0 ]; then
@@ -2104,8 +5655,8 @@ main() {
     write_json_report "SUCCESS"
   else
     print_warning "Still waiting on: ${slow_rollouts[*]}"
-    print_info "Keep watching with: ${C_BOLD}kubectl rollout status deployment/${slow_rollouts[0]} -n kubeagents-system${C_RESET}"
-    print_info "Inspect a stuck pod with: ${C_BOLD}kubectl describe pod -l app=${slow_rollouts[0]} -n kubeagents-system${C_RESET}"
+    print_info "Keep watching with: ${C_BOLD}kubectl rollout status deployment/${slow_rollouts[0]} -n ${namespace}${C_RESET}"
+    print_info "Inspect a stuck pod with: ${C_BOLD}kubectl describe pod -l app=${slow_rollouts[0]} -n ${namespace}${C_RESET}"
     write_json_report "SUCCESS_PENDING_ROLLOUT"
   fi
 
@@ -2119,7 +5670,7 @@ main() {
 
   echo -e "${C_BOLD}Component Status Summary:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Project:${C_RESET} ${project_id} (Project Number: ${project_number})"
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region})"
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"
@@ -2130,19 +5681,35 @@ main() {
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo -e "  • ${C_CYAN}Slack App Link:${C_RESET} ${C_UNDERLINE}https://app.slack.com/client${C_RESET}"
   fi
-  if [ "${PARAM_ENABLE_WEBUI:-false}" = "true" ] || [ "${HERMES_DASHBOARD_ENABLED:-false}" = "true" ]; then
+  if [ "$PARAM_ENABLE_WEBUI" = "true" ]; then
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} ${C_GREEN}Enabled${C_RESET}"
-    echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward deploy/platform-agent-gateway -n kubeagents-system 9119:9119"
+    # A sandboxed pod cannot be reached with `kubectl port-forward`: the forward
+    # is established in the host-side CNI netns while the dashboard listens in
+    # the sandbox's own network stack, so the connection is refused. The relay
+    # in scripts/exec_tunnel.py goes through `kubectl exec` instead; print
+    # whichever one will actually work here.
+    if [ "${enable_gvisor:-false}" = "true" ]; then
+      echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} ${repo_dir}/scripts/hermes-dashboard-tunnel.py"
+      echo -e "      (the agent is sandboxed under gVisor, which kubectl port-forward cannot reach)"
+    else
+      echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${namespace} 9119:9119"
+    fi
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
 
   if [ "${google_chat_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/k8s-operator/scripts/print_instructions_gchat.sh" || true
+    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/k8s-operator/scripts/print_instructions_slack.sh" || true
+    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+  fi
+  # Repeated here, where the two printers above give their instructions. Arm 4
+  # prints it as well, for the runs that never reach the end of main().
+  if [ "$chat_choice" = "4" ]; then
+    echo ""
+    _prompt_no_chat_enabled
   fi
 }
 

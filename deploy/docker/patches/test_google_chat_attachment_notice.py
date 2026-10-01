@@ -17,7 +17,9 @@ matters most, and it is the one a grep in the Dockerfile cannot make.
 """
 
 import asyncio
+import importlib
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,13 +34,30 @@ from apply_google_chat_attachment_notice import (
 
 # deploy/docker/patches/ -> deploy/docker/ -> deploy/ -> repository root.
 REPO_ROOT = Path(__file__).resolve().parents[3]
-RELAY_PATCH = REPO_ROOT / "agents/platform/scripts/google_chat_relay_patch.py"
+SCRIPTS = REPO_ROOT / "agents/platform/scripts"
+RELAY_PATCH = SCRIPTS / "google_chat_relay_patch.py"
+# What the patched notice imports to translate a staged copy back to the path
+# the agent wrote. Named here so the block below can take it away again.
+STAGING_MODULE = "sandbox_artifact_patch"
+
+
+class _ImportBlocker:
+    """A ``sys.meta_path`` finder that makes one module un-importable."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self.name:
+            raise ImportError(f"no module named {fullname!r} on this image")
+        return None
 
 # Verbatim from plugins/platforms/google_chat/adapter.py in the pinned base
-# image, from ``async def`` to the closing paren of its ``return``. Everything
-# above the class is scaffolding: the real module reaches this method with
-# ``SendResult`` imported from gateway and a module logger already configured,
-# neither of which is worth dragging a Hermes tree in for.
+# image (v2026.9.14), from ``async def`` to the closing paren of its ``return``.
+# Everything above the class is scaffolding: the real module reaches this method
+# with ``SendResult`` imported from gateway, a module logger already configured,
+# and the module-level ``_thread_body`` helper (copied verbatim too), none of
+# which is worth dragging a Hermes tree in for.
 UPSTREAM = '''\
 from __future__ import annotations
 
@@ -61,48 +80,33 @@ class SendResult:
         self.error = error
 
 
-class GoogleChatAdapter:
-    async def _post_attachment_fallback(
-        self,
-        chat_id: str,
-        path: str,
-        filename: str,
-        caption: Optional[str],
-        thread_id: Optional[str],
-    ) -> SendResult:
-        """Post a text notice when native attachment delivery is unavailable.
+def _thread_body(text: str, thread_id: Optional[str]) -> Dict[str, Any]:
+    """``{"text": ...}`` plus ``thread.name`` when replying into a thread."""
+    body: Dict[str, Any] = {"text": text}
+    if thread_id:
+        body["thread"] = {"name": thread_id}
+    return body
 
-        Tells the user that file delivery requires a one-time consent
-        flow (``/setup-files``) and reports the local-host path so the
-        file isn't lost. Returns ``success=False`` so callers know the
-        attachment did not land.
-        """
-        lines = []
-        if caption:
-            lines.append(caption)
+
+class GoogleChatAdapter:
+    async def _post_attachment_fallback(self, chat_id: str, path: str, filename: str, caption: Optional[str],
+                                        thread_id: Optional[str]) -> SendResult:
+        """Post the ``/setup-files`` notice (plus host path) when native delivery is
+        unavailable. Always returns ``success=False``."""
+        lines = [caption] if caption else []
         lines.extend([
             f"⚠️ No he podido adjuntar **{filename}**.",
-            "Google Chat s\xf3lo permite adjuntar archivos cuando el bot tiene "
-            "permiso expl\xedcito tuyo (OAuth de usuario). Es un consentimiento "
-            "\xfanico que se hace desde este chat.",
+            "Google Chat s\xf3lo permite adjuntar archivos cuando el bot tiene permiso expl\xedcito tuyo (OAuth de usuario). "
+            "Es un consentimiento \xfanico que se hace desde este chat.",
             "**Para activarlo:** env\xeda `/setup-files` y sigue las instrucciones.",
             f"Mientras tanto el archivo est\xe1 en el host: `{path}`",
         ])
-        body: Dict[str, Any] = {"text": "\\n".join(lines)}
-        if thread_id:
-            body["thread"] = {"name": thread_id}
         try:
-            await self._create_message(chat_id, body)
+            await self._create_message(chat_id, _thread_body("\\n".join(lines), thread_id))
         except Exception:
-            logger.debug(
-                "[GoogleChat] attachment fallback notice send failed",
-                exc_info=True,
-            )
+            logger.debug("[GoogleChat] attachment fallback notice send failed", exc_info=True)
         return SendResult(
-            success=False,
-            error="google_chat: native attachment requires user OAuth — "
-            "run /setup-files in chat",
-        )
+            success=False, error="google_chat: native attachment requires user OAuth — run /setup-files in chat")
 '''
 
 # The report from card t_e5e1ba5e, whose notice was the reported message.
@@ -143,7 +147,8 @@ def load(path, name):
     return module
 
 
-def send(cls, *, caption=None, thread_id=None, filename=FILENAME, raises=False):
+def send(cls, *, caption=None, thread_id=None, filename=FILENAME, raises=False,
+         path=PATH):
     """Run the fallback on a bare instance; return ``(body_or_None, result)``.
 
     ``object.__new__`` skips ``__init__``: the method touches nothing on the
@@ -162,7 +167,7 @@ def send(cls, *, caption=None, thread_id=None, filename=FILENAME, raises=False):
     adapter._create_message = create_message
     result = asyncio.run(
         cls._post_attachment_fallback(
-            adapter, "spaces/AAAA1234", PATH, filename, caption, thread_id
+            adapter, "spaces/AAAA1234", path, filename, caption, thread_id
         )
     )
     return (sent[0] if sent else None), result
@@ -263,11 +268,37 @@ class BranchTest(PatchedFixture, unittest.TestCase):
         self.assertNotIn("/setup-files", rendered)
         self.assertIn("credential proxy", rendered)
 
-    def test_a_relay_install_is_still_left_something_to_do(self):
+    def test_a_relay_install_is_told_why_rather_than_offered_a_dead_end(self):
         """Upstream's notice always ended with an action, and this branch took
-        the only one it had away. What replaces it needs no credentials: the
-        file is already on the agent's disk, so it can be read out in chat."""
-        self.assertIn("paste", self.text(self.relayed_cls))
+        the only one it had away.
+
+        For a while what replaced it was an offer to paste the contents in
+        chat. Since #999 the relay patch does that automatically, so this
+        notice is only reached when pasting was already tried and declined --
+        a PNG, a file over the 32 KiB ceiling, bytes that do not decode, or a
+        paste the API refused partway through. An offer to paste is then an
+        invitation the agent cannot honour, so the line gives the reason
+        instead, and the host path below it stays as the one thing the reader
+        can still act on.
+        """
+        rendered = self.text(self.relayed_cls)
+        self.assertNotIn("Ask me to paste", rendered)
+        self.assertIn("could not be pasted", rendered)
+        self.assertIn("on the agent host at", rendered)
+
+    def test_a_relay_install_is_told_a_failed_paste_is_one_of_the_reasons(self):
+        """The refused-paste path reaches this notice too, and a reader who
+        retries on it would likely succeed.
+
+        ``google_chat_relay_patch`` routes both a ``send`` that refuses and a
+        ``send`` that raises back here, and on that path the file is a
+        perfectly pasteable text file: none of "no text form", "too large" or
+        "could not be read" is true of it. A 429 at part 2 of a valid 10 KiB
+        ``.md`` would otherwise leave the reader three false reasons and the
+        impression that asking again is pointless.
+        """
+        rendered = self.text(self.relayed_cls)
+        self.assertIn("failed partway through", rendered)
 
     def test_the_flag_is_honoured_when_set_on_the_class_itself(self):
         """How the relay patch actually sets it — on the class it patched.
@@ -322,6 +353,64 @@ class NoticeContentTest(PatchedFixture, unittest.TestCase):
     def test_the_notice_goes_to_the_space_it_came_from(self):
         (chat_id, _), _ = send(self.cls)
         self.assertEqual(chat_id, "spaces/AAAA1234")
+
+
+class StagedPathTest(PatchedFixture, unittest.TestCase):
+    """The notice names the agent's own path, not the copy staged out of the sandbox.
+
+    With the shell sandbox on, the path this method is handed is a copy that
+    ``sandbox_artifact_patch`` made under the system temp directory and deletes
+    as soon as the delivery returns. This branch is the one line of the product
+    whose whole job is telling the user where the file is, so a stale temp path
+    here is the one wrong path guaranteed to be read.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if str(SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS))
+            self.addCleanup(sys.path.remove, str(SCRIPTS))
+        import sandbox_artifact_patch
+
+        self.staging = sandbox_artifact_patch
+
+    def test_a_staged_copy_is_reported_as_the_path_the_agent_wrote(self):
+        staged = f"/tmp/{self.staging.STAGED_DIR_PREFIX}abc123/0/{FILENAME}"
+        self.staging._ORIGINALS[staged] = PATH
+        self.addCleanup(self.staging._ORIGINALS.pop, staged, None)
+        for cls in (self.cls, self.relayed_cls):
+            with self.subTest(cls=cls.__name__):
+                rendered = self.text(cls, path=staged)
+                self.assertIn(PATH, rendered)
+                self.assertNotIn(staged, rendered)
+
+    def test_a_path_that_was_never_staged_is_named_as_it_is(self):
+        """No sandbox, or an artifact the gateway itself wrote: unchanged."""
+        for cls in (self.cls, self.relayed_cls):
+            with self.subTest(cls=cls.__name__):
+                self.assertIn(PATH, self.text(cls, path=PATH))
+
+
+class NoStagingModuleTest(PatchedFixture, unittest.TestCase):
+    """The lookup is best-effort: an image without the agent scripts still posts.
+
+    ``apply_google_chat_attachment_notice`` runs at build time against the
+    stock upstream image, where ``/opt/defaults/scripts`` is not on the path at
+    all. An unguarded import there would turn every failed attachment into a
+    traceback instead of a notice.
+    """
+
+    def test_the_path_is_named_when_the_staging_module_cannot_be_imported(self):
+        saved = sys.modules.pop(STAGING_MODULE, None)
+        if saved is not None:
+            self.addCleanup(sys.modules.__setitem__, STAGING_MODULE, saved)
+        blocker = _ImportBlocker(STAGING_MODULE)
+        sys.meta_path.insert(0, blocker)
+        self.addCleanup(sys.meta_path.remove, blocker)
+        # Without this the test passes on an import that quietly succeeded.
+        with self.assertRaises(ImportError):
+            importlib.import_module(STAGING_MODULE)
+        self.assertIn(PATH, self.text())
 
 
 class ContractTest(PatchedFixture, unittest.TestCase):
@@ -399,8 +488,8 @@ class DriftTest(unittest.TestCase):
         that would otherwise ship Spanish again with a green build.
         """
         moved = UPSTREAM.replace(
-            "        Tells the user that file delivery requires a one-time consent\n",
-            "        Tells the user that file delivery needs a one-time consent\n",
+            "        unavailable. Always returns ``success=False``.\"\"\"\n",
+            "        unavailable. Always answers ``success=False``.\"\"\"\n",
         )
         self.assertNotEqual(moved, UPSTREAM)
         root, _ = build(moved)

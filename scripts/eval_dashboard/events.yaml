@@ -1,0 +1,18 @@
+# Optional human annotations for the eval dashboard that no log line can
+# carry: the catch counts the Cases page's footer quotes. Everything
+# measurable comes from data.json; this file is only for what a human
+# classified or decided. render.py tolerates an absent or empty file (the
+# footer sentence disappears), so deleting a stale line can never break a
+# render.
+#
+# File shape (all keys optional):
+#
+#   catches:                      # the Cases page's footer
+#     product_bugs: 4             # real product bugs the suite caught
+#     prs_blocked: 2              # PRs the gate stopped from merging
+#     ledger: "#1054"             # where the receipts live
+
+catches:
+  product_bugs: 4
+  prs_blocked: 2
+  ledger: "#1054"

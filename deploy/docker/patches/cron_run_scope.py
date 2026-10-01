@@ -71,10 +71,11 @@ not:
   the marker through the fallback, so under ``dispatch_in_gateway`` an unrelated
   worker running concurrently with somebody else's dispatch answered
   ``current_cron_job() == '<their job>'``.
-* **It was inherited by spawned workers.** ``hermes_cli/kanban_db.py``'s spawn
-  copies ``os.environ`` and scrubs only the ``HERMES_KANBAN_*`` keys
-  ``gateway/session_context.py`` lists. This marker is not among them, so a
-  worker spawned during a run carried it for life.
+* **It was inherited by spawned workers.** ``_default_spawn`` in
+  ``hermes_cli/kanban_db_dispatch.py`` copies ``os.environ`` and scrubs only
+  the ``HERMES_KANBAN_*`` keys ``gateway/session_context.py`` lists. This
+  marker is not among them, so a worker spawned during a run carried it for
+  life.
 
 A ContextVar has none of those failure modes and needs no save/restore: it is
 scoped to the thread ``run_job`` submitted the run on, ``copy_context()`` carries
@@ -100,6 +101,7 @@ from typing import Iterator, Mapping, Optional
 
 #: Name of the marker, used for both the context variable and the env var.
 CRON_RUN_ENV = "HERMES_KANBAN_CRON_RUN"
+CRON_RISK_ENV = "HERMES_KANBAN_CRON_RISK"
 
 #: Set by the kanban dispatcher to the card the worker is scoped to.
 WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
@@ -112,10 +114,16 @@ CRON_RESPONSE_LIMIT = 4000
 #: Job id of the dispatch executing in this context, empty outside one.
 _CRON_RUN_JOB: ContextVar = ContextVar(CRON_RUN_ENV, default="")
 
+#: Fail-closed fallback tier when risk is undeclared or unannotated.
+DEFAULT_CRON_RISK = "high"
+
+#: Declared risk tier of the cron job executing in this context (default "high").
+_CRON_RUN_RISK: ContextVar = ContextVar(CRON_RISK_ENV, default="")
+
 
 @contextlib.contextmanager
-def cron_run_scope(job_id: str) -> Iterator[None]:
-    """Mark the current context as executing cron job ``job_id``.
+def cron_run_scope(job_id: str, risk: str = DEFAULT_CRON_RISK) -> Iterator[None]:
+    """Mark the current context as executing cron job ``job_id`` with risk ``risk``.
 
     A ``ContextVar`` and nothing else. ``run_job`` takes a
     ``contextvars.copy_context()`` immediately before submitting
@@ -129,10 +137,26 @@ def cron_run_scope(job_id: str) -> Iterator[None]:
     ``os.environ``-writing version got that wrong.
     """
     token = _CRON_RUN_JOB.set(str(job_id or "?"))
+    risk_token = _CRON_RUN_RISK.set(str(risk or DEFAULT_CRON_RISK))
     try:
         yield
     finally:
+        _CRON_RUN_RISK.reset(risk_token)
         _CRON_RUN_JOB.reset(token)
+
+
+def current_cron_risk(environ: Optional[Mapping[str, str]] = None) -> str:
+    """Return the risk tier of the dispatch running in this context, or ``"high"``.
+
+    Context variable first, environment second. Falls back to fail-closed
+    ``"high"`` when unset so unannotated dispatches run under the read-only
+    command policy (cron_command_policy_block), not blocked outright.
+    """
+    risk = _CRON_RUN_RISK.get()
+    if risk:
+        return risk
+    env = os.environ if environ is None else environ
+    return env.get(CRON_RISK_ENV) or DEFAULT_CRON_RISK
 
 
 def current_cron_job(environ: Optional[Mapping[str, str]] = None) -> str:

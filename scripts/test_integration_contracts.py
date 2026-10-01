@@ -1,6 +1,6 @@
 """Cross-file contract lints: joins that nothing in any language checks.
 
-Three contracts, each of which fails silently today when the two sides drift:
+Contracts that each fail silently today when the two sides drift:
 
 * A verification spec naming a tool that no registry defines can never trip —
   the silent-green shape review found on the first gate branch (a safeguard
@@ -12,10 +12,21 @@ Three contracts, each of which fails silently today when the two sides drift:
   workflows: [...]`) and artifact-name strings; renaming a workflow silently
   disables every consumer, which for the autopush chain means continuous
   deployment stops without a red anywhere.
+* The broken-main notifier watches a fixed roster of push-to-main workflows;
+  a required check dropped from that roster goes red on main without anyone
+  being told, which is how a thirteen-hour red main went unnoticed (#1223).
+* The flaky-check notifier's roster is the inverse: every pull-request check
+  is either watched or named as excluded with a reason; a new check that is
+  neither has its re-runs recorded nowhere, and nothing says so.
+* The CI-health bot reads the pool-pressure periodic's artifact instead of
+  importing it, so a renamed field raises nothing: it blanks every number in
+  the Chat note and sends the fallback message.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -24,11 +35,49 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+
+# The push-to-main workflows `main-broken-notify.yml` must watch: every required
+# push-to-main workflow whose run re-checks everything it covers, so its green on
+# main is a statement about the tree. The header of that workflow says what
+# qualifies and why `Prettier Check` does not. `Documentation Checks` and
+# `Python Unit Tests` are here because they were missing when both went red on
+# main for thirteen hours and nothing paged (gke-labs/kube-agents#1223).
+BROKEN_MAIN_NOTIFIER = "main-broken-notify.yml"
+BROKEN_MAIN_WATCHED_WORKFLOWS = (
+    "Actionlint",
+    "Docker Build",
+    "Documentation Checks",
+    "Operator Tests",
+    "Python Unit Tests",
+    "Validate Repo Structure",
+)
+# The flaky-check reporter's contract is the inverse of the broken-main one:
+# not a fixed list it must contain, but that every pull-request check is
+# either watched or named here as left out on purpose. The reasons are in the
+# workflow's header comment; this tuple is the machine-readable copy of it.
+FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
+FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
+    # A title edit legitimately turns it green without a commit.
+    "Validate PR Title",
+    # The advisory database moves between attempts.
+    "Security Scanning",
+    # pull_request_target automations, not checks on the tree.
+    "Auto Assign Milestone on Merge",
+    "Hold Unresolved Threads",
+    "Risk Classification",
+)
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
+REPO_SCRIPTS = REPO_ROOT / "scripts"
+# The pool-pressure periodic's captured breach day, replayed here to get a real
+# pool-pressure.json. test_pool_pressure.py drives the same pair.
+POOL_PRESSURE_FIXTURE = REPO_SCRIPTS / "testdata" / "pool_pressure" / "breach"
+POOL_PRESSURE_AS_OF = datetime(2026, 8, 27, tzinfo=timezone.utc)
+POOL_PRESSURE_WINDOW_DAYS = 1
 
 
 def _yaml():
@@ -41,15 +90,40 @@ class SpecToolRegistryTest(unittest.TestCase):
     """Every tool name in a verification spec exists in a live registry."""
 
     # Hermes-image built-in tools this repository references but does not
-    # define: the kanban pool. Evidence of each lives in the image patches
-    # (deploy/docker/patches/*kanban*); a name added here needs the same.
-    HERMES_BUILTIN_TOOLS = {
-        "kanban_create",
-        "kanban_show",
-        "kanban_complete",
-        "kanban_block",
-        "kanban_heartbeat",
+    # define: the kanban pool, and the skill writer the image gates. Evidence
+    # of each lives in the image patches that touch them, and only in its own
+    # family's files (HERMES_BUILTIN_EVIDENCE); a name added here needs the same.
+    HERMES_BUILTIN_EVIDENCE = {
+        "*kanban*": {
+            "kanban_create",
+            "kanban_list",
+            "kanban_show",
+            "kanban_complete",
+            "kanban_block",
+            "kanban_heartbeat",
+        },
+        "*skill_manage_image_owned*": {"skill_manage"},
     }
+    HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
+
+    # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
+    # as (server alias, tool): nothing in this repository can enumerate them,
+    # so a spec may name one only through this list, registered under both
+    # separator spellings like the local servers. Evidence of each lives in
+    # the personas or the skill references that tell the agent about the
+    # tool (test_the_remote_allowlist_still_has_evidence_in_the_agent_text);
+    # a name added here needs the same, and its alias must still be a
+    # remote-proxy server in some agent config.
+    REMOTE_MCP_TOOLS = {
+        # #1765: the 50-a-day Developer Knowledge method the personas forbid
+        # and knowledge-grounding-sources-probe's safeguard names.
+        ("developer_knowledge", "answer_query"),
+    }
+    REMOTE_TOOL_EVIDENCE = (
+        "agents/platform/SOUL.md",
+        "agents/cluster/SOUL.md",
+        "agents/platform/skills/gke-basics/references/mcp-usage.md",
+    )
 
     def _mcp_server_aliases(self):
         """Alias → the local server script it launches, from every agent config.
@@ -74,6 +148,30 @@ class SpecToolRegistryTest(unittest.TestCase):
                     if arg.endswith(".py"):
                         aliases[alias] = Path(arg).name
         return aliases
+
+    def _remote_mcp_aliases(self):
+        """Aliases whose server is the remote proxy, from every agent config."""
+        yaml = _yaml()
+        aliases = set()
+        configs = list((REPO_ROOT / "agents").glob("*/config.yaml"))
+        configs.append(REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml")
+        for config_path in configs:
+            if not config_path.exists():
+                continue
+            document = yaml.safe_load(config_path.read_text()) or {}
+            for alias, spec in (document.get("mcp_servers") or {}).items():
+                args = (spec or {}).get("args") or []
+                if any(str(arg).endswith("proxy.js") for arg in args):
+                    aliases.add(alias)
+        return aliases
+
+    def _remote_mcp_tools(self):
+        """REMOTE_MCP_TOOLS in the two namespaced spellings a trajectory carries."""
+        names = set()
+        for alias, tool in self.REMOTE_MCP_TOOLS:
+            names.add(f"mcp_{alias}_{tool}")
+            names.add(f"mcp__{alias}__{tool}")
+        return names
 
     def _registered_mcp_tools(self):
         """The tool names a trajectory can actually carry, not the bare ones.
@@ -150,7 +248,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         return wanted
 
     def test_every_spec_tool_name_resolves_to_a_registry(self):
-        registry = self._registered_mcp_tools() | self.HERMES_BUILTIN_TOOLS
+        registry = self._registered_mcp_tools() | self._remote_mcp_tools() | self.HERMES_BUILTIN_TOOLS
         unresolved = [
             f"{path.parent.name}: {name}"
             for path, name in self._spec_tool_names()
@@ -163,24 +261,62 @@ class SpecToolRegistryTest(unittest.TestCase):
             "can never trip, which is a silent-green gate: " + ", ".join(unresolved),
         )
 
+    @staticmethod
+    def _names_builtin(name, corpus):
+        """Whether the corpus names the tool as a call or a quoted name.
+
+        A bare substring is not enough: `skill_manage` is part of the patch
+        module's own file name, which every file of that family imports. A
+        kanban tool also counts by its quoted action (`"create"`), the form
+        the kanban patches dispatch on.
+        """
+        root = name.removeprefix("kanban_")
+        forms = [f"{name}(", f"'{name}'", f'"{name}"']
+        if root != name:
+            forms += [f"'{root}'", f'"{root}"']
+        return any(form in corpus for form in forms)
+
     def test_the_builtin_allowlist_still_has_evidence_in_the_image_patches(self):
         patches = REPO_ROOT / "deploy" / "docker" / "patches"
+        for pattern, names in sorted(self.HERMES_BUILTIN_EVIDENCE.items()):
+            corpus = "\n".join(p.read_text(errors="replace") for p in patches.glob(pattern))
+            for name in sorted(names):
+                self.assertTrue(
+                    self._names_builtin(name, corpus),
+                    f"{name} is allowlisted as a hermes builtin but the {pattern} "
+                    "image patches carry no evidence of it — stale allowlist entry",
+                )
+
+    def test_builtin_evidence_is_a_call_or_a_quoted_name(self):
+        self.assertFalse(self._names_builtin("skill_manage", "from tools.skill_manage_image_owned import x"))
+        self.assertTrue(self._names_builtin("skill_manage", "raw = smt.skill_manage(**kwargs)"))
+        self.assertTrue(self._names_builtin("kanban_create", 'if action == "create":'))
+        self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
+
+
+    def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):
+        remote = self._remote_mcp_aliases()
         corpus = "\n".join(
-            p.read_text(errors="replace") for p in patches.glob("*kanban*")
+            (REPO_ROOT / rel).read_text(errors="replace") for rel in self.REMOTE_TOOL_EVIDENCE
         )
-        for name in sorted(self.HERMES_BUILTIN_TOOLS):
-            root = name.removeprefix("kanban_")
+        for alias, tool in sorted(self.REMOTE_MCP_TOOLS):
+            self.assertIn(
+                alias,
+                remote,
+                f"{alias} is allowlisted as a remote MCP server but no agent config "
+                "launches it through the remote proxy — stale allowlist entry",
+            )
             self.assertTrue(
-                name in corpus or f"'{root}'" in corpus or f'"{root}"' in corpus,
-                f"{name} is allowlisted as a hermes builtin but the image "
-                "patches carry no evidence of it — stale allowlist entry",
+                f"{alias}__{tool}" in corpus or f"`{tool}`" in corpus,
+                f"{alias}/{tool} is allowlisted as a remote MCP tool but the personas "
+                "and skill references carry no evidence of it — stale allowlist entry",
             )
 
 
 class DnsPredicateParityTest(unittest.TestCase):
     """The bash and python DNS-endpoint predicates answer alike, case by case.
 
-    `k8s-operator/scripts/gke_dns_endpoint.sh` says "Keep the two predicates
+    `scripts/installer/gke_dns_endpoint.sh` says "Keep the two predicates
     in step" about `agents/platform/scripts/gke_endpoint.py`; this is the
     table that enforces the sentence. Both sides run for real — bash through
     a fake gcloud on PATH, python through its Runner seam.
@@ -238,7 +374,7 @@ class DnsPredicateParityTest(unittest.TestCase):
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
             script = (
-                f'source "{REPO_ROOT}/k8s-operator/scripts/gke_dns_endpoint.sh"\n'
+                f'source "{REPO_ROOT}/scripts/installer/gke_dns_endpoint.sh"\n'
                 "gke_dns_endpoint_flag c l p\n"
                 'printf "%s" "$GKE_DNS_ENDPOINT_FLAG"\n'
             )
@@ -304,6 +440,87 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "has silently disabled these consumers: " + ", ".join(broken),
         )
 
+    def test_the_flaky_check_notifier_watches_every_pull_request_check_or_says_why_not(self):
+        """A pull-request check missing from the watch list fails silently:
+        re-runs of it record nothing and nothing says so. Every workflow with
+        a pull_request or pull_request_target trigger is therefore either in
+        the list or in FLAKY_CHECK_EXCLUDED_WORKFLOWS with its reason, and a
+        new check has to choose. The reverse holds too: an exclusion that no
+        longer names a workflow is stale."""
+        documents = self._workflows()
+        triggers = documents[FLAKY_CHECK_NOTIFIER].get("on") or documents[FLAKY_CHECK_NOTIFIER].get(True) or {}
+        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        pull_request_checks = set()
+        for filename, document in documents.items():
+            if filename == FLAKY_CHECK_NOTIFIER:
+                continue
+            on = document.get("on") or document.get(True) or {}
+            # `on:` may be a mapping, a list, or a bare scalar (`on: pull_request`);
+            # iterating the scalar would walk its characters.
+            if isinstance(on, str):
+                on = {on: None}
+            elif not isinstance(on, dict):
+                on = {key: None for key in on}
+            if "pull_request" in on or "pull_request_target" in on:
+                pull_request_checks.add(document.get("name") or filename)
+        excluded = set(FLAKY_CHECK_EXCLUDED_WORKFLOWS)
+        unaccounted = sorted(pull_request_checks - watched - excluded)
+        self.assertEqual(
+            [],
+            unaccounted,
+            f"{FLAKY_CHECK_NOTIFIER} neither watches nor excludes these "
+            "pull-request checks, so a re-run of any of them files no issue: "
+            + ", ".join(unaccounted),
+        )
+        both = sorted(watched & excluded)
+        self.assertEqual([], both, "watched and excluded at once: " + ", ".join(both))
+        stale = sorted(excluded - pull_request_checks)
+        self.assertEqual([], stale, "excluded but no longer a pull-request check: " + ", ".join(stale))
+
+    def test_the_broken_main_notifier_watches_every_whole_tree_required_check(self):
+        """A required check missing from the watch list fails silently: main
+        goes red, every open pull request inherits the red, and nobody is told.
+        That is how #1223's thirteen-hour window happened. The test above
+        catches a watched name that stopped matching; this one catches a name
+        dropped from the list in an edit. Neither can tell that a context newly
+        promoted to required was never added: required-ness lives in branch
+        protection, not in the tree, so adding a workflow to this tuple stays a
+        review question whenever one joins the required set."""
+        document = self._workflows()[BROKEN_MAIN_NOTIFIER]
+        triggers = document.get("on") or document.get(True) or {}
+        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        missing = sorted(set(BROKEN_MAIN_WATCHED_WORKFLOWS) - watched)
+        self.assertEqual(
+            [],
+            missing,
+            f"{BROKEN_MAIN_NOTIFIER} no longer watches these push-to-main "
+            "workflows, so a red on main from any of them files no issue: "
+            + ", ".join(missing),
+        )
+
+    def test_the_required_python_job_runs_the_suite_in_strict_mode(self):
+        """The gate is one flag on one line, and losing it fails open.
+
+        `make coverage` tolerates a failing test directory by design -- it is a
+        meter, and one red directory must not hide the number for the rest. The
+        job that reports the required `Run Python Unit Tests` context runs that
+        target, so COVERAGE_STRICT=1 is the only thing making a red suite a red
+        check. Drop it in a reformat and CI reports success on failing tests:
+        the suite still runs, the log still shows the failures, and the context
+        still goes green. Nothing else in the repository asserts this.
+        """
+        yaml = _yaml()
+        workflow = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        steps = workflow["jobs"]["test"]["steps"]
+        commands = " ".join(step.get("run", "") for step in steps)
+        self.assertIn(
+            "COVERAGE_STRICT=1",
+            commands,
+            "the required Run Python Unit Tests job no longer passes "
+            "COVERAGE_STRICT=1, so a failing test directory would be reported "
+            "but would not fail the check",
+        )
+
     def test_the_coverage_artifact_name_join_holds(self):
         producer = (WORKFLOWS / "python-tests.yml").read_text()
         consumer_path = WORKFLOWS / "coverage-comment.yml"
@@ -316,6 +533,131 @@ class WorkflowNameJoinTest(unittest.TestCase):
             consumer,
             "the poster downloads an artifact name the producer no longer uploads",
         )
+
+
+class PoolPressureArtifactContractTest(unittest.TestCase):
+    """The CI-health bot's rule-8 note against the artifact it reads (#1607).
+
+    Nothing imports pool_pressure.py: health.py takes its verdict, cause and
+    numbers as given, post_health.py copies its cause labels. A rename there
+    raises nothing here, so this replays the periodic over its captured breach
+    day and joins the two sides on the result.
+    """
+
+    def _modules(self):
+        sys.path.insert(0, str(REPO_SCRIPTS))
+        import pool_pressure
+        from eval_dashboard import health, post_health
+
+        return pool_pressure, health, post_health
+
+    def _artifact(self, pool_pressure):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            pool_pressure.measure(
+                from_dir=str(POOL_PRESSURE_FIXTURE),
+                as_of=POOL_PRESSURE_AS_OF,
+                window_days=POOL_PRESSURE_WINDOW_DAYS,
+                as_json=True,
+            )
+        return json.loads(buffer.getvalue())
+
+    def test_the_cause_labels_post_health_branches_on_are_the_periodics(self):
+        pool_pressure, _, post_health = self._modules()
+        self.assertEqual(
+            (pool_pressure.CAUSE_CAPACITY, pool_pressure.CAUSE_CONCURRENCY_CAP, pool_pressure.CAUSE_CONTROL_PLANE),
+            (post_health.CAUSE_CAPACITY, post_health.CAUSE_CONCURRENCY_CAP, post_health.CAUSE_CONTROL_PLANE),
+            "the copy has drifted: the message names no remedy for a cause the periodic still emits",
+        )
+        # UNKNOWN is not copied, nor is a label added later; both must reach
+        # the fallback message rather than one of the three remedies.
+        for cause in (pool_pressure.CAUSE_UNKNOWN, "SOMETHING_NEW"):
+            self.assertIn("cause unclear", post_health.pool_cause_text({"cause": cause}), cause)
+
+    def test_the_verdicts_health_reads_are_the_periodics(self):
+        pool_pressure, health, _ = self._modules()
+        self.assertEqual(pool_pressure.VERDICT_BREACH, health.POOL_BREACH)
+        self.assertEqual(pool_pressure.VERDICT_UNMEASURED, health.POOL_UNMEASURED)
+        # STALE is health.py's own word: an artifact cannot report that it
+        # stopped being written, so the note overrides the verdict it carries.
+        # A periodic emitting STALE would make that override look like agreement.
+        self.assertNotIn(
+            health.POOL_STALE,
+            (pool_pressure.VERDICT_OK, pool_pressure.VERDICT_BREACH, pool_pressure.VERDICT_UNMEASURED),
+        )
+
+    def test_the_note_quotes_the_periodics_own_numbers(self):
+        """Every figure in the note, against the field it came from.
+
+        The fixture breached on p95 alone and had two runs queued at the time,
+        so it covers both halves of the breach rule. Its window is one day
+        long, so the day's row and the seven-day aggregate hold the same
+        numbers here: which of the two the note quotes is pinned in
+        test_eval_dashboard_health.py, not here.
+        """
+        pool_pressure, health, _ = self._modules()
+        doc = self._artifact(pool_pressure)
+        self.assertEqual(pool_pressure.VERDICT_BREACH, doc["verdict"], "the fixture is the captured breach day")
+        day, = doc["trend"]["days"]
+        note = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
+        self.assertEqual(
+            {
+                "verdict": doc["verdict"],
+                "cause": doc["cause"],
+                "day": day["day"],
+                # The capture predates the `recent` block, which is also what
+                # the first tick after a deploy reads: the note falls back to
+                # the worst day rather than losing its numbers.
+                "window_hours": None,
+                "p50_s": int(day["p50_minutes"] * 60),
+                "p95_s": int(day["p95_minutes"] * 60),
+                "breach_seen": True,
+                # The captured queue's longest wait: 150 minutes, the run that
+                # also makes over_threshold non-zero.
+                "waiting_longest_s": int(max(r["minutes"] for r in doc["queue"]["waiting_runs"]) * 60),
+                # That 150 minutes against the captured 15 minute p50 limit,
+                # and the same 150 minutes back from the reading dates the jam.
+                "waiting_now": True,
+                "waiting_since": health.iso(
+                    health.parse_iso(doc["window_end"]) - timedelta(minutes=max(r["minutes"] for r in doc["queue"]["waiting_runs"]))
+                ),
+                "over_threshold": doc["queue"]["over_threshold"],
+                "threshold_p50_s": int(doc["thresholds"]["p50_minutes"] * 60),
+                "threshold_p95_s": int(doc["thresholds"]["p95_minutes"] * 60),
+                "free": doc["pool"]["free"],
+                "total": doc["pool"]["total"],
+                "max_concurrency": doc["max_concurrency"],
+            },
+            {key: note[key] for key in note if key not in ("since", "measured_at")},
+        )
+        self.assertEqual(health.parse_iso(doc["window_end"]), health.parse_iso(note["measured_at"]))
+        # And once the periodic writes the block, the note quotes it instead:
+        # the same keys, read from `recent` rather than the day's row.
+        doc["recent"] = {"hours": pool_pressure.RECENT_WINDOW_HOURS, "runs": 31, "judged": True,
+                         "p50_minutes": 18.0, "p95_minutes": 52.0, "worst_minutes": 61.0}
+        fresh = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
+        self.assertEqual(fresh["window_hours"], pool_pressure.RECENT_WINDOW_HOURS)
+        self.assertIsNone(fresh["day"])
+        self.assertEqual(fresh["p50_s"], 1080)
+        # The digest reads the newest day's row, not the seven-day aggregate.
+        self.assertEqual(int(day["p50_minutes"] * 60), health.pool_wait_p50_s(doc, POOL_PRESSURE_AS_OF))
+
+    def test_a_field_the_periodic_stops_writing_is_not_quietly_zero(self):
+        """A renamed field reads as absent, and absent must not print as a
+        number: "0 of 30 projects free" is a sentence the reader believes."""
+        pool_pressure, health, post_health = self._modules()
+        doc = self._artifact(pool_pressure)
+        doc["pool"].pop("free")
+        doc["queue"].pop("over_threshold")
+        note = health.pool_note(doc, POOL_PRESSURE_AS_OF, None)
+        self.assertIsNone(note["free"])
+        self.assertEqual(0, note["over_threshold"], "no live queue is a real reading of zero")
+        # The count only reaches a message under CAUSE_CONTROL_PLANE; the other
+        # three never print it, so the fixture's own cause proves nothing.
+        note["cause"] = post_health.CAUSE_CONTROL_PLANE
+        rendered = post_health.render_pool({"pool": note})
+        self.assertIn("? of", rendered)
+        self.assertNotIn("0 of", rendered)
 
 
 if __name__ == "__main__":

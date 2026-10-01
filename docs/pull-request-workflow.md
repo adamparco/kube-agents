@@ -1,8 +1,9 @@
 # Pull-request workflow mechanics
 
 **Scope:** The commands for getting a branch from "about to start" to "merged" in this repository —
-finding work already in flight, measuring drift from `main`, validating locally, and working the
-automated review.
+finding work already in flight, measuring drift from `main`, validating locally, working the
+automated review, the labels Tide merges on, re-running a check that flaked, and whose move it is
+at any point in between.
 
 **Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
 review passes, live-test the change, resolve every thread — is stated in
@@ -10,15 +11,23 @@ review passes, live-test the change, resolve every thread — is stated in
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
 
 A rule about how to run a command correctly can sit here rather than in `AGENTS.md`, because it
-means nothing until you have the command in front of you — that a contributor on a fork cannot
-self-assign an issue is the example. The test is when a rule has to fire, though, not how
+means nothing until you have the command in front of you — that self-assigning an issue needs
+`triage` access is the example. The test is when a rule has to fire, though, not how
 procedural it sounds: that a draft is not in the review queue reads like mechanics, but it has to
 reach an agent before it decides to wait, so `AGENTS.md` states it and only the measurement behind
 it is here. `AGENTS.md` is loaded into every session and this page is not, so anything that has to
 fire before an agent thinks to open a link belongs on that side of the line, not this one.
 
+The split is by form, not by topic: this page owns the mechanics that are commands, and
+[`.agents/rules/`](../.agents/rules/) owns the ones that are prose. `AGENTS.md` had no budget left
+to hold prose mechanics itself, so the pre-PR passes' went to
+[`.agents/rules/pre_pr_review.md`](../.agents/rules/pre_pr_review.md) and the workflow-authoring
+rules' to [`.agents/rules/github_actions.md`](../.agents/rules/github_actions.md). A mechanic with
+no command in it goes there rather than here, whichever rule it serves.
+
 Related: [`.agents/skills/review-preflight/SKILL.md`](../.agents/skills/review-preflight/SKILL.md)
-owns the pre-PR review plumbing, and
+owns the pre-PR review plumbing,
+[`.agents/rules/`](../.agents/rules/) owns the rules an agent follows by family, and
 [`.claude/commands/pr-review-batch.md`](../.claude/commands/pr-review-batch.md) owns the mechanics of
 reviewing somebody else's pull request.
 
@@ -50,8 +59,8 @@ gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me
 ```
 
 `@me` is the account whose token you hold, and `AGENTS.md` is explicit that this makes it a person
-you are volunteering. A contributor working from a fork without write access cannot self-assign at
-all; offer a comment instead.
+you are volunteering. A contributor without `triage` access cannot self-assign; offer a comment
+instead.
 
 ## Measure how far a branch has drifted from `main`
 
@@ -107,11 +116,26 @@ CI on files you did not touch. Prefer the installed binary over `npx prettier`, 
 package against the npm registry on every run and fails outright behind an authenticated mirror —
 that failure is why this step has previously been skipped rather than run.
 
+**Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
+same target on every pull request, and it is a required check, so a warning-severity finding in
+any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
+shellcheck step in `.github/workflows/validate.yml`) from
+<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
+package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two releases behind, and a
+release two behind reports a different set of findings than CI.
+Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
+command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
+place, and the comment above the target says why.
+
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
 ```bash
 docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .
 ```
+
+`make docker-build-platform` runs the same build and supplies `HERMES_AGENT_TAG` from `tags.env`,
+the build argument the Dockerfile has no default for and the `Docker Build` CI job passes from the
+same file.
 
 Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE
 nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
@@ -125,8 +149,103 @@ after merge (#658). CI runs the same check in
 `docker-build.yml`. The docstring in `scripts/check_image_layers.py` owns which image the gate points
 at and why — read it before changing the target.
 
+**Third-party download retries.** A non-piped `curl` that fetches over the network in
+`deploy/docker/Dockerfile`, `deploy/sandbox/Dockerfile`, `hack/ci-env.sh` or
+`.github/workflows/validate.yml` needs both
+`--retry N` and `--retry-all-errors` — the count alone does not survive a connection reset
+mid-transfer, and without either a bad second from the upstream CDN fails a build that has
+nothing to do with the download. `tests/test_third_party_download_retry.py` fails the pull
+request otherwise, and its `DOWNLOAD_SOURCES` is the hand-maintained list of files it walks — a new
+file that downloads something is not covered until it is added there. A download piped into a
+consumer is exempt, because curl retries by restarting the transfer and the consumer has already
+been fed the bytes of the failed one.
+
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
+against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
+cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
+
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
+
+**A2A module code.** If you modify `a2a/`, run `go vet ./...` and `go test -race ./...` inside that
+directory — what the `A2A Module Tests` CI job runs. The conformance suite starts an embedded
+JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
+envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
+and the run still reports green. To match it, run with
+`KUBEBUILDER_ASSETS="$(make -C ../k8s-operator -s envtest-path)"` — the path is relative to
+`a2a/`, and getting it wrong makes the substitution empty and the cases skip exactly as if it had
+not been set.
+
+**Image pins.** `images.json` is the source of truth for every image an install pulls, but a bump
+starts there and rarely ends there. Several images keep a second copy that the file is the source
+for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+`make images-check` is what holds them in step. It covers every image the chart renders, on a
+default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
+bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
+`k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
+fallback, the NATS and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
+worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
+rather than a literal. Two copies it does not reach, where a stale pin passes every check:
+Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
+`platformAgent.harness.memory.provider`, which no render turns on — so their pins in
+`charts/kube-agents/values.yaml` are unguarded; and cert-manager's version is set again in
+`terraform/examples/full-install/variables.tf`, which no check reads. So: bump the pin in
+`images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
+version before opening the pull request.
+
+**CodeQL alerts.** CodeQL runs here through GitHub's default setup, which analyses pushes to `main`
+and the other protected branches, a weekly schedule, and, intermittently, pull requests whose head
+branch lives in this repository; in the repository's history one fork pull request has been
+analysed, and no pull request of any kind since early September. Contributor branches live on
+forks, so a change that closes a code-scanning alert cannot count on CI to show it closing.
+Reproduce it locally instead: install the CLI as a `gh` extension, pin it to the version the
+alert's `tool.version` reports, and build a database over a scratch tree holding the flagged file
+at its repository path, once before the change and once after:
+
+```bash
+gh extension install github/gh-codeql
+gh codeql set-version 2.27.1 # the alert's tool.version
+gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
+gh codeql database analyze /tmp/cq/db \
+  codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
+  --download --format=sarif-latest --output /tmp/cq/out.sarif
+```
+
+An alert names a rule id, not a query. The query is the `.ql` in the pack whose `@id` matches it:
+after the first `--download`,
+`grep -rl '@id py/clear-text-logging-sensitive-data' ~/.codeql/packages/codeql/python-queries/`
+finds `Security/CWE-312/CleartextLogging.ql`, and `CleartextStorage.ql` beside it is the storage
+rule. The before run has to reproduce the alert at `main`'s line, and the SARIF's `codeFlows` names
+the source the flagged line was reached from; the after run reports none. Quote both under
+**Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
+code-scanning tab on the merged head is still the final check.
+
+**Terraform module tests.** If you change a module or composition under `terraform/`, run
+`make terraform-test`. It runs the `terraform test` suite of each directory under
+`terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
+needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
+plugin cache); it needs Terraform 1.7 or newer for `mock_provider`, above the 1.5 floor the modules
+and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
+below includes it.
+
+**Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
+and test, the Python suites, the conformance suite, the Terraform module tests. The per-area targets it wraps, for a faster
+loop while you work:
+
+- `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
+  check; see **Shell scripts** above for the release to install.
+- `make validate` — the structure check in the `Validate Repo Structure` job; fails if skills
+  live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
+- `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
+  `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
+- `make test-integration` — the seam tier only, for a component another one talks to across a
+  process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
+  Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints
+  `OK`. [`tests/integration/README.md`](../tests/integration/README.md) is the tier's contract;
+  [`testing-map.md`](testing-map.md) says which suite runs where.
+- `make docs-check`, plus `cd docs/site && npm ci && npm run build` if you touched `docs/site/`.
 
 ## The automated review
 
@@ -152,7 +271,8 @@ Poll on a schedule rather than continuously — nothing is worth checking in the
 once a minute. Expect the review by 15 minutes; at 30 with nothing posted, stop waiting and tell the
 user the bot dropped this one. Nothing retries on its own, so ask whether to spend a trigger — and
 say which: a review that goes missing was a first-review-width one, so `/review all` is what replaces
-it, and `/review` narrows the retry to what the bot is certain of.
+it, and `/review` narrows the retry to what the bot is certain of (plus any marked high-severity near
+miss).
 
 Two things make a wait read wrong:
 
@@ -199,7 +319,10 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve:
+resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
+the `do-not-merge` label,
+applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
+resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
 ```bash
 # Every unresolved thread, with both ids you need: resolveReviewThread takes the
@@ -243,3 +366,228 @@ Four ways that goes wrong quietly:
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
   something you resolved.
+
+## How a change merges
+
+Nobody presses Merge. This is a Prow repository: `google-oss-prow` squash-merges a pull request on
+its own once Tide's query matches it, and that query wants the labels `lgtm` and `approved` both
+present, with `do-not-merge`, `do-not-merge/hold`, `do-not-merge/invalid-owners-file`, and
+`do-not-merge/work-in-progress` all absent. The configuration is
+[`prow/oss/config.yaml`](https://github.com/GoogleCloudPlatform/oss-test-infra/blob/master/prow/oss/config.yaml)
+and
+[`prow/oss/plugins.yaml`](https://github.com/GoogleCloudPlatform/oss-test-infra/blob/master/prow/oss/plugins.yaml)
+in `GoogleCloudPlatform/oss-test-infra` — another repository, which is why nothing here can be
+authoritative about it. Read it there when the answer matters, and
+[oss.gprow.dev/command-help](https://oss.gprow.dev/command-help) for the full command set.
+
+The two labels are the two people:
+
+- **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment.
+  This is what the auto-requested human reviewer is being asked for. Prow does not take an `/lgtm`
+  from the pull request's own author, so every change needs one other person however it is approved.
+  `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
+  strips it again unless the author is in that team, and the reviewer has to give it a second time.
+- **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
+  the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
+  presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
+  alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
+  to what the presubmit runs or what blocks; the nightly file and the case directories under
+  `bench/tasks/` fall through to the root approvers (#1546). An approver's
+  "Approve" review sets both labels at once, which is why most pull requests here need exactly one
+  review from one person (#1070). An approver's own pull request counts as self-approved, so a
+  change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
+  on the `lgtm` (#1075).
+
+Everyone `.github/auto_request_review.yml` can assign is an `OWNERS` approver for what it assigns
+them: its `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt` entries send a
+change there to its own `eval-crew` group, so the reviewer the bot's green check summons can clear
+both labels in one action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
+paths still waits on a root approver's `/approve` after that review. The bot never requests the
+author, so a member's own case or roster change goes to the rest of the group, with the author's
+`approved` already on it (#1075). That is a property of two lists agreeing today — the alias in
+`OWNERS_ALIASES` and the group in the bot's config — not a guarantee either file makes.
+
+Before any of that, a pull request from an author Prow does not already trust is labelled
+`needs-ok-to-test`, and its Prow presubmits hold until a member comments `/ok-to-test`. It gates
+Prow's jobs, not the GitHub Actions checks, so a pull request can look fully green and still be
+waiting on it.
+
+`/hold` parks an otherwise-mergeable pull request without withdrawing anything else, and
+`/hold cancel` releases it — #1045 held that way for a smoke test. The bare `do-not-merge` label is
+a different thing: [`hold-unresolved-threads.yml`](../.github/workflows/hold-unresolved-threads.yml)
+puts it on any pull request in the pool whose review threads are not all resolved, and takes it off
+at the next five-minute sweep after the last resolution. Tide does not read the
+conversation-resolution rule, so without the label it picks such a pull request, fails the merge,
+and retries it every ~85 seconds ahead of everyone else — #608 and #1197 held the queue that way
+for an hour on 2026-09-05. `/hold cancel` does not remove this label; resolving the threads does.
+A person who applies the same label by hand keeps it: the workflow removes only what it added.
+`/override <context>`, which only
+a repository admin can use, forces a check that cannot pass on its own, required or not. The forced status
+embeds the base SHA at override time, so by itself it would expire on the next merge to `main` and
+Tide would re-run the job — which is how an override came to need repeating whenever `main` moved
+before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green, so
+an override usually holds for the head it was given until a push — subject to the same race with
+Tide's sync, and a lost race costs more here, because the retest is of a check that cannot pass: it
+comes back red and the override has to be given again. Prow's `/override-sticky` would do this
+without the race, with the `[prow:skip-retest]` sentinel Tide accepts regardless of base — but it is
+not in the Prow build this repository merges through: the
+[plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
+`/override`, and the command is silently ignored.
+
+**Branch protection is not the gate and reads as though there is none.** `main` requires ten
+contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`, and
+`Agent instructions cite assets that exist` — and conversation resolution, but **zero** approving
+reviews, because approval is Tide's business rather than GitHub's. A reader who checks the
+repository settings for the review requirement therefore finds nothing and concludes wrongly.
+
+The last four joined the set on 2026-09-02; before that, a pull request they had not run on could
+merge without them.
+
+Those ten are not the whole required set either. Tide also requires every Prow presubmit not marked
+`optional`, and those are configured in `oss-test-infra` rather than in branch protection —
+`pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
+(GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
+date. The command below therefore answers part of the question, and the two lists together still do
+not answer all of it: they say which contexts must be _present_ and green, but Tide also refuses any
+posted context that is not green, required or not, unless Prow marks it `optional`: Tide always
+reads a cancelled or failed check run as a failing context, and with no Tide context policy for this
+repository an unknown context is not optional. A `classify` run cancelled
+by a superseding event held #1364 unmerged with `lgtm` and `approved` on it, though `classify` is in
+neither list. `tide`'s own status names the offending context; `gh run rerun <run-id> --job <job-id>`
+clears it — by job ID, since `--failed` (below) re-runs failed jobs and a cancelled one is not failed.
+
+```bash
+gh api repos/gke-labs/kube-agents/branches/main/protection \
+  --jq '.required_status_checks.contexts'
+```
+
+Every workflow behind one of those contexts also runs for a pull request whose base is a `release/`
+branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. A backport
+pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook in
+`scripts/release/README.md` ("Patch releases from a release line") is what happens after it merges.
+Which contexts a `release/` branch _requires_ is a repository setting like `main`'s, read back with
+the same command and the branch substituted, URL-encoded (`release%2F0.8`); no `release/` branch
+carries one today, and a line needs it before its first backport merges.
+
+**A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
+against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
+— so on its own every merge to `main` would invalidate every other pull request's green
+`pull-kube-agents-smoke-test` and re-run the whole job for a pull request whose head has not
+changed (#1179, #1202). [`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix
+to the new head of `main` — for every open pull request against `main` on each push to `main`, and
+for one commit when its green arrives after `main` has already moved — with a note in the
+description saying so, and Tide reads the result as current. It is a race against Tide's roughly
+once-a-minute sync: when the sweep lands first, a pull request green at its own head merges without
+a fresh-base retest, one per sync once no batch is in flight; when Tide's sync lands first it
+starts the retest as before (a batch, when two or more qualify), crier's `pending` is then the
+newer status, and the sweep leaves it alone. A push still starts a fresh run;
+`/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
+reports (`/retest` does not, because it reruns only failed contexts); a red is never touched, and
+an admin `/override` is carried the same way as a green, because crier stamps the same `BaseSHA:`
+suffix on it. What this trades away is testing the combination with the `main`
+it lands on before the merge; until a scheduled eval run on `main` exists, a bad combination is
+found by the next smoke run that actually starts after it — a push or `/test` on whichever pull
+request that is, whose author then sees a red that is not theirs. Prow's own form of this — a `[prow:skip-retest]` sentinel
+written by `/override-sticky` — is upstream but not in the Prow build this repository merges
+through; `scripts/pin_smoke_status.py` says when to switch.
+
+**`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
+reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
+`main` restricts pushes to the `google-oss-prow` app and GitHub scores that restriction as a block
+on the querying user. #1065 read `BLOCKED` while carrying both labels and while `tide` reported
+`In merge pool.` Ask Tide instead — its status on the head commit states its own reason — and
+[oss.gprow.dev/tide](https://oss.gprow.dev/tide) shows the queue. One reason the status omits: a
+merge attempt that failed — an unresolved review thread, most often — is retried every ~85
+seconds and recorded only in the `err` field of
+[tide-history](https://oss.gprow.dev/tide-history); #1122 sat approved for 5h46m and 231
+attempts that way — the case the `do-not-merge` label above now keeps out of the pool.
+
+```bash
+# Why Tide has not merged it: its own reason first, then the labels it wants.
+gh api repos/gke-labs/kube-agents/commits/<head-sha>/status \
+  --jq '.statuses[] | select(.context == "tide") | "\(.state): \(.description)"'
+gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].name]'
+```
+
+## Re-running a check that failed
+
+A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
+re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
+[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) watches the completed
+attempts of the checks its `workflow_run` trigger lists, and when an attempt after the first passes
+on the same commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
+(or Go test, or pytest file) the failed attempts' logs name, falling back to one per failing job and
+step when they name none or name more than a handful, or adds a row to the issue that class already
+has. The tree did not change
+between the attempts, so the code was not the cause; the issue is where the occurrences accumulate
+until someone
+reads them together. It never closes an issue, because every green run of a flaky check looks like a
+fix from the outside; close it when the cause is fixed, and a recurrence opens a new one that links
+back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header says why
+`Validate PR Title` and `Security Scanning` are left off.
+
+A re-run that fails again records nothing, and neither does a push that happens to go green: only a
+same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke
+test is a different system and is not watched; the `presubmit-gate` label is that job's channel.
+
+## Who owns an open pull request
+
+Every open pull request has exactly one party whose move it is, and the commonest way one sits for
+a fortnight is that both sides believe it is the other's. The rule:
+
+**The author owns it while it is blocked on them** — a draft, a failing or cancelled check that
+`tide` names, merge conflicts, unresolved review threads, changes requested, or no human reviewer
+requested yet.
+**Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
+is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
+
+A draft is owned by its author and waited on by nobody, so it is not a backlog item — it is work in
+progress, and chasing it is noise.
+
+Four states that look like somebody else's problem and are not:
+
+- **`CHANGES_REQUESTED` does not clear itself.** It stays set until a reviewer submits a _new_
+  review. Pushing the fix does not clear it, resolving every thread does not clear it, and GitHub
+  will report `CHANGES_REQUESTED` and "review requested from X" in the same breath. Re-requesting
+  review is the explicit hand-back — do that rather than assuming the push spoke for itself.
+- **Nobody is requested at all.** Because a human is only assigned once the `AI Review` check goes
+  green, an author with outstanding bot findings has no reviewer and no notification saying so.
+  Clearing the findings and commenting `/review` for a clean pass is what summons one;
+  `/request-review` is the override. Answering every bot thread does not summon one by itself, so
+  an author who has done everything asked of them can still be sitting with nobody assigned.
+- **A red check that is not required.** It still blocks the merge if it is red on the head: Tide
+  refuses any posted context that is not green unless Prow marks it `optional`, not only the ones on
+  the two lists above, so a cancelled run of a non-required job is the author's problem too. `tide`
+  is what actually knows —
+  ask it before treating a failing job as work owed, and before concluding one is not.
+- **`mergeable: UNKNOWN`.** GitHub computes mergeability lazily and the first query only triggers
+  the job, so a conflict reads as conflict-free until you ask twice.
+
+`skip_reason()` and `already_reviewed_reason()` in
+[`scripts/request_reviewers.py`](../scripts/request_reviewers.py) are the same rule in code for the
+one decision this repository automates — it declines to request a reviewer for a draft, for a title
+carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
+the changed files has submitted `APPROVED`, and when a human other than the author has submitted
+`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+`.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
+robot that reviews under a user account re-reviews every push and files its follow-ups as
+`COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
+request and the check-run path would never request a human, and a review request outstanding to it
+is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
+`OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
+comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
+`AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
+one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
+naming the reason. A periodic
+triage sweep applies the wider rule and messages whoever owns each pull request; it runs outside
+this repository, so the rule above is all this page can state about it.
+
+```bash
+# Whose move is it: draft, conflicts, verdict, and who is on the hook now.
+gh pr view <number> --repo gke-labs/kube-agents \
+  --json isDraft,mergeable,reviewDecision,reviewRequests \
+  --jq '{draft: .isDraft, mergeable, decision: .reviewDecision,
+         requested: [.reviewRequests[].login]}'
+```

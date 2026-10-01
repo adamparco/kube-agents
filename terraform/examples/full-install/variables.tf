@@ -20,9 +20,15 @@ variable "cluster_mode" {
 }
 
 variable "create_cluster" {
-  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled."
+  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise, the NetworkPolicy half unless accept_no_network_policy is set."
   type        = bool
   default     = true
+}
+
+variable "accept_no_network_policy" {
+  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's — is accepted by the API server and enforced by nothing. The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
+  type        = bool
+  default     = false
 }
 
 variable "location" {
@@ -40,6 +46,12 @@ variable "gvisor_pool_name" {
   description = "Name of the gVisor node pool."
   type        = string
   default     = "gvisor-pool"
+}
+
+variable "agent_runtime_class" {
+  description = "RuntimeClass for the agent pod, overriding what enable_gvisor_node_pool implies. Autopilot ships the gvisor RuntimeClass with no node pool to manage — and enable_gvisor_node_pool fails the plan there — so \"gvisor\" here is how an Autopilot install asks for the sandbox without reaching for extra_helm_values. Empty derives the value from enable_gvisor_node_pool."
+  type        = string
+  default     = ""
 }
 
 variable "deletion_protection" {
@@ -84,14 +96,21 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+# With one bundle left, this no longer selects between bundles: `read-only` takes
+# local.read_only_roles and `custom` requires project_roles, which wins on its own.
+# It stays because it is still load-bearing in two places — installer_common.sh
+# writes it into every generated terraform.tfvars, so removing the variable would
+# fail every installer-driven apply on an unsupported argument, and outputs.tf
+# preconditions on it to catch `custom` with no roles named. It is also the gate
+# that refuses a configuration still asking for the removed admin bundle.
 variable "permission_set" {
-  description = "Which GCP IAM role bundle the agent's service account gets: read-only, gke-admin, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
+  description = "Which GCP IAM role bundle the agent's service account gets: read-only, or custom (custom requires project_roles). Ignored when project_roles is set explicitly."
   type        = string
   default     = "read-only"
 
   validation {
-    condition     = contains(["read-only", "gke-admin", "custom"], var.permission_set)
-    error_message = "permission_set must be one of read-only, gke-admin, or custom."
+    condition     = contains(["read-only", "custom"], var.permission_set)
+    error_message = "permission_set must be one of read-only or custom. The gke-admin bundle was removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and the container.clusters.impersonate it carries applies to every cluster in the project. Name the roles you need in project_roles instead."
   }
 }
 
@@ -99,6 +118,157 @@ variable "project_roles" {
   description = "Project-level IAM roles granted to the agent's service account. Leave null to take the bundle permission_set names; set explicitly (including []) to manage the roles yourself, which overrides permission_set."
   type        = list(string)
   default     = null
+}
+
+variable "scoped_clusters" {
+  description = <<-EOT
+    GKE clusters to provision a scoped reader service account for -- one account
+    per cluster. Empty, the default, provisions no pool and leaves the agent's
+    single identity in place.
+
+    A non-empty list does two things. It provisions the accounts, and it arms
+    the credential broker: the mapping reaches the PlatformAgent CR, and a
+    request naming a cluster that is not in this list is then refused rather
+    than served by a wider credential.
+
+    The default is empty because a pool member holds no IAM grant. The IAM
+    Condition that scoped it grants nothing for Kubernetes object operations
+    (measured 2026-08-12), and un-conditioned the same binding is project-wide
+    container.viewer, so both are gone -- see the kube-agents-iam module's
+    scoped_pool.tf. An armed pool therefore selects a powerless identity for
+    every request and turns every cluster read into a Forbidden. Set this to
+    exercise the selection, refusal and minting path; the authority arrives with
+    per-cluster RBAC.
+
+    Name each cluster by value rather than from module.gke_cluster's outputs,
+    including this composition's own: the accounts would otherwise depend on the
+    cluster existing and Terraform would refuse to plan the IAM until after it
+    was created.
+  EOT
+  type = list(object({
+    project_id   = string
+    location     = string
+    cluster_name = string
+  }))
+  nullable = false
+  default  = []
+}
+
+variable "scope" {
+  description = <<-EOT
+    The GCP projects beyond project_id whose GKE clusters the Cluster Agent
+    reconcile enumerates, and what it leaves unmanaged: `spec.scope` on the
+    PlatformAgent CR, declared once here and reaching both halves of the
+    install from this one value. The kube-agents-iam module binds its read
+    allowlist (scope_roles: the read subset of the default project roles,
+    intersected with the roles the host project got) in each project, and the
+    chart renders the same object into the CR, so the IAM and the declaration
+    cannot name different projects, and the bindings exist before the CR that
+    declares them is written (the module refuses the plan when the host role
+    set carries neither of the two roles that list and get clusters). Ordering
+    is not propagation: a first install's one-shot inventory sweep may name a
+    scoped project as denied, and the hourly reconcile creates its profiles
+    once the grant has propagated.
+
+    Empty, the default, binds nothing and renders a scope block with empty
+    lists, which declares that the management project alone is in scope.
+    Removing a project from `projects` on a later apply revokes its bindings
+    and retires its Cluster Agent profiles over the reconcile's next two clean
+    runs. `exclude.projects` takes project IDs or shell-style globs;
+    `exclude.clusters` names single clusters by the full triple, because a
+    cluster name is unique only within a project and location. Neither
+    exclusion changes IAM, except that an `exclude.projects` entry naming a
+    Shared VPC service project by ID, or a monitored project by its project
+    number, withholds its grant (a monitored project excluded by ID keeps
+    it, for the reconcile's naming call); a glob is the reconcile's alone. `folders`
+    and `organizations` are numeric Resource
+    Manager IDs: each is bound on the container itself with the same allowlist
+    plus roles/cloudasset.viewer, so every project beneath it inherits the
+    grant and a project created under a declared folder later is discovered
+    and readable with no change here; declaring one also enables
+    cloudasset.googleapis.com in project_id, which the reconcile's container
+    search calls. An organisation binding reaches every project in the
+    organisation; the design recommends folders until the scoped service
+    account pool grants authority. `shared_vpc_hosts` and `metrics_scopes`
+    are project IDs, of a Shared VPC host and of a Metrics Scope's scoping
+    project: the module resolves each to the projects it reaches at plan
+    time, as the identity Terraform plans with, and binds the allowlist in
+    every one (and in each scoping project, and roles/compute.viewer alone in
+    a host not otherwise in scope, for the reconcile's lookups),
+    because nothing is inherited through either; a project attached or
+    linked after the apply reads denied until the next one. A lookup the
+    planning identity cannot make fails the plan with the selector named,
+    before anything is applied.
+  EOT
+  type = object({
+    projects         = optional(list(string), [])
+    folders          = optional(list(string), [])
+    organizations    = optional(list(string), [])
+    shared_vpc_hosts = optional(list(string), [])
+    metrics_scopes   = optional(list(string), [])
+    exclude = optional(object({
+      projects = optional(list(string), [])
+      clusters = optional(list(object({
+        project_id   = string
+        location     = string
+        cluster_name = string
+      })), [])
+    }), {})
+  })
+  nullable = false
+  default  = {}
+}
+
+variable "agent_service_account_id" {
+  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs, named by litellm_service_account_id and github_minter_service_account_id rather than by this variable (the minter's authorization rule does track this one — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so a distinct GSA name un-collides creation, not identity: set agent_ksa_name too, or installs sharing the agent namespace can each mint the other's tokens."
+  type        = string
+  default     = null
+}
+
+variable "agent_ksa_name" {
+  description = "Kubernetes ServiceAccount the agent pod runs as, and the KSA half of its Workload Identity binding. The Workload Identity principal is project/namespace/KSA with no cluster in it, so two installs in one project that share the namespace and this name bind one principal and each agent can mint the other's GSA tokens however differently the GSAs are named; give a second install its own name here. One variable feeds both consumers — the composition passes it to the kube-agents-iam module's ksa_name and to the chart's platformAgent.security.serviceAccountName — so the binding and the pod cannot name different KSAs. The default is the name both consumers defaulted to before this variable existed, so an install that never sets it does not move. Through the installer front doors, set it as a TF_VAR_agent_ksa_name=... line in install.env: unlike agent_service_account_id, which the front doors now name with PLATFORM_AGENT_GSA_NAME, this has no install.env key of its own yet, and the generator writes no agent_ksa_name into terraform.tfvars, so the TF_VAR_ passthrough is what Terraform reads."
+  type        = string
+  nullable    = false
+  default     = "kubeagents-platform-agent"
+
+  # A label rather than the DNS subdomain a ServiceAccount name may be: the
+  # value is interpolated into the Workload Identity member string and into
+  # system:serviceaccount:<ns>:<name> principals, and a label is the subset
+  # every one of those accepts.
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.agent_ksa_name))
+    error_message = "agent_ksa_name must be a DNS-1123 label: lowercase letters, digits and hyphens, 1-63 characters, starting and ending with a letter or digit."
+  }
+
+  # The suffix keeps the KSA inside the admission policy's selector. The chart
+  # ships the kube-agents-agent-binding-scope ValidatingAdmissionPolicy (source:
+  # k8s-operator/config/admission/agent-rbac-policy.yaml), whose binds-agent-sa
+  # matchCondition selects the bindings it governs by `s.name.endsWith('-agent')`
+  # on the bound ServiceAccount, and a matchCondition that evaluates false
+  # removes the object from the policy rather than failing it. Today that
+  # policy's one validation names developer-team-agent, and the operator's own
+  # reconcile is exempt from it, so on current main no admission decision
+  # changes for a platform KSA either way. What a name outside the suffix loses
+  # is selection: every validation the policy gains, and every binding to this
+  # KSA written by something other than the operator (a GitOps overlay, a
+  # human), falls outside it with nothing reporting the gap.
+  # tests/test_agent_ksa_name_guard.py holds this literal to the policy's.
+  validation {
+    condition     = endswith(var.agent_ksa_name, "-agent")
+    error_message = "agent_ksa_name must end in \"-agent\": the kube-agents-agent-binding-scope ValidatingAdmissionPolicy (k8s-operator/config/admission/agent-rbac-policy.yaml, shipped by the chart) selects the bindings it governs by matchCondition binds-agent-sa, s.name.endsWith('-agent'), so a name outside the suffix drops this install's agent bindings out of the policy rather than failing them."
+  }
+}
+
+variable "github_minter_service_account_id" {
+  description = "IAM service account ID for the GitHub token minter's GSA. Null selects the module default (kubeagents-github-minter-gsa), which is one fixed name per project like agent_service_account_id, and a second install in the same project that enables the minter must set its own for the same reason."
+  type        = string
+  default     = null
+}
+
+variable "litellm_service_account_id" {
+  description = "IAM service account ID for the LiteLLM gateway's Vertex AI GSA (model_provider = vertex_ai only). One fixed name per project, so a second Vertex install in the same project must set its own. A real default rather than null: the module it reaches (kube-agents-iam) defaults to the AGENT's name, which a null would select."
+  type        = string
+  default     = "kubeagents-litellm-gsa"
 }
 
 variable "image_tag" {
@@ -148,21 +318,38 @@ variable "model_provider" {
 }
 
 variable "vertex_project_id" {
-  description = "Project serving the Vertex AI models when model_provider = \"vertex\". Empty uses project_id. The gateway's service account is granted roles/aiplatform.user here, which works cross-project."
+  description = "Project serving the Vertex AI models when model_provider = \"vertex_ai\". Empty uses project_id. The gateway's service account is granted roles/aiplatform.user here, which works cross-project, unless vertex_manage_serving_project is false."
   type        = string
   default     = ""
 }
 
 variable "vertex_location" {
-  description = "Vertex AI serving location when model_provider = \"vertex\" (e.g. us-east4). Empty uses the cluster location — override when the model is not served in the cluster's region."
+  description = "Vertex AI serving location when model_provider = \"vertex_ai\" (e.g. us-east4). Empty uses \"global\", which serves the first-party Gemini models from wherever has capacity. Set a region when you have a data-residency requirement, or when the model is a Model Garden partner model served only from specific regions."
   type        = string
   default     = ""
+}
+
+variable "vertex_manage_serving_project" {
+  description = "Whether this composition enables aiplatform.googleapis.com in vertex_project_id and grants the gateway's service account roles/aiplatform.user there. Set false when vertex_project_id is a project the applying identity cannot administer; the operator then enables the API and makes that grant by hand, and the composition still creates the gateway's service account and Workload Identity binding in project_id. Meant to be chosen at the first apply: turning it off on an install whose earlier apply created the two resources destroys them on the next apply, which revokes the grant — `terraform state rm` both first to hand them over."
+  type        = bool
+  default     = true
 }
 
 variable "model_default_name" {
   description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
   type        = string
   default     = ""
+}
+
+variable "model_max_tokens" {
+  description = "Output tokens the LiteLLM gateway asks the provider for on a request that names none, rendered as max_tokens under every model_list alias; 0 leaves the key out. For a self-hosted backend whose prompt and output share one window. What it does and does not cap: the site's inference-gateway page, \"Setting the output-token budget\"."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.model_max_tokens >= 0 && floor(var.model_max_tokens) == var.model_max_tokens
+    error_message = "model_max_tokens must be a whole number of tokens, 0 or more."
+  }
 }
 
 variable "api_server_key" {
@@ -235,7 +422,7 @@ variable "enable_slack" {
 }
 
 variable "slack_bot_token" {
-  description = "SLACK_BOT_TOKEN (xoxb-...) stored in the credentials Secret. Only used when enable_slack is true."
+  description = "SLACK_BOT_TOKEN stored in the credentials Secret: one xoxb-... token, or several comma-separated, one per Slack workspace the agent serves. Only used when enable_slack is true."
   type        = string
   sensitive   = true
   default     = ""
@@ -385,13 +572,67 @@ variable "enable_cert_manager" {
 variable "cert_manager_version" {
   description = "cert-manager chart version. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
   type        = string
-  default     = "v1.21.1"
+  default     = "v1.21.2"
 }
 
 variable "enable_webhooks" {
   description = "Enable the operator's PlatformAgent admission webhooks (defaulting, validation, delete protection). Requires cert-manager in the cluster — either enable_cert_manager or a pre-existing install."
   type        = bool
   default     = true
+}
+
+variable "enable_pubsub_platform" {
+  description = "Enable the Pub/Sub platform adapter AgentPlugin (opens event listeners for Cloud Pub/Sub subscriptions)."
+  type        = bool
+  default     = false
+}
+
+variable "enable_stockout_investigator" {
+  description = "Enable the GKE Stockout Investigator AgentPlugin (diagnoses autoscaler capacity failures and proposes GitOps PRs). Automatically enables pubsub_platform for alert ingress."
+  type        = bool
+  default     = false
+}
+
+variable "stockout_pubsub_topic" {
+  description = "Pub/Sub topic for GKE stockout alerts. Only used when enable_stockout_investigator is true."
+  type        = string
+  default     = "gke-stockout-alerts-topic"
+}
+
+variable "stockout_pubsub_subscription" {
+  description = "Pub/Sub subscription for GKE stockout alerts. Only used when enable_stockout_investigator is true."
+  type        = string
+  default     = "gke-stockout-alerts-sub"
+}
+
+variable "stockout_pubsub_sink" {
+  description = "Log sink name for GKE stockout alerts. Only used when enable_stockout_investigator is true."
+  type        = string
+  default     = "gke-stockout-alerts-sink"
+}
+
+variable "enable_drift_pubsub" {
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which this composition leaves to extra_helm_values; with the flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write no value for this variable into terraform.tfvars; through them it is a TF_VAR_enable_drift_pubsub line in install.env, as agent_ksa_name is."
+  type        = bool
+  default     = false
+}
+
+variable "drift_pubsub_topic" {
+  description = "Pub/Sub topic the drift audit-log sink publishes to. Only used when enable_drift_pubsub is true. One fixed default per project: lifecycle.sh apply adopts a topic of this name that exists but is not in state, and cannot tell one another live install in the project owns from one an earlier install left behind, so a second install that turns the flag on names its own topic, subscription and sink."
+  type        = string
+  default     = "platform-agent-drift-audit"
+}
+
+variable "drift_pubsub_subscription" {
+  description = "Pub/Sub pull subscription the drift detector reads from. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
+  type        = string
+  default     = "platform-agent-drift-audit-sub"
+}
+
+variable "drift_pubsub_sink" {
+  description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
+  type        = string
+  default     = "platform-agent-drift-audit-sink"
 }
 
 variable "extra_helm_values" {

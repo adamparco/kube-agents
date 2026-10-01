@@ -27,9 +27,11 @@ instead, which only the gated steps below create.
 """
 
 import ast
+import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -114,6 +116,37 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run(["hermes", "gateway", "run"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup, "the gateway container must build the shared tree")
+
+    def test_the_setup_creates_a_group_accessible_scratch_dir(self):
+        """Step 4.5: the `gh --body-file` handoff directory must exist,
+        group-accessible, before any script lazily creates it with whatever
+        umask that process happens to carry. The sandbox (uid 10000) stages
+        body files there and the credential sidecar (uid 10001) reads them
+        through the shared fsGroup — group bits are the whole bridge since the
+        #955 uid split; #1030 is what their absence looks like."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "gateway", "run"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_WAIT_SECS": "0",
+                },
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            scratch = home / "scratch"
+            self.assertTrue(scratch.is_dir(), "the setup must create scratch/")
+            mode = scratch.stat().st_mode
+            self.assertEqual(
+                mode & 0o070,
+                0o070,
+                f"scratch/ is {oct(mode & 0o777)}: the sidecar reaches it only "
+                "through the group bits",
+            )
 
     def test_dashboard_sidecar_skips_the_setup(self):
         proc, ran_setup = self._run(["hermes", "dashboard"])
@@ -456,6 +489,25 @@ def _extract_shell_function(name):
     raise AssertionError(f"{name}() is never closed in {_ENTRYPOINT}")
 
 
+def _extract_shell_block(opener, closer="fi"):
+    """Return the text of a top-level block, from the line equal to `opener` to `closer`.
+
+    Same bargain as `_extract_shell_function`, for the steps that are written inline
+    rather than as a function: run the shipped lines, never a paraphrase of them. The
+    block must start at column zero and end at the first later line equal to `closer`,
+    which is how the script already writes its top-level steps.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, line in enumerate(lines) if line == opener]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one `{opener}` in {_ENTRYPOINT}, found {len(starts)}")
+    start = starts[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == closer:
+            return "\n".join(lines[start : end + 1]) + "\n"
+    raise AssertionError(f"`{opener}` is never closed by `{closer}` in {_ENTRYPOINT}")
+
+
 class FreshVolumeDetectionTest(unittest.TestCase):
     """A fresh volume is not an absent file, and getting that wrong cost a whole install.
 
@@ -570,12 +622,12 @@ class ConfigBackfillTest(unittest.TestCase):
     def test_a_key_the_live_file_lost_is_restored(self):
         """`model: {}` is what a save leaves behind; the template's block goes back in."""
         proc, live, _ = self._fill(
-            {"model": {"base_url": "http://litellm/v1", "api_mode": "chat_completions"}},
+            {"model": {"base_url": "http://inference-gateway/v1", "api_mode": "chat_completions"}},
             {"model": {}},
         )
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(live["model"]["base_url"], "http://litellm/v1")
+        self.assertEqual(live["model"]["base_url"], "http://inference-gateway/v1")
         self.assertEqual(live["model"]["api_mode"], "chat_completions")
         self.assertIn("model.base_url", proc.stdout)
 
@@ -604,7 +656,7 @@ class ConfigBackfillTest(unittest.TestCase):
 
     def test_nothing_missing_leaves_the_file_byte_identical(self):
         """No rewrite when there is nothing to add — that is what keeps the comments."""
-        live = "# the agent's own file\nmodel:\n  base_url: http://litellm/v1\n"
+        live = "# the agent's own file\nmodel:\n  base_url: http://inference-gateway/v1\n"
         proc, _, unchanged = self._fill({"model": {"base_url": "http://other/v1"}}, live)
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -612,7 +664,7 @@ class ConfigBackfillTest(unittest.TestCase):
 
     def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
         """A corrupt config must not take the container down; step 2d only reports."""
-        proc, live, unchanged = self._fill({"model": {"base_url": "http://litellm/v1"}}, "- a\n- b")
+        proc, live, unchanged = self._fill({"model": {"base_url": "http://inference-gateway/v1"}}, "- a\n- b")
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(unchanged)
@@ -642,6 +694,295 @@ class ConfigBackfillTest(unittest.TestCase):
         self.assertEqual(live["monitoring"]["install_id"], "abc123")
         for key in ("toolsets", "platform_toolsets", "kanban", "agent"):
             self.assertIn(key, live, f"{key} was lost to the managed strip and not restored")
+
+
+class RemoteMcpUserAgentRepairTest(unittest.TestCase):
+    """The in-place repair of the remote MCP User-Agent in a profile's live config.yaml.
+
+    The header is image-owned state inside files the entrypoint otherwise leaves alone: a
+    cluster profile's config.yaml is identity-stamped and never force-synced, and the
+    platform profile's is only back-filled at the front door. Both fills recurse only
+    where both sides are mappings, and the header sits in `args`, a list. So a PVC
+    upgraded onto an image that changed the header kept sending the old one from every
+    profile scaffolded before the change, for the life of the volume, while a fresh
+    install sent the new one — two header shapes from one build, on the value the API
+    teams key dashboards on.
+
+    Lifted out by its marker like the back-fill, and for the same reason: the program
+    under test is the one that ships. Both halves matter here too — what it rewrites,
+    and the identity stamp and everything else it must not touch.
+    """
+
+    _PROGRAM = None
+    _CLUSTER_TEMPLATE = _REPO / "agents" / "cluster" / "config.yaml"
+    _OLD_HEADER = "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
+    _IDENTITY = {"project": "p", "cluster": "c", "location": "us-central1"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls._PROGRAM = _extract_heredoc("UAEOF")
+
+    def _repair(self, template, live):
+        """Run the real program over two files, returning `(proc, reloaded_live, unchanged)`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            template_path = pathlib.Path(tmp) / "template.yaml"
+            live_path = pathlib.Path(tmp) / "live.yaml"
+            template_path.write_text(
+                template if isinstance(template, str) else yaml.safe_dump(template, sort_keys=False),
+                encoding="utf-8",
+            )
+            live_path.write_text(
+                live if isinstance(live, str) else yaml.safe_dump(live, sort_keys=False),
+                encoding="utf-8",
+            )
+            before = live_path.read_bytes()
+            proc = subprocess.run(
+                [sys.executable, "-c", self._PROGRAM, str(template_path), str(live_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            after = live_path.read_bytes()
+            return proc, yaml.safe_load(after), before == after
+
+    def _header_value(self, server):
+        args = server["args"]
+        return args[args.index("--header") + 1]
+
+    def _scaffolded_cluster_profile(self, header):
+        """A cluster profile's config.yaml as cluster_agent_profile.create_profile leaves it.
+
+        The template copied whole, the header as the image that scaffolded it spelled
+        it, and the `cluster_identity` stamp appended — the record the reconciler
+        matches the profile to its cluster by.
+        """
+        live = yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+        for server in live["mcp_servers"].values():
+            args = server.get("args")
+            if isinstance(args, list) and "--header" in args:
+                args[args.index("--header") + 1] = header
+        live["cluster_identity"] = dict(self._IDENTITY)
+        return live
+
+    def test_a_profile_scaffolded_with_the_old_header_takes_the_templates(self):
+        """The upgrade path, on the shipped cluster template: every remote server moves."""
+        template = yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+        proc, live, _ = self._repair(
+            self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"),
+            self._scaffolded_cluster_profile(self._OLD_HEADER),
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        remote = [n for n, s in template["mcp_servers"].items() if "--header" in s.get("args", [])]
+        self.assertGreaterEqual(len(remote), 1, "the cluster template ships no remote server to repair")
+        for name in remote:
+            self.assertEqual(
+                self._header_value(live["mcp_servers"][name]),
+                self._header_value(template["mcp_servers"][name]),
+                f"{name} still sends the header it was scaffolded with",
+            )
+            self.assertIn(name, proc.stdout)
+        self.assertEqual(
+            live["cluster_identity"],
+            self._IDENTITY,
+            "the identity stamp was lost: the reconciler would scaffold a duplicate profile",
+        )
+        live.pop("cluster_identity")
+        self.assertEqual(live, template, "something other than the header changed")
+
+    def test_a_profile_already_current_is_left_byte_identical(self):
+        """No rewrite when there is nothing to repair — every boot must not churn the file."""
+        template = self._CLUSTER_TEMPLATE.read_text(encoding="utf-8")
+        current = yaml.safe_load(template)
+        current["cluster_identity"] = dict(self._IDENTITY)
+        proc, live, unchanged = self._repair(template, current)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged, f"the file was rewritten with nothing to repair: {proc.stdout}")
+        self.assertEqual(live["cluster_identity"], self._IDENTITY)
+
+    def test_a_profile_without_the_header_gains_it_where_the_template_carries_it(self):
+        """A profile from before the header existed: inserted, not appended after the URL."""
+        template = {
+            "mcp_servers": {
+                "gke": {
+                    "command": "node",
+                    "args": ["/opt/mcp-remote/dist/proxy.js", "--header", "User-Agent: x/1 (daemon)", "https://example/mcp"],
+                }
+            }
+        }
+        live = {
+            "mcp_servers": {
+                "gke": {"command": "node", "args": ["/opt/mcp-remote/dist/proxy.js", "https://example/mcp"], "lazy": True}
+            },
+            "cluster_identity": dict(self._IDENTITY),
+        }
+        proc, live, _ = self._repair(template, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["mcp_servers"]["gke"]["args"], template["mcp_servers"]["gke"]["args"])
+        self.assertIs(live["mcp_servers"]["gke"]["lazy"], True)
+        self.assertEqual(live["cluster_identity"], self._IDENTITY)
+
+    def test_only_the_user_agent_value_of_a_server_the_template_ships_is_touched(self):
+        """A server the image does not know, another header, a non-list `args`: all kept."""
+        template = {
+            "mcp_servers": {
+                "gke": {"args": ["proxy.js", "--header", "User-Agent: x/1 (daemon)", "https://gke/mcp"]},
+                "local": {"command": "python3", "args": ["server.py"]},
+            }
+        }
+        live = {
+            "mcp_servers": {
+                "gke": {
+                    "args": [
+                        "proxy.js",
+                        "--header",
+                        "Authorization: Bearer t",
+                        "--header",
+                        "user-agent: x/0",
+                        "https://gke/mcp",
+                    ]
+                },
+                "local": {"command": "python3", "args": "server.py"},
+                "mine": {"args": ["proxy.js", "--header", "User-Agent: mine/1", "https://mine/mcp"]},
+            }
+        }
+        proc, live, _ = self._repair(template, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            live["mcp_servers"]["gke"]["args"],
+            ["proxy.js", "--header", "Authorization: Bearer t", "--header", "User-Agent: x/1 (daemon)", "https://gke/mcp"],
+            "the other header must survive and the header name is case-insensitive",
+        )
+        self.assertEqual(live["mcp_servers"]["local"]["args"], "server.py")
+        self.assertEqual(live["mcp_servers"]["mine"]["args"][2], "User-Agent: mine/1")
+
+    def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
+        """A corrupt config must not take the container down; the repair only reports."""
+        template = self._CLUSTER_TEMPLATE.read_text(encoding="utf-8")
+        proc, live, unchanged = self._repair(template, "- a\n- b")
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertEqual(live, ["a", "b"])
+        self.assertIn("skipped", proc.stderr)
+
+    def test_the_shipped_cluster_loop_repairs_a_profile_on_the_volume(self):
+        """The cluster call site, run rather than read: the loop over profiles/cluster-*.
+
+        The regex test below proves the call is spelled right; this proves the guard in
+        front of it and the loop around it reach a real profile directory, which is the
+        path that had no test at all — a wrong variable in that guard ships with the
+        suite green, and the symptom is exactly the one the helper exists to fix. The
+        block is lifted by its opener like step 2.6b's; the skills sync it also calls
+        returns at once because the fixture template has no skills/ directory, and the
+        cron back-fill is skipped because no scaffold script is in scope.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        script += block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            profile.mkdir(parents=True)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            live = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+        template = yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+        for name, server in template["mcp_servers"].items():
+            if "--header" in server.get("args", []):
+                self.assertEqual(
+                    self._header_value(live["mcp_servers"][name]),
+                    self._header_value(server),
+                    f"the loop left {name} on the header it was scaffolded with",
+                )
+        self.assertEqual(live["cluster_identity"], self._IDENTITY)
+        self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
+        self.assertIn("User-Agent repair", proc.stdout)
+
+    def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
+        """The call sites, read off the source: the cluster loop and the front-door fill.
+
+        The helper is inert until something calls it, and each profile it is for is one
+        whose config.yaml step 2.6 deliberately leaves alone. A cluster profile takes it
+        from the cluster template, the platform profile from its own; each caller names
+        its template, so one wired to the wrong one is what this checks.
+        """
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        calls = re.findall(
+            r"repair_remote_mcp_user_agent\s*\\?\s*\n?\s*\"\$(\w+)/config\.yaml\"\s+\"([^\"]+)\"",
+            source,
+        )
+        self.assertEqual(
+            sorted(calls),
+            [
+                ("CLUSTER_TEMPLATE", "$d/config.yaml"),
+                ("PLATFORM_TEMPLATE", "$TARGET_DIR/profiles/platform/config.yaml"),
+            ],
+            f"expected the cluster loop and step 2.6b to be the only callers, found {calls}",
+        )
+
+
+class ImageOwnedForceSyncTest(unittest.TestCase):
+    """Step 2a overwrites a PVC copy that `cp -u` would keep because it looks newer.
+
+    The onboarding prompts are graded by the first-install-hello eval cases, and
+    bootstrap_onboarding reads the PVC copy first, so a stale one would be what is graded.
+    """
+
+    def test_a_newer_stale_pvc_copy_of_each_onboarding_prompt_is_replaced(self):
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in names:
+                (image / name).parent.mkdir(parents=True, exist_ok=True)
+                (image / name).write_text("image\n", encoding="utf-8")
+                (pvc / name).parent.mkdir(parents=True, exist_ok=True)
+                (pvc / name).write_text("stale\n", encoding="utf-8")
+                future = time.time() + 3600
+                os.utime(pvc / name, (future, future))
+            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            subprocess.run(
+                ["bash", "-c", block],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            for name in names:
+                self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
 
 class ManagedScopeAssertionTest(unittest.TestCase):
@@ -732,7 +1073,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
     NEW = f"skills.new.{POD}"
     OLD = f"skills.old.{POD}"
 
-    def _sync(self, src_parent, dst_parent, preamble="", pod=None):
+    def _sync(self, src_parent, dst_parent, preamble="", pod=None, overlay=None):
         """Run the real function under `set -e`, returning the completed process.
 
         `preamble` is shell injected between the function definition and the call.
@@ -749,7 +1090,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
         """
         script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
         script += preamble
-        script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
+        script += f'sync_profile_skills "{src_parent}" "{dst_parent}" "{overlay or ""}"\necho DONE\n'
         return subprocess.run(
             ["sh", "-c", script],
             capture_output=True,
@@ -780,6 +1121,72 @@ class SyncProfileSkillsTest(unittest.TestCase):
         for path in [root, *root.rglob("*")]:
             if path.is_dir():
                 path.chmod(0o700)
+
+    def test_the_overlay_is_composed_into_the_same_atomic_swap(self):
+        """The A2A skill rides 2.6a's staging as $3 rather than being copied into
+        the live directory afterwards.
+
+        Written as a second pass over $_dst it would be a non-staged writer on a
+        volume the staging protocol exists to protect: landing inside another
+        replica's swap window it recreates skills/ holding only its own file,
+        which sends that pod down the "reappeared during the swap" arm and
+        leaves the shared profile with no real skills at all. Composed here,
+        template and overlay install together in one rename.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            self._tree(tmp / "a2a" / "skills", **{"a2a-topics.md": "bus"})
+            self._tree(tmp / "profile" / "skills", **{"stale.md": "x"})
+
+            proc = self._sync(
+                tmp / "template", tmp / "profile", overlay=tmp / "a2a" / "skills"
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = sorted(p.name for p in (tmp / "profile" / "skills").iterdir())
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
+            # No staging litter survives a clean run.
+            self.assertFalse((tmp / "profile" / self.NEW).exists())
+            self.assertFalse((tmp / "profile" / self.OLD).exists())
+
+    def test_no_overlay_leaves_the_template_alone(self):
+        """A today install passes an empty $3 — the flip-back self-clean. The
+        skill is gone because the swap rebuilt skills/ from the template only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            self._tree(
+                tmp / "profile" / "skills",
+                **{"platform.md": "old", "a2a-topics.md": "left from next"},
+            )
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = sorted(p.name for p in (tmp / "profile" / "skills").iterdir())
+            self.assertEqual(installed, ["platform.md"])
+
+    def test_an_unstageable_overlay_keeps_the_existing_copy(self):
+        """Same class as a failed stage: abandon the swap rather than install a
+        half-composed tree, and never fail the boot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            overlay = self._tree(tmp / "a2a" / "skills", **{"a2a-topics.md": "bus"})
+            self._tree(tmp / "profile" / "skills", **{"existing.md": "keep me"})
+            overlay.chmod(0o000)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile", overlay=overlay)
+
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("DONE", proc.stdout)
+                installed = sorted(
+                    p.name for p in (tmp / "profile" / "skills").iterdir()
+                )
+                self.assertEqual(installed, ["existing.md"])
+            finally:
+                self._restore_modes(tmp)
 
     def test_the_image_copy_replaces_the_volume_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1255,7 +1662,7 @@ class PlatformFrontDoorTest(unittest.TestCase):
         copy would keep passing after the block it stands in for changed. Everything the
         block reads is a variable, so a temp tree and an env is the whole fixture — the
         one exception being `$INSTALL_DIR/.venv/bin/python3`, which the fill arm calls
-        and which is faked here with a symlink to the interpreter running the tests.
+        and which is faked here with a wrapper script executing the interpreter running the tests.
 
         `template` and `live` are YAML text; `live=None` means the file is absent, which
         is the branch under test. Returns (CompletedProcess, live text or None).
@@ -1276,10 +1683,14 @@ class PlatformFrontDoorTest(unittest.TestCase):
                 (profile / "config.yaml").write_text(live, encoding="utf-8")
             venv = root / "install" / ".venv" / "bin"
             venv.mkdir(parents=True)
-            (venv / "python3").symlink_to(sys.executable)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
 
             script = "set -e\n" + _extract_shell_function("platform_is_front_door") + "\n"
-            script += _extract_shell_function("backfill_config_from_template") + "\n" + block
+            for name in ("backfill_config_from_template", "repair_remote_mcp_user_agent"):
+                script += _extract_shell_function(name) + "\n"
+            script += block
             proc = subprocess.run(
                 ["sh", "-c", script],
                 capture_output=True,
@@ -1336,6 +1747,30 @@ class PlatformFrontDoorTest(unittest.TestCase):
         )
         self.assertIn("monitoring", parsed, "the fill must add a key the template declares")
 
+    def test_step_2_6b_repairs_the_remote_mcp_user_agent_the_fill_cannot_reach(self):
+        """The front door's copy of the header, which the fill leaves alone because `args`
+        is a list, follows the image template through the same block.
+
+        Flag off, step 2.6 force-syncs the whole file and this is moot. Flag on, this
+        arm is the only writer left, and a fill-only pass keeps the header the profile
+        was scaffolded with for the life of the volume — the platform profile then
+        sends one shape and every other install the other.
+        """
+        template = (
+            "mcp_servers:\n  gke:\n    args: [proxy.js, --header, 'User-Agent: x/1 (daemon)', https://gke/mcp]\n"
+            "monitoring: {}\n"
+        )
+        live = (
+            "mcp_servers:\n  gke:\n    args: [proxy.js, --header, 'User-Agent: x/1', https://gke/mcp]\n"
+            "platforms:\n  google_chat:\n    home_channel: spaces/AAQA\n"
+        )
+        proc, written = self._run_step_2_6b(template, live=live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        parsed = yaml.safe_load(written)
+        self.assertEqual(parsed["mcp_servers"]["gke"]["args"][2], "User-Agent: x/1 (daemon)")
+        self.assertEqual(parsed["platforms"]["google_chat"]["home_channel"], "spaces/AAQA")
+        self.assertIn("monitoring", parsed, "the fill must still add a key the template declares")
+
     def test_the_predicate_survives_set_e_when_it_is_false(self):
         """The off path is every existing install, so a false return must not end the boot.
 
@@ -1346,6 +1781,754 @@ class PlatformFrontDoorTest(unittest.TestCase):
         proc = self._run("platform_sync_items >/dev/null\necho SURVIVED\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SURVIVED", proc.stdout)
+
+    def test_step_2c_invalidates_local_mcp_schema_cache(self):
+        """Step 2c drops local MCP server cache entries on startup so new tools appear."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            defaults = root / "defaults" / "scripts"
+            defaults.mkdir(parents=True)
+            invalidate_src = pathlib.Path(__file__).resolve().parent.parent / "agents" / "platform" / "scripts" / "invalidate_mcp_cache.py"
+            shutil.copy(invalidate_src, defaults / "invalidate_mcp_cache.py")
+
+            data = root / "data"
+            (data / "scripts").mkdir(parents=True)
+            shutil.copy(invalidate_src, data / "scripts" / "invalidate_mcp_cache.py")
+            cache_dir = data / "profiles" / "platform" / "cache"
+            cache_dir.mkdir(parents=True)
+            cache_file = cache_dir / "mcp_schema_cache.json"
+            cache_file.write_text(
+                json.dumps({
+                    "platform_control": {"fingerprint": "abc", "tools": [{"name": "verify_gke_cluster"}]},
+                    "developer_knowledge": {"fingerprint": "def", "tools": [{"name": "search_docs"}]},
+                }),
+                encoding="utf-8",
+            )
+
+            lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+            start = next(i for i, line in enumerate(lines) if line.startswith('# 2c. Invalidate locally-hosted MCP server schemas'))
+            end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+            block = "\n".join(lines[start : end + 1])
+
+            proc = subprocess.run(
+                ["sh", "-c", "set -e\n" + block],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TARGET_DIR": str(data),
+                    "PYTHONPATH": str(defaults),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            updated = json.loads(cache_file.read_text(encoding="utf-8"))
+            self.assertNotIn("platform_control", updated)
+            self.assertIn("developer_knowledge", updated)
+
+
+class ApiKeyPinCheckTest(unittest.TestCase):
+    """The startup self-check for issue #786.
+
+    The bug it names: Hermes' stage2 hook generates a random API_SERVER_KEY into the PVC
+    `.env` when that file has none, `load_hermes_dotenv` applies that file over the
+    container environment, and so the gateway authenticated against a value invented at
+    boot that nothing else in the pod knew — every authenticated call 401'd, including
+    the container's own startup probe. The operator now pins the key in the managed
+    `.env`, which is applied last; this check is what says so out loud when the pin is
+    missing, because managed scope fails open and the probe alone reports only THAT
+    something is wrong.
+
+    What these hold is the shape of the report, not its wording: warns when the file is
+    absent, warns when it pins a different value, is silent when the two agree, and never
+    ends the boot — a pod that comes up unpinned still answers, and failing the container
+    would trade a degraded API for none.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._FUNC = _extract_shell_function("warn_unless_api_key_is_pinned")
+
+    def _run(self, managed_env, key="cluster-internal-trusted"):
+        """Run the shipped function over a real file; returns the completed process.
+
+        `managed_env` is the file's content, or None for "the mount did not arrive".
+        `set -e` is on, as it is in the entrypoint, so a check that failed the boot on
+        the warning paths would show up here as a non-zero exit.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / ".env"
+            if managed_env is not None:
+                path.write_text(managed_env, encoding="utf-8")
+            return subprocess.run(
+                ["sh", "-c", f'set -e\n{self._FUNC}\nwarn_unless_api_key_is_pinned "{path}" "{key}"\necho SURVIVED\n'],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+    def test_an_agreeing_pin_says_nothing(self):
+        """The steady state is every boot, so it must not warn."""
+        proc = self._run("API_SERVER_KEY=cluster-internal-trusted\nSLACK_ALLOW_ALL_USERS=false\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_a_missing_managed_env_is_named(self):
+        proc = self._run(None)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("786", proc.stderr)
+        self.assertIn("NOT pinned", proc.stderr)
+
+    def test_a_pin_that_disagrees_is_named(self):
+        """A stale ConfigMap pinning a key nobody presents.
+
+        Distinct from "no pin at all" in the one way an operator acts on: managed scope is
+        applied last, so HERE the managed file is the winner and the container's env is
+        what loses. Told the PVC won, they would go and read the wrong file.
+        """
+        proc = self._run("API_SERVER_KEY=" + "a1b2" * 16 + "\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("786", proc.stderr)
+        self.assertIn("to a different value", proc.stderr)
+        self.assertNotIn(".env wins", proc.stderr)
+
+    def test_a_managed_env_that_pins_other_keys_is_a_disagreement(self):
+        """A chat-only render is exactly the file this shipped with before the fix.
+
+        Nothing overrides the key, so the winner is the PVC's stage2-generated one — the
+        opposite file from the branch above, and the message has to say so.
+        """
+        proc = self._run("GOOGLE_CHAT_ALLOW_ALL_USERS=false\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("does not pin API_SERVER_KEY", proc.stderr)
+        self.assertIn(".env wins", proc.stderr)
+
+    def test_a_line_that_merely_contains_the_value_is_not_the_pin(self):
+        """`grep -x`, not a substring: a different key holding the same value agrees
+        about nothing, and neither does a commented-out pin."""
+        proc = self._run("# API_SERVER_KEY=cluster-internal-trusted\nOTHER=cluster-internal-trusted\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("does not pin API_SERVER_KEY", proc.stderr)
+
+    def test_it_never_ends_the_boot(self):
+        """Report, never exit — asserted on the warning paths, where it would matter."""
+        for content in (None, "API_SERVER_KEY=something-else\n"):
+            with self.subTest(managed_env=content):
+                proc = self._run(content)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("SURVIVED", proc.stdout)
+
+
+class SandboxMirrorGateTest(unittest.TestCase):
+    """Step 5.7 pushes the profile layout into the shell sandbox, and is fatal.
+
+    The agent's Kubernetes credentials are read-only, so nothing in this container can
+    write an Event or a condition to say the migration failed. Exiting non-zero is the
+    one channel it has: the kubelet restarts the container, and the operator's
+    getDeploymentStatusDetails scans the gateway pod's container statuses and copies the
+    waiting reason into the CR as phase Degraded. Come up 0 instead and the CR reads
+    Ready while the model's files sit on this volume where its shell cannot see them —
+    which is what happened on a live upgrade, to ten cluster profile homes at once.
+
+    So the exit status is the contract, and these pin both directions of it. The
+    transient case does not arrive here as a failure at all: sandbox_mirror.py returns 0
+    when the sandbox has not started yet and leaves its marker unwritten, so the next
+    start retries. What reaches this block non-zero is a wrong --remote-root or a
+    transfer that ran and failed, and neither gets better on its own.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(
+            'SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"'
+        )
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, invoked)` — `invoked` says whether the interpreter was reached
+        at all, which is the only way to tell "the mirror passed" from "the gate above
+        it never ran".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            (target / "logs").mkdir(parents=True)
+            (target / "scripts").mkdir()
+            if install_script:
+                (target / "scripts" / "sandbox_mirror.py").write_text("", encoding="utf-8")
+
+            # Stands in for the venv interpreter, and records that it ran. The log line
+            # it writes is what the failure path is supposed to put in front of an
+            # operator, so the test can assert the tail carried it out to stderr.
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                "#!/bin/sh\n"
+                f'echo "$@" >"{marker}"\n'
+                'echo "mirror said something an operator needs to read"\n'
+                f"exit {rc}\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                },
+            )
+            return proc, marker.exists()
+
+    def test_a_failed_migration_ends_start_up(self):
+        proc, invoked = self._run(rc=1)
+        self.assertTrue(invoked, "the mirror never ran, so this asserts nothing")
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "a migration that failed left the container coming up healthy; the CR will "
+            "say Ready and nothing will say the model's files did not cross",
+        )
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_failure_names_itself_and_carries_the_log_out(self):
+        """`kubectl logs` is where the CR's Degraded message sends you; it has to say why."""
+        proc, _ = self._run(rc=1)
+        self.assertIn("FATAL", proc.stderr)
+        self.assertIn(
+            "mirror said something an operator needs to read",
+            proc.stderr,
+            "the cause stayed in logs/sandbox_mirror.log on the PVC, which is exactly "
+            "the silence this change exists to end",
+        )
+
+    def test_a_clean_migration_leaves_start_up_alone(self):
+        proc, invoked = self._run(rc=0)
+        self.assertTrue(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Two tar streams into one directory race; only the primary mirrors.
+
+        Run with a mirror that would fail, so a regression that drops the gate fails
+        this loudly rather than passing on a stub that happens to succeed.
+        """
+        proc, invoked = self._run(rc=1, primary="0")
+        self.assertFalse(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_an_image_without_the_script_is_not_a_failure(self):
+        """The block is guarded on the script existing, and predates it in some images."""
+        proc, invoked = self._run(rc=1, install_script=False)
+        self.assertFalse(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+
+_TERMINAL_PIN_ASSIGNMENT = 'TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"'
+_TERMINAL_PIN_OPENER = (
+    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then'
+)
+
+
+class TerminalEnvPinGateTest(unittest.TestCase):
+    """Step 4b pins every profile's scheduled-run terminal, and is fatal.
+
+    The host never has the image path, so every other entrypoint test skips this block.
+    The block is extracted from its `if` so the script path can point at a temp file.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_TERMINAL_PIN_OPENER)
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, argv, script, target)`; `argv` is what the interpreter was called
+        with, or None when it never ran.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            target.mkdir()
+            script = tmp / "terminal_env_pin.py"
+            if install_script:
+                script.write_text("", encoding="utf-8")
+
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                f'#!/bin/sh\necho "$@" >"{marker}"\nexit {rc}\n',
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                    "TERMINAL_ENV_PIN_SCRIPT": str(script),
+                },
+            )
+            argv = marker.read_text(encoding="utf-8").split() if marker.exists() else None
+            return proc, argv, script, target
+
+    def test_a_failed_pin_ends_start_up(self):
+        proc, argv, _, _ = self._run(rc=1)
+        self.assertIsNotNone(argv, "the pin never ran, so this asserts nothing")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+        self.assertIn("refusing to start", proc.stderr)
+
+    def test_a_clean_pin_sweeps_every_profile_and_leaves_start_up_alone(self):
+        """Without --sweep only $TARGET_DIR is pinned, and named profiles stay on local."""
+        proc, argv, script, target = self._run(rc=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertEqual(argv, [str(script), "--hermes-home", str(target), "--sweep"])
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Run with a pin that would fail, so dropping the gate fails loudly."""
+        proc, argv, _, _ = self._run(rc=1, primary="0")
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_host_without_the_script_is_not_a_failure(self):
+        proc, argv, _, _ = self._run(rc=1, install_script=False)
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_script_runs_from_the_image_copy(self):
+        """The PVC copy under $TARGET_DIR is writable by the agent; the image copy is not."""
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        opener = lines.index(_TERMINAL_PIN_OPENER)
+        self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
+
+
+class A2AModeProbeTest(unittest.TestCase):
+    """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
+
+    The probe hands the operator's managed .env to Python and lets runtime_mode —
+    the one agent-side reader the mode spec allows — answer. Exit meanings:
+    0 next (overlay), 1 today or no managed scope (skip silently), 2 no readable
+    managed env (skip with a warning; on an operator-managed install that is a
+    fault the skill's silent absence would otherwise hide).
+
+    The parse is the strict KEY=value renderManagedEnv writes, never `.`-sourced:
+    the entrypoint is pid 1, and sourcing would execute whatever a value that
+    grew a space turned into. That property is asserted here, not just claimed.
+    """
+
+    def _probe(self, managed_env, pwned_marker=None, extra_env=None, reader=True):
+        """Run the real probe. `managed_env` is the .env body, or None for no file,
+        or ... (Ellipsis) for HERMES_MANAGED_DIR unset entirely.
+
+        `extra_env` adds process environment the container would have inherited.
+        `reader=False` drops runtime_mode off the path, standing in for a broken
+        image.
+        """
+        script = f"{_extract_shell_function('a2a_mode_probe')}\na2a_mode_probe\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            # The image runs the probe on $INSTALL_DIR's venv Python and imports
+            # runtime_mode from /opt/defaults/scripts; neither exists on a host.
+            # The venv is faked with a symlink and the module comes in through
+            # PYTHONPATH — sys.path.insert of an absent directory is harmless, so
+            # the probe under test is byte-identical to the one the image runs.
+            (tmp / ".venv" / "bin").mkdir(parents=True)
+            (tmp / ".venv" / "bin" / "python3").symlink_to(sys.executable)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "INSTALL_DIR": str(tmp),
+            }
+            if reader:
+                env["PYTHONPATH"] = str(_REPO / "agents" / "platform" / "scripts")
+            if extra_env:
+                env.update(extra_env)
+            if managed_env is not Ellipsis:
+                managed = tmp / "managed"
+                managed.mkdir()
+                env["HERMES_MANAGED_DIR"] = str(managed)
+                if managed_env is not None:
+                    body = managed_env
+                    if pwned_marker:
+                        body = body.replace("{MARKER}", str(pwned_marker))
+                    (managed / ".env").write_text(body, encoding="utf-8")
+            return subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
+            )
+
+    def test_next_answers_overlay(self):
+        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=next\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_today_answers_skip(self):
+        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_an_unrecognized_mode_fails_closed(self):
+        """runtime_mode's own rule, exercised through the probe: the dark stack
+        stays dark from both sides of the boundary."""
+        proc = self._probe("KUBEAGENTS_MODE=quantum\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_pin_free_env_reads_as_today(self):
+        proc = self._probe("API_SERVER_KEY=x\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_missing_managed_env_is_reported_not_conflated(self):
+        proc = self._probe(None)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_no_managed_scope_at_all_skips_silently(self):
+        """Unset HERMES_MANAGED_DIR is a non-operator start (compose, docker run),
+        not a fault — the same marker every other managed-scope step gates on."""
+        proc = self._probe(Ellipsis)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_the_inherited_container_env_cannot_decide_the_mode(self):
+        """The managed file is the ONLY delivery path, which is the spec's whole
+        point — one answer per agent, computed in one place.
+
+        This is not hypothetical: an AgentPlugin's spec.env is copied into the
+        agent container verbatim with no allowlist, so a plugin can put this key
+        in the process environment. Before os.environ.clear() the probe read it
+        whenever the file was silent, which made the plugin a second writer of a
+        decision the operator owns. Found by adversarial review before this
+        shipped.
+        """
+        # Key absent from the file entirely: the inherited value must not fill in.
+        proc = self._probe("API_SERVER_KEY=x\n", extra_env={"KUBEAGENTS_MODE": "next"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        # And the file still wins when the two disagree.
+        proc = self._probe(
+            "KUBEAGENTS_MODE=today\n", extra_env={"KUBEAGENTS_MODE": "next"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_malformed_line_is_skipped_not_called_unreadable(self):
+        """An empty key is not a pin. os.environ refuses one, and letting that
+        raise reported a perfectly readable file as missing."""
+        proc = self._probe("=x\nKUBEAGENTS_MODE=next\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_missing_reader_is_a_fault_not_a_decision(self):
+        """A broken image must not read as 'today' behind a bare traceback: the
+        skill would be silently absent with nothing saying why."""
+        proc = self._probe("KUBEAGENTS_MODE=next\n", reader=False)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_a_hostile_value_is_data_not_shell(self):
+        """The reason this is a parse and not a `.`: a value carrying a space and
+        a command must neither break the gate nor run."""
+        with tempfile.TemporaryDirectory() as outside:
+            marker = pathlib.Path(outside) / "pwned"
+            proc = self._probe(
+                "SLACK_HOME_CHANNEL_NAME=general chat; touch {MARKER}\n"
+                "KUBEAGENTS_MODE=next\n",
+                pwned_marker=marker,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(marker.exists(), "a managed .env value was executed")
+
+
+
+def _extract_nested_block(opener, indent, closer="fi"):
+    """Like `_extract_shell_block`, for a step written inside another block.
+
+    `opener` and `closer` are matched at exactly `indent` spaces and the block comes
+    back dedented by that much, so the shipped lines run at top level in a test shell.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    pad = " " * indent
+    starts = [i for i, line in enumerate(lines) if line == pad + opener]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one `{opener}` at indent {indent} in {_ENTRYPOINT}, found {len(starts)}")
+    start = starts[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == pad + closer:
+            block = lines[start : end + 1]
+            return "\n".join(line[indent:] if line.startswith(pad) else line for line in block) + "\n"
+    raise AssertionError(f"`{opener}` is never closed by `{closer}` at indent {indent} in {_ENTRYPOINT}")
+
+
+_JOURNAL_SCRIPT = _REPO / "deploy" / "shared" / "sqlite_journal_migrate.py"
+_JOURNAL_STEP_OPENER = (
+    'if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] '
+    '&& [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+)
+_JOURNAL_WAIT_OPENER = 'if [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+_JOURNAL_WAIT_INDENT = 8
+_DELETE_PIN = "database:\n  journal_mode: delete\n"
+
+
+def _wal_database(path):
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _header_versions(path):
+    with path.open("rb") as handle:
+        header = handle.read(100)
+    return header[18], header[19]
+
+
+class _JournalModeCase(unittest.TestCase):
+    """Shared staging for the two halves of the WAL-to-DELETE conversion.
+
+    The block is run with the real script and the real interpreter, reached through a
+    wrapper at the venv path the entrypoint hard-codes, so what is tested is the shipped
+    shell driving the shipped Python — not a stub of either.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.target = self.tmp / "data"
+        self.target.mkdir()
+        self.managed = self.tmp / "managed"
+        self.managed.mkdir()
+        self.invoked = self.tmp / "invoked"
+        self.python = self.tmp / "hermes" / ".venv" / "bin" / "python3"
+        self.python.parent.mkdir(parents=True)
+        self._install_python(f'exec "{sys.executable}" "$@"\n')
+
+    def _install_python(self, body):
+        self.python.write_text(f'#!/bin/sh\ntouch "{self.invoked}"\n{body}', encoding="utf-8")
+        self.python.chmod(0o755)
+
+    def pin(self, text=_DELETE_PIN):
+        (self.managed / "config.yaml").write_text(text, encoding="utf-8")
+
+    def env(self, managed=True, script=None):
+        env = {
+            **os.environ,
+            "TARGET_DIR": str(self.target),
+            "INSTALL_DIR": str(self.tmp / "hermes"),
+            "SQLITE_JOURNAL_MIGRATE_SCRIPT": str(script or _JOURNAL_SCRIPT),
+        }
+        env.pop("HERMES_MANAGED_DIR", None)
+        if managed:
+            env["HERMES_MANAGED_DIR"] = str(self.managed)
+        return env
+
+
+class JournalModeConversionStepTest(_JournalModeCase):
+    """Step 1.7: the owner converts the volume's databases out of WAL once, before step 2."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_JOURNAL_STEP_OPENER)
+
+    def _run(self, **env_kwargs):
+        return subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=self.env(**env_kwargs),
+        )
+
+    def test_the_owner_converts_a_wal_database_when_delete_is_pinned(self):
+        db = _wal_database(self.target / "profiles" / "platform" / "state.db")
+        self.pin()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertEqual(_header_versions(db), (1, 1), proc.stderr)
+        self.assertIn("converted to delete", proc.stderr, "the conversion has to reach the container log")
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_no_pin_leaves_the_database_in_wal(self):
+        db = _wal_database(self.target / "state.db")
+        self.pin("model:\n  default: x\n")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists(), "the gate is in the script; the step itself must still run")
+        self.assertEqual(_header_versions(db), (2, 2))
+
+    def test_no_managed_scope_means_the_step_does_not_run(self):
+        """Outside the operator nobody pins anything, and the step must not even try."""
+        db = _wal_database(self.target / "state.db")
+        proc = self._run(managed=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertEqual(_header_versions(db), (2, 2))
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_missing_script_is_skipped_not_fatal(self):
+        self.pin()
+        proc = self._run(script=self.tmp / "absent.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_conversion_that_fails_warns_and_start_up_continues(self):
+        """Best-effort: the volume is no worse than WAL left it, and the next start retries."""
+        self._install_python("exit 3\n")
+        self.pin()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("exit 3", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_step_sits_between_the_bootstrap_lock_and_the_default_sync(self):
+        """After the lock, so one container converts; before step 2, which opens databases."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        lock = text.index("flock -w 300 9")
+        step = text.index(_JOURNAL_STEP_OPENER)
+        sync = text.index("# 2. Sync default agent files")
+        self.assertLess(lock, step)
+        self.assertLess(step, sync)
+
+    def test_the_script_path_is_named_once_and_used_by_both_halves(self):
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertEqual(text.count('SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"'), 1)
+        self.assertIn(_JOURNAL_WAIT_OPENER, text)
+        self.assertLess(text.index(_JOURNAL_WAIT_OPENER), text.index(_JOURNAL_STEP_OPENER))
+
+
+class JournalModeWaitTest(_JournalModeCase):
+    """The non-owner's bounded wait for step 1.7.
+
+    A sidecar that opens a database while the owner is converting it is exactly the
+    concurrent opener the conversion refuses to run under, so the two would settle into
+    "left in WAL" on every start. The wait holds the sidecar back, ends as soon as the
+    headers flip, and proceeds anyway at the budget, like the config wait beside it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_nested_block(_JOURNAL_WAIT_OPENER, _JOURNAL_WAIT_INDENT)
+
+    def _run(self, wait_secs=30, convert_after=None, timeout=None, **env_kwargs):
+        """Run the wait with `_wait_secs` already parsed, the way the branch above it does.
+
+        `convert_after`, in seconds, runs the real conversion from a timer thread — the
+        owner finishing step 1.7 while this container waits.
+        """
+        timer = None
+        if convert_after is not None:
+            timer = threading.Timer(
+                convert_after,
+                lambda: subprocess.run(
+                    [sys.executable, str(_JOURNAL_SCRIPT), "--agent-home", str(self.target),
+                     "--managed-config", str(self.managed / "config.yaml")],
+                    check=True,
+                    capture_output=True,
+                    timeout=60,
+                ),
+            )
+            timer.start()
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n_wait_secs={wait_secs}\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=timeout if timeout is not None else wait_secs + 60,
+                env=self.env(**env_kwargs),
+            )
+        finally:
+            if timer is not None:
+                timer.cancel()
+        return proc, time.monotonic() - started
+
+    def test_a_volume_with_nothing_to_convert_is_not_waited_for(self):
+        """The steady state: every restart after the conversion must not pause."""
+        _wal_database(self.target / "notepad.db")  # not governed
+        self.pin()
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertLess(elapsed, 20)
+
+    def test_the_wait_ends_as_soon_as_the_owner_has_converted(self):
+        _wal_database(self.target / "state.db")
+        self.pin()
+        proc, elapsed = self._run(wait_secs=60, convert_after=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("waiting up to 60s", proc.stderr)
+        self.assertIn("conversion finished after", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertLess(elapsed, 30, f"the wait polls; taking the budget means it is a sleep:\n{proc.stderr}")
+
+    def test_a_conversion_that_never_comes_starts_the_process_anyway(self):
+        """Bounded: a non-owner that never starts is worse than one that starts early."""
+        db = _wal_database(self.target / "state.db")
+        self.pin()
+        proc, _ = self._run(wait_secs=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("still reads WAL after 2s", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertEqual(_header_versions(db), (2, 2), "the waiter converted the database itself")
+
+    def test_no_pin_means_no_wait_however_many_databases_read_wal(self):
+        _wal_database(self.target / "state.db")
+        self.pin("model:\n  default: x\n")
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertLess(elapsed, 20)
+
+    def test_a_missing_managed_config_means_no_wait(self):
+        """The config wait above already covers a scope that has not arrived."""
+        _wal_database(self.target / "state.db")
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertLess(elapsed, 20)
+
+    def test_a_host_without_the_interpreter_does_not_wait(self):
+        _wal_database(self.target / "state.db")
+        self.pin()
+        self.python.unlink()
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertLess(elapsed, 20)
+
+    def test_the_wait_is_inside_the_non_owner_branch(self):
+        """It is the sidecar that waits; the owner is the one being waited for."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        disowns = text.index(f'echo "[ENTRYPOINT] \'$*\' {_DISOWNS}')
+        wait = text.index(_JOURNAL_WAIT_OPENER)
+        gate_end = text.index("# 1.55 Check the image's skill trees")
+        self.assertLess(disowns, wait)
+        self.assertLess(wait, gate_end)
 
 
 if __name__ == "__main__":

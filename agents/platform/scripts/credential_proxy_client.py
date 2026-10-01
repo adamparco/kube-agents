@@ -4,22 +4,724 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import http.client
 import json
 import os
+import re
+import stat
 import sys
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
 
 
+# What this client may be invoked *as*, which is a different list from what the
+# broker may run. `CommandExecutor.ALLOWED_EXECUTABLES` is derived from the
+# forges an install configured, so a forge CLI appears there and only there:
+# the broker is where that CLI runs. The overlap is not an invariant and these
+# two lists are not to be folded together.
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+
+# How long to wait to reach the broker. Bounds the connect only — see
+# BrokerConnection.
+BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
+
+# `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
+# `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
+# scope key in a log line and a filename in the broker's state dir. `fullmatch`
+# at the call site says the same thing twice on purpose: whichever a later
+# reader changes, the other still holds.
+_GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+
+# Enough for any real kubeconfig; the point is that the file is read into
+# memory before anything is known about it.
+MAX_KUBECONFIG_BYTES = 1 << 20
+
+# The broker's read-only Cloud API relay: `GET {broker}/v1/gcp/<host>/<path>`
+# forwards a permitted Google API read on the broker's credential. Declared
+# here rather than in the broker because both sides spell it and this is the
+# module both import; `credential_proxy` re-exports it. `ApiSession` below is
+# the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
+API_RELAY_PREFIX = "/v1/gcp/"
+
+# Where a `get-credentials` that named no destination leaves its file:
+# `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
+# the convention agents/platform/AGENTS.md ("Cluster Credentials") teaches and
+# `platform_mcp_server._thread_kubeconfig_path` owns. The default home is the
+# one that convention spells as `${HERMES_HOME:-/opt/data}`.
+DEFAULT_HERMES_HOME = "/opt/data"
+KUBECONFIG_DIR_NAME = ".kubeconfigs"
+# What a workspace `open` labels itself with, so the broker's log can say who
+# holds a slot when the store is full: the kanban card first, the session
+# otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
+# outside it is dropped rather than sent, because a label is a courtesy to the
+# log and must never be what fails an open.
+CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
+CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
+PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
+
+# A shell's context pin: which cluster the last context-less `get-credentials`
+# in this command line fetched, so a context-less `kubectl` later in the same
+# line reaches it -- `get-credentials seeded-a && kubectl get ...`, the shape
+# #1968's workers ran. Kept under the kubeconfig directory because
+# sandbox_mirror already excludes that from the profile mirror, and holding a
+# context name and nothing else.
+#
+# Keyed on the nearest shell above the `get-credentials` -- stepping over a
+# `timeout`, `xargs` or helper -- by its pid and its
+# start time from /proc, so a recycled pid is a different key. Hermes runs
+# every terminal command in a fresh `bash -c`, so the pin lasts exactly one
+# command line: the next command, a resumed card and another worker all have a
+# different shell and see none of it. A backgrounded `( ... ) &` subshell of
+# two or more commands is a shell of its own and pins alone; bash execs a
+# one-command `( get-credentials x ) &`, so that fetch pins the line's shell,
+# the same as without the parentheses.
+SHELL_CONTEXT_DIR_NAME = "shells"
+SHELL_CONTEXT_SUFFIX = ".context"
+# A GKE context name is under 200 characters; anything longer is not one.
+MAX_SHELL_CONTEXT_BYTES = 512
+PROC_ROOT = Path("/proc")
+# /proc/<pid>/stat fields, counted from the one after the `)` that closes the
+# command name (which may itself hold spaces and parentheses): the parent pid
+# is field 4 and the start time field 22, so 1 and 19 here.
+_STAT_PPID_INDEX = 1
+_STAT_STARTTIME_INDEX = 19
+# How far up a kubectl looks for a pin. `$(kubectl ...)`, a pipeline, a loop
+# or `timeout`/`xargs` puts one or two processes between the shell and
+# kubectl; this is a bound on a walk, not a depth anything reaches.
+MAX_SHELL_ANCESTORS = 16
+# The process names a pin may be keyed on: the shells a command line runs in.
+# Only these are keys: the walk steps over any other process without keying it.
+SHELL_COMMAND_NAMES = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "ash"})
+_SHELL_CONTEXT_FILE = re.compile(r"^([0-9]+)-([0-9]+)\.context\Z")
+
+# kubectl stops reading its own flags here; what follows belongs to the
+# command `kubectl exec` or `kubectl debug` runs.
+END_OF_FLAGS = "--"
+CONTEXT_FLAG = "--context"
+KUBECONFIG_FLAG = "--kubeconfig"
+
+
+class BrokerConnection(http.client.HTTPConnection):
+    """Bound how long we wait to reach the broker, not how long it works.
+
+    A plain ``urlopen(request, timeout=N)`` sets one socket timeout for the
+    whole exchange, which would put a ceiling on the command as well as on the
+    connect. That ceiling must not exist: Envoy routes /v1/exec with
+    ``timeout: 0s`` deliberately, because a proxied ``gcloud container clusters
+    get-credentials`` or a large ``git clone`` legitimately runs for minutes.
+
+    Before the split there was no need for either — the broker was on the Pod's
+    own loopback, so a connect either succeeded or was refused at once. Now the
+    call crosses a Service. A Pending broker still fails fast, with
+    ``[Errno 111] Connection refused`` from a Service that has no endpoints;
+    what hangs is a SYN that is dropped rather than rejected, which is exactly
+    what a default-deny egress policy does. So: a timeout while connecting, and
+    none once connected.
+    """
+
+    def connect(self) -> None:
+        self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
+        super().connect()
+        self.sock.settimeout(None)
+
+
+class _BrokerHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(BrokerConnection, req)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect out of the broker.
+
+    urllib re-sends the Authorization header across a cross-host redirect, so
+    a 302 in a broker response would hand the projected token to wherever the
+    Location points. Only reachable by something that already controls the
+    broker's responses, but the header is the one thing worth not leaking on
+    the way out.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+# A private opener rather than urllib.request.install_opener: this module is
+# imported by github_token_refresh and the two relay patches, and a global
+# opener would strip the total timeouts their own urlopen calls rely on.
+_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
+
+
+def open_broker_request(request: urllib.request.Request):
+    """Send `request` to the broker with a bounded connect."""
+    return _BROKER_OPENER.open(request)
+
+
+class TokenUnavailable(Exception):
+    """The configured caller token could not be read."""
+
+
+def authorization_headers() -> dict[str, str]:
+    """Return the credential that identifies this caller to the broker.
+
+    The operator projects a ServiceAccount token with the broker's audience into
+    every container that may call, and points CREDENTIAL_PROXY_TOKEN_FILE at it.
+    Empty when that variable is unset, which is a misconfiguration rather than a
+    layout: the broker is on a ClusterIP and authenticates every caller by
+    TokenReview, so a request with no header earns a 401 that says so.
+
+    Read on every invocation, never cached: the kubelet rewrites a projected
+    token in place as it approaches expiry, and this process is short-lived
+    enough that re-reading costs nothing.
+    """
+    token_file = os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "").strip()
+    if not token_file:
+        return {}
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise TokenUnavailable(f"{token_file}: {exc.strerror or exc}") from exc
+    if not token:
+        raise TokenUnavailable(f"{token_file} is empty")
+    return {"Authorization": f"Bearer {token}"}
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. `git` and `gh` ignore the variable, so
-# forwarding it to them buys nothing and costs plenty — the server rejects an
-# out-of-workspace path rather than ignoring it, which would turn a stray
-# KUBECONFIG into a 400 on a command that has nothing to do with Kubernetes.
+# resolving it for them buys nothing and costs plenty — an unreadable kubeconfig
+# is a hard failure, which would turn a stray KUBECONFIG into a refused `gh pr
+# create`.
 KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
+
+# Flags whose value may be `-`, meaning "read the document from stdin". This is
+# the whole list the shipped skills use: kubectl's `-f`/`--filename` and
+# `--patch-file`, and gh's `--body-file`.
+#
+# `gh`'s `-F` short form is deliberately absent, and every caller that used to
+# pass it now spells `--body-file` instead. It is not a synonym: `gh api -F
+# key=value` sets a typed field, so matching it here would forward fd 0 for an
+# API call that never asked for it. When a new call site needs a document from
+# stdin, widen it to the long flag rather than adding the short one.
+STDIN_FILE_FLAGS = frozenset({"-f", "--filename", "--patch-file", "--body-file"})
+
+
+def reads_stdin(argv: list[str]) -> bool:
+    """Whether this argv asks, explicitly, to read a document from stdin.
+
+    The shim has never forwarded stdin, and the comment in `__main__` gives the
+    reason: an MCP or other stdio-based parent may have a protocol stream on
+    fd 0, and consuming it would break the parent rather than the command. That
+    reason is sound and this does not overrule it -- it narrows it. Reading fd 0
+    only when a flag in `STDIN_FILE_FLAGS` is followed by a bare `-` means the
+    read happens when the caller wrote `kubectl apply -f -` and at no other
+    time, and no MCP server is invoked that way.
+
+    The consequence of getting this wrong is asymmetric and the narrow form errs
+    the safe way: reading when we should not corrupts a parent's protocol
+    stream, while not reading when we should leaves the command receiving an
+    empty document -- which is exactly the behaviour today.
+    """
+    for index, token in enumerate(argv):
+        if token in STDIN_FILE_FLAGS and index + 1 < len(argv) and argv[index + 1] == "-":
+            return True
+        if "=" in token:
+            flag, _, value = token.partition("=")
+            if flag in STDIN_FILE_FLAGS and value == "-":
+                return True
+    return False
+
+
+@dataclass(frozen=True)
+class ClusterTarget:
+    """A GKE cluster identified well enough to re-fetch credentials for it."""
+
+    project: str
+    location: str
+    cluster: str
+
+    @property
+    def context_name(self) -> str:
+        return f"gke_{self.project}_{self.location}_{self.cluster}"
+
+
+def parse_gke_context(context: str) -> ClusterTarget | None:
+    """Recover the cluster triple from a `gke_<project>_<location>_<cluster>` name.
+
+    This is the same convention the operator builds in `buildCredentialProxyEnv`
+    and the Cluster Agent preflight compares against, and it is what makes the
+    broker's regeneration possible: the context name alone says which cluster to
+    ask Google for. Underscores are the separator and none of the three
+    components may contain one, so a 4-way split is unambiguous.
+
+    Each component is held to the GKE naming rules, which is also what keeps the
+    value safe to use in a filename — no separators, no dots, no traversal, and
+    no newline, which `$` would have let through and `context_name` would then
+    have carried into a path and a log record.
+    """
+    parts = context.split("_", 3)
+    if len(parts) != 4 or parts[0] != "gke":
+        return None
+    project, location, cluster = parts[1], parts[2], parts[3]
+    if not all(
+        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (project, location, cluster)
+    ):
+        return None
+    return ClusterTarget(project=project, location=location, cluster=cluster)
+
+
+def read_current_context(text: str) -> str | None:
+    """Read `current-context` out of a kubeconfig the way kubectl would.
+
+    `yaml.safe_load`, deliberately, and never `yaml.CSafeLoader`. The C loader
+    recurses in C, so a deeply nested document exits on SIGSEGV where the
+    pure-Python loader raises a catchable `RecursionError`. `safe_load` picks
+    the Python loader on its own; the point of saying so is that switching it
+    would be a denial of service rather than an optimisation.
+
+    Alias expansion is not a concern here. PyYAML resolves every reference to an
+    anchor to the same node and caches the object built from it, so a
+    billion-laughs document costs memory proportional to its own size rather
+    than to its nominal expansion.
+
+    Anything else — a syntax error, several documents, a top level that is not a
+    mapping, a non-string `current-context` — reads as absent, and the caller
+    turns that into a rejection.
+    """
+    import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+
+    try:
+        document = yaml.safe_load(text)
+    except (yaml.YAMLError, RecursionError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    context = document.get("current-context")
+    if not isinstance(context, str):
+        return None
+    return context.strip() or None
+
+
+class KubeconfigUnreadable(RuntimeError):
+    """A kubeconfig was named, and no cluster name could be taken from it."""
+
+
+def kubeconfig_context(kubeconfig: str) -> str:
+    """The GKE context a local kubeconfig pins, to send in the file's place.
+
+    The broker is in another pod and cannot open this file. It also should not:
+    a kubeconfig is not passive data — `users[].user.exec.command` names a
+    program to run, `clusters[].cluster.server` and `proxy-url` choose where the
+    access token is sent, and `users[].user.tokenFile` reads a file of the
+    author's choosing and sends it as the bearer token. The agent writes this
+    file, so parsing it beside the credentials was the thing worth avoiding, and
+    the pod boundary now makes it impossible rather than merely discouraged.
+
+    What crosses instead is the one string the broker ever took from it. The
+    broker holds that string to `parse_gke_context` and regenerates every other
+    field with `gcloud container clusters get-credentials`, so naming a cluster
+    is all the authority this hands the caller — and `get-credentials` is bound
+    by the same IAM the broker already runs under.
+
+    Raises rather than returning None. A kubeconfig that cannot be read is a
+    request whose target cluster is unknown, and running it anyway means running
+    it against the broker's own default cluster: the wrong cluster, silently.
+    """
+    entries = [entry.strip() for entry in kubeconfig.split(os.pathsep) if entry.strip()]
+    if not entries:
+        raise KubeconfigUnreadable("KUBECONFIG is set but empty")
+    if len(entries) > 1:
+        raise KubeconfigUnreadable(
+            "KUBECONFIG must name a single file; merged lists are not supported"
+        )
+    candidate = Path(entries[0])
+    try:
+        if candidate.stat().st_size > MAX_KUBECONFIG_BYTES:
+            raise KubeconfigUnreadable(f"kubeconfig is implausibly large: {candidate}")
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise KubeconfigUnreadable(f"kubeconfig is unreadable: {candidate}: {exc}") from exc
+    context = read_current_context(text)
+    if not context:
+        raise KubeconfigUnreadable(f"kubeconfig names no current-context: {candidate}")
+    if parse_gke_context(context) is None:
+        raise KubeconfigUnreadable(
+            f"current-context {context!r} is not a GKE context name"
+            " (expected gke_<project>_<location>_<cluster>)"
+        )
+    return context
+
+
+def resolve_kubeconfig_flags(argv: list[str]) -> list[str]:
+    """Rewrite any `--kubeconfig <path>` in argv to the context that path pins.
+
+    The flag is the second door into cluster selection and beats the environment
+    in kubectl's own precedence, so it has to be translated here for the same
+    reason the environment is: the path names a file only this pod has. The
+    broker resolves whichever it receives through the same regeneration.
+    Stops at `--`, as `kubectl_context_flag` does: a `--kubeconfig` after it
+    belongs to the command `kubectl exec` runs, names no file of this pod's,
+    and is passed through untouched.
+    """
+    rewritten = list(argv)
+    for index, argument in enumerate(rewritten):
+        if argument == END_OF_FLAGS:
+            break
+        if argument == KUBECONFIG_FLAG and index + 1 < len(rewritten):
+            rewritten[index + 1] = kubeconfig_context(rewritten[index + 1])
+        elif argument.startswith(f"{KUBECONFIG_FLAG}="):
+            _, _, value = argument.partition("=")
+            rewritten[index] = f"{KUBECONFIG_FLAG}={kubeconfig_context(value)}"
+    return rewritten
+
+
+def names_kubeconfig_flag(argv: list[str]) -> bool:
+    """Whether argv carries a `--kubeconfig` of its own, in either spelling."""
+    for argument in argv:
+        if argument == END_OF_FLAGS:
+            return False
+        if argument == KUBECONFIG_FLAG or argument.startswith(f"{KUBECONFIG_FLAG}="):
+            return True
+    return False
+
+
+def kubectl_context_flag(argv: list[str]) -> str | None:
+    """The `--context` a kubectl argv names, the last one winning as in kubectl.
+
+    Stops at `--`: after it the words are the remote command's, and a
+    `kubectl exec pod -- tool --context x` names no context of kubectl's.
+    """
+    context: str | None = None
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == END_OF_FLAGS:
+            break
+        if argument == CONTEXT_FLAG and index + 1 < len(argv):
+            context = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith(f"{CONTEXT_FLAG}="):
+            context = argument.partition("=")[2]
+        index += 1
+    return context
+
+
+def kubeconfig_dir() -> Path:
+    """`$HERMES_HOME/.kubeconfigs`, read at call time so the session decides."""
+    home = os.environ.get("HERMES_HOME", "").strip() or DEFAULT_HERMES_HOME
+    return Path(home) / KUBECONFIG_DIR_NAME
+
+
+def per_target_kubeconfig_path(target: ClusterTarget) -> Path:
+    """The per-target file AGENTS.md tells the agent to export.
+
+    Built from a `ClusterTarget`, so every component has already passed
+    `parse_gke_context` and none can steer the path.
+    """
+    return kubeconfig_dir() / PER_TARGET_KUBECONFIG_NAME.format(
+        project=target.project, cluster=target.cluster, location=target.location
+    )
+
+
+def _process_stat(pid: int) -> tuple[int, str, str] | None:
+    """`(parent pid, start time, command name)` for `pid`, or None once it has exited."""
+    try:
+        raw = (PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    close = raw.rfind(")")
+    comm = raw[raw.find("(") + 1 : close]
+    fields = raw[close + 1 :].split()
+    try:
+        return int(fields[_STAT_PPID_INDEX]), fields[_STAT_STARTTIME_INDEX], comm
+    except (IndexError, ValueError):
+        return None
+
+
+def _shell_keys() -> list[str]:
+    """`<pid>-<start time>` for the shells this process runs under, nearest first.
+
+    The walk starts at the parent and steps over anything that is not a shell
+    -- `timeout`, `xargs`, a helper script -- without keying it, so recording
+    and reading agree: a `timeout 60 gcloud ... get-credentials` records under
+    the line's shell, replacing whatever an earlier fetch in the line recorded,
+    and a `timeout 30 kubectl` under that shell reads it.
+
+    Only shells are keys. sshd, which outlives every command line on a Hermes
+    ControlMaster connection, is never one, so a pin file named for it is never
+    read, and a default cannot outlast the line the way #1799's did. The cost:
+    a helper that bash exec'd as the last command of a bare `bash -c` keeps the
+    shell's pid but not its name, so a kubectl it starts reads the host. The
+    Hermes command wrapper runs the command inside an `eval` that is not its
+    last line, so bash does not exec it there.
+    """
+    keys: list[str] = []
+    pid = os.getppid()
+    for _ in range(MAX_SHELL_ANCESTORS):
+        if pid <= 1:
+            break
+        stat = _process_stat(pid)
+        if stat is None:
+            break
+        if stat[2] in SHELL_COMMAND_NAMES:
+            keys.append(f"{pid}-{stat[1]}")
+        pid = stat[0]
+    return keys
+
+
+def _own_key() -> str | None:
+    """This process's own key, which is its shell's when the shell exec'd it.
+
+    bash replaces itself with the last command of a `-c` string, an `eval` or a
+    subshell instead of forking it, so in `get-credentials x ; kubectl ...` the
+    kubectl *is* the shell that ran the get-credentials: same pid, same start
+    time, and a parent above the command line.
+    """
+    pid = os.getpid()
+    stat = _process_stat(pid)
+    return f"{pid}-{stat[1]}" if stat is not None else None
+
+
+def _shell_context_dir() -> Path:
+    return kubeconfig_dir() / SHELL_CONTEXT_DIR_NAME
+
+
+def _prune_shell_contexts(directory: Path, keep: str) -> None:
+    """Remove the pins of shells that have exited, except `keep`. Best-effort.
+
+    A pin is only ever read by its own shell's descendants, so once that shell
+    is gone the file is dead weight; clearing it here, on the next write, keeps
+    the directory to roughly the shells alive at once without a sweep.
+    """
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        match = _SHELL_CONTEXT_FILE.fullmatch(entry.name)
+        if match is None or entry.name == keep:
+            continue
+        stat = _process_stat(int(match.group(1)))
+        if stat is not None and stat[1] == match.group(2):
+            continue
+        try:
+            entry.unlink()
+        except OSError:
+            pass
+
+
+def _replace_file(path: Path, text: str) -> None:
+    """Write `text` to `path` so a concurrent reader sees the old file or the new.
+
+    A plain truncate-and-write leaves a window where the file is empty: a
+    kubectl reading the shell's pin in it falls back to the host with exit 0, and
+    one exporting the per-target kubeconfig, or a Cluster Agent's pinned
+    `--kubeconfig`/`KUBECONFIG` destination, fails as unreadable. Both are the
+    failures this module exists to prevent, so the file is staged beside its
+    destination and renamed over it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, staged = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(staged, path)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
+
+
+def record_shell_context(context: str) -> bool:
+    """Make `context` this command line's default for a kubectl naming no cluster.
+
+    What gcloud does on a workstation -- the cluster you just fetched is
+    current -- for the rest of the shell that fetched it and nothing else, so
+    it never becomes the pod's default: the drift #1799 reported, which #1852
+    closed by pinning the broker to the host cluster. The next command line, a
+    resumed card or a multi-command parallel subshell has another shell, and a
+    context-less kubectl there reads the host cluster exactly as #1852 left it.
+
+    Returns whether the pin was recorded. Failing to record it costs the
+    convenience, not the command, so it is reported and not raised.
+    """
+    keys = _shell_keys()
+    if not keys:
+        return False
+    directory = _shell_context_dir()
+    path = directory / f"{keys[0]}{SHELL_CONTEXT_SUFFIX}"
+    try:
+        _replace_file(path, context)
+    except OSError as exc:
+        print(f"credential proxy: could not record the shell's context in {path}: {exc}", file=sys.stderr)
+        # An earlier fetch's pin in this shell would otherwise stay in force
+        # while the caller says the line reads the host.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    _prune_shell_contexts(directory, keep=path.name)
+    return True
+
+
+def shell_context() -> str | None:
+    """The context the nearest enclosing shell's context-less get-credentials fetched.
+
+    The file is the agent's to write, so what it holds is caller input like any
+    other: it crosses only as a name, and only a name `parse_gke_context`
+    accepts. Naming a cluster is what `KUBECONFIG` already lets a caller do.
+
+    Only a pin this uid wrote counts. The hermes principal runs with
+    HERMES_HOME=/opt/data, a directory the sandboxed agent owns; a pin the
+    agent planted there under a hermes shell's key would otherwise steer a
+    trusted kubectl. The open refuses a symlink and the file must be a regular
+    file with one link, owned by this uid, which a file the agent made is not.
+    """
+    directory = _shell_context_dir()
+    own = _own_key()
+    uid = os.geteuid()
+    for key in ([own] if own else []) + _shell_keys():
+        try:
+            # O_NONBLOCK: a FIFO planted under the name would otherwise hold
+            # open() until a writer appears, before fstat can refuse it.
+            fd = os.open(
+                directory / f"{key}{SHELL_CONTEXT_SUFFIX}",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1:
+                return None
+            raw = stream.read(MAX_SHELL_CONTEXT_BYTES + 1)
+        if len(raw) > MAX_SHELL_CONTEXT_BYTES:
+            return None
+        context = raw.decode("utf-8", errors="replace").strip()
+        return context if parse_gke_context(context) is not None else None
+    return None
+
+
+def implicit_kubectl_context(argv: list[str]) -> str:
+    """The cluster a kubectl that names no kubeconfig should reach, or "".
+
+    Only reached when neither `--kubeconfig` nor `KUBECONFIG` is set: those
+    pin a cluster already and keep precedence, so a Cluster Agent's pinned
+    file is never overridden from here.
+
+    `--context` first. The broker runs a context-less request against the host
+    cluster's file, which holds the host context alone, so a `--context` naming
+    any other cluster used to end in "context was not found". Sending the name
+    instead has the broker generate that cluster's file, whose one context is
+    the one the flag names. A `--context` that is not a GKE name is left to
+    kubectl, as before.
+
+    Then the shell's pin, when there is no `--context` at all. Empty otherwise,
+    which is the broker's host default.
+    """
+    flag = kubectl_context_flag(argv)
+    if flag is not None:
+        return flag if parse_gke_context(flag) is not None else ""
+    return shell_context() or ""
+
+
+def land_implicit_kubeconfig(generated: str) -> None:
+    """File a context-less get-credentials' kubeconfig, and say how to use it.
+
+    gcloud on a workstation would have written the default kubeconfig and made
+    the fetched cluster current. Here that default is the broker's, pinned to
+    the host cluster (#1852), so without this the file vanished into the
+    broker's pod and the agent's next bare `kubectl` read the host -- exit 0,
+    an empty answer, and a fixture reported absent that was there.
+
+    The context comes from what the broker returned, not from argv: gcloud
+    resolves an omitted `--project` or a `--zone`/`--region` spelling itself,
+    and the file is the only place the answer is written down.
+
+    Never changes the exit code. gcloud succeeded, and `--context` reaches the
+    cluster whether or not the file could be written here.
+    """
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return
+    path = per_target_kubeconfig_path(target)
+    written = True
+    try:
+        _replace_file(path, generated)
+    except OSError as exc:
+        written = False
+        print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
+    pinned = record_shell_context(target.context_name)
+    lines = ["credential proxy: no --kubeconfig or KUBECONFIG was given."]
+    if written:
+        lines.append(f"  Credentials for {target.context_name} are in {path}.")
+    if pinned:
+        lines.append(
+            "  For the rest of this command line, a kubectl that names no cluster"
+            f" reads {target.context_name}. Later commands read the host cluster;"
+            f" to reach {target.context_name} from them:"
+        )
+    else:
+        lines.append(
+            "  A kubectl that names no cluster still reads the host cluster."
+            f" To reach {target.context_name}:"
+        )
+    if written:
+        lines.append(f"    export KUBECONFIG={path}")
+    lines.append(f"    kubectl --context={target.context_name} ...")
+    print("\n".join(lines), file=sys.stderr)
+
+
+def is_get_credentials(argv: list[str]) -> bool:
+    """Is this the one command that legitimately authors a kubeconfig?
+
+    Matched on the subcommand sequence rather than on position, so global flags
+    may appear anywhere ahead of it.
+    """
+    if not argv or argv[0] != "gcloud":
+        return False
+    try:
+        index = argv.index("container")
+    except ValueError:
+        return False
+    return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None]:
+    """Take the `--kubeconfig` off a get-credentials argv, keeping where it pointed.
+
+    This one command writes a kubeconfig rather than reading one, so the flag
+    cannot be resolved to a context name — the file does not exist yet, and the
+    cluster it will name is in the rest of the argv. The path also cannot be
+    forwarded: it is a path in this pod, and gcloud runs in the broker's. So the
+    flag comes off, the broker returns the file it generated, and `execute`
+    writes it here.
+
+    Falls back to `$KUBECONFIG`, which is where a Cluster Agent profile's pin
+    lives when the caller did not name one.
+    """
+    stripped: list[str] = []
+    destination: str | None = None
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--kubeconfig" and index + 1 < len(argv):
+            destination = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith("--kubeconfig="):
+            destination = argument.split("=", 1)[1]
+            index += 1
+            continue
+        stripped.append(argument)
+        index += 1
+    if destination is None:
+        destination = os.environ.get("KUBECONFIG", "").strip() or None
+    return stripped, Path(destination) if destination else None
 
 
 def execute(
@@ -27,36 +729,71 @@ def execute(
     argv: list[str],
     stdin: str | None = None,
 ) -> int:
+    # No `cwd`. The broker resolves a path against its own filesystem, and it
+    # has no view of this one — so a directory sent from here would name either
+    # nothing or, worse, a same-named directory of the broker's. Every command
+    # runs at the broker's own workspace root instead.
+    #
+    # KUBECONFIG is the one thing an agent legitimately steers with a path:
+    # Cluster Agent profiles pin themselves to a target cluster through it (see
+    # agents/cluster/config.yaml). It survives the pod boundary by being
+    # resolved to a context name here rather than forwarded as a path.
+    # Whitespace is stripped because profile .env files routinely carry a
+    # trailing newline.
+    #
+    # With neither set, a get-credentials still asks for its file back and a
+    # kubectl may still name a cluster: see `land_implicit_kubeconfig` and
+    # `implicit_kubectl_context` for why, and for what keeps #1852's host
+    # default for everything that names nothing.
+    destination: Path | None = None
+    implicit_destination = False
+    try:
+        context = ""
+        if is_get_credentials(argv):
+            argv, destination = get_credentials_destination(argv)
+            implicit_destination = destination is None
+        elif argv and argv[0] in KUBECONFIG_AWARE:
+            flag_pinned = names_kubeconfig_flag(argv)
+            argv = resolve_kubeconfig_flags(argv)
+            kubeconfig = os.environ.get("KUBECONFIG", "").strip()
+            if kubeconfig:
+                context = kubeconfig_context(kubeconfig)
+            elif argv[0] == "kubectl" and not flag_pinned:
+                context = implicit_kubectl_context(argv)
+    except KubeconfigUnreadable as exc:
+        print(f"credential proxy: {exc}", file=sys.stderr)
+        return 1
+
     request_payload = {
         "requestId": str(uuid.uuid4()),
         "argv": argv,
-        "cwd": os.getcwd(),
     }
-    # The command runs in the sidecar, so the caller's environment is not
-    # inherited. KUBECONFIG is the one variable an agent legitimately needs to
-    # steer: Cluster Agent profiles pin themselves to a target cluster with it
-    # (see agents/cluster/config.yaml). Forward the path and let the server
-    # decide whether it is acceptable — it only honours paths inside the shared
-    # workspace. Whitespace is stripped because profile .env files routinely
-    # carry a trailing newline.
-    if argv and argv[0] in KUBECONFIG_AWARE:
-        kubeconfig = os.environ.get("KUBECONFIG", "").strip()
-        if kubeconfig:
-            request_payload["kubeconfig"] = kubeconfig
+    if context:
+        request_payload["kubeconfigContext"] = context
+    if destination is not None or implicit_destination:
+        request_payload["wantsKubeconfig"] = True
     if stdin is not None:
         request_payload["stdin"] = stdin
     body = json.dumps(
         request_payload,
         separators=(",", ":"),
     ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers.update(authorization_headers())
+    except TokenUnavailable as exc:
+        # Sending the request anyway would earn an undifferentiated 401 and
+        # hide the real fault, which is a broken token projection.
+        print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
+        return 1
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/v1/exec",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request) as response:
+        with open_broker_request(request) as response:
             payload = json.load(response)
     except urllib.error.HTTPError as exc:
         # The proxy's own errors are JSON, but the error can also come from
@@ -88,7 +825,504 @@ def execute(
     sys.stderr.write(payload.get("stderr", ""))
     if payload.get("truncated"):
         print("credential proxy output truncated", file=sys.stderr)
+    generated = payload.get("kubeconfig")
+    if implicit_destination and generated:
+        land_implicit_kubeconfig(generated)
+    if destination is not None and generated:
+        # gcloud's own output, written where gcloud would have written it had it
+        # run here. The agent never runs a command against this file — a later
+        # kubectl names the cluster and the broker regenerates from that name —
+        # so this is the visible pin `cluster_agent_profile.py` records and the
+        # Cluster Agent preflight stats, and nothing more.
+        try:
+            _replace_file(destination, generated)
+        except OSError as exc:
+            print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
+            return 1
     return int(payload.get("exitCode", 1))
+
+
+class WorkspaceUnavailable(RuntimeError):
+    """The broker does not have content workspaces armed."""
+
+
+class BrokerDisconnected(RuntimeError):
+    """The connection broke after the request was on the wire.
+
+    Distinct from `urllib.error.URLError`, which `urllib` raises for a send
+    that never landed. Only `h.request(...)` is wrapped in it; `getresponse()`
+    and the body read after it are not, and `BrokerConnection.connect` clears
+    the socket timeout once connected — so a broker evicted or rolled
+    mid-request raises `http.client.RemoteDisconnected`, `IncompleteRead` or a
+    bare `ConnectionResetError` out of the read, none of them a `URLError`.
+
+    Translated here rather than caught by the caller because this module owns
+    the transport: `vcs_client` must import no network client of its own, and
+    `test_vcs.test_the_only_network_client_is_the_broker` holds it to that.
+
+    The two are worth telling apart downstream. A send that never landed
+    changed nothing; a connection that broke mid-answer may have been acted on
+    at the far end, and a retry has to be written knowing that.
+    """
+
+
+class WorkspaceRequestError(RuntimeError):
+    """The broker refused. `status` and `payload` carry its answer verbatim."""
+
+    def __init__(self, status: int, payload: dict) -> None:
+        # Two spellings of the same field, because the broker has two error
+        # shapes: a refusal from `ContentWorkspaceError` answers `{status,
+        # code, message}`, while a malformed body answers `{error}`. Reading
+        # only one of them would render half the broker's refusals as the
+        # generic fallback below, which is the sentence that tells a caller
+        # nothing.
+        super().__init__(
+            payload.get("message")
+            or payload.get("error")
+            or f"workspace request failed ({status})"
+        )
+        self.status = status
+        self.payload = payload
+
+
+class Listing(list):
+    """The entries `list` returned, plus what it did not return.
+
+    A plain list, so every existing caller keeps working, carrying the two
+    fields that say whether it is the whole answer. A listing that stops at the
+    broker's ceiling and looks complete is how a caller ends up asking `read`
+    for a path it inferred rather than one it saw.
+    """
+
+    def __init__(self, entries, total: int = 0, truncated: bool = False) -> None:
+        super().__init__(entries)
+        self.total = total or len(self)
+        self.truncated = truncated
+
+
+def default_caller_label() -> str:
+    """The card or session id this process runs under, or "" when it has none.
+
+    Read at call time, like `session_lease` in the skill, because the agent
+    runs each command in a fresh process and the identity lives in its
+    environment. A value the broker's grammar would refuse is dropped here:
+    the label exists so the log can name who filled the store, and it must
+    never be the reason an open fails.
+    """
+    for name in CALLER_LABEL_ENV:
+        value = os.environ.get(name, "").strip()
+        if value and CALLER_LABEL_RE.match(value):
+            return value
+    return ""
+
+
+class Workspace:
+    """A git repository the broker owns and this process cannot see.
+
+    There is no path anywhere in this class, which is the point. A caller says
+    "write these bytes to `manifests/app.yaml` and commit them"; it never learns
+    where that file lands, so it cannot be talked into reading or writing
+    anything else there -- including `.git/config`, which is where a filter
+    driver or a hook path would have to be defined for the sixteen known
+    code-execution routes to work.
+
+    Typical use, replacing a clone/add/commit/push sequence:
+
+        with Workspace.open(endpoint, "acme/infra") as workspace:
+            current = workspace.read_text("manifests/app.yaml")
+            workspace.commit(
+                branch="fix/replicas",
+                message="raise replicas",
+                changes={"manifests/app.yaml": patched.encode()},
+            )
+            workspace.push()
+    """
+
+    def __init__(self, endpoint: str, opened: dict) -> None:
+        self.endpoint = endpoint
+        self.handle = opened["handle"]
+        self.repo = opened["repo"]
+        self.base = opened["base"]
+        self.base_sha = opened["baseSha"]
+        self.branch_sha = opened.get("branchSha", "")
+        self.started_from = opened.get("startedFrom", "")
+        self.shallow = bool(opened.get("shallow", False))
+        self.branch: str | None = None
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        endpoint: str,
+        repo: str,
+        base: str | None = None,
+        branch: str | None = None,
+        depth: int | None = None,
+        caller: str | None = None,
+    ) -> "Workspace":
+        """`branch` names the branch this session will commit to, if known.
+
+        `caller` labels the workspace in the broker's log; left None, it is the
+        card or session id from the environment (`default_caller_label`).
+
+        Naming it decides what `read` and `list` answer with: when the branch
+        already exists on the remote -- a second round of review feedback -- the
+        broker checks that out rather than the base, so a file read here is the
+        file as the pull request has it.
+
+        `depth` opens a shallow single-branch clone for reading. The broker
+        refuses `commit` on one and refuses `depth` together with `branch`.
+        """
+        payload = {"repo": repo}
+        if base:
+            payload["base"] = base
+        if branch:
+            payload["branch"] = branch
+        if depth:
+            payload["depth"] = depth
+        label = default_caller_label() if caller is None else caller
+        if label:
+            payload["caller"] = label
+        return cls(endpoint, _workspace_call(endpoint, "open", payload))
+
+    def read(self, path: str) -> bytes:
+        result = _workspace_call(
+            self.endpoint, "read", {"handle": self.handle, "path": path}
+        )
+        return base64.b64decode(result["contentBase64"])
+
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        return self.read(path).decode(encoding)
+
+    def read_many(self, paths: list[str]) -> tuple[dict[str, bytes], list[dict]]:
+        """Several files in one round trip.
+
+        Returns what came back and what did not, the second as the broker's own
+        `{path, reason}` records. A caller that ignores the second half will
+        materialise a partial tree and not know it -- `requestBudget` means ask
+        again for the rest, `tooLarge` means that file is never coming, and
+        `symlink` means the file is there but the broker will not follow a link
+        to it, so ask for the target's own name.
+        """
+        result = _workspace_call(
+            self.endpoint, "read", {"handle": self.handle, "paths": list(paths)}
+        )
+        files = {
+            entry["path"]: base64.b64decode(entry["contentBase64"])
+            for entry in result.get("files", [])
+        }
+        return files, result.get("skipped", [])
+
+    def list(self, prefix: str | None = None, after: str | None = None) -> Listing:
+        """One page of tracked names. `after` is the last path of the page before.
+
+        `total` on the result counts what is still in scope after the cursor, so
+        a caller pages until `truncated` is false.
+        """
+        payload = {"handle": self.handle}
+        if prefix:
+            payload["prefix"] = prefix
+        if after:
+            payload["after"] = after
+        result = _workspace_call(self.endpoint, "list", payload)
+        return Listing(
+            result.get("entries", []),
+            total=result.get("total", 0),
+            truncated=bool(result.get("truncated")),
+        )
+
+    def grep(
+        self,
+        pattern: str,
+        prefix: str | None = None,
+        regex: bool = False,
+        ignore_case: bool = False,
+    ) -> dict:
+        """Search the checked-out tree. Fixed-string unless `regex` is set.
+
+        The whole answer, `{matches, total, truncated}`, rather than the matches
+        alone: a search that hit the broker's ceiling and looks complete sends a
+        reader off with a wrong conclusion about the repository.
+        """
+        payload = {"handle": self.handle, "pattern": pattern}
+        if prefix:
+            payload["prefix"] = prefix
+        if regex:
+            payload["regex"] = True
+        if ignore_case:
+            payload["ignoreCase"] = True
+        return _workspace_call(self.endpoint, "grep", payload)
+
+    def commit(
+        self,
+        branch: str,
+        message: str,
+        changes: dict[str, bytes | None],
+        expected_base_sha: str | None = None,
+        expected_branch_sha: str | None = None,
+    ) -> dict:
+        """`changes` maps a repository-relative path to bytes, or to None to delete.
+
+        Pass `expected_base_sha` (normally `self.base_sha`) to have the broker
+        refuse with 409 when the base branch has moved under a file this commit
+        also writes. Leaving it out means last-writer-wins against whatever
+        landed in the meantime.
+
+        The working branch is checked the same way and needs no argument: the
+        broker compares against the sha it last saw for that branch, which is
+        the only place the value exists. `expected_branch_sha` overrides it for
+        a caller that learned the sha somewhere else.
+        """
+        entries = []
+        for path, content in changes.items():
+            if content is None:
+                entries.append({"path": path, "delete": True})
+            else:
+                entries.append(
+                    {
+                        "path": path,
+                        "contentBase64": base64.b64encode(content).decode("ascii"),
+                    }
+                )
+        payload = {
+            "handle": self.handle,
+            "branch": branch,
+            "message": message,
+            "changes": entries,
+        }
+        if expected_base_sha:
+            payload["expectedBaseSha"] = expected_base_sha
+        if expected_branch_sha:
+            payload["expectedBranchSha"] = expected_branch_sha
+        result = _workspace_call(self.endpoint, "commit", payload)
+        self.branch = result["branch"]
+        # `committed: false` is an ordinary answer rather than an error -- a
+        # re-run whose fix is already on the branch has nothing to add -- and it
+        # carries neither a sha nor a commit. Callers read the flag; reading
+        # `result["commit"]` unconditionally is how that case turns into a
+        # KeyError several frames from the decision that produced it.
+        if result.get("baseSha"):
+            self.base_sha = result["baseSha"]
+        if result.get("branchSha") is not None:
+            self.branch_sha = result["branchSha"]
+        return result
+
+    def push(self, branch: str | None = None) -> dict:
+        branch = branch or self.branch
+        if not branch:
+            raise ValueError("nothing has been committed on this workspace yet")
+        result = _workspace_call(
+            self.endpoint, "push", {"handle": self.handle, "branch": branch}
+        )
+        if result.get("branchSha"):
+            self.branch_sha = result["branchSha"]
+        return result
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _workspace_call(self.endpoint, "close", {"handle": self.handle})
+
+    def __enter__(self) -> "Workspace":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        # Best effort: a failure to clean up a broker-side tree must not mask
+        # the exception that is already propagating out of the with-block.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def workspaces_available(endpoint: str) -> bool:
+    """Whether this broker has content workspaces armed.
+
+    Both mechanisms run side by side while the skills migrate, so a caller that
+    can do either asks first rather than assuming.
+    """
+    try:
+        _workspace_call(endpoint, "open", {"repo": ""})
+    except WorkspaceUnavailable:
+        return False
+    except WorkspaceRequestError as exc:
+        # 401 is the one status that says nothing about the route: the broker
+        # rejects the caller before it looks at the path, so a client with no
+        # token would read "workspaces are armed" off a broker that never
+        # reached the question. Every other status is an answer about the
+        # payload, and an answer about the payload means the route exists.
+        #
+        # Reported live: a sandbox with no CREDENTIAL_PROXY_TOKEN_FILE saw this
+        # return True and then failed on the first real verb.
+        if exc.status == 401:
+            return False
+        return True
+    except TokenUnavailable:
+        # No token to present, so nothing here is reachable whatever the broker
+        # is serving.
+        return False
+    except urllib.error.URLError:
+        return False
+    return True
+
+
+def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # The same credential and the same opener `execute` uses. These routes
+    # spend the broker's GitHub token exactly as /v1/exec does, so a
+    # cross-Pod call that omitted the header would earn a 401, and one that
+    # went through the stock opener would carry a total socket timeout onto a
+    # clone that legitimately runs for minutes.
+    headers.update(authorization_headers())
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + f"/v1/workspace/{verb}",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with open_broker_request(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            answer = json.load(exc)
+        except (ValueError, TypeError):
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+        if answer.get("code") == "CONTENT_WORKSPACES_DISABLED":
+            raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
+        raise WorkspaceRequestError(exc.code, answer) from exc
+
+
+def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
+    """One `POST /v1/vcs/<verb>`.
+
+    Its own function rather than a parameter on `_workspace_call`, because the
+    two namespaces are different protocols that happen to share a transport:
+    every `/v1/vcs/*` call stands alone and holds nothing across a session.
+    Folding them together would put a `handle` argument on routes that have
+    none and invite a caller to hold one.
+
+    Public, unlike its neighbour, because the version-control skill is the
+    caller and it lives outside this module.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # Same credential and same opener as `execute`: these routes spend the
+    # broker's forge credential, so a cross-Pod call without the header earns a
+    # 401, and the stock opener would put a total socket timeout on a clone
+    # that legitimately runs for minutes.
+    headers.update(authorization_headers())
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + f"/v1/vcs/{verb}",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with open_broker_request(request) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            answer = json.load(exc)
+        except (ValueError, TypeError):
+            # The status arrived but the body is not a refusal document. The
+            # status is the whole answer.
+            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
+        except (http.client.HTTPException, OSError) as broke:
+            # The body ran out mid-read instead: an `IncompleteRead`, or a
+            # `RemoteDisconnected`, or a reset socket. None of those is a
+            # `ValueError`, so the clause above does not see them, and the
+            # identical clause at the foot of this `try` cannot either --
+            # Python does not offer an exception raised inside an `except`
+            # block to that block's siblings. Without this arm it leaves
+            # `vcs_call` as a raw `http.client` type, which `vcs_client.call`
+            # has no arm for and every consumer is built on it having one.
+            raise BrokerDisconnected(f"{type(broke).__name__}: {broke}") from broke
+        if answer.get("code") == "VCS_UNAVAILABLE":
+            # A broker too old to have these routes at all. Distinguished from
+            # every other refusal because it is the one a caller cannot fix by
+            # asking differently.
+            raise WorkspaceUnavailable(answer.get("error", "not available")) from exc
+        raise WorkspaceRequestError(exc.code, answer) from exc
+    except urllib.error.URLError:
+        # Out untouched: the send never landed, and `vcs_client.call` has an
+        # arm that says so. Named before the clause below only because
+        # `URLError` is itself an `OSError` and would otherwise be swallowed by
+        # it and reported as a connection that broke mid-answer.
+        raise
+    except (http.client.HTTPException, OSError) as exc:
+        raise BrokerDisconnected(f"{type(exc).__name__}: {exc}") from exc
+
+
+class ApiSession:
+    """A requests-shaped session whose GETs to a Google API go through the broker.
+
+    The sandbox holds no Google credential, so a script that needs a Cloud
+    Monitoring read cannot call `monitoring.googleapis.com` itself. This
+    rewrites `https://<host>/<path>` onto the broker's `/v1/gcp/<host>/<path>`
+    route and attaches the caller token; the broker checks the read against
+    `api_policy.API_READ_ROUTES`, forwards it on its own credential, and hands
+    back the upstream status, `Content-Type` and body unchanged. A refusal
+    arrives as a 403 whose JSON body carries `rule` and `message`, the same
+    shape `/v1/exec` uses.
+
+    The URL a caller writes stays the real endpoint, so a collector's evidence
+    label still names it, and `.get(url, params=, timeout=)` is what a
+    `requests.Session` offers, so code written against one runs against this
+    unchanged. `requests` is imported here and not at module scope: it is in the
+    sandbox image, where this class runs, and nowhere else this module is
+    imported needs it. `http` is injectable for tests and for a caller that
+    already holds a configured session.
+    """
+
+    def __init__(self, endpoint: str | None = None, http=None) -> None:
+        endpoint = endpoint or os.environ.get("CREDENTIAL_PROXY_URL", "")
+        if not endpoint:
+            raise RuntimeError(
+                "CREDENTIAL_PROXY_URL is not set; the credential broker is the only "
+                "path from here to a Google API"
+            )
+        self._endpoint = endpoint.rstrip("/")
+        if http is None:
+            import requests
+
+            http = requests.Session()
+        self._http = http
+
+    def relay_url(self, url: str) -> str:
+        """The broker URL that stands for `url`; the query is kept where it was."""
+        parsed = urllib.parse.urlsplit(url)
+        relayed = f"{self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        if parsed.query:
+            relayed += f"?{parsed.query}"
+        return relayed
+
+    def get(self, url: str, *, params=None, timeout=None):
+        return self._http.get(
+            self.relay_url(url),
+            params=params,
+            headers=authorization_headers(),
+            timeout=timeout,
+        )
+
+
+def read_stdin_if_requested(argv: list[str]) -> str | None:
+    """fd 0, but only for an argv that named `-` as an input file.
+
+    Still `None` when fd 0 is a terminal: an interactive `kubectl apply -f -`
+    with nothing piped in would otherwise hang the shim on a read that never
+    returns, which reads to the agent as the proxy being down.
+    """
+    if not reads_stdin(argv):
+        return None
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return None
+        return sys.stdin.read()
+    except (OSError, ValueError):
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,15 +1348,12 @@ if __name__ == "__main__":
             print("CREDENTIAL_PROXY_URL is not configured", file=sys.stderr)
             raise SystemExit(1)
         argv = [invoked_as, *sys.argv[1:]]
-        # Do not consume inherited stdin here. MCP and other stdio-based parent
-        # processes may have a protocol stream on fd 0. Pipelines and
-        # redirections remain local to the sandbox shell around this wrapper.
-        stdin = None
+        stdin = read_stdin_if_requested(argv)
     else:
         args = parse_args()
         endpoint = args.endpoint
         argv = [args.executable, *args.arguments]
-        stdin = None
+        stdin = read_stdin_if_requested(argv)
     raise SystemExit(
         execute(
             endpoint,

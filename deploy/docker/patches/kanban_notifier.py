@@ -1,7 +1,7 @@
 """Everything the kanban notifier does with a card's terminal event.
 
 Installed into the image at ``/opt/hermes/gateway/kanban_notifier.py`` and
-wired into ``gateway/kanban_watchers.py`` by
+wired into ``gateway/kanban_watchers_notifier.py`` by
 ``deploy/docker/patches/apply_kanban_notifier.py``.
 
 One module because it is one code path. When a card reaches a terminal state
@@ -10,7 +10,7 @@ model turn waking the agent that created the card. Three separate patches used
 to rewrite that path — a clip, a result delivery, and a wake filter — each with
 its own applier anchored into the same function, each its own way for a
 base-image bump to break the build for a reason that has nothing to do with the
-other two. They are merged here: two anchors, one applier, one verifier.
+other two. They are merged here: three anchors, one applier, one verifier.
 
 The concerns, in the order the notifier reaches them:
 
@@ -32,7 +32,9 @@ The concerns, in the order the notifier reaches them:
    spending a turn to find out.
 5. **Store** the report the user just read: :func:`store_incident_report` puts
    it in the ``incidents`` table, keyed on the thread it was posted in, so a
-   reply of ``apply Option A`` reaches an agent that can see what Option A was.
+   reply of ``apply Option A`` reaches an agent that can see what Option A was
+   — or, where the report proposed a single unlettered fix, so that a bare
+   ``apply`` reaches one that can see which fix it authorises.
 
 Step 3 is only defensible because steps 1 and 2 happened, which is the clearest
 argument for keeping them together: ``kanban.wake_on_events`` may drop
@@ -73,6 +75,7 @@ __all__ = [
     "unstructured_result",
     "handoff_with_result",
     "DEFAULT_WAKE_KINDS",
+    "UNDELIVERED_OUTCOME_KINDS",
     "CONFIG_KEY",
     "resolve_wake_kinds",
     "wake_kinds_for",
@@ -116,7 +119,7 @@ __all__ = [
 # the notifier already builds**, rather than a second message, and that is
 # deliberate: the existing send site is wrapped in the notifier's failure
 # counter, cursor rewind, and subscription-drop logic
-# (``gateway/kanban_watchers.py``). One message inherits all of it. A follow-up
+# (``gateway/kanban_watchers_notifier.py``). One message inherits all of it. A follow-up
 # ``adapter.send()`` would sit outside that machinery, after the cursor has
 # advanced, and would need its own — a second failure path guarding the payload
 # that matters most.
@@ -125,12 +128,12 @@ __all__ = [
 # ---------------------------------
 # :func:`handoff_with_result` replaces the notifier's ``handoff`` rather than
 # appending to it, and it has to. Where the completion event carries no
-# ``summary``, ``kanban_watchers.py`` builds the status line out of the very
-# field this code exists to deliver::
+# ``summary``, ``kanban_watchers_notifier.py``'s ``_fmt_completed`` builds the
+# status line out of the very field this code exists to deliver::
 #
-#     elif task and task.result:
-#         r = _clip_handoff(task.result)
-#         handoff = f"\n{r}"
+#     elif n.task and n.task.result:
+#         wake_handoff = _clip_handoff(n.task.result)
+#         handoff = f"\n{wake_handoff}"
 #
 # ``delivered`` is then a 1200-character clip of ``result``, so asking whether
 # ``result`` already appears inside it — the containment test
@@ -386,9 +389,13 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # 2. ``adapter.handle_message(...)`` then injects a synthetic ``MessageEvent``
 #    to *wake the agent that created the card*, which costs a full model turn.
 #
-# Upstream hardcodes which event kinds trigger step 2::
+# Upstream hardcodes which event kinds trigger step 2, as ``_WAKE_KINDS`` in
+# ``gateway/kanban_watchers_notifier.py`` (v2026.9.14; it was a local of the
+# notifier loop in ``gateway/kanban_watchers.py`` before the September
+# decomposition)::
 #
-#     _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+#     _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked",
+#                    "review_requested", "changes_requested", "block_loop_detected")
 #
 # There is no config key for it anywhere in Hermes. For the Chat Agent front
 # door that makes ``completed`` pure overhead: the summary has already been
@@ -403,6 +410,16 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # the front door genuinely should react — retry, escalate, or tell the user what
 # broke. So this is not "turn the wake off", it is "wake for the events that
 # need a decision, not for the one that already answered itself".
+#
+# The review-flow kinds upstream added afterwards — ``review_requested``,
+# ``changes_requested``, ``block_loop_detected`` — are in the default set, so
+# an image with the key unset wakes for them exactly as upstream does, and an
+# operator's ``wake_on_events`` governs them exactly as it governs the other
+# five: listed, they wake; omitted, they do not. What they are not is a
+# delivered result. The card is *waiting* on the creator (in ``review``, or in
+# ``triage`` after the loop breaker) and nothing has been answered, so section
+# 4 — which records a suppressed kind as "already delivered" — never treats one
+# of them as such: :data:`UNDELIVERED_OUTCOME_KINDS` is the set it leaves out.
 #
 # :func:`resolve_wake_kinds` reads ``kanban.wake_on_events`` from config and
 # falls back to the upstream tuple, so an image built without that key set
@@ -423,7 +440,44 @@ DEFAULT_WAKE_KINDS: Tuple[str, ...] = (
     "crashed",
     "timed_out",
     "blocked",
+    # The review-flow kinds v2026.8.13 and v2026.9.14 added upstream. An
+    # operator's ``kanban.wake_on_events`` governs the ping-then-wake path for
+    # all eight: listed, a kind wakes; omitted, it does not. These three differ
+    # only in section 4 -- being :data:`UNDELIVERED_OUTCOME_KINDS`, a suppressed
+    # one is never noted as a delivered result.
+    "review_requested",
+    "changes_requested",
+    "block_loop_detected",
 )
+
+#: The kinds that carry a decision request or a triage notice rather than a
+#: result: a worker asking for review, a reviewer sending the card back, the
+#: loop breaker routing it to ``triage``. ``kanban.wake_on_events`` governs
+#: whether they wake the creator, as it does every other kind; what it cannot
+#: do is make section 4's note true of them. That note says the card's result
+#: was already delivered to the conversation, and on these events there is no
+#: result — the card is waiting in ``review`` or ``triage`` — so "already
+#: delivered" is never true of them: :func:`suppressed_kinds` leaves them out
+#: and :func:`note_suppressed_completion` stages nothing for them. Every entry
+#: is also in :data:`DEFAULT_WAKE_KINDS`, which :func:`_check_kinds` asserts
+#: at import.
+UNDELIVERED_OUTCOME_KINDS: Tuple[str, ...] = (
+    "review_requested",
+    "changes_requested",
+    "block_loop_detected",
+)
+
+
+def _check_kinds() -> None:
+    missing = [k for k in UNDELIVERED_OUTCOME_KINDS if k not in DEFAULT_WAKE_KINDS]
+    if missing:
+        raise RuntimeError(
+            "kanban notifier: UNDELIVERED_OUTCOME_KINDS must be a subset of "
+            f"DEFAULT_WAKE_KINDS; {', '.join(missing)} is not"
+        )
+
+
+_check_kinds()
 
 CONFIG_KEY = "wake_on_events"
 
@@ -507,6 +561,9 @@ def resolve_wake_kinds(
     read is distinguishable from a key nobody set.
     Only an explicit, well-formed value narrows the set; an explicit empty list
     disables the wake entirely, which is a deliberate choice a user can make.
+
+    This is the *configured* set and nothing more: :func:`wake_kinds_for`
+    applies it, and widens it only on the paths where no text ping was sent.
     """
     kcfg = _load_kanban_config(load_config)
     if kcfg is None or CONFIG_KEY not in kcfg:
@@ -629,10 +686,15 @@ def wake_kinds_for(
     always applies — including an explicit ``wake_on_events: []``. That key
     means "do not spend a turn re-reading an answer already delivered", which
     is not a thing anyone can be asking for where nothing was delivered.
+
+    :data:`UNDELIVERED_OUTCOME_KINDS` get no special treatment here: a list
+    that omits ``review_requested`` does not wake for it on the ping-then-wake
+    path, and the no-send paths wake for it as for any default kind. Where
+    they differ is section 4, which never records one as a delivered result.
     """
-    allowed = resolve_wake_kinds(load_config)
+    allowed = set(resolve_wake_kinds(load_config))
     if not passive_delivered or (adapter is not None and not _adapter_can_push(adapter)):
-        allowed = DEFAULT_WAKE_KINDS
+        allowed = set(DEFAULT_WAKE_KINDS)
     return {ev.kind for ev in events if getattr(ev, "kind", None) in allowed}
 
 
@@ -678,7 +740,7 @@ def wake_kinds_for(
 # notes". ``GatewayRunner._set_pending_turn_sidecar_notes(session_key, notes)``
 # parks strings on ``SessionState.conversation.sidecar_notes``; the next turn's
 # agent setup drains them into ``agent._gateway_turn_context_notes``
-# (``gateway/run.py``), and ``agent/turn_context.py`` appends them to *that
+# (``gateway/run_turn_runner.py``), and ``agent/turn_context.py`` appends them to *that
 # turn's user message* through the ``api_content`` sidecar. Upstream uses it for
 # the auto-reset notice, the first-contact intro, and Discord voice-channel
 # changes.
@@ -722,7 +784,9 @@ def wake_kinds_for(
 # Which completions get one
 # -------------------------
 # Exactly the ones the narrowing suppressed: the terminal kinds upstream would
-# have woken for, minus the ones this delivery is waking for. A kind that still
+# have woken for, minus the ones this delivery is waking for, and never
+# :data:`UNDELIVERED_OUTCOME_KINDS`, which have no delivered result for the
+# note to describe. A kind that still
 # wakes needs no marker (the wake enters the transcript itself), and a gateway
 # with ``kanban.wake_on_events`` unset suppresses nothing, so it writes no notes
 # and behaves exactly as before. That makes the existing config key the on
@@ -753,6 +817,15 @@ def suppressed_kinds(events: Iterable[object], wake_kinds: object) -> set:
     read and stays correct however :func:`resolve_wake_kinds` narrowed the set
     — including the non-push carve-out, where nothing is narrowed and this
     returns the empty set.
+
+    :data:`UNDELIVERED_OUTCOME_KINDS` are never in the answer, whether or not
+    the narrowing dropped them. The note :func:`completion_note` renders for a
+    suppressed kind says the result was already delivered, which on a card
+    waiting in ``review`` or ``triage`` for the creator's decision is false, so
+    a review handoff the config does not wake for goes unrecorded rather than
+    misdescribed. Excluding them here rather than trusting the caller's
+    ``wake_kinds`` keeps that sentence true even for a caller that computed the
+    wake set some other way.
     """
     try:
         woken = set(wake_kinds or ())
@@ -761,7 +834,7 @@ def suppressed_kinds(events: Iterable[object], wake_kinds: object) -> set:
     fired = set()
     for ev in events or ():
         kind = getattr(ev, "kind", None)
-        if kind in DEFAULT_WAKE_KINDS:
+        if kind in DEFAULT_WAKE_KINDS and kind not in UNDELIVERED_OUTCOME_KINDS:
             fired.add(kind)
     return fired - woken
 
@@ -805,6 +878,11 @@ def completion_note(
     delivered (so it does not re-post it), states *why* there is no record of
     the finish earlier in the transcript (so the absence is not read as
     evidence), and says what to call if it wants the content back.
+
+    Every sentence of it presumes a *delivered* result, which is why
+    :data:`UNDELIVERED_OUTCOME_KINDS` never reach it: :func:`suppressed_kinds`
+    filters them out before :func:`note_suppressed_completion` gets here, so a
+    card in ``review`` or ``triage`` is never described as already answered.
     """
     tid = str(task_id or "").strip() or "(unknown)"
     head = NOTE_SIGNATURE + tid
@@ -953,7 +1031,7 @@ def note_suppressed_completion(
 ) -> bool:
     """Record a terminal event that :func:`wake_kinds_for` chose not to wake for.
 
-    Called from ``gateway/kanban_watchers.py`` immediately after the wake set
+    Called from ``gateway/kanban_watchers_notifier.py`` immediately after the wake set
     is computed, on the path where every text ping for this delivery has
     already been sent — so "the result is in the thread", which is what the
     note asserts, is true by the time it is written.
@@ -1085,10 +1163,19 @@ def note_suppressed_completion(
 #
 # Which cards get a row
 # ---------------------
-# Only the ones carrying something to act on: a ``What to do`` section and at
-# least one lettered ``Option``. That is not a proxy for "was this event
-# triage" — it is the question itself. The row exists so ``apply Option A`` can
-# be resolved, and a card whose result is a one-line status has no Option A.
+# Only the ones carrying something to act on: a ``What to do`` section holding
+# either a lettered ``Option`` or the ``To authorize:`` call to action. That is
+# not a proxy for "was this event triage" — it is the question itself. The row
+# exists so ``apply Option A`` can be resolved, and a card whose result is a
+# one-line status has neither an Option A nor anything to authorize.
+#
+# Two patterns rather than one because the template asks for two shapes. A
+# report proposing a single fix does not letter it — a lone "Option A" reads as
+# a list of one — so it carries no lettered option at all, and gating on the
+# letter alone would deny a row to exactly the reports whose reply is the
+# simplest, a bare ``apply``. The ``To authorize:`` bullet is the line both
+# shapes end on, and it is the one this row serves: it is the sentence that
+# invites the reply the row exists to resolve.
 #
 # Card metadata cannot answer it. By the time the notifier sees the
 # subscription, ``kanban_event_routing`` has rewritten the row to look exactly
@@ -1135,17 +1222,42 @@ _WHAT_TO_DO_RE = re.compile(r"^ {0,3}#{1,6} +what to do\b", re.IGNORECASE | re.M
 #: order", and a lowercase "option a" in prose is a sentence, not a label.
 _OPTION_RE = re.compile(r"\bOption [A-Z]\b")
 
+#: The call to action. The template's single-option shape has no lettered option
+#: to match, and this bullet is what it ends on instead — see
+#: ``session_kv_server._triage_task_body``, which owns both shapes. The colon is
+#: load-bearing and the case is not incidental: this has to match a bullet's
+#: label, not the phrase "to authorize the quota increase" in someone's prose,
+#: which is a sentence rather than an offer to act on.
+#:
+#: ``[*_]*`` is what sits between the word and the colon, and it is the whole
+#: reason this pattern is not simply ``To authorize:``. The template emits
+#: ``**To authorize:**``, with the colon inside the emphasis — but a model
+#: reproducing a ``**Label:**`` bullet will as readily close the emphasis first
+#: and write ``**To authorize**:``, and italic and ``__``-bold do the same. Those
+#: are the same bullet, and matching only the template's exact spelling fails
+#: them silently: the single-option shape has no lettered option to fall back on,
+#: so the report is delivered, no ``incidents`` row is written, and the ``apply``
+#: it invites reaches the front door with nothing attached. That is the #802
+#: failure, in the one shape this gate exists to cover.
+#:
+#: The lookbehind does the job ``\b`` would, and is here because ``\b`` cannot:
+#: ``_`` is a word character, so ``\bTo`` finds no boundary in
+#: ``__To authorize__:`` and the ``__``-bold spelling fails on the opening
+#: marker rather than the closing one.
+_AUTHORIZE_RE = re.compile(r"(?<![0-9A-Za-z])To authorize[*_]*:")
+
 
 def actionable_report(result: object) -> bool:
     """Whether ``result`` is a report a reply could ask to act on.
 
     True only when both halves of the triage template's ``What to do`` section
-    are present: the heading, and at least one lettered option under it. Either
-    alone is not enough — a heading with no options offers nothing to apply, and
-    the word "Option" in a paragraph is not a label.
+    are present: the heading, and under it either a lettered option or the
+    ``To authorize:`` call to action. Either half alone is not enough — a
+    heading with neither offers nothing to apply, and the word "Option" in a
+    paragraph is not a label.
 
-    "Under it" is literal: the option search starts at the end of the heading
-    match, not at the top of the report. A ``What to do`` section holding only
+    "Under it" is literal: the search starts at the end of the heading match,
+    not at the top of the report. A ``What to do`` section holding only
     unlettered bullets, in a report whose ``Why`` quotes "Option A" from an
     earlier one, offers nothing to apply — and a row stored for it would hold
     the thread's one ``INSERT OR IGNORE`` slot against the report that does.
@@ -1158,7 +1270,10 @@ def actionable_report(result: object) -> bool:
     heading = _WHAT_TO_DO_RE.search(body)
     if not heading:
         return False
-    return bool(_OPTION_RE.search(body, heading.end()))
+    return bool(
+        _OPTION_RE.search(body, heading.end())
+        or _AUTHORIZE_RE.search(body, heading.end())
+    )
 
 
 def _incident_address(sub: object) -> Tuple[str, str]:
@@ -1198,16 +1313,18 @@ def store_incident_report(
 ) -> bool:
     """Key the delivered report to its chat thread. True when a row was posted.
 
-    Called from ``gateway/kanban_watchers.py`` on the same path as
-    :func:`note_suppressed_completion`, where every text ping for this delivery
-    has already been sent — so the report this stores is one the reader has, and
-    a reply to it is a reply to something.
+    Called from ``gateway/kanban_watchers_notifier.py`` at the tail of
+    ``_send_pings``, once per event, after ``_send_event`` returned and
+    ``clear_failures()`` ran — so the report this stores is one the reader has,
+    and a reply to it is a reply to something. :func:`note_suppressed_completion`
+    runs later and once, from ``build_wake_text``, after every ping of the
+    delivery is out.
 
     Takes the loop's *current* event, not the delivery's whole event list, which
-    is where it parts company with :func:`note_suppressed_completion` at the
-    same call site. That function is asking what the delivery as a whole
-    suppressed, so it wants every kind; this one is asking whether *this* send
-    was the report, and the call site runs once per event. Reading the list here
+    is where it parts company with :func:`note_suppressed_completion`. That
+    function is asking what the delivery as a whole suppressed, so it wants
+    every kind; this one is asking whether *this* send was the report, and its
+    call site runs once per event. Reading the list here
     would fire on a delivery's ``commented`` event too — writing the row before
     the ``completed`` iteration has sent the report it claims the reader has,
     and again on the iteration that did.
@@ -1250,17 +1367,17 @@ def store_incident_report(
             # The common case — every status line, every "no drift found". Not
             # a warning: this is what most cards look like.
             logger.debug(
-                "kanban notifier: card %s completed with no options to act on; "
-                "no incident row stored",
+                "kanban notifier: card %s completed with nothing for a reply to "
+                "act on; no incident row stored",
                 card,
             )
             return False
         chat_id, thread_id = _incident_address(sub)
         if not (chat_id and thread_id):
             logger.warning(
-                "kanban notifier: card %s delivered a report with remediation "
-                "options to chat %s thread %s, which is not a thread — a reply "
-                "naming an option will reach an agent that cannot see the report",
+                "kanban notifier: card %s delivered a report inviting a reply "
+                "to chat %s thread %s, which is not a thread — that reply will "
+                "reach an agent that cannot see the report",
                 card,
                 chat_id or "<no chat>",
                 thread_id or "<no thread>",

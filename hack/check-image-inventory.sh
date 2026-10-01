@@ -9,12 +9,54 @@
 #   2. A new image appears with no inventory entry. Nothing copies it, and the
 #      air-gapped install fails at pull time on a registry nobody approved.
 #
+# And one that has not happened yet: the Go builder pin matches the inventory
+# but no longer satisfies k8s-operator/go.mod, so the image build fails, or a
+# base without GOTOOLCHAIN=local builds with a toolchain nobody pinned.
+#
 # Run via `make images-check`; CI runs it in validate.yml.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 INVENTORY=images.json
+readonly GO_MOD=k8s-operator/go.mod
+readonly GOLANG_IMAGE_ARG=GOLANG_IMAGE
+readonly GOTOOLCHAIN_PIN='ENV GOTOOLCHAIN=local'
 MIRROR=registry.example.invalid/mirror
+
+# githubMinter.org and githubMinter.repo are required when the minter is
+# enabled. Nothing the render produces depends on their values.
+readonly MINTER_ORG=ci-org
+readonly MINTER_REPO=ci-repo
+
+# Which render a check-3 failure came from. Each is the subject of the
+# sentence the failure opens with, because "the chart renders X" is not
+# actionable once more than one configuration renders; check_toggle extends
+# them with the toggle's name.
+readonly LABEL_DEFAULT="a default install"
+readonly LABEL_MIRRORED="a mirrored install"
+
+# The env vars whose values are image references, matched on the variable's
+# name. Matching on the shape of the value instead — a quoted string with a
+# slash and a colon in it — cannot tell an image from any other reference-like
+# value: githubMinter's ISSUER_ALLOWLIST is two https:// URLs joined by a comma
+# and matches that shape exactly, so it was reported as an image rendered
+# outside the mirror (#1139). The chart emits four names the pattern below
+# catches: OPERATOR_IMAGE, PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and
+# FLUENT_BIT_IMAGE.
+readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
+readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
+
+# The `image:` field of a rendered manifest, quoted or bare, reference in group
+# 1; a reference has no whitespace, so the class stops there and trailing
+# blanks stay out of it. Extended syntax like the two awk patterns above,
+# applied with `sed -E`: the basic-syntax spelling of an optional quote is
+# `"\?`, a GNU extension that BSD sed reads as a pattern matching nothing, so
+# on macOS every `image:` field dropped out of image_refs and nothing reported
+# it (#1449). POSIX basic syntax has `"\{0,1\}`, which works everywhere and
+# reads as a repetition count rather than an optional quote; `-E` is what the
+# sed programs in checks 4 and 5 use.
+readonly IMAGE_FIELD_RE='^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$'
+
 status=0
 
 fail() {
@@ -101,6 +143,75 @@ check_base_image golang deploy/docker/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+# The a2a images. All parameterize their builder bases: the auth callout on
+# this branch, the gateway on main in #1334.
+check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
+check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
+# The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
+# builder base to compare: its runtime base is the platform-agent image of the
+# same build, passed as a build arg with no default, so there is no runtime
+# pin in the Dockerfile. The image itself is a first-party inventory entry
+# (hermes-bridge), published by the release workflow beside the three A2A
+# images.
+check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
+
+# The Go builder and k8s-operator/go.mod's `go` directive must name the same
+# major.minor: a builder behind the directive fails the image build (the
+# official golang image sets GOTOOLCHAIN=local, and the Dockerfiles repeat it so
+# a substituted base cannot quietly download a newer toolchain instead, #1138),
+# and a builder ahead of it ships a compiler the directive does not name. A tag
+# that names only a major.minor (`1.27-alpine`) pulls the newest patch from
+# Docker Hub, so equality is the whole check; a mirror populated by
+# `make mirror-images` freezes whichever patch it copied, and a patch-pinned tag
+# (`1.27.3-alpine`) is the answer when the directive outruns that copy. A tag
+# that names a patch or pre-release must also sit at or above the directive.
+# The ENV line is checked too, between the FROM that opens the Go stage and its
+# first RUN: it is the only guard left once a mirror has frozen the patch, and
+# nothing else would notice a reshuffle moving it out of that stage or below the
+# `go build` it has to precede.
+# The third argument is the module whose `go` directive the builder is tied to.
+# It defaults to the operator's because that was the only Go image here for a
+# long time; a2a/ is a second module with its own go.mod, and pinning its
+# builder against the operator's directive would pass while the two drift.
+check_go_directive() {
+  local dockerfile=$1 version_arg=$2 go_mod=${3:-$GO_MOD}
+  local builder_tag directive builder_ver builder_mm directive_mm
+  awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile" |
+    grep -qx "$GOTOOLCHAIN_PIN" ||
+    fail "$dockerfile: no line exactly '$GOTOOLCHAIN_PIN' between the FROM \${$GOLANG_IMAGE_ARG} line and that stage's first RUN, so a substituted $GOLANG_IMAGE_ARG without that default downloads a toolchain the pin does not name instead of failing."
+  builder_tag="$(arg_default "$dockerfile" "$version_arg")"
+  directive="$(sed -n 's/^go[[:space:]][[:space:]]*\([0-9][0-9A-Za-z.]*\).*$/\1/p' "$go_mod" | head -n1)"
+  [ -n "$directive" ] || {
+    fail "$go_mod has no 'go' directive, so nothing pins the toolchain that module builds with."
+    return
+  }
+  builder_ver="$(sed -n 's/^\([0-9][0-9A-Za-z.]*\).*$/\1/p' <<<"$builder_tag")"
+  builder_mm="$(sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*$/\1/p' <<<"$builder_ver")"
+  directive_mm="$(sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*$/\1/p' <<<"$directive")"
+  [ -n "$builder_mm" ] || {
+    fail "$dockerfile: ARG $version_arg defaults to '${builder_tag:-<unset>}', which does not name a Go major.minor, so nothing ties the builder to the 'go $directive' directive in $go_mod."
+    return
+  }
+  [ "$builder_mm" = "$directive_mm" ] || {
+    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_mm), but $go_mod says 'go $directive' (Go $directive_mm). Move both together: a go.mod ahead of the builder fails the image build, a builder ahead of go.mod ships a compiler the directive does not name."
+    return
+  }
+  [ "$builder_ver" = "$builder_mm" ] ||
+    [ "$(printf '%s\n%s\n' "$directive" "$builder_ver" | sort -V | head -n1)" = "$directive" ] ||
+    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_ver), below the 'go $directive' floor in $go_mod, so the image build fails under $GOTOOLCHAIN_PIN."
+}
+
+check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
+check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
+check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
@@ -122,14 +233,69 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
   done || status=1
 
 # ---------------------------------------------------------------------------
-# 2. The fluent-bit pin compiled into the operator. It is the only image the
-#    operator falls back to without an env var, so a drift here mirrors the
-#    wrong tag with nothing to catch it at render time.
+# 2. The pins compiled into the operator. Each is an image the operator falls
+#    back to when its env var is unset, so a drift here mirrors the wrong tag
+#    with nothing to catch it at render time. fluent-bit reaches every agent
+#    pod. nats and nats-box reach only a `spec.mode: next` install, which no
+#    chart render in check 3 turns on, so this is the only check that sees
+#    them (#1557). The constants keep Docker Hub's short spelling because that
+#    is the string the operator renders into the pod template; the comparison
+#    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
+#    The first-party next defaults (gateway, worker, callout) are release
+#    images with no fixed tag in the inventory, so the operator compiles in
+#    the bare image name and takes registry and tag from its own or the
+#    agent image; the second check below holds each name to the inventory's
+#    entry, and that entry's repository to the name under the agent image's
+#    registry, which is what the operator renders when nothing overrides it.
 # ---------------------------------------------------------------------------
-want_fluent="$(normalise "$(repo_of fluent-bit)"):$(pin_of fluent-bit)"
-got_fluent="$(sed -n 's/.*fallbackFluentBitImage = "\(.*\)".*/\1/p' k8s-operator/internal/controller/manifest_helpers.go)"
-[ "$(normalise "$got_fluent")" = "$want_fluent" ] ||
-  fail "k8s-operator/internal/controller/manifest_helpers.go: fallbackFluentBitImage is '$got_fluent', but $INVENTORY has '$want_fluent'."
+check_operator_pin() {
+  local name=$1 gofile=$2 constant=$3
+  local want got
+  want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
+  [ "$(normalise "$got")" = "$want" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
+}
+
+check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage
+check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
+check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
+
+# A compiled image name for a release image the operator renders: the
+# constant must be the inventory entry's name, and the entry's repository
+# must be that name beside platform-agent's, since the operator derives the
+# registry from the agent image and never from the constant. Each capture
+# below takes a lone string literal (a trailing comment allowed) and nothing
+# else, so a constant built by concatenation reads as unset rather than as
+# its first piece.
+check_compiled_image_name() {
+  local name=$1 gofile=$2 constant=$3
+  local want_repo got
+  want_repo="$(dirname "$(repo_of platform-agent)")/${name}"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
+  [ "$got" = "$name" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY names the image '$name'."
+  [ "$(repo_of "$name")" = "$want_repo" ] ||
+    fail "$INVENTORY: '$name' has repository '$(repo_of "$name")', but the operator renders it as '$want_repo' (the name beside platform-agent) when nothing overrides it."
+}
+
+# A compiled repository for a release image: the constant must be the
+# inventory's repository, character for character, since the tag is not the
+# constant's to know. The gateway binary keeps its own copy of the worker
+# repository for a run outside the operator, which it concatenates whole.
+check_compiled_repository() {
+  local name=$1 gofile=$2 constant=$3
+  local want got
+  want="$(repo_of "$name")"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
+  [ "$got" = "$want" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has repository '$want' for '$name'."
+}
+
+check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName
+check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName
+check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
+check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
 # 3. The chart. Rendering it is the only way to see what it actually pulls:
@@ -142,29 +308,76 @@ REQUIRED_VALUES=(
   --set platformAgent.harness.projectId=ci-project
 )
 
-# Every image the chart renders, from `image:` fields and from the operator's
-# *_IMAGE env vars — the latter are what the operator later stamps onto agent
-# pods, so leaving them public half-mirrors the install.
-#
-# A render failure is fatal rather than an empty list: the loops below iterate
-# this output, and "no images" reads exactly like "no images to object to".
-chart_images() {
-  local rendered
-  rendered="$(helm template test-release charts/kube-agents "${REQUIRED_VALUES[@]}" "$@")" || {
+# What turns the GitHub token minter on, passed to check_toggle below.
+MINTER_VALUES=(
+  --set githubMinter.enabled=true
+  --set "githubMinter.org=$MINTER_ORG"
+  --set "githubMinter.repo=$MINTER_REPO"
+)
+
+# The rendered manifests for one configuration. A render failure is fatal
+# rather than an empty list: the checks below iterate what comes out of it, and
+# "no images" reads exactly like "no images to object to".
+render_chart() {
+  helm template test-release charts/kube-agents "${REQUIRED_VALUES[@]}" "$@" || {
     echo "ERROR: 'helm template' failed for the chart${*:+ with $*} — see the error above." >&2
     return 1
   }
-  sed -n -e 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p' \
-    -e 's/^[[:space:]]*value:[[:space:]]*"\([^"]*\/[^"]*:[^"]*\)"[[:space:]]*$/\1/p' <<<"$rendered" |
-    sort -u
+}
+
+# The `image:` fields of a rendered manifest stream on stdin. The job that
+# runs this, validate.yml, runs it on GNU sed, which accepts the escapes BSD
+# sed does not; tests/test_check_image_inventory_sed_portability.py lints
+# every sed program in this file for them, so a Linux run notices.
+image_field_refs() {
+  sed -E -n "s/${IMAGE_FIELD_RE}/\1/p"
+}
+
+# The image references the *_IMAGE env vars carry, from the same stream. The
+# pass pairs a name line with the value line under it rather than matching the
+# value alone, because an env var's value is not an image by its shape, only by
+# which variable holds it — IMAGE_ENV_NAME_RE is that test. Anything between
+# the name and its value — a `valueFrom:`, the next list entry — drops the
+# pairing.
+image_env_refs() {
+  awk -v name_re="$IMAGE_ENV_NAME_RE" -v value_re="$VALUE_FIELD_RE" '
+    $0 ~ name_re { pending = 1; next }
+    pending && match($0, value_re) {
+      ref = substr($0, RLENGTH + 1)
+      sub(/[[:space:]]+$/, "", ref)
+      sub(/^"/, "", ref)
+      sub(/"$/, "", ref)
+      if (ref != "") print ref
+      pending = 0
+      next
+    }
+    { pending = 0 }
+  '
+}
+
+# Every image a rendered manifest stream on stdin pulls: the `image:` fields,
+# and the operator's *_IMAGE env vars — the latter are what the operator later
+# stamps onto agent pods, so leaving them public half-mirrors the install.
+image_refs() {
+  local rendered
+  rendered="$(cat)"
+  {
+    image_field_refs <<<"$rendered"
+    image_env_refs <<<"$rendered"
+  } | sort -u
 }
 
 # Split a reference into repository and tag. The digest, if any, goes first;
 # the tag is then the part after a colon in the final path segment, so a
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
-# digest (tag@sha256:...), because that is the form images.json pins
-# digest-only upstreams with (hindsight-postgresql) and what the chart's
-# default render must match byte for byte.
+# digest (tag@sha256:...), because that is the form images.json pins a tag and
+# a digest together with and what the chart's default render must match byte for
+# byte. No render reaches that branch today: images.json pins four entries as
+# tag@digest — hindsight-api, hindsight-postgresql, busybox and, through
+# tags.env, the Hermes base — and the last two are build-time while the
+# Hindsight pair sits behind hindsight.enabled, which no render below turns on.
+# The branch is what keeps the comparison right when one of them does reach a
+# render.
 split_ref() {
   local ref=${1%%@*} digest=""
   case "$1" in
@@ -183,42 +396,43 @@ split_ref() {
   ref_pin="$ref_tag${digest:+@$digest}"
 }
 
-default_images="$(chart_images)" || exit 1
-[ -n "$default_images" ] || {
-  echo "ERROR: the chart rendered no image references at all — the extraction patterns in chart_images no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
-  exit 1
-}
-mirrored_images="$(chart_images --set "global.imageRegistry=$MIRROR")" || exit 1
+inventory_repos="$(jq -r '.images[].repository' "$INVENTORY" | sort -u)"
+inventory_names="$(jq -r '.images[].name' "$INVENTORY" | sort -u)"
 
-# 3a. Default install: every rendered image must be in the inventory, at the
+# 3a. Unmirrored render: every image in it must be in the inventory, at the
 #     pin the inventory carries, so the mirror built from it is complete and
 #     the tags it holds are the tags the install asks for. Matching on the
 #     repository alone would pass through failure mode #1 — the chart on
 #     LiteLLM v1.92.0 while the inventory says v1.95.0 is one entry, one
 #     repository, and an ImagePullBackOff.
-inventory_repos="$(jq -r '.images[].repository' "$INVENTORY" | sort -u)"
-while read -r image; do
-  [ -n "$image" ] || continue
-  split_ref "$image"
-  grep -qxF "$ref_repo" <<<"$inventory_repos" || {
-    fail "the chart renders '$image', which has no entry in $INVENTORY — 'make mirror-images' would not copy it."
-    continue
-  }
-  want_tag="$(pin_of_repo "$ref_repo")"
-  [ -z "$want_tag" ] || [ "$ref_pin" = "$want_tag" ] ||
-    fail "the chart renders '$image', but $INVENTORY pins '$ref_repo' at '$want_tag' — 'make mirror-images' would copy '$want_tag' and the install would ask for '$ref_pin'."
-done <<<"$default_images"
+check_inventory_pins() {
+  local label=$1 images=$2 image want_tag
+  while read -r image; do
+    [ -n "$image" ] || continue
+    split_ref "$image"
+    grep -qxF "$ref_repo" <<<"$inventory_repos" || {
+      fail "$label: the chart renders '$image', which has no entry in $INVENTORY — 'make mirror-images' would not copy it."
+      continue
+    }
+    want_tag="$(pin_of_repo "$ref_repo")"
+    [ -z "$want_tag" ] || [ "$ref_pin" = "$want_tag" ] ||
+      fail "$label: the chart renders '$image', but $INVENTORY pins '$ref_repo' at '$want_tag' — 'make mirror-images' would copy '$want_tag' and the install would ask for '$ref_pin'."
+  done <<<"$images"
+}
 
 # 3b. Mirrored install: nothing may be left on a public registry. This is the
 #     chart-side equivalent of TestNoPublicRegistryWhenMirrored in the
 #     operator, and it covers the env vars a Go test cannot see.
-while read -r image; do
-  [ -n "$image" ] || continue
-  case "$image" in
-  "$MIRROR"/*) ;;
-  *) fail "with global.imageRegistry set, the chart still renders '$image' outside the mirror." ;;
-  esac
-done <<<"$mirrored_images"
+check_mirror_prefix() {
+  local label=$1 images=$2 image
+  while read -r image; do
+    [ -n "$image" ] || continue
+    case "$image" in
+    "$MIRROR"/*) ;;
+    *) fail "$label: with global.imageRegistry set, the chart still renders '$image' outside the mirror." ;;
+    esac
+  done <<<"$images"
+}
 
 # 3c. Mirrored install, continued: the reference has to be in the mirror, not
 #     merely under its prefix. scripts/mirror_images.sh names each destination
@@ -227,23 +441,93 @@ done <<<"$mirrored_images"
 #     rule by taking the repository's trailing path segment, and
 #     kube-agents.thirdPartyImage takes the real name explicitly for the
 #     entries where the two differ (hindsight-postgresql is
-#     docker.io/ankane/pgvector). So the check reads the mirrored render
+#     docker.io/pgvector/pgvector). So the check reads the mirrored render
 #     directly: every image under the mirror prefix must sit at a name the
 #     inventory carries, or it points at a path 'make mirror-images' never
 #     pushed to and the install fails at pull time on the one path this
 #     feature exists for.
-inventory_names="$(jq -r '.images[].name' "$INVENTORY" | sort -u)"
-while read -r image; do
-  [ -n "$image" ] || continue
-  case "$image" in
-  "$MIRROR"/*) ;;
-  *) continue ;; # not under the prefix is check 3b's finding, not this one
-  esac
-  split_ref "$image"
-  segment="${ref_repo##*/}"
-  grep -qxF "$segment" <<<"$inventory_names" ||
-    fail "with global.imageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
-done <<<"$mirrored_images"
+check_mirror_names() {
+  local label=$1 images=$2 image segment
+  while read -r image; do
+    [ -n "$image" ] || continue
+    case "$image" in
+    "$MIRROR"/*) ;;
+    *) continue ;; # not under the prefix is check 3b's finding, not this one
+    esac
+    split_ref "$image"
+    segment="${ref_repo##*/}"
+    grep -qxF "$segment" <<<"$inventory_names" ||
+      fail "$label: with global.imageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
+  done <<<"$images"
+}
+
+# The images in the first list that the second does not carry.
+# Precondition: requires both inputs to be sorted and deduplicated under matching
+# collation (as produced by image_refs' sort -u) for comm -23 to perform a correct
+# sorted merge.
+added_images() {
+  comm -23 <(printf '%s\n' "$1" | sed '/^$/d') <(printf '%s\n' "$2" | sed '/^$/d')
+}
+
+# An off-by-default chart toggle: rendered unmirrored and mirrored on top of
+# REQUIRED_VALUES, and checked against the default pair below. Without this the
+# toggle's images reach no render at all and their pins sit behind every check
+# — the gap #1139 was filed about.
+#
+# Only what the toggle adds is checked. Its render is a superset of the default
+# pair, so passing the whole list would report a drifted LiteLLM pin once per
+# configuration that renders LiteLLM, and the same message printed twice under
+# two labels reads as two problems.
+#
+# Adding nothing is fatal. A toggle that has stopped turning on — a renamed
+# value, a chart that now requires another key — takes its images back out of
+# every check with everything still green, which is the original failure
+# wearing a new coat.
+#
+# Adding the next toggle is one call. Hindsight, behind hindsight.enabled, is
+# the one still uncovered.
+check_toggle() {
+  local name=$1
+  shift
+  local rendered mirrored_rendered added mirrored_added
+  rendered="$(render_chart "$@")" || exit 1
+  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR")" || exit 1
+  added="$(added_images "$(image_refs <<<"$rendered")" "$default_images")"
+  mirrored_added="$(added_images "$(image_refs <<<"$mirrored_rendered")" "$mirrored_images")"
+  [ -n "$added" ] || {
+    echo "ERROR: enabling $name added no image the default render already carried, so its renders exercise nothing the default and mirrored pair does not and whatever it guards is unchecked. Check that the values check_toggle passes for $name still turn it on." >&2
+    exit 1
+  }
+  check_inventory_pins "$LABEL_DEFAULT with $name enabled" "$added"
+  check_mirror_prefix "$LABEL_MIRRORED with $name enabled" "$mirrored_added"
+  check_mirror_names "$LABEL_MIRRORED with $name enabled" "$mirrored_added"
+}
+
+default_render="$(render_chart)" || exit 1
+mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR")" || exit 1
+default_images="$(image_refs <<<"$default_render")"
+mirrored_images="$(image_refs <<<"$mirrored_render")"
+
+# One guard per extractor rather than one over their union. Either half of
+# image_refs keeps the union non-empty while the other matches nothing, so a
+# guard on the union passes with half the images unchecked — the state macOS
+# sat in until #1449: BSD sed matched nothing for image_field_refs, the env
+# vars kept the list non-empty, and checks 3a, 3b and 3c inspected the three
+# env-var references and none of the `image:` fields.
+[ -n "$(image_field_refs <<<"$default_render")" ] || {
+  echo "ERROR: the chart rendered no 'image:' field that image_field_refs recognises, so checks 3a, 3b and 3c see only the *_IMAGE env vars. Either the chart stopped emitting them, IMAGE_FIELD_RE no longer matches the shape it emits, or this sed does not accept the pattern." >&2
+  exit 1
+}
+[ -n "$(image_env_refs <<<"$default_render")" ] || {
+  echo "ERROR: the chart rendered no *_IMAGE env var that image_env_refs recognises, so the images the operator stamps onto agent pods are unchecked. Either the chart stopped emitting them or IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
+  exit 1
+}
+
+check_inventory_pins "$LABEL_DEFAULT" "$default_images"
+check_mirror_prefix "$LABEL_MIRRORED" "$mirrored_images"
+check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"
+
+check_toggle githubMinter "${MINTER_VALUES[@]}"
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by
@@ -304,6 +588,6 @@ while IFS=$'\t' read -r file line image; do
 done <<<"$integration_refs"
 
 if [ "$status" -eq 0 ]; then
-  echo "Image inventory check passed: $INVENTORY matches every pin, and the chart mirrors cleanly."
+  echo "Image inventory check passed: $INVENTORY matches every pin, the Go builder pin matches $GO_MOD, and the chart mirrors cleanly."
 fi
 exit "$status"

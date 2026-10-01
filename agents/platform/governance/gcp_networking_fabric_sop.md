@@ -13,8 +13,13 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit
+./skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit [--repo "<owner>/<repo>"]
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
 
@@ -42,6 +47,7 @@ gcloud compute networks subnets list --format=json
 #### 2.2 Cloud NAT gateway port allocation saturation (`cloud-nat-exhaustion`)
 
 - **Severity**: `critical`
+- **Discovery**: `gcloud compute routers list --project=$PROJECT --format=json` — binds `$ROUTER` and `$REGION`; run the command below once per router whose `nats` list is non-empty. A router with no `nats` entry is a BGP router, not a NAT gateway: skip it rather than reading its empty mapping as a gateway without IPs. A project with no NAT router has nothing to inspect: record the check in `checks_run` with the discovery command, not in `limitations`.
 - **Command**: `gcloud compute routers get-nat-mapping-info $ROUTER --region=$REGION --project=$PROJECT --format=json`
 - **Condition**: Cloud NAT mapping indicates allocated ports exceed 80% available port capacity per VM or gateway lacks auto-allocated IP addresses.
 - **Remediation**: Increase `minPortsPerVm` or add additional NAT IP addresses in Cloud Router specification.
@@ -181,8 +187,10 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json
-# -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
+./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
+  --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
+  [--repo "<owner>/<repo>"]
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```

@@ -7,8 +7,6 @@ set -euo pipefail
 # that the platform agent processes the alert.
 # ==============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
 if [ -z "$PROJECT_ID" ]; then
     echo "Error: Could not determine GCP Project ID. Set GCP_PROJECT_ID or PROJECT_ID."
@@ -21,7 +19,11 @@ if [ -z "$CONTEXT" ]; then
     exit 1
 fi
 
-NAMESPACE="kubeagents-system"
+# AGENT_NAMESPACE is what the scenario harness (scenarios/lib/common.sh) and the E2E
+# suite's fixture both call this, and the suite runs verify.sh in the same breath as its
+# own kubectl probes -- so reading a different variable makes the two disagree on any
+# non-default namespace. Same default either way.
+NAMESPACE="${AGENT_NAMESPACE:-kubeagents-system}"
 CLUSTER_NAME="${TARGET_CLUSTER_NAME:-}"
 if [ -z "$CLUSTER_NAME" ]; then
     echo "Error: set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for,"
@@ -44,6 +46,7 @@ CONTROLLER_NAME="ml-training-job-gpu-2-${TEST_ID##*-}"
 # The adapter route these alerts arrive on, and the string every log line about them
 # carries. Must match the subscription key in templates/agentplugin.yaml.
 ROUTE_NAME="${STOCKOUT_ROUTE:-gke_stockout_alerts}"
+GATEWAY_WAIT_TIMEOUT="${GATEWAY_WAIT_TIMEOUT:-120}"
 
 echo "============================================================"
 echo "Verifying GKE Stockout Investigator Extension"
@@ -54,6 +57,10 @@ echo "PubSub Topic:    ${TOPIC}"
 echo "Test Event ID:   ${TEST_ID}"
 echo "Test Workload:   ${CONTROLLER_NAME}"
 echo "============================================================"
+
+echo "Step 0: Verifying platform-agent-gateway availability and readiness..."
+kubectl --context="$CONTEXT" rollout status deployment/platform-agent-gateway \
+    -n "$NAMESPACE" --timeout="${GATEWAY_WAIT_TIMEOUT}s"
 
 # Construct test payload matching log sink filter & stockout investigator template
 PAYLOAD=$(cat <<EOF

@@ -16,14 +16,15 @@ Three subcommands, one job each:
 Why ``reply`` writes the marker rather than the model
 -----------------------------------------------------
 The marker is the whole idempotency scheme: a request is unanswered when no
-self-authored comment carries ``<!-- agent-answered:<node-id> -->``. If the model
+self-authored comment carries ``<!-- agent-answered:<comment-ref> -->``, the ref
+being the ``<kind>-<id>`` the poll reported for it. If the model
 had to remember to type it, the failure mode of forgetting is not a missing
 comment — it is the same request being answered again on every tick, ten minutes
 apart, forever. So the marker is appended here, from the ``--comment-id`` the
 command already requires, and cannot be forgotten.
 
 Being unforgettable is not enough on its own, because the id is still the
-model's to supply. A numeric comment id, a truncated node id, or the id of a
+model's to supply. A bare number, a truncated ref, or the ref of a
 neighbouring comment all produce a marker that matches nothing, which is the
 same runaway by a slower road. ``--comment-id`` is therefore checked against the
 requests the forge reports as unanswered at that moment, and a mismatch fails
@@ -56,7 +57,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 from datetime import datetime
 
 # `$HERMES_HOME/scripts`, where the entrypoint's step 2b force-sync stages the
@@ -72,13 +72,17 @@ import pr_triggers  # noqa: E402
 
 SCRATCH_DIR = "/opt/data/scratch"
 
-# How much of a thread travels with the requests. Both caps are generous enough
-# that no ordinary review conversation meets them, and both report what they
-# dropped — `omitted_earlier` on the thread, `truncated_chars` on the comment —
-# because a silently shortened transcript reads as a complete one, and the
-# worker would answer confidently from a conversation it only half saw.
+
+# How much of a thread travels with the requests. All caps are generous enough
+# that no ordinary review conversation meets them, and all report what they
+# dropped — `omitted_earlier` and `omitted_requests` on the thread, `truncated_chars`
+# on the comment / request — because a silently shortened transcript reads as a
+# complete one, and the worker would answer confidently from a conversation it only
+# half saw.
 CONTEXT_MAX_COMMENTS = 40
 CONTEXT_MAX_BODY_CHARS = 4000
+CONTEXT_MAX_REQUEST_CHARS = pr_triggers.MAX_REQUEST_CHARS
+CONTEXT_MAX_REQUESTS = 10
 
 
 def _fail(message: str):
@@ -86,14 +90,26 @@ def _fail(message: str):
     sys.exit(1)
 
 
-def _resolve_repo() -> str:
-    try:
-        repo = forge.target_repo()
-    except forge.ForgeError as error:
-        _fail(f"{error.reason}: {error.value}")
-    if not repo:
-        _fail("No target repository configured in SETTINGS.md.")
-    return repo
+def validate_repo(repo: str) -> str:
+    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
+    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug, validate_repo_org
+    if not repo or not is_valid_repo_slug(repo):
+        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
+    managed = get_managed_github_repos()
+    if managed and repo not in managed:
+        raise ValueError(
+            f"Repository {repo!r} is not in the managed repositories list: {managed}"
+        )
+    return validate_repo_org(repo)
+
+
+def _resolve_repo(args=None) -> str:
+    if args and getattr(args, "repo", None):
+        try:
+            return validate_repo(args.repo)
+        except ValueError as error:
+            _fail(str(error))
+    _fail("No target repository specified; pass --repo <owner/repo>.")
 
 
 def _find_pr(provider, repo: str, number: int, viewer: str):
@@ -125,6 +141,14 @@ def _find_pr(provider, repo: str, number: int, viewer: str):
     _fail(f"{repo}#{number} is not an open pull request.")
 
 
+def _context_request(request: str) -> tuple[str, int]:
+    """A request text as the model should see it, and how much was cut."""
+    text = request or ""
+    if len(text) <= CONTEXT_MAX_REQUEST_CHARS:
+        return text, 0
+    return text[:CONTEXT_MAX_REQUEST_CHARS], len(text) - CONTEXT_MAX_REQUEST_CHARS
+
+
 def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
     """Every comment on one pull request, and the unanswered requests among them.
 
@@ -133,36 +157,38 @@ def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
     comment the gate deliberately passed over.
     """
     comments = provider.list_comments(repo, pr)
-    handled = pr_triggers.handled_node_ids(comments, viewer)
+    handled = pr_triggers.handled_refs(comments, viewer)
     allowed_bots = pr_triggers.bot_allowlist()
     requests = []
     for comment in comments:
-        if comment.node_id in handled:
+        if comment.ref in handled:
             continue
         if forge.normalise_login(comment.author) == viewer:
             continue
         if not pr_triggers.is_addressable_bot(comment, allowed_bots):
             continue
         trigger = pr_triggers.find_trigger(
-            comment.body, viewer, comment.node_id, comment.author
+            comment.body, viewer, comment.ref, comment.author
         )
         if trigger is None:
             continue
-        requests.append(
-            {
-                "pr": pr.number,
-                "head_ref": pr.head_ref,
-                "comment_id": comment.node_id,
-                "author": comment.author,
-                "can_write": comment.can_write,
-                "can_write_known": comment.can_write_known,
-                "kind": trigger.kind,
-                "request": trigger.request,
-                "created_at": comment.created_at,
-                "path": comment.path,
-                "line": comment.line,
-            }
-        )
+        req_text, truncated = _context_request(trigger.request)
+        row = {
+            "pr": pr.number,
+            "head_ref": pr.head_ref,
+            "comment_id": comment.ref,
+            "author": comment.author,
+            "can_write": comment.can_write,
+            "can_write_known": comment.can_write_known,
+            "kind": trigger.kind,
+            "request": req_text,
+            "created_at": comment.created_at,
+            "path": comment.path,
+            "line": comment.line,
+        }
+        if truncated:
+            row["truncated_chars"] = truncated
+        requests.append(row)
     return comments, requests
 
 
@@ -173,7 +199,7 @@ def _refusals_already_posted(comments, viewer: str) -> int:
     markers are: the sweep and the worker are separate processes on separate
     schedules, and the thread is the only state both of them can see.
     """
-    return len(pr_triggers.refused_node_ids(comments, viewer))
+    return len(pr_triggers.refused_refs(comments, viewer))
 
 
 def _refusals_exhausted(comments, viewer: str) -> bool:
@@ -211,7 +237,9 @@ def _context_body(body: str) -> tuple[str, int]:
     return text[:CONTEXT_MAX_BODY_CHARS], len(text) - CONTEXT_MAX_BODY_CHARS
 
 
-def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
+def _conversation(
+    comments, self_login: str, request_ids, all_request_ids=None
+) -> tuple[list, int]:
     """The thread one pull request's requests arrived in, oldest first.
 
     Sorted here as well as in the provider: ordering is part of this payload's
@@ -228,28 +256,29 @@ def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
     point opposite ways: the sweep hands the worker the *oldest* unanswered
     trigger, and the cap drops the *oldest* comments — so on a thread past the
     cap the comment being answered is the first thing thrown away. For a
-    `mention` trigger `Trigger.request` is empty by construction, so the card
+    `@mention` trigger `Trigger.request` is empty by construction, so the card
     carries no copy of it either, and the worker would be asked to answer a
     request whose text appears nowhere in its context. Pinning costs at most
-    `PR_AGENT_MAX_PER_TICK` extra rows.
+    `CONTEXT_MAX_REQUESTS` extra rows.
     """
-    ordered = sorted(comments, key=lambda c: (c.created_at, c.node_id))
+    ordered = sorted(comments, key=lambda c: (c.created_at, c.ref))
     wanted = set(request_ids or ())
+    is_req_ids = set(all_request_ids if all_request_ids is not None else wanted)
     recent = ordered[max(0, len(ordered) - CONTEXT_MAX_COMMENTS) :]
-    kept_ids = {c.node_id for c in recent} | wanted
-    kept = [c for c in ordered if c.node_id in kept_ids]
+    kept_ids = {c.ref for c in recent} | wanted
+    kept = [c for c in ordered if c.ref in kept_ids]
     omitted_earlier = len(ordered) - len(kept)
     rows = []
     for comment in kept:
         body, truncated = _context_body(comment.body)
         row = {
-            "comment_id": comment.node_id,
+            "comment_id": comment.ref,
             "author": comment.author,
             "created_at": comment.created_at,
             "kind": comment.kind,
             "can_write": comment.can_write,
             "is_self": forge.normalise_login(comment.author) == self_login,
-            "is_request": comment.node_id in request_ids,
+            "is_request": comment.ref in is_req_ids,
             "body": body,
         }
         if comment.path:
@@ -269,34 +298,130 @@ def handle_poll(args) -> int:
     operator-facing glossary covers both halves of the watcher.
     """
     try:
-        repo = forge.target_repo()
+        from gitops_workspace import get_managed_github_repos
+        if getattr(args, "repo", None):
+            repos = [validate_repo(args.repo)]
+        else:
+            repos = get_managed_github_repos()
+    except ValueError as error:
+        print(json.dumps({"status": "ERROR", "reason": "INVALID_REPOSITORY", "value": str(error)}))
+        return 0
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))
         return 0
-    if not repo:
+    except Exception as error:
+        print(json.dumps({"status": "ERROR", "reason": "DISCOVERY_FAILED", "value": str(error)}))
+        return 0
+    if not repos:
         print(json.dumps({"status": "NOT_CONFIGURED"}))
         return 0
 
-    provider = forge.provider_for()
     try:
-        provider.preflight()
-        viewer = provider.viewer_login()
-        if not viewer:
-            print(json.dumps({"status": "ERROR", "reason": "VIEWER_UNKNOWN", "value": ""}))
+        # Inside the guard, not above it: `provider_for` raises
+        # `UnknownForgeHost` for a forge no module in this install serves, and
+        # `RepoUnparseable` for a value that names no repository at all — both
+        # of which belong in the reason code below rather than in a traceback.
+        provider = forge.provider_for(repo=repos[0])
+        prs: list[tuple[str, forge.PullRequest]] = []
+        nameless: list[str] = []
+        # Repositories the poll could not read at all, with the reason. A
+        # different thing from `nameless`: that is a credential that answered
+        # and could not name itself, this is a call that did not come back.
+        refused: list[tuple[str, forge.ForgeError]] = []
+        for r in repos:
+            # Per repository, because identity belongs to a forge rather than
+            # to this install: two configured forges are two accounts. The
+            # provider caches per repository, so repositories on one forge
+            # share a single lookup.
+            #
+            # The refusal is caught here and not by the guard around this whole
+            # block. `viewer_login` raises for a credential the forge rejected
+            # and for a host no provider module claims, and out there one such
+            # repository ended the poll for every other one — the worker was
+            # handed an ERROR and none of the requests waiting on a repository
+            # that was working, every tick until somebody fixed the other.
+            try:
+                viewer = provider.viewer_login(r)
+                if not viewer:
+                    # Without it the agent cannot tell its own pull requests
+                    # from a stranger's, nor its own comments from a
+                    # reviewer's — both of which fail dangerously — so this
+                    # repository is skipped rather than swept half-blind.
+                    nameless.append(r)
+                    continue
+                for pr in provider.list_open_prs(r):
+                    if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
+                        if not args.pr or pr.number == args.pr:
+                            prs.append((r, pr))
+            except forge.ForgeError as error:
+                refused.append((r, error))
+        # Before either decision below, so a repository dropped for one reason
+        # is still named when the poll ends for the other. stderr for the same
+        # reason `nameless` uses it: out of the JSON the SKILL parses, in front
+        # of whoever is debugging a request that never arrived.
+        for name, error in sorted(refused, key=lambda item: item[0]):
+            sys.stderr.write(
+                f"pr_conversation: {name} not swept — {error.reason}"
+                f"{f' ({error.value})' if error.value else ''}\n"
+            )
+        if refused and len(refused) == len(repos):
+            # Nothing was read at all, so there is no partial poll to
+            # qualify and the first refusal is the whole story — the same
+            # single ERROR this printed before it read repositories one at a
+            # time.
+            #
+            # Counted, not inferred from an empty `prs`: a repository with no
+            # open pull request is the ordinary case, so on a partial outage
+            # this would have reported the poll dead everywhere on most ticks
+            # while the repositories that answered were being swept fine.
+            first = refused[0][1]
+            print(json.dumps(
+                {"status": "ERROR", "reason": first.reason, "value": first.value}
+            ))
             return 0
-        prs = [
-            pr
-            for pr in provider.list_open_prs(repo)
-            if forge.is_agent_pull_request(pr, repo, viewer) and not pr.is_ignored
-        ]
-        if args.pr:
-            prs = [pr for pr in prs if pr.number == args.pr]
+        if nameless and len(nameless) + len(refused) == len(repos):
+            # Every one of them: this is the credential, not a repository, and
+            # the model is told so rather than shown an empty poll it would
+            # read as "nothing to do".
+            print(json.dumps({
+                "status": "ERROR",
+                "reason": "VIEWER_UNKNOWN",
+                "value": ", ".join(nameless),
+            }))
+            return 0
+        if nameless:
+            # Some but not all. The poll goes on with what it can read, but a
+            # repository dropped in silence reads as one with nothing on it, so
+            # it is named on stderr too.
+            sys.stderr.write(
+                f"pr_conversation: {len(nameless)} repository(ies) not swept — "
+                f"the credential cannot name itself there: {', '.join(nameless)}\n"
+            )
 
         found = []
         threads = []
         over_budget = 0
-        for pr in prs:
-            comments, pr_requests = _requests_on(provider, repo, pr, viewer)
+        deferred_requests = 0
+        # Pull requests whose conversation could not be read, with the reason.
+        # Per pull request rather than per poll, the way `sweep_pr_comments`
+        # files them: `list_comments` refuses a conversation past one page, and
+        # that is a permanent property of one busy thread rather than a fault
+        # -- letting it out of this loop would end the poll for every other
+        # pull request, which is the failure `refused` above already exists to
+        # prevent one repository causing. The watcher skips such a thread and
+        # goes on, and this command is the one an operator runs to see what the
+        # watcher saw.
+        unreadable: list[tuple[str, int, forge.ForgeError]] = []
+        for repo, pr in prs:
+            # Cached by the pass above, which dropped every repository whose
+            # credential could not name itself, so this costs nothing and is
+            # never empty.
+            viewer = provider.viewer_login(repo)
+            try:
+                comments, pr_requests = _requests_on(provider, repo, pr, viewer)
+            except forge.ForgeError as refusal:
+                unreadable.append((repo, pr.number, refusal))
+                continue
             # Untrusted requests past this pull request's refusal budget are not
             # offered at all. The sweep already stopped refusing them, on
             # purpose, and handing them to the worker is how that bound got
@@ -314,6 +439,29 @@ def handle_poll(args) -> int:
                 ]
                 over_budget += len(pr_requests) - len(kept)
                 pr_requests = kept
+
+            # After the budget filter: cap-deferred rows keep is_request,
+            # budget-buried rows stay unflagged.
+            all_unanswered_ids = {row["comment_id"] for row in pr_requests}
+
+            # Prioritize trusted requests over untrusted ones so an untrusted burst
+            # before refusal budget exhaustion cannot starve maintainer requests.
+            trusted_requests = [
+                r for r in pr_requests if r.get("can_write") or not r.get("can_write_known")
+            ]
+            untrusted_requests = [
+                r for r in pr_requests if not r.get("can_write") and r.get("can_write_known")
+            ]
+            ordered_requests = trusted_requests + untrusted_requests
+
+            deferred_count = 0
+            if len(ordered_requests) > CONTEXT_MAX_REQUESTS:
+                deferred_count = len(ordered_requests) - CONTEXT_MAX_REQUESTS
+                deferred_requests += deferred_count
+                pr_requests = ordered_requests[:CONTEXT_MAX_REQUESTS]
+            else:
+                pr_requests = ordered_requests
+
             if not pr_requests:
                 # No thread without a request in it: the worker is answering
                 # something, and a transcript of a pull request nobody addressed
@@ -321,12 +469,39 @@ def handle_poll(args) -> int:
                 continue
             found.extend(pr_requests)
             rows, omitted_earlier = _conversation(
-                comments, viewer, {row["comment_id"] for row in pr_requests}
+                comments,
+                viewer,
+                request_ids={row["comment_id"] for row in pr_requests},
+                all_request_ids=all_unanswered_ids,
             )
-            thread = {"pr": pr.number, "head_ref": pr.head_ref, "comments": rows}
+            thread = {"repo": repo, "pr": pr.number, "head_ref": pr.head_ref, "comments": rows}
             if omitted_earlier:
                 thread["omitted_earlier"] = omitted_earlier
+            if deferred_count:
+                thread["omitted_requests"] = deferred_count
             threads.append(thread)
+
+        if unreadable and len(unreadable) == len(prs):
+            # Every one of them, which is no longer one thread's property but
+            # the read itself: an empty poll here would be read as nothing to
+            # do, so it stays the error it was before this loop learned to
+            # continue.
+            first = unreadable[0][2]
+            print(json.dumps(
+                {"status": "ERROR", "reason": first.reason, "value": first.value}
+            ))
+            return 0
+        if unreadable:
+            sys.stderr.write(
+                "pr_conversation: "
+                + ", ".join(
+                    f"{repo}#{number} ({refusal.reason})"
+                    for repo, number, refusal in sorted(
+                        unreadable, key=lambda row: (row[0], row[1])
+                    )
+                )
+                + " could not be read and were skipped\n"
+            )
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))
         return 0
@@ -339,24 +514,18 @@ def handle_poll(args) -> int:
             f"pr_conversation: {over_budget} untrusted request(s) not offered — "
             "the pull request's refusal budget is spent\n"
         )
+    if deferred_requests:
+        sys.stderr.write(
+            f"pr_conversation: {deferred_requests} request(s) deferred — "
+            f"poll offers at most {CONTEXT_MAX_REQUESTS} per pull request\n"
+        )
 
     if not found:
-        print(json.dumps({"status": "NO_REQUESTS", "repository": repo}))
+        print(json.dumps({"status": "NO_REQUESTS"}))
         return 0
-    # Every request, not just the trusted ones: the worker is told about a
-    # request it must not act on so it can say so, rather than appearing to
-    # have missed it. `can_write` is on each row and the SKILL.md is explicit
-    # that a false one is refused.
-    print(
-        json.dumps(
-            {
-                "status": "FOUND",
-                "repository": repo,
-                "requests": found,
-                "conversations": threads,
-            }
-        )
-    )
+
+    payload = {"status": "FOUND", "requests": found, "conversations": threads}
+    print(json.dumps(payload))
     return 0
 
 
@@ -558,27 +727,28 @@ def _check_claim(provider, repo: str, pr, sha: str, no_change: bool, requested_a
 
 
 def _post(args, marker_kind: str) -> int:
-    repo = _resolve_repo()
-    provider = forge.provider_for()
+    repo = _resolve_repo(args)
 
     # Everything that talks to the forge before the post, inside one guard.
     # `handle_poll` turns a `ForgeError` into a reason code the SKILL tells the
     # model to read; leaving these outside the guard meant an auth blip handed
     # it a Python traceback instead, after it had already written the body.
+    # Selecting the provider is inside it for the same reason: it raises on a
+    # host no forge module serves, and on a value that names no repository.
     try:
-        provider.preflight()
-        viewer = provider.viewer_login()
+        provider = forge.provider_for(repo=repo)
+        viewer = provider.viewer_login(repo)
         if not viewer:
-            _fail("the GitHub credential could not name the account it authenticates as.")
+            _fail(f"the credential for {repo} could not name the account it authenticates as.")
         pr = _find_pr(provider, repo, args.pr, viewer)
         comments, requests = _requests_on(provider, repo, pr, viewer)
     except forge.ForgeError as error:
         _fail(f"{error.reason}: {error.value}")
 
     # The marker closes the request named by `--comment-id`, and the model
-    # supplies that id. A numeric id, a truncated node id, or the id of a
+    # supplies that ref. A bare number, a truncated ref, or the ref of a
     # different comment all post a real answer stamped with a marker that
-    # matches nothing — so `handled_node_ids` keeps returning the request, and
+    # matches nothing — so `handled_refs` keeps returning the request, and
     # the sweep re-answers it every ten minutes. That is the exact failure this
     # helper exists to prevent, so the id is checked against the requests the
     # forge reports as unanswered right now rather than trusted.
@@ -616,35 +786,28 @@ def _post(args, marker_kind: str) -> int:
     )
 
     # Marker syntax is stripped out of the model's body before the real marker
-    # is appended. `handled_node_ids` reads raw bodies and counts *every* marker
+    # is appended. `handled_refs` reads raw bodies and counts *every* marker
     # in a self-authored comment, so one the model imitated in its own prose
     # becomes a real marker the moment this posts — and a marker naming another
-    # node id closes that request for good, at both readers, with silence as the
+    # ref closes that request for good, at both readers, with silence as the
     # reviewer's only signal. The model holds both halves: SKILL.md prints the
-    # syntax in full in order to forbid it, and `poll` carries every node id. A
+    # syntax in full in order to forbid it, and `poll` carries every ref. A
     # line of prose is not the boundary that belongs in front of that.
     body = pr_triggers.strip_markers(_confined_body(args.body_file))
     if not body:
         _fail(f"Reply body {args.body_file} is nothing but marker syntax.")
     stamped = f"{body}\n\n{pr_triggers.marker(args.comment_id, marker_kind)}\n"
 
-    # The stamped copy stays inside scratch: same confinement as the input, and
-    # the same directory the skill is already allowed to write.
-    os.makedirs(SCRATCH_DIR, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix=".md", dir=SCRATCH_DIR, delete=False
-    )
+    # The stamped copy is never written down. It used to go to a file in
+    # scratch, on the volume the credential sidecar also mounted; with the
+    # broker in its own pod there is no such volume, and `post_comment` takes
+    # the text. `_confined_body` above still governs where the *input* may come
+    # from — that confinement is about what the model is allowed to read, and is
+    # unaffected by how the result travels.
     try:
-        handle.write(stamped)
-        handle.close()
-        provider.post_comment(repo, pr, handle.name)
+        provider.post_comment(repo, pr, stamped)
     except forge.ForgeError as error:
         _fail(f"could not post to {repo}#{args.pr}: {error}")
-    finally:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
 
     print(
         json.dumps(
@@ -673,6 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     poll = sub.add_parser("poll", help="list unanswered requests as JSON")
+    poll.add_argument("--repo", default=None, help="target repository (owner/repo)")
     poll.add_argument("--pr", type=int, default=0, help="limit to one pull request")
     poll.set_defaults(func=handle_poll)
 
@@ -681,11 +845,16 @@ def build_parser() -> argparse.ArgumentParser:
         ("refuse", handle_refuse, "post a refusal and mark the request refused"),
     ):
         cmd = sub.add_parser(name, help=help_text)
+        cmd.add_argument(
+            "--repo",
+            required=True,
+            help="the target repository (owner/repo)",
+        )
         cmd.add_argument("--pr", type=int, required=True)
         cmd.add_argument(
             "--comment-id",
             required=True,
-            help="the node id of the comment being answered",
+            help="the ref of the comment being answered",
         )
         cmd.add_argument(
             "--body-file",
@@ -699,7 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
             claim = cmd.add_mutually_exclusive_group(required=True)
             claim.add_argument(
                 "--verify-commit",
-                default="",
+                default=None,
                 metavar="SHA",
                 help="the commit this reply claims to have made; checked against "
                 "the pull request before anything is posted",

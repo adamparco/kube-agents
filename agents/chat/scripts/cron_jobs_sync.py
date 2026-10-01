@@ -78,8 +78,10 @@ same PVC, and has no scheduler of its own — never reaches the step that calls 
 ``getDefaultStorageConfig`` switches the data PVC to ReadWriteMany on
 ``standard-rwx``, and ``useStatefulSet`` stays false without custom ReadWriteOnce
 storage, so it is several pods against one PVC rather than one volume each. A
-rolling update then runs this in a new pod while old pods are still up
-(``maxUnavailable`` is 25%, which rounds down to 0 of 2).
+rolling update then runs this in a new pod while an old pod is still up
+(``maxSurge`` is 25%, which rounds up to 1 of 2, so a new pod is admitted
+before the last old one is gone; ``maxUnavailable`` is an absolute 1, so one
+old pod also stays while it starts).
 
 What that costs is bounded but real, and stating it precisely matters more than
 naming a mechanism:
@@ -133,6 +135,7 @@ from pathlib import Path
 RUNTIME_WINS = ("deliver",)
 
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
+DEFAULT_LEGACY_CRON_RISK = "low"
 
 
 def log(msg: str) -> None:
@@ -246,7 +249,10 @@ def reconcile(
             continue
         job_id = job.get("id")
         if job_id not in seen:
-            result.append(job)
+            if "risk" not in job:
+                result.append({**job, "risk": DEFAULT_LEGACY_CRON_RISK})
+            else:
+                result.append(job)
 
     return result, ledger | {j.get("id") for j in image_jobs if j.get("id")}, summary
 

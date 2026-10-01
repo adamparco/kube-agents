@@ -13,6 +13,8 @@ name: Docker Build
 # Cloud Build, on main, after merge. It does add a second image build per merge.
 on:
   pull_request:
+    branches: [main, "release/**"]
+  merge_group:
     branches: [main]
   push:
     branches: [main]
@@ -41,16 +43,67 @@ jobs:
         run: cat tags.env >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # platforms: linux/amd64 on every deploy/docker/Dockerfile build: the images
       # deploy to amd64 GKE nodes, and the multi-arch bases otherwise resolve to
       # whatever the runner is (#560). Redundant on today's amd64 runners; load-bearing
       # the day the runner label changes.
-      # load: true, unlike the other builds here, so the layer-budget step below
-      # has an image to inspect. It costs a transfer from the buildx cache into
-      # the daemon; nothing else needs the image, which is why the others do
-      # without.
+      # load: true, so the layer-budget step below has an image to inspect. It costs
+      # a transfer from the buildx cache into the daemon, which is why only this
+      # build and the gate-test build below -- the two whose output a later step
+      # runs or inspects -- pay for it.
+      #
+      # The only build here carrying a remote layer cache, and the only one that
+      # needs one: `platform` is the deepest chain the Dockerfile ships and nearly
+      # all of this job's ~5.5 minutes is spent on it. Measured on a fork: 211s and
+      # 236s uncached, 79s restoring, which takes the job from 5.4 to 3.6 minutes.
+      # The export costs the writing run about 150s, which is why only main pays it.
+      # The two builds below that
+      # share its lineage reuse it without a cache of their own --
+      # entrypoint-gate-test is FROM platform and credential-proxy reaches
+      # agent-base through proxy-tools, so both hit buildkit's local state from this
+      # step. Separate scopes for them would export the same layers again for no
+      # extra hit. Build Replay Proxy is not in that set: it builds from its own
+      # context and shares no stage with this chain, so a cache would have to be its
+      # own, and at ~7s of the job it is not worth one.
+      #
+      # Read on the pull request and on a merge-queue run, build fresh and write on
+      # the push to main. The two sides want opposite things and the split is the
+      # point.
+      #
+      # A pull request, and a merge-queue run, want speed, and a slightly stale base
+      # is fine there because nothing either builds ships. The push to main must
+      # not read the cache: this
+      # workflow's header says the layer budget and the entrypoint gate are checked
+      # only here, and the image they check has to be the one that ships. What ships
+      # is built by docker-publish-ghcr.yml, which carries no cache at all. The
+      # agent-base stage installs its apt packages and `uv pip install
+      # hermes-agent[...]` without version pins, and buildkit keys those layers on the
+      # command string and parent digest, so neither key moves when upstream
+      # publishes. HERMES_AGENT_TAG is digest-pinned in tags.env, so the base image is
+      # not the exposure -- what is installed on top of it is. Restore those layers on
+      # main and the gate would validate one dependency set while the publish shipped
+      # another, which is the after-merge Cloud Build failure this job exists to
+      # prevent. Main pays for a full build today, so building fresh here costs
+      # nothing against the status quo and keeps each merge's export honest.
+      #
+      # Writing only on main is also a budget decision. A cache written on a pull
+      # request ref is restorable by later runs of that same pull request but is
+      # invisible to every other ref, so N branches exporting mode=max copies of an
+      # image this size compete for one repository budget -- already ~17 GB across
+      # ~378 entries when this was written, close enough to eviction to push the
+      # setup-go and CodeQL entries out. One writer per merge keeps a single lineage
+      # every pull request restores from its base. That write is not free either: the
+      # gha backend stores one entry per layer keyed by content digest, so unchanged
+      # layers cost nothing after the first export, but the first one is the whole
+      # lineage. Watch `gh api /repos/gke-labs/kube-agents/actions/cache/usage` after
+      # this merges -- if the total climbs rather than settling, this is why.
+      #
+      # scope= is explicit because buildkit's gha backend defaults every export to
+      # the scope `buildkit`, where docker-publish-k8s-operator.yml already writes a
+      # different image. Two images sharing a scope overwrite each other's index and
+      # both stop hitting.
       - name: Build Platform Agent
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -61,6 +114,8 @@ jobs:
           push: false
           load: true
           tags: platform-agent:latest
+          cache-from: ${{ contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) && 'type=gha,scope=platform-agent' || '' }}
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=platform-agent' || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
@@ -89,8 +144,37 @@ jobs:
           target: entrypoint-gate-test
           platforms: linux/amd64
           push: false
+          # load, unlike before: the step below re-runs this stage's check as a
+          # container rather than as a build RUN, and needs the image in the daemon.
+          load: true
+          tags: entrypoint-gate-test:latest
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      # The same check again, against the rootfs the operator actually gives the pod.
+      # The RUN above cannot cover this: a build layer is writable by definition, so it
+      # proves the entrypoint works but says nothing about whether it needs the write.
+      # readOnlyRootFilesystem turns any such write into EROFS at container start, and
+      # the entrypoint runs a script this repo does not own (upstream's stage2-hook.sh),
+      # so "it only writes under $HERMES_HOME and /tmp" has to be tested rather than read
+      # off the source. Cheap, because the image is already in the daemon from the load.
+      #
+      # One --tmpfs stands in for two writable mounts the Deployment provides separately:
+      # the data PVC at $PLATFORM_AGENT_HOME, which the check already relocates under /tmp,
+      # and the tmp-scratch emptyDir. Those have independent budgets in the pod -- a
+      # multi-Gi PVC and a 2Gi emptyDir -- so size=2g is a ceiling on the two combined and
+      # not a model of either. It is there to keep a runaway case from filling the runner,
+      # not to predict which volume a real pod would outgrow; read a failure here as "this
+      # case writes more than we expect", not as "tmp-scratch is too small". exec, because
+      # the check's HA-handoff case runs a wrapper script from the scratch tree and
+      # Docker's default tmpfs is noexec.
+      - name: Verify entrypoint under a read-only root filesystem
+        run: |
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777,size=2g \
+            --entrypoint /usr/local/bin/entrypoint-gate-check \
+            entrypoint-gate-test:latest
 
       # No load: true. This shares only agent-base with the build above, so it is
       # the shorter chain of the two and not the one the budget is measured
@@ -113,3 +197,25 @@ jobs:
           context: examples/inference-replay/replay-proxy
           push: false
           tags: replay-proxy:latest
+
+      # Context is the repository root: the sandbox ships the same
+      # credential-proxy client the agent image does, from its own location.
+      # load: true because the next step runs the image, not just builds it.
+      - name: Build Agent Sandbox
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/sandbox/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: agent-sandbox:latest
+
+      # A build cannot tell you whether sshd starts, whether the agent's key is
+      # accepted, or whether CREDENTIAL_PROXY_URL reaches the shell — the last
+      # of which depends on sshd's config parser and the session type, and was
+      # wrong in the first version of this image while every static check
+      # passed. The script starts the container and connects to it the way the
+      # agent pod does.
+      - name: Smoke-test Agent Sandbox
+        run: deploy/sandbox/smoke-test.sh agent-sandbox:latest

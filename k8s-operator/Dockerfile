@@ -3,12 +3,22 @@
 # a full reference rather than a shared prefix. Defaults are upstream, so an
 # ordinary build is unchanged.
 ARG GOLANG_IMAGE=golang
-ARG GOLANG_VERSION=1.26-alpine
+ARG GOLANG_VERSION=1.27-alpine
 ARG DISTROLESS_IMAGE=gcr.io/distroless/static
 ARG DISTROLESS_VERSION=nonroot
 
 # Build stage
 FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS builder
+
+# The official golang image sets this already; it is repeated here so a
+# substituted GOLANG_IMAGE (a mirror, an in-house base) cannot reintroduce Go's
+# default GOTOOLCHAIN=auto. Under `auto`, a go.mod `go` directive newer than
+# the builder does not fail the build: Go downloads the newer toolchain and
+# builds with it, so the compiler behind the shipped binary is no longer the
+# one GOLANG_VERSION names or images.json pins, and nothing reports the swap.
+# Under `local` that mismatch is a build failure. hack/check-image-inventory.sh
+# catches the same drift before a build runs. (#1138)
+ENV GOTOOLCHAIN=local
 
 ARG TARGETOS
 ARG TARGETARCH

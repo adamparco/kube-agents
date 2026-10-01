@@ -15,18 +15,25 @@ assert on that.
 """
 
 import pathlib
-import subprocess
+import sys
 import unittest
 
-_OPERATOR_DIR = pathlib.Path(__file__).resolve().parents[1] / "k8s-operator"
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from _run_make import run_make  # noqa: E402
+
+_OPERATOR_DIR = _HERE.parent / "k8s-operator"
+
+#: These recipes only print, but the sweep this suite runs inside can be slow.
+_MAKE_TIMEOUT_SECONDS = 60
 
 
 def _make_n(target):
-    result = subprocess.run(
-        ["make", "-n", target, "IMG=example.com/operator:test"],
+    result = run_make(
+        ["-n", target, "IMG=example.com/operator:test"],
+        timeout=_MAKE_TIMEOUT_SECONDS,
         cwd=_OPERATOR_DIR,
-        capture_output=True,
-        text=True,
     )
     if result.returncode != 0:
         raise AssertionError(
@@ -55,6 +62,87 @@ class DeployContractTest(unittest.TestCase):
 
     def test_uninstall_does_not_regenerate_manifests(self):
         self.assertNotIn("controller-gen", _make_n("uninstall"))
+
+    def test_dev_rebuild_agent_points_at_a_script_that_exists(self):
+        """The helpers moved to the repository root's scripts/dev/, and this
+        target ran ./scripts/dev/... relative to k8s-operator/ — a path that
+        stopped existing with the move. `make -n` still prints a recipe for a
+        missing script, so resolve what it names against the filesystem.
+        """
+        recipe = _make_n("dev-rebuild-agent")
+        script = "scripts/dev/dev_rebuild_agent.sh"
+        self.assertIn(script, recipe)
+        repo_root = _OPERATOR_DIR.parent
+        self.assertTrue(
+            (repo_root / script).is_file(),
+            f"{script} must resolve from the repository root, not {_OPERATOR_DIR}",
+        )
+        self.assertFalse(
+            (_OPERATOR_DIR / script).exists(),
+            "k8s-operator/scripts/ is gone; the recipe must not resolve there",
+        )
+
+    def test_images_check_delegates_to_parent_makefile(self):
+        """images-check delegates to the root Makefile target; verify that
+        `make -n images-check` invokes make -C .. images-check.
+        """
+        recipe = _make_n("images-check")
+        self.assertIn("-C .. images-check", recipe)
+
+
+def _check_img(img, env=None):
+    """Run the real check-img target (no cluster needed) and return the result."""
+    return run_make(
+        ["-s", "check-img", f"IMG={img}", *(env or [])],
+        timeout=_MAKE_TIMEOUT_SECONDS,
+        cwd=_OPERATOR_DIR,
+    )
+
+
+class MutableImageGuardTest(unittest.TestCase):
+    """`make deploy` refuses a floating tag (#1009).
+
+    A controller deployed from `:latest` is upgraded on its next pod reschedule
+    while the ClusterRole applied with it stays put, and the first verb the
+    newer controller needs that the older role lacks fails every reconcile.
+    The guard is a prerequisite of `deploy`, so a reordered prerequisite or a
+    broken `case` pattern would let the floating tag through with no build
+    failing; run the target itself, which touches no cluster.
+    """
+
+    def test_deploy_depends_on_the_guard(self):
+        # `make -n` prints the prerequisites' recipes too, so the guard's
+        # refusal text appearing here proves deploy still depends on it.
+        self.assertIn("ALLOW_MUTABLE_IMG", _make_n("deploy"))
+
+    def test_floating_and_missing_tags_are_refused(self):
+        for img in (
+            "example.com/operator:latest",
+            "example.com/operator:main",
+            "example.com/operator:dev",
+            "example.com/operator",
+            "registry.example.com:5000/operator",
+        ):
+            with self.subTest(img=img):
+                result = _check_img(img)
+                self.assertNotEqual(result.returncode, 0, f"{img} should be refused")
+                self.assertIn("#1009", result.stderr)
+                self.assertIn("ALLOW_MUTABLE_IMG=1", result.stderr)
+
+    def test_immutable_references_pass(self):
+        for img in (
+            "example.com/operator:0.1.0",
+            "example.com/operator:" + "a" * 40,
+            "registry.example.com:5000/operator:abc123",
+            "example.com/operator@sha256:" + "a" * 64,
+        ):
+            with self.subTest(img=img):
+                result = _check_img(img)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_override_lets_a_floating_tag_through(self):
+        result = _check_img("example.com/operator:latest", ["ALLOW_MUTABLE_IMG=1"])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

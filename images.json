@@ -15,8 +15,17 @@
       "repository": "ghcr.io/gke-labs/kube-agents/credential-proxy",
       "tagPolicy": "release",
       "override": "CREDENTIAL_PROXY_IMAGE",
-      "pulledBy": "The credential-proxy sidecar in the agent pod.",
-      "description": "The platform-agent image plus the Envoy-based credential proxy runtime."
+      "pulledBy": "The credential-proxy Deployment, and the agent-api-auth sidecar in the agent pod.",
+      "description": "Envoy, the credential runtime, and the CLIs it wraps — the only image holding real credentials."
+    },
+    {
+      "name": "agent-sandbox",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/agent-sandbox",
+      "tagPolicy": "release",
+      "override": "AGENT_SANDBOX_IMAGE",
+      "pulledBy": "The shell sandbox StatefulSet the operator renders beside every agent pod.",
+      "description": "SSH-reachable shell sandbox: Python, an SSH server, and the credential-proxy CLI wrappers, with no credentials and no path back into the agent pod."
     },
     {
       "name": "k8s-operator",
@@ -37,10 +46,61 @@
       "description": "Record/replay proxy for model traffic."
     },
     {
+      "name": "pubsub-platform",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/pubsub-platform",
+      "tagPolicy": "release",
+      "pulledBy": "The pubsub-platform AgentPlugin.",
+      "description": "Pub/Sub ingress adapter plugin opening event listeners for Cloud Pub/Sub subscriptions."
+    },
+    {
+      "name": "gke-stockout-investigator",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/gke-stockout-investigator",
+      "tagPolicy": "release",
+      "pulledBy": "The gke-stockout-investigator AgentPlugin.",
+      "description": "Autonomous diagnostic and remediation skill for GKE compute stockouts."
+    },
+    {
+      "name": "a2a-gateway",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-gateway",
+      "tagPolicy": "release",
+      "override": "A2A_GATEWAY_IMAGE",
+      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way.",
+      "description": "The chat gateway of the A2A next stack: adapters, the bus relay and the session spawner (a2a/Dockerfile.gateway)."
+    },
+    {
+      "name": "a2a-worker",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
+      "tagPolicy": "release",
+      "override": "A2A_WORKER_IMAGE",
+      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE.",
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker)."
+    },
+    {
+      "name": "a2a-authcallout",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
+      "tagPolicy": "release",
+      "override": "A2A_CALLOUT_IMAGE",
+      "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
+    },
+    {
+      "name": "hermes-bridge",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
+      "tagPolicy": "release",
+      "pulledBy": "The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's.",
+      "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
+    },
+    {
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.96.2",
+      "tag": "v1.100.1",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -49,16 +109,34 @@
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",
-      "tag": "5.1.0",
+      "tag": "5.1.2",
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."
     },
     {
+      "name": "nats",
+      "origin": "third-party",
+      "repository": "docker.io/library/nats",
+      "tag": "2.10-alpine",
+      "override": "A2A_NATS_IMAGE",
+      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
+    },
+    {
+      "name": "nats-box",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/nats-box",
+      "tag": "0.14.5",
+      "override": "A2A_PROVISION_IMAGE",
+      "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing on a default install.",
+      "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
+    },
+    {
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",
-      "tag": "1.34.9",
+      "tag": "1.36.4",
       "pulledBy": "The chart's pre-delete cleanup hook Job.",
       "description": "alpine/k8s — kubectl plus a shell, for the hook that deletes the PlatformAgent CR before Helm removes the operator. The name is the trailing path segment because the chart renders this one: kube-agents.imageRepository rewrites onto <prefix>/<trailing name>, which has to be the destination mirror_images.sh writes (<prefix>/<name>)."
     },
@@ -75,7 +153,7 @@
       "name": "hindsight-api",
       "origin": "third-party",
       "repository": "ghcr.io/vectorize-io/hindsight-api",
-      "tag": "0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab",
+      "tag": "0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812",
       "override": "HINDSIGHT_API_IMAGE",
       "pulledBy": "The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path).",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
@@ -83,17 +161,17 @@
     {
       "name": "hindsight-postgresql",
       "origin": "third-party",
-      "repository": "docker.io/ankane/pgvector",
-      "tag": "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8",
+      "repository": "docker.io/pgvector/pgvector",
+      "tag": "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da",
       "override": "HINDSIGHT_POSTGRES_IMAGE",
       "pulledBy": "The chart, alongside the Hindsight API.",
-      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. Upstream publishes only a floating 'latest', so the digest is the real pin."
+      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still."
     },
     {
       "name": "cert-manager-controller",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-controller",
-      "tag": "v1.21.1",
+      "tag": "v1.21.2",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "Issues the webhook serving certificates the operator's webhooks need."
     },
@@ -101,7 +179,7 @@
       "name": "cert-manager-cainjector",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-cainjector",
-      "tag": "v1.21.1",
+      "tag": "v1.21.2",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "Injects CA bundles into webhook configurations."
     },
@@ -109,7 +187,7 @@
       "name": "cert-manager-webhook",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-webhook",
-      "tag": "v1.21.1",
+      "tag": "v1.21.2",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "cert-manager's own admission webhook."
     },
@@ -117,7 +195,7 @@
       "name": "cert-manager-acmesolver",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-acmesolver",
-      "tag": "v1.21.1",
+      "tag": "v1.21.2",
       "pulledBy": "cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself; the copy exists so a mirrored cert-manager install can point the flag at it.",
       "description": "Solver pod cert-manager runs for ACME HTTP-01 challenges."
     },
@@ -125,7 +203,7 @@
       "name": "cert-manager-startupapicheck",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-startupapicheck",
-      "tag": "v1.21.1",
+      "tag": "v1.21.2",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false. Runs once per install as a post-install hook Job.",
       "description": "One-shot check that the cert-manager API is actually serving before the install is declared done."
     },
@@ -145,7 +223,7 @@
       "name": "envoy",
       "origin": "build-time",
       "repository": "docker.io/envoyproxy/envoy",
-      "tag": "v1.39.0",
+      "tag": "v1.39.1",
       "buildArg": "ENVOY_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
       "description": "Source of the envoy binary copied into the credential-proxy image."
@@ -154,19 +232,28 @@
       "name": "golang",
       "origin": "build-time",
       "repository": "docker.io/library/golang",
-      "tag": "1.26-alpine",
+      "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.worker and a2a/Dockerfile.hermes-bridge builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
+    },
+    {
+      "name": "node",
+      "origin": "build-time",
+      "repository": "docker.io/library/node",
+      "tag": "22-slim",
+      "buildArg": "NODE_IMAGE",
+      "pulledBy": "a2a/Dockerfile.worker runtime stage.",
+      "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary."
     },
     {
       "name": "python",
       "origin": "build-time",
       "repository": "docker.io/library/python",
-      "tag": "3.11-slim",
+      "tag": "3.14-slim",
       "buildArg": "PYTHON_IMAGE",
-      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile.",
-      "description": "Runtime base for the replay proxy."
+      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile.",
+      "description": "Runtime base for the replay proxy, and for the agent sandbox — which needs a python3 on PATH because that is what execute_code invokes."
     },
     {
       "name": "distroless-static",
@@ -174,8 +261,16 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile runtime stage.",
+      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout and a2a/Dockerfile.gateway runtime stages.",
       "description": "Runtime base for the operator image."
+    },
+    {
+      "name": "busybox",
+      "origin": "build-time",
+      "repository": "docker.io/library/busybox",
+      "tag": "musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37",
+      "pulledBy": "agentplugins/*/Dockerfile base images.",
+      "description": "Minimal userland (sh, cp, ls) base image for plugin images to support staging init containers."
     }
   ]
 }

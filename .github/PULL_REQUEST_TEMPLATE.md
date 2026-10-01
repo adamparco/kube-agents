@@ -28,6 +28,28 @@ file matters.
 
 <!-- Include related issues, PRs, follow-up work, or other background. -->
 
+## Bug Fix: Preventing Recurrence
+
+<!--
+Required when this PR fixes a bug, which includes every `fix` type, scoped or not.
+Otherwise write "Not a bug fix."
+
+- Why it shipped: the test, check, or review step that should have caught the bug, and
+  why it did not.
+- What catches it now: the test, eval case, or check that fails if the bug comes back,
+  and that fails without the fix: seen by you, or on record for an `expected_fail` case
+  this change flips. An existing case counts; name it.
+- Where else it lives: other places the same mistake could be, and whether you checked
+  them or the guard covers them.
+
+If nothing automated can catch it, say why and what stands in for it.
+
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
+-->
+
+-
+
 ## Testing
 
 <!-- Automated checks: unit tests, builds, `make docs-check`, `prettier --check`. -->
@@ -37,10 +59,24 @@ file matters.
 ### Live validation
 
 <!--
-Required: an empty section is not an answer. Describe how this change was exercised
-against a real, running kube-agents installation — which install (cluster, image tag,
-operator version), what you did, and what you observed at each layer the change claims to
-touch: the CR `.status`, the Deployment env, the file or process inside the pod.
+Required: an empty section is not an answer. Three forms, by what the change touches:
+
+- It changes what an agent does (prompt, SOP, skill, tool, runtime path, a fix for agent
+  behaviour, or a chart/operator/config change that alters it): the eval loop is the live
+  validation. Name the case (new or existing); the red run against `main` (install and commit,
+  the failing check and its reason, one line of the agent's report); the three green runs
+  against this branch; where the case is registered. Mechanics:
+  .agents/rules/eval_driven_development.md. A case you file for a gap someone else owns lands
+  red and marked `expected_fail: true`; the fix that flips it cites that record (same file,
+  "When the fix is not yours"). "No cluster" is not an answer: every contributor has a dev
+  project.
+- It changes runtime behaviour but not what an agent does (operator, chart, installer, image):
+  describe how it was exercised against a real, running kube-agents installation — which
+  install (cluster, image tag, operator version), what you did, and what you observed at each
+  layer the change claims to touch: the CR `.status`, the Deployment env, the file or process
+  inside the pod.
+- It cannot reach a running installation (docs, CI, pool/fleet/Prow infrastructure, the bench
+  harness under `bench/kube_agents_bench/`): write "Not live-tested" and say why.
 
 Prove the mechanism, not a coincidence: if the new behaviour happens to match the old
 default, set something distinctly different, then revert and confirm it goes back.
@@ -48,8 +84,10 @@ default, set something distinctly different, then revert and confirm it goes bac
 Say plainly what you could NOT cover and why, and confirm any test artifacts were
 cleaned up.
 
-If the change cannot reach a running installation — docs-only, a CI workflow, a path
-that needs infrastructure you do not have — write "Not live-tested" and say why.
+For a genuinely graphical surface (admin console, docs site, chat), capture and link a
+screenshot with `scripts/pr_evidence_screenshot.sh` — it publishes the image and prints
+Markdown stamped with the commit and capture time. Command output stays as fenced text
+transcripts, not screenshots.
 
 If the install is shared with other agents, take the lease first: see
 docs/designs/live-test-lease.md.
@@ -57,7 +95,8 @@ docs/designs/live-test-lease.md.
 Re-testing after new commits folds into this section rather than stacking a round
 beneath it: keep what still holds, and re-run or flag what the new commits invalidated.
 
-Full contract: AGENTS.md, "Pull Request Hygiene".
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
 -->
 
 -
@@ -90,7 +129,8 @@ Re-running the pass folds into this section rather than stacking a round beneath
 it: keep what still holds, re-state what the new commits changed, and drop the
 superseded round rather than a finding's disposition.
 
-Full contract: AGENTS.md, "Pull Request Hygiene".
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
 -->
 
 -

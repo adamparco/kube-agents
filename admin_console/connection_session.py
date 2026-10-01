@@ -59,9 +59,12 @@ def initialize_connection_controller(
     st.session_state.authenticated_user = authenticated_user
     persisted_connection = load_connection(authenticated_user)
 
-    provisioned_target = load_provisioned_target(
-        package_parent / "k8s-operator" / "scripts" / "vars.sh"
-    )
+    # install.env is what the installers read, so it is the one file the portal
+    # must agree with. The generated k8s-operator/scripts/vars.sh it replaced is
+    # no longer consulted: nothing has written it since the installers switched
+    # over, so anything still on disk there is stale and would preselect a
+    # cluster the installers are not pointed at.
+    provisioned_target = load_provisioned_target(package_parent / "install.env")
     query_project = str(st.query_params.get("project", "")).strip()
     configured_project = os.environ.get("KUBE_AGENTS_GCLOUD_PROJECT", "").strip()
     persisted_project = (

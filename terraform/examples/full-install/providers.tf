@@ -14,6 +14,11 @@ terraform {
       source  = "hashicorp/random"
       version = ">= 3.5, < 4.0"
     }
+    tls = {
+      source = "hashicorp/tls"
+      # ED25519 support in tls_private_key landed in 4.0.
+      version = ">= 4.0, < 5.0"
+    }
     helm = {
       source = "hashicorp/helm"
       # The kubernetes = { ... } attribute syntax below is helm-provider-3.x
@@ -40,8 +45,21 @@ data "google_client_config" "default" {}
 
 provider "helm" {
   kubernetes = {
-    host                   = "https://${module.gke_cluster.cluster_endpoint}"
-    token                  = data.google_client_config.default.access_token
-    cluster_ca_certificate = base64decode(module.gke_cluster.cluster_ca_certificate)
+    host  = "https://${module.gke_cluster.cluster_endpoint}"
+    token = data.google_client_config.default.access_token
+
+    # The cluster CA signs the IP endpoints only. When cluster_endpoint is the
+    # DNS-based endpoint -- which is what GKE reports for a cluster with IP
+    # access disabled -- Google Front End terminates the connection with a
+    # publicly signed certificate, and passing the cluster CA makes it the sole
+    # trust anchor, so every handshake fails with
+    # "x509: certificate signed by unknown authority". Unset, client-go falls
+    # back to the system trust store, which is what kubectl does after
+    # `get-credentials --dns-endpoint`.
+    cluster_ca_certificate = (
+      module.gke_cluster.cluster_endpoint_is_dns
+      ? null
+      : base64decode(module.gke_cluster.cluster_ca_certificate)
+    )
   }
 }

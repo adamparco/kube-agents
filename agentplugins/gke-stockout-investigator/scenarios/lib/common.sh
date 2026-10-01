@@ -31,13 +31,22 @@
 #   scenario_reasons()   echoes a JSON fragment of rejectedMigs/napFailureReasons
 #                        (optional) — this is what steers the diagnosis
 #   scenario_notes()     echoes free text shown after the run (optional)
+#   scenario_preflight() checks this scenario's own prerequisites (optional) — runs at
+#                        the end of preflight(), so before clear_dedup or any workload
+#                        exists. Put a `die` here rather than in a hook: the hooks above
+#                        first run once the run has already mutated both clusters.
 #
-# Each hook runs in a subshell, and scenario_manifest runs more than once per invocation,
-# so nothing a hook assigns reaches the next one. A hook that resolves something at run
-# time must wrap the resolver in scenario_memo (below) or it will resolve repeatedly, and
-# may not resolve the same way twice.
+# Each of the three output hooks runs in a subshell, and scenario_manifest runs more than
+# once per invocation, so nothing they assign reaches the next one. A hook that resolves
+# something at run time must wrap the resolver in scenario_memo (below) or it will resolve
+# repeatedly, and may not resolve the same way twice. scenario_preflight is the exception:
+# preflight() calls it directly, so what it assigns does persist -- which is why it is the
+# right place for a check whose answer the run depends on.
 
 set -euo pipefail
+
+# Enforce system python for gcloud to prevent google-auth AttributeError crashes in CI
+export CLOUDSDK_PYTHON="${CLOUDSDK_PYTHON:-/usr/bin/python3}"
 
 # --------------------------------------------------------------------- settings
 #
@@ -84,7 +93,9 @@ GITOPS_REPO="${GITOPS_REPO:-}"
 PLUGIN_NAME="${PLUGIN_NAME:-gkestockoutinvestigator}"
 
 # Zones of the target region, used by scenarios that pin a workload to one zone.
+# shellcheck disable=SC2034 # read by the scenario scripts that source this file
 ZONE_A="${CLUSTER_LOCATION}-b"
+# shellcheck disable=SC2034 # read by the scenario scripts that source this file
 ZONE_B="${CLUSTER_LOCATION}-c"
 
 # Defaults a scenario may override before calling scenario_main.
@@ -102,6 +113,10 @@ KEEP_DEDUP=0
 DRY_RUN=0
 EMIT_MANIFEST=""
 WATCH_TIMEOUT="${WATCH_TIMEOUT:-600}"
+AGENT_AVAILABILITY_TIMEOUT="${AGENT_AVAILABILITY_TIMEOUT:-180}"
+SKILL_MOUNT_TIMEOUT="${SKILL_MOUNT_TIMEOUT:-30}"
+IN_LOOP_POD_RESOLVE_TIMEOUT="${IN_LOOP_POD_RESOLVE_TIMEOUT:-15}"
+AGENT_POLL_INTERVAL=5
 
 SCENARIO_SLUG="$(basename "${BASH_SOURCE[1]:-scenario}" .sh)"
 RUN_ID=""
@@ -200,7 +215,7 @@ Usage: ./${SCENARIO_SLUG}.sh [options]
                     cluster+namespace+controller is otherwise silently dropped.
   --watch-timeout N Seconds to watch for the investigation (default ${WATCH_TIMEOUT}).
   --emit-manifest F Write the scenario's manifest to F ("-" for stdout) and exit, ready
-                    for `kubectl apply -f`. Includes the namespace and pins the workload
+                    for \`kubectl apply -f\`. Includes the namespace and pins the workload
                     to it, so the file stands alone — useful for launching a scenario by
                     hand, or for reading what a scenario actually deploys.
   --dry-run         Print the manifest and the alert payload; change nothing.
@@ -236,12 +251,53 @@ _parse_args() {
 
 # -------------------------------------------------------------------- preflight
 
-# Resolve the gateway pod once; several steps need to exec into it.
+# Sync PLATFORM_POD from the file latch if a subshell resolved a new pod.
+_sync_platform_pod() {
+    if [ -f "${SCENARIO_RUN_DIR}/platform_pod" ]; then
+        PLATFORM_POD="$(cat "${SCENARIO_RUN_DIR}/platform_pod")"
+    fi
+}
+
+# Wait for a ready, non-terminating gateway pod with container platform-agent ready.
+# Accepts an optional timeout in seconds (defaulting to AGENT_AVAILABILITY_TIMEOUT).
+# Returns 0 on success, 1 on timeout (does not call die so subshell callers don't trigger set -e).
+# All progress output is directed to stderr to keep caller stdout unpolluted.
+_wait_for_platform_pod() {
+    local timeout="${1:-$AGENT_AVAILABILITY_TIMEOUT}"
+    local waited=0 pod=""
+    dim "waiting up to ${timeout}s for a ready platform-agent-gateway pod" >&2
+    while [ "$waited" -lt "$timeout" ]; do
+        pod="$(kmgmt get pods -n "$AGENT_NAMESPACE" -l app=platform-agent-gateway -o json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for p in data.get("items", []):
+        meta = p.get("metadata", {})
+        if meta.get("deletionTimestamp"):
+            continue
+        if p.get("status", {}).get("phase") != "Running":
+            continue
+        statuses = {c["name"]: c.get("ready", False) for c in p.get("status", {}).get("containerStatuses", [])}
+        if statuses.get("platform-agent", False):
+            print(meta.get("name", ""))
+            break
+except Exception:
+    pass
+' || true)"
+        if [ -n "$pod" ]; then
+            PLATFORM_POD="$pod"
+            printf '%s' "$pod" > "${SCENARIO_RUN_DIR}/platform_pod"
+            return 0
+        fi
+        sleep "$AGENT_POLL_INTERVAL"
+        waited=$((waited + AGENT_POLL_INTERVAL))
+    done
+    return 1
+}
+
 _resolve_platform_pod() {
-    PLATFORM_POD="$(kmgmt get pods -n "$AGENT_NAMESPACE" \
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
-        | grep '^platform-agent-gateway-' | head -1 || true)"
-    [ -n "$PLATFORM_POD" ] || die "no platform-agent-gateway pod in ${AGENT_NAMESPACE} on ${MGMT_CONTEXT}"
+    _wait_for_platform_pod "$AGENT_AVAILABILITY_TIMEOUT" \
+        || die "no ready platform-agent-gateway pod in ${AGENT_NAMESPACE} after ${AGENT_AVAILABILITY_TIMEOUT}s"
 }
 
 # The failure modes below are the ones that have actually cost time: an alert that is
@@ -282,29 +338,77 @@ preflight() {
     _resolve_platform_pod
     dim "gateway pod ${PLATFORM_POD}"
 
-    # $HERMES_HOME is /opt/data in the shipped image, but read it rather than assume:
-    # a plugin that mounted at the wrong path is exactly the failure this catches.
-    if kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        sh -c 'test -f "${HERMES_HOME:-/opt/data}/profiles/platform/plugins/'"${PLUGIN_NAME}"'/skills/gke-stockout-investigator/SKILL.md"' 2>/dev/null
-    then
+    # Wait up to SKILL_MOUNT_TIMEOUT for the skill to be readable in the resolved pod.
+    # Transient mount lag resolves within seconds; a short bound keeps permanent failures
+    # from consuming the scenario headroom.
+    _sync_platform_pod
+    local skill_waited=0 skill_found=0
+    while [ "$skill_waited" -lt "$SKILL_MOUNT_TIMEOUT" ]; do
+        if kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+            sh -c 'test -f "${HERMES_HOME:-/opt/data}/profiles/platform/plugins/'"${PLUGIN_NAME}"'/skills/gke-stockout-investigator/SKILL.md"' 2>/dev/null; then
+            skill_found=1
+            break
+        fi
+        sleep "$AGENT_POLL_INTERVAL"
+        skill_waited=$((skill_waited + AGENT_POLL_INTERVAL))
+    done
+    if [ "$skill_found" -eq 1 ]; then
         ok "skill resolves in the platform profile"
     else
-        warn "SKILL.md not found under the platform profile's plugins directory"
+        warn "SKILL.md not found under the platform profile's plugins directory after ${skill_waited}s"
         warn "the investigation would run without it — check the plugin mount"
     fi
 
     gcloud pubsub topics describe "$TOPIC" --project="$PROJECT_ID" >/dev/null 2>&1 \
         || die "Pub/Sub topic ${TOPIC} not found in ${PROJECT_ID}"
     ok "topic ${TOPIC} exists"
+
+    # Last, so a scenario's own prerequisite is reported after the shared ones it
+    # depends on -- and still before clear_dedup wipes the registry.
+    if declare -F scenario_preflight >/dev/null; then
+        scenario_preflight
+    fi
+}
+
+# Reclaim and archive any active, blocked, or stuck tasks on the kanban board for this route
+# so concurrency slots (max_in_progress = 2) are not starved.
+cleanup_kanban() {
+    _sync_platform_pod
+    [ -n "$PLATFORM_POD" ] || return 0
+    local script_dir clean_script
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    clean_script="${script_dir}/clean_stale_kanban_tasks.py"
+    if [ ! -f "$clean_script" ]; then
+        warn "kanban cleanup script missing: ${clean_script}"
+        return 1
+    fi
+    local out
+    if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+        python3 -c "$(< "$clean_script")" "$ROUTE_NAME" 2>&1)"; then
+        local count="${out##*$'\n'}"
+        if [ "$count" -gt 0 ] 2>/dev/null; then
+            ok "archived ${count} stale kanban task(s) for ${ROUTE_NAME}"
+        else
+            dim "kanban board clean for ${ROUTE_NAME} (0 active tasks)"
+        fi
+        return 0
+    else
+        warn "kanban cleanup encountered an error: ${out}"
+        return 1
+    fi
 }
 
 # The adapter dedups on cluster + namespace + controller for 24h. Re-running a
 # scenario is the normal case here, so clear the registry unless asked not to.
 clear_dedup() {
     [ "$KEEP_DEDUP" -eq 1 ] && { dim "keeping dedup registry (--keep-dedup)"; return 0; }
+    _sync_platform_pod
     kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         rm -f /opt/data/pubsub_registry.json >/dev/null 2>&1 || true
     ok "cleared the adapter dedup registry"
+    # Board cleanup is best-effort hygiene before starting a scenario run; if it fails,
+    # warn but proceed so a transient Hermes error does not abort the scenario setup.
+    cleanup_kanban || warn "proceeding despite kanban cleanup failure; slots may remain occupied"
 }
 
 # ------------------------------------------------------------------- the payload
@@ -420,11 +524,16 @@ _manifest_part() {
     scenario_manifest | python3 -c '
 import sys, yaml
 want = sys.argv[1]
-INFRA = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-sel = [d for d in docs if (d.get("kind") in INFRA) == (want == "infra")]
+infra_kinds = {"ComputeClass", "StorageClass", "PriorityClass", "ResourceQuota"}
+raw = sys.stdin.read()
+docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, dict)]
+sel = []
+for doc in docs:
+    is_infra = doc.get("kind") in infra_kinds
+    if is_infra == (want == "infra"):
+        sel.append(doc)
 if sel:
-    print(yaml.safe_dump_all(sel, sort_keys=False), end="")
+    print(yaml.safe_dump_all(sel, sort_keys=False))
 ' "$1"
 }
 
@@ -450,10 +559,15 @@ emit_manifest() {
             printf -- '---\n'
             printf '%s\n' "$work" | python3 -c '
 import sys, yaml
-docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
-for d in docs:
-    d.setdefault("metadata", {})["namespace"] = sys.argv[1]
-print(yaml.safe_dump_all(docs, sort_keys=False), end="")
+ns = sys.argv[1]
+raw = sys.stdin.read()
+docs = [doc for doc in yaml.safe_load_all(raw) if isinstance(doc, dict)]
+for doc in docs:
+    meta = doc.setdefault("metadata", {})
+    if isinstance(meta, dict):
+        meta["namespace"] = ns
+if docs:
+    print(yaml.safe_dump_all(docs, sort_keys=False))
 ' "$WORKLOAD_NAMESPACE"
         }
     } > >(if [ "$out" = "-" ]; then cat; else cat > "$out"; fi)
@@ -516,8 +630,8 @@ apply_workload() {
     # by the time it looks. Autopilot marks the pod Pending and records the
     # provisioning failure within a few tens of seconds.
     info "waiting up to 90s for the pods to go Pending with a scheduling failure"
-    local i pending blocked
-    for i in $(seq 1 18); do
+    local pending blocked
+    for _ in $(seq 1 18); do
         pending="$(kprod get pods -n "$WORKLOAD_NAMESPACE" \
             -l "scenario=${SCENARIO_SLUG}" \
             -o jsonpath='{range .items[?(@.status.phase=="Pending")]}{.metadata.name}{"\n"}{end}' \
@@ -549,6 +663,9 @@ apply_workload() {
 
 cleanup_workload() {
     step "Cleaning up"
+    # Reclaim and archive any active tasks created during this run. Non-fatal so that
+    # k8s workload deletion and PVC cleanup below proceed even if Hermes encounters an error.
+    cleanup_kanban || true
     if ! declare -F scenario_manifest >/dev/null; then
         dim "nothing to remove"; return 0
     fi
@@ -574,8 +691,8 @@ cleanup_workload() {
         # Count controllers, not `all`: the delete above does not wait, so pods and
         # replica sets from the scenario just removed are still terminating and would
         # make an empty namespace look occupied.
-        local left i
-        for i in 1 2 3; do
+        local left
+        for _ in 1 2 3; do
             left="$(kprod get deploy,statefulset,job -n "$WORKLOAD_NAMESPACE" \
                 -o name 2>/dev/null | grep -c . || true)"
             [ "${left:-0}" -eq 0 ] && break
@@ -596,38 +713,137 @@ cleanup_workload() {
 
 # ---------------------------------------------------------------------- watching
 
+# One line per run, not one per poll.
+#
+# watch_investigation calls the readers below every 10 seconds for up to WATCH_TIMEOUT —
+# 600s by default, so sixty times — and prints a `\r` progress counter between calls. An
+# unlatched warning is therefore both repeated sixty times and half-erased by the next
+# tick, which buries the one message it exists to surface under its own repeats.
+#
+# The latch is a file rather than a variable for the same reason scenario_memo above is
+# one: these readers run inside `$( )` and on the left of a pipe, both subshells, so an
+# assignment would be discarded along with the subshell that made it.
+warn_once() {
+    local key="$1"; shift
+    local latch="${SCENARIO_RUN_DIR}/warned.${key}"
+
+    if [ -e "$latch" ]; then
+        return 0
+    fi
+    : > "$latch"
+    # `warn` prints to stdout, and both callers have their stdout consumed by a parser.
+    warn "$@" >&2
+}
+
+# Returns the gateway's session list as JSON, or `{}` — and says which, on stderr, when
+# it is the second one.
+#
+# The `|| echo '{}'` used to cover the whole call, and a rejected request is not a call
+# that failed: `requests.get` returns a 401 body happily, this printed it, and the caller's
+# `.get('data', [])` read it as an empty session list. So a watcher pointed at an agent
+# whose entire API surface was returning 401 reported "nothing has happened yet" and went
+# on doing so until it timed out — which is exactly what issue #786 was, for two months,
+# across every caller shaped like this one. An empty result and a refused one look the
+# same to every consumer downstream, so the distinction has to be made here or nowhere.
+#
+# Still non-fatal: a scenario watcher that aborts on one transient blip is worse than one
+# that waits. The contract is unchanged for callers; what is new is that a human reading
+# the transcript can tell the two apart.
 _sessions_json() {
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+    _sync_platform_pod
+    local out
+    # The diagnostic goes to stdout inside the pod and is CAPTURED, not printed: this
+    # function's stdout is piped straight into a json.load. Only the failure branch
+    # un-captures it, onto stderr, via warn_once.
+    if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         python3 -c "
-import os, requests
+import os, sys, requests
 key = os.environ.get('API_SERVER_KEY', '')
-print(requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
-                   headers={'Authorization': 'Bearer ' + key}, timeout=10).text)
-" 2>/dev/null || echo '{}'
+r = requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
+                 headers={'Authorization': 'Bearer ' + key}, timeout=10)
+if r.status_code != 200:
+    print('the gateway API refused it: HTTP %s %s' % (r.status_code, r.text[:200]))
+    sys.exit(1)
+print(r.text)
+" 2>/dev/null)"; then
+        printf '%s\n' "$out"
+    else
+        _wait_for_platform_pod "$IN_LOOP_POD_RESOLVE_TIMEOUT" || true
+        warn_once sessions "could not read the agent's session list; treating it as empty — ${out:-no response} (issue #786)"
+        echo '{}'
+    fi
 }
 
 # Sessions started before we published are from earlier runs; only a newer one is ours.
 _task_after() {
+    _sync_platform_pod
     # The kanban twin of _session_after, for routes with `dispatch: kanban`. Those file
     # the alert as a task owned by the specialist profile and never create a gateway
     # session, so watching only for sessions reports "nothing happened" while the
     # investigation runs to completion.
-    local since="$1"
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        env HOME=/tmp hermes kanban ls --json 2>/dev/null | python3 -c "
-import json, sys
-since = float('$since')
+    #
+    # Distinguishes a failed read from an empty board for the same reason _sessions_json
+    # does, and it is the same bug: `2>/dev/null` plus `except Exception: sys.exit(0)`
+    # turned a pod that could not be exec'd into, a `hermes kanban` that errored, and a
+    # board with nothing on it into one answer — no output — which watch_investigation
+    # reads as "nothing has happened yet" until it times out. The two exec paths are the
+    # only ones this watcher has, so leaving this one silent would have fixed the report
+    # for `dispatch: api` routes and left `dispatch: kanban` routes lying.
+    local since="$1" out err errtext
+    # stderr goes to a file, not into `out`, and is read only on the failure branch.
+    # It cannot be discarded — on that branch the command's own message is the only
+    # account of what went wrong — but it must not be merged into stdout either: `out`
+    # is piped straight into a json.load below, so one benign line from the CLI or from
+    # kubectl would break the parse and report a working board as broken. Unlike
+    # _sessions_json, the program on the other end is not ours to make print elsewhere.
+    err="$(mktemp)"
+    if ! out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+        python3 -c '
+import json, os, subprocess, sys
+
+since = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
+route_name = sys.argv[2] if len(sys.argv) > 2 else ""
+cmd_env = dict(os.environ)
+cmd_env["HOME"] = "/tmp"
+cmd_env.setdefault("HERMES_HOME", "/opt/data")
+
+res = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True)
+if res.returncode != 0:
+    sys.stderr.write(res.stderr)
+    sys.exit(res.returncode)
+
+raw = res.stdout
+data = None
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(raw)
 except Exception:
-    sys.exit(0)
-tasks = data.get('tasks') if isinstance(data, dict) else data
-for t in sorted(tasks or [], key=lambda x: x.get('created_at') or 0, reverse=True):
-    if (t.get('created_at') or 0) >= since and str(t.get('title','')).startswith('${ROUTE_NAME}'):
-        print('%s\t%s\t%s' % (t.get('id',''), t.get('status') or 'running',
-                              (t.get('title') or '')[:70]))
+    start = min([pos for pos in (raw.find("["), raw.find("{")) if pos != -1], default=-1)
+    end = max([pos for pos in (raw.rfind("]"), raw.rfind("}")) if pos != -1], default=-1)
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(raw[start:end+1])
+        except Exception:
+            pass
+if data is None:
+    sys.stderr.write(f"kanban ls did not return valid JSON: {raw[:200]}\n")
+    sys.exit(3)
+
+tasks = data.get("tasks") if isinstance(data, dict) else data
+for t in sorted(tasks or [], key=lambda x: x.get("created_at") or 0, reverse=True):
+    if (t.get("created_at") or 0) >= since and str(t.get("title","")).startswith(route_name):
+        print("%s\t%s\t%s" % (t.get("id",""), t.get("status") or "running", (t.get("title") or "")[:70]))
         break
-"
+' "$since" "$ROUTE_NAME" 2>"$err")"; then
+        errtext="$(head -c 200 "$err")"
+        rm -f "$err"
+        if [[ "$errtext" == *"not found"* || "$errtext" == *"NotFound"* || "$errtext" == *"terminating"* || "$errtext" == *"closed before"* ]]; then
+            _wait_for_platform_pod "$IN_LOOP_POD_RESOLVE_TIMEOUT" || true
+        fi
+        warn_once tasks "could not read the agent's kanban board; treating it as empty — ${errtext:-${out:-no response}}"
+        return 0
+    fi
+    rm -f "$err"
+    printf '%s\n' "$out"
 }
 
 _session_after() {
@@ -672,8 +888,15 @@ watch_investigation() {
     step "Watching for the investigation (up to ${WATCH_TIMEOUT}s)"
     info "the agent notifies chat, checks for duplicate PRs, then diagnoses"
 
-    local waited=0 found="" line kind
-    while [ "$waited" -lt "$WATCH_TIMEOUT" ]; do
+    local start_time deadline now waited found="" line kind
+    start_time="$(date +%s)"
+    deadline=$((start_time + WATCH_TIMEOUT))
+
+    while true; do
+        now="$(date +%s)"
+        [ "$now" -ge "$deadline" ] && break
+        _sync_platform_pod
+
         # Either dispatch mode counts: a gateway session (`dispatch: api`) or a board task
         # (`dispatch: kanban`). Checking both keeps one watcher honest for both routes.
         kind="session"
@@ -704,7 +927,7 @@ watch_investigation() {
             return 0
         fi
         sleep 10
-        waited=$((waited + 10))
+        waited=$(( $(date +%s) - start_time ))
         printf '    %s%ds%s\r' "$C_DIM" "$waited" "$C_OFF"
     done
     printf '                    \r'

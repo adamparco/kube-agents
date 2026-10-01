@@ -16,16 +16,28 @@ package main
 
 import (
 	"context"
-	"net/http"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/pem"
+	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
-	"k8s.io/client-go/rest"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	container "google.golang.org/api/container/v1"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 // minimalKubeconfig returns a syntactically valid kubeconfig
@@ -51,23 +63,96 @@ current-context: ` + contextName + `
 }
 
 // gkeContext is the context name `gcloud container clusters get-credentials`
-// writes, and the one discovery now requires a profile's kubeconfig to select.
+// writes. Only the --kubeconfig flag's tests need it now; discovery reads
+// config.yaml and asks the GKE API.
 func gkeContext(project, cluster, location string) string {
 	return "gke_" + project + "_" + location + "_" + cluster
 }
 
+// testCA is the certificate stubGKE hands back as every cluster's CA, built
+// once for the whole package. Generated rather than pasted in: a PEM blob in a
+// public repository invites the question of where it came from, and this way
+// there is no answer to give.
+var (
+	testCAOnce sync.Once
+	testCA     []byte
+	testCAErr  error
+)
+
+func testCAPEM(t *testing.T) []byte {
+	t.Helper()
+	testCAOnce.Do(func() {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			testCAErr = err
+			return
+		}
+		template := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: "k8s-event-watcher test CA"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+		if err != nil {
+			testCAErr = err
+			return
+		}
+		testCA = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	})
+	if testCAErr != nil {
+		t.Fatalf("generating the test CA: %v", testCAErr)
+	}
+	return testCA
+}
+
+// stubGKE makes discovery answerable without a Google credential or a network
+// call: every cluster is described as an ordinary public one, and the token
+// source hands back a fixed string. Returns the failures map — put an error in
+// it under "<project>/<location>/<cluster>" to make that one lookup fail.
+//
+// It replaces the package-level discovery seam rather than passing a Discoverer
+// in, because buildWatchSet reaches discoverClusterProfiles through two layers
+// that have no reason to carry one.
+func stubGKE(t *testing.T) map[string]error {
+	t.Helper()
+	failures := map[string]error{}
+	saved := discovery
+	t.Cleanup(func() { discovery = saved })
+	discovery.Describe = func(_ context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		if err, bad := failures[id.String()]; bad {
+			return nil, err
+		}
+		return &container.Cluster{
+			Endpoint: id.String() + ".example.invalid",
+			// A real certificate, even though no TLS session is established here.
+			// ClientConfigForIdentity puts these bytes in rest.Config.CAData and
+			// kubernetes.NewForConfig builds the CertPool eagerly, so arbitrary
+			// base64 fails at client construction with "unable to parse bytes as
+			// PEM block" and every discovery test reports zero clusters. The
+			// clusterprofiles package's own tests can use arbitrary base64
+			// precisely because they stop before this step.
+			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString(testCAPEM(t))},
+		}, nil
+	}
+	discovery.TokenSource = func(context.Context) (oauth2.TokenSource, error) {
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}), nil
+	}
+	return failures
+}
+
 // writeClusterProfile creates a Cluster Agent profile directory the way
-// cluster_agent_profile.py does: a kubeconfig.yaml plus a config.yaml carrying
-// a cluster_identity block.
+// cluster_agent_profile.py does: a config.yaml carrying a cluster_identity
+// block. No kubeconfig.yaml — since the shell moved into its own pod, the one
+// `gcloud container clusters get-credentials` writes lands on the sandbox's
+// volume and never appears here.
 func writeClusterProfile(t *testing.T, base, profile, project, cluster, location string) {
 	t.Helper()
 	home := filepath.Join(base, profile)
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatalf("mkdir %s: %v", home, err)
-	}
-	if err := os.WriteFile(filepath.Join(home, "kubeconfig.yaml"),
-		[]byte(minimalKubeconfig("https://example.invalid", gkeContext(project, cluster, location))), 0o600); err != nil {
-		t.Fatalf("write kubeconfig: %v", err)
 	}
 	cfg := "model:\n  provider: custom\ncluster_identity:\n" +
 		"  project: " + project + "\n" +
@@ -92,173 +177,57 @@ func writeNonClusterProfile(t *testing.T, base, profile string) {
 	}
 }
 
-func TestDiscoverClusterProfiles_ReadsIdentityNotDirName(t *testing.T) {
+// clusterprofiles.Discoverer owns the scan itself and is tested there; these
+// cover what discoverClusterProfiles adds on top of it — a Kubernetes client
+// per cluster, and a skipped profile becoming a log line and a metric.
+
+func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
+	stubGKE(t)
 	dir := t.TempDir()
-	// Profile directory names are sanitized and hash-truncated by the Python
-	// side, so the identity must come from config.yaml, not the dir name.
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projB-staging-europe-west1", "projB", "staging", "europe-west1")
+	writeNonClusterProfile(t, dir, "default")
 
-	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	m := newMetrics()
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
 	if err != nil {
 		t.Fatalf("discoverClusterProfiles: %v", err)
 	}
 	if got, want := len(clusters), 2; got != want {
-		t.Fatalf("got %d clusters, want %d", got, want)
+		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
 	}
 	byName := make(map[string]targetCluster, len(clusters))
 	for _, c := range clusters {
+		if c.Client == nil {
+			t.Errorf("cluster %s has no client; nothing would be watched on it", c.identity())
+		}
 		byName[c.Name] = c
 	}
+	// The whole identity is carried through, not just the name: the dedup
+	// snapshot filename and the triage payload both read it off targetCluster.
 	prod, ok := byName["prod"]
 	if !ok {
 		t.Fatalf("missing cluster %q; got %v", "prod", clusterNames(clusters))
 	}
 	if prod.ProjectID != "projA" || prod.Location != "us-central1" {
-		t.Errorf("prod identity = project %q location %q; want projA / us-central1", prod.ProjectID, prod.Location)
+		t.Errorf("prod identity = %s; want projA/us-central1/prod", prod.identity())
 	}
 	if prod.Profile != "cluster-projA-prod-us-central1" {
 		t.Errorf("prod profile = %q; want the directory name", prod.Profile)
-	}
-	if prod.Client == nil {
-		t.Error("prod has no client")
 	}
 	if _, ok := byName["staging"]; !ok {
 		t.Errorf("missing cluster %q; got %v", "staging", clusterNames(clusters))
 	}
 }
 
-func TestDiscoverClusterProfiles_SkipsNonClusterProfiles(t *testing.T) {
+func TestDiscoverClusterProfiles_SkippedProfileIsCounted(t *testing.T) {
+	// The counter is the only thing that says a cluster we should be watching
+	// is not being watched, so a skip that does not reach it is a silent
+	// half-fleet.
+	failures := stubGKE(t)
+	failures["p/us-central1/ghost"] = errors.New("clusters.get: 404")
 	dir := t.TempDir()
-	writeClusterProfile(t, dir, "cluster-p-good-us-central1", "p", "good", "us-central1")
-	// "default" and "platform" exist but carry no cluster_identity.
-	writeNonClusterProfile(t, dir, "default")
-	writeNonClusterProfile(t, dir, "platform")
-	// A profile with an identity but no kubeconfig is not usable either.
-	halfHome := filepath.Join(dir, "cluster-p-nokubeconfig-us-central1")
-	if err := os.MkdirAll(halfHome, 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(halfHome, "config.yaml"),
-		[]byte("cluster_identity:\n  project: p\n  cluster: nokubeconfig\n  location: us-central1\n"), 0o600); err != nil {
-		t.Fatalf("write config.yaml: %v", err)
-	}
-	// Loose files and dotfiles at the top level are not profiles.
-	if err := os.WriteFile(filepath.Join(dir, "kanban.db"), []byte("junk"), 0o600); err != nil {
-		t.Fatalf("write loose file: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, ".cache"), 0o700); err != nil {
-		t.Fatalf("mkdir dotdir: %v", err)
-	}
-
-	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
-	if got, want := len(clusters), 1; got != want {
-		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
-	}
-	if clusters[0].Name != "good" {
-		t.Errorf("got cluster %q; want %q", clusters[0].Name, "good")
-	}
-}
-
-func TestDiscoverClusterProfiles_NoProfilesIsNotAnError(t *testing.T) {
-	// A single-cluster install has no Cluster Agent profiles at all —
-	// reconcile only creates them for clusters other than the management one —
-	// so an empty result is a steady state, not a misconfiguration. Erroring
-	// here would crashloop the sidecar on every single-cluster install.
-	dir := t.TempDir()
-	writeNonClusterProfile(t, dir, "platform")
-
-	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
-	if len(clusters) != 0 {
-		t.Errorf("expected 0 clusters, got %d (%v)", len(clusters), clusterNames(clusters))
-	}
-}
-
-func TestDiscoverClusterProfiles_SameNameDifferentLocation(t *testing.T) {
-	dir := t.TempDir()
-	// A GKE cluster name is unique only within a project and location, so this
-	// is two real clusters, not a duplicate — and an ordinary fleet layout.
-	// Keying identity on the bare name would watch whichever one ReadDir
-	// returned first and silently drop the other.
-	writeClusterProfile(t, dir, "cluster-p-prod-us-central1", "p", "prod", "us-central1")
-	writeClusterProfile(t, dir, "cluster-p-prod-europe-west1", "p", "prod", "europe-west1")
-
-	m := newMetrics()
-	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
-	if got, want := len(clusters), 2; got != want {
-		t.Fatalf("got %d clusters, want %d — same name in two locations must not collide", got, want)
-	}
-	locations := map[string]bool{}
-	for _, c := range clusters {
-		if c.Name != "prod" {
-			t.Errorf("expected both clusters named %q, got %q", "prod", c.Name)
-		}
-		locations[c.Location] = true
-	}
-	for _, want := range []string{"us-central1", "europe-west1"} {
-		if !locations[want] {
-			t.Errorf("missing cluster in %s; got locations %v", want, locations)
-		}
-	}
-	// Neither was treated as a duplicate.
-	for _, p := range []string{"cluster-p-prod-us-central1", "cluster-p-prod-europe-west1"} {
-		if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues(p)); got != 0 {
-			t.Errorf("profile %s was counted as an error (%v); it is a distinct cluster", p, got)
-		}
-	}
-}
-
-func TestDiscoverClusterProfiles_DuplicateClusterIsSkipped(t *testing.T) {
-	dir := t.TempDir()
-	// Two profiles claiming the same cluster would give it two watchers and two
-	// independent dedup caches. Take the first, count the second.
-	writeClusterProfile(t, dir, "profile-one", "projA", "prod", "us-central1")
-	writeClusterProfile(t, dir, "profile-two", "projA", "prod", "us-central1")
-
-	m := newMetrics()
-	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
-	if got, want := len(clusters), 1; got != want {
-		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
-	}
-	if clusters[0].Profile != "profile-one" {
-		t.Errorf("expected the first profile to win, got %q", clusters[0].Profile)
-	}
-	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("profile-two")); got != 1 {
-		t.Errorf("expected the duplicate to be counted once, got %v", got)
-	}
-}
-
-// writeProfileWithKubeconfig creates a cluster profile whose config.yaml is
-// valid but whose kubeconfig.yaml is whatever the caller supplies.
-func writeProfileWithKubeconfig(t *testing.T, base, profile, project, cluster, location, kubeconfig string) {
-	t.Helper()
-	writeClusterProfile(t, base, profile, project, cluster, location)
-	if err := os.WriteFile(filepath.Join(base, profile, "kubeconfig.yaml"), []byte(kubeconfig), 0o600); err != nil {
-		t.Fatalf("overwrite kubeconfig: %v", err)
-	}
-}
-
-func TestDiscoverClusterProfiles_EmptyKubeconfigIsSkipped(t *testing.T) {
-	// The regression this whole check exists for. clientcmd.BuildConfigFromFlags
-	// does not fail on an empty kubeconfig — its deferred loader reads "empty" as
-	// "nothing specified" and silently returns the in-cluster config. That handed
-	// back a working client pointed at the management cluster, which was then
-	// watched a second time under this profile's name: every event duplicated,
-	// half of them labelled with a cluster where nothing had happened.
-	dir := t.TempDir()
-	writeProfileWithKubeconfig(t, dir, "cluster-p-ghost-us-central1", "p", "ghost", "us-central1", "")
+	writeClusterProfile(t, dir, "cluster-p-ghost-us-central1", "p", "ghost", "us-central1")
 	writeClusterProfile(t, dir, "cluster-p-real-us-central1", "p", "real", "us-central1")
 
 	m := newMetrics()
@@ -267,79 +236,56 @@ func TestDiscoverClusterProfiles_EmptyKubeconfigIsSkipped(t *testing.T) {
 		t.Fatalf("discoverClusterProfiles: %v", err)
 	}
 	if got, want := len(clusters), 1; got != want {
-		t.Fatalf("got %d clusters (%v), want only the real one — an empty kubeconfig must not fall back to in-cluster", got, clusterNames(clusters))
+		t.Fatalf("got %d clusters (%v), want only the real one", got, clusterNames(clusters))
 	}
 	if clusters[0].Name != "real" {
 		t.Errorf("got cluster %q, want %q", clusters[0].Name, "real")
 	}
 	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-p-ghost-us-central1")); got != 1 {
-		t.Errorf("expected the empty kubeconfig to be counted once, got %v", got)
+		t.Errorf("expected the undescribable cluster to be counted once, got %v", got)
 	}
 }
 
-func TestDiscoverClusterProfiles_KubeconfigPointingElsewhereIsSkipped(t *testing.T) {
-	// `gcloud container clusters get-credentials` appends to a kubeconfig rather
-	// than replacing it, so a profile can end up holding several clusters'
-	// contexts. Whichever current-context names is where it actually connects —
-	// which may not be the cluster its cluster_identity claims. Watching that
-	// would mislabel every event it reported.
+func TestDiscoverClusterProfiles_UnusableConfigIsSkippedNotWatchedWithANilClient(t *testing.T) {
+	// The one branch in this function that is not field copying: a config the
+	// package was willing to build and kubernetes.NewForConfig then rejects.
+	// Reachable because the two disagree about the cluster CA —
+	// ClientConfigForIdentity only base64-decodes it, NewForConfig parses it as
+	// PEM — so a certificate that is valid base64 and not a PEM block gets
+	// through the first and fails the second. Without this, dropping the
+	// `continue` below would append a targetCluster with a nil Client and ship
+	// green, and run would hand that nil to newWatcher.
+	stubGKE(t)
+	discovery.Describe = func(_ context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		return &container.Cluster{
+			Endpoint:   id.String() + ".example.invalid",
+			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString([]byte("not-a-pem-block"))},
+		}, nil
+	}
 	dir := t.TempDir()
-	writeProfileWithKubeconfig(t, dir, "cluster-p-claims-us-central1", "p", "claims", "us-central1",
-		minimalKubeconfig("https://example.invalid", gkeContext("p", "somewhere-else", "us-east4")))
+	writeClusterProfile(t, dir, "cluster-p-prod-us-central1", "p", "prod", "us-central1")
 
 	m := newMetrics()
 	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
 	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
+		t.Fatalf("a cluster whose client will not build is a skip, not a failure: %v", err)
 	}
 	if len(clusters) != 0 {
-		t.Fatalf("expected 0 clusters, got %v — a kubeconfig pointing at another cluster must not be watched", clusterNames(clusters))
+		t.Fatalf("got %d clusters (%v), want none: a cluster with no client is worse than no cluster",
+			len(clusters), clusterNames(clusters))
 	}
-	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-p-claims-us-central1")); got != 1 {
-		t.Errorf("expected the mismatched kubeconfig to be counted once, got %v", got)
-	}
-}
-
-func TestDiscoverClusterProfiles_MalformedConfigIsSkipped(t *testing.T) {
-	dir := t.TempDir()
-	home := filepath.Join(dir, "cluster-broken")
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(home, "kubeconfig.yaml"),
-		[]byte(minimalKubeconfig("https://example.invalid", "gke_p_us-central1_broken")), 0o600); err != nil {
-		t.Fatalf("write kubeconfig: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(home, "config.yaml"),
-		[]byte("cluster_identity: [this is not a mapping\n"), 0o600); err != nil {
-		t.Fatalf("write config.yaml: %v", err)
-	}
-
-	// A good profile alongside the broken one, to prove the broken one does not
-	// take the rest of the fleet down with it.
-	writeClusterProfile(t, dir, "cluster-ok", "projA", "healthy", "us-central1")
-
-	m := newMetrics()
-	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
-	if got, want := len(clusters), 1; got != want {
-		t.Fatalf("got %d clusters (%v), want only the healthy one", got, clusterNames(clusters))
-	}
-	if clusters[0].Name != "healthy" {
-		t.Errorf("got cluster %q, want %q", clusters[0].Name, "healthy")
-	}
-	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-broken")); got != 1 {
-		t.Errorf("expected the broken profile to be counted once, got %v", got)
+	// Counted under the profile, not the cluster name: the profile is what an
+	// operator has to go and look at.
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-p-prod-us-central1")); got != 1 {
+		t.Errorf("expected the unusable config to be counted once under its profile, got %v", got)
 	}
 }
 
 func TestDiscoverClusterProfiles_MissingDirIsFatal(t *testing.T) {
-	// Deliberately fatal, unlike every other discovery failure. The directory is
-	// written by another process, so a restart is what fixes this — and since
-	// discovery runs only once, starting successfully without it would mean
-	// never watching the profile clusters at all.
+	// The package returns this as an error rather than a skip, and the watcher
+	// has to propagate it: discovery runs only once, so starting successfully
+	// without the directory would mean never watching the profile clusters at
+	// all, where exiting lets the next start pick them up.
 	// Under an existing, traversable parent, so the failure is reliably
 	// ErrNotExist. A path whose parent is also missing is not portable: some
 	// systems answer EACCES rather than ENOENT for it, which is a different
@@ -356,14 +302,15 @@ func TestDiscoverClusterProfiles_MissingDirIsFatal(t *testing.T) {
 	// Not counted: the counter means "a cluster we should be watching was
 	// dropped", and here the process is exiting rather than carrying on
 	// without them.
-	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("-")); got != 0 {
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues(clusterprofiles.NoProfile)); got != 0 {
 		t.Errorf("expected no discovery-error count when exiting, got %v", got)
 	}
 }
 
-func TestDiscoverClusterProfiles_UnreadableDirIsNotFatal(t *testing.T) {
+func TestDiscoverClusterProfiles_UnreadableDirIsCountedUnderNoProfile(t *testing.T) {
 	// A directory that exists but cannot be read will not be fixed by a
-	// restart, so this degrades instead of crashlooping forever.
+	// restart, so the package degrades — and the watcher has to give that
+	// failure a label, since there is no profile name to count it under.
 	dir := filepath.Join(t.TempDir(), "profiles")
 	if err := os.MkdirAll(dir, 0o000); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -381,7 +328,7 @@ func TestDiscoverClusterProfiles_UnreadableDirIsNotFatal(t *testing.T) {
 	if len(clusters) != 0 {
 		t.Errorf("expected 0 clusters, got %d", len(clusters))
 	}
-	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("-")); got != 1 {
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues(clusterprofiles.NoProfile)); got != 1 {
 		t.Errorf("expected an unreadable profiles dir to be counted, got %v", got)
 	}
 }
@@ -395,6 +342,7 @@ func TestDiscoverClusterProfiles_UnreadableDirIsNotFatal(t *testing.T) {
 // would find out until the informer's initial list, long after the entry that
 // could not be denied was discarded.
 func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T) {
+	stubGKE(t)
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
@@ -445,6 +393,7 @@ func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T)
 // cluster's profile, --in-cluster is the only thing watching it, so the direct
 // entry must survive.
 func TestBuildWatchSet_DirectClusterSurvivesWhenNoProfileCoversIt(t *testing.T) {
+	stubGKE(t)
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
 
@@ -484,6 +433,7 @@ func TestBuildWatchSet_DirectClusterSurvivesWhenNoProfileCoversIt(t *testing.T) 
 // apart. Absorbing a guess would unwatch the other cluster and mis-stamp this
 // one, so nothing is absorbed and no direct entry is added.
 func TestBuildWatchSet_AmbiguousNameAbsorbsNothing(t *testing.T) {
+	stubGKE(t)
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-east1", "projA", "mgmt", "us-east1")
@@ -683,52 +633,91 @@ func TestDedupPersistPath(t *testing.T) {
 	}
 }
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-func TestUseGoogleTokenSource(t *testing.T) {
-	// Profile kubeconfigs authenticate by running gke-gcloud-auth-plugin, which
-	// is not in this image. The exec directive must be dropped and replaced
-	// with a bearer token, while the server address and CA are left alone.
-	cfg := &rest.Config{
-		Host:         "https://example.invalid",
-		ExecProvider: &clientcmdapi.ExecConfig{Command: "gke-gcloud-auth-plugin"},
-	}
-	useGoogleTokenSource(cfg, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
-
-	if cfg.ExecProvider != nil {
-		t.Error("ExecProvider still set; the missing plugin would still be invoked")
-	}
-	if cfg.Host != "https://example.invalid" {
-		t.Errorf("Host = %q; the server address must survive untouched", cfg.Host)
-	}
-	if cfg.WrapTransport == nil {
-		t.Fatal("WrapTransport not set; no credential would be attached")
-	}
-
-	// The wrapper must actually put the token on the wire.
-	var got string
-	rt := cfg.WrapTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-		got = r.Header.Get("Authorization")
-		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
-	}))
-	req, err := http.NewRequest(http.MethodGet, "https://example.invalid/api/v1/events", nil)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	if _, err := rt.RoundTrip(req); err != nil {
-		t.Fatalf("round trip: %v", err)
-	}
-	if want := "Bearer test-token"; got != want {
-		t.Errorf("Authorization = %q; want %q", got, want)
-	}
-}
-
 func clusterNames(clusters []targetCluster) []string {
 	out := make([]string, 0, len(clusters))
 	for _, c := range clusters {
 		out = append(out, c.Name)
 	}
 	return out
+}
+
+// The soft memory limit is half of what the operator reports as the container's
+// limit, and only when nothing else has already set one.
+func TestDeriveMemoryLimit(t *testing.T) {
+	tests := []struct {
+		name           string
+		goMemLimit     string
+		containerLimit string
+		wantApply      bool
+		wantBytes      int64
+		wantReason     string
+	}{
+		{name: "container limit set", containerLimit: "2147483648", wantApply: true, wantBytes: 1073741824},
+		{name: "explicit GOMEMLIMIT wins", goMemLimit: "512MiB", containerLimit: "2147483648", wantReason: "GOMEMLIMIT=512MiB is set and takes precedence"},
+		{name: "nothing set", wantReason: "EVENT_WATCHER_MEMORY_LIMIT_BYTES is not set"},
+		{name: "garbage", containerLimit: "2Gi", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="2Gi" is not a positive byte count`},
+		{name: "zero", containerLimit: "0", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="0" is not a positive byte count`},
+		{name: "negative", containerLimit: "-5", wantReason: `EVENT_WATCHER_MEMORY_LIMIT_BYTES="-5" is not a positive byte count`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBytes, gotApply, gotReason := deriveMemoryLimit(tt.goMemLimit, tt.containerLimit)
+			if gotApply != tt.wantApply {
+				t.Fatalf("apply = %v, want %v (reason %q)", gotApply, tt.wantApply, gotReason)
+			}
+			if gotBytes != tt.wantBytes {
+				t.Errorf("bytes = %d, want %d", gotBytes, tt.wantBytes)
+			}
+			if !strings.Contains(gotReason, tt.wantReason) {
+				t.Errorf("reason = %q, want it to contain %q", gotReason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// applyMemoryLimit turns the derived value into the runtime's soft limit —
+// the same setting GOMEMLIMIT controls — and leaves it alone otherwise.
+func TestApplyMemoryLimit_SetsTheRuntimeSoftLimit(t *testing.T) {
+	// SetMemoryLimit(-1) reads the current limit without changing it.
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv("EVENT_WATCHER_MEMORY_LIMIT_BYTES", "2147483648")
+	applyMemoryLimit()
+	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
+		t.Errorf("runtime soft limit = %d, want 1073741824", got)
+	}
+
+	// An explicit GOMEMLIMIT is respected: the limit set above must not move.
+	debug.SetMemoryLimit(prev)
+	t.Setenv("GOMEMLIMIT", "256MiB")
+	applyMemoryLimit()
+	if got := debug.SetMemoryLimit(-1); got != prev {
+		t.Errorf("runtime soft limit = %d with GOMEMLIMIT set, want it untouched at %d", got, prev)
+	}
+}
+
+// The process applies the limit, not just the helper: realMain has to reach
+// applyMemoryLimit before anything that can fail. A kubeconfig that does not
+// parse stops the run right after it, and the runtime's limit shows whether
+// the call happened.
+func TestRealMain_AppliesTheMemoryLimitBeforeStarting(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv("EVENT_WATCHER_MEMORY_LIMIT_BYTES", "2147483648")
+
+	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := realMain([]string{"--dry-run", "--kubeconfig", badKubeconfig, "--cluster-name", "x"})
+	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
+		t.Fatalf("want realMain to stop on the unparseable kubeconfig, got err=%v", err)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
+		t.Errorf("runtime soft limit after realMain = %d, want 1073741824", got)
+	}
 }

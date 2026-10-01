@@ -48,27 +48,59 @@ helper = _load_helper()
 
 SELF = "kube-agents-bot"
 REPO = "acme/toolkit"
+#: A second managed repository, deliberately on another host. Identity is a
+#: property of a forge, so a two-repository test on one forge would not notice a
+#: sweep that asked once and reused the answer.
+OTHER_REPO = "gitlab.example/acme/toolkit"
+OTHER_SELF = "other-agent-bot"
 HEAD_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
 
 class FakeProvider:
-    supports_acknowledge = True
-
     def __init__(
-        self, prs=None, comments=None, post_error=None, viewer=SELF, commits=None
+        self,
+        prs=None,
+        comments=None,
+        post_error=None,
+        viewer=SELF,
+        commits=None,
+        acknowledges=True,
     ):
         self.prs = prs or []
         self.comments = comments or {}
         self.post_error = post_error
+        #: A login, or a dict keyed by repository for an install serving two
+        #: forges -- which authenticates as two accounts, one per forge.
         self._viewer = viewer
         self.commits = COMMITS if commits is None else commits
         self.posted = []
+        self.acknowledges = acknowledges
+        self.viewer_lookups = []
+        #: What the real provider records when a listing fills its page. Nothing
+        #: in this skill reads it -- `github_scan_gate` is the only caller of
+        #: `truncations()`, and `test_github_scan_gate.py` is where the operator
+        #: warning is pinned. It is here because the fake stands in for the whole
+        #: Protocol, not because a test in this file sets it.
+        self.truncated = []
 
-    def preflight(self):
-        pass
+    def truncations(self):
+        return list(self.truncated)
 
-    def viewer_login(self):
-        return self._viewer
+    def viewer_login(self, repo):
+        self.viewer_lookups.append(repo)
+        if isinstance(self._viewer, dict):
+            answer = self._viewer.get(repo, "")
+        else:
+            answer = self._viewer
+        # A forge that refuses the credential outright, as against one that
+        # answers with no name. The two are different outcomes for the sweep,
+        # so the fake has to be able to produce either.
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def supports_acknowledge(self, repo):
+        return self.acknowledges
 
     def list_open_prs(self, repo):
         return list(self.prs)
@@ -81,11 +113,10 @@ class FakeProvider:
             raise self.commits
         return list(self.commits)
 
-    def post_comment(self, repo, pr, body_file):
+    def post_comment(self, repo, pr, body):
         if self.post_error:
             raise self.post_error
-        with open(body_file, "r", encoding="utf-8") as handle:
-            self.posted.append((pr.number, handle.read()))
+        self.posted.append((pr.number, body))
 
 
 #: When the default request in these tests was made. Every commit below lands
@@ -118,7 +149,7 @@ def make_pr(
 
 
 def make_comment(
-    node_id,
+    ref,
     body,
     author="reviewer",
     can_write=True,
@@ -127,9 +158,14 @@ def make_comment(
     path="",
     line=None,
     can_write_known=True,
+    is_bot=False,
 ):
+    # `is_bot` is passed, not derived from `author`, because that is how it
+    # arrives: the forge says whether the author is an automation and the login
+    # is normalised on the way through, so `[bot]` in the string here is only
+    # what a caller would *see*, never what it decides on.
     return forge.Comment(
-        node_id=node_id,
+        ref=ref,
         numeric_id=1,
         author=author,
         body=body,
@@ -139,6 +175,7 @@ def make_comment(
         path=path,
         line=line,
         can_write_known=can_write_known,
+        is_bot=is_bot,
     )
 
 
@@ -159,15 +196,31 @@ class _Harness(unittest.TestCase):
         Path(path).write_text(content, encoding="utf-8")
         return path
 
-    def run_helper(self, argv, provider, repo=REPO, repo_error=None):
-        target = (
+    def run_helper(self, argv, provider, repo=REPO, repo_error=None, provider_error=None):
+        if argv and argv[0] in ("reply", "refuse") and "--repo" not in argv:
+            argv = [argv[0], "--repo", repo or REPO] + list(argv[1:])
+        # `repo` is one name, a list of them, or None for an install with none.
+        if isinstance(repo, (list, tuple)):
+            managed = list(repo)
+        else:
+            managed = [repo] if repo else []
+        managed_mock = (
             mock.Mock(side_effect=repo_error)
             if repo_error
-            else mock.Mock(return_value=repo)
+            else mock.Mock(return_value=managed)
+        )
+        # `provider_error` is the only way to reach the raising branch of
+        # `provider_for`. Every other test patches it to hand back a provider,
+        # which is what let the two call sites sit outside their guards
+        # unnoticed.
+        selector = (
+            mock.Mock(side_effect=provider_error)
+            if provider_error
+            else mock.Mock(return_value=provider)
         )
         buf = StringIO()
-        with mock.patch.object(forge, "target_repo", target), \
-             mock.patch.object(forge, "provider_for", return_value=provider), \
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch.object(forge, "provider_for", selector), \
              redirect_stdout(buf):
             rc = helper.main(argv)
         return rc, buf.getvalue()
@@ -185,6 +238,154 @@ class PollTest(_Harness):
         _rc, out = self.run_helper(["poll"], provider)
         self.assertEqual(json.loads(out)["status"], "NO_REQUESTS")
 
+    def test_identity_is_asked_of_every_repository(self):
+        """Two forges are two accounts, and only one of them opened this proposal.
+
+        Asking once and reusing the answer is the single-forge assumption in
+        miniature: on the second forge every proposal fails
+        `is_agent_pull_request` against a login from the first, and the poll
+        goes quiet there without saying why.
+        """
+        provider = FakeProvider(viewer={REPO: SELF, OTHER_REPO: OTHER_SELF})
+        self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(set(provider.viewer_lookups), {REPO, OTHER_REPO})
+
+    def test_one_nameless_credential_does_not_silence_the_other_repository(self):
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer={REPO: SELF, OTHER_REPO: ""},
+        )
+        _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        # `FakeProvider` answers the same proposal for either repository, and
+        # only the readable one's contributed a request.
+        self.assertEqual(len(payload["requests"]), 1)
+
+    def test_a_repository_whose_identity_refuses_is_skipped_not_the_sweep(self):
+        """One dead credential must not stand down the poll everywhere else.
+
+        `viewer_login` raises for a credential the forge rejected and for a host
+        no provider module claims. Asked per repository, that refusal ended the
+        whole poll: the worker got an ERROR and none of the requests waiting on
+        a forge that was answering, every tick until somebody fixed the other
+        one. The sibling of this test lives in `test_github_scan_gate.py`; the
+        same loop was written twice.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_AUTH", "HTTP 401"),
+            },
+        )
+        err = StringIO()
+        with redirect_stderr(err):
+            _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(len(payload["requests"]), 1)
+        # Skipped, but not in silence: a repository dropped without a word reads
+        # as one with nothing on it.
+        self.assertIn(OTHER_REPO, err.getvalue())
+        self.assertIn("FORGE_AUTH", err.getvalue())
+
+    def test_a_quiet_healthy_repository_is_not_read_as_a_total_outage(self):
+        """A repository with nothing open is the ordinary case, not an outage.
+
+        Deciding "nothing was read" from an empty request list asks the same
+        question on a total outage and on a partial one whose working
+        repository simply had no open pull request -- so the poll answered
+        ERROR, and the worker stood down everywhere, on most ticks of a partial
+        outage. Counted repositories tell the two apart.
+        """
+        provider = FakeProvider(
+            prs=[],
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_AUTH", "HTTP 401"),
+            },
+        )
+        err = StringIO()
+        with redirect_stderr(err):
+            _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(json.loads(out)["status"], "NO_REQUESTS")
+        self.assertIn(OTHER_REPO, err.getvalue())
+
+    def test_every_repository_refusing_is_still_one_error(self):
+        """Nothing was read, so there is no partial poll to qualify."""
+        refusal = forge.ForgeError("FORGE_AUTH", "HTTP 401")
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer={REPO: refusal, OTHER_REPO: refusal},
+        )
+        with redirect_stderr(StringIO()):
+            _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "FORGE_AUTH")
+
+    def test_one_unreadable_conversation_does_not_end_the_whole_poll(self):
+        """The watcher skips such a pull request; this must skip the same one.
+
+        `list_comments` refuses a conversation past one page with
+        `CONVERSATION_TRUNCATED`, which is a permanent property of one busy
+        thread rather than a fault that clears. `sweep_pr_comments` files it
+        under unreadable and goes on; before this, `poll` let it out of the
+        loop and answered ERROR for every other pull request too -- and this
+        command is the one an operator runs to see what the watcher saw.
+        """
+        busy = make_pr(1, head_ref="platform-agent/busy")
+        quiet = make_pr(2, head_ref="platform-agent/quiet")
+
+        class TruncatingProvider(FakeProvider):
+            def list_comments(self, repo, pr):
+                if pr.number == 1:
+                    raise forge.ForgeError("CONVERSATION_TRUNCATED", f"{repo}#1")
+                return [make_comment("IC_2", "/agent bump to 4")]
+
+        err = StringIO()
+        with redirect_stderr(err):
+            _rc, out = self.run_helper(
+                ["poll"], TruncatingProvider(prs=[busy, quiet])
+            )
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_2"])
+        # Named rather than dropped in silence, for the reason the sweep names
+        # its own: a thread nobody can read never clears itself.
+        self.assertIn("CONVERSATION_TRUNCATED", err.getvalue())
+        self.assertIn(f"{REPO}#1", err.getvalue())
+
+    def test_every_conversation_unreadable_is_still_one_error(self):
+        """Nothing was read at all, so an empty poll would read as nothing to do."""
+
+        class TruncatingProvider(FakeProvider):
+            def list_comments(self, repo, pr):
+                raise forge.ForgeError("CONVERSATION_TRUNCATED", f"{repo}#{pr.number}")
+
+        with redirect_stderr(StringIO()):
+            _rc, out = self.run_helper(["poll"], TruncatingProvider(prs=[make_pr()]))
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "CONVERSATION_TRUNCATED")
+
+    def test_no_credential_anywhere_names_itself_is_an_error_not_a_quiet_poll(self):
+        """The model must not read "the credential is broken" as "nothing to do"."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            viewer="",
+        )
+        _rc, out = self.run_helper(["poll"], provider, repo=[REPO, OTHER_REPO])
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "VIEWER_UNKNOWN")
+        self.assertIn(OTHER_REPO, payload["value"])
+
     def test_a_trigger_is_reported_with_its_context(self):
         provider = FakeProvider(
             prs=[make_pr()], comments={12: [make_comment("IC_1", "/agent bump to 4")]}
@@ -198,6 +399,40 @@ class PollTest(_Harness):
         self.assertEqual(row["kind"], "slash")
         self.assertEqual(row["head_ref"], "platform-agent/x")
         self.assertTrue(row["can_write"])
+
+    def test_poll_across_multiple_repositories(self):
+        """poll returns requests across all managed repositories."""
+        pr1 = make_pr(1, head_ref="platform-agent/fix-1", head_repo="acme/repo1")
+        pr2 = make_pr(2, head_ref="platform-agent/fix-2", head_repo="acme/repo2")
+
+        class MultiRepoFakeProvider(FakeProvider):
+            def list_open_prs(self, repo):
+                if repo == "acme/repo1":
+                    return [pr1]
+                elif repo == "acme/repo2":
+                    return [pr2]
+                return []
+
+            def list_comments(self, repo, pr):
+                if repo == "acme/repo1" and pr.number == 1:
+                    return [make_comment("IC_1", "/agent fix repo1")]
+                elif repo == "acme/repo2" and pr.number == 2:
+                    return [make_comment("IC_2", "/agent fix repo2")]
+                return []
+
+        provider = MultiRepoFakeProvider()
+        managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch.object(forge, "provider_for", return_value=provider), \
+             redirect_stdout(StringIO()) as buf:
+            helper.main(["poll"])
+            out = buf.getvalue()
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(len(payload["requests"]), 2)
+        repos_in_conversations = [conv["repo"] for conv in payload["conversations"]]
+        self.assertIn("acme/repo1", repos_in_conversations)
+        self.assertIn("acme/repo2", repos_in_conversations)
 
     def test_an_untrusted_request_is_reported_rather_than_hidden(self):
         """The worker is told so it can refuse, not left looking like it missed it."""
@@ -258,6 +493,28 @@ class PollTest(_Harness):
             ["poll"], FakeProvider(), repo_error=forge.RepoUnparseable("evil.com/a/b")
         )
         self.assertEqual(json.loads(out)["reason"], "GIT_REPO_UNPARSEABLE")
+
+    def test_a_forge_with_no_provider_reports_its_reason_code(self):
+        """`provider_for` raising has to land in the payload, not a traceback.
+
+        It could not raise at all once — an unknown host fell back to the one
+        provider there was — so the call sat above the guard. Selecting the
+        provider is inside it now, and this is what holds it there. Both codes
+        are pinned because they come from different sides of the boundary: an
+        unreadable repository value is refused here, and a host no forge module
+        serves is the broker's refusal arriving through `forge.call`.
+        """
+        for error in (
+            forge.UnknownForgeHost("gitlab.com"),
+            forge.RepoUnparseable("git@gitlab.com:g/s/p"),
+        ):
+            with self.subTest(reason=error.reason):
+                _rc, out = self.run_helper(
+                    ["poll"], FakeProvider(), provider_error=error
+                )
+                payload = json.loads(out)
+                self.assertEqual(payload["status"], "ERROR")
+                self.assertEqual(payload["reason"], error.reason)
 
 
 class ConversationContextTest(_Harness):
@@ -413,6 +670,83 @@ class ConversationContextTest(_Harness):
         row = self.poll_threads(provider)["conversations"][0]["comments"][0]
         self.assertNotIn("truncated_chars", row)
 
+    def test_a_long_request_is_truncated_and_reports_truncated_chars(self):
+        long_req = "x" * (helper.CONTEXT_MAX_REQUEST_CHARS + 300)
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", f"/agent {long_req}")]}
+        )
+        data = self.poll_threads(provider)
+        req_row = data["requests"][0]
+        self.assertEqual(len(req_row["request"]), helper.CONTEXT_MAX_REQUEST_CHARS)
+        self.assertEqual(req_row["truncated_chars"], 300)
+
+    def test_a_short_request_is_not_marked_truncated(self):
+        provider = FakeProvider(
+            prs=[make_pr()], comments={12: [make_comment("IC_1", "/agent please fix tests")]}
+        )
+        data = self.poll_threads(provider)
+        req_row = data["requests"][0]
+        self.assertEqual(req_row["request"], "please fix tests")
+        self.assertNotIn("truncated_chars", req_row)
+
+    def test_requests_are_capped_to_context_max_requests(self):
+        comments = [
+            make_comment(
+                f"IC_{n:03d}", f"/agent task {n}", created_at=f"2026-08-12T{n // 60:02d}:{n % 60:02d}:00Z"
+            )
+            for n in range(helper.CONTEXT_MAX_REQUESTS + 15)
+        ]
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        err = StringIO()
+        with redirect_stderr(err):
+            data = self.poll_threads(provider)
+        self.assertEqual(len(data["requests"]), helper.CONTEXT_MAX_REQUESTS)
+        self.assertEqual(data["requests"][0]["comment_id"], "IC_000")
+        self.assertEqual(data["requests"][-1]["comment_id"], f"IC_{helper.CONTEXT_MAX_REQUESTS - 1:03d}")
+        self.assertEqual(data["conversations"][0]["omitted_requests"], 15)
+        self.assertIn("15 request(s) deferred", err.getvalue())
+
+    def test_trusted_requests_are_prioritized_over_untrusted_before_refusal_budget_exhausted(self):
+        # 14 untrusted requests followed by 1 trusted maintainer request
+        comments = [
+            make_comment(
+                f"IC_UNTRUSTED_{n:02d}",
+                f"/agent untrusted {n}",
+                author="stranger",
+                can_write=False,
+                can_write_known=True,
+                created_at=f"2026-08-12T00:{n:02d}:00Z",
+            )
+            for n in range(14)
+        ]
+        comments.append(
+            make_comment(
+                "IC_MAINTAINER",
+                "/agent maintainer task",
+                author="maintainer",
+                can_write=True,
+                can_write_known=True,
+                created_at="2026-08-12T00:30:00Z",
+            )
+        )
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        err = StringIO()
+        with redirect_stderr(err):
+            data = self.poll_threads(provider)
+        self.assertEqual(len(data["requests"]), helper.CONTEXT_MAX_REQUESTS)
+        # Maintainer request is prioritized at the head of requests
+        self.assertEqual(data["requests"][0]["comment_id"], "IC_MAINTAINER")
+        self.assertTrue(data["requests"][0]["can_write"])
+        # Thread reports omitted_requests
+        self.assertEqual(data["conversations"][0]["omitted_requests"], 5)
+        # Comments in conversations all have is_request=True
+        conv_comments = {c["comment_id"]: c for c in data["conversations"][0]["comments"]}
+        self.assertTrue(conv_comments["IC_MAINTAINER"]["is_request"])
+        for n in range(14):
+            if f"IC_UNTRUSTED_{n:02d}" in conv_comments:
+                self.assertTrue(conv_comments[f"IC_UNTRUSTED_{n:02d}"]["is_request"])
+        self.assertIn("5 request(s) deferred", err.getvalue())
+
     def test_a_long_thread_keeps_the_recent_end_and_counts_what_it_dropped(self):
         comments = [
             make_comment(
@@ -494,13 +828,26 @@ def answerable(prs=None, request="/agent bump to 4", **kwargs):
 
 
 class ReplyTest(_Harness):
-    def _reply(self, provider, body="Bumped it to 4.", command="reply"):
+    def _reply(self, provider, body="Bumped it to 4.", command="reply", comment_id="IC_1"):
         path = self.scratch_file("reply.md", body)
         return self.run_helper(
-            [command, "--pr", "12", "--comment-id", "IC_1", "--body-file", path]
+            [command, "--pr", "12", "--comment-id", comment_id, "--body-file", path]
             + (["--no-change"] if command == "reply" else []),
             provider,
         )
+
+    def test_reply_can_answer_a_request_past_the_poll_cap(self):
+        comments = [
+            make_comment(
+                f"IC_{n:03d}", f"/agent task {n}", created_at=f"2026-08-12T{n // 60:02d}:{n % 60:02d}:00Z"
+            )
+            for n in range(helper.CONTEXT_MAX_REQUESTS + 5)
+        ]
+        provider = FakeProvider(prs=[make_pr()], comments={12: comments})
+        target_id = f"IC_{helper.CONTEXT_MAX_REQUESTS + 2:03d}"
+        self._reply(provider, comment_id=target_id)
+        self.assertEqual(len(provider.posted), 1)
+        self.assertIn(f"<!-- agent-answered:{target_id} -->", provider.posted[0][1])
 
     def test_the_marker_is_appended_by_the_helper(self):
         """The model cannot forget it, because the model does not write it."""
@@ -516,7 +863,7 @@ class ReplyTest(_Harness):
         self._reply(provider)
         _number, posted = provider.posted[0]
         self.assertEqual(
-            pr_triggers.handled_node_ids(
+            pr_triggers.handled_refs(
                 [make_comment("IC_9", posted, author=f"{SELF}[bot]")], SELF
             ),
             {"IC_1"},
@@ -595,7 +942,7 @@ class ReplyTest(_Harness):
         SKILL.md prints the syntax in order to forbid it and `poll` carries
         every node id, so a body that imitates one is one edit away. Posted
         unchanged it would be a *self-authored* marker naming another request,
-        which `handled_node_ids` reads as that request having been handled —
+        which `handled_refs` reads as that request having been handled —
         closing it at both readers, for good, with nothing said in the thread.
         """
         provider = answerable()
@@ -606,7 +953,7 @@ class ReplyTest(_Harness):
         _number, posted = provider.posted[0]
         self.assertIn("Done.", posted)
         self.assertEqual(
-            pr_triggers.handled_node_ids(
+            pr_triggers.handled_refs(
                 [make_comment("IC_9", posted, author=f"{SELF}[bot]")], SELF
             ),
             {"IC_1"},
@@ -644,6 +991,31 @@ class ReplyTest(_Harness):
         provider = answerable(viewer="")
         with self.assertRaises(SystemExit):
             self._reply(provider)
+
+    def test_a_forge_with_no_provider_blocks_the_post(self):
+        """Selecting the provider is inside the guard the comment there names.
+
+        Above it, an unknown host would have been a traceback thrown after the
+        model had already written the body — and `provider_for` only started
+        raising when repository identity moved into `repo_ref`.
+        """
+        provider = answerable()
+        with self.assertRaises(SystemExit):
+            self.run_helper(
+                [
+                    "reply",
+                    "--pr",
+                    "12",
+                    "--comment-id",
+                    "IC_1",
+                    "--body-file",
+                    self.scratch_file("reply.md", "Bumped it to 4."),
+                    "--no-change",
+                ],
+                provider,
+                provider_error=forge.UnknownForgeHost("gitlab.com"),
+            )
+        self.assertEqual(provider.posted, [])
         self.assertEqual(provider.posted, [])
 
 
@@ -666,7 +1038,7 @@ class CommentIdValidationTest(_Harness):
     """`--comment-id` is checked against the forge, not trusted.
 
     A wrong id posts a real, visible answer stamped with a marker that closes
-    nothing: `handled_node_ids` keeps returning the request, so the sweep files
+    nothing: `handled_refs` keeps returning the request, so the sweep files
     the card again on the next tick and the agent answers the same comment
     every ten minutes. Failing before the post is the only place that loop can
     be cut, because after it the comment is already public.
@@ -727,7 +1099,7 @@ class CommentIdValidationTest(_Harness):
         """
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]")]},
+            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]", is_bot=True)]},
         )
         with self.assertRaises(SystemExit):
             self._post(provider, "IC_1")
@@ -736,7 +1108,7 @@ class CommentIdValidationTest(_Harness):
     def test_an_allowlisted_bot_is_answerable(self):
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
+            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]", is_bot=True)]},
         )
         with mock.patch.dict(
             "os.environ", {pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}, clear=False
@@ -1081,6 +1453,36 @@ class TrustGateTest(_Harness):
         self.assertEqual(payload["status"], "FOUND")
         self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_1"])
 
+    def test_poll_past_refusal_budget_leaves_buried_untrusted_requests_unflagged_in_transcript(self):
+        """Once refusal budget is spent, dropped untrusted requests must not show is_request: True."""
+        already = [
+            make_comment(
+                f"IC_old{n}",
+                f"Refused.\n\n{pr_triggers.marker('IC_them%d' % n, pr_triggers.REFUSED_MARKER)}",
+                author=SELF,
+            )
+            for n in range(2)
+        ]
+        untrusted = make_comment("IC_UNTRUSTED", "/agent spam request", author="stranger", can_write=False, can_write_known=True)
+        trusted = make_comment("IC_MAINTAINER", "/agent maintainer task", author="maintainer", can_write=True, can_write_known=True)
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: already + [untrusted, trusted]},
+        )
+        err = StringIO()
+        with (
+            mock.patch.dict(os.environ, {pr_triggers.MAX_REFUSALS_ENV: "2"}),
+            redirect_stderr(err),
+        ):
+            _rc, out = self.run_helper(["poll", "--pr", "12"], provider)
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([row["comment_id"] for row in payload["requests"]], ["IC_MAINTAINER"])
+        conv_comments = {c["comment_id"]: c for c in payload["conversations"][0]["comments"]}
+        self.assertTrue(conv_comments["IC_MAINTAINER"]["is_request"])
+        self.assertFalse(conv_comments["IC_UNTRUSTED"]["is_request"])
+        self.assertIn("1 untrusted request(s) not offered", err.getvalue())
+
     def test_a_trusted_out_of_scope_request_can_be_refused(self):
         """The other reason to refuse: a maintainer asking for something the
         agent will not do. Gating refusal on `can_write` would block it."""
@@ -1105,6 +1507,30 @@ class TrustGateTest(_Harness):
             self._post(provider, "reply", "--no-change")
         self.assertEqual(provider.posted, [])
         self.assertIn(forge.IGNORE_LABEL, err.getvalue())
+
+
+class RepoValidationTest(_Harness):
+    def test_invalid_repo_format_rejected(self):
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self.run_helper(["reply", "--repo", "../invalid", "--pr", "12", "--comment-id", "IC_1", "--body-file", self.scratch_file("r.md", "body"), "--no-change"], provider)
+        self.assertIn("Invalid repository format", err.getvalue())
+
+    def test_unmanaged_repo_rejected(self):
+        provider = answerable()
+        err = StringIO()
+        with self.assertRaises(SystemExit), redirect_stderr(err):
+            self.run_helper(["reply", "--repo", "unmanaged/repo", "--pr", "12", "--comment-id", "IC_1", "--body-file", self.scratch_file("r.md", "body"), "--no-change"], provider, repo="managed/repo")
+        self.assertIn("not in the managed repositories list", err.getvalue())
+
+    def test_poll_unmanaged_repo_returns_error(self):
+        provider = answerable()
+        _rc, out = self.run_helper(["poll", "--repo", "unmanaged/repo"], provider, repo="managed/repo")
+        payload = json.loads(out)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "INVALID_REPOSITORY")
+        self.assertIn("not in the managed repositories list", payload["value"])
 
 
 if __name__ == "__main__":

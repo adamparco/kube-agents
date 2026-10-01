@@ -21,13 +21,89 @@ import (
 	"sync"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/informers"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
+
+const (
+	// forbiddenRetryInterval is how long an informer whose Event list or watch
+	// the API server refused with 403 Forbidden waits before trying again. A
+	// 403 is a permission the identity does not hold, and permissions change
+	// on the order of minutes when someone edits an IAM binding or a
+	// RoleBinding — not on the cadence the reflector's default backoff
+	// assumes for a flapping connection. That backoff settles at 30 to 60
+	// seconds between attempts (a 30-second cap with full jitter), so a fleet
+	// where every cluster refuses the list is a refused request, logged twice,
+	// from one cluster or another every second or two, for the life of the
+	// process. The informer is kept, not stopped: a cluster whose permission
+	// is granted or restored during the hold is picked up on the next
+	// attempt, with no restart. One length before and after the initial sync:
+	// a permission revoked from a running fleet is the same refused request
+	// on the same clock, and cluster_up reports the held cluster as down for
+	// the whole interval (see handleWatchError). The preflight that runs
+	// before the informer is built holds a refused cluster on the same clock
+	// (see awaitPermitted): a permission is a permission whichever request
+	// discovers it missing.
+	forbiddenRetryInterval = 10 * time.Minute
+
+	// preflightResource and the two verbs are what the preflight asks the API
+	// server about: the core Events list and watch the informer is about to
+	// make, at the cluster scope, in that order. The list is asked first
+	// because it is the first request the classic reflector makes and the
+	// permission GKE's IAM names in its refusal; the watch is asked only once
+	// the list is allowed, so a denied cluster costs one review per check,
+	// not two. Both are required: the reflector's watch-list mode (see
+	// newListWatch) streams the initial state through the watch and falls
+	// back to the list only when that stream fails, so an identity granted
+	// watch but not list would have been served there and is held here. That
+	// grant shape does not occur in practice — every role template and IAM
+	// role pairs the two — and the hold is the price of asking for the
+	// permissions the informer is documented to need rather than the ones a
+	// particular reflector mode happens to exercise.
+	preflightResource  = "events"
+	preflightListVerb  = "list"
+	preflightWatchVerb = "watch"
+
+	// preflightNoReason stands in for a review that came back denied with an
+	// empty status.reason. Kubernetes RBAC never sets one, so this is what
+	// the host cluster of every install prints when the pod's service account
+	// lacks the grant: the line says what an empty reason means and what to
+	// grant, rather than leaving the operator with a blank where the 403 it
+	// replaces (see awaitPermitted) named both remediation paths.
+	preflightNoReason = "no reason given (Kubernetes RBAC returns none; grant list and watch on events to this identity)"
+
+	// preflightDeniedFormat is the one line a denied preflight logs per check:
+	// cluster, resource, verb, the identity that was refused (see whoAmI),
+	// hold, and the authorizer's reason, which on GKE names the missing IAM
+	// permission.
+	preflightDeniedFormat = "watcher: [%s] %s %s denied at preflight for %s, holding %s before the next check: %s"
+
+	// directProfile is the Profile main.go gives the one cluster reached with
+	// the process's own credential rather than a token for the pod's Google
+	// identity; whoAmI reads it to say which of the two was refused when the
+	// API server will not name the identity itself.
+	directProfile = "direct"
+	// The two fallbacks whoAmI names in that case, and the shape it wraps
+	// them in with the reason the identity could not be read.
+	directIdentityFallback          = "the process's own credential (in a pod, its service account)"
+	profileIdentityFallback         = "the pod's Google identity"
+	preflightIdentityFallbackFormat = "%s (not named: SelfSubjectReview %s)"
+	preflightIdentityEmpty          = "returned no username"
+	// preflightInconclusiveFormat is the one line logged when the review
+	// could not decide, before falling through to building the informer.
+	preflightInconclusiveFormat = "watcher: [%s] preflight inconclusive, starting the informer anyway: %v"
+)
+
+// preflightVerbs is the order the preflight asks in (see preflightResource).
+var preflightVerbs = [...]string{preflightListVerb, preflightWatchVerb}
 
 // eventDispatcher represents the callback target for processed events.
 // Decoupled into an interface to allow injecting mock implementations in tests.
@@ -50,6 +126,30 @@ type watcher struct {
 	dispatcher   eventDispatcher
 	cluster      targetCluster
 	resyncPeriod time.Duration
+	// forbiddenHold is the wait applied by handleWatchError after a 403 and by
+	// awaitPermitted after a denied preflight; it is forbiddenRetryInterval
+	// everywhere except tests, which shorten it.
+	forbiddenHold time.Duration
+
+	// onWatching is Run's callback, kept on the watcher so that
+	// handleWatchError and the watch func of the ListWatch can report a
+	// transition from their own goroutines. Nil until Run is entered.
+	onWatching func(watching bool)
+	// The watch state, guarded by stateMu: synced is set once Run's
+	// WaitForCacheSync has returned, held while a 403 has the reflector
+	// waiting and no watch has succeeded since, and watching is the last
+	// value reported through onWatching. Two flags rather than one because
+	// the reflector and Run observe the initial sync on different goroutines:
+	// the reflector can have its first watch refused before Run has seen the
+	// list complete, and the caller has to hear the same sequence either way
+	// (see markSynced). stateMu is held across the onWatching call so that
+	// transitions reach the callback in the order they happened; a gauge set
+	// from them must end on the latest state, and an atomic flag alone would
+	// not order the calls.
+	stateMu  sync.Mutex
+	synced   bool
+	held     bool
+	watching bool
 }
 
 // newWatcher constructs a watcher. resyncPeriod == 0 disables the
@@ -58,21 +158,34 @@ type watcher struct {
 // cadence — usually not what you want, so default 0 in main.go.
 func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster, resyncPeriod time.Duration) *watcher {
 	return &watcher{
-		client:       client,
-		dispatcher:   dispatcher,
-		cluster:      cluster,
-		resyncPeriod: resyncPeriod,
+		client:        client,
+		dispatcher:    dispatcher,
+		cluster:       cluster,
+		resyncPeriod:  resyncPeriod,
+		forbiddenHold: forbiddenRetryInterval,
 	}
 }
 
-// Run starts the informer + handler goroutines and blocks until ctx
-// is cancelled. Returns any startup error (e.g., initial list
-// failure); shutdown-path errors are logged but not returned so
-// callers can distinguish "startup failed, restart me" from "clean
-// shutdown."
-func (w *watcher) Run(ctx context.Context, onSynced func()) error {
-	factory := informers.NewSharedInformerFactory(w.client, w.resyncPeriod)
-	eventInformer := factory.Core().V1().Events().Informer()
+// Run asks whether this identity may list and watch Events on the cluster,
+// holds until it may (see awaitPermitted), then starts the informer + handler
+// goroutines and blocks until ctx is cancelled. Returns any startup error
+// (e.g., initial list failure, or ctx cancelled while held at preflight);
+// shutdown-path errors are logged but not returned so callers can distinguish
+// "startup failed, restart me" from "clean shutdown."
+//
+// onWatching is called with true once the initial list has completed, with
+// false when a 403 Forbidden takes the cluster out of that state (see
+// handleWatchError), and with true again when a later attempt succeeds. It
+// fires once per transition, never twice with the same value, and never
+// before the initial list has completed: a cluster held at preflight or from
+// its first list never hears anything. The call is made from an informer
+// goroutine, so it must not block.
+func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error {
+	w.onWatching = onWatching
+	if err := w.awaitPermitted(ctx); err != nil {
+		return err
+	}
+	eventInformer := cache.NewSharedIndexInformer(w.newListWatch(), &corev1.Event{}, w.resyncPeriod, cache.Indexers{})
 
 	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
@@ -104,6 +217,11 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 	if err != nil {
 		return fmt.Errorf("watcher: register event handler: %w", err)
 	}
+	// Must be registered before RunWithContext: the informer refuses a handler
+	// once it is running.
+	if err := eventInformer.SetWatchErrorHandlerWithContext(w.handleWatchError); err != nil {
+		return fmt.Errorf("watcher: register watch error handler: %w", err)
+	}
 	// Report client-go's internal errors ("unknown object type in
 	// cache" on shutdown, where cache.HandleCrash trips over
 	// ctx.Done races) through our logger too. Note this appends to
@@ -121,7 +239,7 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 		})
 	})
 
-	factory.Start(ctx.Done())
+	go eventInformer.RunWithContext(ctx)
 	// WaitForCacheSync blocks until the initial list is done —
 	// without this, the first N events after startup would
 	// arrive without their prior Count/LastTimestamp, breaking
@@ -136,11 +254,289 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 	// on the line above indefinitely rather than returning an error. Callers
 	// that want to know whether a cluster is live have to be told, because
 	// they cannot infer it from Run having not returned.
-	if onSynced != nil {
-		onSynced()
-	}
+	w.markSynced()
 	<-ctx.Done()
 	return nil
+}
+
+// awaitPermitted runs the preflight and holds the cluster until it passes: a
+// denied verb logs one line and waits forbiddenHold, or until ctx is done,
+// before asking again. Nothing is built for a held cluster — no reflector, no
+// cache, no retry loop — so a fleet where every cluster refuses the list is
+// one line per cluster in the first second of the process and one more per
+// cluster per hold, with the reason the authorizer gave, instead of a hold
+// discovered from inside the reflector's retry. A cluster granted during the
+// hold is picked up on the next check, with no restart, which is the same
+// contract handleWatchError keeps after the informer is up.
+//
+// The preflight is advisory: a review that cannot be made at all (an
+// authorizer that does not answer SelfSubjectAccessReview, a stripped
+// system:basic-user) or that the authorizer could not decide (a webhook
+// outage; see preflight) is logged once and the informer is built exactly as
+// it would have been without the preflight, so this can only make
+// a denied cluster quieter, never withhold one the reflector would have
+// watched. It is also blind to a permission revoked after it ran; that is
+// handleWatchError's path. Nothing is reported through onWatching from here:
+// the caller has not heard true yet, and a held cluster is exactly the
+// "never synced" a cluster_up of 0 already means.
+//
+// A cancelled ctx during the hold returns an error, as a cancelled
+// WaitForCacheSync does, so the caller sees the same "startup did not
+// complete" for a cluster that was still held when the process stopped.
+func (w *watcher) awaitPermitted(ctx context.Context) error {
+	for {
+		verb, reason, err := w.preflight(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("watcher: stopped during preflight: %w", ctx.Err())
+			}
+			log.Printf(preflightInconclusiveFormat, w.cluster.Name, err)
+			return nil
+		}
+		if verb == "" {
+			return nil
+		}
+		if reason == "" {
+			reason = preflightNoReason
+		}
+		log.Printf(preflightDeniedFormat, w.cluster.Name, preflightResource, verb, w.whoAmI(ctx), w.forbiddenHold, reason)
+		if !holdOrDone(ctx, w.forbiddenHold) {
+			return fmt.Errorf("watcher: stopped while held at preflight (%s %s denied: %s): %w", preflightResource, verb, reason, ctx.Err())
+		}
+	}
+}
+
+// holdOrDone waits d, or until ctx is done, whichever comes first, and reports
+// whether the hold ran its full length. Both holds go through here — the
+// preflight's after a denial (awaitPermitted) and the reflector's after a 403
+// (handleWatchError) — so the one clock and one contract the comments above
+// promise cannot drift apart between two copies of the same select.
+func holdOrDone(ctx context.Context, d time.Duration) bool {
+	hold := time.NewTimer(d)
+	defer hold.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-hold.C:
+		return true
+	}
+}
+
+// preflight asks the API server, one SelfSubjectAccessReview per verb in
+// preflightVerbs, whether this identity may list and then watch Events at the
+// cluster scope, stopping at the first refusal. It returns the refused verb
+// and the review's status.reason, or an empty verb when both are allowed. An
+// error means the question was not answered, not that the answer was no;
+// awaitPermitted treats the two differently. A review that comes back not
+// allowed with status.evaluationError set is an error here, not a refusal:
+// the authorizer chain could not decide (a webhook authorizer, GKE's IAM
+// among them, that cannot reach its backend), and the API server answers the
+// list itself with a 500 in that state, not a 403, which the reflector
+// retries on its default backoff. Holding on it would withhold a cluster the
+// reflector would have been watching moments after the authorizer recovered.
+//
+// SelfSubjectAccessReview needs no grant of its own — system:basic-user binds
+// it to system:authenticated — and on GKE it resolves through the same
+// authorizer chain as the list itself, IAM included, so the reason it returns
+// is the one the reflector would have been refused with.
+func (w *watcher) preflight(ctx context.Context) (string, string, error) {
+	for _, verb := range preflightVerbs {
+		review := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Group:    "",
+					Resource: preflightResource,
+					Verb:     verb,
+				},
+			},
+		}
+		result, err := w.client.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
+		if err != nil {
+			return "", "", fmt.Errorf("SelfSubjectAccessReview for %s %s: %w", verb, preflightResource, err)
+		}
+		if result.Status.Allowed {
+			continue
+		}
+		if result.Status.EvaluationError != "" {
+			return "", "", fmt.Errorf("SelfSubjectAccessReview for %s %s: authorizer could not decide: %s", verb, preflightResource, result.Status.EvaluationError)
+		}
+		return verb, result.Status.Reason, nil
+	}
+	return "", "", nil
+}
+
+// whoAmI names the identity the preflight was refused as, so the denial line
+// can say who to grant the permission to. A held cluster never reaches the
+// reflector, so that line replaces the 403 the operator used to read, which
+// named the identity (`User "<gsa>@<project>.iam.gserviceaccount.com" cannot
+// list resource "events"`); without it a denial with no reason, which is what
+// RBAC returns, cannot be told apart between the pod's service account on the
+// host cluster and its Google identity on a profile cluster, and the two are
+// fixed in different places. The API server answers a SelfSubjectReview with
+// the username it authenticated the caller as — the Google identity's email
+// through GKE's authenticator, `system:serviceaccount:<ns>:<name>` for a
+// service-account token — and system:basic-user grants that review as it
+// does the access review. When it will not say (an older API server, a
+// stripped basic-user role), the line falls back to which credential this
+// cluster is reached with (see directProfile) and says why it could not do
+// better. Asked only on a denial, so an allowed cluster pays nothing.
+func (w *watcher) whoAmI(ctx context.Context) string {
+	review, err := w.client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	var why string
+	switch {
+	case err != nil:
+		why = err.Error()
+	case review.Status.UserInfo.Username == "":
+		why = preflightIdentityEmpty
+	default:
+		return review.Status.UserInfo.Username
+	}
+	source := profileIdentityFallback
+	if w.cluster.Profile == directProfile {
+		source = directIdentityFallback
+	}
+	return fmt.Sprintf(preflightIdentityFallbackFormat, source, why)
+}
+
+// newListWatch builds the informer's list and watch calls: the same
+// Events(NamespaceAll).List and .Watch the informer factory would make,
+// wrapped the same way so the reflector uses watch-list semantics against a
+// real client and not against the fake one in tests, plus two hooks — a watch
+// call that returns without error reports the cluster as watching again, and
+// a list that does ends a hold without reporting anything.
+//
+// The watch call is the recovery signal rather than the list because it is
+// the last request the reflector makes before events flow, whichever mode it
+// is in. Under client-go's WatchListClient feature, on by default since 0.35,
+// a recovered reflector streams its initial state through the watch call and
+// may never call List at all; and in the classic mode an identity that may
+// list but not watch would otherwise read as up for the instant between each
+// relist and the refused watch that follows it.
+func (w *watcher) newListWatch() cache.ListerWatcher {
+	return cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (k8sruntime.Object, error) {
+			list, err := w.client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
+			if err == nil {
+				w.listCompleted()
+			}
+			return list, err
+		},
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			wi, err := w.client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
+			if err == nil {
+				w.watchEstablished()
+			}
+			return wi, err
+		},
+	}, w.client)
+}
+
+// markSynced records that the initial list has completed and reports it. Run
+// calls it once WaitForCacheSync returns, which is on Run's goroutine and so
+// may come after the reflector has already had the watch that follows the
+// list refused: in that case the caller hears true and then false here, the
+// same two reports in the same order as when the 403 lands after Run has seen
+// the sync. The cluster did complete its list either way, so the caller's
+// count of synced clusters — and the no-cluster-synced exit in main.go built
+// on it — is the same whichever goroutine got there first.
+func (w *watcher) markSynced() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	w.synced = true
+	w.reportLocked(true)
+	if w.held {
+		w.reportLocked(false)
+	}
+}
+
+// listCompleted is the list func's hook: a list that returned without error
+// ends the hold a refused list began, but reports nothing, because the watch
+// that follows is the signal (see newListWatch). Without it a cluster held
+// from its first list and then granted both permissions would be reported as
+// synced, held and recovered within the space of the watch call whenever Run
+// saw the list complete before the reflector opened the watch.
+func (w *watcher) listCompleted() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	w.held = false
+}
+
+// markHeld records a 403 from the list or the watch. Before the initial list
+// has completed there is nothing to report — the caller has not heard true
+// yet — and markSynced picks the state up if the list completes meanwhile.
+func (w *watcher) markHeld() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	w.held = true
+	if w.synced {
+		w.reportLocked(false)
+	}
+}
+
+// watchEstablished is the watch func's hook: a watch call that returned
+// without error ends any hold. Before the initial list has completed it only
+// clears the flag — the first successful watch is opened before
+// WaitForCacheSync returns, and Run reports that one — so the caller's first
+// true still means "initial list complete" as it always has. After the sync
+// it reports the transition back to watching that ends a hold.
+func (w *watcher) watchEstablished() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	w.held = false
+	if w.synced {
+		w.reportLocked(true)
+	}
+}
+
+// reportLocked reports a transition through onWatching, once per change. A
+// repeat of the current state is dropped, so the informer's many watch calls
+// and repeated holds cost the caller nothing. Caller holds stateMu.
+func (w *watcher) reportLocked(watching bool) {
+	if w.watching == watching {
+		return
+	}
+	w.watching = watching
+	if w.onWatching != nil {
+		w.onWatching(watching)
+	}
+}
+
+// handleWatchError is the informer's watch error handler. The reflector calls
+// it synchronously from its retry loop, after a list or watch failed and
+// before the backoff that precedes the next attempt, so time spent in here is
+// added to the retry interval. That is the lever this uses: a 403 Forbidden,
+// from the list or from the watch, before or after the initial sync, holds
+// the reflector for forbiddenHold, or until the informer is stopped,
+// whichever comes first. Every other error goes to the default handler
+// unchanged and retries on the default backoff. The reflector wraps the list
+// error with %w and passes the watch error through as is, so
+// apierrors.IsForbidden sees the StatusError either way; a client-go that
+// stopped wrapping would fall back to the default path, which is the pre-hold
+// behaviour rather than a new failure.
+//
+// A cluster that has already synced is reported as not watching before the
+// hold starts, and as watching again by the first watch call that succeeds
+// afterwards (see newListWatch), so cluster_up reads 0 for the whole hold
+// rather than 1 for a cluster whose events are up to forbiddenHold stale.
+// That is what lets the hold apply after the sync at all: an identity whose
+// permission is revoked mid-run, or that may list but not watch, gets the
+// same treatment as one that never had it, because the operator who edited
+// the binding did not make that distinction and cannot see it. A cluster
+// whose list is refused never syncs, so nothing is reported for it: it stays
+// at 0, WaitForCacheSync in Run stays blocked, and the no-cluster-synced exit
+// in main.go still fires when every cluster is held from the start.
+//
+// One log line per attempt, and the default handler is skipped for the held
+// 403 so klog's "Failed to watch" and the runtime.ErrorHandlers echo of it
+// stay quiet too.
+func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err error) {
+	if !apierrors.IsForbidden(err) {
+		cache.DefaultWatchErrorHandler(ctx, r, err)
+		return
+	}
+	w.markHeld()
+	log.Printf("watcher: [%s] events forbidden, holding %s before the next attempt: %v", w.cluster.Name, w.forbiddenHold, err)
+	holdOrDone(ctx, w.forbiddenHold)
 }
 
 // dispatch converts a *corev1.Event to the internal TriageEvent

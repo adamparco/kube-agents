@@ -62,7 +62,8 @@ _Illustrative end-state shape._ It generalizes today's `PlatformAgent`: `tier` /
 and `iac.format` are **new**; `serviceAccountName` and `runtimeClassName` exist today **nested** under
 `spec.security` / `spec.deployment` (`k8s-operator/api/v1alpha1`), `spec.harness` is a **struct** (not
 the string shown), and `integration` (with per-platform `allowedUsers`) already exists nested under
-`spec.integration.{googleChat,slack}` (`platformagent_types.go:32–108`). `profile` denotes persona
+`spec.integration.{googleChat,slack}` plus the forge and repository declarations `spec.integration.forges` and
+`spec.integration.repositories` (with `spec.integration.github` as a deprecated alias) (`platformagent_types.go`). `profile` denotes persona
 selection — **v1 = a baked per-tier image** (`<tier>-agent:<tag>`, built from `agents/<tier>/` exactly as
 the platform image is today; [08](08-agent-runtime-and-identity.md) §2); a mounted profile is deferred.
 Phase 1/2 decide only which fields to **promote** vs keep nested ([07](07-implementation-roadmap.md)).
@@ -199,8 +200,9 @@ read-only scope.
 ## 2b. ChatOps addressing & routing contract
 
 How a human names the agent they want ([02](02-agent-personas.md) §2.4). The **ChatOps gateway**
-(C15, [05](05-system-architecture.md)) resolves every inbound chat message to exactly one
-`(tier, scope)` **`Agent` CR** via three modes, deterministic first. _(This is v1-compatible: it
+(C15, [05](05-system-architecture.md)) resolves every inbound chat message, deterministic first, either to exactly
+one `(tier, scope)` **`Agent` CR** (a slash command or a handle) or to the conversation's session
+(free text), which reaches an `Agent` CR only by asking the gateway to mint a child task to it. _(This is v1-compatible: it
 enforces the existing trusted-human allowlist, adds no per-request authorization, and dispatches to
 the separate per-tier pods — it is **not** the deferred co-located multiplexer or the deferred authz
 gateway C14, [08](08-agent-runtime-and-identity.md) §3.)_
@@ -221,15 +223,20 @@ dispatches directly to the named agent — constant-time, no inference. On Googl
 carries a numeric `commandId`; on Slack it is a registered `/command`. Both map to the handle table
 above; the gateway normalizes them to a single dispatch path.
 
-**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) NL inference (fallback; low
-confidence → clarify, not guess). Modes 1–2 spend no inference; mode 3 spends one router call.
+**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) the conversation's session agent
+(fallback for a thread nothing has bound; unsure → clarify, not guess). The gateway spends no inference
+in any mode; mode 3's inference is the session agent's, which the gateway hands the turn to. A `/session`
+command that opts a conversation onto the session route is a slash command that names a route rather
+than a handle; it is planned, not built.
 
 **Attribution (extends §8).** Every chat turn's audit record adds the **resolved agent** (`tier`,
-`scope`) and the **routing mode** (`slash` | `handle` | `inference`) alongside the requester +
-trace/session IDs. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
+`scope`) and the **routing mode** (`slash` | `handle` | `session`) alongside the requester +
+trace/session IDs; for mode 3 the gateway records the session, and the target of any delegation the
+session makes is on the child task's envelope, with the same requester. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
 (§6). Routing is **never** an authz signal ([03](03-security-model.md) §4a): the gateway checks the
-target agent's `AllowedUsers` before dispatch, and the NL router (model output) is never trusted for
-authorization.
+target agent's `AllowedUsers` before dispatch, and when a session delegates, the gateway mints the child task on the
+session's request and checks the target's `AllowedUsers` against the turn's requester before it does; the session agent's routing
+choice (model output) is never trusted for authorization.
 
 **Allowlist source & enforcement.** The gateway resolves the **target** agent's trusted-human allowlist
 by reading that `(tier, scope)` **`Agent` CR's** `integration.{googleChat,slack}.allowedUsers` (§1.1) —
@@ -238,12 +245,14 @@ the same field each agent pod's own Hermes gateway already reads (today rendered
 pod's own gateway enforces its allowlist; as the central router fronts multiple per-tier pods it resolves
 the target CR and checks `allowedUsers` **before** dispatch, with the target pod's gateway remaining a
 defense-in-depth backstop. An empty/absent `allowedUsers` means "all authenticated users" (today's
-default) — a closed allowlist must be set explicitly.
+default) — a closed allowlist must be set explicitly. A session-routed turn has no target CR at the
+door: it is gated by the gateway's own ingress allowlist (the adapter's allowed-users setting), and
+the target CR's `allowedUsers` is read when the session asks the gateway to mint a child task to it.
 
 ## 3. GitOps repository layout & propose/apply contract
 
-Single source of truth (`05` C13) — the **customer's own GitOps repository** (configured via the agent's
-`integration.github.gitRepo`, checked out into the agent workspace), **separate from the kube-agents
+Single source of truth (`05` C13) — the **customer's own GitOps repository** (scoped to the agent's
+GitHub organization/context, checked out dynamically into the agent workspace), **separate from the kube-agents
 source tree**; `submit-suggestion` pushes a branch here and opens the PR. This layout is scaffolded in
 Phase 0 ([07](07-implementation-roadmap.md)); it does not exist in the source repo today. Recommended
 layout:
@@ -257,6 +266,7 @@ layout:
 ├── fleet/                         # project-level policy; platform-tier Agent CR + identity
 ├── knowledge/                     # OKF base (§5)
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
+├── .kube-agents/intent.yaml       # paths an audit reads for declared-intent notes (§5)
 └── .github/workflows/ (or .ci/)   # the actuation pipeline config (customer's CI/CD)
 ```
 
@@ -304,7 +314,9 @@ The six types are the canonical starting set; `type` is an **open convention, no
 types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown
 links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
-**not** session state.
+**not** session state. An entry of any type may carry `declares:`, a list of
+`{check, namespace, object}` items (plus `cluster` for a one-cluster choice) that an audit reads as a
+declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from.
 
 ## 6. Session-state contract (mem0 deferred post-v1)
 

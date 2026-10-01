@@ -1,0 +1,808 @@
+name: CI Health (dashboard refresh + presubmit gate adjudicator)
+
+# Every 15 minutes, and on demand: refresh the live eval dashboard
+# (incremental collect -> render -> publish, the pipeline
+# hack/ci-dashboard-refresh.sh runs), decide from the data.json just
+# collected whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why
+# (scripts/eval_dashboard/health.py), publish health.json next to data.json,
+# render the dashboard with that verdict and its history baked into the
+# Brief (render.py --health / --health-history, the same flags the refresh
+# script passes), and tell #kube-agents-ci-health on Google Chat only when
+# the state changes plus one digest a day (scripts/eval_dashboard/
+# post_health.py). docs/ci-health.md explains the states, the rules and the
+# advice each one carries. The data and the verdict are fresh together; the
+# inputs fetched outside that collect -- pool-pressure's hourly artifact
+# (#1607), the watched periodics' latest builds and the rest -- are optional;
+# an absence just drops its note.
+# The order is adjudicate ->
+# upload health.json -> append history -> render -> publish -> post ->
+# comment, so the Brief a reader opens from a message already shows the
+# verdict the message names.
+#
+# Two identities, each least-privilege for its half, which is why the
+# refresh script is not invoked as one unit here: it couples collect and
+# publish in a single invocation, and the two halves need different accounts.
+#
+#   A. Collect runs as github-actions@kube-agents-prow. It is the only
+#      account with a read grant on gs://kube-agents-prow (the OSS Prow
+#      project's bucket; the grant cannot be copied from here). It reads the
+#      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
+#      and the watched periodics' gs://kube-agents-periodic-logs (both
+#      kube-agents-owned; it holds objectViewer on each, and whichever
+#      account replaces it needs the same), the eval evidence store
+#      gs://kube-agents-evals-bench (objectViewer, for the Trend page;
+#      best-effort, and incremental against the store.json the last tick
+#      published) and the prior data.json, and writes the merged data.json
+#      to the runner's disk. It writes nothing to any bucket. A read grant for the dedicated publisher has been
+#      requested from the OSS Prow owners; once it lands, this step
+#      switches account and the job is single-identity.
+#   B. Everything else runs as eval-dashboard-publisher@kube-agents-prow --
+#      the dedicated publisher hack/ci-eval-pr.sh names for this bucket. It
+#      holds roles/storage.objectUser on gs://kube-agents-dashboards, the
+#      read roles bench/tf/fleet grants it on each pool project (the pool-state
+#      scan, below), and is
+#      the identity of the Chat app "Smoke Health" (same project), so the
+#      Chat token is minted under it too: `gcloud auth print-access-token
+#      --scopes=chat.bot`, because the auth action's default access token
+#      does not carry that scope.
+#
+# Nothing a presubmit can run as ever holds a write on the bucket; the
+# guards protect that boundary: a schedule runs the default branch's
+# workflow file, and a workflow_dispatch from any other ref no-ops on the
+# `github.ref` guard -- `ref: main` on a checkout alone would not do that,
+# since a dispatch executes the workflow file of the ref it is dispatched
+# against (#1251's review). The fork guard covers the other axis.
+#
+# Budget: this job runs the INCREMENTAL path only -- the bucket holds
+# data.json, and collect.py's watermark makes a tick cost one listing of
+# Prow's per-job directory index plus the new builds (seconds to a few
+# minutes). A cold sweep does
+# not fit here and is not attempted: hack/ci-dashboard-refresh.sh prices it
+# at 30-45 minutes, past the 30-minute job, and retrying it every 15 minutes
+# would burn a red run per tick without ever publishing. So a tick that finds
+# no published data.json fails fast and says how to seed the bucket once, by
+# hand. The 1500s ceiling is for the incremental path's own worst case (a
+# slow listing, a burst of new builds), not for a sweep. A collect that could
+# not list or read the archive is not published: collect.py degrades a failed
+# listing to "nothing new" with a fresh generated_at, which would republish
+# yesterday's runs as today's and hide the stall from health.py's staleness
+# check. Step A greps its own log for that and skips publishing; the
+# adjudicator then reads whatever the bucket holds, flags it stale once it is
+# old enough, the space hears about the stall, and the last step fails the
+# run so the red is visible.
+#
+# The target space (CI_HEALTH_CHAT_SPACE, `spaces/AAQAlcuDUJI`, the
+# "kube-agents-ci-health" space) is not a secret and defaults here; a
+# repository variable overrides it. The off switch is a separate variable,
+# CI_HEALTH_MUTE=true: no token is minted, the poster finds nothing to post
+# with and exits 0 ("webhook not configured") before it would file an
+# issue, the comment step is skipped, and the refresh, the verdict and the
+# health.json upload carry on -- so the one switch silences every write
+# onto Chat, issues and other people's pull requests. (An empty CI_HEALTH_CHAT_SPACE could
+# not be that switch: `vars.X || 'default'` yields the default for an empty
+# string too.) An incoming-webhook URL is the optional alternative, read
+# from Secret Manager (ci-health-chat-webhook in kube-agents-prow) when a
+# version exists.
+#
+# health.json is uploaded before anything is posted: it is the --prev the
+# next tick reads, so a Chat fault must not cost the adjudicator its memory.
+# A post failure still fails the run, in the last step, so the red shows.
+# After the upload the same health.json is appended, with a `tick` time, to
+# health-history.jsonl beside it (download, append, upload: GCS has no
+# append); a failure there is a warning.
+#
+# Two things write to GitHub with this workflow's own token, which is why
+# the job asks for pull-requests: write and issues: write and nothing else
+# does: the poster files the tracking issue a new OUTAGE lacks (label
+# presubmit-gate; it adopts a human's if one names the same cases, and
+# never closes one), for a new lost_pods, fixture_drift or pool_drift
+# condition the issue its owner is owed (same label; it adopts a human's
+# naming the same nodes, roles or finding ids), and for a deadline_kill OUTAGE
+# the gate owner's (it adopts a human's titled for the deadline kills);
+# scripts/eval_dashboard/gate_comment.py leaves one comment per
+# pull request whose smoke run went red -- or lost its build node, or was
+# killed at the job deadline -- since the last tick, edited in place on
+# later runs. Both are best-effort: a
+# GitHub failure is a warning, retried next tick, never a failed run.
+#
+# A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
+# runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
+# every pool project (scripts/eval_dashboard/fixture_state.py) and publishes
+# fixture-state.json beside health.json; the adjudicator reads it for the
+# fixture_drift condition, the digest carries one line of it, and a scan
+# that could check nothing is said once and is never a drift. Its own job
+# rather than a step gated on the top-of-hour tick, because it needs kubectl
+# and gke-gcloud-auth-plugin, runs every mapped project for a few minutes, and
+# must never delay the 15-minute verdict: the tick reads whatever scan is
+# published, and a late one is "stale" in health.json. Two crons fire at the
+# top of the hour; each run's `github.event.schedule` sends it to one job.
+# Every read the scan makes runs as that project's seeded-fleet reader, so
+# the publisher needs one grant per pool project and, for this scan, nothing
+# on the project itself (docs/ci-health.md, "The seeded-fleet scan"); a
+# project without it scans as "not checked". The same job then runs the pool-state scan
+# (#1967): scripts/eval_dashboard/pool_state.py runs the verifier's read-only
+# checks against every pool project as the publisher itself and publishes
+# pool-state.json beside fixture-state.json; the adjudicator reads it for
+# the pool_drift condition, whose tracking issue carries the repair command
+# per project. That read needs the project roles bench/tf/fleet grants the
+# publisher (docs/ci-health.md, "The pool-state scan"); a project without
+# them scans as "not checked".
+
+on:
+  schedule:
+    # The refresh-and-adjudicate tick.
+    - cron: "*/15 * * * *"
+    # The seeded-fleet scan (header). The :00 firing of the tick's cron is a
+    # separate run; the job guards below keep the two apart.
+    - cron: "0 * * * *"
+  #checkov:skip=CKV_GHA_7:One boolean, fixture_state_scan, which decides whether a manual run also scans the fleet; nothing is built and no input reaches a shell
+  workflow_dispatch:
+    inputs:
+      fixture_state_scan:
+        description: "Also run the hourly scans (seeded-fleet fixture state and pool-project state)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# One tick at a time, and one scan at a time -- set per job below rather than
+# here: a slow tick overlapping the next would race on the published
+# data.json and the last-posted state object, but the scan must not hold a
+# tick (or be held by one), so the two jobs queue on groups of their own.
+
+env:
+  DASHBOARD_BUCKET: gs://kube-agents-dashboards/evals
+  # Rule 8's input: where the hourly pool-pressure periodic (#1069) archives
+  # its runs. `latest-build.txt` beside them names the newest.
+  POOL_PRESSURE_LOGS: gs://kube-agents-prow/logs/ci-kube-agents-pool-pressure
+  # How far back the fetch step looks for a build that finished, when the
+  # newest one is still running. Three covers a run of aborted builds without
+  # turning one tick into a walk down the whole archive.
+  POOL_FALLBACK_BUILDS: "3"
+  WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+  # Step A's identity: the Prow-archive reader (see the header).
+  COLLECT_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
+  # Step B's identity: the dedicated publisher and Chat app; a repository
+  # variable overrides it.
+  CI_HEALTH_SA: ${{ vars.CI_HEALTH_SA || 'eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com' }}
+  CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
+  CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
+  # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
+  # the smoke-test presubmit's archive, the nightly periodic's log prefix
+  # (its own bucket, gs://kube-agents-evals-nightly-logs, since the nightly's
+  # identity cannot write the cluster default; the collect step's
+  # github-actions@kube-agents-prow holds objectViewer on it. Until a night
+  # lands there the prefix holds no objects, which collect.py notes and
+  # carries on -- with or without a night on record from the old bucket; a
+  # prefix that fails to list for any other reason once a night is on
+  # record is the refusal line below), the bound collect.py
+  # applies to a prior it finds unusable (a corrupt download; a missing one
+  # stops the step before collect.py runs), and the freshness-badge
+  # threshold written into data.json (this job's 15m cadence with slack for
+  # ~2 missed ticks).
+  PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
+  # The release-candidate lane's archive. A postsubmit, so logs/ rather than
+  # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
+  RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
+  SINCE_DAYS: "14"
+  STALE_AFTER_S: "2400"
+  # The eval evidence store the nightly appends to (docs/designs/
+  # eval-scorer.md); scripts/eval_dashboard/store.py reads it for the Trend
+  # page. One listing plus the objects the last published store.json does
+  # not hold, so the budget is for a cold read of the 90-day window.
+  EVIDENCE_STORE: gs://kube-agents-evals-bench/evidence
+  STORE_TIMEOUT_S: "600"
+  COLLECT_TIMEOUT_S: "1500"
+  # The refresh job's timeout-minutes in seconds (move the two together),
+  # and what the store read must leave on that clock for the adjudicator,
+  # the render and the post after it (recent ticks spend 80-150 s on the
+  # whole job).
+  JOB_TIMEOUT_S: "1800"
+  JOB_TAIL_S: "240"
+  WEBHOOK_SECRET: ci-health-chat-webhook
+  WEBHOOK_SECRET_PROJECT: kube-agents-prow
+  # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
+  # projects scanned at once, the ceiling per project for the runner and the
+  # state check together (a healthy project takes ~20 s; the ceiling is for
+  # a hung API server), and the ceiling for the whole scan. The scan ceiling
+  # must cover every wave of the mapped pool at the per-project ceiling plus
+  # the 60 s token mint that precedes it (ceil(35 / 7) = 5 waves of 360 s,
+  # 1800 s, plus a margin; a test pins it against hack/ci-deploy.sh's
+  # mapping), or a pool-wide stall kills the step and publishes nothing
+  # instead of "not checked" entries.
+  FIXTURE_STATE_WORKERS: "7"
+  FIXTURE_STATE_PROJECT_TIMEOUT_S: "300"
+  FIXTURE_STATE_TIMEOUT_S: "1920"
+  # The pool-state scan's knobs (scripts/eval_dashboard/pool_state.py), the
+  # same arithmetic without the mint (5 waves of 300 s, plus a margin).
+  POOL_STATE_WORKERS: "7"
+  POOL_STATE_PROJECT_TIMEOUT_S: "300"
+  POOL_STATE_TIMEOUT_S: "1620"
+
+jobs:
+  refresh-and-adjudicate:
+    # Credentialed and schedule-triggered: never on a fork, never from a ref
+    # other than main (.agents/rules/github_actions.md, and the guard
+    # rationale in the header). The hourly cron's run belongs to the scan
+    # job below; a dispatch runs this job whatever its inputs.
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main' && (github.event_name != 'schedule' || github.event.schedule == '*/15 * * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: ci-health
+      cancel-in-progress: false
+    # The workflow-level grant plus the two writes the header explains: the
+    # gate comment on a pull request (a red run, a lost build node, or a
+    # deadline kill) and the tracking issue (an OUTAGE, or a lost_pods
+    # condition).
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      # The job's wall clock, for the store read's budget below: first, so
+      # the full-history checkout and the tool setups count against it
+      # (timeout-minutes runs from the runner's pick-up; the seconds of
+      # bring-up before this step are inside JOB_TAIL_S).
+      - name: Note when the job started
+        run: echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # render.py's "what changed right before" block reads the last
+          # three days of first-parent history and omits itself when
+          # `git rev-parse --is-shallow-repository` is not "false"; any
+          # positive depth is still shallow, so the full history it is.
+          fetch-depth: 0
+          # The job token holds issues/PR write; nothing here pushes, and
+          # render's git log is local, so the token does not stay on disk.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      # render.py imports yaml; health.py reads case-notes.yaml for the
+      # tracking issue an OUTAGE message cites (without pyyaml it warns and
+      # cites none).
+      - name: Install pyyaml
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # ---- A. collect, as the Prow-archive reader; no bucket writes ----------
+      - name: Authenticate to Google Cloud (Prow-archive reader)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.COLLECT_SA }}
+
+      # setup-gcloud registers a credential only if one exists when it runs,
+      # and it runs before either auth step. gcloud honours the credential
+      # file the auth step exports through an environment variable; gsutil
+      # does not, and without this login every gsutil call in the job ran as
+      # an anonymous caller (401 on the bucket, 40 failed ticks on
+      # 2026-09-10). `gcloud auth login --cred-file` is what setup-gcloud
+      # would have done, and it makes the credential the active account for
+      # gcloud, gsutil and `gcloud auth print-access-token` alike. Moving
+      # setup-gcloud below this auth step would fix only this half; the
+      # publisher half below needs the same login (or a second SDK download),
+      # so one mechanism serves both. An empty path would send gcloud to the
+      # interactive browser flow and hang the job, hence the `:?` guard.
+      - name: Make the Prow-archive reader credential active for gsutil
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Collect (incremental, onto the published data.json)
+        id: collect
+        continue-on-error: true
+        env:
+          # collect.py resolves runs[].pr_merged through `gh pr view`,
+          # best-effort; the workflow token is enough to read a public PR.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p work
+          # No prior document means a cold sweep, which this job does not
+          # attempt (header). Seed once by hand and the next tick is
+          # incremental.
+          if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
+            exit 1
+          fi
+          timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
+            --pr-glob "$PR_GLOB" \
+            --nightly-prefix "$NIGHTLY_PREFIX" \
+            --rc-glob "$RC_GLOB" \
+            --merge-with work/prior-data.json \
+            --since-days "$SINCE_DAYS" \
+            --stale-after-s "$STALE_AFTER_S" \
+            --out work/data.json 2>&1 | tee work/collect.log
+          test "${PIPESTATUS[0]}" -eq 0
+          # collect.py degrades a failed listing or read to a warning and a
+          # document with nothing new; publishing that would stamp old runs
+          # with a fresh generated_at. Refuse, so the stall stays visible.
+          #
+          # The RC glob is excluded on purpose. What that lane's verdict gates
+          # is the staging deploy, not this dashboard, and it must not be able
+          # to stall it: an RC listing that fails leaves
+          # releases[] carried forward from the prior and stales nothing, and
+          # `gsutil ls` exits non-zero on a prefix with no objects, so a week
+          # with no release candidate would otherwise stop every publish. Both
+          # RC warning shapes (the ls failure and the timeout) name the glob,
+          # so dropping lines that mention the job name drops exactly those.
+          if grep -v "post-kube-agents-eval-rc" work/collect.log \
+            | grep -Eq "warning: gsutil (ls|cat) .*(failed|timed out)"; then
+            echo "::error::collect.py could not list or read the Prow archive; not publishing"
+            exit 1
+          fi
+          python3 -c '
+          import json, sys
+          if not json.load(open("work/data.json")).get("runs"):
+              sys.exit("collected zero runs: refusing to publish an empty dashboard over a good one")
+          '
+
+      # Rule 8's input (#1607): the hourly pool-pressure periodic's newest
+      # artifact, read here because it lives in the Prow archive and only this
+      # half of the job holds the reader credential. Optional throughout --
+      # no reading means no note and no digest wait, which is what "not wired
+      # up" should look like; health.py judges a present one's age.
+      - name: Fetch the pool-pressure artifact
+        continue-on-error: true
+        run: |
+          mkdir -p work
+          # A NotFound is "the periodic has never run", which is what no note
+          # is meant to look like. Anything else -- a denied read above all --
+          # would otherwise ship the whole feature dark: no note, no digest
+          # figure, and no ⚪ either, because the dead-man's switch only ages
+          # an artifact it managed to read. The two sibling reads below tell
+          # the same two apart the same way.
+          if ! build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gsutil.err); then
+            grep -Eq "NotFound|No URLs matched|404" gsutil.err \
+              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            rm -f gsutil.err
+            exit 0
+          fi
+          rm -f gsutil.err
+          [ -n "$build" ] || exit 0
+          # The pointer moves at job start, so for the ~8 minutes the periodic
+          # runs it names a build with no artifact. finished.json lands with
+          # the artifact, so its absence means "still running" -- and the build
+          # before it holds a reading at most an hour old, well inside
+          # POOL_STALE_AFTER. Skipping instead would drop the note from
+          # health.json, the Brief and the digest for that tick.
+          if ! gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json"; then
+            # Compared as Python ints, not by sort or awk: a build id is 19
+            # digits, which a float rounds until neighbouring builds collide.
+            # The one before it has to have finished too. An aborted build --
+            # evicted pod, lost node -- publishes neither finished.json nor an
+            # artifact, and reading it would write the sentinel and announce
+            # that the periodic had stopped while it was minutes from
+            # publishing. Walking back costs one stat a build and lands on a
+            # real reading, which ages on its own window_end if it is old.
+            newest=$build
+            build=""
+            while read -r prior; do
+              if gsutil -q stat "$POOL_PRESSURE_LOGS/$prior/finished.json"; then build=$prior; break; fi
+            done < <(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
+            # Nothing finished behind it: the periodic's first build is still
+            # running, or every build in reach was aborted. Neither is the
+            # periodic publishing nothing, so say nothing.
+            [ -n "$build" ] || exit 0
+          fi
+          # The periodic opens the file with a shell redirect before it runs,
+          # so a crash publishes a 0-byte object that copies fine. Parsing is
+          # the only check that catches it, and it costs nothing on the object
+          # health.py is about to parse anyway.
+          if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
+            || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' work/pool-pressure.json 2>/dev/null; then
+            # The build finished and published nothing usable, so the periodic
+            # is running and failing. Ageing `window_end` cannot catch
+            # that -- an artifact never written never gets old -- and staying
+            # quiet would read as "not wired up". A document with no reading in
+            # it is what health.py turns into "the numbers stopped". An object
+            # we simply cannot read gets the same treatment on purpose: either
+            # way the bot has lost sight of the queue, and the message links to
+            # the job's history, which distinguishes the two.
+            printf '{"note": "build %s published no usable pool-pressure.json"}\n' "$build" \
+              > work/pool-pressure.json
+          fi
+
+      # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
+      # the pull sweep and the two seeded-fleet reconciles): their latest
+      # finished build each, for the note health.py carries and the poster
+      # sends once when one fails or stops running. Best-effort like the
+      # read above: a job that has never run writes nothing, a denied read
+      # warns, and neither fails the tick.
+      - name: Fetch the watched periodics' latest builds
+        continue-on-error: true
+        # Bounded: a hung read here would otherwise run into the job's
+        # 30-minute timeout, which cancels the verdict, the render and the post.
+        timeout-minutes: 5
+        run: |
+          mkdir -p work/periodics
+          python3 scripts/eval_dashboard/periodics.py fetch --out-dir work/periodics
+
+      # The Trend page's input, still as the reader (step A). Best-effort by
+      # construction: whatever stops the read (a failed listing, store.py
+      # killed by its timeout or crashed, no wall clock left after the
+      # collect) writes the last published store.json back with `error`
+      # set, so the page keeps its last good read and says it is stale and
+      # why (docs/ci-health.md promises that); with no prior at all the
+      # step leaves no work/store.json, the render below skips --store, and
+      # the page says the store was not read. The other pages publish in
+      # every case. The prior is the copy render.py published beside
+      # data.json last tick, so a tick fetches only last night's objects;
+      # only a NotFound on it means the first tick (a cold read of the whole
+      # span), any other download failure is retried and then ends the
+      # step, because a cold read against a bucket that just failed would
+      # spend the budget and could not fall back to a prior it does not
+      # have. Skipped after a failed collect: nothing renders then.
+      #
+      # The job has one wall clock (timeout-minutes) and two budgeted reads
+      # before the publisher half, the collect and this one, whose budgets
+      # sum past it. This read gets what the collect left less JOB_TAIL_S,
+      # and is not started when that is under a minute: a job-level timeout
+      # is not continue-on-error and would cancel the health verdict, the
+      # render and the post, not just this page. Inside its budget the read
+      # stops itself between waves (--deadline-s, 30 s under the budget) and
+      # keeps what it fetched, so a cold read that does not fit one tick
+      # finishes over the next ones instead of starting over each time;
+      # `timeout` is the hard stop behind it.
+      - name: Read the evidence store for the Trend page (best-effort)
+        if: steps.collect.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # `gsutil stat` exits 1 for a missing object and for a failed
+          # call alike, so the error text is read (as the health-history
+          # step below does).
+          prior=unreachable
+          for attempt in 1 2 3; do
+            if gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json 2>gsutil.err; then prior=present; break; fi
+            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then prior=absent; break; fi
+            echo "::warning::attempt $attempt: could not download the prior store.json (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            if [ "$attempt" -lt 3 ]; then sleep 15; fi
+          done
+          rm -f gsutil.err
+          case "$prior" in
+            absent) echo "no published store.json yet; reading the whole span" ;;
+            unreachable)
+              echo "::warning::the prior store.json could not be downloaded; the store is not read this tick and the page says so (the bucket's copy waits for the next tick)"
+              exit 1
+              ;;
+          esac
+          keep_prior() {
+            echo "::warning::$1; the Trend page shows the last published store.json as a stale read, or says the store was not read when there is none"
+            python3 scripts/eval_dashboard/store.py --location "$EVIDENCE_STORE" --prior work/prior-store.json --out work/store.json --fail-with "$1"
+          }
+          left=$(( JOB_TIMEOUT_S - JOB_TAIL_S - ($(date +%s) - JOB_STARTED) ))
+          budget=$(( left < STORE_TIMEOUT_S ? left : STORE_TIMEOUT_S ))
+          if [ "$budget" -lt 60 ]; then
+            keep_prior "the store was not read: ${left}s of the job's wall clock left after the collect"
+          else
+            timeout "$budget" python3 scripts/eval_dashboard/store.py \
+              --location "$EVIDENCE_STORE" \
+              --prior work/prior-store.json \
+              --deadline-s $(( budget - 30 )) \
+              --out work/store.json \
+              || keep_prior "store.py failed or timed out (exit $?, budget ${budget}s)"
+          fi
+
+      # ---- B. everything that writes or posts, as the dedicated publisher --
+      - name: Authenticate to Google Cloud (dashboard publisher and Chat app)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_HEALTH_SA }}
+
+      # Same as the reader's login above: make this credential the active
+      # account for gsutil (and the Chat token mint) too.
+      - name: Make the publisher credential active for gsutil
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Fetch data.json (after a failed collect) and the last-posted state
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+        run: |
+          mkdir -p work
+          # After a successful collect work/data.json is the document about
+          # to be published; after a failed one it is whatever the bucket
+          # holds, which the adjudicator ages against the clock.
+          if [ "$COLLECT_OUTCOME" != "success" ]; then
+            gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+          fi
+          # No state yet is the first tick, not an error.
+          gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
+          gsutil -q cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
+          # The hourly seeded-fleet scan's latest document (the scan job
+          # below); none yet means the scan has not run, and the adjudicator
+          # then has no fixture_state to report.
+          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true
+          # The same job's pool-state scan (pool-state.json); none yet means
+          # it has not run, and there is no pool_state to report.
+          gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true
+
+      - name: Adjudicate
+        run: |
+          # --posted-state is the poster's file, read for the tracking issue
+          # the bot filed so health.json can cite it, and for the pool
+          # episode's start across a tick that read no artifact.
+          # --fixture-state and --pool-state are the hourly scans' documents,
+          # for the fixture_drift and pool_drift conditions. --periodics-dir is
+          # what the step above fetched of the watched Prow periodics.
+          python3 scripts/eval_dashboard/health.py \
+            --data work/data.json \
+            --prev work/health-prev.json \
+            --posted-state work/health-state.json \
+            --pool-pressure work/pool-pressure.json \
+            --fixture-state work/fixture-state.json \
+            --pool-state work/pool-state.json \
+            --periodics-dir work/periodics \
+            --out work/health.json
+          python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
+
+      - name: Upload health.json next to data.json
+        run: |
+          gsutil -q -h "Cache-Control: no-cache" cp work/health.json "$DASHBOARD_BUCKET/health.json"
+
+      - name: Append this tick to health-history.jsonl
+        continue-on-error: true
+        run: |
+          # Download-append-upload. Only a download that failed because the
+          # object does not exist (the first tick) starts the feed empty; any
+          # other failure -- a 5xx, a timeout, a permission denial -- stops
+          # here, before an upload could replace the whole feed with one
+          # line. (`gsutil stat` cannot tell the two apart: it exits 1 for
+          # both, which is why the error text is read instead.)
+          set +e
+          gsutil -q cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gsutil.err
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then
+              echo "no health-history.jsonl yet; starting the feed"
+              : > work/health-history.jsonl
+            else
+              echo "::warning::could not download health-history.jsonl (not a NotFound); not appending this tick:"
+              cat gsutil.err
+              rm -f gsutil.err
+              exit 1
+            fi
+          fi
+          rm -f gsutil.err
+          python3 scripts/eval_dashboard/health_history.py --health work/health.json --history work/health-history.jsonl
+          if ! gsutil -q -h "Cache-Control: no-cache" cp work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
+            echo "::warning::health-history.jsonl was not updated this tick"
+            exit 1
+          fi
+
+      # Render with the verdict just taken and its history, the way
+      # hack/ci-dashboard-refresh.sh does (`--health`, `--health-history`,
+      # each passed only when the file exists). health.json is always there
+      # by now; the history file is missing only when the step above failed
+      # before downloading, and the Brief then shows the current state alone.
+      # Still gated on the collect: publishing re-renders data.json too, and
+      # a failed collect has nothing new that is safe to publish (header).
+      - name: Render and publish the dashboard
+        if: steps.collect.outcome == 'success'
+        run: |
+          render_args=()
+          [ -f work/health.json ] && render_args+=(--health work/health.json)
+          [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
+          [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
+          # The evidence-store read above, when it produced one; without it
+          # the Trend page says the store was not read this tick.
+          [ -f work/store.json ] && render_args+=(--store work/store.json)
+          [ -f work/store.json ] || echo "::warning::no store.json this tick; the Trend page renders as 'store not read'"
+          # --public-url (bare) emits <base href> for the published site,
+          # post_health.DASHBOARD_URL's directory, so the pages' links
+          # resolve there whatever URL the console login lands on.
+          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}" --public-url
+          python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
+
+      - name: Fetch the webhook URL (optional alternative to the Chat API)
+        if: env.CI_HEALTH_MUTE != 'true'
+        run: |
+          # No version means the webhook path is unused; the Chat API is the
+          # primary path. Any other failure (a permission denial, most
+          # likely) is said out loud rather than read as "not configured".
+          set +e
+          url="$(gcloud secrets versions access latest --secret="$WEBHOOK_SECRET" --project="$WEBHOOK_SECRET_PROJECT" 2>gcloud.err)"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ] && [ -n "$url" ]; then
+            echo "::add-mask::$url"
+            echo "CI_HEALTH_CHAT_WEBHOOK=$url" >> "$GITHUB_ENV"
+          elif grep -q "NOT_FOUND" gcloud.err; then
+            echo "no webhook version in $WEBHOOK_SECRET; using the Chat API"
+          else
+            echo "::warning::could not read $WEBHOOK_SECRET as $CI_HEALTH_SA (not a NOT_FOUND):"
+            cat gcloud.err
+          fi
+          rm -f gcloud.err
+
+      # The token goes to the poster step alone, as a masked step output
+      # rather than through GITHUB_ENV, so no later step sees it.
+      - name: Mint a Chat token
+        id: chat_token
+        if: env.CI_HEALTH_MUTE != 'true'
+        run: |
+          token="$(gcloud auth print-access-token --scopes=https://www.googleapis.com/auth/chat.bot)"
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Post on state change or digest
+        id: post
+        continue-on-error: true
+        env:
+          CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
+          # For the tracking issue a new OUTAGE or lost_pods condition files (header).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --digest-hour is a Toronto hour (the poster's default zone).
+          # --data is the data.json this tick collected (or, after a failed
+          # collect, the bucket's): the digest's nightly line reads last
+          # night's run from it.
+          python3 scripts/eval_dashboard/post_health.py \
+            --health work/health.json \
+            --data work/data.json \
+            --state "$DASHBOARD_BUCKET/health-state.json" \
+            --digest-hour 9
+
+      # One comment per pull request whose smoke run went red, or lost its
+      # build node, since the last tick (header). The script exits 0 on a
+      # GitHub failure; the continue-on-error covers everything else, so
+      # this never reds the run. The mute switch covers this write too
+      # (header).
+      - name: Comment on pull requests whose smoke run went red or lost its node
+        if: env.CI_HEALTH_MUTE != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/eval_dashboard/gate_comment.py \
+            --data work/data.json \
+            --health work/health.json \
+            --state "$DASHBOARD_BUCKET/gate-comment-state.json"
+
+      - name: Fail the run if the collect or the post failed
+        if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          POST_OUTCOME: ${{ steps.post.outcome }}
+        run: |
+          if [ "$COLLECT_OUTCOME" = "failure" ]; then
+            echo "::error::the collect failed (see its step); nothing was published and the verdict above was taken on the previously published data.json"
+          fi
+          if [ "$POST_OUTCOME" = "failure" ]; then
+            echo "::error::the Chat post failed (see its step); health.json was still published and the message is retried next tick"
+          fi
+          exit 1
+
+  # ---- The hourly scans: seeded-fleet fixtures, then pool-project state (header)
+  fixture-state-scan:
+    # Same fork and ref guards as the tick. Runs on the hourly cron's firing,
+    # or on a dispatch that asked for it.
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main' && (github.event.schedule == '0 * * * *' || (github.event_name == 'workflow_dispatch' && inputs.fixture_state_scan))
+    runs-on: ubuntu-latest
+    # FIXTURE_STATE_TIMEOUT_S plus POOL_STATE_TIMEOUT_S plus setup and the uploads.
+    timeout-minutes: 70
+    # The publisher's grant on the bucket is all this job writes with; it
+    # holds no GitHub write at all.
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: ci-health-fixture-state-scan
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      # kubectl for the presence probes and the state reads;
+      # gke-gcloud-auth-plugin because the kubeconfig gcloud writes, before
+      # the runner rewrites it to the reader's exec credential, names it. The
+      # runner mints as the reader once, up front, and stops with nothing
+      # written when it cannot ("not checked" for the project).
+      - name: Set up Cloud SDK (with kubectl and the GKE auth plugin)
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          install_components: gke-gcloud-auth-plugin,kubectl
+
+      - name: Authenticate to Google Cloud (dashboard publisher)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_HEALTH_SA }}
+
+      # The same login the tick does (its comment explains why): gsutil and
+      # `gcloud auth print-access-token --impersonate-service-account` both
+      # need the credential to be the active account.
+      - name: Make the publisher credential active for gsutil and gcloud
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
+      - name: Fetch the previous scan
+        run: |
+          mkdir -p work
+          # The previous document rides along as `previous` in the new one,
+          # which is how the adjudicator asks "drifted last scan too?" from
+          # one file. None yet is the first scan.
+          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state-prior.json || echo "no previous fixture-state.json; first scan"
+
+      # Never reds on what it finds: a project the publisher cannot read, a
+      # missing grant, a hung API server are all "not checked" with a reason
+      # in the document. Only a repository bug (no project mapping, no
+      # catalog) or the ceiling exits non-zero here.
+      - name: Scan every pool project's seeded fleet
+        id: fleet_scan
+        run: |
+          timeout "$FIXTURE_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/fixture_state.py \
+            --out work/fixture-state.json \
+            --prior work/fixture-state-prior.json \
+            --workers "$FIXTURE_STATE_WORKERS" \
+            --project-timeout "$FIXTURE_STATE_PROJECT_TIMEOUT_S"
+
+      - name: Upload fixture-state.json next to health.json
+        id: fleet_upload
+        run: |
+          gsutil -q -h "Cache-Control: no-cache" cp work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
+          python3 -c '
+          import json
+          doc = json.load(open("work/fixture-state.json"))
+          s = doc["summary"]
+          print("{checked} of {projects} projects checked; drifted on {drifted_projects}; roles healthy {healthy}, drifted {drifted}, not checked {not_checked}".format(**s))
+          for project, entry in sorted(doc["projects"].items()):
+              drifted = [r for r, v in entry["roles"].items() if v["state"] == "drifted"]
+              if drifted or entry.get("error"):
+                  print(f"  {project}: " + ("drifted: " + ", ".join(drifted) if drifted else "not checked: " + entry["error"]))
+          '
+
+      # The pool-state scan, after the fleet scan and with the same identity:
+      # the verifier's read-only checks against every pool project, read as
+      # the publisher itself. It publishes even when the fleet scan above
+      # failed the step, and vice versa, since each has its own document.
+      - name: Fetch the previous pool-state scan
+        if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
+        run: |
+          gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
+
+      # Never reds on what it finds: a project the publisher cannot read, a
+      # missing role, a hung API are all "not checked" with a reason in the
+      # document, and a finding is what the adjudicator is for. Only a
+      # repository bug (no project mapping, no verifier) or the ceiling
+      # exits non-zero here.
+      - name: Scan every pool project's shape
+        if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
+        run: |
+          timeout "$POOL_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/pool_state.py \
+            --out work/pool-state.json \
+            --prior work/pool-state-prior.json \
+            --workers "$POOL_STATE_WORKERS" \
+            --project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"
+
+      - name: Upload pool-state.json next to fixture-state.json
+        if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
+        run: |
+          test -s work/pool-state.json || { echo "::error::the pool-state scan wrote no document"; exit 1; }
+          gsutil -q -h "Cache-Control: no-cache" cp work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"
+          python3 -c '
+          import json
+          doc = json.load(open("work/pool-state.json"))
+          s = doc["summary"]
+          print("{checked} of {projects} projects checked; drifted on {drifted_projects} ({findings} findings); checks healthy {healthy}, drifted {drifted}, not checked {not_checked}".format(**s))
+          for project, entry in sorted(doc["projects"].items()):
+              if entry["findings"] or entry.get("error"):
+                  print(f"  {project}: " + ("drifted: " + ", ".join(sorted(entry["findings"])) if entry["findings"] else "not checked: " + entry["error"]))
+          '

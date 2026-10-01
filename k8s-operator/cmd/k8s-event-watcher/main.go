@@ -21,22 +21,41 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"sigs.k8s.io/yaml"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
+)
+
+const (
+	// memoryLimitEnv carries the container's memory limit in bytes. The
+	// operator sets it through the Downward API from the agent-api-auth
+	// container's limits.memory (see buildAgentAPIAuthSidecar), so the watcher
+	// learns the ceiling it shares without a flag that could drift from it.
+	memoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// goMemLimitEnv is the Go runtime's own soft-limit variable. When it is
+	// set the runtime has already applied it before main runs, and it is an
+	// explicit choice that this process does not second-guess.
+	goMemLimitEnv = "GOMEMLIMIT"
+	// memoryLimitFraction is the share of the container limit the watcher
+	// claims as its soft limit. The Python API authenticator lives in the same
+	// container, so the whole limit is not the watcher's to spend; half leaves
+	// the collector working well before the kernel's OOM killer is the only
+	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
+	// the heap approaches it; it does not cap live heap.
+	memoryLimitFraction = 0.5
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -96,7 +115,7 @@ func parseFlags(args []string) (*flags, error) {
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
-	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, using that profile's own kubeconfig.yaml and cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
+	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
 	// Operational.
@@ -244,54 +263,42 @@ type targetCluster struct {
 	Client  kubernetes.Interface
 }
 
-// identity is what makes this cluster distinct from every other watched
-// cluster. A GKE cluster name is unique only within a project and location, so
-// a fleet can legitimately run "prod" in us-central1 and "prod" in
-// europe-west1 — the Platform Agent creates a profile for each, keyed on the
-// full triple. Keying on the bare name here would treat the second as a
-// duplicate of the first and silently leave it unmonitored.
+// identity names this cluster in logs and in the startup line, in the form
+// that tells two clusters apart. A GKE cluster name is unique only within a
+// project and location, so a fleet can legitimately run "prod" in us-central1
+// and "prod" in europe-west1, and a line naming only "prod" says nothing about
+// which one it means.
 //
-// Empty for the direct --in-cluster/--kubeconfig cluster, which has no
-// cluster_identity to read. That is safe: there is only ever one of it, so it
-// cannot collide with itself, and its name still distinguishes it from the
-// profile clusters.
+// Not the deduplication key, despite the matching format: profile clusters are
+// deduplicated inside clusterprofiles.Discover, on Identity.String(), before
+// they ever become a targetCluster. Changing the format here changes what the
+// logs say and nothing else.
+//
+// ProjectID and Location are empty for the direct --in-cluster/--kubeconfig
+// cluster, which has no cluster_identity to read; the bare name still
+// distinguishes it from the profile clusters.
 func (tc targetCluster) identity() string {
 	return tc.ProjectID + "/" + tc.Location + "/" + tc.Name
 }
 
-// clusterIdentity is the cluster_identity block the Platform Agent writes into
-// each Cluster Agent profile's config.yaml. sigs.k8s.io/yaml converts YAML to
-// JSON, hence the json tags.
-type clusterIdentity struct {
-	Project  string `json:"project"`
-	Cluster  string `json:"cluster"`
-	Location string `json:"location"`
-}
-
-// profileConfig is the subset of a profile's config.yaml that we read.
-type profileConfig struct {
-	ClusterIdentity clusterIdentity `json:"cluster_identity"`
-}
+// discovery is the profile scan discoverClusterProfiles runs. Its zero value
+// reaches the real GKE API with this pod's own credentials; the tests replace
+// its Describe and TokenSource fields so the scan needs neither. OnSkip is set
+// per call instead, because it needs the metrics registry the caller holds.
+var discovery clusterprofiles.Discoverer
 
 // discoverClusterProfiles scans a Hermes profiles directory (normally
 // /opt/data/profiles) and returns one targetCluster per Cluster Agent profile
-// found. The Platform Agent creates these on cluster onboarding and removes
-// them on teardown — see agents/platform/scripts/cluster_agent_profile.py — so
-// the directory is the inventory of clusters we should be watching, and each
-// profile already holds credentials scoped to its own cluster.
+// found. clusterprofiles.Discoverer.Discover does the scanning and the
+// addressing — read its doc comment for what counts as a cluster profile and
+// which failures are fatal — and this function adds the two things that are the
+// watcher's rather than the package's: a Kubernetes client per cluster, and
+// what a skipped profile looks like in the logs and in clusterDiscoveryErrors.
 //
-// This runs once, from buildWatchSet at startup, so the result is a snapshot
-// rather than something the watcher keeps in step with the directory. A cluster
-// onboarded later is not watched until the process restarts, and one torn down
-// later leaves an informer retrying against a control plane that is gone.
-// Re-scanning on an interval and reconciling the running informers against the
-// result is deliberate follow-up work, not done here.
-//
-// A subdirectory is treated as a cluster profile only if it has both a
-// kubeconfig.yaml and a config.yaml carrying a complete cluster_identity
-// block. That is how non-cluster profiles ("default", "platform") are skipped:
-// testing for the data we need is more durable than hardcoding a list of names
-// that the Python side may extend.
+// The package returns configs rather than clients because the drift detector
+// wants a dynamic.Interface from the same scan. Building the informer-backed
+// kubernetes.Interface here is what keeps that choice with the caller who makes
+// it.
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
@@ -301,156 +308,43 @@ type profileConfig struct {
 // would have been fine. Every skip logs and increments
 // clusterDiscoveryErrors{profile}, so "this cluster is not being watched" stays
 // visible and alertable without being fatal.
-//
-// Failing to read the directory splits two ways, because a restart fixes one
-// kind of failure and not the other.
-//
-// A directory that does not exist yet is fatal. It is written by another
-// process that may simply not have run, so exiting is what makes this
-// self-healing: whatever supervises the watcher restarts it, and the next
-// attempt succeeds once the directory appears. Degrading instead would be
-// permanent — discovery runs once, so a watcher that starts without profiles
-// keeps watching only the direct cluster until something else restarts it,
-// which is a far worse outcome than a few seconds of restarts at boot.
-//
-// Any other read error — permissions, I/O — is not something a restart will
-// fix, so those degrade rather than crashloop forever.
-//
-// Finding none is not an error either. A freshly installed harness has no
-// Cluster Agent profiles until the first cluster-agent-reconcile tick creates
-// them, so an empty result is a normal startup state rather than a
-// misconfiguration. The caller decides whether the combined watch set is empty.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("profiles dir %s does not exist yet (it is created by the platform agent; exiting so the next start can pick it up): %w", dir, err)
+	skip := func(profile string, err error) {
+		if profile == clusterprofiles.NoProfile {
+			// The directory itself, not a profile in it — the error already
+			// says which directory and what it means.
+			log.Printf("k8s-event-watcher: %v", err)
+		} else {
+			log.Printf("k8s-event-watcher: skipping profile %s, its cluster will NOT be watched: %v", profile, err)
 		}
-		log.Printf("k8s-event-watcher: cannot read profiles dir %s, no profile clusters will be watched: %v", dir, err)
-		m.clusterDiscoveryErrors.WithLabelValues("-").Inc()
-		return nil, nil
+		m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
 	}
-	var clusters []targetCluster
-	// Minted on first use, then shared: every profile authenticates as the same
-	// pod identity, and a process with no Google credentials at all (a local
-	// run against hand-written kubeconfigs) should not pay for one it never needs.
-	var tokenSource oauth2.TokenSource
-	// Keyed on the full project/location/cluster triple, not the bare name:
-	// two clusters called "prod" in different locations are two clusters, and
-	// both get their own profile. See targetCluster.identity.
-	seen := make(map[string]string) // identity -> profile it came from
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
-		home := filepath.Join(dir, e.Name())
-		kubeconfig := filepath.Join(home, "kubeconfig.yaml")
-		if _, err := os.Stat(kubeconfig); err != nil {
-			continue // not a cluster profile
-		}
-		skip := func(format string, args ...any) {
-			log.Printf("k8s-event-watcher: skipping profile %s, its cluster will NOT be watched: %s",
-				e.Name(), fmt.Sprintf(format, args...))
-			m.clusterDiscoveryErrors.WithLabelValues(e.Name()).Inc()
-		}
 
-		identity, err := readClusterIdentity(filepath.Join(home, "config.yaml"))
-		if err != nil {
-			skip("%v", err)
-			continue
-		}
-		if identity == nil {
-			continue // not a cluster profile
-		}
-		tc := targetCluster{
-			Name:      identity.Cluster,
-			ProjectID: identity.Project,
-			Location:  identity.Location,
-			Profile:   e.Name(),
-		}
-		if prev, dup := seen[tc.identity()]; dup {
-			skip("cluster %s is already claimed by profile %s", tc.identity(), prev)
-			continue
-		}
+	// A copy, so setting OnSkip does not write to the package-level seam.
+	d := discovery
+	d.OnSkip = skip
+	discovered, err := d.Discover(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
 
-		cfg, err := clientConfigForProfile(kubeconfig, *identity)
+	clusters := make([]targetCluster, 0, len(discovered))
+	for _, c := range discovered {
+		client, err := kubernetes.NewForConfig(c.Config)
 		if err != nil {
-			skip("kubeconfig %s: %v", kubeconfig, err)
+			skip(c.Profile, fmt.Errorf("kubernetes client: %w", err))
 			continue
 		}
-		if cfg.ExecProvider != nil {
-			if tokenSource == nil {
-				tokenSource, err = google.DefaultTokenSource(ctx, gkeAuthScope)
-				if err != nil {
-					skip("kubeconfig authenticates via the %q exec plugin, which is not in this image; falling back to Google credentials failed: %v",
-						cfg.ExecProvider.Command, err)
-					continue
-				}
-			}
-			useGoogleTokenSource(cfg, tokenSource)
-		}
-		client, err := kubernetes.NewForConfig(cfg)
-		if err != nil {
-			skip("kubernetes client: %v", err)
-			continue
-		}
-		seen[tc.identity()] = e.Name()
-		tc.Client = client
-		clusters = append(clusters, tc)
+		clusters = append(clusters, targetCluster{
+			Name:      c.Identity.Cluster,
+			ProjectID: c.Identity.Project,
+			Location:  c.Identity.Location,
+			Profile:   c.Profile,
+			Client:    client,
+		})
 	}
 	return clusters, nil
 }
-
-// clientConfigForProfile builds a rest.Config from a profile's kubeconfig and
-// refuses anything that does not demonstrably point at the cluster the profile
-// claims to be.
-//
-// It exists because clientcmd.BuildConfigFromFlags cannot be trusted to fail
-// here. Given an *empty* kubeconfig it does not return an error: the deferred
-// loader treats an empty config as "nothing was specified" and silently falls
-// back to the in-cluster config. A profile whose credential fetch died before
-// writing anything therefore produced a working client — pointed at the
-// management cluster, the one cluster it certainly was not describing.
-//
-// Nothing downstream could notice. The cluster label comes from
-// cluster_identity, not from the connection, so that profile was watched under
-// its own name while reading another cluster's events. Observed in autopush:
-// two watchers on the management cluster, every event reported twice, one copy
-// naming a cluster where nothing had happened. A corrupt kubeconfig fails
-// loudly and always did; an empty one was the gap.
-//
-// So the context is resolved explicitly, and checked against the identity. GKE
-// context names are gke_<project>_<location>_<cluster>, which is the same shape
-// the credential proxy already requires of any kubeconfig the agent supplies
-// (see docs/credential-isolation-design.md), so this adds no new convention. It
-// also catches a kubeconfig that accumulated several clusters' contexts and is
-// pointing at the wrong one — merged kubeconfigs are how profiles go wrong in
-// practice, since `gcloud container clusters get-credentials` appends.
-func clientConfigForProfile(kubeconfig string, identity clusterIdentity) (*rest.Config, error) {
-	apiCfg, err := clientcmd.LoadFromFile(kubeconfig)
-	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig: %w", err)
-	}
-	if apiCfg.CurrentContext == "" {
-		return nil, errors.New("kubeconfig has no current-context (it is empty or was never written); refusing to fall back to the in-cluster config, which would silently watch the wrong cluster")
-	}
-	want := fmt.Sprintf("gke_%s_%s_%s", identity.Project, identity.Location, identity.Cluster)
-	if apiCfg.CurrentContext != want {
-		return nil, fmt.Errorf("kubeconfig current-context is %q but this profile describes %q; it points at a different cluster than it claims",
-			apiCfg.CurrentContext, want)
-	}
-	// NewNonInteractiveClientConfig, not the deferred loader: this one reports an
-	// unusable config as an error instead of reaching for the in-cluster config.
-	cfg, err := clientcmd.NewNonInteractiveClientConfig(*apiCfg, apiCfg.CurrentContext, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
-	if err != nil {
-		return nil, fmt.Errorf("build client config for context %q: %w", apiCfg.CurrentContext, err)
-	}
-	return cfg, nil
-}
-
-// gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
-// token is accepted by the GKE control plane as a bearer credential.
-const gkeAuthScope = "https://www.googleapis.com/auth/cloud-platform"
 
 // initialSyncGrace is how long the process will run with nothing synced before
 // giving up and letting its supervisor restart it. Generous on purpose: it has
@@ -459,52 +353,6 @@ const gkeAuthScope = "https://www.googleapis.com/auth/cloud-platform"
 // cluster deadline — individual informers keep retrying indefinitely, and one
 // cluster syncing is enough to satisfy it.
 const initialSyncGrace = 2 * time.Minute
-
-// useGoogleTokenSource swaps a kubeconfig's exec-plugin authentication for a
-// bearer token minted from this process's Google credentials.
-//
-// Cluster Agent profile kubeconfigs come from `gcloud container clusters
-// get-credentials`, so they authenticate by shelling out to
-// gke-gcloud-auth-plugin. That binary is deliberately absent here: the image
-// build refuses to ship credential-aware CLIs into the agent's containers
-// (deploy/docker/Dockerfile), concentrating them in the credential proxy
-// instead. Rather than widen that boundary, mint the token directly — the pod
-// already authenticates to Google as this identity via Workload Identity, which
-// is the same identity the plugin would have used.
-//
-// Only the credential is replaced. The API server address and CA certificate
-// still come from the kubeconfig, and are untouched.
-func useGoogleTokenSource(cfg *rest.Config, ts oauth2.TokenSource) {
-	cfg.ExecProvider = nil
-	cfg.AuthProvider = nil
-	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
-		return &oauth2.Transport{Source: ts, Base: rt}
-	})
-}
-
-// readClusterIdentity parses the cluster_identity block out of a profile's
-// config.yaml. Returns nil (not an error) when the file is absent or the block
-// is missing or incomplete — that means "not a cluster profile", matching what
-// cluster_agent_profile.read_cluster_identity treats as absent. A config.yaml
-// that exists but cannot be parsed is a real error.
-func readClusterIdentity(path string) (*clusterIdentity, error) {
-	data, err := os.ReadFile(path) // #nosec G304 -- Path to profile config file supplied via flag / discovery
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	var cfg profileConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	id := cfg.ClusterIdentity
-	if id.Cluster == "" || id.Project == "" || id.Location == "" {
-		return nil, nil
-	}
-	return &id, nil
-}
 
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
 // One dispatcher is built per watched cluster, each owning that cluster's dedup
@@ -767,6 +615,44 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
 
+// deriveMemoryLimit decides the Go soft memory limit from the two variables
+// that can set it. It returns the limit in bytes and true when
+// memoryLimitEnv should be applied, or zero, false and the reason when the
+// runtime's own setting should stand: GOMEMLIMIT already set (the runtime
+// applied it and it wins), the container limit absent (running outside the
+// operator's Deployment), or unparseable or non-positive (the value is not a
+// byte count, so nothing is derived from it).
+func deriveMemoryLimit(goMemLimit, containerLimit string) (int64, bool, string) {
+	if goMemLimit != "" {
+		return 0, false, fmt.Sprintf("%s=%s is set and takes precedence", goMemLimitEnv, goMemLimit)
+	}
+	if containerLimit == "" {
+		return 0, false, fmt.Sprintf("%s is not set; the runtime default applies", memoryLimitEnv)
+	}
+	limitBytes, err := strconv.ParseInt(containerLimit, 10, 64)
+	if err != nil || limitBytes <= 0 {
+		return 0, false, fmt.Sprintf("%s=%q is not a positive byte count; the runtime default applies", memoryLimitEnv, containerLimit)
+	}
+	return int64(float64(limitBytes) * memoryLimitFraction), true, ""
+}
+
+// applyMemoryLimit sets the Go runtime's soft memory limit to
+// memoryLimitFraction of the container's, when the operator has told the
+// watcher what that is and nothing else has set a limit. debug.SetMemoryLimit
+// is the same knob GOMEMLIMIT turns; doing it here rather than in the
+// entrypoint keeps the derivation under test. One line either way, so the
+// startup log says which limit the process is running under.
+func applyMemoryLimit() {
+	limitBytes, apply, reason := deriveMemoryLimit(os.Getenv(goMemLimitEnv), os.Getenv(memoryLimitEnv))
+	if !apply {
+		log.Printf("k8s-event-watcher: memory limit not derived: %s", reason)
+		return
+	}
+	debug.SetMemoryLimit(limitBytes)
+	log.Printf("k8s-event-watcher: Go soft memory limit set to %d bytes (%s=%s × %g)",
+		limitBytes, memoryLimitEnv, os.Getenv(memoryLimitEnv), memoryLimitFraction)
+}
+
 func main() {
 	if err := realMain(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "k8s-event-watcher:", err)
@@ -785,6 +671,8 @@ func realMain(argv []string) error {
 	if err := f.validate(); err != nil {
 		return err
 	}
+
+	applyMemoryLimit()
 
 	// Resolve bearer token from env (unless dry-run).
 	var token string
@@ -821,9 +709,23 @@ func realMain(argv []string) error {
 	// see the two run paths below. Everything constructed here (filter,
 	// metrics, injector) is stateless or goroutine-safe and is shared.
 
+	// A metrics listener that cannot bind costs the watcher its /metrics, not
+	// its job: the events it exists to triage are still watched. Exiting here
+	// would hand the process to the entrypoint's supervisor, which retries with
+	// backoff and after three short exits reports that NO cluster events are
+	// being watched — true of a port conflict only if this line makes it so.
+	// The ALERT line is the signal instead: it names the consequence and stays
+	// greppable beside the supervisor's own. startMetrics returns a nil server
+	// on failure, which Run treats as "no listener".
 	metricsSrv, err := startMetrics(f.metricsAddr, m)
 	if err != nil {
-		return fmt.Errorf("metrics server start: %w", err)
+		log.Printf("k8s-event-watcher: ALERT %v — running without a /metrics listener; cluster events are still watched", err)
+	}
+	if metricsSrv != nil {
+		// The bound address, so a scrape target that is down can be read
+		// against what the process opened: the entrypoint forwards whatever
+		// port it was given, and a port other than the declared one binds fine.
+		log.Printf("k8s-event-watcher: /metrics listening on %s", metricsSrv.ln.Addr())
 	}
 
 	// Set up context cancellation on SIGINT/SIGTERM for clean shutdown.
@@ -880,7 +782,7 @@ func realMain(argv []string) error {
 		go func(tc targetCluster, disp *dispatcher) {
 			defer wg.Done()
 			w := newWatcher(tc.Client, disp, tc, 0)
-			log.Printf("k8s-event-watcher: [%s] starting informer (source=%s project=%s location=%s)",
+			log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 			// Starts at 0 and only reaches 1 once the initial list completes.
 			// Setting it before Run would have reported every cluster up the
@@ -889,12 +791,28 @@ func realMain(argv []string) error {
 			// failing, so liveness of the goroutine proves nothing.
 			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 			defer m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-			onSynced := func() {
-				synced.Add(1)
+			// The gauge follows every transition the watcher reports: 1 on the
+			// initial sync and again when a held cluster recovers, 0 while a
+			// 403 holds it. Only the first 1 counts toward synced — a recovery
+			// is the same cluster coming back, not another one syncing — and
+			// the guard is atomic because the watcher calls in from its own
+			// goroutines.
+			var counted atomic.Bool
+			onWatching := func(watching bool) {
+				if !watching {
+					m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+					log.Printf("k8s-event-watcher: [%s] events forbidden, no longer watching until the next successful attempt", tc.Name)
+					return
+				}
 				m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
-				log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
+				if !counted.Swap(true) {
+					synced.Add(1)
+					log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
+					return
+				}
+				log.Printf("k8s-event-watcher: [%s] events permitted again, watching resumed", tc.Name)
 			}
-			if err := w.Run(ctx, onSynced); err != nil {
+			if err := w.Run(ctx, onWatching); err != nil {
 				// Log and continue — one cluster's informer failing
 				// must not blind the rest. The peer goroutines keep
 				// running.
@@ -945,7 +863,7 @@ func realMain(argv []string) error {
 	}
 	select {
 	case <-syncFailed:
-		return fmt.Errorf("no cluster synced within %s; %d informer(s) started but none completed their initial list", initialSyncGrace, started)
+		return fmt.Errorf("no cluster synced within %s; %d cluster(s) started but none completed an initial list (a cluster denied at preflight never attempts one; see its preflight line)", initialSyncGrace, started)
 	default:
 	}
 	return nil
@@ -973,21 +891,21 @@ func realMain(argv []string) error {
 // The two entries are not interchangeable, so which one survives matters. The
 // profile carries the project/location/cluster identity that stamps the payload
 // and labels every metric; the direct entry knows only a name. But the profile
-// also carries a credential that can be refused: it authenticates as the GSA
-// through a get-credentials kubeconfig, so a permission set without
-// roles/container.viewer, or master authorized networks that exclude the pod's
-// egress, denies it. The direct entry uses the pod's own service account against
+// also carries a credential that can be refused: it authenticates as the GSA,
+// so a permission set without roles/container.viewer, or master authorized
+// networks that exclude the pod's egress, denies it. The direct entry uses the pod's own service account against
 // kubernetes.default.svc and never leaves the cluster.
 //
-// Nothing here would notice the difference. discoverClusterProfiles builds a
-// client without contacting an API server, so a profile displaces on the
-// strength of a well-formed kubeconfig and the credential is not exercised until
-// the informer's initial list — by which time the entry it displaced is gone. On
-// a single-cluster install that leaves a watch set of one, and a watch set of one
-// that never syncs trips the initialSyncGrace check in run: the process exits and
-// the pod crashloops watching nothing. On a fleet it is quieter and worse — the
-// peers sync, nothing restarts, and the one cluster whose failure breaks
-// everything else is silently unmonitored.
+// Nothing here would notice the difference. discoverClusterProfiles contacts
+// the GKE API for the control plane's address, but nothing exercises that
+// address until the informer's initial list — so a profile still displaces on
+// the strength of an answer that says where the cluster is rather than one that
+// says the cluster will talk to us, and by the time it will not, the entry it
+// displaced is gone. On a single-cluster install that leaves a watch set of one,
+// and a watch set of one that never syncs trips the initialSyncGrace check in
+// run: the process exits and the pod crashloops watching nothing. On a fleet it
+// is quieter and worse — the peers sync, nothing restarts, and the one cluster
+// whose failure breaks everything else is silently unmonitored.
 //
 // So the direct entry wins and takes the profile's identity triple with it.
 // Reachability is the half that cannot be reconstructed; project and location are
@@ -1039,7 +957,7 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 			// the per-cluster filename for dedup snapshots, and every install
 			// already on disk has this cluster's cache under that name. Renaming
 			// it would silently resume from an empty cache after an upgrade.
-			direct := targetCluster{Name: f.clusterName, Profile: "direct"}
+			direct := targetCluster{Name: f.clusterName, Profile: directProfile}
 			if len(candidates) == 1 {
 				covered := candidates[0]
 				clusters = removeProfile(clusters, covered.Profile)

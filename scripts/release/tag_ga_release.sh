@@ -8,29 +8,46 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 RELEASE_VERSION="${1:-${RELEASE_VERSION:-${TARGET_VERSION:-${TARGET_TAG:-}}}}"
-RELEASE_COMMIT="${2:-${RELEASE_COMMIT:-${TARGET_COMMIT:-}}}"
+RC_CANDIDATE_COMMIT="${2:-${RC_CANDIDATE_COMMIT:-${TARGET_COMMIT:-}}}"
 
-# Sibling symmetry: support swapped arguments
-if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
-  if [[ ! "${1}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "${2}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    local_tmp="${RELEASE_VERSION}"
-    RELEASE_VERSION="${RELEASE_COMMIT}"
-    RELEASE_COMMIT="${local_tmp}"
-  fi
-fi
-
-if [ -z "${RELEASE_VERSION}" ] || [ -z "${RELEASE_COMMIT}" ]; then
-  echo "❌ ERROR: RELEASE_VERSION and RELEASE_COMMIT are required as arguments or environment variables." >&2
-  echo "Usage: $0 (with RELEASE_VERSION and RELEASE_COMMIT in env) or $0 <RELEASE_VERSION> <RELEASE_COMMIT>" >&2
+if [ -z "${RELEASE_VERSION}" ] || [ -z "${RC_CANDIDATE_COMMIT}" ]; then
+  echo "❌ ERROR: RELEASE_VERSION and RC candidate commit are required as arguments or environment variables." >&2
+  echo "Usage: $0 (with RELEASE_VERSION and RC candidate commit in env) or $0 <RELEASE_VERSION> <RC_CANDIDATE_COMMIT>" >&2
   exit 1
 fi
 
 validate_pure_numeric_semver "${RELEASE_VERSION}" "Release version" || exit 1
 
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/../.." && pwd))"
+
+# Canonicalize RC candidate commit SHA
+RC_CANDIDATE_COMMIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --verify "${RC_CANDIDATE_COMMIT}^{commit}" 2>/dev/null || echo "${RC_CANDIDATE_COMMIT}")"
+
+RELEASE_COMMIT="$(create_stamped_release_commit "${RELEASE_VERSION}" "${RC_CANDIDATE_COMMIT_SHA}" "${REPO_ROOT}")"
+
+RELEASE_LINE_BRANCH="$(release_branch_for_line "$(release_line_for_version "${RELEASE_VERSION}")")"
+
+# The banner is printed here rather than by tag_commit.sh: the GA rung pushes
+# two refs, the tag and its release line, and it pushes them atomically through
+# ensure_ga_release_refs so that neither can exist on the remote without the
+# other, and it reads where the line is before anything is pushed: a line at
+# any commit but the release commit, its candidate, or beyond it stops the run
+# with nothing pushed. The line's first release creates `release/X.Y` because
+# the line is absent; a later patch fast-forwards it because it is at the
+# candidate; a merge that lands on the line meanwhile rejects the whole push,
+# and the re-run stamps from the new head. This script keeps what is genuinely its own — the pure-SemVer gate, the
+# swapped-argument handling, the stamping — and the shared helpers keep the
+# idempotency contract every rung of the ladder has.
 echo "======================================================================"
 echo "🏷️ CREATING AND PUSHING GA RELEASE GIT TAG"
-echo "Release Version: ${RELEASE_VERSION}"
-echo "Release Commit:  ${RELEASE_COMMIT}"
+echo "Tag:          ${RELEASE_VERSION}"
+echo "Commit SHA:   ${RELEASE_COMMIT}"
+echo "Release Version:     ${RELEASE_VERSION}"
+echo "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}"
+if [ "${RELEASE_COMMIT}" != "${RC_CANDIDATE_COMMIT_SHA}" ]; then
+  echo "Release Commit:      ${RELEASE_COMMIT:0:7}"
+fi
+echo "Release Line:        ${RELEASE_LINE_BRANCH}"
 echo "======================================================================"
 
-ensure_git_tag "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "Release ${RELEASE_VERSION}"
+ensure_ga_release_refs "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "${RC_CANDIDATE_COMMIT_SHA}"

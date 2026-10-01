@@ -39,12 +39,56 @@ _SECTION_END_RE = re.compile(r"^# ─── (?!2b\.)", re.MULTILINE)
 
 # Repeated here on purpose rather than parsed out of the script: a test that
 # derives the expected mapping from the mapping under test asserts nothing.
-# These pairs are also the table in
-# docs/site/src/content/docs/deploy/ci-pool-projects.md.
+# docs/ci-pool-projects.md is the onboarding runbook that
+# points here; it carries no copy of the pairs.
 _EXPECTED_MAPPING = {
     "kube-agents-evals": "gke-agentic/kube-agents-evals-infra",
     "kube-agents-evals-2": "gke-agentic/kube-agents-evals-2-infra",
+    "kube-agents-evals-3": "gke-agentic/kube-agents-evals-3-infra",
+    "kube-agents-evals-4": "gke-agentic/kube-agents-evals-4-infra",
+    "kube-agents-evals-5": "gke-agentic/kube-agents-evals-5-infra",
+    "kube-agents-evals-6": "gke-agentic/kube-agents-evals-6-infra",
+    "kube-agents-evals-7": "gke-agentic/kube-agents-evals-7-infra",
+    "kube-agents-evals-8": "gke-agentic/kube-agents-evals-8-infra",
+    "kube-agents-evals-9": "gke-agentic/kube-agents-evals-9-infra",
+    "kube-agents-evals-10": "gke-agentic/kube-agents-evals-10-infra",
+    "kube-agents-evals-11": "gke-agentic/kube-agents-evals-11-infra",
+    "kube-agents-evals-12": "gke-agentic/kube-agents-evals-12-infra",
+    "kube-agents-evals-13": "gke-agentic/kube-agents-evals-13-infra",
+    "kube-agents-evals-14": "gke-agentic/kube-agents-evals-14-infra",
+    "kube-agents-evals-15": "gke-agentic/kube-agents-evals-15-infra",
+    "kube-agents-evals-16": "gke-agentic/kube-agents-evals-16-infra",
+    "kube-agents-evals-17": "gke-agentic/kube-agents-evals-17-infra",
+    "kube-agents-evals-18": "gke-agentic/kube-agents-evals-18-infra",
+    "kube-agents-evals-19": "gke-agentic/kube-agents-evals-19-infra",
+    "kube-agents-evals-20": "gke-agentic/kube-agents-evals-20-infra",
+    "kube-agents-evals-21": "gke-agentic/kube-agents-evals-21-infra",
+    "kube-agents-evals-22": "gke-agentic/kube-agents-evals-22-infra",
+    "kube-agents-evals-23": "gke-agentic/kube-agents-evals-23-infra",
+    "kube-agents-evals-24": "gke-agentic/kube-agents-evals-24-infra",
+    "kube-agents-evals-25": "gke-agentic/kube-agents-evals-25-infra",
+    "kube-agents-evals-26": "gke-agentic/kube-agents-evals-26-infra",
+    "kube-agents-evals-27": "gke-agentic/kube-agents-evals-27-infra",
+    "kube-agents-evals-28": "gke-agentic/kube-agents-evals-28-infra",
+    "kube-agents-evals-29": "gke-agentic/kube-agents-evals-29-infra",
+    "kube-agents-evals-30": "gke-agentic/kube-agents-evals-30-infra",
+    "kube-agents-evals-31": "gke-agentic/kube-agents-evals-31-infra",
+    "kube-agents-evals-32": "gke-agentic/kube-agents-evals-32-infra",
+    "kube-agents-evals-33": "gke-agentic/kube-agents-evals-33-infra",
+    "kube-agents-evals-34": "gke-agentic/kube-agents-evals-34-infra",
+    "kube-agents-evals-35": "gke-agentic/kube-agents-evals-35-infra",
 }
+
+# The fail-closed tests need a project the mapping will never contain, and for
+# a while that was "kube-agents-evals-3" — the obvious next name in the
+# sequence, picked because nothing could plausibly claim it. The pool claimed
+# it: the project was added to Boskos on 2026-08-21 and every presubmit that
+# leased it died on the unmapped-project refusal. Mapping it turned this suite
+# red, which is the test doing its job, but it also showed the fixture was
+# wrong to begin with. A placeholder that is a plausible future value of the
+# thing it stands outside of is a placeholder with an expiry date on it, and
+# the next name in the sequence has the same date on it.
+_NEVER_MAPPED_PROJECT = "not-a-pool-project-fixture"
 
 
 def _resolution_block():
@@ -111,11 +155,23 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
         repos = list(_EXPECTED_MAPPING.values())
         self.assertEqual(len(repos), len(set(repos)))
 
+    def test_the_fail_closed_fixture_is_not_a_mapped_project(self):
+        """Keeps the fail-closed tests honest about what they prove.
+
+        If the fixture ever becomes a real mapping, `test_unmapped_project_*`
+        starts asserting that a *mapped* project is refused — the opposite of
+        its name. It would fail loudly here rather than quietly inverting its
+        own meaning, which is the failure the kube-agents-evals-3 fixture was
+        one onboarding away from.
+        """
+        self.assertNotIn(_NEVER_MAPPED_PROJECT, _EXPECTED_MAPPING)
+        self.assertNotIn(_NEVER_MAPPED_PROJECT, _resolution_block())
+
     # --- fail-closed ------------------------------------------------------
 
     def test_unmapped_project_fails_the_prow_deploy(self):
         rc, out, err = self._resolve(
-            "kube-agents-evals-3", PULL_NUMBER="123", JOB_NAME="pull-eval"
+            _NEVER_MAPPED_PROJECT, PULL_NUMBER="123", JOB_NAME="pull-eval"
         )
         self.assertNotEqual(rc, 0)
         self.assertNotIn("RESOLVED", out)

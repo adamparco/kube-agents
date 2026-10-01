@@ -12,10 +12,187 @@ UPSTREAM_SKILLS_PATH = os.path.join("skills", "cloud")
 SKILL_PREFIX = "gke-"
 
 # Target agents where upstream GKE skills should be synced.
+#
+# Upstream skills from google/skills (skills/cloud) target the Platform Agent (agents/platform/).
+# Cluster Agent skills (agents/cluster/skills/) are not synced from upstream: they are repo-native
+# templates tailored specifically for single-cluster runtime debugging and operations (see AGENTS.md),
+# with cluster-specific personas and diagnostic tooling that an upstream overwrite would wipe.
+# Consequently, DEFAULT_TARGET_AGENTS is ["platform"] and cluster skills are maintained independently
+# in this repository.
 DEFAULT_TARGET_AGENTS = ["platform"]
 SKILL_AGENT_OVERRIDES = {
-    # Per-skill target agent overrides if specific skills should go to multiple agents
-    # e.g., "gke-observability": ["platform", "cluster"],
+    # Per-skill target agent overrides if specific skills should go to additional/alternative agents.
+}
+
+SKILL_MD_FILENAME = "SKILL.md"
+UTF_8_ENCODING = "utf-8"
+SUBSTITUTION_COUNT = 1
+
+GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET = """**Enable Network Policy Enforcement:**
+
+```bash
+gcloud container clusters update <cluster-name> \\
+    --update-addons=NetworkPolicy=ENABLED \\
+    --region <region>
+```
+
+> [!NOTE] If your cluster uses Dataplane V2 (`--enable-dataplane-v2`), Network
+> Policy enforcement is built-in and this step is not required (and may fail)."""
+
+GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET = """**Check Network Policy Enforcement & Dataplane:**
+
+Before modifying cluster networking, inspect whether NetworkPolicy enforcement
+is already active or provided natively by Dataplane V2:
+
+```bash
+gcloud container clusters describe <cluster-name> \\
+    --location <location> \\
+    --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'
+```
+
+- If `datapathProvider` is `ADVANCED_DATAPATH` (Dataplane V2), NetworkPolicy
+  enforcement is built-in natively via eBPF/Cilium from cluster creation. Calico
+  addons cannot be enabled and are not needed.
+- If `networkPolicy.enabled` is `True`, Calico enforcement is already enabled on nodes.
+- If neither is active, enable Calico network policy enforcement using the two-step
+  sequence below.
+
+**Enable Network Policy Enforcement (non-DPv2 clusters):**
+
+Enabling network policy enforcement on clusters without Dataplane V2 requires
+two sequential commands in this order: first enable the Calico addon on the
+control plane, then enable network policy enforcement on the nodes. GKE rejects
+`--enable-network-policy` with HTTP 400 until the addon is enabled, and `gcloud`
+rejects both flags in a single invocation.
+
+```bash
+# Step 1: Enable the NetworkPolicy addon on the control plane
+gcloud container clusters update <cluster-name> \\
+    --update-addons=NetworkPolicy=ENABLED \\
+    --region <region>
+
+# Step 2: Enable NetworkPolicy enforcement on the nodes (node pools may be recreated; this can take several minutes)
+gcloud container clusters update <cluster-name> \\
+    --enable-network-policy \\
+    --region <region>
+```"""
+
+# gke-manifest-generation's frontmatter description is what the router reads to pick a skill, and
+# the routing has to name gcp-config-connector, a skill this repository has and upstream does not.
+# The description is a folded YAML scalar, so the whole sentence has to be replaced rather than an
+# appended footer.
+GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET = (
+    "pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning "
+    "(use gke-cluster-creation)."
+)
+
+GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET = (
+    "pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning "
+    "(use gke-cluster-creation), or Google Cloud resources as Config Connector manifests "
+    "(use gcp-config-connector)."
+)
+
+# gke-manifest-generation's example ServiceAccount name upstream is `devteam-agent-sa`, a name from
+# this repository's retired multi-CR era (issue #340). The example is neutral here so the skill does
+# not suggest a DevTeamAgent exists.
+GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET = "(e.g., `devteam-agent-sa`)"
+
+GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET = "(e.g., `checkout-sa`)"
+
+# gke-manifest-generation's inference-manifest step upstream passes `--output-path` to gcloud. Here
+# gcloud runs in the credential proxy's container, which refuses that flag, so the skill has to
+# redirect stdout instead (#723). The replacement keeps the fence and adds the paragraph saying why.
+GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET = """          --output-path={output_file_path}
+        ```
+"""
+
+GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_path}
+        ```
+
+        Redirect stdout rather than passing `--output-path`: `gcloud` runs in
+        the credential proxy's container, so that flag writes the manifest
+        next to the credentials instead of in your workspace, and the proxy
+        refuses it.
+"""
+
+# gke-basics' cluster credentials example upstream runs `gcloud container clusters get-credentials`
+# without isolating KUBECONFIG, which overwrites the default kubeconfig context and breaks the Platform
+# Agent's ambient host cluster context. The replacement isolates credentials to a per-target KUBECONFIG
+# under $HERMES_HOME/.kubeconfigs/, in the form agents/platform/AGENTS.md ("Cluster Credentials")
+# gives: `export`, so the pin survives to the kubectl calls that follow rather than scoping to the
+# gcloud, and one file per project/cluster/location, the naming _thread_kubeconfig_path in
+# agents/platform/scripts/platform_mcp_server.py builds and is the source of truth for.
+GKE_BASICS_OLD_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials:
+     ```bash
+     gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
+     ```"""
+
+GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify the cluster's location (`--region` for regional clusters, `--zone` for zonal, or `--location` for either) when fetching credentials, and `export` a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` first, so the pin survives to every `kubectl` that follows and concurrent reads of different clusters do not race on one `current-context`:
+     ```bash
+     PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request
+     export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+     gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
+     ```"""
+
+# gke-manifest-generation's grounding step upstream prefers Developer Knowledge's `answer_query`,
+# whose default quota is 50 requests per day per project (developers.google.com/knowledge/quota),
+# shared by every agent in an install; once spent, every lookup 429s for the rest of the day.
+# `search_documents` reads the same corpus at 100 requests per minute, so the skill starts there
+# and never calls `answer_query` (#1765). `get_document` is also not the tool's name.
+GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`answer_query`**: Use this to ask direct questions (e.g., *"How to
+            configure GCS Fuse CSI driver in GKE"*). This is the preferred tool
+            for general queries.
+        -   **`search_documents`**: Use this to search for relevant GKE guides
+            or examples when you don't have a specific question.
+        -   **`get_document`**: Use this to fetch full document contents when
+            you have a specific document ID."""
+
+GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`search_documents`**: Start every lookup here (e.g., *"configure
+            GCS Fuse CSI driver in GKE"*). It takes only `query`.
+        -   **`get_documents`**: Use this to fetch full document contents when
+            a returned chunk needs its surrounding page.
+        -   Do not call **`answer_query`**: its quota is 50 requests per day per
+            project, shared by every agent in the install, and it reads the
+            same corpus as `search_documents`. Never retry its `429`."""
+
+# In-place content substitutions applied to freshly-synced skills to correct upstream defects
+# where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
+# skill only this repository has from a passage upstream cannot know about, or to drop a name this
+# repository has retired. Every pair here is also applied by hand to the in-tree copy, and
+# scripts/test_sync_upstream_skills.py checks that copy already reads as the next sync leaves it.
+SKILL_SUBSTITUTIONS = {
+    "gke-workload-security": [
+        (
+            GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET,
+            GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET,
+        ),
+    ],
+    "gke-manifest-generation": [
+        (
+            GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET,
+        ),
+    ],
+    "gke-basics": [
+        (
+            GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
+            GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
+        ),
+    ],
 }
 
 # Marker that identifies our auto-injected footer, so injection is idempotent and
@@ -25,10 +202,13 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Two things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Four things need saying today — the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
-# and gke-networking must not present `--dns-endpoint` as unconditionally safe.
+# gke-networking must not present `--dns-endpoint` as unconditionally safe, gke-upgrades must
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks, and
+# gke-batch-hpc and gke-workload-scaling must preflight GPU/TPU and large-shape requests into
+# capacity-obtainability.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -47,7 +227,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \\
 
 The command is idempotent, so it is safe to re-run. This gives the new cluster an agent
 immediately. (The `cluster-agent-reconcile` cron would also pick it up on its next run — it
-manages every cluster in the project, so no labeling is required.)
+manages every cluster in every project in scope, so no labeling is required.)
 
 ## Cluster Agent Profile Teardown
 
@@ -65,6 +245,16 @@ Do not delete a Cluster Agent profile while its cluster still exists.
 Deleting the profile here is the immediate, preferred path. As a backstop, the hourly
 `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone, so a
 profile missed during teardown is cleaned up on the next reconcile cycle.
+
+## Before recommending GPU/TPU or large-shape capacity
+
+Before recommending capacity for a GPU/TPU or large-shape design, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics:
+verify the regional quota for the exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather
+capacity obtainability advice (`gcloud beta compute advice capacity`) for the requested machine
+shape and count across the region's zones, for the Spot and Flex-Start provisioning models the
+advice API accepts. That skill owns the rules for what to probe and how to report it; follow it
+rather than restating them here.
 """,
     "gke-networking": f"""{FOOTER_MARKER}
 
@@ -91,7 +281,110 @@ scaffolding already pass the flag exactly when it applies; the check above is fo
 run `get-credentials` by hand. That decision is re-read about once a minute per cluster, so after
 enabling the setting, wait a moment before retrying rather than concluding it did not work.
 """,
+    "gke-upgrades": f"""{FOOTER_MARKER}
+
+## Executed version checks: the fleet-upgrade-verification skill
+
+This skill plans one upgrade at a time; its references read one cluster at a time. When the
+question is which clusters in a fleet lag a target version, by how many minors, and whether the
+control plane or a node pool is the laggard, run the
+[fleet-upgrade-verification](../fleet-upgrade-verification/SKILL.md) skill's script and paste its
+table rather than reasoning from memory:
+
+```bash
+./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \\
+  --output /opt/data/scratch/fleet_versions.json
+```
+
+Without `--target-version` it measures each cluster against its own release channel's default and
+prints that baseline per member. Run again during a rollout, it says which members started,
+completed or stalled since the previous run. Without `--readiness` (below) it reads with
+`gcloud container` only and changes nothing in GCP; the only thing it then writes is its own
+record of each run under `/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and
+checklist for the members it flags are this skill's job.
+
+The same script's `--readiness` flag executes three items of this skill's pre-upgrade checklist
+per member, against the same target: PodDisruptionBudgets that would block a node drain
+(`maxUnavailable: 0`, or `minAvailable` demanding every expected pod), maintenance exclusions and
+the maintenance window at a given instant (`--at`, default now), and node-pool version skew
+against the target control plane. Run it before writing the plan and carry its `blocked` rows into
+the checklist rather than asking the operator to check those three by hand. The PDB read costs one
+`get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
+`${{HERMES_HOME:-/opt/data}}/.kubeconfigs/`; an exclusion is reported as holding back automatic
+upgrades only.
+
+When the checklist's deprecated-API item comes up, the same skill's `api_deprecation_scan.py` scans
+the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
+its replacement and the commit it read; run it with `--target-version` and the version report's
+`--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
+""",
+    "gke-batch-hpc": f"""{FOOTER_MARKER}
+
+## Before scheduling a GPU/TPU batch job with a deadline
+
+Before recommending a start time, zone, or capacity path for a GPU/TPU or large-shape batch job —
+especially one that must finish inside a horizon — load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its **Future windows**
+section: verify the regional quota for the exact accelerator metric, probe
+`gcloud beta compute advice calendar-mode` once per candidate region for the job's shape, count,
+duration, and horizon, and rank the returned windows. That skill owns the probe's flags, the
+chips-per-node arithmetic, the ranking rule, and the paired ProvisioningRequest + LocalQueue
+shapes; follow it rather than restating them here.
+""",
+    "gke-workload-scaling": f"""{FOOTER_MARKER}
+
+## Before recommending GPU/TPU or large-shape capacity for a scale-up
+
+Before recommending capacity for a GPU/TPU or large-shape scale-up, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics: the
+regional quota for the exact accelerator metric, then live obtainability advice for the requested
+shape across zones and provisioning models — and, for a deadline-bound batch scale-up, its
+**Future windows** section (`gcloud beta compute advice calendar-mode`). That skill owns what to
+probe and how to report it; follow it rather than restating it here.
+""",
 }
+
+
+def apply_substitutions(dest_path, skill_name):
+    """Apply in-place string substitutions to a freshly-synced skill's SKILL.md.
+
+    Used when an upstream defect must be corrected in-place (such as a remediation
+    sequence where an appended footer would still leave the broken command in the
+    body of the skill).
+
+    Idempotent: if replacement text is already present, the substitution is skipped.
+    Returns True if at least one substitution was applied, else False.
+    """
+    substitutions = SKILL_SUBSTITUTIONS.get(skill_name)
+    if not substitutions:
+        return False
+
+    skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
+    if not os.path.isfile(skill_md):
+        print(f"Warning: {skill_md} not found; cannot apply substitutions.", file=sys.stderr)
+        return False
+
+    with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
+        content = f.read()
+
+    modified = False
+    for target, replacement in substitutions:
+        if replacement in content:
+            continue
+        if target in content:
+            content = content.replace(target, replacement, SUBSTITUTION_COUNT)
+            modified = True
+        else:
+            print(
+                f"Warning: target snippet for substitution not found in {skill_name}/{SKILL_MD_FILENAME}",
+                file=sys.stderr,
+            )
+
+    if modified:
+        with open(skill_md, "w", encoding=UTF_8_ENCODING) as f:
+            f.write(content)
+
+    return modified
 
 
 def inject_footer(dest_path, skill_name):
@@ -104,18 +397,18 @@ def inject_footer(dest_path, skill_name):
     if footer is None:
         return False
 
-    skill_md = os.path.join(dest_path, "SKILL.md")
+    skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
     if not os.path.isfile(skill_md):
         print(f"Warning: {skill_md} not found; cannot inject Cluster Agent footer.", file=sys.stderr)
         return False
 
-    with open(skill_md, "r", encoding="utf-8") as f:
+    with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
         existing = f.read()
     if FOOTER_MARKER in existing:
         return False
 
     separator = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
-    with open(skill_md, "a", encoding="utf-8") as f:
+    with open(skill_md, "a", encoding=UTF_8_ENCODING) as f:
         f.write(separator + footer)
     return True
 
@@ -191,9 +484,13 @@ def main():
                     # Copy from upstream src to dest
                     shutil.copytree(src_skill_path, dest_path)
 
+                    # Apply in-place substitutions to correct upstream defects.
+                    if apply_substitutions(dest_path, skill_name):
+                        print(f"  Applied substitutions to {skill_name}/{SKILL_MD_FILENAME}")
+
                     # Re-inject the Cluster Agent coupling footer (wiped by the copy above).
                     if inject_footer(dest_path, skill_name):
-                        print(f"  Injected kube-agents footer into {skill_name}/SKILL.md")
+                        print(f"  Injected kube-agents footer into {skill_name}/{SKILL_MD_FILENAME}")
 
             print("\nSynchronization complete!")
     except subprocess.CalledProcessError:

@@ -6,18 +6,38 @@ ConfigMap, the Workload Identity KSA, and the NetworkPolicy. The GCP half —
 the minter GSA, its Workload Identity binding, and the import-only KMS signing
 key — is terraform/modules/github-minter; the GitHub App private key is
 imported into that key outside the chart (install.sh runs the import, or see
-the module README for the manual command).
+the module README, which links the upstream guide for doing it by hand).
 */}}
 {{- if .Values.githubMinter.enabled }}
+{{- /*
+  minty mints GitHub App installation tokens and nothing else, so enabling it
+  on an install that declares forges and no GitHub one among them is a
+  contradiction rather than a combination. Failing here names it at `helm
+  install`; rendering the minter anyway would surface as the credential proxy
+  handing the agent a token no forge it talks to accepts. An install that
+  declares no forge at all still renders the minter, which is what every
+  existing values file relies on.
+
+  With `github` the only registered provider, kube-agents.forgeProviders
+  refuses anything else before this can fire. This guard is what keeps that
+  true when the registry widens, which is the same change that gives a
+  non-GitHub forge a credential path of its own -- see
+  docs/designs/version-control-support.md §6.
+*/}}
+{{- $providers := include "kube-agents.forgeProviders" . }}
+{{- if and $providers (not (has "github" (splitList "," $providers))) }}
+{{- fail (printf "githubMinter.enabled is set but platformAgent.integration declares no github forge (providers: %s); the GitHub token minter issues GitHub App tokens only" $providers) }}
+{{- end }}
 {{- $m := .Values.githubMinter }}
 {{- $org := required "githubMinter.org is required when githubMinter.enabled" $m.org }}
-{{- $repo := required "githubMinter.repo is required when githubMinter.enabled" $m.repo }}
+{{- $rawRepo := required "githubMinter.repo is required when githubMinter.enabled" $m.repo }}
+{{- $repo := regexReplaceAll "^.*/" (regexReplaceAll "\\.git$" $rawRepo "") "" }}
 {{- $projectId := required "platformAgent.harness.projectId is required when githubMinter.enabled" .Values.platformAgent.harness.projectId }}
 {{- $location := required "platformAgent.harness.location is required when githubMinter.enabled" .Values.platformAgent.harness.location }}
 {{- $clusterName := required "platformAgent.harness.clusterName is required when githubMinter.enabled" .Values.platformAgent.harness.clusterName }}
 {{- /* KMS rings are regional; a zonal cluster location maps to its region —
        the same derivation as derive_kms_location in
-       k8s-operator/scripts/installer_common.sh, so chart and installer name
+       scripts/installer/installer_common.sh, so chart and installer name
        the same ring. */}}
 {{- $kmsLocation := $m.kms.location | default (regexReplaceAll "-[a-z]$" $location "") }}
 {{- $allowedSa := $m.allowedServiceAccount | default (printf "kubeagents-platform-gsa@%s.iam.gserviceaccount.com" $projectId) }}
@@ -50,6 +70,12 @@ metadata:
     iam.gke.io/gcp-service-account: {{ $m.gsaName }}@{{ $projectId }}.iam.gserviceaccount.com
 automountServiceAccountToken: false
 ---
+# Two scopes per policy. `platform-agent-scope` is the write token the agent's
+# managed repositories ride; `platform-agent-read-scope` grants `contents: read`
+# alone and is what the operator renders for each `context_repos` entry, so
+# the broker can clone a private context repository without holding a write
+# token for it. The operator reads the read scope out of default.yaml; a
+# ConfigMap without it renders no context policies.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -58,7 +84,7 @@ metadata:
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
 data:
-  {{ $org }}-{{ $repo }}.yaml: |
+  default.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
       if: "assertion.iss == 'https://accounts.google.com'"
@@ -72,6 +98,34 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+      platform-agent-read-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'read'
+  {{ $repo }}.yaml: |
+    version: 'minty.abcxyz.dev/v2'
+    rule:
+      if: "assertion.iss == 'https://accounts.google.com'"
+    scope:
+      platform-agent-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'write'
+          pull_requests: 'write'
+          issues: 'write'
+      platform-agent-read-scope:
+        rule:
+          if: "assertion.email in ['{{ $allowedSa }}']"
+        repositories:
+          - '{{ $repo }}'
+        permissions:
+          contents: 'read'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -97,6 +151,9 @@ spec:
         app: github-token-minter
         {{- include "kube-agents.labels" . | nindent 8 }}
     spec:
+      {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" ($m.topologySpread | default dict).enabled "replicas" $m.replicaCount "selectorLabels" "app: github-token-minter")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       serviceAccountName: {{ $m.ksaName }}
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}
@@ -158,8 +215,7 @@ spec:
             {{- toYaml $m.resources | nindent 12 }}
           volumeMounts:
             - name: config-volume
-              mountPath: /etc/minty/{{ $org }}/{{ $repo }}.yaml
-              subPath: {{ $org }}-{{ $repo }}.yaml
+              mountPath: /etc/minty/{{ $org }}
       volumes:
         - name: config-volume
           configMap:
@@ -243,18 +299,20 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Allow GCP Workload Identity / Metadata Server.
-    # The minter dials 169.254.169.254:80, but the node DNATs that to the metadata
-    # daemon on port 988 before NetworkPolicy is evaluated: 169.254.169.252 on the
-    # iptables datapath, the hosting node's internal IP on Dataplane V2. Permitting
-    # only the link-local address drops every token fetch. On Dataplane V2, add one
-    # /32 per node to the port-988 rule.
+    # GCP Metadata Server (pre-NAT link-local address, port 80). The minter dials
+    # 169.254.169.254:80 for OAuth2 token fetches. On Dataplane V2 (eBPF), policy is
+    # evaluated pre-NAT at the socket layer, so this rule admits those fetches directly.
     - to:
         - ipBlock:
             cidr: 169.254.169.254/32
       ports:
         - protocol: TCP
           port: 80
+    # GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+    # the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    # is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+    # policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
+    # Port 987 (ALTS) is deliberately omitted because standard OAuth2/REST token fetches do not use DirectPath.
     - to:
         - ipBlock:
             cidr: 169.254.169.252/32

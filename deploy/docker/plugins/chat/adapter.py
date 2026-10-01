@@ -3,7 +3,7 @@
 Installed at ``/opt/hermes/plugins/platforms/chat/`` so Hermes discovers it as a
 bundled platform plugin. Nothing in the Hermes tree is edited: the scheduler
 already routes ``deliver=<name>`` through the platform registry, and
-``cron/scheduler.py::_plugin_cron_env_var`` says so in its own words —
+``cron/scheduler_delivery.py::_plugin_cron_env_var`` says so in its own words —
 plugins that set ``cron_deliver_env_var`` on their ``PlatformEntry`` "get cron
 delivery support without editing this module".
 
@@ -96,6 +96,43 @@ API_KEY_ENV = "SESSION_KV_API_KEY"
 #: written down as a failure.
 RELAY_TIMEOUT_SECONDS = 360.0
 
+#: Markdown a model wraps around a bare token: emphasis, code spans, and the
+#: whitespace either side. Stripped from both ends of a report before it is
+#: tested for silence — see :func:`is_silent_report`.
+_MARKDOWN_DRESS = "`*_~ \t\r\n"
+
+#: How much of a route's error or relay detail is kept. Both end up inside the
+#: ``error`` string the scheduler stores per job run as ``last_delivery_error``,
+#: so a route that echoed a stack trace or the report itself would otherwise
+#: write the whole thing into the job record.
+_DETAIL_MAX_CHARS = 200
+
+#: Suffix of the variable a platform's home channel reaches a cron child in
+#: (``SLACK_HOME_CHANNEL``, ``GOOGLE_CHAT_HOME_CHANNEL``, and this plugin's own
+#: ``CHAT_HOME_CHANNEL``). Hermes strips these from a spawned process, so
+#: ``profile_cron_tick.home_target_env`` sets them again from the root
+#: ``config.yaml``'s ``platforms.<p>.home_channel`` before the child starts, and
+#: the scheduler's ``all`` expands over the platforms it finds set. This plugin
+#: reads the same variables and nothing else, so it can under-report a sibling
+#: (a duplicate) but never claim one the scheduler lacks, without importing
+#: anything from ``cron.scheduler_delivery``.
+_HOME_CHANNEL_SUFFIX = "_HOME_CHANNEL"
+
+#: Where a cron child's profile lives when ``HERMES_HOME`` is unset, and the
+#: roster inside it -- the same paths ``profile_cron_tick`` spawns the child on.
+_DEFAULT_HERMES_HOME = "/opt/data"
+_CRON_ROSTER = ("cron", "jobs.json")
+
+#: The token a cron run emits to say it has nothing to report.
+#:
+#: Restated rather than imported from ``cron.scheduler``, which lives in the
+#: pinned base image and is absent from this checkout — importing it would make
+#: this module unimportable under its own tests and take the whole silence
+#: predicate with it. Restating a constant is only safe if something notices
+#: when the two diverge, so ``verify_chat_relay.py`` imports the upstream one at
+#: image-build time and fails the build if it is not this string.
+SILENT_MARKER = "[SILENT]"
+
 #: ``_deliver_result``'s wrapper. Matched, not assumed — see
 #: :func:`parse_cron_wrapper`.
 _WRAPPER_RE = re.compile(
@@ -145,6 +182,166 @@ def relay_url() -> str:
     return (os.getenv(RELAY_URL_ENV, "") or "").strip() or DEFAULT_RELAY_URL
 
 
+def sibling_delivery_targets(job_id: str) -> list[str]:
+    """Platforms the scheduler is posting this same report to, besides the relay.
+
+    ``deliver`` takes a list, and the relay is one entry in it. ``deliver:
+    "chat"`` is relay-only and this returns nothing; ``deliver: "all"`` also
+    posts the raw report to every home channel, so unless the relay is told, its
+    fan-out puts a second, composed copy in each of those channels. The route
+    subtracts what this names — see ``relay_cron_report``.
+
+    Answered here rather than on the server because this process is the one that
+    knows. ``all`` expands over the platforms with a home channel in the *cron
+    child*, and ``profile_cron_tick.home_target_env`` rebuilds those from the
+    root ``config.yaml``: an install whose config carries ``slack: {}`` has no
+    ``SLACK_HOME_CHANNEL`` here, the scheduler silently drops Slack from the
+    expansion, and the relay leg is the only thing that reaches it. The server
+    cannot see any of that — it runs in the gateway, with the full pod
+    environment — so deciding there would suppress a leg nobody sent.
+
+    Best effort in both directions, and the direction matters: an unreadable
+    roster returns nothing, which relays as before rather than dropping a
+    channel. Over-reporting would lose a delivery; under-reporting only risks
+    the duplicate this exists to prevent.
+    """
+    home = Path(os.getenv("HERMES_HOME", "") or _DEFAULT_HERMES_HOME)
+    try:
+        with open(home.joinpath(*_CRON_ROSTER), encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+    jobs = store.get("jobs") if isinstance(store, dict) else store
+    raw: object = ""
+    # An empty `job_id` is every delivery that carries no cron wrapper -- the
+    # `cron.wrap_response: false` case this module still relays -- and matching
+    # it against `job.get("id") or ""` made it equal to the first job in the
+    # store with a missing or empty id. A hand-edited `jobs.json` is all that
+    # takes, and the delivery then subtracts platforms on a different job's
+    # `deliver`. There is no job to look up here, so look none up.
+    for job in jobs if isinstance(jobs, list) and job_id else []:
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+            raw = job.get("deliver") or ""
+            break
+
+    # A list is the shape the paragraph above describes and the one hermes
+    # treats as native -- `hermes_cli/cron.py` coerces a string *into* a list,
+    # never the reverse -- so it is the string form here that is the shorthand.
+    # `str()` over the list gave `"['slack', 'gchat']"`, whose comma split
+    # yields two tokens matching no platform and no `<NAME>_HOME_CHANNEL`. The
+    # fan-out then came back empty, which is indistinguishable from the honest
+    # empty answer for `deliver: "chat"` -- so every sibling channel quietly got
+    # the duplicate copy this function exists to subtract.
+    text = ",".join(str(entry) for entry in raw) if isinstance(raw, list) else str(raw)
+    # Split the way the scheduler does and no other way. It is
+    # `cron/scheduler_delivery.py::_resolve_delivery_targets`, and it splits on `,`
+    # alone. Accepting `;` as well made this the looser of the two parsers,
+    # which is the direction the docstring above says never to err in:
+    # `deliver: "chat,slack;x"` gave the scheduler one part it cannot resolve,
+    # so it delivered nowhere, while this named `slack` as handled and the
+    # relay subtracted it. Nothing was posted anywhere and the run recorded
+    # `ok`. On `,` alone, `slack;x` matches no platform, so the relay posts and
+    # the channel gets one copy.
+    #
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if {part.split(":", 1)[0].strip().lower() for part in parts} <= {PLATFORM_NAME}:
+        return []
+
+    # What `all` resolves to in this process: every platform whose home channel
+    # is actually set. A variable that is present but empty is not a target --
+    # the scheduler requires a non-empty chat id -- so the value is tested, not
+    # just the key.
+    with_home = {
+        key[: -len(_HOME_CHANNEL_SUFFIX)].lower()
+        for key, value in os.environ.items()
+        if key.endswith(_HOME_CHANNEL_SUFFIX) and value.strip()
+    }
+
+    handled = set()
+    for part in parts:
+        name, has_id, rest = part.partition(":")
+        name = name.strip().lower()
+        if name == "all":
+            handled |= with_home
+            continue
+        home_channel = os.getenv(f"{name.upper()}{_HOME_CHANNEL_SUFFIX}", "").strip()
+        if not home_channel:
+            # A bare name resolves through the home channel alone, so without
+            # one the scheduler sends it nowhere. An explicit id is delivered
+            # regardless, but there is no home channel here to compare it
+            # against, and the paragraph below says what that comparison is for.
+            continue
+        # `platform:chat_id[:thread]` is a target the scheduler resolves --
+        # `_resolve_single_delivery_target` splits on the first `:` and looks
+        # the platform up -- and it posts to the *named* id. The relay's leg
+        # for a platform goes to that platform's home channel and nowhere
+        # else: `relay_cron_report` sends a leg with no known thread as an
+        # unthreaded `hermes send --to <platform>`. So the two legs meet only
+        # when the named id is the home channel. Claiming every explicit part
+        # subtracted the home-channel leg on the strength of a DM the relay
+        # never addresses: on `deliver: "chat,slack:D…"` the DM got the raw
+        # copy, the home channel got nothing, and `undelivered` stayed empty
+        # because it is computed after the subtraction. A channel the relay
+        # does not address cannot get a duplicate from it, so such a part is
+        # not a sibling. Reading the part whole was wrong the other way:
+        # `slack:D…` matched no platform, and a job delivering to the home
+        # channel by its id got the composed copy on top of the raw one.
+        if has_id and rest.split(":", 1)[0].strip() != home_channel:
+            continue
+        handled.add(name)
+    handled.discard(PLATFORM_NAME)
+    return sorted(handled)
+
+
+def is_silent_report(report: str) -> bool:
+    """Should this report be swallowed rather than relayed?
+
+    True for an empty report, and for one whose *entire* content is the silence
+    marker however the model dressed it. ``` `[SILENT]` ``` and ``**[SILENT]**``
+    are the forms to expect: these reports are written by agents that write
+    markdown by default, and every audit SOP tells a quiet run to make the bare
+    marker its entire final response. Emphasise it once and the run that meant
+    to say nothing posts the word "[SILENT]" to the home channel instead, which
+    is the one outcome the silent path exists to prevent. So undress the report
+    before testing it. On a real report this changes nothing: stripping
+    punctuation off the two ends of a multi-line audit summary cannot turn it
+    into the marker.
+
+    **Entire** is load-bearing, and it is why this does not call the scheduler's
+    ``_is_cron_silence_response``. That matcher accepts the marker on its own
+    line among prose, which is right for the thing it grades — a model's final
+    response to a cron prompt, where the marker anywhere means the model chose
+    silence and the prose is its reasoning. It is wrong for what reaches here.
+    ``standalone_send`` is this platform's sender for every ``hermes send --to
+    chat``, whichever process issues it: the scheduler's ``deliver: "chat"`` leg
+    today, and any alert or tool that names the platform tomorrow. An alert that
+    quotes the marker while explaining why a run published nothing — which is
+    exactly what an alert about a silent run says — would match that matcher
+    and be dropped with ``{"success": True, "skipped": "empty_text"}`` and no
+    ``message_id``, so the caller could not tell it had lost the page.
+
+    Delegating would buy nothing against that cost. Where the scheduler's
+    matcher applies it suppresses delivery before this sender runs, so its extra
+    leniency is redundant here; the only calls it would change are the ones it
+    never graded. Everything the marker legitimately arrives as when it is the
+    whole message — bare, lowercased, dressed, padded — the two lines below
+    already catch.
+
+    Bare ``strip()`` on both sides of the dress, because this predicate
+    replaced a plain ``not report.strip()`` and has to stay a superset of it.
+    ``_MARKDOWN_DRESS`` can only list ASCII characters, while ``str.strip()``
+    also takes NBSP, ``\\x0b``, ``\\x0c``, ``\\x1c``, ``\\u2028``, ``\\u2003``
+    and ``\\u3000`` — so stripping the dress alone called a report of one NBSP
+    non-empty and relayed it. `submit_cron_report` then rejects it as blank
+    with an HTTP 400 that lands in ``last_delivery_error``, which is the exact
+    failure this guard exists to prevent. The trailing strip catches the same
+    characters once the dress around them is gone.
+    """
+    bare = report.strip().strip(_MARKDOWN_DRESS).strip()
+    return not bare or bare.upper() == SILENT_MARKER
+
+
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     """FastAPI's ``detail`` off an error response, as ``": <detail>"`` or ``""``.
 
@@ -158,25 +355,41 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
         return ""
     if not isinstance(detail, str) or not detail.strip():
         return ""
-    return f": {detail.strip()[:200]}"
+    return f": {detail.strip()[:_DETAIL_MAX_CHARS]}"
 
 
-def _relay_verdict(response) -> str:
-    """The route's ``relay`` field off a 2xx body, or ``""`` if it did not say.
+def _relay_receipt(response) -> dict:
+    """The route's 2xx body, or ``{}`` if it could not be read.
+
+    Three fields are read off it, and each says something a bare 200 does not:
+    ``relay`` (``degraded`` when the report is in a channel but the delivery did
+    not go as intended), ``relay_detail`` (which of the degradations it was, in
+    words) and ``undelivered`` (the enabled chat platforms this report did not
+    reach while another one did).
 
     Best effort, like :func:`_http_error_detail`: the body is read once and a
     delivery that worked is never turned into an exception by failing to parse
-    the receipt for it. ``""`` therefore means "no verdict", not "composed" —
-    the caller treats only an explicit ``degraded`` as degraded.
+    the receipt for it. ``{}`` therefore means "the route did not say", not
+    "nothing to report" — the caller acts only on explicit values.
+
+    The whole body comes back rather than one field off it because the caller
+    reads three, and a tuple carrying some of them is one the two ends have to
+    keep in step. ``relay_detail`` is the route's own wording for why ``relay``
+    is ``degraded`` -- one cause today, a Chat Agent turn that did not compose
+    the report -- carried so that this end stops hard-coding that sentence and
+    a second cause can land in the route without a client change. A route too
+    old to send it leaves the field absent, and the caller falls back to the
+    sentence it used to print unconditionally.
     """
     try:
-        return str((json.loads(response.read().decode("utf-8", "replace")) or {}).get("relay") or "")
+        body = json.loads(response.read().decode("utf-8", "replace"))
     except Exception:
-        return ""
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
-def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], str]:
-    """POST *payload* as JSON. ``(None, verdict)`` on success, else ``(why, "")``.
+def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], dict]:
+    """POST *payload* as JSON. ``(None, receipt)`` on success, else ``(why, {})``.
 
     Blocking, and called through :func:`asyncio.to_thread`. ``urllib`` rather
     than ``httpx`` keeps this module stdlib-only, so its tests run wherever the
@@ -198,15 +411,15 @@ def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], str]:
         with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT_SECONDS) as response:
             status = getattr(response, "status", None) or response.getcode()
             if status >= 300:
-                return f"chat relay answered HTTP {status}", ""
-            return None, _relay_verdict(response)
+                return f"chat relay answered HTTP {status}", {}
+            return None, _relay_receipt(response)
     except urllib.error.HTTPError as exc:
         # The route names the failing leg in `detail` ("composed but not
         # delivered to google_chat"), which is the difference between a
         # last_delivery_error someone can act on and a bare status code.
-        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}", ""
+        return f"chat relay answered HTTP {exc.code}{_http_error_detail(exc)}", {}
     except Exception as exc:  # URLError, socket timeout, malformed URL
-        return f"chat relay unreachable: {type(exc).__name__}: {exc}", ""
+        return f"chat relay unreachable: {type(exc).__name__}: {exc}", {}
 
 
 async def standalone_send(
@@ -225,8 +438,9 @@ async def standalone_send(
     for.
 
     ``chat_id``, ``thread_id``, ``media_files`` and ``force_document`` are
-    accepted for signature parity and ignored: the relay route has exactly one
-    destination, and the Chat Agent decides where its own message goes.
+    accepted for signature parity and ignored: this sender names no destination
+    at all. The route resolves them itself — one per enabled chat platform — and
+    the Chat Agent decides what its own message says.
 
     The error strings become ``last_delivery_error``, so they name the condition
     and never the key.
@@ -252,7 +466,12 @@ async def standalone_send(
     # Ahead of the credential check on purpose. There is nothing to send, so a
     # missing key is not this tick's problem, and reporting one would be the
     # same error-every-ten-minutes by another name.
-    if not report.strip():
+    #
+    # :func:`is_silent_report` also covers the marker upstream lets through
+    # because a model emphasised it. Relaying that would be worse than posting
+    # it raw: the route runs a Chat Agent turn over the text, and the Chat Agent
+    # asked to relay "[SILENT]" writes a sentence about it.
+    if is_silent_report(report):
         logger.info(
             "chat relay: nothing to relay for job_id=%s — silent tick", job_id or "?"
         )
@@ -278,30 +497,65 @@ async def standalone_send(
         "profile": profile_name(),
         "title": title,
         "report": report,
+        # Without this the route fans the composed report out to every enabled
+        # platform, and `deliver: "all"` -- which posts the raw report to those
+        # same platforms itself -- lands twice in each of them.
+        "also_delivered_to": sibling_delivery_targets(job_id),
     }
-    error, verdict = await asyncio.to_thread(_post, relay_url(), payload, api_key)
+    error, receipt = await asyncio.to_thread(_post, relay_url(), payload, api_key)
     if error:
         return {"error": error}
 
-    if verdict == "degraded":
-        # The route answered 200 and the report is in the channel, so this is
-        # not a lost delivery — but the Chat Agent turn failed and what landed
-        # is the raw text under an `[unrelayed]` marker. `error` is the only
-        # field of this dict the scheduler reads, and `last_delivery_error` is
-        # the only place a run record can carry the fact, so the verdict goes
-        # there rather than into a log line nobody greps. The string says
-        # plainly that the report did arrive, because `cronjob list` showing a
-        # delivery error is otherwise read as "nothing was sent" and invites a
-        # re-run that would post the same finding twice.
+    # Two ways a 200 is still worth recording, and a run can hit both at once,
+    # so they accumulate rather than returning early. In each case the report IS
+    # in a channel: `error` is the only field of this dict the scheduler reads
+    # and `last_delivery_error` is the only place a run record can carry the
+    # fact, so the verdict goes there rather than into a log line nobody greps —
+    # and each string says plainly that the report arrived, because `cronjob
+    # list` showing a delivery error is otherwise read as "nothing was sent" and
+    # invites a re-run that would post the same finding twice.
+    #
+    # Not doing this is what the relay was built to stop, one layer out: a front
+    # door that has been down all week would otherwise produce run records
+    # byte-identical to healthy ones.
+    notes = []
+
+    if receipt.get("relay") == "degraded":
+        # The wording comes from the route. `degraded` has one cause today --
+        # the Chat Agent turn did not compose the report and the raw text was
+        # posted instead -- and a leg that never landed is not this case: the
+        # route keeps `relay: ok` and names the platform in `undelivered`. The
+        # fallback is the sentence this end used to print unconditionally,
+        # which is right for the one cause a route too old to send a detail
+        # could have.
         #
-        # Not doing this is what the relay was built to stop, one layer out: a
-        # front door that has been down all week would otherwise produce run
-        # records byte-identical to healthy ones.
-        message = (
-            "chat relay degraded: the report was posted but the Chat Agent turn "
-            "failed, so the channel has the raw text marked [unrelayed] rather "
-            "than a composed message. Delivered — do not re-run to resend."
+        # Bounded at `_DETAIL_MAX_CHARS`, the same ceiling as :func:`_http_error_detail`, and
+        # for the same reason: this ends up inside the `error` string the
+        # scheduler stores as `last_delivery_error`, once per job run. Left
+        # unbounded, a route that echoes a stack trace or the report itself
+        # writes the whole thing into the job record.
+        detail = str(receipt.get("relay_detail") or "").strip()[:_DETAIL_MAX_CHARS]
+        notes.append(
+            "chat relay degraded: the report was posted but "
+            + (
+                detail
+                or "the Chat Agent turn failed, so the channel has the raw text "
+                "marked [unrelayed] rather than a composed message"
+            )
+            + "."
         )
+
+    # A fan-out that reached one platform and missed another — the audience that
+    # heard nothing is exactly the silence #1094 is about. Separate from
+    # `relay_detail` above rather than folded into it: a route can report a
+    # clean `relay: "ok"` and still have missed a platform, and that case has no
+    # detail string to carry it.
+    undelivered = str(receipt.get("undelivered") or "").strip()
+    if undelivered:
+        notes.append(f"chat relay partial: the report did not reach {undelivered}.")
+
+    if notes:
+        message = " ".join(notes) + " Delivered — do not re-run to resend."
         logger.warning("chat relay: %s (job_id=%s)", message, job_id or "?")
         return {"error": message}
 
@@ -357,8 +611,8 @@ def register(ctx) -> None:
         standalone_sender_fn=standalone_send,
         # No chunking. The Chat Agent is composing a message from this text, not
         # posting it; the length bound that matters is CRON_REPORT_MAX_CHARS on
-        # the relay route, which rejects rather than silently splitting a report
-        # into pieces that each start a separate turn.
+        # the relay route, which truncates to a single marked report rather than
+        # splitting it into pieces that each start a separate turn.
         max_message_length=0,
         emoji="🗣️",
         # Never offer /update from a channel that has no inbound side.

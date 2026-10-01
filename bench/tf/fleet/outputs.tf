@@ -21,6 +21,11 @@ output "cluster_names" {
   ]
 }
 
+output "fleet_reader_service_account" {
+  description = "Read-only service account the evaluation checks read the fleet as. hack/ci-eval-pr.sh defaults FLEET_READONLY_SA to it from the leased project; export it yourself for a fleet outside the pool. hack/fleet-kubeconfigs.sh mints its token as this account and writes nothing without one."
+  value       = google_service_account.fleet_reader.email
+}
+
 output "lagging_version" {
   description = "The version seeded-b is pinned to this cycle (REGULAR default minus one minor, freshest patch)."
   value       = local.lagging_version

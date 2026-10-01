@@ -27,7 +27,7 @@ The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime]
 - **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for session and agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
 - **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface, plus a `kanban` toolset for creating and routing delegation cards.
 
-**The Cluster Agents** (`agents/cluster/`, per-cluster `cluster-*` profiles) — read-only single-cluster SREs, scaffolded at runtime from the baked template by `cluster_agent_profile.py`, one per managed GKE cluster. Each is pinned to its cluster (scoped `KUBECONFIG`, a `cluster_identity` block in its config), carries only the read-only `gke` and `developer_knowledge` MCP servers plus six runtime-debugging skills (`agents/cluster/skills/`), and returns diagnoses over the kanban board — it never mutates cluster state or opens PRs. See [Cluster Agents](/kube-agents/concepts/cluster-agents/).
+**The Cluster Agents** (`agents/cluster/`, per-cluster `cluster-*` profiles) — read-only single-cluster SREs, scaffolded at runtime from the baked template by `cluster_agent_profile.py`, one per managed GKE cluster. Each is pinned to its cluster (scoped `KUBECONFIG`, a `cluster_identity` block in its config), carries only the read-only `gke` and `developer_knowledge` MCP servers plus the runtime-debugging skills in `agents/cluster/skills/`, and returns diagnoses over the kanban board — it never mutates cluster state or opens PRs. See [Cluster Agents](/kube-agents/concepts/cluster-agents/).
 
 ### 3. Inference gateway
 
@@ -41,7 +41,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 Short-lived GitHub App installation tokens signed via GCP KMS and delivered through Workload Identity. This lets the `submit-suggestion` skill (and the `github-issue-resolver` watchdog) open pull requests against your GitOps repo without a long-lived PAT. Source: [`k8s-operator/config/integrations/github/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github).
 
-## What actually runs after `./install.sh`
+## What actually runs after installation
 
 Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 
@@ -55,12 +55,12 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 
 ## What is _not_ included
 
-- **No local Kind path** — there is no `kind` workflow in the repo; the installer and the Terraform composition it drives both target GKE. You need a real GKE cluster. (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
-- **No web UI or CLI beyond `kubectl` port-forward + the Hermes API** — chat is the primary user interface.
+- **No local Kind install** — the installer and the Terraform composition it drives both target GKE, and a deployment needs a real GKE cluster. A kind cluster exists only as a development path for contributors; see [Helm and Kind](/kube-agents/install/helm-and-kind/). (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
+- **No web UI, and no CLI outside the pod** — chat is the primary user interface. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` is not a way in, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and install path all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 
 ## Where to go next
 
 - [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) — the background watchdogs and how they close loops.
 - [Architecture](/kube-agents/overview/architecture/) — how requests and cron ticks flow through the components.
-- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run `./install.sh` end-to-end.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run the installer end-to-end.

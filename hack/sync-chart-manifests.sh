@@ -4,6 +4,19 @@
 #   - charts/kube-agents/crds/*.yaml are verbatim copies of config/crd/bases/.
 #   - The ClusterRole rules in templates/operator-rbac.yaml are spliced from
 #     config/rbac/role.yaml between the GENERATED RULES markers.
+#   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
+#     wrapped in the chart's values gate. The chart is the only thing that installs those
+#     policies, so a drifted copy is a backstop nobody applies.
+#   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
+#     the cert-manager objects), so it is compared rather than rewritten:
+#     hack/check_chart_webhooks.py renders it and diffs the webhooks and Service
+#     targetPort against config/webhook. Sync mode only prints a reminder.
+# And one derived file whose source is NOT under config/:
+#   - charts/kube-agents/files/footprint.yaml holds the resource totals of the pods the operator
+#     renders, which the chart's quota preflight cannot compute for itself. It is summed
+#     from the operator's golden manifest for the default example CR, not from config/ and
+#     not from a live render, so the golden is what you edit: change the operator, re-bless
+#     the golden, then sync. Syncing before re-blessing regenerates the old numbers.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,6 +25,14 @@ CRD_SRC=k8s-operator/config/crd/bases
 CRD_DST=charts/kube-agents/crds
 ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
+VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
+VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
+readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
+readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
+readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
+readonly FOOTPRINT_GEN=scripts/generate_chart_footprint.py
+readonly FOOTPRINT_SRC=k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml
+readonly FOOTPRINT_DST=charts/kube-agents/files/footprint.yaml
 
 check=false
 [[ "${1:-}" == "--check" ]] && check=true
@@ -74,8 +95,78 @@ grep -q '^  - apiGroups:' "$tmp" || { rm -f "$tmp"; fail "splice produced no rul
 if $check; then
   diff -u "$RBAC_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart ClusterRole rules out of date vs $ROLE_SRC"; }
   rm -f "$tmp"
-  echo "Chart CRD and RBAC copies are in sync with k8s-operator/config."
 else
   mv "$tmp" "$RBAC_TPL"
-  echo "Chart CRD and RBAC copies synced from k8s-operator/config."
+fi
+
+# Admission policies: the whole template is generated, so there is nothing in it
+# to hand-edit and nothing to splice around — the chart adds only the values gate.
+# Everything else, including the honesty header about what the policies do not
+# cover, lives in the source file so every install that applies it carries it.
+[[ -f "$VAP_SRC" ]] || fail "admission policy source missing: $VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}'
+  echo "# GENERATED from $VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# See values.yaml (admissionPolicy) for the gate and when to turn it off.'
+  echo '#'
+  echo '# The semverCompare half is not the same switch as the values gate. ValidatingAdmissionPolicy'
+  echo '# only reached v1 in Kubernetes 1.30, and Chart.yaml accepts >=1.29.0-0, so on a 1.29 cluster'
+  echo '# a default install would fail the whole release (and, through Terraform, the whole apply) on'
+  echo '# `no matches for kind`. Rendering nothing there is the only behaviour that keeps the chart'
+  echo '# installable across the range it claims. It is a condition on this one template, not a'
+  echo '# second delivery path.'
+  # One substitution, and only this one: the chart runs the controller as
+  # <release>-operator-sa in the release namespace, while the source file names
+  # the kustomize path's kubeagents-controller. The policy's operator exemption
+  # has to name the identity that will actually reconcile, so the chart's copy
+  # gets the rendered form. tests/test_admission_policy_shipped.py applies the
+  # same substitution before comparing the two, so a second one appearing here
+  # fails that comparison rather than passing unnoticed.
+  sed "s|'system:serviceaccount:kubeagents-system:kube-agents-operator-sa'|'system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator-sa'|" "$VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$VAP_TPL"
+fi
+
+# Webhooks: compared, not generated. The failure message is deliberately not fail(),
+# because `make chart-sync` does not touch this template; the fix is a hand edit.
+# The script exits 1 on drift and 2 when it could not run (no helm, no PyYAML,
+# a failed render); only the first gets the hand-edit hint, the second has
+# already said what to install.
+if $check; then
+  webhook_rc=0
+  python3 "$WEBHOOK_CHECK" || webhook_rc=$?
+  if [[ $webhook_rc -eq 1 ]]; then
+    echo "ERROR: $WEBHOOK_TPL has drifted from $WEBHOOK_SRC_DIR (see the diff above)." >&2
+    echo "       It is hand-maintained: edit the template to match the source, then rerun 'make chart-check'." >&2
+    exit 1
+  elif [[ $webhook_rc -ne 0 ]]; then
+    exit "$webhook_rc"
+  fi
+  # Footprint: the same exit-code split as the webhook check above. 1 is drift, and
+  # anything else is "could not run" (no PyYAML, an unreadable golden), which must not
+  # be reported as drift because the fix is a different one.
+  footprint_rc=0
+  python3 "$FOOTPRINT_GEN" --check || footprint_rc=$?
+  if [[ $footprint_rc -eq 1 ]]; then
+    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC (see the diff above)." >&2
+    echo "       $FOOTPRINT_SRC is a golden, so re-bless it before syncing:" >&2
+    echo "       (cd k8s-operator && go test ./internal/testing/... -update), then 'make chart-sync'." >&2
+    echo "       That package, not ./internal/controller/..., writes this golden; the latter has an" >&2
+    echo "       unrelated -update flag of its own that exits 0 and leaves this golden stale." >&2
+    exit 1
+  elif [[ $footprint_rc -ne 0 ]]; then
+    exit "$footprint_rc"
+  fi
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC."
+else
+  echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
+  echo "Note: $WEBHOOK_TPL is hand-maintained and was not rewritten; 'make chart-check' compares it with $WEBHOOK_SRC_DIR."
+  python3 "$FOOTPRINT_GEN"
 fi

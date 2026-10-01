@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -50,7 +51,7 @@ func fallbackPlatformAgentImage() string {
 }
 
 const (
-	fallbackFluentBitImage = "fluent/fluent-bit:5.1.0"
+	fallbackFluentBitImage = "fluent/fluent-bit:5.1.2"
 
 	// Operator-level image overrides for installs that mirror images into a
 	// private registry. Set on the controller-manager Deployment; a CR's
@@ -70,6 +71,15 @@ const (
 
 	// fieldOwner identifies this controller in Server-Side Apply managedFields.
 	fieldOwner = "platformagent-controller"
+
+	// The values status.usage.activeInterfaces is made of, one per channel the
+	// spec can enable. A status vocabulary of its own rather than Hermes' platform
+	// keys ("google_chat" in the rendered config): the status is read by people and
+	// dashboards, and one lower-case word per channel reads the same everywhere.
+	interfaceDashboard  = "dashboard"
+	interfaceGoogleChat = "googlechat"
+	interfaceSlack      = "slack"
+	interfaceTeams      = "teams"
 )
 
 // The Kubernetes recommended labels, stamped on every object this controller
@@ -146,31 +156,68 @@ func withCommonLabels(obj metav1.Object, agent *agentv1alpha1.PlatformAgent) {
 // sites keeps this function total, so no caller can emit an empty
 // OTEL_EXPORTER_OTLP_ENDPOINT, and keeps the manifest builders pure — they take no client
 // and cannot discover anything themselves.
-func otelTelemetryEnvVars(agentType, name, namespace, endpoint string) []corev1.EnvVar {
-	if endpoint == "" {
-		endpoint = managedOTelEndpoint
-	}
-	return []corev1.EnvVar{
+//
+// disabled says the controller resolved otlpSourceNone: discovery probed, this cluster
+// has no collector, and nothing configured one. Then no endpoint is emitted at all and
+// the SDK is switched off instead.
+//
+// What this silences is the stock OpenTelemetry SDK's *metric* exporter, which reads
+// OTEL_EXPORTER_OTLP_ENDPOINT directly and is what actually floods the log: on a
+// collector-less cluster it POSTs /v1/metrics to a name that never resolves, once per
+// export interval, for the life of the pod. Omitting the endpoint on its own would not
+// stop it — with the variable unset the SDK falls back to its own default of
+// http://localhost:4318 and trades the DNS failure for a refused connection at the same
+// rate — so the variable has to be set, not merely skipped. OTEL_SDK_DISABLED=true is
+// also already the off switch charts/kube-agents/README.md tells operators to set by hand
+// for exactly this cluster shape; this makes it the default there.
+//
+// For agent *spans*, the companion hermes_otel plugin does not read
+// OTEL_EXPORTER_OTLP_ENDPOINT directly; its config is managed by deploy/shared/otel_config.py.
+// When OTEL_SDK_DISABLED=true is set here (or HERMES_OTEL_ENABLED=false is configured),
+// deploy/shared/docker-entrypoint.sh invokes otel_config.py --disabled, marking the plugin
+// disabled (enabled: false) and clearing its backends list so no spans are created or exported
+// to the baked fallback URL (#933).
+//
+// It stays overridable: mergeEnvVars applies spec.deployment.env last, so an operator who
+// wants the exporter pointed somewhere regardless can set either variable themselves.
+func otelTelemetryEnvVars(agentType, name, namespace, endpoint string, disabled bool) []corev1.EnvVar {
+	envs := []corev1.EnvVar{
 		{
 			Name:  "OTEL_SERVICE_NAME",
 			Value: name + "-gateway",
 		},
-		{
-			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
-			Value: endpoint,
-		},
-		{
-			Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",
-			Value: "http/protobuf",
-		},
-		{
-			Name: "OTEL_RESOURCE_ATTRIBUTES",
-			Value: fmt.Sprintf(
-				"service.namespace=%s,k8s.namespace.name=%s,kubeagents.agent_type=%s,kubeagents.agent_name=%s",
-				namespace, namespace, agentType, name,
-			),
-		},
 	}
+
+	if disabled {
+		envs = append(envs, corev1.EnvVar{
+			Name:  "OTEL_SDK_DISABLED",
+			Value: "true",
+		})
+	} else {
+		if endpoint == "" {
+			endpoint = managedOTelEndpoint
+		}
+		envs = append(envs,
+			corev1.EnvVar{
+				Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
+				Value: endpoint,
+			},
+			corev1.EnvVar{
+				Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",
+				Value: "http/protobuf",
+			},
+		)
+	}
+
+	// Identity, not export configuration: kept in both cases. OTEL_SERVICE_NAME in
+	// particular is what docker-entrypoint passes to otel_config.py as --service-name.
+	return append(envs, corev1.EnvVar{
+		Name: "OTEL_RESOURCE_ATTRIBUTES",
+		Value: fmt.Sprintf(
+			"service.namespace=%s,k8s.namespace.name=%s,kubeagents.agent_type=%s,kubeagents.agent_name=%s",
+			namespace, namespace, agentType, name,
+		),
+	})
 }
 
 // deriveAgentImageFromOperator derives the platform-agent image from an operator image reference.
@@ -179,12 +226,26 @@ func otelTelemetryEnvVars(agentType, name, namespace, endpoint string) []corev1.
 // platform-agent manifest, so it falls back to a tag if present before the digest (e.g. :v1@sha256:...)
 // or :latest.
 // E.g.:
-//   "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0"                -> "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
-//   "ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a" -> "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a"
-//   "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:111111..."    -> "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
-//   "mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
-//   "k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
+//
+//	"ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0"                -> "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
+//	"ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a" -> "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a"
+//	"ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:111111..."    -> "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+//	"mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
+//	"k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
 func deriveAgentImageFromOperator(operatorImage string) string {
+	return deriveImageFromOperator(operatorImage, appNamePlatformAgent)
+}
+
+// deriveImageFromOperator is the same substitution for any repository built and
+// released alongside the operator, not the platform agent alone. The sandbox is
+// the second caller: it is an image from the same workflow and the same
+// commit, so an install that mirrored the operator has mirrored it too, and
+// reaching ghcr.io for it on a private-registry install is the same failure
+// this derivation exists to avoid for the agent. The three A2A next-stack
+// images are the third, through a2aReleaseImage, which passes OPERATOR_IMAGE
+// when set and the resolved agent image otherwise; the substitution is the
+// same.
+func deriveImageFromOperator(operatorImage, repository string) string {
 	lastSlash := strings.LastIndex(operatorImage, "/")
 	prefix := ""
 	refPart := operatorImage
@@ -201,7 +262,7 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 	if tagIdx := strings.Index(refPart, ":"); tagIdx >= 0 {
 		suffix = refPart[tagIdx:]
 	}
-	return prefix + appNamePlatformAgent + suffix
+	return prefix + repository + suffix
 }
 
 // defaultPlatformAgentImage returns the agent image used when a CR omits
@@ -228,7 +289,7 @@ func fluentBitImage() string {
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
 //
-// qualify_image_ref() in k8s-operator/scripts/common.sh is the provisioning-time
+// qualify_image_ref() in scripts/installer/common.sh is the provisioning-time
 // twin of this rule and must agree on how a reference is split. The no-tag
 // fallback deliberately differs: this path is serving a live CR and settles for
 // "latest", while the shell helper can still abort the run and does.
@@ -385,7 +446,7 @@ func mergeAnnotations(defaults map[string]string, custom map[string]string) map[
 }
 
 // resolveDeploymentReplicasAndStrategy determines the replica count and deployment strategy
-// based on HighAvailability and ScaleToZero settings in the DeploymentSpec.
+// based on Availability and ScaleToZero settings in the DeploymentSpec.
 func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
 	replicas := int32(1)
 	strategy := appsv1.DeploymentStrategy{
@@ -404,11 +465,40 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 		}
 
 		if intendedReplicas > 1 {
+			// maxUnavailable is resolved here rather than handed to Kubernetes as a
+			// percentage, and it never lands below 1. Kubernetes rounds a maxSurge
+			// percentage up and a maxUnavailable percentage down, so
+			// defaultSurgePercent on both sides rendered maxSurge 1 /
+			// maxUnavailable 0 at 2 and 3 replicas — the shape that cannot roll at
+			// all under a namespace ResourceQuota with no room for one more gateway
+			// Pod. The old ReplicaSet may not shrink, the surge Pod is refused with
+			// FailedCreate, and the rollout stalls until progressDeadlineSeconds,
+			// including the rollout carrying the fix for whatever prompted it
+			// (#749).
+			//
+			// Scaling defaultSurgePercent rather than hard-coding its arithmetic
+			// keeps one source for the percentage: change the constant and both
+			// sides move together. roundUp=false is what Kubernetes itself would
+			// have applied; the floor is the only added behaviour, and it binds
+			// only at 2 and 3 replicas, where the percentage had no representable
+			// answer other than "make no progress".
+			// An error here means defaultSurgePercent is not a parseable
+			// percentage, which is a constant in this file rather than input; the
+			// floor below then supplies 1 and the rollout still makes progress.
+			scaled, err := intstr.GetScaledValueFromIntOrPercent(
+				ptr.To(intstr.FromString(defaultSurgePercent)), int(intendedReplicas), false)
+			if err != nil {
+				scaled = 0
+			}
+			maxUnavailable := int32(scaled) // #nosec G115 -- bounded by intendedReplicas
+			if maxUnavailable < 1 {
+				maxUnavailable = 1
+			}
 			strategy = appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDeployment{
 					MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
-					MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+					MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: maxUnavailable},
 				},
 			}
 		}
@@ -499,4 +589,32 @@ func defaultSecretRef(ref *corev1.SecretKeySelector, secretName, defaultKey stri
 		Key:                  defaultKey,
 		Optional:             ptr.To(true),
 	}
+}
+
+// resolveActiveInterfaces lists the interfaces agent's spec enables, sorted, for
+// status.usage.activeInterfaces. Nil-safe on every pointer along the way: the
+// integration block and each channel in it are optional, and a channel's Enabled
+// is a *bool defaulting to false, so a present block is not an enabled one. The
+// dashboard is the exception, on unless the spec turns it off, which
+// isDashboardEnabled already encodes. Sorted so that two specs enabling the same
+// set compare equal in the status gate whatever order the checks run in.
+func resolveActiveInterfaces(agent *agentv1alpha1.PlatformAgent) []string {
+	var interfaces []string
+	if isDashboardEnabled(agent) {
+		interfaces = append(interfaces, interfaceDashboard)
+	}
+	if agent != nil && agent.Spec.Integration != nil {
+		integration := agent.Spec.Integration
+		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+			interfaces = append(interfaces, interfaceGoogleChat)
+		}
+		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+			interfaces = append(interfaces, interfaceSlack)
+		}
+		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+			interfaces = append(interfaces, interfaceTeams)
+		}
+	}
+	slices.Sort(interfaces)
+	return interfaces
 }

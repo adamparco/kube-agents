@@ -28,6 +28,7 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -154,11 +155,16 @@ class IssuesSweepTest(unittest.TestCase):
         self.assertEqual(result.warnings, [])
 
     def test_error_reaches_the_room(self):
-        with self._poll({"status": "ERROR", "reason": "GITHUB_AUTH_NOT_CONFIGURED"}):
+        # A reason the resolver can still produce. It used to be
+        # `GITHUB_AUTH_NOT_CONFIGURED`, one of the three the `gh auth status`
+        # pre-flight hand-rolled; this series deletes that pre-flight, and a
+        # fixture naming a code nothing emits reads as documentation that it
+        # is still live.
+        with self._poll({"status": "ERROR", "reason": "FORGE_UNAUTHENTICATED"}):
             result = gate.sweep_issues()
         self.assertEqual(result.cards, [])
         self.assertEqual(len(result.warnings), 1)
-        self.assertIn("GITHUB_AUTH_NOT_CONFIGURED", result.warnings[0])
+        self.assertIn("FORGE_UNAUTHENTICATED", result.warnings[0])
 
     def test_error_value_is_carried_through(self):
         """``GIT_REPO_UNPARSEABLE`` is only actionable with the offending value."""
@@ -167,6 +173,13 @@ class IssuesSweepTest(unittest.TestCase):
         ):
             result = gate.sweep_issues()
         self.assertIn("not a url", result.warnings[0])
+
+    def test_error_with_unreachable_repos_carries_unreachable_details(self):
+        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=["org/r1", "org/r2"]):
+            with self._poll({"status": "ERROR", "reason": "PARTIAL_FAILURE", "unreachable_repos": ["org/r2"]}):
+                result = gate.sweep_issues()
+        self.assertEqual(result.cards, [])
+        self.assertIn("unreachable repositories: org/r2", result.warnings[0])
 
     def test_unrecognised_status_is_a_warning_not_silence(self):
         """A resolver that grows a new status must not be read as "nothing to do"."""
@@ -219,8 +232,8 @@ class CardBucketTest(unittest.TestCase):
     cards. A worker that ends its turn before the skill's Step 2 — which Step 1
     prescribes on an ``ERROR`` status — leaves the issue with no ``status:``
     label, so the poll keeps returning it and the key keeps suppressing it. The
-    poll returns only the lowest-numbered unaddressed issue, so that also hides
-    every higher-numbered one.
+    poll returns exactly one issue per tick — the highest-priority unaddressed
+    one — so that also hides every other issue.
     """
 
     PAYLOAD = {
@@ -266,6 +279,54 @@ class CardBucketTest(unittest.TestCase):
         self.assertTrue(card.idempotency_key.endswith(expected))
 
 
+class IssueCardTitleTest(unittest.TestCase):
+    """The card title is human-facing, so it takes the resolver's plain title.
+
+    ``resolver.handle_poll`` emits the issue title twice: ``title``, wrapped in
+    ``<untrusted_title>`` boundary tags for the model, and ``title_plain`` for
+    everywhere else. The payloads elsewhere in this file are hand-written with a
+    bare ``title``, so they cannot tell the two apart — which is why this class
+    builds its fixture in the shape ``handle_poll`` actually prints.
+    """
+
+    #: Shaped as ``handle_poll`` actually prints it, not as a test finds
+    #: convenient — the mismatch between those two is the bug being pinned.
+    def _payload(self, plain):
+        return {
+            "status": "FOUND",
+            "repository": "gke-labs/kube-agents",
+            "issue_number": 42,
+            "title": f"<untrusted_title>{plain}</untrusted_title>",
+            "title_plain": plain,
+            "body": "<untrusted_body>b</untrusted_body>",
+        }
+
+    def test_the_card_title_carries_no_boundary_markup(self):
+        card = gate._issue_card(self._payload("Pods crashlooping"))
+        self.assertEqual(
+            card.title, "Triage and resolve gke-labs/kube-agents#42: Pods crashlooping"
+        )
+        self.assertNotIn("untrusted_title", card.title)
+
+    def test_a_long_title_cannot_leave_an_unclosed_boundary_tag(self):
+        """The 200-character cut is where reading ``title`` got dangerous.
+
+        The prefix plus an opening ``<untrusted_title>`` is about 62 characters,
+        so a title past roughly 120 had its closing tag sliced off and the card
+        reached the worker with an opening boundary marker and no close.
+        """
+        card = gate._issue_card(self._payload("Ingress 502s on payments " * 8))
+        self.assertLessEqual(len(card.title), 200)
+        self.assertNotIn("<untrusted", card.title)
+
+    def test_a_payload_without_title_plain_still_files_a_card(self):
+        """A card queued before the resolver grew ``title_plain``."""
+        card = gate._issue_card(
+            {"status": "FOUND", "repository": "o/r", "issue_number": 7, "title": "t"}
+        )
+        self.assertEqual(card.title, "Triage and resolve o/r#7: t")
+
+
 class PrCardKeyTest(unittest.TestCase):
     """The same expiry, for the sweep that needed it more.
 
@@ -285,18 +346,18 @@ class PrCardKeyTest(unittest.TestCase):
     an abandoned one costs one retry rather than the pull request.
     """
 
-    def _card(self, now, node_id="IC_1", number=12, repo="acme/toolkit"):
+    def _card(self, now, ref="IC_1", number=12, repo="acme/toolkit"):
         pr = forge.PullRequest(
             number=number, head_ref="platform-agent/x", author="agent[bot]"
         )
         comment = forge.Comment(
-            node_id=node_id,
+            ref=ref,
             author="reviewer",
             body="/agent bump to 4",
             can_write=True,
             created_at="2026-08-17T14:00:00Z",
         )
-        trigger = pr_triggers.find_trigger(comment.body, "agent", node_id, comment.author)
+        trigger = pr_triggers.find_trigger(comment.body, "agent", ref, comment.author)
         return gate._pr_card(
             pr, [gate._Pending(pr=pr, comment=comment, trigger=trigger)], repo, now=now
         )
@@ -322,7 +383,7 @@ class PrCardKeyTest(unittest.TestCase):
         key = self._card(now).idempotency_key
         self.assertNotEqual(key, self._card(now, repo="other/repo").idempotency_key)
         self.assertNotEqual(key, self._card(now, number=13).idempotency_key)
-        self.assertNotEqual(key, self._card(now, node_id="IC_2").idempotency_key)
+        self.assertNotEqual(key, self._card(now, ref="IC_2").idempotency_key)
 
     def test_the_default_clock_is_utc_not_local(self):
         card = self._card(None)
@@ -366,6 +427,24 @@ class RunResolverPollTest(unittest.TestCase):
              ):
             with self.assertRaises(RuntimeError):
                 gate.run_resolver_poll()
+
+    def test_timeout_scales_linearly_with_managed_repositories(self):
+        payload = {"status": "NO_ISSUES"}
+        test_cases = [
+            ("single repo", ["org/r1"], 300),
+            ("multiple repos", ["org/r1", "org/r2", "org/r3"], 900),
+            ("empty repos defaults to 1", [], 300),
+        ]
+        for desc, repos, expected_timeout in test_cases:
+            with self.subTest(desc=desc):
+                with mock.patch.object(gate, "_resolver_path", return_value=Path(__file__)), \
+                     mock.patch("gitops_workspace.get_managed_github_repos", return_value=repos), \
+                     mock.patch.object(
+                         subprocess, "run", return_value=_completed(json.dumps(payload), 0)
+                     ) as mock_run:
+                    gate.run_resolver_poll()
+                    mock_run.assert_called_once()
+                    self.assertEqual(mock_run.call_args.kwargs.get("timeout"), expected_timeout)
 
 
 class MainTest(unittest.TestCase):
@@ -482,51 +561,59 @@ class ParseTaskIdTest(unittest.TestCase):
 
 
 class PostBodyTest(unittest.TestCase):
-    """`gh` runs in the sidecar, so the body file must be on the shared volume.
+    """The body is handed over as text, never as a path.
 
-    Regression for a live failure: with the body in `/tmp` — a per-container
-    emptyDir — every refusal died on "no such file or directory", because the
-    container running `gh` cannot see the container that wrote the file.
+    Regression for two live failures that both came of staging it in a file.
+    With the body in `/tmp` — a per-container emptyDir — every refusal died on
+    "no such file or directory" (#1030). Moving it to a shared volume traded
+    that for the #955 uid split, where the 0600 file `NamedTemporaryFile`
+    creates was unreadable to the process that ran `gh`. Neither can recur: the
+    gate no longer runs `gh` at all — it hands the text to the provider, which
+    sends it in a verb's JSON payload — and separate pods leave no shared
+    volume to stage a file on anyway.
     """
 
     class _Recorder:
         def __init__(self):
-            self.path = None
             self.body = None
+            self.calls = 0
 
-        def post_comment(self, repo, pr, body_file):
-            self.path = body_file
-            with open(body_file, encoding="utf-8") as handle:
-                self.body = handle.read()
+        def post_comment(self, repo, pr, body):
+            self.calls += 1
+            self.body = body
 
-    def test_the_body_file_lands_on_the_shared_volume(self):
-        import tempfile as _tempfile
-
+    def test_the_body_is_handed_over_as_text(self):
         recorder = self._Recorder()
-        with _tempfile.TemporaryDirectory() as shared:
-            with mock.patch.object(gate, "SCRATCH_DIR", shared):
-                gate._post_body(recorder, "acme/toolkit", make_pr(), "the refusal")
-            self.assertTrue(
-                Path(recorder.path).is_relative_to(shared),
-                f"{recorder.path} is not under the shared volume {shared}",
-            )
+        gate._post_body(recorder, "acme/toolkit", make_pr(), "the refusal")
         self.assertEqual(recorder.body, "the refusal")
+        self.assertEqual(recorder.calls, 1)
 
-    def test_the_file_is_removed_afterwards(self):
+    def test_nothing_is_written_to_disk(self):
+        """No scratch file, so no shared volume and no uid agreement to get wrong."""
         import tempfile as _tempfile
 
-        recorder = self._Recorder()
-        with _tempfile.TemporaryDirectory() as shared:
-            with mock.patch.object(gate, "SCRATCH_DIR", shared):
-                gate._post_body(recorder, "acme/toolkit", make_pr(), "x")
-            self.assertFalse(Path(recorder.path).exists())
+        with _tempfile.TemporaryDirectory() as private:
+            before = set(Path(private).iterdir())
+            with mock.patch.object(_tempfile, "tempdir", private):
+                gate._post_body(self._Recorder(), "acme/toolkit", make_pr(), "x")
+            self.assertEqual(set(Path(private).iterdir()), before)
 
-    def test_an_absent_volume_falls_back_rather_than_crashing(self):
-        """Off-cluster there is no /opt/data, and the unit tests still run."""
-        recorder = self._Recorder()
-        with mock.patch.object(gate, "SCRATCH_DIR", "/proc/nonexistent/scratch"):
-            gate._post_body(recorder, "acme/toolkit", make_pr(), "x")
-        self.assertEqual(recorder.body, "x")
+    def test_the_gate_names_no_scratch_directory_at_all(self):
+        """The constant is gone, not merely unused; a reader must not find it.
+
+        It named "the one filesystem both this container and the credential
+        sidecar can see", which after the split into separate pods is no
+        filesystem at all.
+        """
+        self.assertFalse(hasattr(gate, "SCRATCH_DIR"))
+
+    def test_a_failed_post_is_not_swallowed(self):
+        class Failing:
+            def post_comment(self, repo, pr, body):
+                raise RuntimeError("HTTP 403")
+
+        with self.assertRaises(RuntimeError):
+            gate._post_body(Failing(), "acme/toolkit", make_pr(), "x")
 
 
 # ---------------------------------------------------------------------------
@@ -543,44 +630,70 @@ class FakeProvider:
     what these tests are about is the sweep's policy — who is trusted, what
     counts as answered, how much it will do in one tick — and a fake that
     records `posted` and `acknowledged` states those directly. `test_forge.py`
-    is where the argv and the JSON get pinned.
+    is where the verb and its payload get pinned, and
+    `test_providers_contract.py` where the call the forge module makes of them
+    does.
     """
 
-    supports_acknowledge = True
-
-    def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=()):
+    def __init__(self, prs=None, comments=None, viewer=SELF, fail_on=(),
+                 acknowledges=True, fail_reason="REPO_UNREACHABLE"):
         self.prs = prs or []
         self.comments = comments or {}
+        # Per repository, the way the real provider answers it. A plain string
+        # is every repository, which is what all but the multi-forge tests want.
         self._viewer = viewer
+        self.acknowledges = acknowledges
         self.fail_on = set(fail_on)
+        self.fail_reason = fail_reason
         self.posted = []
         self.acknowledged = []
-        self.preflighted = False
+        self.viewer_lookups = []
+        #: What the real provider records when a listing fills its page.
+        #: Set by `test_a_truncated_listing_becomes_one_operator_warning` and
+        #: the two tests beside it, which pin the operator warning.
+        self.truncated = []
 
-    def preflight(self):
-        self.preflighted = True
+    def truncations(self):
+        return list(self.truncated)
 
-    def viewer_login(self):
+    def viewer_login(self, repo):
+        self.viewer_lookups.append(repo)
+        if isinstance(self._viewer, dict):
+            answer = self._viewer.get(repo, "")
+            # The real `BrokerProvider.viewer_login` raises for a call that did
+            # not happen or was refused -- a dead credential, or a host no
+            # provider module claims -- rather than answering "". A test that
+            # can only express the empty answer cannot see what a raise does to
+            # the repositories beside it.
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
         return self._viewer
+
+    def supports_acknowledge(self, repo):
+        return self.acknowledges
 
     def list_open_prs(self, repo):
         return list(self.prs)
 
     def list_comments(self, repo, pr):
         if pr.number in self.fail_on:
-            raise forge.ForgeError("REPO_UNREACHABLE", f"#{pr.number}")
+            raise forge.ForgeError(self.fail_reason, f"#{pr.number}")
         return list(self.comments.get(pr.number, []))
 
-    def post_comment(self, repo, pr, body_file):
-        with open(body_file, "r", encoding="utf-8") as handle:
-            self.posted.append((pr.number, handle.read()))
+    def post_comment(self, repo, pr, body):
+        self.posted.append((pr.number, body))
 
-    def acknowledge(self, repo, comment):
-        self.acknowledged.append(comment.node_id)
+    def acknowledge(self, repo, pr, comment):
+        self.acknowledged.append((pr.number, comment.ref))
         return True
 
 
 REPO = "acme/toolkit"
+#: A second managed repository, deliberately on another host: identity,
+#: capability and permission are all properties of a forge, and a test that used
+#: two repositories on one would not notice a provider that asked once.
+OTHER_REPO = "gitlab.example/acme/toolkit"
 
 
 def make_pr(
@@ -600,28 +713,39 @@ def make_pr(
 
 
 def make_comment(
-    node_id,
+    ref,
     body,
     author="reviewer",
     can_write=True,
     created_at="2026-08-12T10:00:00Z",
     can_write_known=True,
+    is_bot=False,
 ):
+    # `is_bot` is passed, not derived from `author`, because that is how it
+    # arrives: the forge says whether the author is an automation and the login
+    # is normalised on the way through, so `[bot]` in the string here is only
+    # what a caller would *see*, never what it decides on.
     return forge.Comment(
-        node_id=node_id,
-        numeric_id=abs(hash(node_id)) % 10_000,
+        ref=ref,
+        numeric_id=abs(hash(ref)) % 10_000,
         author=author,
         body=body,
         can_write=can_write,
         created_at=created_at,
         can_write_known=can_write_known,
+        is_bot=is_bot,
     )
 
 
 class PrCommentsSweepTest(unittest.TestCase):
     def _sweep(self, provider, repo=REPO, env=None, repo_error=None, dry_run=False):
-        target = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=repo)
-        with mock.patch.object(forge, "target_repo", target), \
+        # `repo` is one name, a list of them, or None for an install with none.
+        if isinstance(repo, (list, tuple)):
+            managed = list(repo)
+        else:
+            managed = [repo] if repo else []
+        managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=managed)
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              mock.patch.dict("os.environ", env or {}, clear=False):
             import os
@@ -654,6 +778,46 @@ class PrCommentsSweepTest(unittest.TestCase):
         result = self._sweep(provider)
         self.assertEqual(result.cards, [])
         self.assertEqual(provider.acknowledged, [])
+
+    # -- the page ceiling --------------------------------------------------
+    def test_a_truncated_listing_becomes_one_operator_warning(self):
+        """The one output of `truncations()`, which the sweep drains every tick.
+
+        A listing read short is not a failure the sweep can recover from -- it
+        simply did not see everything -- so the only evidence an operator gets
+        that a request may have been missed is this line.
+        """
+        provider = FakeProvider()
+        provider.truncated = ["acme/toolkit#12 reviews"]
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(result.warnings), 1)
+        warning = result.warnings[0]
+        self.assertIn(f"read only the first {forge.LISTING_CEILING} of", warning)
+        self.assertIn("acme/toolkit#12 reviews", warning)
+
+    def test_the_same_listing_truncating_twice_is_reported_once(self):
+        """Two repositories fill the same page on the same tick, routinely.
+
+        De-duplicated on the note rather than counted, so the warning names what
+        was cut short and not how many times the sweep noticed.
+        """
+        provider = FakeProvider()
+        provider.truncated = [
+            "acme/toolkit#12 reviews",
+            "acme/toolkit#12 reviews",
+            "acme/toolkit#13 comments",
+        ]
+        result = self._sweep(provider)
+        self.assertEqual(len(result.warnings), 1)
+        warning = result.warnings[0]
+        self.assertEqual(warning.count("acme/toolkit#12 reviews"), 1)
+        self.assertIn("acme/toolkit#13 comments", warning)
+
+    def test_nothing_truncated_is_silence(self):
+        """The ordinary tick. `truncations()` is called on every one of them."""
+        result = self._sweep(FakeProvider())
+        self.assertEqual(result.warnings, [])
 
     # -- scope -------------------------------------------------------------
     def test_a_pr_the_agent_did_not_author_is_out_of_scope(self):
@@ -697,7 +861,28 @@ class PrCommentsSweepTest(unittest.TestCase):
             prs=[pr], comments={12: [make_comment("IC_1", "/agent bump to 4")]}
         )
         self._sweep(provider)
-        self.assertEqual(provider.acknowledged, ["IC_1"])
+        # The proposal travels with the comment: a comment id alone does not
+        # locate a comment on every forge, so the verb takes both.
+        self.assertEqual(provider.acknowledged, [(12, "IC_1")])
+
+    def test_a_forge_with_no_reactions_is_still_answered(self):
+        """`supports_acknowledge` False is a courtesy skipped, not a card lost.
+
+        Bitbucket Cloud has no reactions on pull-request comments. The 👀 is
+        the only thing that goes missing there -- the trigger is still accepted
+        and the card is still filed -- and the verb is not called at all, so a
+        forge that answers the request by doing nothing is never asked.
+        """
+        pr = make_pr()
+        provider = FakeProvider(
+            prs=[pr],
+            comments={12: [make_comment("IC_1", "/agent bump to 4")]},
+            acknowledges=False,
+        )
+        result = self._sweep(provider)
+        self.assertEqual(provider.acknowledged, [])
+        self.assertEqual(len(result.cards), 1)
+        self.assertIn("IC_1", result.cards[0].body)
 
     def test_two_triggers_on_one_pr_ride_on_one_card(self):
         """One conversation gets one answer, not one per paragraph."""
@@ -725,6 +910,36 @@ class PrCommentsSweepTest(unittest.TestCase):
             },
         )
         self.assertEqual(len(self._sweep(provider).cards), 2)
+
+    def test_sweep_across_multiple_repositories(self):
+        """sweep_pr_comments iterates across all managed repos and files cards per repo."""
+        pr1 = make_pr(1, head_ref="platform-agent/fix-1", head_repo="acme/repo1")
+        pr2 = make_pr(2, head_ref="platform-agent/fix-2", head_repo="acme/repo2")
+
+        class MultiRepoFakeProvider(FakeProvider):
+            def list_open_prs(self, repo):
+                if repo == "acme/repo1":
+                    return [pr1]
+                elif repo == "acme/repo2":
+                    return [pr2]
+                return []
+
+            def list_comments(self, repo, pr):
+                if repo == "acme/repo1" and pr.number == 1:
+                    return [make_comment("IC_1", "/agent fix repo1")]
+                elif repo == "acme/repo2" and pr.number == 2:
+                    return [make_comment("IC_2", "/agent fix repo2")]
+                return []
+
+        provider = MultiRepoFakeProvider()
+        managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch.object(forge, "provider_for", return_value=provider):
+            res = gate.sweep_pr_comments()
+            self.assertEqual(len(res.cards), 2)
+            keys = [card.idempotency_key for card in res.cards]
+            self.assertTrue(any("acme-repo1-1" in k for k in keys))
+            self.assertTrue(any("acme-repo2-2" in k for k in keys))
 
     def test_the_card_body_says_it_is_a_pointer_not_a_transcript(self):
         provider = FakeProvider(
@@ -876,7 +1091,26 @@ class PrCommentsSweepTest(unittest.TestCase):
         """Answering another bot is a loop nobody is watching."""
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="dependabot[bot]")]},
+            comments={
+                12: [
+                    make_comment("IC_1", "/agent x", author="dependabot[bot]", is_bot=True)
+                ]
+            },
+        )
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertEqual(provider.posted, [])
+
+    def test_a_bot_whose_login_does_not_say_so_is_still_passed_over(self):
+        """The suffix is a spelling, not the fact. A GitHub App's REST author
+        arrives as `renovate[bot]`, but the broker's translation strips the
+        affix and `normalise_login` strips whichever of them is left, so by the
+        time a login reaches this sweep it is plain `renovate` -- reading
+        `[bot]` off the string would pass an automation through. `is_bot`, the
+        forge's own answer, is the fact."""
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x", author="renovate", is_bot=True)]},
         )
         result = self._sweep(provider)
         self.assertEqual(result.cards, [])
@@ -885,7 +1119,9 @@ class PrCommentsSweepTest(unittest.TestCase):
     def test_an_allowlisted_bot_is_honoured(self):
         provider = FakeProvider(
             prs=[make_pr()],
-            comments={12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]")]},
+            comments={
+                12: [make_comment("IC_1", "/agent x", author="ci-bot[bot]", is_bot=True)]
+            },
         )
         result = self._sweep(
             provider, env={pr_triggers.BOT_ALLOWLIST_ENV: "ci-bot"}
@@ -902,7 +1138,7 @@ class PrCommentsSweepTest(unittest.TestCase):
         provider = FakeProvider(prs=prs, comments=comments)
         result = self._sweep(provider, env={gate.PR_MAX_PER_TICK_ENV: "2"})
         self.assertEqual(len(result.cards), 2)
-        self.assertEqual(provider.acknowledged, ["IC_1", "IC_2"])
+        self.assertEqual(provider.acknowledged, [(1, "IC_1"), (2, "IC_2")])
 
     def test_the_default_cap_is_three(self):
         prs = [make_pr(n) for n in range(1, 6)]
@@ -1115,6 +1351,29 @@ class PrCommentsSweepTest(unittest.TestCase):
         result = self._sweep(provider)
         self.assertEqual(len(result.cards), 1)
         self.assertIn("acme/toolkit#12", result.warnings[0])
+        # A transient fault clears itself; it is not told to label anything.
+        self.assertNotIn("agent:ignore", result.warnings[0])
+
+    def test_the_warning_says_which_kind_of_unreadable(self):
+        """Two faults land here and they send an operator to different places.
+
+        A transport or credential fault clears itself and wants nothing done. A
+        conversation too long to read in one page never clears: the thread has
+        to be split, or the request repeated in a fresh comment. Without the
+        reason both read as "could not read", and the second is waited out
+        forever.
+        """
+        provider = FakeProvider(
+            prs=[make_pr(12)],
+            fail_on=(12,),
+            fail_reason=forge.REASON_CONVERSATION_TRUNCATED,
+        )
+        result = self._sweep(provider)
+        self.assertEqual(result.cards, [])
+        self.assertIn("acme/toolkit#12", result.warnings[0])
+        self.assertIn(forge.REASON_CONVERSATION_TRUNCATED, result.warnings[0])
+        # It never clears on its own, so the way to stop it is named.
+        self.assertIn("`agent:ignore`", result.warnings[0])
 
     def test_a_credential_that_cannot_name_itself_is_loud(self):
         """No viewer identity means no way to tell our own PR from anyone else's.
@@ -1133,10 +1392,149 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertTrue(result.warnings)
         self.assertIn("could not name the account", result.warnings[0])
 
-    def test_the_preflight_runs_through_the_provider(self):
-        provider = FakeProvider()
-        self._sweep(provider)
-        self.assertTrue(provider.preflighted)
+    def test_identity_is_asked_of_every_repository_not_once_for_the_install(self):
+        """Two forges are two accounts, and only one of them can write here.
+
+        The old shape asked once and reused the answer everywhere, which is the
+        GitHub-only assumption in miniature: with a second forge configured, a
+        proposal there is compared against a login that belongs to the first
+        one, `is_agent_pull_request` says no to every one of them, and the sweep
+        goes quiet on that repository without saying anything.
+        """
+        provider = FakeProvider(viewer={REPO: SELF, OTHER_REPO: "other-bot"})
+        self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(set(provider.viewer_lookups), {REPO, OTHER_REPO})
+
+    def test_a_repository_whose_credential_is_nameless_is_skipped_not_the_sweep(self):
+        """One unreadable credential must not blind the watcher everywhere else.
+
+        The warning names the repository for the same reason: "the credential
+        could not name itself" on an install with two forges sends an operator
+        to look at both.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+            viewer={REPO: SELF, OTHER_REPO: ""},
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        # `FakeProvider` answers the same pull request for either repository, so
+        # the one card is the readable repository's and the other contributed
+        # nothing but its warning.
+        self.assertEqual(len(result.cards), 1)
+        self.assertTrue(any(OTHER_REPO in w for w in result.warnings))
+        self.assertFalse(any(f"`{REPO}`" in w for w in result.warnings))
+
+    def test_a_repository_whose_identity_refuses_is_skipped_not_the_sweep(self):
+        """The same claim for the answer the real provider actually gives.
+
+        `viewer_login` raises for a credential the forge rejected and for a
+        host no provider module claims; it does not answer "". With the catch
+        around the whole loop, the second repository's refusal discarded the
+        first repository's pull requests and the tick filed no cards for a
+        repository that was working.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+            },
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(len(result.cards), 1)
+        named = [w for w in result.warnings if OTHER_REPO in w]
+        self.assertEqual(len(named), 1)
+        self.assertIn("FORGE_UNAUTHENTICATED", named[0])
+        self.assertFalse(any(f"`{REPO}`" in w for w in result.warnings))
+
+    def test_every_repository_refusing_is_still_one_warning(self):
+        """Nothing was swept, so there is no partial result to qualify.
+
+        The per-repository catch must not turn the ordinary total outage --
+        one forge, one dead credential, every repository on it -- into a
+        warning per repository saying the others were fine.
+        """
+        provider = FakeProvider(
+            prs=[make_pr()],
+            comments={12: [make_comment("IC_1", "/agent x")]},
+            viewer={
+                REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+                OTHER_REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+            },
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("FORGE_UNAUTHENTICATED", result.warnings[0])
+
+    def test_a_quiet_healthy_repository_is_not_read_as_a_total_outage(self):
+        """Having nothing open is the ordinary state, not evidence of an outage.
+
+        The first version of the test above asked whether any card had been
+        filed, which is the same question on a total outage and on a partial
+        one whose working repository simply had no open pull request this
+        tick -- the common case. So a partial outage announced the watcher was
+        not running at all, named no repository, and withheld the named
+        warning the operator needed, every ten minutes. Counted repositories
+        tell the two apart.
+        """
+        provider = FakeProvider(
+            prs=[],
+            viewer={
+                REPO: SELF,
+                OTHER_REPO: forge.ForgeError("FORGE_UNAUTHENTICATED", "revoked"),
+            },
+        )
+        result = self._sweep(provider, repo=[REPO, OTHER_REPO])
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn(OTHER_REPO, result.warnings[0])
+        self.assertIn("The other managed repositories were swept", result.warnings[0])
+
+
+class ResolverPathTest(unittest.TestCase):
+    def test_finds_resolver_in_platform_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / gate.PLATFORM_PROFILE_DIR / gate.RESOLVER_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home):
+                self.assertEqual(gate._resolver_path(), target)
+
+    def test_finds_resolver_in_home_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / gate.RESOLVER_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home):
+                self.assertEqual(gate._resolver_path(), target)
+
+    def test_finds_resolver_in_platform_template(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "data"
+            home.mkdir(parents=True, exist_ok=True)
+            template_root = Path(tmpdir) / "template"
+            target = template_root / gate.RESOLVER_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home), \
+                 mock.patch.object(gate, "PLATFORM_TEMPLATE_DIR", str(template_root)):
+                self.assertEqual(gate._resolver_path(), target)
+
+    def test_fallback_returns_home_resolver_rel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "profiles" / "platform"
+            home.mkdir(parents=True, exist_ok=True)
+            expected = home / gate.RESOLVER_REL
+            nonexistent = str(Path(tmpdir) / "nonexistent" / "github_scan_gate.py")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home), \
+                 mock.patch.object(gate, "PLATFORM_TEMPLATE_DIR", str(Path(tmpdir) / "nonexistent")), \
+                 mock.patch.object(gate, "__file__", nonexistent):
+                self.assertEqual(gate._resolver_path(), expected)
 
 
 if __name__ == "__main__":

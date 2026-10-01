@@ -49,14 +49,24 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
   `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of
   findings the body actually rendered, which under the size budget of §7.1 may be a strict subset of
-  the run's findings.
+  the run's findings — plus, on a run that passed `--manifest-file`, the ids of previous findings
+  the collector still flags and the document did not carry
+  ([collector design §3.3](fleet-audit-collector-manifest.md)).
 - Findings render as rows in a findings table with per-finding anchors, each row naming its
   remediation state and, where one exists, its remediation PR.
 - A clean run closes the issue **as completed** and closes any remediation PRs still open for that
-  stream.
+  stream. Its closing comment carries the run's `checks_run` evidence table, since the body is not
+  rewritten on a clean run, and the close is refused — `status: "HELD"`, ledger left open with a
+  comment — when the previous body carried a finding whose check this run's own `checks_run` says
+  ran again on that cluster and the document neither reports it nor explains it under
+  `resolved_because` (#1683) — or, on a run that passed `--manifest-file`, whose candidate the
+  collector still emits and the document has not moved under `declared`
+  ([collector design §3.3](fleet-audit-collector-manifest.md)). `start` hands the worker the
+  carried findings so it can.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no coverage gap, and no remediation PR opened or closed. If any of those fails
+  `resolved == 0`, no coverage gap, no held close, no remediation PR opened or closed, and no
+  collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md)). If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
   could not read the whole fleet is never silent even when both counters are zero, because "I found
@@ -113,12 +123,15 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 
 1. `severity == "critical"`, and
 2. `remediation.kind == "manifest"`, and
-3. there is no **live** pull request on its branch.
+3. there is no **live** pull request on its branch, and
+4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
+   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)).
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
 streams into a notification firehose. At most five auto-promotions per run (§13 Q4); the surplus is
-named in the ledger.
+named in the ledger, in the same section that names what a collector manifest withholds from the
+sweep ([collector design §3.4](fleet-audit-collector-manifest.md)).
 
 "Live" rather than "in any state" is condition 3's whole point, and the distinction is between two
 kinds of closed PR. One the harness closed itself as stale carries the `audit:stale-closed` label,
@@ -231,8 +244,8 @@ could not read the cluster has no standing to assert it.
 The comment does **not** print the command that no longer reproduces, or its output, and an earlier
 draft of this section promising both was wrong about what is knowable at that moment. A resolved
 finding is by definition absent from the current document, so its evidence is not in hand; the only
-place it survives is the previous ledger body, and recovering it would mean parsing rendered
-Markdown back into fields. The renderer emits the command only on the rare path where a caller
+place it survives is the previous run's stored report, whose document `finish` reads only for
+titles; carrying the evidence through to the comment is not built. The renderer emits the command only on the rare path where a caller
 supplies the finding — and says nothing rather than print an empty code fence.
 
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
@@ -297,7 +310,7 @@ one.** A finding that no longer reproduces is absent from the run's document, so
 the findings table to carry a state — `derive_finding_state` is only ever called with
 `reproduces=True` in production, and the two resolved labels never reach a reader. What the reader
 sees instead is the delta comment, which names the resolution by id and by the title recovered from
-the previous body. The distinction between the two states survives only in the code, where it
+the previous run's stored report. The distinction between the two states survives only in the code, where it
 decides whether a pull request is closed as stale or left alone because it already merged.
 
 Three of the rendered rows are easy to misread, and two of them were wrong in an earlier draft:
@@ -366,12 +379,55 @@ stream's open ledger issue, and returns the scratch path for `findings.json`. Em
   "repo": "acme/fleet",
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
-  "pending_remediation_requests": ["netpol-missing-payments"]
+  "pending_remediation_requests": ["netpol-missing-payments"],
+  "context_repos": ["acme/terraform-live"],
+  "declared_intent_repos": ["acme/fleet", "acme/terraform-live"]
 }
 ```
 
 `pending_remediation_requests` is the parsed set of `/remediate` targets from the issue's comments,
 surfaced early so the agent knows which findings need a manifest written during inspection.
+
+`context_repos` is the `context_repos` key of the same ConfigMap: repositories an SOP's
+declared-intent step reads before it reports a posture as a finding (#1341). It is a separate key
+from `managed_repos` because the managed list feeds the broker's push gate, the repository resolver
+and the minter policy, and a `role: context` marker inside it would have been flattened into a
+writable entry by the shared parser; a key no write path reads is read-only by construction (the
+minter policy does read it, for a `contents: read` grant the broker's own clone presents).
+The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
+the `repo`, `path` and `excerpt` of the declaration — validated for scope, a non-overlapping
+identity, and a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
+beside the roster; a fault check or a stream with no declared-intent step is rejected), and never
+given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
+the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
+the list's length as `declared`.
+
+`declared_intent_repos` is the set that step must account for — the GitOps repository plus every
+`context_repos` slug, folded to one entry each — and `start` writes the same set to a run record
+beside the findings document (`run_<audit-id>.json`). `start` clears the previous record as its
+first act and writes the new one last, after every step that can fail and before it prints, so the
+record is never newer than the list the worker was handed and a `start` that failed leaves none.
+The document may carry a top-level `declared_intent_searched` list of `owner/name@sha` strings, one
+per repository the step searched, validated for shape (the slug rule `declared[].declaration.repo`
+uses, a sha of 7 to 40 lowercase hex characters) and rejected on a stream with no `declarable`
+set. `finish` measures it against the run record, not the ConfigMap at finish time, and holds the
+record to the repository it is finishing, so a multi-repository cron cannot measure one
+repository's document against another's record: whenever any cluster's `checks_run` names a
+declarable check and the list does not cover every slug in the record — or there is no usable
+record — every finding whose check is declarable is withheld and the run goes partial (§7.4).
+`remediate` applies the same withhold and refuses a withheld id by name. The sha comes from the
+reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mode
+`inspect_repository.py clone` and `open` print it for a context copy (#1477).
+
+`start` also performs the search itself: it reads each repository in that set for `declares:`
+frontmatter within the paths its `.kube-agents/intent.yaml` names — in content mode copying the
+intent directory first and then only those paths, so the copy's caps count notes rather than
+manifests — files the result in `declarations_<audit-id>.json`, records each repository it read
+completely (every note under the searched paths arrived and was read) under `searched` in the run
+record, and `finish` unions that list into the document and moves each covered finding to
+`declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
+severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
+stays a finding.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
@@ -383,34 +439,46 @@ layout.
 
 That also fixes an ordering problem worth recording: the GitHub App token is repo-scoped, so it
 cannot be minted before the repo is known, and the repo used to be derived from the clone the token
-was needed to create. The repo now comes from the `Git Repo:` line of `/opt/data/SETTINGS.md`, which
-the operator writes at provisioning time and which is present from the pod's first second, with the
-git remote kept only as a fallback. This resolves §13 Q1 in passing: `github-issue-resolver` already
-read that same line, so the two skills now agree by construction rather than by coincidence.
+was needed to create. The repo now comes from the managed repositories ConfigMap (`$GITOPS_STATE_CONFIGMAP`),
+with workspace lease markers and the git remote kept as fallbacks. This resolves §13 Q1 in passing:
+`github-issue-resolver` and `fleet-audit` read from the same ConfigMap, so the two skills now agree
+by construction rather than by coincidence.
 
 `start` is also the **only** subcommand that scrubs the working tree — see the note under
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.
 
-### `finish --audit <id> --findings-file <path> [--dry-run]`
+### `finish --audit <id> --findings-file <path> [--dry-run] [--manifest-file <path> | --no-collector-manifest <why>]`
+
+The two collector flags are the subject of
+[`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md), which says why a stream
+whose SOP runs a collector must pass one; on any other stream the steps below are the whole of
+`finish`.
 
 1. Validate the document (existing validator plus `recommendation`, the finding-id charset rule of
    §2, and the scope rules of §7.2).
 2. Reconcile: one `gh pr list` call builds the finding→PR state map from head branch names.
-3. Compute the delta against the ledger issue's `<!-- audit-findings -->` marker, unless its
+3. Compute the delta against the `<!-- audit-findings -->` marker of the ledger body the previous
+   run stored ([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §4), unless its
    `<!-- audit-id-scheme -->` stamp names a scheme this run cannot join against — then `resolved`
    is withheld for the one run it takes to rewrite the block.
 4. Compute coverage gaps (§7.4). A gap does not stop the run; it narrows what the run may conclude.
 5. Clean run → answer every unanswered `/remediate` on the ledger, then close the ledger issue as
    completed, close every open remediation PR for the stream, print `CLEAN`. **Unless the run is
    partial**, in which case the status is still `CLEAN` but the issue stays open with a comment
-   naming the gaps and no PR is retired.
+   naming the gaps and no PR is retired. **And unless the previous body carried a finding whose
+   check this run's `checks_run` says ran again on that cluster** and the document neither reports
+   nor lists under `resolved_because` — then the status is `HELD`, the issue stays open with a
+   comment naming each such finding and the check that ran, no PR is retired, and `resolved` is `0`
+   (#1683).
 
    The answers come **before** the close, and that ordering is the whole of the rule. "Every
    `/remediate` gets exactly one answer" cannot have the clean run as its exception: this is the one
    morning the issue disappears, taking with it the thread the requester would have re-asked on, so
    it is the one morning silence costs the most. The answer says the finding no longer reproduces,
-   and whether the ledger is closing or staying open on partial coverage. Authorization is not
+   and whether the ledger is closing or staying open on partial coverage — except on a held close,
+   where it says the run did not account for the findings the ledger carries, and, with a manifest,
+   over a lost store record, where it says the run cannot tell whether the target was among them. Authorization is not
    consulted — nothing is being acted on for anybody, and the answer is equally true and equally
    useful to a commenter without write access.
 
@@ -428,27 +496,35 @@ is indistinguishable from "3 requests silently dropped": opened with its URL, re
 open and deliberately not force-pushed over, `superseded` by a human close written after the request
 (§3.1), or not published this run and queued for a retry. A **refusal** is likewise never silence.
 Naming a `gcloud` or `manual` finding, naming an id that is not in the document, lacking write
-access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it, or
-writing it with no target at all each get exactly one reply.
+access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it,
+writing it inside a block quote or CommonMark lazy continuation line, or writing it with no target at all each get exactly one reply.
 
-Four of those five replies carry the ids that would have worked — capped at ten, then "and N more",
+Five of those six replies carry the ids that would have worked — capped at ten, then "and N more",
 since a refusal is help and not a second copy of the report. **The write-access refusal deliberately
 carries neither the id list nor the syntax.** Every other refusal is a correction to someone who may
 retry and succeed; that one is a "no" to someone who cannot, and handing them a menu of fixes they
 are not permitted to request reads as an invitation rather than an answer. It says what the rule is
-and stops. The one deliberate silence is a mid-sentence mention from someone without write access:
+and stops. The one deliberate silence is a mid-sentence or quoted mention from someone without write access:
 their correctly-typed command would have been refused anyway, and two replies to one comment that
 was probably never a command is a bot picking an argument. A `/remediate` the harness itself renders
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — nine keys, always all nine:
+Exit contract — the keys below on every line:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false}`
-- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
+- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[],"unaccounted":[]}`
+
+`postures_withheld` is the ids of the posture findings `finish` took out of the document because it
+recorded no complete declared-intent search (§7.4); empty on every other run.
+
+When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_checks` and
+`uncorroborated_findings` join the line; they are absent on every other run
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.6).
 
 `--dry-run` renders the issue body and every PR body it _would_ open to stdout with zero git or gh
 **side effects**: nothing is cloned, staged, committed, pushed, created, edited, commented, or
@@ -465,7 +541,7 @@ One asymmetry with the real run is deliberate: a dry run **warns** about a `reme
 is missing or fails containment, and does not rewrite the finding to `manual` the way `finish` does.
 Degrading a document it is only previewing would show the reader a body the real run never produces.
 
-### `remediate --audit <id> --findings-file <path> --finding <id>...`
+### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 
 The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
 the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
@@ -506,17 +582,18 @@ lose and anything present is debris from a run that did not finish.
 
 ## 7. Rendering
 
-| Artifact             | Contents                                                                                                                                                                                                                                                                                                                                                   |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ledger issue title   | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                           |
-| Ledger issue body    | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered, followed by the `<!-- audit-id-scheme -->` stamp that says which identity scheme minted them. |
-| Scope                | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2.                                                                                                    |
-| Size budget          | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                        |
-| Delta comment        | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything. Reuses `render_delta_comment`.                                                                                                                                                                                                    |
-| Clean-close comment  | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                           |
-| Remediation PR title | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                         |
-| Remediation PR body  | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), and the risk note. For a group, one section per member.                                                                                                                                                                                                  |
-| Stale-close comment  | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                              |
+| Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                   |
+| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1).               |
+| Scope                 | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)). |
+| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                         |
+| Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                             |
+| Clean-close comment   | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                   |
+| Remediation PR title  | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), and the risk note. For a group, one section per member.                                                                                                                                                                                                                                                                                                                          |
+| Stale-close comment   | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                                                                                                                                                      |
 
 ### 7.1 Size budget
 
@@ -537,15 +614,18 @@ headroom for the trailing marker and for anything a later section appends.
 - **Table caps.** The scope and skipped tables cap at 60 rows each, with a trailing "…and N more"
   row. Without the cap a body with _zero findings_ overflows: 1,200 clusters plus 1,200 skipped
   entries renders 148,627 characters of pure scope.
-- **Order of measurement.** Header, scope, and footer are rendered and measured first; whatever
-  remains of the 60,000 is the findings budget. Findings are selected **severity-first**, so
+- **Order of measurement.** Header, scope, and footer (the complete-list block excepted, see below) are rendered and measured first; whatever
+  remains of the 60,000 is the findings budget. The collector-held section, when there is one, is
+  measured after the findings and before the evidence appendix, degrading to identity lines and then
+  to a note rather than displacing a finding (collector design §3.3). Findings are selected **severity-first**, so
   truncation only ever eats the least-severe end and criticals are structurally safe — a fleet with
   five criticals and three hundred minors publishes all five criticals no matter what.
 - **Truncation is stated, counts are not.** When findings are omitted the body says so explicitly,
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
-  body contains, not the full finding set. Otherwise the next run would see a truncated finding
+  body contains, not the full finding set — and, after them, the collector-held ids the body carries
+  under their own heading (collector design §3.3). Otherwise the next run would see a truncated finding
   absent from the previous marker, or present in it and absent from the body, and report a finding
   that is very much still reproducing as _resolved_. The marker is itself a size term and was
   unbounded: 1,250 finding ids render 80,526 characters of marker alone, over the limit before a
@@ -564,6 +644,17 @@ headroom for the trailing marker and for anything a later section appends.
   calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
   to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
   one is chosen.
+- **A truncated body also lists every finding id.** The delta marker's rendered-only list leaves no
+  machine-readable record that a cut finding was filed at all, so a grader or a script reading the
+  ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
+  omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
+  with every current id and the collector-held ids. Nothing joins against it: the delta keeps
+  reading the rendered marker, for the reason the bullet above gives, so a cut finding is announced
+  as new the first run it renders, whatever freed the room. Findings are selected once without the
+  block and, only if that cut something, again with it charged, so it never truncates a body that
+  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
+  characters) it is left out rather than truncated, since a partial complete list would be the same
+  ambiguity with a different name.
 - **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
   `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
   reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
@@ -573,6 +664,12 @@ headroom for the trailing marker and for anything a later section appends.
   body; the index needs no separate ordering rule because the body is already severity-first.
 - The clean-close comment is measured against the same budget, for the same reason: a clean run on a
   fleet with 900 skipped clusters must still be postable.
+- **The _Declared intent_ table** (the `declared` list, #1341) is measured with the fixed sections,
+  before the findings claim what is left, and capped at 50 rows with a trailing "…and N more" row:
+  a declaration that silently fell off the body would leave the posture unexplained, and a
+  row-capped table bounds what the findings can lose to it. Its `repo:path` pointer is clipped at
+  the 320-character identifier ceiling rather than the 120-character cell one, because it is
+  followed rather than read.
 
 ### 7.2 Scope, skipped, and limitations
 
@@ -628,20 +725,24 @@ read on the days it matters.
 #### "Did not run" and "cannot run" are different claims
 
 `checks_run` collapsed them, and the collapse had a cost that only shows on a real fleet. Four of
-this stream's ten upgrade checks read a node pool, and an Autopilot cluster has none to read. The
+this stream's ten upgrade checks read a node pool, and an Autopilot cluster was taken to have none
+to read. The
 SOP's answer was a `limitations` note — which is a coverage gap, so those clusters rendered `6/10 ⚠`
 on every run, forever. `partial` was therefore `true` on every run, forever, and everything keyed to
 `partial` followed: `resolved` pinned at `0`, the ledger unable to close, no stale remediation PR
 ever retired. On the fleet this was found on, two of three clusters are Autopilot. The audit was
 permanently unable to report good news about the majority of the fleet it audits, and the flag that
 was supposed to mean "I could not look here" had come to mean "there is nothing here to look at" —
-which is the opposite claim, published in the same column.
+which is the opposite claim, published in the same column. (The Autopilot premise was later found
+false — `clusters list` returns Autopilot node pools with every field those checks read, and the
+stream now runs all ten there — but the failure holds for any shape that genuinely rules a check
+out, such as the workload shapes Autopilot admission rejects in the compliance stream.)
 
 So `scope.clusters[]` gains an optional `checks_not_applicable`: a list of `{check, reason}` using
 the same slugs as `checks_run`. Those checks leave the denominator rather than counting as missing,
-so `6/10 ⚠` becomes `6/6 (4 n/a)`. `coverage_gaps` computes `applicable = roster - not_applicable`
-and reports a shortfall against that, which is what lets a fully-covered Autopilot fleet close its
-ledger.
+so `6/10 ⚠` became `6/6 (4 n/a)`. `coverage_gaps` computes `applicable = roster - not_applicable`
+and reports a shortfall against that, which is what lets a fully-covered fleet close its ledger when
+its shape rules checks out.
 
 The `reason` is required and must be at least sixteen characters. That is a deliberately crude
 proxy: it cannot tell a real reason from a padded one, but it does stop `"N/A"`, `"n/a"`, and
@@ -682,7 +783,8 @@ Four changes close it, and none of them pretend to verify anything:
   cluster.
 - **The commands are published.** The ledger's last section, _How this run checked the fleet_, is a
   collapsed table of every entry, rendered against whatever body budget the findings left and
-  dropped whole rather than half if it does not fit.
+  dropped whole rather than half if it does not fit — with a notice pointing at the run's stored
+  report, which keeps every entry.
 
 One residual risk is worth naming because the design cannot remove it: the harness runs as a
 subprocess of the agent, so it never observes the commands the agent issued — only the document
@@ -722,6 +824,11 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
   likewise indented at most three, nothing else on the line, unterminated fences run to the end.
   Dropping the indentation bound — stripping each line before comparing — makes four-space
   ` ``` `, which CommonMark and GitHub both render as literal text, read as a closer.
+- **Block quotes and lazy continuations are stripped.** `strip_block_quotes` drops blockquote
+  lines starting with `>` (indented 0-3 spaces) and consumes subsequent lazy continuation lines
+  that CommonMark (§5.1) includes in the block quote until a paragraph break (such as an empty quote line,
+  blank line, code fence, heading, or thematic break) is encountered, preserving lazy continuations
+  for both quoted paragraphs and list items inside the quote to prevent quoted `/remediate` suggestions from firing.
 - **Table cells escape `|` and flatten newlines**; identifiers additionally replace a backtick,
   because one backtick closes the inline code span they sit in and the rest of the value renders as
   live Markdown.
@@ -730,14 +837,43 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
 
 ### 7.4 Partial coverage
 
-`coverage_gaps(data)` folds the three representations of "did not look" — every `scope.skipped`
-entry, every cluster `limitations` note, and every cluster whose `checks_run` falls short of the
-checks that _apply_ to it — into one list of human-readable strings, and a run with a non-empty list
-is **partial**. A cluster contributes at most one line however many of the three apply to it, so a
-partly-checked cluster that also carries a limitation reads as one sentence with two reasons rather
-than as two separate gaps. The denominator is the stream's roster minus that cluster's
-`checks_not_applicable`, which is what keeps a check the cluster's shape forbids from reading as a
-check nobody ran.
+`coverage_gaps(data)` folds the four representations of "did not look" — every `scope.skipped`
+entry, every cluster `limitations` note, every cluster whose `checks_run` falls short of the
+checks that _apply_ to it, and, on a stream with a declared-intent step, posture checks that ran
+with no complete search record — into one list of human-readable strings, and a run with a
+non-empty list is **partial**. A cluster contributes at most one line however many of the first
+three apply to it, so a partly-checked cluster that also carries a limitation reads as one sentence
+with two reasons rather than as two separate gaps. The denominator is the stream's roster minus that
+cluster's `checks_not_applicable`, which is what keeps a check the cluster's shape forbids from
+reading as a check nobody ran. `finish` appends the gaps no document field expresses: a waived
+collector manifest, and on a clean run whose report store holds no trusted record of the open ledger, one
+of two lost-memory gaps — the collector still flags something the document does not carry, or
+nothing shows whether the findings the ledger carries were fixed
+([collector design §3.3, §4](fleet-audit-collector-manifest.md),
+[report store design §4](fleet-audit-report-store.md)). They count toward `partial` like the rest.
+The waiver renders in the Scope section's own list. A lost-memory gap arises only on a clean run,
+which comments rather than rewriting the body, so it appears in that comment, the JSON line and the
+stored report.
+
+The fourth is fleet-wide and comes from `withhold_unsearched_postures`, which `finish` runs once,
+after the document loads and `start`'s search record and declarations have been folded into it
+(the `start` section above), and before the dry-run split. When any cluster's `checks_run` names a
+declarable check and the document's `declared_intent_searched` — the worker's list with the run
+record's `searched` unioned in — does not cover every repository in `start`'s run record, or
+`start` left none, it takes every finding whose check is declarable out
+of `findings`, the dangling-target `hpa-cannot-scale` fault included (the validator cannot tell it
+from the `min == max` posture), and files them on the document under `postures_withheld`. Every
+caller of `coverage_gaps` then derives the same sentence — each withheld entry, the repositories not
+searched, and the `hpa-cannot-scale` caveat — and the withheld ids enter no delta block and no
+remediation pull request; the faults and the `declared[]` entries publish unchanged. A `/remediate`
+standing on the ledger that names a withheld posture is neither refused nor acted on: it is
+answered once with a reply carrying an `audit-deferred` marker, which nothing reads as "answered",
+so the same comment is honoured by the first run that records the search — on the findings branch
+and on the clean branch alike, where the "no longer reproduces" answer would be false. Routing it
+through `coverage_gaps` rather than through a fifth gate is the same economy as the roster
+shortfall below: everything keyed on `partial` follows. The ledger renders the withheld postures
+under _Declared intent not searched_ below the Scope table, and the clean comment lists them, so a
+clean run that is clean only because the harness took the postures out says so (#1477).
 
 Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
 economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
@@ -790,9 +926,12 @@ applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
 moved nothing an operator needs to hear about — nothing new, nothing resolved, no coverage gap, no
-remediation PR opened or closed — and it is computed from the numbers `finish` is about to _report_,
-not the ones it privately knows. A partial run reports `resolved: 0`; an unreadable previous body
-makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
+held close, no remediation PR opened or closed, and, on a run that passed `--manifest-file`, no
+collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md))
+— and it is computed from the numbers `finish` is
+about to _report_,
+not the ones it privately knows. A partial run reports `resolved: 0`; a report store with no record of
+the open ledger makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
 and the report can never disagree. The PR counters are in the conjunction because opening a fix is
 news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
 while a pull request now exists that did not before.
@@ -1040,6 +1179,8 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
 
 - A run of 250 findings renders a body at or under the limit.
 - The hidden delta block contains exactly the ids the body rendered — no more, no fewer.
+- A truncated body's `audit-findings-all` block lists every finding id; an untruncated body carries
+  none, and a list over `ALL_FINDINGS_BLOCK_CAP` is left out.
 - 5 critical plus 300 minor findings keeps all 5 criticals.
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.
 - The clean-run comment stays under the limit with 900 skipped clusters.
@@ -1093,11 +1234,10 @@ This is worth the cost of a real repository in the suite: the bug it guards agai
 Tier 2 — every manifest the audit wrote would have been deleted moments before the harness looked
 for it, and every finding would have been published as "the fix was named but never written".
 
-**Repo-resolution cases** (§13 Q1): the `Git Repo:` line parsed from `https://`, `git@`, and bare
-`owner/name` forms; the literal `None` the operator writes for an unset CR field; a missing
-`SETTINGS.md` falling back to the git remote; SETTINGS winning when both are present; and an error
-that names both sources when neither works. Plus ordering: the repo is resolved before the token is
-minted, the token is minted for the resolved repo, and both happen before the clone.
+**Repo-resolution cases** (§13 Q1): repo resolution from the managed repositories ConfigMap,
+workspace lease markers, and the git remote fallback, with an error that names all sources when
+none work. Plus ordering: the repo is resolved before the token is minted, the token is minted
+for the resolved repo, and both happen before the clone.
 
 **One hazard the suite has to defend against itself.** Two test classes were both named
 `TestStaleClose`. Python rebinds the name at import, long before `unittest` collects anything, so the
@@ -1121,13 +1261,13 @@ issue-repo argument and the App token needs scope on both.
 _Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look.
 
 The divergence this question surfaced — `audit_report.py` deriving the repo from the working
-directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from the
-`Git Repo:` line of `/opt/data/SETTINGS.md` — was first recorded as cosmetic and deferred. It was
+directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from
+the managed repositories ConfigMap — was first recorded as cosmetic and deferred. It was
 not cosmetic. Reading the remote requires a working tree, the audit cron does not start in one, and
 the clone that would create one needs a repo-scoped token that cannot be minted until the repo is
 known. The old resolution was circular and would have failed on the first real run. `resolve_repo()`
-now reads `SETTINGS.md` first and falls back to the remote, so the two skills agree by construction
-and the repo is knowable before anything has been cloned (§6, `start`).
+now reads the managed repositories ConfigMap first and falls back to the remote, so the two skills
+agree by construction and the repo is knowable before anything has been cloned (§6, `start`).
 
 **Q2. Does the App token already carry `issues: write`?** `github-issue-resolver/scripts/resolver.py`
 creates labels, comments, and closes issues with the same token, so issue write is established — but
@@ -1163,7 +1303,8 @@ genuinely bad fleet day could still open many at once. Consider a per-run cap wi
 named in the ledger.
 
 _Resolved: auto-promotion is capped at five PRs per `finish` run._ Withheld findings are named in the
-ledger as awaiting `/remediate`, so nothing is lost, only deferred to a human's judgement about which
+ledger as awaiting `/remediate` (a section a collector manifest can add two blocks to —
+[collector design §3.4](fleet-audit-collector-manifest.md)), so nothing is lost, only deferred to a human's judgement about which
 five matter first. An explicit `/remediate` is **uncapped** — a human asked for it, and a cap there
 would just make them ask again.
 

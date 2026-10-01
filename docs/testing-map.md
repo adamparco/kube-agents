@@ -1,0 +1,171 @@
+# Where tests go
+
+`AGENTS.md` owns the rule: decide by asking whether a model call is in the loop. This page is the
+mechanics behind it — the full set of homes, what runs each one, and the traps that make a
+misplaced test look fine.
+
+## The homes
+
+| What you are testing                                                                       | Where it goes                                                                                | What runs it                                                                                                                                                                                                                                                                                                                                                                                                                                                  | On a pull request                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A Python module's own logic                                                                | beside the module; the exact directory set is the `PYTHON_TEST_DIRS` globs in the `Makefile` | `make test-python` (`make coverage` in CI)                                                                                                                                                                                                                                                                                                                                                                                                                    | runs, unconditionally                                                                                                                                                                                                                                  |
+| A shell script, a rendered manifest, an installer — something with no module to sit beside | `tests/test_*.py`, and `tests/memory/` for the memory provider                               | `make test-python` (`make coverage` in CI)                                                                                                                                                                                                                                                                                                                                                                                                                    | runs, unconditionally                                                                                                                                                                                                                                  |
+| Two components across a seam, no model call                                                | `tests/integration/test_seam_*.py`                                                           | `make test-python` (`make coverage` in CI)                                                                                                                                                                                                                                                                                                                                                                                                                    | runs, unconditionally                                                                                                                                                                                                                                  |
+| A security or permissions invariant, as a deterministic assertion                          | `tests/conformance/` (bucket 1; `bucket2/` needs a cluster and is opt-in)                    | `make conformance` → `tests/conformance/run.py`; `conformance.yml`, unfiltered on purpose — deliberately outside `PYTHON_TEST_DIRS`, see `tests/conformance/README.md`                                                                                                                                                                                                                                                                                        | runs, unconditionally                                                                                                                                                                                                                                  |
+| The bench harness itself — verifiers, parsing — plus contract tests needing its imports    | `bench/tests/`                                                                               | `make test-bench`                                                                                                                                                                                                                                                                                                                                                                                                                                             | runs, unconditionally                                                                                                                                                                                                                                  |
+| A Terraform module's plan-time rules: preconditions, read postconditions, what it binds    | `terraform/{modules,examples}/<dir>/tests/*.tftest.hcl`, against mocked providers            | `make terraform-test`; the `validate` job in `validate.yml`                                                                                                                                                                                                                                                                                                                                                                                                   | runs, unconditionally                                                                                                                                                                                                                                  |
+| The Go operator                                                                            | `k8s-operator/`                                                                              | `make -C k8s-operator test`: `go test` under envtest, plus the operator's one Python suite, `internal/controller`, which `make test-python` (`make coverage` in CI) also runs on every pull request through its own `PYTHON_TEST_DIRS` glob                                                                                                                                                                                                                   | paths-filtered: runs only when the change touches `k8s-operator/**`                                                                                                                                                                                    |
+| An agent plugin                                                                            | `agentplugins/*/tests/test_*.py`                                                             | `make test-python` (`make coverage` in CI), one discovery pass per plugin                                                                                                                                                                                                                                                                                                                                                                                     | runs, unconditionally                                                                                                                                                                                                                                  |
+| The A2A bus module — library, topics CLI, profiles, auth callout, conformance suite        | `a2a/` (Go, beside the code; the conformance suite runs an embedded JetStream server)        | `a2a-test.yml` (`go vet` + `go test -race`, after installing the envtest binaries and the `nats` CLI); `make verify` locally runs the same packages with neither, so the envtest and `nats` CLI cases skip silently — reach them with `KUBEBUILDER_ASSETS="$(make -C ../k8s-operator -s envtest-path)" go test ./...` from `a2a/` (the `../` matters: from `a2a/` the unprefixed path makes `make` fail, and the empty substitution skips the cases silently) | paths-filtered: runs only when the change touches `a2a/**`                                                                                                                                                                                             |
+| Whether the agent diagnoses a defect you planted for it                                    | `bench/tasks/<name>/task.yaml`                                                               | `hack/ci-eval-pr.sh`, as the Prow presubmit, over `hack/eval/presubmit-cases.txt`; a `hack/eval/nightly-cases.txt` entry runs only under `EVAL_TIER=nightly`, the Prow nightly eval periodic's (`ci-kube-agents-eval-nightly`) export                                                                                                                                                                                                                         | runs as a presubmit and reports on the pull request — except a `nightly-cases.txt` entry, which runs nightly via `ci-kube-agents-eval-nightly` and reports on no pull request; whether the presubmit blocks is Prow config this repository cannot read |
+| Whether an install you already have still works for a user                                 | `bench/cuj/test_<NN>_<name>.py`, or `bench/cuj/<area>/` under it                             | `uv run --project bench pytest -s bench/cuj`, by hand                                                                                                                                                                                                                                                                                                                                                                                                         | nothing runs it, by design                                                                                                                                                                                                                             |
+| The release gate                                                                           | `tests/e2e/`                                                                                 | `rc-release-pipeline.yml`, dispatched by `rc-scheduler.yml` on a three-hourly schedule; `staging-promotion-pipeline.yml` (GitHub Actions release promotion), dispatched daily by `staging-promotion-scheduler.yml`; `e2e-gchat-test.yml` by hand                                                                                                                                                                                                              | nothing — it gates releases, not pull requests                                                                                                                                                                                                         |
+
+Some of those rows carry a footnote that matters more than the row.
+
+**`make test-python` runs twice in CI, on two interpreters.** `python-tests.yml`'s required job runs
+it under coverage on `.python-version`, CI's Python, and a second, non-required job runs it plain on
+`.agent-python-version`, the Python inside the platform agent image, where `agents/platform/scripts`,
+`deploy/shared` and the agent plugins execute. A suite that passes on one and not the other is the
+second job's whole purpose; it replaced two workflows that ran only `tests/` and the plugin suites
+on that interpreter. It is not a required check, so it holds no merge, but a red on `main` fails the
+workflow run and files a main-broken issue like any other job in it.
+
+**`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
+The difference is who supplies the failure and who owns the environment.
+
+A `bench/tasks/` case is an **eval, and it runs in CI**, in the Prow presubmit or the Prow nightly periodic tier (`ci-kube-agents-eval-nightly`). It plants a defect and the
+run owns the environment the defect sits in: the case's `infrastructure.deployer` decides where,
+with `tofu` provisioning a stack for the run and tearing it down after, and `noop` grading against
+the cluster the deploy already stood up. The agent is pointed at it and its diagnosis is graded
+against the case's `verification_spec`. The subject is the agent — the defect is known, and what is
+in question is whether the agent finds it. That is why a case needs a `domain:` slug and
+deterministic checks, and why adding one changes what a pull request reports.
+
+A `bench/cuj/` journey is a **manual tier: a live black-box test you run by hand against your own
+install, never part of the presubmit**. It plants nothing and provisions nothing. It talks to Kage
+as a user through the admin portal API and scores only evidence the deployed system returned, so the
+subject is the install: the agent is assumed to work, and what is in question is whether this
+deployment is wired up. It needs a real installation to point at, which is why no CI job runs it,
+why adding one changes nothing about what a pull request reports, and why it cannot gate anything.
+
+Being manual is the design rather than a gap someone will automate later. The tier is what you reach
+for after an install or an upgrade, to confirm the deploy landed, and while working a bug on a live
+system — the cases where the question is about one deployment and no amount of CI could answer it.
+Write a journey expecting to run it yourself, and do not expect anything to run it for you.
+
+Rule of thumb: if you would have to break something on purpose for the test to be meaningful, it is
+a `bench/tasks/` case. If you would run it against production to check the deploy landed, it is a
+`bench/cuj/` journey.
+
+**The two paths-filtered workflows report `success` on a pull request that ran nothing.**
+`k8s-operator-test.yml` and `a2a-test.yml` both run `dorny/paths-filter` and then gate
+every subsequent step on the result, so the job always completes and the check always goes green.
+`k8s-operator-test.yml`'s own header comment says it: the job "reports `success` on a pull request
+that ran no tests". A change that breaks an operator contract from outside `k8s-operator/**` gets a
+green `Run Controller Tests` that compiled nothing.
+
+**In `a2a/`, the tests that prove the bus's authorization model are the ones that skip.**
+The auth callout's suite has three tiers and only the first runs everywhere. Tests that
+stand up an embedded `nats-server` against a fake clientset need nothing, and that includes
+the end-to-end connect through the callout. Tests that need the `nats` CLI on `PATH` are the
+JetStream-API escape probes.
+Tests that stand up a real API server — the pod-bound token claims, the end-to-end connect
+through the callout, a whole session run under its own derived grants — need
+`KUBEBUILDER_ASSETS`, and they `t.Skip` without it. `make verify` sets neither, so it reports
+green on a change that broke every one of them. `a2a-test.yml` installs both, which is what
+actually gates; locally, run
+
+```
+KUBEBUILDER_ASSETS="$(make -C k8s-operator -s envtest-path)" go test ./...
+```
+
+from `a2a/` before believing a security change in that module. A fourth tier,
+`a2a/worker-adapter/live_test.go` and `a2a/gateway/live_test.go`, needs a real install and is
+gated on `A2A_LIVE_NATS_URL`; nothing automatic runs it.
+
+**`tests/e2e/` is not manual-only.** `rc-scheduler.yml` runs on `cron: "17 */3 * * *"` and
+dispatches `rc-release-pipeline.yml` whenever a new candidate exists, and
+`step-4-tag-validated` depends on the suite. Breaking a test there is not free — it reds the
+release-candidate pipeline within three hours and stops the tag. Both it and `staging-promotion-pipeline.yml`
+reach the suite through the same reusable `e2e-run.yml`; `e2e-gchat-test.yml` and
+`e2e-manual-runner.yml` are the by-hand callers. `tests/e2e/operator/agentplugins_e2e_test.py` is
+the exception inside the exception: it is the whole of the `agent-plugin` suite and is in the
+`nightly` E2E test set too, and `staging-promotion-pipeline.yml` runs `agent-plugin` as tolerated coverage
+rather than as its gate — so the scheduler dispatches the pipeline daily when an eligible
+candidate exists, so it does run automatically — and nothing fails when it does.
+
+**A `*_e2e_test.py` suffix opts a plugin test out of CI, and `test_*.py` opts it in.**
+The `agentplugins/*/tests/test_*.py` glob in `PYTHON_TEST_DIRS` matches `test_*.py`, which
+deliberately does not match the `*_e2e_test.py` suites sitting in the same directory. Naming a live-infrastructure test
+`test_dedup_e2e.py` rather than `dedup_e2e_test.py` joins it to the pull-request suite, where it
+needs a Pub/Sub topic that CI does not have.
+
+## Disambiguating scheduled and periodic jobs
+
+Multiple automated jobs run on timers or tags across Prow and GitHub Actions. Several share the
+colloquial name "nightly" despite running on different platforms, with different triggers, budgets,
+and purposes:
+
+| Job                              | Platform        | Trigger                                                 | Input                                     | What it produces                                                                                                                   |
+| -------------------------------- | --------------- | ------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `rc-release-pipeline.yml`        | GitHub Actions  | `rc-scheduler.yml`, `cron: "17 */3 * * *"`              | A commit on `main`                        | `rc_<ts>_<sha>`, then `rc_<ts>_<sha>_validated`                                                                                    |
+| `staging-promotion-pipeline.yml` | GitHub Actions  | `staging-promotion-scheduler.yml`, `cron: "17 2 * * *"` | A validated `rc_` tag                     | The E2E matrix, then an `evalcand_` tag that nominates the commit for the eval below, then, on a green verdict, the `staging_` tag |
+| `post-kube-agents-eval-rc`       | Prow postsubmit | An `evalcand_` tag push                                 | Nominated candidate commit (`evalcand_*`) | A verdict on that candidate against the merge-blocking presubmit matrix, not the full catalog (360m budget, parallelism 4)         |
+| `ci-kube-agents-eval-nightly`    | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | Baseline evidence store and dashboard rows against the eval catalog (480m budget, parallelism 6)                                   |
+| `ci-kube-agents-pool-pressure`   | Prow periodic   | `cron: "23 * * * *"`                                    | None (leases nothing)                     | Pool health verification                                                                                                           |
+
+When diagnosing failures or reporting incidents, name the specific job rather than saying "the nightly":
+
+`ci-kube-agents-eval-nightly` is the Prow periodic eval grading `main` against the full evaluation catalog (`presubmit-cases.txt` plus `nightly-cases.txt`).
+
+`staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
+
+`post-kube-agents-eval-rc` grades nominated candidates against the merge-blocking presubmit matrix, the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
+
+## Running on a pull request is not gating a merge
+
+The last column says what a trigger and its `if:` conditions support, which is a weaker claim than
+"blocks the merge". Which checks are actually required lives in branch protection on
+`gke-labs/kube-agents` and in Prow config in `GoogleCloudPlatform/oss-test-infra`; neither is a file
+in this repository, so this table asserts nothing about either.
+[`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
+contexts as they stand, gives the command to read them back, and says why that command sees only
+the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
+local answer to the same question — everything a pull request must pass offline, in one target —
+and [`pull-request-workflow.md`](pull-request-workflow.md#local-validation-before-committing) lists
+the individual targets to run when you have touched a given area.
+
+Per-tier detail lives with each tier: [`bench/cuj/README.md`](../bench/cuj/README.md) for adding a
+journey, [`tests/integration/README.md`](../tests/integration/README.md) for the seam tier,
+[`tests/e2e/README.md`](../tests/e2e/README.md) for the release gate,
+[`bench/README.md`](../bench/README.md) for running the evals that already exist, and the `## Tests`
+section of each Terraform module README that has one, for what its `terraform test` suite covers.
+
+For an eval case, [`bench-case-format.md`](designs/bench-case-format.md) is the contract and this
+page does not restate it. It rules on what a `task.yaml` must carry — the `id`, the mandatory
+`domain:` slug, `owner:` and `verification_spec`, the exact-versus-judged line, and which keys red
+a build —
+and `make bench-case-check` checks it in about a second before you push. The target itself
+runs in no workflow: `scripts/test_task_registration.py` calls the same validator and
+asserts it returned no findings, and that lint is what gates, through `PYTHON_TEST_DIRS`
+and `python-tests.yml`. Read the contract before writing a case;
+[`bench/CUSTOM-TASKS.md`](../bench/CUSTOM-TASKS.md) is the walkthrough that sits under it.
+
+## The trap that spans every tier
+
+**A new test directory that no wildcard reaches never runs.** `make test-python` discovers from
+`PYTHON_TEST_DIRS`, a list of globs in the `Makefile`. A directory the globs miss fails
+nothing — it sits unexecuted and the suite reports green around it, which is how eight test files
+stayed unrun for months. Adding a directory means adding its glob in the same change.
+`scripts/test_test_discovery.py` fails the build if you forget, and its `EXCLUDED` dict is where a
+directory goes that must deliberately not run, with the reason it must not. The Terraform tier has
+the same shape: `make terraform-test` loops over `terraform/modules/*/` and `terraform/examples/*/`,
+a `.tftest.hcl` anywhere else runs nowhere, and `tests/test_terraform_module_tests.py` fails the
+build on one.
+
+This is the one that catches people who put a test in a reasonable-looking place. The equivalent
+traps for eval cases — a missing `domain:` slug counting as coverage of nothing, and a presubmit
+seat before the activation blockers in [`../bench/tasks/DRAFTS.md`](../bench/tasks/DRAFTS.md)
+clear — are in [`bench-case-format.md`](designs/bench-case-format.md), enforced rather than
+described.

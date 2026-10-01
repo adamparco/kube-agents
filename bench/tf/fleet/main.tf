@@ -95,6 +95,90 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
   member  = "serviceAccount:${google_service_account.fleet_nodes.email}"
 }
 
+# ---------------------------------------------------------------------------
+# The evaluation READ credential.
+#
+# Every open pull request's presubmit reads this fleet at the same time, and a
+# check that can write to it spoils a fixture for whoever is running minutes
+# later -- non-deterministically, and in someone else's build. The runner's own
+# identity has to create GKE clusters for the eval tasks, so handing it to the
+# verifiers would be handing them cluster-admin on the shared fleet.
+#
+# roles/container.viewer is the whole grant, verified against the live role
+# rather than assumed: get/list only, no create/update/delete/patch on any
+# Kubernetes object (its one *.create is container.tokenReviews.create, the
+# read-shaped token validation API), and no container.secrets.* at all -- so
+# this account cannot read a Secret on platform-agent-host either. It is
+# project-scoped because IAM is where GKE authorization starts; the fleet
+# stack's kubernetes provider only reaches seeded-a, so an RBAC-level grant
+# could not cover b and c.
+#
+# hack/fleet-kubeconfigs.sh binds it by minting an access token
+# (FLEET_READONLY_SA), which is why the token-creator grant below exists.
+# Impersonation on `gcloud container clusters get-credentials` would NOT do:
+# get-credentials writes an exec entry for gke-gcloud-auth-plugin, and that
+# plugin has no impersonation, so the flag changes who read the cluster
+# metadata and nothing about who kubectl talks to the API server as.
+resource "google_service_account" "fleet_reader" {
+  account_id   = "seeded-fleet-reader"
+  display_name = "Read-only credential for seeded-fleet evaluation checks"
+}
+
+resource "google_project_iam_member" "fleet_reader_container_viewer" {
+  project = var.project_id
+  role    = "roles/container.viewer"
+  member  = "serviceAccount:${google_service_account.fleet_reader.email}"
+}
+
+# Who may mint a token AS the reader. Defaults to the pool's Prow runner, which
+# is what closes the write path -- see variables.tf for why the default lives
+# there rather than in the caller. A project with no entry still gets the
+# account, but fleet-kubeconfigs.sh refuses to read the fleet on the runner's
+# own credential, so a run that leases it stops at its fleet step.
+resource "google_service_account_iam_member" "fleet_reader_token_creators" {
+  for_each           = toset(var.fleet_reader_token_creators)
+  service_account_id = google_service_account.fleet_reader.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = each.value
+}
+
+# ---------------------------------------------------------------------------
+# The pool-state scan's read on the project (#1967).
+#
+# The CI health bot's other hourly scan runs scripts/verify_ci_pool_project.py's
+# read-only checks against every pool project as the bot itself, so it needs
+# project-level read here: the project and its IAM policy, the service
+# accounts' policies, the service listing, the cluster listing, the
+# repository, the key and its policy, the state bucket's metadata. These
+# roles cover every read those checks make on the project; none writes. The
+# warm-cache repository's policy in the Prow project stays unread. They live in this
+# stack, beside the reader's token-creator grant, because this is the one
+# stack every pool project applies: a project provisioned after this landed
+# gets the grant with no separate step, and one applied before it is one
+# re-apply, or the loop in docs/ci-health.md ("The pool-state scan").
+locals {
+  # Kept equal to POOL_STATE_READER_ROLES in scripts/verify_ci_pool_project.py
+  # by scripts/test_verify_ci_pool_project.py.
+  pool_state_reader_roles = [
+    "roles/iam.securityReviewer",
+    "roles/container.clusterViewer",
+    "roles/artifactregistry.reader",
+    "roles/cloudkms.viewer",
+    "roles/storage.bucketViewer",
+  ]
+  pool_state_reader_grants = {
+    for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
+    "${pair[0]} ${pair[1]}" => { member = pair[0], role = pair[1] }
+  }
+}
+
+resource "google_project_iam_member" "pool_state_readers" {
+  for_each = local.pool_state_reader_grants
+  project  = var.project_id
+  role     = each.value.role
+  member   = each.value.member
+}
+
 # seeded-b is held one minor version behind whatever the REGULAR channel
 # currently defaults to, derived live rather than hardcoded so the pin does
 # not rot: each apply re-computes "current default minus one". The cluster
@@ -223,12 +307,22 @@ resource "google_container_node_pool" "seeded_a_default" {
   name       = "default-pool"
   location   = var.zone
   cluster    = google_container_cluster.seeded_a.name
-  node_count = 1
+  node_count = 2
 
   node_config {
-    # e2-medium rather than e2-small: cluster A hosts the defect workloads
-    # (checkout-gateway, payments-api) alongside system pods, and e2-small's
-    # ~1.5 GiB allocatable cannot fit them all.
+    # e2-medium, two of them (2026-09-08, #1278). Cluster A hosts the defect
+    # workloads (checkout-gateway, payments-api) alongside GKE's system pods,
+    # and the binding constraint is CPU *requests*, not memory: one
+    # e2-medium's 940m allocatable is fully claimed by system pods alone
+    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity, ...).
+    # The fixtures only ever ran because they scheduled before the system
+    # set filled in; the weekend auto-upgrade rebuilt the node, system-
+    # critical pods scheduled first, and every fixture went Pending on all
+    # 30 pool projects. A second node holds the fixtures plus the Pending
+    # system deployments with ~600m to spare, and survives the next node
+    # rebuild (surge upgrades rotate one node at a time). Matches the live
+    # `gcloud container clusters resize` applied during the incident, so
+    # the next apply is a no-op, not a pool replacement.
     machine_type    = "e2-medium"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
@@ -348,14 +442,14 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
-# upgrade SOP's master-behind check keys every branch off the cluster's
+# upgrade SOP's master-behind check grades (b) and (c) off the cluster's
 # channel entry in get-server-config: branch (b), the one this defect
 # exists to trip, is minor(currentMasterVersion) < minor(channel
 # defaultVersion), severity major. A channel-less cluster has no channels[]
-# entry, so (b)/(c) cannot evaluate, and branch (a) -- version absent from
-# validMasterVersions -- is false by construction here because the pin is
-# drawn from that very list. The earlier UNSPECIFIED design hid the defect
-# from the audit it was planted for.
+# entry, so (b)/(c) cannot evaluate; the earlier UNSPECIFIED design hid the
+# defect from the audit it was planted for. Branch (a) -- version offered by
+# no channel and absent from validMasterVersions -- stays false while the
+# pin, drawn from that very list, remains in it.
 #
 # What holds the lag under a channel: the maintenance exclusion below, at
 # scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now

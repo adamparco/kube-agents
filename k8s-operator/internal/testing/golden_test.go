@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -19,18 +20,48 @@ import (
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/testing/testutil"
 )
 
-var (
-	update     = flag.Bool("update", false, "update golden files")
-	testScheme = runtime.NewScheme()
-)
+var update = flag.Bool("update", false, "update golden files")
 
-func init() {
-	_ = agentv1alpha1.AddToScheme(testScheme)
-	_ = corev1.AddToScheme(testScheme)
-	_ = appsv1.AddToScheme(testScheme)
-	_ = networkingv1.AddToScheme(testScheme)
-	_ = policyv1.AddToScheme(testScheme)
-	_ = rbacv1.AddToScheme(testScheme)
+// newTestScheme builds a Scheme for one subtest. Per-subtest and not a shared
+// package-level var, because a Scheme is not safe to hand to concurrent fake
+// clients: controller-runtime's fake client lazily registers types it has not
+// seen (fake.(*fakeClient).addToSchemeIfUnknownAndUnstructuredOrPartial calls
+// Scheme.AddKnownTypeWithName). That function does take c.schemeLock, which is
+// why this looks safe at a glance -- but schemeLock is a field on the client,
+// so it orders writes within one fake client and nothing at all across the
+// three siblings here that were handed the same Scheme.
+//
+// The readers are wider than the writers. Every SSA Create rebuilds a
+// RESTMapper over the Scheme (testrestmapper.TestOnlyStaticRESTMapper ->
+// Scheme.PrioritizedVersionsForGroup), so a single lazy write races the whole
+// of every sibling's reconcile, not just their own lazy writes. Measured on the
+// parent commit: 23 of 25 race-detector runs report it, and 7 of 40 plain runs
+// die outright with `fatal error: concurrent map writes`.
+//
+// A fatal error is not a recoverable panic: it killed the whole binary and
+// printed whichever goroutine happened to be mid-reconcile, so it read as a
+// defect in whatever the reader had just touched rather than as test-harness
+// contention (#918).
+//
+// Registering more types up front is the tempting narrower fix, and for today's
+// code it does work -- FQDNNetworkPolicy is the only type the golden path
+// reaches lazily, and pre-registering it takes the race to 0 of 25. It is not
+// the fix taken, because it holds only until the next unregistered type, and
+// the lazy path fires precisely on the types nobody thought to register.
+// Isolation does not depend on that guess: a Scheme reachable from one
+// goroutine cannot be raced on.
+func newTestScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	_ = agentv1alpha1.AddToScheme(s)
+	_ = corev1.AddToScheme(s)
+	_ = appsv1.AddToScheme(s)
+	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
+	// reconcile, which is every golden case.
+	_ = batchv1.AddToScheme(s)
+	_ = networkingv1.AddToScheme(s)
+	_ = policyv1.AddToScheme(s)
+	_ = rbacv1.AddToScheme(s)
+	return s
 }
 
 func TestAgentsGolden(t *testing.T) {
@@ -70,6 +101,66 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
 			},
 		},
+		{
+			// The scoped service account pool on. Diff this against
+			// platformagent-tagged.yaml and the whole of what
+			// spec.security.scopedServiceAccounts renders is a ConfigMap key,
+			// a SubPath mount and two environment variables — which is the
+			// point of the fixture. The exit criterion for that work is that
+			// the cluster-to-account mapping is readable off a manifest rather
+			// than inferred from what the broker does at runtime, and a golden
+			// file is the only artifact that can hold that claim honestly.
+			name:         "PlatformAgentScopedServiceAccounts",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-scoped-sa.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scoped-sa.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
+			// A spec.scope block. Diff this against platformagent-tagged.yaml and the
+			// whole of what phases 1 to 3 of docs/designs/multi-project-scope.md render is
+			// one ConfigMap key, scope.json, sorted regardless of declaration order (projects, folders, organisations, Shared VPC hosts, Metrics Scopes, exclusions);
+			// the optional volume, its mount and KUBEAGENTS_SCOPE_FILE are in every
+			// expected output because they do not depend on the field being set.
+			name:         "PlatformAgentScope",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-scope.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scope.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
+			// The above-one-replica shape. This is the only fixture that
+			// renders the leader Role's pods get/patch rule, and it is here
+			// because that rule is the agent identity's one write grant --
+			// the shape a reviewer most needs to be able to read off a
+			// manifest, and the one every other fixture renders away.
+			name:         "PlatformAgentHighAvailability",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-ha.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-ha.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
+			// The egress policy on. Diff this against
+			// platformagent-tagged.yaml and the whole of what
+			// spec.security.egressPolicy renders is one NetworkPolicy —
+			// which is the object that has to be read carefully, since an
+			// egress allowlist that is subtly wrong either breaks the agent
+			// or protects nothing.
+			name:         "PlatformAgentEgressAllowlist",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-egress-allowlist.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-egress-allowlist.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -80,7 +171,7 @@ func TestAgentsGolden(t *testing.T) {
 				tt.inputPath,
 				tt.expectedPath,
 				*update,
-				testScheme,
+				newTestScheme(),
 				tt.newAgent,
 				tt.newReconciler,
 			)

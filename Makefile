@@ -13,7 +13,23 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
+# The sandbox image is built from a different Dockerfile and shares none of
+# those bases, so it takes its own list. Passing the union to both would make
+# every build warn about build args the Dockerfile never declares.
+SANDBOX_IMAGE_VARS := PYTHON_IMAGE
+SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
+# What the image reports as its own version. Hermes interpolates it into the
+# `User-Agent` of every remote-MCP call, so an image built without it is
+# indistinguishable on the wire from any other. Both cloudbuild files, the
+# CI deploy and `dev_rebuild_agent.sh` already pass it; these targets are the
+# only image entry point that did not, and they publish to $(REPO) like the
+# rest. `dev` matches the Dockerfile's own ARG default, so a plain
+# `make docker-build` is unchanged.
+KUBE_AGENTS_VERSION ?= dev
+VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
+
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -33,7 +49,7 @@ help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\n"} /^[a-zA-Z_0-9][a-zA-Z_0-9 -]*:.*##/ { printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # Docker builds
-docker-build: docker-build-agents docker-build-credential-proxy ## Build every image in deploy/docker/Dockerfile (the default target).
+docker-build: docker-build-agents docker-build-credential-proxy docker-build-sandbox ## Build every image this repository ships (the default target).
 docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build the agent images (see the AGENTS variable).
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
@@ -42,13 +58,25 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build t
 # otherwise resolve to the build host — an arm64 machine would silently produce
 # an image that crashloops on the cluster (#560).
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
-	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(VERSION_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+
+# Context is the repository root, not deploy/sandbox: the image ships the same
+# credential-proxy client and PATH script the agent image does, and copying
+# them into deploy/sandbox to narrow the context is how the two drift apart.
+docker-build-sandbox: ## Build the agent shell sandbox image.
+	docker build --platform linux/amd64 $(SANDBOX_IMAGE_ARGS) -t $(REPO)/agent-sandbox:latest -f deploy/sandbox/Dockerfile .
+
+# Not folded into docker-build-sandbox: it runs containers and binds a port,
+# which a plain build should not do. The script explains why the checks it makes
+# cannot be made statically.
+docker-smoke-sandbox: docker-build-sandbox ## Build the sandbox image and exercise it over ssh.
+	deploy/sandbox/smoke-test.sh $(REPO)/agent-sandbox:latest
 
 # Docker pushes
-docker-push: docker-push-agents docker-push-credential-proxy ## Build and push every image to $$REPO.
+docker-push: docker-push-agents docker-push-credential-proxy docker-push-sandbox ## Build and push every image to $$REPO.
 docker-push-agents: $(foreach agent,$(AGENTS),docker-push-$(agent)) ## Build and push the agent images.
 
 .PHONY: $(foreach agent,$(AGENTS),docker-push-$(agent))
@@ -58,8 +86,12 @@ $(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
 docker-push-credential-proxy: docker-build-credential-proxy ## Build and push the credential-proxy image.
 	docker push $(REPO)/credential-proxy:latest
 
+docker-push-sandbox: docker-build-sandbox ## Build and push the agent shell sandbox image.
+	docker push $(REPO)/agent-sandbox:latest
+
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
-	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
+	@chmod +x scripts/installer/*.sh scripts/dev/*.sh 2>/dev/null || true
+	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
 # Copy every image in images.json into a registry of your own, for installs
 # that may only pull from an approved one. Run `./scripts/mirror_images.sh
@@ -67,7 +99,7 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents).
 	@./scripts/mirror_images.sh $(ARGS)
 
-images-check: ## Verify images.json still matches every pin it mirrors, and that the chart renders nothing off a public registry when mirrored (CI runs this).
+images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, and that the chart renders nothing off a public registry when mirrored (CI runs this).
 	@./hack/check-image-inventory.sh
 
 
@@ -94,14 +126,59 @@ prettier-check: ## Check Markdown/YAML formatting (CI runs this).
 prettier-write: ## Reformat all Markdown/YAML in place.
 	$(PRETTIER) --write "**/*.md" "**/*.yaml" "**/*.yml"
 
-# Unit tests for every Python helper outside k8s-operator/, which has its own
-# target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl
-# rather than importing SDKs -- but the agent scripts do import a few third
-# party packages, listed in requirements-test.txt and installed by
-# `make test-python-deps`. CI installs the same file.
+# Every tracked shell script through shellcheck. The `validate` job in
+# .github/workflows/validate.yml runs this target on every pull request with
+# the shellcheck release it pins there, so a warning in a tracked script fails
+# the merge; run it with that release locally, since the apt package is older
+# and reports a different set. No `-s`: each shebang decides the dialect, so
+# deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
+# SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
+# sources a runtime path that `-x` cannot follow; every other finding is fixed
+# or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
+# list is how a real finding gets silenced.
+#
+# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
+# copies of google/skills that scripts/sync-upstream-skills.py deletes and
+# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
+# hooks rewrite SKILL.md only, so a directive or fix written into one of their
+# .sh files lasts until the next sync and the target goes red on a tree nobody
+# edited by hand. A warning in one of them is fixed upstream, not here.
+SHELLCHECK_PATHSPEC := *.sh
+SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
+SHELLCHECK_SEVERITY := warning
+SHELLCHECK_EXCLUDE := SC1090,SC1091
+
+shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
+		exit 1; \
+	}
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+
+# ruff's error-only rules: syntax errors (E9), comparisons that are always
+# wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
+# class of defect #1413 fixed by hand. tests/test_lint_python.py runs this same
+# command, so `make test-python` and `make coverage` already enforce it on
+# every pull request; this target is the developer entry point, and the test
+# asserts its rule set matches this one. --isolated because the repository has
+# no ruff config file and a user-level one must not change the verdict. ruff
+# itself comes from requirements-test.txt (`make test-python-deps`).
+RUFF_SELECT := E9,F63,F7,F82
+
+lint-python: ## Run ruff's error rules over every Python file (the set tests/test_lint_python.py enforces).
+	@python3 -m ruff check --isolated --select $(RUFF_SELECT) .
+
+# Unit tests for every Python helper in the tree, the operator's leader-election
+# wrapper (k8s-operator/internal/controller) included. `make -C k8s-operator
+# test-python` runs that one too, so operator work stays self-contained; it is
+# one small file, so the second run under `make verify` costs nothing. Mostly
+# stdlib-only -- the skill helpers shell out to gh/kubectl rather than importing
+# SDKs -- but the agent scripts do import a few third party packages, listed in
+# requirements-test.txt and installed by `make test-python-deps`. CI installs
+# the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Eight globs rather than one because the tests do
+# without editing this file. Several globs rather than one because the tests do
 # not all live under skills -- the admin console, the shared agent scripts,
 # Chat Agent plugins and hooks, image patches, image build and repository
 # tooling in scripts/ each hold their own. scripts/ is here
@@ -116,6 +193,16 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # deploy/docker, deploy/docker/patches and each deploy/docker/plugins/<name>
 # separate, which they must be: those tests import their subject by bare module
 # name, which only resolves with their own directory as the discovery root.
+#
+# tests/integration is the newest entry and the only one that is not a unit
+# suite. It ran alone in its own CI job through a probation period, so that a
+# flake in a young seam test could not red an already-gating job; it finished
+# that period without a single failure, and a tier nothing gates on is a tier
+# people learn to merge around. It is deterministic by construction -- real
+# components, no model calls -- so it belongs in the sweep the `test` job runs
+# rather than beside it. The one thing that costs: the injector seam shells out
+# to `go test`, so every job that expands this list needs a Go toolchain on
+# PATH or those tests skip themselves and the sweep reports green without them.
 PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
@@ -123,11 +210,106 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
+	$(wildcard agentplugins/*/tests/test_*.py) \
+	$(wildcard agentplugins/lib/tests/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
-	$(wildcard tests/test_*.py)))
+	$(wildcard tests/integration/test_*.py) \
+	$(wildcard tests/test_*.py) \
+	$(wildcard tests/memory/test_*.py)))
+
+# What both callers of the sweep below -- test-python and coverage -- export as
+# PYTHONPATH, prepended to whatever the caller already has. Declared once
+# because the two had already drifted: coverage exported only $(CURDIR), so it
+# resolved imports differently from the suite it claims to mirror. Nothing
+# depended on the difference yet, which is exactly why it went unnoticed -- the
+# coverage target tolerates a failing directory, so a test that needed the
+# missing entries would have been swallowed by the "failing test directories"
+# note. Now that the same run produces the required verdict, that drift would
+# read as a test that passes locally under `make test-python` and fails in CI.
+#
+# Sharing the sweep made the discovery structural; this makes the environment it
+# runs in structural too, which is the other half of measuring the same suite.
+PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform
+
+# How many of those directories `test-python` and `coverage` run at once. They
+# are separate `python3` processes that share nothing -- each cd's into its own
+# directory, servers in the seam tier bind port 0, and fixtures go through
+# tempfile -- so the sweep costs its slowest single directory rather than the
+# sum of all of them. Four directories are most of that sum, so the win is
+# large and then flat: raising this past a handful buys nothing.
+#
+# Set it to 1 to serialise. That is for reproducing a failure you suspect is
+# concurrency's doing, or for a machine you need the cores back on -- not for
+# readability, since the sweep captures each directory's output either way:
+#   make test-python PYTHON_TEST_JOBS=1
+PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
+
+# The sweep over PYTHON_TEST_DIRS that `test-python` and `coverage` both run.
+# $(1) is the command executed inside each directory, and it is the only thing
+# the two callers differ by.
+#
+# One macro rather than two loops because that mirroring is load-bearing and
+# used to be only asserted in a comment: a coverage target that walks the
+# directories differently measures a different suite than the one that gates,
+# and nothing would say so. Sharing the sweep makes it structural.
+#
+# Contract: leaves `$$failed` set to a space-separated list of the directories
+# whose command exited non-zero, empty when none did. The caller decides what
+# that means -- test-python exits 1, coverage prints a note and carries on.
+#
+# Two properties the sequential loop had, kept by different means now that the
+# directories run concurrently. Every directory still runs even after another
+# fails: xargs keeps going, and each worker records its own verdict in a file
+# because a variable assigned in a subprocess cannot come back to the parent.
+# And each directory's output still arrives as a labelled block, because it is
+# captured to its own file and printed afterwards in PYTHON_TEST_DIRS order --
+# concurrent writers to one stream interleave mid-line and the "==> dir" headers
+# stop meaning anything. What that costs is progress, and a run killed mid-sweep
+# (a CI cancellation, a step timeout) loses the captured output entirely, so
+# each worker prints a line as it finishes to leave something behind.
+#
+# The verdict file is per-directory and read as fail-closed: a directory whose
+# .rc is missing or non-zero counts as failed. One shared append-only file would
+# be shorter, but a failed append -- a full TMPDIR, which 25 concurrent suites
+# make likelier than the old loop did -- would silently drop a red directory and
+# let the gate pass. Absence has to mean failure, not success.
+#
+# $(1) is interpolated into a single-quoted sh -c string, so it must not contain
+# a single quote. It also must not contain a comma: $(call) splits arguments on
+# commas before the body ever sees them, so `python3 -c "import os, sys"` would
+# arrive silently truncated at the comma. Both callers avoid each.
+define sweep_python_test_dirs
+work=$$(mktemp -d); \
+trap 'rm -rf "$$work"' EXIT INT TERM; \
+export work; \
+printf '%s\n' $(PYTHON_TEST_DIRS) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
+	dir="$$1"; \
+	stem="$$work/$$(printf "%s" "$$dir" | tr "/" "_")"; \
+	if (cd "$$dir" && $(1)) >"$$stem.log" 2>&1; then \
+		rc=0; printf "    ok  %s\n" "$$dir"; \
+	else \
+		rc=1; printf "  FAIL  %s\n" "$$dir"; \
+	fi; \
+	echo "$$rc" >"$$stem.rc" \
+' _ {}; \
+echo; \
+failed=""; \
+for dir in $(PYTHON_TEST_DIRS); do \
+	echo "==> $$dir"; \
+	stem="$$work/$$(printf "%s" "$$dir" | tr "/" "_")"; \
+	if [ -f "$$stem.log" ]; then \
+		cat "$$stem.log"; \
+	else \
+		echo "no output captured -- this directory never ran"; \
+	fi; \
+	[ "$$(cat "$$stem.rc" 2>/dev/null)" = "0" ] || failed="$$failed $$dir"; \
+done; \
+failed=$${failed# }
+endef
 
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
@@ -136,6 +318,16 @@ PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicor
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
+
+e2e-tests: ## Run the live E2E promotion test suite against the target GKE cluster.
+	@./scripts/release/execute_e2e_tests.sh
+
+test-e2e: e2e-tests ## Alias for e2e-tests.
+
+test-e2e-deps: ## Install dependencies required to run the E2E test suite.
+	@python3 -m pip install -r tests/e2e/requirements.txt
+
+e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.
@@ -146,17 +338,22 @@ test-python-deps: ## Install the third-party imports `make test-python` needs.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
+	@echo "==> go build (a2a)"; cd a2a && go build ./...
+	@echo "==> go vet (a2a)";   cd a2a && go vet ./...
+	@echo "==> go test (a2a)";  cd a2a && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
+	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
+	@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test
 	@echo "==> verify OK"
 
-test-python: ## Run the Python unit tests outside k8s-operator/.
+test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
+		echo "Error: the PYTHON_TEST_DIRS globs matched no test_*.py files."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
@@ -185,58 +382,106 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 # tests) never ran at all, while the output still ended in a familiar-looking
 # failure. A red run that hides four green directories is survivable; one that
 # hides an untested directory is not.
-	@failed=""; \
-	for dir in $(PYTHON_TEST_DIRS); do \
-		echo "==> $$dir"; \
-		(cd $$dir && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
-	done; \
+#
+# Both survive the move to concurrency; sweep_python_test_dirs says how.
+	@export PYTHONPATH="$(PYTHON_TEST_PATH):$${PYTHONPATH:-}"; \
+	$(call sweep_python_test_dirs,python3 -m unittest discover -p "test_*.py"); \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
 		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
 	done; \
 	if [ -n "$$failed" ]; then \
 		echo; \
-		echo "Failing test directories:$$failed"; \
+		echo "Failing test directories: $$failed"; \
 		if [ -n "$$missing" ]; then \
 			echo "Missing third-party imports:$$missing -- run: make test-python-deps"; \
 		fi; \
 		exit 1; \
 	fi
 
-# Coverage runs the same suite the same way -- the loop below is test-python's
-# loop with `coverage run` in place of `python3`. That mirroring is the point:
-# a coverage target that discovers tests any other way measures a different
-# suite. Two things differ. COVERAGE_ROOT pins the measured tree to the
-# repository root (the loop cd's into each directory, and .coveragerc reads the
-# variable because `source` cannot be relative from seventeen places), and
-# COVERAGE_FILE parks every per-directory data file in one place for
-# `coverage combine`. Failing directories are reported but do not stop the
-# measurement: test-python is the gate, this is the meter, and the 13
-# pre-existing failures must not hide the number for the other directories.
+# Coverage runs the same suite the same way -- literally the same sweep as
+# test-python, through sweep_python_test_dirs, with `coverage run` in place of
+# `python3`. That mirroring is the point: a coverage target that discovers tests
+# any other way measures a different suite. Two things differ. COVERAGE_ROOT
+# pins the measured tree to the repository root (the sweep cd's into each
+# directory, and .coveragerc reads the variable because `source` cannot be
+# relative from seventeen places), and COVERAGE_FILE parks every per-directory
+# data file in one place for `coverage combine`. By default a failing directory
+# is reported but does not stop the measurement, so a red directory cannot hide
+# the number for the others.
+#
+# Concurrency needs nothing extra here: .coveragerc already sets parallel = True,
+# so each process writes its own data file suffixed with host and pid and the
+# `coverage combine` below merges them. That setting was there for the
+# per-directory loop, and it is the same property concurrent directories need.
+#
+# COVERAGE_STRICT=1 makes the target fail at the end when any directory failed,
+# which is what lets one run serve as both the verdict and the meter. CI's
+# required job sets it, so the verdict and the number come from one execution
+# rather than a measured run beside an unmeasured one on the same interpreter;
+# the one other run of the sweep in CI is on the agent image's Python, which is
+# a different question, not a second meter. The default stays 0 because
+# a local run against a tree with known-red directories should still print a
+# total. The failing list travels through a file because each recipe line is its
+# own shell: the sweep leaves `$$failed` set in the shell that called it, and
+# the check at the bottom of the target runs in a different one.
 COVERAGE_DIR := .coverage-data
+COVERAGE_STRICT ?= 0
+COVERAGE_FAILED_FILE := failed-dirs.txt
+# Named rather than written literally in the four places below so a test can
+# point one run's output somewhere else. tests/ is itself a PYTHON_TEST_DIR, so
+# a test that invoked this target with the defaults would `rm -rf` the data
+# directory of the very sweep it is running inside -- concurrently, and with no
+# error, leaving the outer run to combine whatever survived.
+COVERAGE_XML ?= coverage.xml
+COVERAGE_GO_XML ?= coverage-go.xml
 
 coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
-	@rm -rf $(COVERAGE_DIR) coverage.xml coverage-go.xml
+	@rm -rf $(COVERAGE_DIR) $(COVERAGE_XML) $(COVERAGE_GO_XML)
 	@mkdir -p $(COVERAGE_DIR)
 	@if [ -z "$(strip $(PYTHON_TEST_DIRS))" ]; then \
 		echo "ERROR: PYTHON_TEST_DIRS expanded to nothing; the globs above are stale."; \
 		exit 1; \
 	fi
-	@failed=""; \
-	for dir in $(PYTHON_TEST_DIRS); do \
-		echo "==> $$dir"; \
-		(cd $$dir && COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
-			PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" \
-			python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py") \
-			|| failed="$$failed $$dir"; \
+# Validated here rather than beside the gate it controls, which runs last: a
+# typo would otherwise cost the whole suite before saying so. Anything but 0 or
+# 1 is refused instead of guessed -- every truthy-looking spelling (true, yes,
+# on) reads as "not 1" to the test below, which turns the gate off silently and
+# is the one failure this flag exists to prevent.
+	@case "$(COVERAGE_STRICT)" in \
+		0|1) ;; \
+		*) echo "ERROR: COVERAGE_STRICT must be 0 or 1, got '$(COVERAGE_STRICT)'."; \
+		   exit 1;; \
+	esac
+# The same preflight test-python runs, and here for the same reason: a missing
+# package surfaces as an ImportError inside one directory's discovery, where it
+# reads like a broken test rather than a missing install. Duplicated rather than
+# factored out because a `define` would have to be expanded by both targets and
+# the indirection costs more than the six lines. A warning, not a hard stop --
+# the sweep's own exit status is what fails the run. It also keeps
+# PYTHON_TEST_IMPORTS exercised by CI: this target is the one CI invokes, so
+# without this the list could drift out of step with requirements-test.txt and
+# nothing would notice.
+	@missing=""; \
+	for mod in $(PYTHON_TEST_IMPORTS); do \
+		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
 	done; \
-	if [ -n "$$failed" ]; then \
-		echo "Note: failing test directories (their coverage is still recorded):$$failed"; \
+	if [ -n "$$missing" ]; then \
+		echo "Warning: missing third-party imports:$$missing"; \
+		echo "         Install them with:  make test-python-deps"; \
+		echo; \
 	fi
+	@export COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage; \
+	export PYTHONPATH="$(PYTHON_TEST_PATH):$${PYTHONPATH:-}"; \
+	$(call sweep_python_test_dirs,python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py"); \
+	if [ -n "$$failed" ]; then \
+		echo "Note: failing test directories (their coverage is still recorded): $$failed"; \
+	fi; \
+	printf '%s' "$$failed" > $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE)
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
 		python3 -m coverage combine --rcfile=$(CURDIR)/.coveragerc
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
-		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o coverage.xml
+		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o $(COVERAGE_XML)
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
 		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | grep '^TOTAL'
 # The Go half is best-effort: it needs gocover-cobertura for the XML diff-cover
@@ -258,7 +503,7 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 			test -n "$$KUBEBUILDER_ASSETS" && \
 			KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" \
 			go test -coverpkg=./... $$(go list ./... | grep -v /e2e) -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/go-cover.out && \
-			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(CURDIR)/coverage-go.xml) \
+			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(COVERAGE_GO_XML)) \
 		|| echo "Go coverage failed; the Python half above is unaffected."; \
 	fi
 # The envtest version is read from k8s-operator/Makefile's own pin rather than
@@ -266,10 +511,18 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 # operator's 1.36.0), and the empty-string failure mode -- setup-envtest
 # failing, KUBEBUILDER_ASSETS="" exported, every suite red, all of it
 # swallowed by the || echo above -- is why both reads are guarded with test -n.
+#
+# The strict gate, last in the target on purpose: combine, xml and report have
+# all run by the time it fails, so a red run still leaves coverage.xml on disk
+# for the CI job to upload and the coverage comment to be posted from.
+	@if [ "$(COVERAGE_STRICT)" = "1" ] && [ -s $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE) ]; then \
+		echo "FAIL (COVERAGE_STRICT=1) -- failing test directories: $$(cat $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE))"; \
+		exit 1; \
+	fi
 
-# 55 is a deliberately loose placeholder: the real floor gets committed from
-# the first green CI run of the coverage job, not from a laptop measurement,
-# because CI's Python and dependency set produce a different number.
+# 55 is a deliberately loose placeholder: the real floor gets committed from the
+# first green CI run of the `test` job's coverage sweep, not from a laptop
+# measurement, because CI's Python and dependency set produce a different number.
 COVERAGE_FLOOR ?= 55
 
 coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `make coverage` first.
@@ -287,19 +540,42 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # of its tests and errors on both. So it runs under its own target, and
 # scripts/test_test_discovery.py keeps the exclusion explicit rather than an
 # accident of the globs above.
-test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
-	@python3 -m pip install -e bench/ pytest
+# pyyaml is a test-only dependency and is named here rather than in bench's
+# runtime `dependencies`: the harness never parses a task.yaml itself (devops-
+# bench does that before any of this package is imported). One test reads the
+# specs directly -- the roster-collision sweep in tests/test_verifiers.py,
+# which has to see every task's phrases at once -- so the parser belongs with
+# the test runner. Keep in step with bench/pyproject.toml's `dev` group.
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
+	@python3 -m pip install -e bench/ pytest pyyaml
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
 
+# A broken bench case otherwise costs a full presubmit to discover: provision,
+# deploy, run the agent, score, read the log. Most of the ways a task.yaml is
+# broken are static -- an unknown domain slug, a fixture role the seeded fleet
+# never planted, a check with no assertion, a case in no TASKS entry -- so they
+# fail here in a second instead. The same rules gate in CI through
+# scripts/test_task_registration.py; this target is the fast path to them.
+bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
+		exit 1; \
+	}
+	@python3 scripts/validate_bench_cases.py
+
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
-# Deliberately NOT in PYTHON_TEST_DIRS while the tier is on probation: its own
-# CI job is the single runner, so a flake in a young seam test cannot red the
-# already-gating unit job. It joins the unit sweep when the job becomes a
-# required check; the discovery guard's exclusion entry tells the same story.
-test-integration: ## Run the in-process integration seam tests.
+# The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
+# test-python` and the CI `test` job both run it, and a red seam test is a red
+# pull request. This target is a convenience for running that one tier while
+# you work on a seam -- seconds instead of the whole sweep -- and is not what
+# CI invokes, so do not reach for it as the definition of what must pass.
+# Install a Go toolchain before trusting a green run here: the injector seam
+# compiles the real Go client, and without `go` on PATH it skips itself rather
+# than failing, which reads exactly like a pass.
+test-integration: ## Run just the integration seam tests; CI reaches them through the PYTHON_TEST_DIRS sweep.
 	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona
@@ -319,13 +595,17 @@ prompt-check: ## Verify the agent's instructions cite skills and files that exis
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
 # <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# The SOP line numbers each governance cron prompt cites are recomputed first,
+# so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
+	@python3 scripts/generate_sop_geography.py
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
+	@python3 scripts/generate_sop_geography.py --check
 	@python3 scripts/generate_docs.py --check
 
 docs-check-links:
@@ -337,20 +617,81 @@ docs-check-terminology:
 docs-check-map:
 	@python3 scripts/check_docs_map.py
 
+docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
+	@python3 scripts/check_docs_audience.py
+
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
 
-chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules from k8s-operator/config.
+chart-sync: ## Sync the chart's CRD, ClusterRole-rule and admission-policy copies from k8s-operator/config, and regenerate files/footprint.yaml from the operator golden; the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator golden (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
+
+iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "iac-parity-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
+		exit 1; \
+	}
+	@python3 scripts/check_iac_parity.py
+
+# The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
+# in front of the real binary (#1309 shipped against a stub that answered `null`
+# where Terraform answers `tostring(null)`; #1350 has the story).
+tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
+	@./hack/check-tfvar-console.sh
+
+# The version mock_provider needs; the install floor the modules declare is
+# lower, and a binary below this reads two green suites as a parse error, so
+# it is named up front, the way test-python names a missing import.
+TERRAFORM_TEST_MIN_VERSION := 1.7.0
+
+# Every module and composition that carries a tests/ directory -- the set
+# the validate job initialises -- against mocked providers, so a plan-time
+# rule -- a precondition, a postcondition on a read, the set of bindings a
+# declaration plans -- runs rather than being grepped for
+# (tests/test_scope_iam.py pins the text; these pin the behaviour). A
+# directory without tests/ is skipped, and a new one's tests/ is reached with
+# no edit here; tests/test_terraform_module_tests.py pins the loop, the step
+# and that no test file sits outside it. Every directory runs even after one
+# fails and the failures are named again at the end, for the reason
+# test-python gives: a red run that hides the next suite's result costs a CI
+# round trip to discover.
+terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
+	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
+	if [ -z "$$version" ]; then \
+	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
+	fi; \
+	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
+	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
+	fi; \
+	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
+	  if [ -d "$$dir/tests" ]; then \
+	    echo "Testing $$dir..."; \
+	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
+	  fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
 
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
 	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
+
+fleet-audit-view: ## Render the fleet-audit report store from the agent pod (e.g. make fleet-audit-view ARGS="--flagged").
+	@python3 scripts/fleet_audit_status_view.py $(ARGS)
+
+# Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
+# by someone remembering them, and a conformance suite whose CI entry depends
+# on a glob is a conformance suite that stops running. It has its own
+# unfiltered workflow (.github/workflows/conformance.yml) for the same reason,
+# and the package's load_tests refuses root discovery so `make test-python`
+# cannot also half-run it with bucket 2 surfacing as skips.
+conformance: ## Run the security invariant conformance suite (bucket 1, no cluster)
+	@python3 tests/conformance/run.py
 
 validate: ## Fail if any skill sits under agents/*/defaults/skills/.
 	@if [ -n "$(BAD_SKILLS)" ]; then \

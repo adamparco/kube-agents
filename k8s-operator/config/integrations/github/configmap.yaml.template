@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: github-token-minter-config
 data:
-  ${GITHUB_ORG}-${GITHUB_REPO}.yaml: |
+  default.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
       if: "assertion.iss == 'https://accounts.google.com'"
@@ -17,3 +17,31 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+      platform-agent-read-scope:
+        rule:
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+        repositories:
+          - '${GITHUB_REPO}'
+        permissions:
+          contents: 'read'
+  ${GITHUB_REPO}.yaml: |
+    version: 'minty.abcxyz.dev/v2'
+    rule:
+      if: "assertion.iss == 'https://accounts.google.com'"
+    scope:
+      platform-agent-scope:
+        rule:
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+        repositories:
+          - '${GITHUB_REPO}'
+        permissions:
+          contents: 'write'
+          pull_requests: 'write'
+          issues: 'write'
+      platform-agent-read-scope:
+        rule:
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+        repositories:
+          - '${GITHUB_REPO}'
+        permissions:
+          contents: 'read'

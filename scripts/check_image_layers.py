@@ -14,8 +14,11 @@ now builds from ``agent-base`` through a short ``proxy-tools`` stage instead, so
 Move ``DEFAULT_IMAGE`` if that ever stops being true -- a gate pointed at the
 shallower chain reports headroom that is not the headroom at risk. The one
 stage deeper than ``platform``, ``entrypoint-gate-test``, is out of scope on
-purpose: buildx alone builds it, buildx has no depth limit, and no daemon ever
-mounts it.
+purpose, but no longer because nothing mounts it: ``docker-build.yml`` loads
+that stage into the daemon and runs it under ``--read-only``. It is out of
+scope because it adds one ``COPY`` and one ``RUN`` on top of ``platform``, so
+the 8-layer gap between ``DEFAULT_MAX_LAYERS`` and ``OVERLAY2_MAX_DEPTH``
+covers it. Narrow that gap and the gate stage is what runs out of room first.
 
 Why a check rather than a comment: the limit belongs to the classic Docker
 daemon, not to the image format. BuildKit has no equivalent limit, so an image
@@ -28,7 +31,7 @@ how build f9f1747c broke on 2026-08-07 before them (#658).
 The budget is checked against a real image rather than by counting ``RUN`` and
 ``COPY`` lines, because the two disagree: BuildKit elides instructions that
 produce no filesystem diff, and the base image contributes layers this file
-cannot see (38 of them, as of ``nousresearch/hermes-agent:v2026.8.13``). The
+cannot see (38 of them, as of ``nousresearch/hermes-agent:v2026.9.14``). The
 count that matters is the one the daemon will have to stack, which is the one
 recorded in the image.
 

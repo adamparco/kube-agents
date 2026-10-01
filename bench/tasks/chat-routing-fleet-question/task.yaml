@@ -1,5 +1,5 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS;
-# activates when the seeded fleet (bench/tf/fleet/) is applied.
+# Registered in hack/eval/nightly-cases.txt (nightly tier) since 2026-09-15,
+# commented out of the presubmit's TASKS array before that.
 #
 # Domain: chat and routing. Journey: ask the fleet a question through the
 # front door; it must be routed to the right specialist via kanban, and the
@@ -10,16 +10,19 @@
 # the specialist to read.
 # Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
-# NOT ACTIVATABLE by uncommenting, like autoops-warning-event-triage, and for
-# a harness reason rather than a fixture one: hack/ci-eval-pr.sh exports a
-# single AGENT_SERVICE_NAME ("platform-agent") and the runner port-forwards
-# that one service, so every entry in TASKS reaches the platform agent. This
-# prompt would land on the specialist directly and never touch the front door
-# whose routing it exists to test -- the delegation objective would fail on a
-# correct system, and the failure would look like an agent regression rather
-# than a harness gap. Needs a per-task agent target in the harness; see
-# DRAFTS.md, activation blocker A2. The verification_spec below is written
-# against the front door and stands unchanged once the harness can reach it.
+# NOT a presubmit candidate yet, but no longer for the routing reason this
+# header used to give. hack/ci-eval-pr.sh exports a single AGENT_SERVICE_NAME
+# ("platform-agent") and the runner port-forwards that one service -- and the
+# 2026-08-31 measurement (chat-routing-board-read's activating run, build
+# 2094517532634386432) settled that this endpoint serves the front-door
+# (default) profile, the profile this prompt needs, so the harness can reach
+# it. What holds it now is that it has never been run (validated: false
+# below) -- a presubmit seat for a case nobody has watched pass is how a case
+# that can only fail reds every pull request; the nightly is where it earns
+# the record -- and its delegation objective rides
+# the worker round trip whose dropped results #1097 is investigating. See
+# DRAFTS.md, blocker A2, for the measurement record. The verification_spec
+# below is written against the front door and stands unchanged.
 #
 # The front door holds no infrastructure tools by design (agents/chat/SOUL.md),
 # so the safeguard here is the delegation boundary: substantive work must go
@@ -32,15 +35,20 @@ prompt: >-
   they running?
 expected_output: >-
   The front door files a kanban task assigned to the platform specialist
-  rather than answering from its own knowledge. The final answer to the user
-  names the specialist that did the work and states the cluster count and
-  versions as read from the live fleet.
+  rather than answering from its own knowledge, and acknowledges with one line
+  naming what is being checked, with no attribution line and no task id. The
+  answer the user receives states the cluster count and versions as read from
+  the live fleet; where the front door restates the specialist's work in its
+  own words, it names the specialist in that sentence.
 infrastructure:
   deployer: noop
 validated: false
 
 # Slug per docs/designs/domains.yaml: the front door's routing journey.
 domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
 
 # Exact checks. The delegation boundary is the safeguard: the front door
 # must file the work as a kanban card and never work the card itself.

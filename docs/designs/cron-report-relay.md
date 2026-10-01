@@ -1,8 +1,10 @@
 # Scheduled-report relay: the specialist reasons, the Chat Agent speaks
 
-**Status:** implemented and validated end to end on a live GKE cluster; every job
-on [the Platform Agent's roster](../../agents/platform/cron/README.md) delivers
-this way.
+**Status:** implemented and validated end to end on a live GKE cluster; every
+report-producing job on
+[the Platform Agent's roster](../../agents/platform/cron/README.md) delivers this
+way. The one exception, `chat-delivery-watch`, is the job that notices when this
+path is broken; see [Detecting a broken leg](#detecting-a-broken-leg).
 
 ## The problem
 
@@ -108,15 +110,35 @@ So the gateway accepts a value the loopback caller never sees, and the sentinel
 turns rejected inside one pod's first two hours, each one degrading to an
 unrelayed raw report that the scheduler still recorded as delivered.
 
-`_gateway_api_token()` reads `.env` first and falls back to the environment, so a
-deployment where nothing rewrites the key is unaffected. It reads per call rather
-than caching at import, because `.env` is rewritten seconds _after_ this process
-starts. The other direction — writing the sentinel into `.env` so the two agree —
-was tried and is not available: the API server then declines to bind at all.
+`_gateway_api_token()` resolves the name instead of reading it, in
+`load_hermes_dotenv`'s own order: managed `.env`, then `$HERMES_HOME/.env`, then
+the environment. It reads per call rather than caching at import, because `.env`
+is rewritten seconds _after_ this process starts.
 
-This is not specific to the relay. Every in-pod caller that trusts the
-environment has the same 401, `trigger_agent_troubleshooter` included, which is
-why both call sites moved.
+**Fixed at source, 2026-08-19 (issue #786).** The resolver above is now a
+backstop rather than the mechanism. `renderManagedEnv` pins `API_SERVER_KEY` to
+the sentinel in the operator's managed `.env`, unconditionally, and Hermes
+applies the managed scope **last with `override=True`** — after the PVC file it
+was losing to. The PVC file still carries whatever stage2 generated; it simply
+no longer wins. One value is now true in four places: the container env, the
+sidecar's `AGENT_API_UPSTREAM_KEY`, the sidecar's own copy, and the managed pin,
+all from the `loopbackAgentAPIKey` constant.
+
+An earlier version of this section said the other direction — writing the
+sentinel into `.env` so the two agree — was tried and is not available because
+the API server then declines to bind. That observation was confounded: the pod
+had lost its credential-proxy sidecar in the same window. Hermes' actual
+constraint is `has_usable_secret(min_length=16)` in the `api_server.py` startup
+guard, which the 24-character sentinel clears. (The managed pin does not write
+`.env` in any case.)
+
+This was never specific to the relay. Every in-pod caller that trusts the
+environment had the same 401, `trigger_agent_troubleshooter` included, which is
+why both call sites moved — and why the fix belongs in the operator rather than
+in each caller. `docker-entrypoint.sh` now checks the agreement before `exec`
+and names it in the log if it breaks, because the container's startup and
+readiness probes call that same API: a fifth party disagreeing no longer
+degrades quietly, it holds the pod out of Ready.
 
 ## Why context works without an append-only endpoint
 
@@ -340,6 +362,98 @@ caps report length instead (`CRON_REPORT_MAX_CHARS`, default 12000), which bound
 the accident that route actually has: a job that cats a log into the model and
 the channel.
 
+The cap truncates rather than rejects. It answered HTTP 413 until #1094, and the
+finding then existed only in the job's saved output with a line in
+`last_delivery_error` that nothing read until `chat-delivery-watch` (see
+[Detecting a broken leg](#detecting-a-broken-leg)); #1094 records three runs lost that way
+over 30 and 31 August 2026, across `stockout-prevention` and `compliance-audit`,
+whose fleet-wide output runs to several times this cap. The head survives, and
+the message opens with a `[truncated]` line naming `cron/output/<job_id>/`,
+where the whole report is.
+
+That line is prepended to the **composed message, after the relay turn** — not
+appended to the report before it. Appended, it is model input, and the relay
+instructions tell the Chat Agent to reproduce the report while adding "nothing
+at the bottom": the one sentence telling a reader the report is incomplete would
+be the sentence the instructions invite it to drop. Prepending it afterwards is
+how `[unrelayed]` already makes the same kind of admission unconditional.
+
+## Which platforms a report is posted to
+
+Every chat platform the install has enabled, resolved by
+`session_kv_server.enabled_chat_platforms`. Three sources, most specific first,
+and consulted **per platform** so that one naming Slack cannot hide a Google Chat
+another knows about: the operator's managed scope
+(`/etc/hermes/config.yaml`, which carries `platforms.<p>.enabled` as explicit
+booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH`
+— `/opt/data/config.yaml`, the front door's own writable file rather than a named
+profile's — then per-platform environment signals for an install neither file
+describes.
+
+The one narrowing is `also_delivered_to`: a platform the cron child already
+posted the raw report to is skipped, and where that would empty the set the
+relay fans out to every platform anyway (see "What this costs" below).
+
+A dual-platform install gets the report on both. Picking one is what #1094 was:
+the resolver returned on its first match, Slack led the order, and an install
+with Slack enabled but no home channel lost every scheduled governance report for
+seven days while Google Chat — which had a home channel — received nothing. A
+partial fan-out is still a 200, because the report is in a channel and a re-run
+would double-post there; the platforms it missed come back in the response body's
+`undelivered`, which the relay adapter turns into `last_delivery_error`.
+
+**This widens who sees a report, and that is a deliberate change rather than a
+side effect.** A governance report carries `evidence.excerpt` — literal
+`kubectl -o yaml` from workloads other teams deploy — and on an install that
+enabled two platforms for two different audiences it now reaches both, with no
+per-job or per-platform opt-out and no CR edit required to take effect. The
+alternative is the status quo, where the same install silently reaches one
+audience and the operator cannot tell which; a report going somewhere unintended
+is visible and correctable, and a report going nowhere was not. An install that
+wants one destination should enable one platform.
+
+Each leg keeps its own thread. A thread id is platform-local, so the session row
+carries `platform_threads` — one `(chat_id, thread_id)` per platform — and every
+leg replays only its own. Keeping a single address instead is how a leg that
+failed once stayed unthreaded for the rest of the day: the next report found the
+row naming another platform, posted a fresh top-level message, and did it again
+on every run. The top-level `platform`/`chat_id`/`thread_id` triple still holds
+one address, because the event-triage card has one destination; it goes to the
+leg the session was already routed to, or to the first that landed.
+
+An incident row is stored for every leg that landed **on that run**, so a reply
+in any channel the report reached replays it. Storing only one left a reply in
+the other channel answered by an agent that had never seen the report. The
+qualifier is load-bearing in the other direction: `platform_threads` is additive
+and never pruned, and the session id is per job per UTC day, so the map also
+holds legs that landed earlier today and failed just now. Writing a row for one
+of those would overwrite that channel's stored context with a report it never
+received, and the store is `INSERT OR REPLACE` on `(chat_id, thread_id)`, so the
+report still on its screen would be the one lost.
+
+`get_active_platform` is the single-destination sibling, called by the alert
+path — `trigger_agent_troubleshooter`, which drives `_post_initial_alert`. An
+incident alert registers the thread it gets back as the session's routing and
+the triage card's completion is addressed there, so two threads on two platforms
+would leave the report addressable to only one. It returns the first enabled
+platform and logs a warning naming the platforms that will not receive the
+message — and the alert path then tries each enabled platform in turn until one
+accepts, so a broken first leg costs a retry rather than the alert. Ordering
+alone would have mirrored #1094 onto whichever installs have the _other_
+platform broken.
+
+The warning fires on the pick rather than inside the fall-through, and that is
+why the pick goes through this function instead of taking `platforms[0]`
+directly. The fall-through logs only after a leg has already refused, so on the
+common dual-platform install — where the first leg accepts — nothing would say
+the second was skipped, and #1094's other half would be documented as fixed
+while emitting nothing.
+
+One send that reports success can still fail to yield a thread id, and the alert
+path treats that as delivered rather than retrying it: the alert is already in
+that channel, so trying the next platform would post it a second time to chase
+an id. The run is recorded as an unconfirmed delivery instead.
+
 ## What a job has to do: nothing
 
 A job relays because of one field. `deliver: "chat"` and no prompt boilerplate —
@@ -359,12 +473,18 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either.
+either. One case the scheduler's check misses: it matches the bare marker only,
+and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
+marker as the whole response) reached both senders. The adapter therefore
+carries its own `is_silent_report`, which undresses the marker before testing,
+and the Slack sender imports the same predicate so the two ends agree. The
+scheduler's direct Google Chat leg, which the two roster jobs on `"all"` still
+use, is upstream's sender and carries no such guard.
 
 ## How the switch is wired: `chat` is a platform
 
 Nothing in Hermes is patched. Upstream already routes `deliver=<name>` through
-the platform registry, and `cron/scheduler.py::_plugin_cron_env_var` says so in
+the platform registry, and `cron/scheduler_delivery.py::_plugin_cron_env_var` says so in
 its own words — a plugin that sets `cron_deliver_env_var` gets "cron delivery
 support without editing this module". So the relay ships as a bundled platform
 plugin, [`deploy/docker/plugins/chat/`](../../deploy/docker/plugins/chat/),
@@ -398,7 +518,9 @@ cannot state in code it owns, so it is asserted at image build time:
 [`verify_chat_relay.py`](../../deploy/docker/plugins/verify_chat_relay.py) drives
 the real `_deliver_result` against a loopback stand-in for the Session KV server
 and asserts on what crossed the wire. Upstream changing the wrapper fails the
-build.
+build, and the same check pins the adapter's `SILENT_MARKER` to the scheduler's
+spelling, so the marker the silence predicate undresses is the one the
+scheduler emits.
 
 ### What this costs
 
@@ -409,12 +531,25 @@ every one of them is visible to a job author:
   Slack. A job that wants one voice names one target.
 - **`deliver: "all"` includes the relay**, because `_expand_routing_tokens`
   expands to every platform with a configured home channel and the relay now has
-  one. A job left on `all` therefore reports twice — once flat into the channel
-  and once through the Chat Agent — on either platform, now that
-  `home_target_env` restores the Google Chat channel too. So the whole Platform
-  Agent roster names `"chat"` rather than relying on the expansion, which is
-  also the only way to say "relay, and do not also post flat" at all: the token
-  is additive, so there is no value that subtracts a target from `all`.
+  one. A job left on `all` therefore reports twice on a platform the scheduler
+  can address — once flat into the channel and once through the Chat Agent. The
+  relay leg subtracts what it can: `adapter.sibling_delivery_targets` resolves
+  the job's `deliver` in the cron child, where alone `all` is known to have
+  expanded, and sends the set as `also_delivered_to`; `relay_cron_report` skips
+  those platforms. An explicit `platform:chat_id` part counts only when its id
+  is that platform's home channel, the one place the relay's leg goes; a DM the
+  relay never addresses cannot get a duplicate from it, and claiming it would
+  cost the home channel its only composed copy. The subtraction is one-sided by design — where it would empty
+  the list it fans out to every platform anyway, because `also_delivered_to`
+  says what the scheduler _intended_ to send and a channel that resolved can
+  still fail on the send. Two copies is a nuisance; none is a missed audit. So
+  on an install where the child can address every enabled platform, a job on
+  `all` still posts twice; the subtraction bites only where the child could
+  address a strict subset. That is why every report-producing job on the
+  Platform Agent roster names `"chat"` except the two the roster README names:
+  the `deliver` token itself remains additive, and `"chat"` is the only way to
+  ask for one composed copy without depending on a subtraction that is designed
+  to give up rather than risk silence.
   No migration was needed to get there: `deliver` is
   an image-owned key on a named profile, so the entrypoint's existing cron merge
   rewrites it on every live volume at the next pod start (`agents/platform/cron/README.md`
@@ -432,6 +567,17 @@ every one of them is visible to a job author:
   unnoticed. So the degradation is stated twice: the posted message is prefixed
   `[unrelayed]`, naming the profile and job, and the response body carries
   `"relay": "degraded"` next to `"status": "delivered"`.
+  `relay` has one cause today, and both callers had hard-coded the sentence for
+  it, so the body also carries `relay_detail`: the route's own wording, which
+  names the cause and never a platform, and which lets a second cause land in
+  the route without a client change.
+  A send that lands on one platform and not another is a different case, and not
+  a degradation — the report reached a channel, so `relay` stays `ok` — but one
+  audience has nothing, so the body carries `undelivered`: the platforms that
+  missed it, comma-joined. Holding the two fields apart is what stops a
+  consumer reporting the same miss twice, once as prose and once as a list — see
+  [Which platforms a report is posted
+  to](#which-platforms-a-report-is-posted-to).
   That is the whole reason the route blocks rather than accepting into a
   background task: answering `accepted` first would make each of those failures
   invisible, leaving the run written down as delivered with nothing in the
@@ -458,11 +604,102 @@ configured/enabled" against a delivery that in fact succeeded.
 `report_to_chat` stays, scoped to what the mode cannot do: reporting mid-run, or
 sending something other than the final response.
 
+## Detecting a broken leg
+
+Everything above records a failed delivery faithfully and reports it to nobody.
+`last_delivery_error` is written on every failed run; #1094 is the account of
+what that was worth (seven days of six audits composed, dropped, and recorded as
+dropped, with the only signal being that the reports had stopped arriving) and
+#1102 is the gap it left open. The watcher on the other end of the field is
+`chat-delivery-watch`
+(`agents/platform/scripts/chat_delivery_watch.py`), a `no_agent` job on the
+Platform Agent's roster that runs every half hour.
+
+**What it counts.** The field holds only the latest run. The next run that
+delivered cleanly sets it back to `None`, and so does a run that delivered
+nothing: a `[SILENT]` answer skips delivery and clears the field with it, so on
+a quiet fleet the evidence of a dead leg is erased every morning. The watcher
+therefore keeps its own ledger, `profiles/platform/cron/chat_delivery_watch.json`,
+keyed by `<profile>/<job id>` across every store on the volume (the chat
+profile's, the Platform Agent's, every Cluster Agent's). A job's streak advances
+only when `last_run_at` has changed since the last tick, so a half-hourly tick
+over a daily job counts runs (a job that runs more often than the watcher is
+under-counted, never over-counted); a failing run adds one, a clean run resets to zero,
+and a silent run, recognised from the job's newest file under `cron/output/`,
+moves the high-water mark and changes nothing else. Failures are graded from the
+strings this design produces: `hard` when the report reached no platform (a 502,
+an unreachable relay, no key), `partial` when it landed somewhere but not on the
+platforms the `undelivered` field names, `degraded` when it posted but the Chat
+Agent's turn failed. The scheduler's own two failures, a platform named in
+`deliver` that is not enabled and a `deliver` that resolved to no target, also
+grade `hard`: nothing was delivered either way. A run the scheduler recorded as
+anything but `ok` and that saved no document (interrupted by a gateway shutdown,
+or failed before delivery) is no evidence either, like a silent one; a failed
+run that did save its document had its failure summary delivered, which is a
+working leg. A note the scheduler files under the same field for a report that
+arrived (a thread it fell back from, an attachment it could not confirm) is not
+a failure. A job that is disabled or paused holds no streak, since it has no
+next run to recover with.
+`CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many consecutive failing runs
+make a job degraded.
+
+**Where it reports.** Not chat: a chat message saying that chat is down is the
+one message guaranteed not to arrive. The job's `deliver` is `"local"`, the only
+platform-roster entry allowed that value (the README's rule and its test carry
+the exemption by name), and it reports through two channels that need no
+privilege the pod does not already hold.
+
+- A **GitHub ledger issue**, one per install, labelled `agent:delivery-watch`
+  and carrying a hidden `<!-- chat-delivery-watch -->` marker. It lives in the
+  repository `CHAT_DELIVERY_LEDGER_REPO` names, or else in the install's one
+  managed GitHub repository; several managed repositories and no override is
+  refused rather than guessed, as `resolve_repo` refuses it. It is opened when
+  any job crosses the threshold, edited when the picture changes (a job joins or
+  leaves the degraded set, a further failing run is counted, an error string
+  changes; a fingerprint in the ledger keeps a tick that saw no new run down to
+  one read, which is how an issue a person closed by hand is noticed and
+  replaced rather than edited while closed), and closed with a comment once
+  every leg has recovered. The call is
+  `forge.call` — a version-control verb, over the sandbox hop into the
+  credential broker — the same route `github-repo-watcher` takes; the minted
+  token already holds `issues: write`.
+  The issue resolver's search excludes the label, so the agent never triages its
+  own ledger. With no repository to use, the job falls back to the log line
+  alone. Two installs that manage one repository would share one issue; the
+  fleet-audit ledgers have the same property, and an install-specific ledger
+  repository is the answer for both.
+- An **`ALERT chat_delivery_watch` line** appended to
+  `<agent home>/logs/chat_delivery_watch.log`. The gateway pod's fluent-bit
+  sidecar ships that directory's log files to Cloud Logging (the pipeline is
+  described on the site's
+  [observability page](../site/src/content/docs/concepts/observability.md)), so
+  a log-based alert reaches it with
+  `resource.type="k8s_container" resource.labels.container_name="fluent-bit"
+jsonPayload.log:"ALERT chat_delivery_watch"`. This is the file rather than
+  the job's own stdout on purpose: the scheduler captures a `no_agent` job's
+  stdout into `cron/output/` and, with `deliver: "local"`, sends it nowhere.
+  The watcher's own failures land on the same line as `self=error`, and the
+  ledger's `last_tick_at` answers whether it has run at all.
+
+**Why not a `PlatformAgent` condition, a Kubernetes Event or a metric yet.** Each
+would be a better fit for an alerting system, and none has a carrier today. The
+agent container mounts no service-account token, the operator grants the agent
+identity no write on anything a watcher could use (the site's
+[security reference](../site/src/content/docs/reference/security-and-iam.md) is
+the canonical account of what it does grant), the credential proxy refuses
+every write verb before RBAC is consulted, and the operator reads nothing the
+pod writes, so a condition or an Event needs a new pod-to-operator path and a
+new grant first. The operator binds no metrics endpoint in the shipped deploy;
+the ones the agent's pods expose are the event watcher's and the credential
+broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
+Hindsight's, and neither carries anything about a report. Those are the next step, with this
+section as the record of why the first step took the channels it did.
+
 ## Related
 
 - [`agents/platform/cron/README.md`](../../agents/platform/cron/README.md) — the
-  roster's own rules, including why no job sets `deliver: "local"` and why an id
-  must not appear on two rosters.
+  roster's own rules, including why exactly one job sets `deliver: "local"` and
+  why an id must not appear on two rosters.
 - [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md)
   — the Session KV server, its callers and its auth.
 - [`concepts/autonomous-watchdogs`](../site/src/content/docs/concepts/autonomous-watchdogs.md)

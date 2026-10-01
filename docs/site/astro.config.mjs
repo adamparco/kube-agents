@@ -3,6 +3,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 const BASE = '/kube-agents';
+const FEEDBACK_FORM_URL =
+  'https://docs.google.com/forms/d/e/1FAIpQLSfw5eGttWOrii7bvSUmALmRbqpxDRWKmdHoImEZZNe6hOtVtQ/viewform';
 
 // Base URL matches the default GitHub Pages path
 // (https://<owner>.github.io/kube-agents/) so relative links resolve
@@ -11,6 +13,12 @@ const BASE = '/kube-agents';
 export default defineConfig({
   site: 'https://gke-labs.github.io',
   base: BASE,
+  // Short link for people who cannot open an issue on GitHub (see the
+  // contributing page's "Where to file issues"). Astro emits a static
+  // meta-refresh page at <base>/feedback/ pointing at the form.
+  redirects: {
+    '/feedback': FEEDBACK_FORM_URL,
+  },
   integrations: [
     starlight({
       title: 'kube-agents',
@@ -100,6 +108,7 @@ export default defineConfig({
             { label: 'Quick start (GKE)', link: '/install/quickstart-gke/' },
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },
+            { label: 'Upgrade', link: '/install/upgrade/' },
             { label: 'Uninstall', link: '/install/uninstall/' },
           ],
         },

@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import profile_scaffold as ps  # noqa: E402
 
 ITEMS = ("config.yaml", "SOUL.md", "AGENTS.md", "CAPABILITIES.md", "cron", "skills", "governance")
+SHIPPED_ROSTER = Path(__file__).resolve().parents[1] / "cron" / "jobs.json"
 
 
 def job(job_id, **extra):
@@ -35,6 +36,7 @@ def job(job_id, **extra):
         "name": job_id.replace("-", " ").title(),
         "schedule": {"kind": "cron", "expr": "20 6 * * *"},
         "prompt": f"run {job_id}",
+        "risk": "low",
         "enabled": True,
         **extra,
     }
@@ -200,9 +202,26 @@ class CronStoreMergeTest(unittest.TestCase):
         merged = self.overlay([job("audit", deliver="chat")], [job("audit", deliver="all")])
         self.assertEqual("chat", merged[0]["deliver"])
 
+    def test_the_image_decides_the_risk_tier(self):
+        merged = self.overlay([job("audit", risk="low")], [job("audit", risk="high")])
+        self.assertEqual("low", merged[0]["risk"])
+
     def test_a_job_the_image_does_not_ship_is_kept(self):
         merged = self.overlay([job("audit")], [job("audit"), job("operator-added")])
         self.assertEqual(["audit", "operator-added"], [j["id"] for j in merged])
+
+    def test_an_unannotated_operator_job_is_backfilled_with_low_risk(self):
+        legacy = {"id": "legacy-custom", "schedule": {"kind": "cron", "expr": "* * * * *"}}
+        merged = self.overlay([job("audit")], [job("audit"), legacy])
+        custom = next(j for j in merged if j["id"] == "legacy-custom")
+        self.assertEqual("low", custom.get("risk"))
+        self.assertNotIn("risk", legacy, "the merge must not mutate caller input in-place")
+
+    def test_an_operator_job_with_explicit_risk_is_preserved(self):
+        custom_high = {"id": "custom-high", "schedule": {"kind": "cron", "expr": "* * * * *"}, "risk": "high"}
+        merged = self.overlay([job("audit")], [job("audit"), custom_high])
+        custom = next(j for j in merged if j["id"] == "custom-high")
+        self.assertEqual("high", custom.get("risk"))
 
     def test_a_job_withdrawn_from_the_image_is_not_pruned(self):
         # The cost of the rule above, stated rather than discovered: nothing
@@ -291,6 +310,24 @@ class CronStoreMergeTest(unittest.TestCase):
         # The platform profile's path, unchanged: it passes no filter.
         merged = self.overlay([job("audit"), job("drift")], [job("audit")])
         self.assertEqual(["audit", "drift"], [j["id"] for j in merged])
+
+    def test_the_shipped_roster_lands_a_new_entry_on_a_volume_that_predates_it(self):
+        # The real roster, not a fixture: this is how a job added to the image
+        # reaches every existing install at its next pod start, with no
+        # migration. `feedback-prompt` is the entry that relies on it -- an
+        # install upgraded to the image that ships it gets the job, armed from
+        # that first tick, while its `.feedback_prompt_*` markers on the volume
+        # are what keep a later roll from re-arming it.
+        shipped = json.loads(SHIPPED_ROSTER.read_text(encoding="utf-8"))["jobs"]
+        volume = [dict(j, last_run_at="2026-09-01T06:20:00Z") for j in shipped if j["id"] != "feedback-prompt"]
+        self.assertNotIn("feedback-prompt", [j["id"] for j in volume])
+        merged = self.overlay(shipped, volume)
+        by_id = {j["id"]: j for j in merged}
+        self.assertIn("feedback-prompt", by_id)
+        self.assertIs(True, by_id["feedback-prompt"]["enabled"])
+        self.assertEqual("feedback_prompt.py", by_id["feedback-prompt"]["script"])
+        self.assertNotIn("last_run_at", by_id["feedback-prompt"])
+        self.assertEqual("2026-09-01T06:20:00Z", by_id["compliance-audit"]["last_run_at"])
 
     def test_the_merge_is_skipped_when_cron_is_not_being_overlaid(self):
         # `--items` without `cron` means the caller is not touching the cron
@@ -391,6 +428,59 @@ class EnsureProfileTest(unittest.TestCase):
         self.assertFalse(ps.is_scaffolded(self.home), "a config alone proves nothing")
         (self.home / "profile.yaml").write_text("name: platform\n")
         self.assertTrue(ps.is_scaffolded(self.home))
+
+
+class BackfillCronStoreTest(unittest.TestCase):
+    """Tests for standalone cron store backfill helpers (for cluster profiles and runtime stores)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_backfill_cron_store_adds_low_risk_to_unannotated_jobs(self):
+        store = {
+            "jobs": [
+                {"id": "a", "prompt": "do a"},
+                {"id": "b", "prompt": "do b", "risk": "high"},
+            ]
+        }
+        res = ps.backfill_cron_store(store)
+        self.assertIsNot(res, store)
+        self.assertEqual(res["jobs"][0]["risk"], "low")
+        self.assertEqual(res["jobs"][1]["risk"], "high")
+        self.assertNotIn("risk", store["jobs"][0], "input dict must stay unmodified")
+
+    def test_backfill_cron_store_no_op_when_already_annotated(self):
+        store = {
+            "jobs": [
+                {"id": "a", "risk": "low"},
+                {"id": "b", "risk": "high"},
+            ]
+        }
+        res = ps.backfill_cron_store(store)
+        self.assertIs(res, store)
+
+    def test_backfill_cron_store_handles_non_dict_and_invalid_shapes(self):
+        self.assertIsNone(ps.backfill_cron_store(None))
+        self.assertEqual(ps.backfill_cron_store("not-a-dict"), "not-a-dict")
+        self.assertEqual(ps.backfill_cron_store({"jobs": "not-a-list"}), {"jobs": "not-a-list"})
+
+    def test_backfill_cron_file_modifies_file_in_place_atomically(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1"}]}))
+        modified = ps.backfill_cron_file(cron_file)
+        self.assertTrue(modified)
+        data = json.loads(cron_file.read_text())
+        self.assertEqual(data["jobs"][0]["risk"], "low")
+
+        # Second run is a no-op
+        self.assertFalse(ps.backfill_cron_file(cron_file))
+
+    def test_backfill_cron_file_handles_nonexistent_file(self):
+        self.assertFalse(ps.backfill_cron_file(self.root / "absent.json"))
 
 
 if __name__ == "__main__":

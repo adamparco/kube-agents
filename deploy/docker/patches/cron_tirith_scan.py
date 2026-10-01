@@ -6,22 +6,30 @@ into ``tools/approval.py`` by ``deploy/docker/Dockerfile``.
 The defect
 ----------
 ``tools/approval.py``'s ``check_all_command_guards`` is the single pre-exec gate
-every ``terminal()`` command passes through. Its non-interactive branch reads::
+every ``terminal()`` command passes through. Its non-interactive branch reads
+(v2026.9.14; v2026.8.19 spelled the same thing as an inline
+``if _is_cron_approval_context(): if _get_cron_approval_mode() == "deny":`` arm)::
 
     if not is_cli and not is_gateway and not is_ask:
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
-                ...detect_dangerous_command(), then check_command_security()...
-        return {"approved": True, "message": None}
+        for ctx in _unattended_contexts():        # single-query, cron, ...
+            result = _unattended_deny(command, ctx)
+            if result is not None:
+                return result
+        return _approved()
+
+    def _unattended_deny(command, ctx):
+        if ctx.mode() != "deny":
+            return None
+        ...detect_dangerous_command(), then check_command_security()...
 
 Upstream put the Tirith call *inside* the ``deny`` arm. ``approvals.cron_mode``
-has exactly two effective values — ``_get_cron_approval_mode`` maps
-``{approve, off, allow, yes}`` to ``approve`` and everything else, including a
-typo, to ``deny`` — so setting ``approve`` does not merely stop the run blocking
-on a prompt it cannot answer. It returns ``approved`` before the scanner is ever
-reached, and every command in every cron run executes with no content scan at
-all.
+has exactly two effective values — ``_get_cron_approval_mode`` (in
+``tools/approval_context.py``) maps ``{approve, off, allow, yes}`` to
+``approve`` and everything else, including a typo, to ``deny`` — so setting
+``approve`` does not merely stop the run blocking on a prompt it cannot answer.
+``_unattended_deny`` returns ``None`` before the scanner is ever reached, the
+loop falls through to ``_approved()``, and every command in every cron run
+executes with no content scan at all.
 
 That conflation is the bug. Answering the approval prompt and scanning the
 command are separate questions, and only the first one needs a human. An
@@ -55,10 +63,10 @@ against the shipped image on 2026-08-08:
   the instruction not to block on a pattern. Tirith refuses them on its own
   authority, so the waiver stops shipping them.
 
-Do not over-read the coverage. A pure-ASCII lookalike TLD
-(``kubernetes.io.evil-cdn.co``) and terminal escape injection are caught by
-neither layer — ANSI is stripped before pattern matching, and real ESC payloads
-did not trip the scanner either.
+Do not over-read the coverage of this module alone. Pure-ASCII lookalike TLDs
+(``kubernetes.io.evil-cdn.co``) and raw terminal escape / C0/C1 control injection
+are caught not by Tirith, but by the companion gate ``tools/cron_risk_gate.py``
+(THREAT-002), which also blocks ``execute_code`` in unattended runs.
 
 Nor should the example be read as saying that turn is still covered here. Issue
 triage is no longer a cron turn: ``github-repo-watcher`` is a ``no_agent``
@@ -127,13 +135,12 @@ scan opt-in through a new ``cron_mode`` value would have left every
 already-written ``cron_mode: approve`` — the operator's overlay, every hand-authored
 ``AgentPlugin`` — silently unscanned, which is the state this patch exists to end.
 
-Out of scope, recorded so it is not mistaken for covered
---------------------------------------------------------
-``check_execute_code_guard`` still auto-approves ``execute_code`` under
-``cron_mode: approve``. Tirith scans POSIX shell strings (``--shell posix``);
-handing it a Python script would produce noise, not a verdict. A cron run can
-therefore still reach ``subprocess`` through ``execute_code`` without a content
-scan. Closing that needs a different scanner, not this one.
+Out of scope for this module; covered by companion gate
+------------------------------------------------------
+Tirith scans POSIX shell strings (``--shell posix``); handing it a Python
+script would produce noise, not a verdict. Closing the ``execute_code`` vector
+in unattended runs is handled by ``tools/cron_risk_gate.py`` (THREAT-002),
+which unconditionally refuses ``execute_code`` under cron approval contexts.
 """
 
 from __future__ import annotations
@@ -210,8 +217,9 @@ def cron_scan_enabled(config: Optional[dict]) -> bool:
 def tirith_fail_open(config: Optional[dict]) -> bool:
     """Whether an unavailable scanner should allow the command through.
 
-    Mirrors the ``ImportError`` handler on ``check_all_command_guards``' cron
-    ``deny`` arm exactly, including its ordering: ``tirith_fail_open`` is only
+    Mirrors the ``ImportError`` handler on the cron ``deny`` arm
+    (``_unattended_deny`` in ``tools/approval.py``, ``_tirith_fail_open`` in
+    ``tools/approval_context.py``) exactly, including its ordering: ``tirith_fail_open`` is only
     consulted when ``tirith_enabled`` is true, so an operator who switched
     Tirith off entirely is not then blocked by its absence.
     """

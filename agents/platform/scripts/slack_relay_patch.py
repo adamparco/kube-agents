@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from credential_proxy_client import authorization_headers
+
 
 LOGGER = logging.getLogger("slack-relay-patch")
 DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -76,6 +78,52 @@ def relay_without_token() -> bool:
     return not os.getenv("SLACK_BOT_TOKEN", "").strip()
 
 
+def is_silent_text(message: Any) -> bool:
+    """Is this delivery a silent cron tick rather than something to post?
+
+    The sibling sender's predicate, imported rather than restated. Both senders
+    are handed the same cron output by the same ``_deliver_result``, and until
+    this they disagreed about it. ``is_silent_report`` undresses the marker
+    before testing; this end only tested for blank. So a scheduled audit that
+    emphasised the marker — every audit SOP tells a quiet run to make the bare
+    marker its entire final response, and a markdown-writing model sometimes
+    dresses it — was suppressed by the relay and posted to Slack as
+    ``*[SILENT]*``. Upstream's matcher takes the marker bare and stops delivery
+    before either sender runs, so only the dressed form ever reaches here, and
+    only this end was still delivering it.
+
+    Falling back to the blank test leaves a deployment with no chat platform
+    installed behaving exactly as it did.
+
+    The test reads the *unwrapped* message, which is the form the sibling
+    tests. ``is_silent_report`` undresses by stripping markdown off the two
+    ends of what it is given, so handed the whole delivery it strips the ends
+    of the wrapper — and ``**[SILENT]**`` under a ``Cronjob Response:`` header
+    came back False, which is every cron delivery there is. The undressing was
+    only ever reachable here on a message that had lost its wrapper.
+    """
+    text = "" if message is None else str(message)
+    try:
+        from plugins.platforms.chat.adapter import (
+            is_silent_report,
+            parse_cron_wrapper,
+        )
+    except Exception as exc:
+        # Loud, because in the gateway process the plugin is always installed:
+        # an import failure here is a packaging fault, not the no-chat-platform
+        # deployment the fallback below is for, and silently reverting to the
+        # blank test would post dressed markers to Slack with nothing logged.
+        LOGGER.warning(
+            "the chat adapter's silence predicate could not be imported (%s: %s); "
+            "testing for blank only",
+            type(exc).__name__,
+            exc,
+        )
+        return not text.strip()
+    _job_id, _title, report = parse_cron_wrapper(text)
+    return bool(is_silent_report(report))
+
+
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
     """Read an upload without allowing it to grow past the relay limit."""
     if path.stat().st_size > max_file_bytes:
@@ -111,10 +159,13 @@ def install() -> None:
 
     def request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        # The relay shares a listener with the credential broker, so it shares
+        # the broker's authentication. Empty in the sidecar deployment.
+        headers = {"Content-Type": "application/json", **authorization_headers()}
         req = urllib.request.Request(
             relay_url + path,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="GET" if body is None else "POST",
         )
         with urllib.request.urlopen(req, timeout=35) as response:
@@ -469,7 +520,15 @@ def install() -> None:
                 return cache_audio_from_bytes(content, ext)
             return cache_image_from_bytes(content, ext)
 
-        async def download_bytes(self: Any, url: str, team_id: str = "") -> bytes:
+        async def download_bytes(
+            self: Any, url: str, team_id: str = "", *, html_label: str = ""
+        ) -> bytes:
+            # ``html_label`` names the download in upstream's own rejection of
+            # an HTML sign-in page where bytes were expected. Behind the relay
+            # that check runs on the proxy's side, so the label is accepted
+            # for signature parity -- upstream's ``_download_slack_file``
+            # passes it by keyword -- and not used.
+            del html_label
             response = await asyncio.to_thread(
                 request,
                 "/v1/chat/slack/files/download",
@@ -604,12 +663,23 @@ def install() -> None:
             # before formatting as well as after: a formatter that decorates
             # its input turns whitespace into a message worth sending, and
             # upstream's own guard — which only sees the formatted text —
-            # would let that through.
+            # would let that through. ``is_silent_text`` is the sibling
+            # sender's predicate, so a dressed ``[SILENT]`` is dropped on both
+            # legs rather than on one.
             blank = {"success": True, "platform": "slack", "skipped": "empty_text"}
-            if not message or not str(message).strip():
-                return blank
-            formatted = format_mrkdwn(module, message)
-            if not formatted or not str(formatted).strip():
+            formatted = message if is_silent_text(message) else format_mrkdwn(module, message)
+            if is_silent_text(formatted):
+                # A drop that leaves no trace is the failure nobody can find
+                # afterwards: `skipped` reports success and the scheduler
+                # records no `last_delivery_error`, so a suppressed report
+                # reads exactly like one that was never scheduled. The sibling
+                # chat sender logs its own suppression; this leg logged none,
+                # which was defensible only while the branch required literally
+                # blank text.
+                LOGGER.info(
+                    "slack relay: dropped a %d-character message as a silent tick",
+                    len(str(message or "")),
+                )
                 return blank
 
             target = str(chat_id or "")
@@ -718,10 +788,10 @@ def install() -> None:
                 try:
                     patch_slack_entry(entry)
                 except Exception:
-                    # sitecustomize latches its trigger before calling
-                    # install(), and the gateway folds an exception from that
-                    # import into a debug line. Raising here would disable the
-                    # relay for the life of the process, and say nothing.
+                    # The gateway folds an exception from the trigger import
+                    # into a debug line and does not import it again. Raising
+                    # here would disable the relay for the life of the
+                    # process, and say nothing.
                     LOGGER.warning("Slack relay entry patch failed", exc_info=True)
             # Forward everything after ``entry`` blind rather than restating
             # today's signature. This wrapper sits on the class, so every
@@ -746,7 +816,7 @@ def install() -> None:
             # through to ``_plugin_scope_from_callable`` on the entry's own
             # ``adapter_factory`` and then its ``check_fn``; both are
             # frame-independent and recover the same scope
-            # (``platform_registry.py:515-520`` in v2026.8.13). Only an entry
+            # (``platform_registry.py:271-278`` in v2026.9.14). Only an entry
             # whose callables the tool registry cannot place lands in the global
             # scope instead of a plugin one.
             return original_registry_register(self, entry, *args, **kwargs)

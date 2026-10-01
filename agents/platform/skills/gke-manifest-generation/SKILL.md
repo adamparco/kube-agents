@@ -3,7 +3,7 @@ name: gke-manifest-generation
 metadata:
   category: Containers
 description: >-
-  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning (use gke-cluster-creation).
+  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning (use gke-cluster-creation), or Google Cloud resources as Config Connector manifests (use gcp-config-connector).
 ---
 
 # GKE Manifest Generation Skill
@@ -26,7 +26,7 @@ following rules:
     active `SETTINGS.md`. Never omit the namespace.
 -   **Dedicated ServiceAccount**: Avoid using the namespace's `default`
     ServiceAccount. Always create and reference a dedicated `ServiceAccount`
-    (e.g., `devteam-agent-sa`) for each microservice.
+    (e.g., `checkout-sa`) for each microservice.
 
 ### 2. GKE Resource Tuning (Autopilot & Standard)
 
@@ -219,13 +219,13 @@ hallucinations and optimize configurations:
     -   For GKE-specific features, API defaults, manifest examples, or security
         contexts, you **must** query Google's developer knowledge base to
         retrieve official GKE documentation:
-        -   **`answer_query`**: Use this to ask direct questions (e.g., *"How to
-            configure GCS Fuse CSI driver in GKE"*). This is the preferred tool
-            for general queries.
-        -   **`search_documents`**: Use this to search for relevant GKE guides
-            or examples when you don't have a specific question.
-        -   **`get_document`**: Use this to fetch full document contents when
-            you have a specific document ID.
+        -   **`search_documents`**: Start every lookup here (e.g., *"configure
+            GCS Fuse CSI driver in GKE"*). It takes only `query`.
+        -   **`get_documents`**: Use this to fetch full document contents when
+            a returned chunk needs its surrounding page.
+        -   Do not call **`answer_query`**: its quota is 50 requests per day per
+            project, shared by every agent in the install, and it reads the
+            same corpus as `search_documents`. Never retry its `429`.
 
 --------------------------------------------------------------------------------
 
