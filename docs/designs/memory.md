@@ -386,7 +386,7 @@ point the agent at a Hindsight service the install never deployed. Taking a
 default has to mean "keep what you have". An enterprise fleet that wants ranked
 recall is in a position to say so, and `--memory=hindsight` is how. Consequently
 `multiuser_memory` is the provider named wherever there is no install to ask — the
-CRD default, `common.sh`, and the Chat Agent's `config.yaml`. The specialist
+CRD default, `install.defaults.env`, and the Chat Agent's `config.yaml`. The specialist
 profile names no provider at all, because a file store has no gateway identity for
 a specialist to key on; see the overlay rule below.
 
@@ -452,7 +452,7 @@ It adds exactly two workloads to `kubeagents-system`.
 
 **1. `hindsight-api` — a `Deployment`, one replica** (`api.yaml`).
 
-- Image `ghcr.io/vectorize-io/hindsight-api:0.9.2`, pinned by digest. The pin
+- Image `ghcr.io/vectorize-io/hindsight-api:0.10.2`, pinned by digest. The pin
   lives in `images.json` at the repository root and the manifest takes it as a
   variable, so a mirrored install can point it at an approved registry.
 - Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;
@@ -532,8 +532,8 @@ It adds exactly two workloads to `kubeagents-system`.
   feel.** GUCs are registered by the shared library at load, not declared in the
   extension's SQL, so a new one appears as soon as a backend loads the new library —
   which the StatefulSet restart guarantees. `hnsw.iterative_scan` is the one that
-  matters: Hindsight 0.9 defaults `HINDSIGHT_API_ANN_ITERATIVE_SCAN=true` and asks
-  for it on every pooled connection. Without it an HNSW scan makes one ground-layer
+  matters: Hindsight has defaulted `HINDSIGHT_API_ANN_ITERATIVE_SCAN=true` since 0.9
+  and asks for it on every pooled connection. Without it an HNSW scan makes one ground-layer
   pass and ends when that pass is exhausted, which can happen before the query's
   `LIMIT` is met; with it the scan resumes in `ef_search`-sized rounds until the
   `LIMIT` is met or `hnsw.max_scan_tuples` is reached. Hindsight sets that ceiling to

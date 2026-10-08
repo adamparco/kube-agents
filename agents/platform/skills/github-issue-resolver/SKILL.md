@@ -2,7 +2,7 @@
 name: github-issue-resolver
 description:
   Autonomously poll, triage, investigate, and resolve unaddressed open issues on
-  our target GitHub repository strictly within authorized scope.
+  our target repository (on GitHub or GitLab) strictly within authorized scope.
 ---
 
 # Skill: github-issue-resolver
@@ -56,7 +56,7 @@ Run the deterministic polling script to sweep stale investigations and check for
 new unaddressed open issues:
 
 ```bash
-"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll
+python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll
 ```
 
 Run it even when a kanban card sent you here already naming an issue. The
@@ -118,7 +118,7 @@ Immediately claim the issue before starting your investigation so other agents
 or engineers do not duplicate work:
 
 ```bash
-"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>  --repo <repo>
+python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>  --repo <repo>
 ```
 
 ### Step 3: Investigate & Diagnose (Reasoning Phase)
@@ -153,19 +153,22 @@ Once your investigation is complete:
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
-     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --repo <repo> --state resolved --report-file /opt/data/scratch/report_<number>.md
+     python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --repo <repo> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
      - Then end the turn per [Ending the turn](#ending-the-turn).
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
-     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number>  --repo <repo> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
+     python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number>  --repo <repo> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
      - You MUST message the chat room to alert the on-call engineer. Use
        `title_plain`, not `title` — the boundary tags are for you, not for a
        human reading chat:
        `🚨 **Human Escalation Required — Action Needed:**`
-       `- [#<number>](https://github.com/<owner>/<repo>/issues/<number>) — <title_plain> — *<1-sentence summary of root cause requiring human intervention>*`
+       `- [#<number>](<issue_url>) — <title_plain> — *<1-sentence summary of root cause requiring human intervention>*`
+       `<issue_url>` is the `issue_url` from the `poll` output — the forge's own
+       issue URL, used exactly as given (GitLab may answer `…/-/issues/<number>`
+       or `…/-/work_items/<number>`); never build one.
        Keep the title **outside** the link, exactly as above. `title_plain` is
        reporter-written text and the sanitizer does not escape Markdown, so a
        title containing `](` placed inside the link label would close the link
@@ -201,7 +204,7 @@ post the chat message the step names first, then end the turn.
 
 Before ending any turn where an issue `#<number>` was claimed, you MUST verify:
 
-1. **Deterministic Transition Called:** `"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition` was executed
+1. **Deterministic Transition Called:** `python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition` was executed
    with your report file (`/opt/data/scratch/report_<number>.md`).
 2. **Chat Alert Handled:** If `status:escalation-needed`, you posted the chat
    alert.

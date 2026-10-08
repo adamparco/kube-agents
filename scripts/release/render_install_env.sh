@@ -54,6 +54,15 @@ fi
 # point of #1081's precedence chain — an empty assignment would beat it and
 # mean "explicitly nothing", which for MEMORY or PERMISSION_SET is a different
 # install from the default one.
+#
+# What that costs: a key absent from this table has no way to be refused at
+# all. The renderer regenerates install.env on every reconcile, so a line
+# written into it by hand is gone by the next run, and the shipped default is
+# the only answer the environment can give. For every key whose default is
+# false that is the quiet outcome; for ENABLE_DRIFT_DETECTOR, whose default is
+# true, it is a Log Router sink over every cluster in the project. A key being
+# in this table is therefore not only how an environment states a non-default
+# choice -- it is the only way it can state one.
 MAPPING="
 PROJECT_ID:GCP_PROJECT_ID
 REGION:GCP_REGION
@@ -91,9 +100,11 @@ HERMES_DASHBOARD_ENABLED:HERMES_DASHBOARD_ENABLED
 ENABLE_GKE_BACKUP_PLAN:ENABLE_GKE_BACKUP_PLAN
 ENABLE_PUBSUB_PLATFORM:ENABLE_PUBSUB_PLATFORM
 ENABLE_STOCKOUT_INVESTIGATOR:ENABLE_STOCKOUT_INVESTIGATOR
+ENABLE_DRIFT_DETECTOR:ENABLE_DRIFT_DETECTOR
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
 NAMESPACE:NAMESPACE
+PLATFORM_AGENT_MODE:PLATFORM_AGENT_MODE
 "
 
 # Always required: without these the script cannot name an install at all, so
@@ -237,6 +248,16 @@ case "${MEMORY_PROVIDER:-}" in
   *)                            MEMORY="file" ;;
 esac
 export MEMORY
+
+# PLATFORM_AGENT_MODE, the PlatformAgent's spec.mode, is copied rather than
+# translated, but checked first: a value that is neither `today` nor `next` is
+# refused here rather than by the installer later. `today` is written as no
+# key at all, which the installer reads as `today` too, so an environment that
+# says `today` or says nothing renders the same file it rendered before the
+# key was mapped. platform_agent_mode_resolve unsets the variable for both.
+# shellcheck source=scripts/release/platform_agent_mode.sh
+. "$(dirname "${BASH_SOURCE[0]}")/platform_agent_mode.sh"
+platform_agent_mode_resolve
 
 
 # ---------------------------------------------------------------------------

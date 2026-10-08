@@ -12,7 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
-- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
+- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`).
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
@@ -149,7 +149,7 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 - Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md` for an AI agent.
 - Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
-- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill from upstream.
+- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill, or aborts on a drifted entry.
 
 ## Engineering Rules
 
@@ -188,13 +188,13 @@ the topic has an owner:
 | Release runbooks                                          | `scripts/release/README.md`                  |
 | The evaluation project pool and Prow configuration        | `docs/ci-pool-projects.md`                   |
 | Agent rules, by family (code, CI, pre-PR, evals, docs)    | `.agents/rules/`                             |
+| Who to ask about an area, and who owns a running service  | `docs/ownership.md`                          |
 
 Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, skill
   catalogue and image inventory are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
-  then run `make docs-generate`.
+  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them; new targets get a `## description`
   comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -209,10 +209,9 @@ Rules:
   and a number tells the reader nothing they can act on.
 - **Verify identifiers against source, not against other docs.** GCP service account names live
   in `install.defaults.env`, the Go version in `k8s-operator/go.mod`.
-- **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
-  Compact `| cell | cell |` rows, never re-aligned: the map is edited from several branches a
-  week, and a re-aligned table rewrites rows your PR did not author. `docs/README.md` §5 owns the
-  rest.
+- **Link a new document from the page that owns its topic; add no map entry.** `docs/README.md`
+  is the tree plus two compact tables, never re-aligned. `docs-check-links` fails a document no
+  reader reaches: do not grow its allowlist; argue a new family glob in the PR.
 - **Write it straight.** Lead with the fact; cut hype and self-assessment (`comprehensive`,
   `robust`, `seamless`); skip "not X, but Y" and rule-of-three padding; prefer prose to a
   `**Bold term:** explanation` list; claim first, caveat after. `SKILL.md` files are the
@@ -221,10 +220,9 @@ Rules:
   sections, no summary that repeats the section above it, no scaffolding a reader will skip.
   `.agents/rules/documentation.md` has the full form of both rules and their upstream guide.
 
-Run `make docs-check` before pushing. It checks generated regions, relative links, identifiers
-against source, map (`docs/README.md`) coverage of every Markdown document outside the root
-dot-directories, site pages for maintainer identifiers, and this file plus `CLAUDE.md` against
-the context budget — the six checks CI runs.
+Run `make docs-check` before pushing. It checks generated regions, relative links and that a
+reader reaches every document, identifiers against source, site pages for maintainer identifiers,
+and this file plus `CLAUDE.md` against the context budget — the five checks CI runs.
 
 ## Contributing as an agent
 
@@ -287,8 +285,8 @@ Agents with a user in the loop follow this file.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
-  `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
-  map coverage, site audience, context budget), while the skill also verifies that doc prose still matches the
+  `make docs-check` enforces only the mechanical subset (generated regions, links, reachability,
+  terminology, site audience, context budget), while the skill also verifies that doc prose still matches the
   source. Its dispositions go in **Self-Review** with the adversarial pass's, not in a section of
   their own. `/pr-preflight` runs this pass alongside the adversarial one, each in its own context.
 - **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
@@ -357,7 +355,7 @@ Agents with a user in the loop follow this file.
 three repetitions each — and has blocked merges since 2026-09-02 (oss-test-infra#2677). It takes
 1.5 to 3.5 hours against a 360-minute ceiling, and a push restarts it unless only inert paths
 changed (step 0), so open the pull request early and batch changes. Another pull request merging
-usually does not — the green status is re-pinned to `main`'s new head.
+does not: a retest Tide starts because `main` moved reuses the head's green in minutes.
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
@@ -406,19 +404,19 @@ Three things to do with it:
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review**, with one exception: a branch the bot last said does not merge gets one after
-the next push. For a fresh review of the current commit, comment `/review` on a line of its own
+the next push. For another pass over the current commit, comment `/review` on a line of its own
 (owners, members, and collaborators only): the strict pass, what the bot is certain of plus any
 high-severity finding just under that bar, marked as such. `/review all` re-reads at the first
 review's width and adds findings it believes are real without being sure. The `agent:ignore` label
 opts a pull request out and outranks both.
 
 **A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
-run alongside its review — `success` when it found nothing, `neutral` when it did — and
-`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
-anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
-clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
-a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
-completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+run, and `.github/workflows/auto_request_review.yml` waits for it to go green before assigning
+anyone from `.github/auto_request_review.yml`. A first review is green only if it found nothing; a
+later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
+([the cases](docs/pull-request-workflow.md#what-the-check-means)). A green
+pass after `/review` is what reaches a reviewer. Exceptions: a pull request opened by a bot is
+assigned as soon as the check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
 owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
 assign a reviewer immediately — the override for a finding you have answered but disagree with, or
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.
@@ -445,10 +443,8 @@ into what is already there, per "Keep these sections current, not chronological"
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
 review brings fresh findings, and folding them in twice is the same wasted round.
 
-**Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
-merge and keeps the change counted as its author's outstanding work; what belongs here is the
-timing. Do it once the fixes are pushed and the last `/review` pass has settled: a fresh review
-opens fresh threads, so resolving before it lands means doing it twice.
+**Then resolve the conversations** once the fixes are pushed and the last `/review` pass has
+settled: a fresh review opens fresh threads, so resolving before it lands means doing it twice.
 
 Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
 the fix is on the pull request head and you can name the commit, or the finding is factually wrong
@@ -457,8 +453,10 @@ your working copy — a finding that looks wrong because the file it cites does 
 often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment
 call, a reviewer asking for something you chose not to do, a rebuttal nobody has answered yet —
 reply and leave it to them. Resolving says the conversation is finished; it is not a way to end a
-disagreement. Reply first, always: a resolved thread collapses, so the reply naming what changed and
-the commit that changed it is the only record the reviewer may ever see.
+disagreement. The exception, with a user in the loop, is a `kube-agents-bot` finding you decline,
+bar the description one: the bot never replies or resolves, so once your reply and **Self-Review**
+give the reason, resolve it. Reply first, always: a resolved thread collapses, so the reply is the
+only record a reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 

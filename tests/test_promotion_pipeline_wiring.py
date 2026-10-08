@@ -45,6 +45,7 @@ import unittest
 import yaml
 
 from tests.testing.common import create_mock_git_repo, get_isolated_test_env
+from tests.testing.release import parse_required_release_images
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
@@ -486,7 +487,7 @@ class PromotionPipelineWiringTest(unittest.TestCase):
                     for step in steps
                     if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
                 )
-                self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+                self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["client-id"])
                 self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
                 self.assertEqual(token_step["with"].get("permission-contents"), "write")
                 self.assertEqual(token_step["with"].get("permission-workflows"), "write")
@@ -786,10 +787,12 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
     # reads every step's name. The name classes admit any repository-legal
     # name (dots and underscores included), so an entry cannot slip out of
     # all three lists at once by its spelling; the array's own entries are
-    # counted against the parsed names for the same reason.
+    # counted against the parsed names for the same reason, in
+    # parse_required_release_images, the one copy of that parse. common.sh's
+    # required_release_images_in_text mirrors it for the release gate, and
+    # test_release_common.py pins the two to each other.
     _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([^/:\s]+):\$\{\{ github\.sha \}\}")
     _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([^/@\s]+)@\$")
-    _ARRAY_ENTRY_RE = re.compile(r"^\s*\"([^\"\s]+)\"\s*$", re.M)
 
     def test_the_workflow_builds_and_signs_exactly_the_required_release_images(self):
         """The three lists this workflow and the release ladder share are kept by
@@ -798,13 +801,10 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         refuse every commit; one in the workflow but not the sign loop ships
         unsigned. So the names the steps tag with :<sha> must equal the array,
         and each must be signed once."""
-        common = _COMMON_SH.read_text()
-        block = re.search(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", common, re.S)
-        self.assertIsNotNone(block, "REQUIRED_RELEASE_IMAGES not found in common.sh")
-        entries = [line for line in block.group(1).splitlines() if line.strip()]
-        required = set(self._ARRAY_ENTRY_RE.findall(block.group(1)))
-        self.assertEqual(len(required), len(entries), "an entry of REQUIRED_RELEASE_IMAGES was not read (unquoted, or two on one line)")
-        self.assertTrue(required)
+        try:
+            required = set(parse_required_release_images(_COMMON_SH.read_text()))
+        except ValueError as err:
+            self.fail(str(err))
         built = set()
         signed = []
         for job in self.jobs.values():
@@ -839,12 +839,32 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                     for job in (doc.get("jobs") or {}).values()
                     for step in (job.get("steps") or [])
                     if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
-                    and "RELEASE_BOT_APP_ID" in str(step.get("with", {}).get("app-id", ""))
+                    and any(
+                        "RELEASE_BOT_APP_ID" in str(step.get("with", {}).get(key, ""))
+                        for key in ("client-id", "app-id")
+                    )
                 ]
                 self.assertTrue(token_steps, f"expected at least one release bot token step in {name}")
                 for step in token_steps:
                     self.assertEqual(step["with"].get("permission-contents"), "write")
                     self.assertEqual(step["with"].get("permission-workflows"), "write")
+
+    def test_no_token_mint_uses_the_deprecated_app_id_input(self):
+        """create-github-app-token v3.1.0 deprecated `app-id` for `client-id`, and the
+        next major that drops it would break every mint at once. The permissions
+        guard above matches either key so that a step reintroduced with `app-id` is
+        still checked; this is the test that says it must not be reintroduced."""
+        for path in sorted(p for glob in ("*.yml", "*.yaml") for p in _WORKFLOWS.glob(glob)):
+            with self.subTest(workflow=path.name):
+                doc = _doc(path)
+                offenders = [
+                    f"{job_name}/{step.get('id') or step.get('name') or '?'}"
+                    for job_name, job in ((doc.get("jobs") or {}).items())
+                    for step in (job.get("steps") or [])
+                    if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+                    and any(str(key).lower() == "app-id" for key in (step.get("with") or {}))
+                ]
+                self.assertEqual(offenders, [], f"steps in {path.name} still mint with the deprecated app-id input")
 
 
 if __name__ == "__main__":

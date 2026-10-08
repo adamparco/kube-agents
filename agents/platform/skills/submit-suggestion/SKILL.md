@@ -1,11 +1,11 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
 
-This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting GitHub Pull Requests (PRs) for human review.
+This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting pull requests (PRs; merge requests on GitLab) for human review. The repository is named as `owner/name` on GitHub, or `<host>/<path>` — `gitlab.com/acme/platform/infra` — for one on another forge, exactly as it appears in the managed repository list.
 
 ## When to Use
 
@@ -17,6 +17,15 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
 
 ## When NOT to Use
 
+- **Answering a request that asked for a diagnosis, not a change.** "Investigate
+  and report the root cause", "why is this crashlooping", "what would you
+  change" are questions; their answer is the finding and the proposed manifest
+  in the reply, marked as a recommendation. Open the pull request only when the
+  request asks for one, or for the change to be submitted or fixed; `SOUL.md`
+  §3, item 3 draws the line, and the unattended case is `fleet-audit`'s own
+  promotion, which `finish` does on a scheduled run, never this skill. A pull
+  request nobody asked for is a write on their repository they now have to
+  triage.
 - **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
   security patch, a policy update — which is exactly why this warning exists. If
   the change addresses a fleet-audit finding (it carries a finding id, or an
@@ -72,7 +81,7 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py pre
 
 _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` or `--repo "acme/fleet" --branch "platform-agent/upgrade-policy-baseline"`)_
 
-In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.4).
+In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.5).
 
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because
@@ -94,9 +103,15 @@ name, which is why the name has to describe the change.
 }
 ```
 
-`base` is what the change merges into: the repository's own default branch, not
-a hardcoded `main` — or, when a pull request for this branch is already open,
-whatever that one is already targeting.
+`base` is what the change merges into: the branch the operator configured for
+this repository when there is one (the broker refuses a pull request onto any
+other), else the repository's own default branch, not a hardcoded `main` — or,
+when a pull request for this branch is already open, whatever that one is
+already targeting. It comes from the broker, never from your environment:
+exporting `GITOPS_BASE_BRANCH` or any other variable does not change it.
+If `prepare` is refused with `BASE_BRANCH_MISSING`, the configured base named
+in the message does not exist on the repository. That is for an operator to
+fix; report it and stop rather than naming another branch.
 
 `started_from` and `proposal` are two halves of one answer — whether this is new
 work or another round on a change already under review. `prepare` asks the forge
@@ -125,8 +140,8 @@ with no open proposal, whose tip is exactly what a closed proposal from this
 repository carried, and every proposal on it opened by this install's
 credential. A credential that cannot name its own login cannot show the last
 part, so for it the prefix and the same-repository rule are the whole bar.
-The log line says which happened. On GitHub nothing is lost: the revisions stay
-reachable from the closed pull request.
+The log line says which happened. Nothing is lost: on GitHub and on GitLab the
+revisions stay reachable from the closed proposal.
 
 If the broker refuses the delete, `prepare` refuses the name and names the
 code. `NOT_SPENT` means the branch moved on after its proposal closed;
@@ -156,21 +171,15 @@ sandbox cannot read the branch at all; `prepare` then refuses the name with
 
 Generate or edit the files **inside the returned `workspace`**.
 
-The local version control binary is `/opt/vcs/libexec/git`. It holds no
-credential and cannot reach a forge, which is exactly why it is the one to use
-on the working copy. Export it once and call it through the variable:
+`git` here holds no credential and cannot reach a forge; it works on the
+working copy and nothing else, and `submit` is what sends the result.
 
 ```bash
-export G=/opt/vcs/libexec/git
 cd <workspace>
 # create or edit the declarative files here
-$G add <file_path_1> <file_path_2>
-$G commit -m "<conventional_commit_message>"
+git add <file_path_1> <file_path_2>
+git commit -m "<conventional_commit_message>"
 ```
-
-Do **not** define a shell alias for it. Each command you run arrives in a fresh
-non-interactive shell, which never expands aliases, so an aliased `git`
-followed by `git commit` silently runs the credentialed program instead.
 
 **CRITICAL SECURITY RULE:** explicitly stage only the targeted declarative files
 you generated or modified. **Never use `git add .` or `git add -A`** — this is a
@@ -178,7 +187,7 @@ real clone on a filesystem you also scratch in, and a blanket add sweeps
 transient debugging output, logs and anything else that landed there into a
 public pull request.
 
-_(Example: `$G add config/manifest.yaml && $G commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
+_(Example: `git add config/manifest.yaml && git commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
 
 Committing here is optional. Uncommitted changes **to files the copy already
 tracks** are recorded as a single revision under the `--title` you pass when you
@@ -189,7 +198,7 @@ request's headline.
 The rule above still holds at Step 3: a file the copy has never seen is not
 swept in for you. `submit` refuses and names it, because it cannot tell a
 manifest you generated from a log you left behind. Stage the ones that belong
-(`$G add <path>`) and delete the rest.
+(`git add <path>`) and delete the rest.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 
@@ -238,7 +247,18 @@ is not the `base` Step 1 reported. It may not name the branch you are
 submitting: a head branch that is its own base carries nothing for anyone to
 review, and `prepare`, `submit` and the broker each refuse it. That covers the
 repository whose trunk is called something other than `main` — the name is read
-from the remote, not from a list.
+from the remote, not from a list. On a repository with a configured base, a new
+pull request may only target that base: a `--base` naming anything else is
+refused with `TARGET_NOT_BASE` before anything is published, and the message
+names the configured base. If you passed `--base`, drop it and submit again.
+If you did not, the copy was prepared before the base was configured or moved:
+read the change in the old copy, run `prepare --force` with the same
+`--branch`, reapply the change, and submit from the new copy. `submit` recorded
+the change as a revision before the publish was refused, so a plain `prepare`
+refuses to replace that copy. `--force` is safe here: the revision it deletes
+is the one you have read and are about to reapply. Do not try another target,
+and do not pass the named branch as `--base` from the old copy: it was cut from
+another branch, and the broker refuses it `BASE_MOVED`.
 
 The script returns the clean, live pull request URL. If a pull request for this
 branch is already open, it updates that one's title and body in place and

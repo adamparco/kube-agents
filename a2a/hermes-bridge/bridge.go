@@ -1,7 +1,9 @@
 // Package hermesbridge is the stand-in executor for tasks addressed to the
-// platform profile: it consumes a2a.tasks.{profile}.*.in, runs one
-// `hermes -p {profile} chat -Q -q <prompt>` per task, and publishes the payload
-// spec's lifecycle events with the output as the result artifact. It is
+// platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
+// as a turn on the pod's Hermes API server (one session per contextId) or,
+// on the cli executor, by one `hermes -p {profile} chat -Q -q <prompt>` per
+// task, and publishes the payload spec's lifecycle events with the answer as
+// the result artifact. It is
 // scaffolding for the Hermes-first world - when the stage-3 dispatcher and
 // the W4 worker adapter land, the bridge retires. Design:
 // a2a/docs/hermes-bridge.md.
@@ -13,7 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -26,6 +32,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -40,6 +47,9 @@ const (
 	// so a terminal that kept stderr alone threw the diagnosis away (#2036).
 	stderrTailBytes = 2048
 	stdoutTailBytes = 2048
+	// publishErrTailBytes bounds the publish error a bus-publish-failed
+	// terminal quotes. The tail, because a wrapped error ends in its cause.
+	publishErrTailBytes = 2048
 	// rateLimitedExitCode is EX_TEMPFAIL, the code Hermes exits with when a
 	// turn gave up on the provider's rate limit; the terminal names it so a
 	// quota storm is not graded as the persona's failure.
@@ -88,11 +98,37 @@ type Config struct {
 	NATSURL string
 	// Profile is the addressee token the bridge executes for ("platform").
 	Profile string
-	// Command is the invocation prefix; the task prompt is appended as the
-	// final argument. Default: ["hermes", "-p", <profile>, "chat", "-Q", "-q"].
+	// Executor is how a task runs: ExecutorAPI posts it as a turn in the
+	// conversation's Hermes session through the pod's API server;
+	// ExecutorCLI spawns Command per task (api.go has the why). The zero
+	// value is ExecutorCLI, so a bridge under test calls no server it did
+	// not ask for; the daemon defaults to ExecutorAPI.
+	Executor string
+	// APIURL, APIKey and APIModel are the API executor's endpoint, bearer
+	// token (the pod's API_SERVER_KEY, which the server needs before it
+	// honours the session headers) and model name. URL and model default
+	// to DefaultAPIURL and DefaultAPIModel; the key has no default.
+	APIURL   string
+	APIKey   string
+	APIModel string
+	// APIConnectRetry is how long a refused connection to the API server is
+	// retried before the task ends hermes-api-unreachable; zero is
+	// DefaultAPIConnectRetry.
+	APIConnectRetry time.Duration
+	// ActivitySecret signs the API executor's hook deliveries: the pod's
+	// managed config carries one hooks.outbound entry for the whole
+	// gateway with secret_env A2A_ACTIVITY_SECRET, and the door attributes
+	// a delivery to a task by the session id in its payload. Empty leaves
+	// the API executor's tasks without a trace (the CLI executor's children
+	// carry their own per-task key either way).
+	ActivitySecret string
+	// Command is the CLI executor's invocation prefix; the task prompt is
+	// appended as the final argument. Default: ["hermes", "-p", <profile>,
+	// "chat", "-Q", "-q"].
 	Command []string
-	// Concurrency caps simultaneous hermes subprocesses (default 2, the
-	// platform profile's concurrency in the profiles spec).
+	// Concurrency caps simultaneous tasks, hermes subprocesses or API
+	// requests (default 2, the platform profile's concurrency in the
+	// profiles spec).
 	Concurrency int
 	// TaskDeadline is the per-invocation wall-clock ceiling (default 7200s,
 	// matching the platform profile's activeDeadlineSeconds).
@@ -106,6 +142,48 @@ type Config struct {
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
 	ResultChunkSize int
+	// ActivityListen is the loopback address of the activity door, where
+	// hermes's outbound webhooks deliver the persona's tool calls
+	// (activity.go). Empty leaves the door closed: no listener, no key in
+	// the child's environment, no activity artifact. The daemon defaults it
+	// to DefaultActivityListen; the zero value here is "off" so a bridge
+	// under test binds nothing it did not ask for.
+	ActivityListen string
+	// ManagedScopeDir is hermes's managed scope as this process sees it:
+	// the directory whose config.yaml and .env each child's own scope is
+	// copied from before the hook is added (activity.go). Empty means
+	// nothing to copy and a hook-only scope; the daemon resolves it from
+	// $HERMES_MANAGED_DIR, else /etc/hermes (cmd/hermes-bridge), so the
+	// library reads no environment and a test's bridge copies nothing from
+	// the machine it runs on.
+	ManagedScopeDir string
+	// ScratchDir holds the per-task managed scopes (default: hermes-bridge
+	// under the temp dir). Each is removed when its child exits.
+	ScratchDir string
+	// ProgressInterval is the heartbeat cadence on the progress artifact.
+	// Zero takes the default (60s), as every other field here does; a
+	// negative value turns the heartbeat off. The daemon maps its
+	// environment's 0 to that, since "0 seconds" can only mean off there.
+	ProgressInterval time.Duration
+	// Scope is the resource path this executor operates in, and it is what
+	// the capability is checked against: not "may this capability do
+	// anything" but "may it execute here". It has to be a scope the
+	// gateway's ceiling contains, which for an unconfigured install is
+	// `namespace/<the agent's namespace>`; the bridge shares that pod, so
+	// the two agree by construction. Resolved by the caller, never
+	// defaulted here — an executor that invented its own scope would be
+	// answering the question it was asked to pose.
+	Scope capability.Scope
+	// CapabilityOptional governs exactly one thing: what a submission with
+	// no capability at all means. Zero value — the safe one — refuses it.
+	// Set, it executes and says so at WARN. That is the mixed-version
+	// window: a gateway that predates the mint in front of an executor
+	// that enforces it, and nothing else.
+	//
+	// It is NOT a switch for enforcement. A capability that is present is
+	// always checked and its refusal is always honoured; there is no
+	// configuration in which this bridge runs work a verifier refused.
+	CapabilityOptional bool
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option
 	Logger      *slog.Logger
@@ -119,6 +197,18 @@ func (c *Config) defaults() {
 		// -Q is hermes's programmatic mode: no banner, no spinner, no TUI
 		// box around the answer - stdout is the response.
 		c.Command = []string{"hermes", "-p", c.Profile, "chat", "-Q", "-q"}
+	}
+	if c.Executor == "" {
+		c.Executor = ExecutorCLI
+	}
+	if c.APIURL == "" {
+		c.APIURL = DefaultAPIURL
+	}
+	if c.APIConnectRetry <= 0 {
+		c.APIConnectRetry = DefaultAPIConnectRetry
+	}
+	if c.APIModel == "" {
+		c.APIModel = DefaultAPIModel
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
@@ -134,6 +224,12 @@ func (c *Config) defaults() {
 	}
 	if c.ResultChunkSize <= 0 {
 		c.ResultChunkSize = 256 * 1024
+	}
+	if c.ProgressInterval == 0 {
+		c.ProgressInterval = DefaultProgressInterval
+	}
+	if c.ScratchDir == "" {
+		c.ScratchDir = filepath.Join(os.TempDir(), "hermes-bridge")
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -160,9 +256,20 @@ type taskRun struct {
 	state      runState
 	proc       *exec.Cmd
 	killTimers []*time.Timer
+	// cancelReq ends the API executor's request (api.go); nil outside one.
+	// Under mu like proc, which it is the counterpart of.
+	cancelReq context.CancelFunc
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
+
+	// act is the task's side of the activity door (activity.go): its
+	// signing key, the calls seen, the heartbeat's lifecycle. Stored before
+	// the subprocess starts, so no delivery can precede it, and atomic
+	// because the door reads it with no lock held, after copying the runs
+	// under b.mu, while the worker writes it under mu - the two locks never
+	// nest, on purpose.
+	act atomic.Pointer[activityState]
 }
 
 // Bridge is one running instance. Two connections by design: the lib client
@@ -182,6 +289,9 @@ type Bridge struct {
 	tasks map[string]*taskRun
 	queue chan *taskRun
 	wg    sync.WaitGroup
+
+	// turns serializes the API executor's turns per Hermes session (api.go).
+	turns sessionTurns
 
 	// closing marks shutdown, so a worker whose subprocess died to the
 	// shutdown SIGKILL reports bridge-shutdown, not a bogus exit code.
@@ -212,6 +322,14 @@ type Bridge struct {
 	// so a test can keep the release pending and count slots in hand without
 	// racing the timer.
 	holdReplaySlot func(release func())
+
+	// apiClient is the API executor's HTTP client (api.go).
+	apiClient *http.Client
+	// The activity door (activity.go); nil when Config.ActivityListen is "".
+	activityLn   net.Listener
+	activitySrv  *http.Server
+	activityDone chan struct{} // closed by closeActivity, so serveActivity's shutdown waiter stops too
+	activityOnce sync.Once
 	// tasksGet is the task lookup lookupTask retries, in the shape of
 	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
 	// drive the retry without a bus fault.
@@ -221,6 +339,15 @@ type Bridge struct {
 // New connects and sweeps but does not consume yet; Run does.
 func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	cfg.defaults()
+	switch cfg.Executor {
+	case ExecutorAPI:
+		if err := apiExecutorValid(&cfg); err != nil {
+			return nil, err
+		}
+	case ExecutorCLI:
+	default:
+		return nil, fmt.Errorf("unknown executor %q: %q or %q", cfg.Executor, ExecutorAPI, ExecutorCLI)
+	}
 	b := &Bridge{
 		cfg: cfg,
 		from: lib.Party{
@@ -231,6 +358,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		tasks:       make(map[string]*taskRun),
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
+		apiClient:   newAPIClient(),
 	}
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
@@ -243,9 +371,39 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.nc, err = nats.Connect(cfg.NATSURL, append([]nats.Option{
+	// An async error handler, for the same reason the session executor has one
+	// (worker-adapter/adapter.go) and one this connection made sharper.
+	//
+	// This is the connection the capability check rides: capability.NewClient
+	// publishes on a2a.cap.verify.<profile> and subscribes to
+	// a2a.cap.reply.<profile>.*. NATS refuses either asynchronously, and nats.go
+	// delivers that -ERR only to the async handler -- with none installed it is
+	// dropped on the floor. Check then simply times out, and the bridge
+	// publishes "the verifier could not be reached" as the task's terminal
+	// reason. So a bridge missing or mis-spelling one of its two verify grants
+	// refuses every task while every log line and every terminal event blames
+	// the verifier Deployment, which is the wrong team's pager and the wrong
+	// hour of debugging.
+	//
+	// The handler does not change any of those outcomes. It makes the refusal
+	// name itself at the moment it happens, which is the difference between "the
+	// verifier is down" and "this bridge was never granted the subject".
+	natsOpts := append([]nats.Option{
 		nats.Name(b.from.Session + "-kv"), nats.MaxReconnects(-1),
-	}, cfg.NATSOptions...)...)
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			subject := ""
+			if sub != nil {
+				subject = sub.Subject
+			}
+			if errors.Is(err, nats.ErrPermissionViolation) || errors.Is(err, nats.ErrAuthorization) {
+				cfg.Logger.Error("the bus refused this bridge", "err", err, "subject", subject,
+					"profile", cfg.Profile, "session", b.from.Session)
+				return
+			}
+			cfg.Logger.Warn("nats async error", "err", err, "subject", subject)
+		}),
+	}, cfg.NATSOptions...)
+	b.nc, err = nats.Connect(cfg.NATSURL, natsOpts...)
 	if err != nil {
 		b.c.Close()
 		return nil, fmt.Errorf("kv connection: %w", err)
@@ -260,12 +418,17 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		b.close()
 		return nil, fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
 	}
+	if err := b.listenActivity(); err != nil {
+		b.close()
+		return nil, err
+	}
 	return b, nil
 }
 
 func (b *Bridge) close() {
 	b.c.Close()
 	b.nc.Close()
+	b.closeActivity()
 }
 
 // Run sweeps orphans from a prior incarnation, then consumes the profile's
@@ -277,6 +440,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err := b.sweep(ctx); err != nil {
 		return fmt.Errorf("startup sweep: %w", err)
 	}
+	b.serveActivity(ctx)
 	for i := 0; i < b.cfg.Concurrency; i++ {
 		b.wg.Add(1)
 		go b.worker(ctx)
@@ -290,7 +454,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile)
+	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
+	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && b.cfg.ActivitySecret == "" {
+		// The door is open but nothing can be attributed through it: the
+		// pod's hook signs with a secret this bridge was not given.
+		b.cfg.Logger.Warn("activity door open with no ActivitySecret: API tasks carry no tool trace",
+			"env", ActivitySecretEnv)
+	}
+	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && !activityHookReaches(b.activityLn.Addr()) {
+		// The pod's hook posts to one address, and the operator renders it
+		// only for a door there; a door elsewhere hears nothing.
+		b.cfg.Logger.Warn("activity door not where the pod-wide hook posts: API tasks carry no tool trace",
+			"listen", b.activityLn.Addr().String(), "hook", DefaultActivityListen)
+	}
 	<-ctx.Done()
 	b.closing.Store(true)
 	sub.Stop()
@@ -317,6 +493,9 @@ func (b *Bridge) shutdownTasks() {
 		r.mu.Lock()
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
+		}
+		if r.state == stateRunning && r.cancelReq != nil {
+			r.cancelReq()
 		}
 		r.mu.Unlock()
 		b.finalize(r, lib.StateFailed, shutdownReason, nil)
@@ -402,6 +581,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.mu.Lock()
 	b.tasks[env.TaskID] = run
 	b.mu.Unlock()
+
 	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
 	select {
 	case b.queue <- run:
@@ -425,6 +605,9 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	pending := run.state == statePending
 	if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {
 		b.killGroup(run, run.proc.Process.Pid)
+	}
+	if run.state == stateRunning && run.cancelReq != nil {
+		run.cancelReq()
 	}
 	run.mu.Unlock()
 	if pending {
@@ -499,10 +682,12 @@ func (b *Bridge) refuseSteer(ctx context.Context, run *taskRun, steer *lib.Envel
 		return
 	}
 	state := lib.StateWorking
-	if run.state == statePending {
+	if run.state == statePending || (b.cfg.Executor == ExecutorAPI && run.act.Load() == nil) {
+		// Queued, or on the API executor still waiting for its session's
+		// turn: working has not been published.
 		state = lib.StateSubmitted
 	}
-	msg := "steering received but not absorbed: the Hermes CLI runs one-shot and cannot " +
+	msg := "steering received but not absorbed: the bridge sends a task's instruction to Hermes once and cannot " +
 		"accept mid-run input. The task continues on its original instruction; cancel if that is wrong."
 	if err := b.publishStatusMessage(ctx, run, state, false, msg); err != nil {
 		b.cfg.Logger.Error("steer refusal publish failed", "task", steer.TaskID, "err", err)
@@ -519,6 +704,25 @@ func (b *Bridge) worker(ctx context.Context) {
 		case run = <-b.queue:
 		}
 		if !run.pending() {
+			continue
+		}
+		// The authorization gate runs BEFORE the look-ahead, and the order
+		// is deliberate. The look-ahead is not free and it is not private:
+		// its fallback replay opens an ephemeral consumer and holds a
+		// replaySlot for the inactive threshold, and replaySlots is bounded
+		// at Concurrency and shared by every worker. Running it first would
+		// let an unauthorized submission spend a bus consumer and park a
+		// slot that authorized tasks queue behind -- work done on behalf of
+		// a requester who was never entitled to any, which is the property
+		// this branch exists to establish. The verifier round trip is a
+		// request-reply on a subject with no shared bounded resource behind
+		// it, so it is the cheaper of the two to spend on a task that turns
+		// out to be refused.
+		//
+		// It also decides the record: an unauthorized submission terminates
+		// `rejected` with the capability's reason rather than `canceled`,
+		// which is the honest terminal and the one an audit can act on.
+		if !b.capabilityPermits(ctx, run) {
 			continue
 		}
 		// The look-ahead runs with the task still pending, so a cancel the
@@ -691,7 +895,53 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 	}, nil
 }
 
+// capabilityPermits is the authorization gate, and it runs HERE — on a
+// worker, after the queue — rather than in accept, which is where the check
+// first landed. Both placements are before `working` publishes, before hermes
+// is invoked and before a model is called, so nothing about what is refused
+// changes. What changes is who waits: accept runs on the bridge's one durable
+// consumer callback, which is serial and which also carries the KindCancel
+// envelopes for tasks that are already running. Check blocks for
+// capability.DefaultTimeout when nothing answers on the verify subject, so a
+// verifier outage made every cancel queue behind 5s per pending submission —
+// a user unable to stop a running hermes subprocess because of an outage in
+// the thing that authorizes new ones. The session executor has always checked
+// in its own process for the same reason (a2a/worker-adapter/adapter.go).
+//
+// The cost of the move: a submission now occupies a queue slot while it is
+// being verified, so a verifier outage long enough to queue taskQueueCapacity
+// of them ends in bridge-queue-overflow rather than capability-refused. At
+// Concurrency workers and one DefaultTimeout each that is thousands of
+// submissions inside one outage on a single-profile bridge, which is the
+// "fault, not load" the capacity already stands for.
+//
+// Returns false when it finalized the task; the caller must not run it.
+func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
+	reason := b.capabilityRefusal(ctx, run.origin)
+	if reason == "" {
+		return true
+	}
+	// "The verifier could not be reached" and "we stopped asking" are
+	// different facts, and Check cannot tell them apart: it turns any
+	// error out of NextMsgWithContext, context.Canceled included, into
+	// a refusal. So a submission whose check was in flight when the
+	// bridge was terminated would land as terminal `rejected` -- which
+	// no supervisor retries -- instead of the retryable shutdown every
+	// other pending task gets. The verifier guards the mirror image of
+	// this on its own side; see capability.DrainAndCancel.
+	if ctx.Err() != nil {
+		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+		return false
+	}
+	b.finalize(run, lib.StateRejected, reason, nil)
+	return false
+}
+
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
+	if b.cfg.Executor == ExecutorAPI {
+		b.runTaskAPI(ctx, run)
+		return
+	}
 	taskID := run.origin.TaskID
 	prompt, ok := promptFromMessage(run.origin.Payload)
 	if !ok {
@@ -712,6 +962,24 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	stderr := newTailBuffer(stderrTailBytes)
 	cmd.Stdout = &stdout
 	cmd.Stderr = stderr
+	// The activity door's side of this task: a signing key in the child's
+	// environment when the door is open, and the heartbeat either way.
+	act := newActivityState(b.activityLn != nil)
+	if b.activityLn != nil {
+		scope, err := b.childManagedScope(taskID)
+		if err != nil {
+			b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
+			return
+		}
+		defer func() {
+			// The scope holds the managed .env; a removal that fails leaves
+			// it in the shared scratch dir until the next start's sweep.
+			if err := os.RemoveAll(scope); err != nil {
+				b.cfg.Logger.Warn("child scope not removed", "task", run.origin.TaskID, "scope", scope, "err", err)
+			}
+		}()
+		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
+	}
 
 	run.mu.Lock()
 	if run.state != stateRunning {
@@ -719,12 +987,16 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		run.mu.Unlock()
 		return
 	}
+	run.act.Store(act)
 	if err := cmd.Start(); err != nil {
+		// No child, so no publisher to join and nothing to drain.
+		run.act.Store(nil)
 		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
 		return
 	}
 	run.proc = cmd
+	go b.runActivity(run)
 	// Cancel may have raced the spawn: its kill saw no process, so re-check
 	// under the same lock its kill path takes.
 	if run.canceled.Load() {
@@ -794,6 +1066,14 @@ func failureReason(err error, stdout, stderr string) string {
 	return sb.String()
 }
 
+// resultPublishFailedReason is the terminal message for a result artifact
+// the bus refused: the token, then a bounded tail of the cause, so the
+// reason a person reads says why (an envelope over the bus's maximum, a
+// timeout) and not only that it failed.
+func resultPublishFailedReason(err error) string {
+	return "reason: bus-publish-failed at result - " + tail(err.Error(), publishErrTailBytes)
+}
+
 // tail is the last n bytes of s, cut on a rune boundary so the text part
 // stays valid UTF-8.
 func tail(s string, n int) string {
@@ -859,17 +1139,23 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 		run.mu.Unlock()
 		return
 	}
+	// The trace first, while the state still admits it: any call still
+	// open, and the budget marker if calls were cut, go out ahead of the
+	// result inside this critical section, so the activity artifact is
+	// complete and nothing of it can follow the final event.
+	b.drainActivity(run)
 	run.state = stateDone
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	if resultOutput != nil {
 		if err := b.publishResult(ctx, run, *resultOutput); err != nil {
 			b.cfg.Logger.Error("result publish failed", "task", run.origin.TaskID, "err", err)
-			state, msg = lib.StateFailed, "reason: bus-publish-failed at result"
+			state, msg = lib.StateFailed, resultPublishFailedReason(err)
 		}
 	}
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
 	run.mu.Unlock()
+	b.waitActivity(run)
 	if err != nil {
 		// The task stays in the KV registry, so a restart's sweep writes the
 		// terminal event this publish could not.

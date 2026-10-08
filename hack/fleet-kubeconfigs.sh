@@ -11,13 +11,18 @@
 # seeded clusters into their OWN files and leaves the ambient kubeconfig alone.
 #
 # The files are keyed by fixture ROLE, never by cluster name and never by
-# project. Each eval project carries its own trio of seeded clusters, so a case
+# project. Each eval project carries its own set of seeded clusters, so a case
 # that named `seeded-a` would be a case that only runs in one project. A case
 # names `fixture_role: crashloop-workload`; bench/tf/fleet/fixtures.json says
-# which SLOT of the trio that role lives on; this script finds the leased
-# project's trio and matches each cluster to its slot. The catalog is the only
-# place the role->slot mapping exists -- the verifier never re-derives it, it
-# just opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig".
+# which SLOT of the fleet that role lives on; this script finds the leased
+# project's seeded clusters and matches each cluster to its slot. The catalog is the only
+# place the role->slot mapping exists -- the verifier never re-derives it. It
+# opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig" for a check on the
+# role's objects; a check that only needs the role's cluster to have been
+# reached (`fixture_roles` on report_contains) reads the slot this script
+# records for the role in .fleet-context (`slot.<role>=<slot>`) and opens
+# "${BENCH_FLEET_KUBECONFIG_DIR}/clusters/<slot>.kubeconfig", which is written
+# for every reached cluster before any role on it is confirmed.
 #
 # Clusters are DISCOVERED BY LABEL, not composed from a name:
 #
@@ -25,7 +30,7 @@
 #   resourceLabels.managed-by=kube-agents-seeded-fleet
 #
 # which is exactly `local.cluster_labels` in bench/tf/fleet/main.tf and is
-# carried by the trio and by nothing else in an eval project (neither
+# carried by the seeded clusters and by nothing else in an eval project (neither
 # platform-agent-host nor the per-run eval-pr-* clusters have either label).
 # Composing "${prefix}-${slot}" from catalog constants instead would silently
 # address the wrong thing the first time someone applies the stack with a
@@ -48,13 +53,13 @@
 # has been SEEN on the slot's cluster, before the agent runs, and the list of
 # what was seen is written beside it as "<role>.confirmed". A labelled cluster
 # is not the same thing as a planted fixture -- an apply that created the
-# clusters and stopped before the Kubernetes provider ran leaves a trio that
+# clusters and stopped before the Kubernetes provider ran leaves a fleet that
 # answers every API call and holds none of the objects -- and the verifier's
 # whole fail/error distinction rests on being able to say an object that is
 # gone AT CHECK TIME went missing DURING the run. Confirming it here is what
 # makes that true, and confirming it PER OBJECT rather than per namespace is
-# what makes it true for the roles that have no namespace: four of the eight
-# are cluster-scoped, so a namespace-only gate waved them through and let a
+# what makes it true for the roles that have no namespace: the cluster-scoped
+# ones, which a namespace-only gate waved through and so let a
 # check on a live-but-empty cluster blame an agent that touched nothing. A
 # fixture that was never planted leaves the role unresolvable, which is an
 # error about the environment, not a failure blamed on the agent.
@@ -64,7 +69,7 @@
 #   hack/fleet-kubeconfigs.sh            # same thing; prints the directory
 #
 # Inputs (all optional except a project):
-#   FLEET_PROJECT_ID          project holding the trio; defaults to PROJECT_ID
+#   FLEET_PROJECT_ID          project holding the fleet; defaults to PROJECT_ID
 #   FLEET_CATALOG             path to fixtures.json
 #   BENCH_FLEET_KUBECONFIG_DIR  where to write; defaults under TMPDIR
 #   FLEET_READONLY_SA         service account to mint a read-only token for
@@ -74,6 +79,8 @@
 #                             scripts refuse it in a Prow job.
 #   FLEET_MINT_RETRY_SECONDS  wait between the gate's mint attempts (default
 #                             5; tests set 0)
+#   FLEET_PROBE_REQUEST_TIMEOUT  kubectl --request-timeout on each presence
+#                             probe (default 30s)
 #
 # Output: exports BENCH_FLEET_KUBECONFIG_DIR when sourced; prints it on stdout
 # when executed. Everything else this script says goes to stderr.
@@ -101,6 +108,9 @@ _FLEET_EXIT_READONLY_UNAVAILABLE=3
 # should be no stricter than they are. A PERMISSION_DENIED is not retried:
 # it is the binding, and it will not change in fifteen seconds.
 _FLEET_MINT_ATTEMPTS=3
+# A presence probe against a control plane that does not answer must not
+# hang the runner: bounded per request, as hack/fleet-fixture-state.py is.
+_FLEET_PROBE_REQUEST_TIMEOUT="${FLEET_PROBE_REQUEST_TIMEOUT:-30s}"
 _FLEET_MINT_RETRY_SECONDS="${FLEET_MINT_RETRY_SECONDS:-5}"
 _FLEET_MINT_DENIED_PATTERN="PERMISSION_DENIED"
 
@@ -172,16 +182,33 @@ for role, spec in sorted(roles.items()):
 # app=nope` exits ZERO with no output, which is the same trap that made the
 # pathless `absent` safeguards read as passes on the wrong cluster.
 _fleet_probe_present() {
-  local kubeconfig="$1" namespace="$2" probe="$3" kind rest
+  local kubeconfig="$1" namespace="$2" probe="$3" kind rest errors probe_rc
   case "$probe" in
     *\?*)
       kind="${probe%%\?*}"
       rest="${probe#*\?}"
+      # 0 present, 1 absent (an empty list), 2 the read itself failed: a
+      # 403, a control plane mid-upgrade or a token that could not be minted
+      # says nothing about whether the fixture is there. Presence is decided
+      # on stdout alone: a successful empty list can carry discovery noise or
+      # a deprecation warning on stderr, which must not read as an object.
+      # One call: stdout into the variable, stderr into a file read only when
+      # the read failed and removed on every path, with no trap (this file
+      # is sourced by the eval job under its own EXIT trap).
+      errors="$(mktemp)" || { _FLEET_PROBE_ERR="mktemp failed"; return 2; }
+      probe_rc=0
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        [ -n "$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name 2>/dev/null)" ]
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -n "$namespace" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>"$errors")" || probe_rc=$?
       else
-        [ -n "$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name 2>/dev/null)" ]
+        _FLEET_PROBE_OUT="$(KUBECONFIG="$kubeconfig" kubectl get "$kind" -l "$rest" -o name --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" 2>"$errors")" || probe_rc=$?
       fi
+      if [ "$probe_rc" -ne 0 ]; then
+        _FLEET_PROBE_ERR="$(cat "$errors")"
+        rm -f "$errors"
+        return 2
+      fi
+      rm -f "$errors"
+      [ -n "$_FLEET_PROBE_OUT" ]
       ;;
     */*)
       kind="${probe%%/*}"
@@ -189,11 +216,16 @@ _fleet_probe_present() {
       # Spelled out twice rather than built into an array: bash 3.2 (still what
       # macOS ships, and what a contributor runs the tests on) errors on
       # "${empty[@]}" under `set -u`.
+      # 0 present, 1 NotFound, 2 any other failure of the read.
       if [ "$namespace" != "-" ] && [ -n "$namespace" ]; then
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" >/dev/null 2>&1
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" -n "$namespace" --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)" && return 0
       else
-        KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" >/dev/null 2>&1
+        _FLEET_PROBE_ERR="$({ KUBECONFIG="$kubeconfig" kubectl get "$kind" "$rest" --request-timeout="$_FLEET_PROBE_REQUEST_TIMEOUT" >/dev/null; } 2>&1)" && return 0
       fi
+      case "$_FLEET_PROBE_ERR" in
+        *NotFound*) return 1 ;;
+      esac
+      return 2
       ;;
     *)
       return 1
@@ -201,13 +233,13 @@ _fleet_probe_present() {
   esac
 }
 
-# The leased project's seeded trio, as "<slot>\t<name>\t<location>" lines, for
+# The leased project's seeded clusters, as "<slot>\t<name>\t<location>" lines, for
 # each discovered cluster whose name ends in "-<slot>" for a slot the catalog
 # declares. A cluster that matches the labels but no slot is reported and
 # skipped: that is a fleet the catalog does not describe, and guessing at it
 # would put a check on a cluster nobody wrote a fixture for.
 #
-# Two clusters claiming the SAME slot -- a leftover trio under an old
+# Two clusters claiming the SAME slot -- a leftover fleet under an old
 # cluster_prefix, or the same prefix in two zones, both legal -- drops the slot
 # entirely rather than letting gcloud's listing order decide. An ambiguous
 # fixture address must not resolve: silently picking one turns "the wrong
@@ -224,25 +256,31 @@ _fleet_list_seeded_clusters() {
     --format='value(name,location)' 2>/dev/null
 }
 
+# Prints the slot a cluster name resolves to, or nothing when none does.
+_fleet_slot_for_name() {
+  local name="$1" slots="$2" slot matched=""
+  for slot in $slots; do
+    # Longest suffix wins. Slots "a" and "batch-a" both end
+    # "seeded-batch-a", and taking the first match in sorted order would
+    # hand slot 'a' a cluster belonging to 'batch-a'. The longest match is
+    # unique by construction: two different slots cannot both be the
+    # same-length tail of one name.
+    if [ "${name%-"${slot}"}" != "$name" ] &&
+      [ "${#slot}" -gt "${#matched}" ]; then
+      matched="$slot"
+    fi
+  done
+  printf '%s' "$matched"
+}
+
 _fleet_match_slots() {
-  local listing="$1" slots="$2" project="$3" name location slot matched
-  local rows dupes
+  local listing="$1" slots="$2" project="$3" name location matched
+  local slot rows dupes
 
   rows=""
   while IFS=$'\t' read -r name location; do
     [ -n "$name" ] || continue
-    matched=""
-    for slot in $slots; do
-      # Longest suffix wins. Slots "a" and "batch-a" both end
-      # "seeded-batch-a", and taking the first match in sorted order would
-      # hand slot 'a' a cluster belonging to 'batch-a'. The longest match is
-      # unique by construction: two different slots cannot both be the
-      # same-length tail of one name.
-      if [ "${name%-"${slot}"}" != "$name" ] &&
-        [ "${#slot}" -gt "${#matched}" ]; then
-        matched="$slot"
-      fi
-    done
+    matched="$(_fleet_slot_for_name "$name" "$slots")"
     if [ -z "$matched" ]; then
       echo "WARNING: seeded cluster ${name} in ${project} matches no slot the catalog declares; ignoring it" >&2
       continue
@@ -478,13 +516,18 @@ write_fleet_kubeconfigs() {
   # So a check that cannot resolve its role can name the project it was looking
   # in. "role X is unavailable" is a bug report nobody can act on; "role X is
   # unavailable in kube-agents-evals-3" is one sentence from the answer. The
-  # per-slot `cluster.<slot>=` / `location.<slot>=` lines are appended below
-  # as each slot resolves.
+  # `slot.<role>=` line per catalog role comes next, from the rows already
+  # parsed and before the cluster listing and every per-slot credential fetch
+  # below, so the record is complete the moment the file exists: a run that stops partway leaves a file whose missing
+  # lines are the per-slot `cluster.<slot>=` / `location.<slot>=` records
+  # appended below as each slot resolves, never a missing slot record a
+  # reader would take for an older runner or an uncatalogued role.
   printf 'project=%s\n' "$project" >"${dir}/.fleet-context"
+  printf '%s\n' "$rows" | awk 'NF >= 2 { printf "slot.%s=%s\n", $1, $2 }' >>"${dir}/.fleet-context"
   chmod 600 "${dir}/${_FLEET_MARKER}" "${dir}/.fleet-context"
 
-  local slot cluster location slot_config listing discovered errors
-  local role namespace probe probes confirmed missing
+  local slot cluster location slot_config listing discovered errors named
+  local role namespace probe probes confirmed missing unreadable unreadable_why probe_rc
   local written=0 unresolved=0 unplanted=0 found=0 labelled=0
   if ! listing="$(_fleet_list_seeded_clusters "$project")"; then
     echo "WARNING: could not list clusters in ${project}; every fleet check will report status=error" >&2
@@ -538,6 +581,29 @@ write_fleet_kubeconfigs() {
     # operator to apply the stack would send them to re-create what already
     # exists. The warnings above name the individual clusters.
     echo "WARNING: project ${project} carries ${labelled} labelled seeded cluster(s) but none resolved to a catalog slot -- see the per-cluster warnings above for whether they were ambiguous or named outside the catalog's slots. Every fleet check in this run reports status=error." >&2
+  else
+    # At least one slot resolved. A slot that did not, with nothing said here,
+    # only adds its roles to `unresolved` below -- the count an unreachable
+    # cluster adds to -- and a caller that tells those apart by warning text
+    # (the pool verifier) would take another cluster's refused credentials as
+    # the reason this slot is empty. A slot some cluster named but that did not
+    # resolve was ambiguous, and _fleet_match_slots has already said so; a
+    # second line here would be the one the fixture-state scan quotes.
+    for slot in $slots; do
+      if printf '%s\n' "$discovered" | awk -F'\t' -v s="$slot" '$1 == s {f = 1} END {exit !f}'; then
+        continue
+      fi
+      named=""
+      while IFS=$'\t' read -r cluster location; do
+        if [ -n "$cluster" ] && [ "$(_fleet_slot_for_name "$cluster" "$slots")" = "$slot" ]; then
+          named=1
+          break
+        fi
+      done <<<"$listing"
+      if [ -z "$named" ]; then
+        echo "WARNING: project ${project} has no labelled seeded cluster for slot '${slot}' (a name ending in '-${slot}'), so every check naming a role on it will report status=error. A project whose fleet was applied before the catalog declared the slot, or whose cluster lost its labels, reads like this." >&2
+      fi
+    done
   fi
 
   while read -r role slot namespace probes; do
@@ -557,18 +623,36 @@ write_fleet_kubeconfigs() {
     # two are still distinguishable is this one, before the run starts.
     #
     # Confirming the NAMESPACE alone is not enough, and was the first version
-    # of this gate: four of the roles have no namespace at all, so it waved
+    # of this gate: the cluster-scoped roles have no namespace at all, so it waved
     # them through and let a check on a live-but-empty cluster report a
     # catastrophic `fail` against an agent that never touched anything.
     confirmed=""
     missing=""
+    unreadable=""
+    unreadable_why=""
     for probe in $probes; do
-      if _fleet_probe_present "$slot_config" "$namespace" "$probe"; then
-        confirmed+="${probe}"$'\n'
-      else
-        missing+="${probe} "
-      fi
+      # Captured, not tested in an `if`: the three-way answer needs the code,
+      # and under `set -e` a bare non-zero call would end the script.
+      probe_rc=0
+      _fleet_probe_present "$slot_config" "$namespace" "$probe" || probe_rc=$?
+      case $probe_rc in
+        0) confirmed+="${probe}"$'\n' ;;
+        1) missing+="${probe} " ;;
+        *)
+          unreadable+="${probe} "
+          unreadable_why="$(printf '%s' "$_FLEET_PROBE_ERR" | tail -n 1 | tr -d '\r')"
+          ;;
+      esac
     done
+    if [ -n "$unreadable" ]; then
+      # Not "never planted": the read failed, so nothing is known about the
+      # fixture, and the scan records the role as not checked, not absent.
+      # Counted with the unreached roles, so the summary line still adds up
+      # to the catalog and the pool verifier excuses it as unreached.
+      echo "WARNING: ${unreadable% } could not be read from ${slot_config##*/} in ${project} (${unreadable_why:-no error text}), so fixture role '${role}' could not be checked. Its checks will report status=error rather than blaming the run." >&2
+      unresolved=$((unresolved + 1))
+      continue
+    fi
     if [ -n "$missing" ]; then
       echo "WARNING: ${missing% } absent from ${slot_config##*/} in ${project}, so fixture role '${role}' was never planted (or has already been destroyed). Its checks will report status=error rather than blaming the run." >&2
       unplanted=$((unplanted + 1))

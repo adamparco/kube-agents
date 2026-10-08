@@ -27,6 +27,7 @@ import socket
 import socketserver
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -37,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, TextIO
 
 import api_policy
 import command_policy
@@ -138,13 +139,74 @@ PIPES_CLOSED_POLL_SECONDS = 0.5
 # A long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
 # long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
 # from a constant of its own beside the output cap and reserves the name, and
-# its cap test sizes the container's memory limit against the two, so the
-# value an install runs moves with that limit rather than through the CR; this
+# the value an install runs is the operator's rather than the CR's; this
 # default is for a broker run outside the operator. `CommandExecutor.request_slot`
-# says which routes hold a slot and why the others take none.
+# says which routes hold a slot and why the others take none. Within the cap,
+# the child memory budget below decides how many are admitted at once; the cap
+# is the upper bound.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
-# How long a request waits for a slot before it is refused with 503. Long
+# The child memory budget (docs/designs/credential-proxy-child-memory-budget.md).
+# The slot cap above counts requests; the container's memory limit holds
+# processes, and the children a request spawns -- gcloud at about 102 MiB per
+# request across a listing burst, kubectl plus its auth-plugin helper at about
+# the same -- are most of what a wide-scope install's container holds. So a
+# request that runs commands also reserves this much for its children when it
+# is admitted, and the sum of reservations has to fit what is left of the
+# limit after the broker's own resident set and the content workspace's one
+# process tree at a time. One size for every route, because every route can
+# end up running the heavy case (§2.1). The operator's sizing test declares
+# the same four figures under matching names (credential_proxy_manifests.go)
+# and asserts the arithmetic against the rendered limit; change them together.
+# They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
+# tests/test_credential_proxy_sizing_parity.py.
+MEBIBYTE = 1024 * 1024
+REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
+# The broker process and Envoy: 168 MiB measured, with margin.
+BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
+# The content workspace store serves one verb at a time under its own lock, so
+# at most one of its process trees exists at any moment; that is a fixed term
+# rather than a reservation per verb, and it is one request's worth.
+CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
+# What the broker itself holds per admitted request, as a multiple of the
+# output cap: the two capped stream buffers, their decoded text, the JSON body
+# and its encoding. Charged for the slots in use, not for the cap.
+OUTPUT_COPIES_PER_COMMAND = 6
+# The fewest requests a budget may admit at once and still be used. Under
+# this the broker treats the budget as absent and admits by slot alone, as it
+# did before the budget existed: a listing phase that cannot run two at once
+# is slower than the OOM exposure the budget prevents, and the case is real --
+# GKE Autopilot without bursting sets a container's limits equal to its
+# requests, so the proxy's limit there is its 512Mi request. The operator's
+# sizing test holds the limit to the same floor
+# (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
+BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
+# child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
+# (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
+# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# be compared with it as text. test_credential_proxy.py holds it to the
+# function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
+# the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
+# kube-agents.credentialProxyMemoryFloorBytes.
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
+# Where the limit comes from, in order: the operator's Downward API variable,
+# then the cgroup v2 file for a broker whose Deployment predates the variable.
+# A value of `max` in the file means no limit, and no limit means no budget.
+ENV_MEMORY_LIMIT_BYTES = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
+CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
+CGROUP_NO_LIMIT = "max"
+# The session role's own share of that pool. Session pods are opened by chat
+# conversations, and under the cluster-view flag all of them draw on the one
+# pool the platform agent's shell uses, so without a bound of their own a
+# conversation holding slow reads could starve the shell for the slot wait.
+# Counted before the pool is asked, and refused at once rather than queued:
+# a session past its share is answered busy and keeps no place in the line.
+# Deliberately small; CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS is the
+# knob, and the operator's spec.deployment.env reaches it.
+DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
+ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
+# How long a request waits for admission -- a slot under the slot cap and room
+# under the child memory budget alike -- before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
 # up by long-running commands answers its callers rather than parking them.
 COMMAND_SLOT_WAIT_SECONDS = 60
@@ -200,6 +262,13 @@ AGENT_API_DRAIN_TIMEOUT_SECONDS = 10
 # match and the length guard both live there, at the same 256 this module
 # enforced before; the alias keeps the name this module's own tests use.
 MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
+
+# The one ref prefix a pinned base may carry, removed once to give the branch's
+# canonical name, and the prefixes that may not follow it or start the value:
+# `heads/x` and a repeated `refs/heads/` would each be read as another branch
+# by some door. The operator's CRD rule refuses the same values.
+PINNED_BASE_REF_PREFIX = "refs/heads/"
+PINNED_BASE_REFUSED_PREFIXES = ("refs/heads/", "heads/")
 
 # The read-only Cloud API relay, `GET /v1/gcp/<host>/<path>?<query>`. The route
 # prefix itself is API_RELAY_PREFIX, imported above from the client module so
@@ -274,11 +343,18 @@ API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
 # Longer than the default 64 because an API path is caller text that has to be
 # readable in the audit line; the same 256 the exec route gives a `cwd`.
 API_RELAY_PATH_LOG_LENGTH = 256
-# The width a principal is logged at. The value comes from the TokenReview,
-# not from the request, and a ServiceAccount username truncated at the default
-# 64 loses exactly its discriminating part; the exec route's audit line uses
-# the same 512 as a literal.
+# The width a principal is logged at, on the exec route's audit records and
+# the relay's lines alike. The value comes from the TokenReview, not from the
+# request, and a ServiceAccount username truncated at the default 64 loses
+# exactly its discriminating part.
 PRINCIPAL_LOG_LENGTH = 512
+# The width a scoped-pool refusal is logged at. The message is fixed text plus
+# four GKE name components, each validated against `[a-z0-9-]` and bounded at
+# `scoped_sa_pool.MAX_NAME_COMPONENT_LENGTH` before it was interpolated, so the
+# whole line is at most 467 characters and fits here whole; at the default 64,
+# or the 256 it was first logged at, the operator's remedy was cut off on
+# every refusal.
+POOL_REFUSAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
 
 # The broker's Prometheus surface: a metrics-only TCP listener of its own,
@@ -309,9 +385,22 @@ METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # vocabularies below, so a caller cannot grow the series set by varying what
 # it sends -- the bound the collector's cardinality depends on.
 TOOL_INVOCATIONS_METRIC = "kubeagents_tool_invocations_total"
+# The gauge the operator's usage poller reads to tell a broker that restarted
+# from one whose counter fell for another reason. Captured once, at import,
+# which for the broker is process start, and never re-read: the poller reads
+# a value that moved as a restart, so it has to be constant for the life of
+# the process by construction (docs/designs/usage-counters-producer.md).
+PROCESS_START_TIME_METRIC = "process_start_time_seconds"
+PROCESS_START_TIME_SECONDS = time.time()
 TOOL_DURATION_METRIC = "kubeagents_tool_execution_duration_seconds"
 PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
+# The label key the operator's usage poller filters outcomes on
+# (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
+# without the matching one there folds every invocation out and freezes
+# toolExecutionsTotal with the scrape still green. Held in step by
+# tests/test_usage_counters_series_names.py.
+TOOL_STATUS_LABEL = "status"
 TOOL_STATUS_SUCCESS = "success"
 TOOL_STATUS_ERROR = "error"
 TOOL_STATUS_BLOCKED = "blocked"
@@ -365,6 +454,45 @@ FORGE_CLI_VOCABULARIES = {"gh": FORGE_CLI_SUBCOMMANDS}
 # The global flags a forge CLI takes a value for ahead of its subcommand, so
 # `gh -R owner/repo pr list` labels `pr` rather than the repository.
 FORGE_CLI_VALUE_FLAGS = {"gh": frozenset({"-R", "--repo"})}
+
+# The broker's log is one JSON object per line (JsonLineFormatter): these are its
+# keys, Cloud Logging's names where it has one. A tool-execution audit record is
+# an ordinary log record carrying an `audit` mapping in `extra`, which the
+# formatter merges in at the top level, so the fields below reach Cloud Logging
+# as jsonPayload keys and the message every existing reader greps for stays.
+AUDIT_EXTRA_KEY = "audit"
+LOG_SEVERITY_KEY = "severity"
+LOG_TIMESTAMP_KEY = "timestamp"
+LOG_LOGGER_KEY = "logger"
+LOG_MESSAGE_KEY = "message"
+LOG_EXCEPTION_KEY = "exception"
+TOOL_EXECUTION_AUDIT_EVENT = "tool_execution_audit"
+# The `status` of a tool-execution audit record: one per outcome the exec route
+# can reach. `completed` says the command ran, whatever its exit code; the
+# code is beside it.
+AUDIT_STATUS_STARTED = "started"
+AUDIT_STATUS_COMPLETED = "completed"
+AUDIT_STATUS_BLOCKED = "blocked"
+AUDIT_STATUS_REJECTED = "rejected"
+AUDIT_STATUS_FAILED = "failed"
+AUDIT_STATUS_ABANDONED = "abandoned"
+AUDIT_STATUS_BUSY = "busy"
+# Rule ids for the refusals the exec route decides itself rather than by a
+# policy rule. The response body and the audit record name the same constant,
+# so the two cannot drift apart.
+RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
+RULE_CALLER_EXECUTABLE = "caller.executable-role"
+RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
+RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
+RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
+RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
+LOG_LEVEL_ENV = "LOG_LEVEL"
+DEFAULT_LOG_LEVEL = "INFO"
+EXIT_STARTUP_FAILURE = 1
+# The record time as Cloud Logging and every log backend parse it without a
+# format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+LOG_MSEC_FORMAT = "%s.%03dZ"
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -438,10 +566,30 @@ def _redacted_fields(exc) -> dict:
     return {"error": redact_credentials(str(exc)), **fields}
 
 
-class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class HandlerErrorsToLog:
+    """Route an exception that escapes a request handler into the log.
+
+    socketserver's default hook prints a plain-text traceback to stderr, and in
+    the broker's container that is the same log as stdout: one such traceback
+    is several lines that a reader expecting one JSON object per line cannot
+    parse. Mixed in ahead of the server class so this hook is the one found.
+    """
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # The address is the peer's: a socket path on the Unix listener, a
+        # host and port on TCP. Neither is an identifier worth a field; the
+        # exception's type and traceback are what a reader needs.
+        LOGGER.exception("request handler failed type=%s", type(sys.exc_info()[1]).__name__)
+
+
+class ThreadingUnixHTTPServer(HandlerErrorsToLog, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
+
+
+class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
+    """ThreadingHTTPServer for the credentialed and API-relay listeners on TCP."""
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +631,8 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 # (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
 # the namespace can replay it until it expires.  mTLS closes that and is not
 # done here.  buildCredentialProxyNetworkPolicy narrows who can open the
-# connection at all, to the sandbox Pod and the gateway Pod.
+# connection at all, to the sandbox Pod, the gateway Pod and, when the next
+# stack takes Google Chat, the A2A gateway Pod.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
@@ -527,11 +676,153 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
+# The session pod the A2A gateway spawns, under the operator's
+# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it kubectl and
+# gcloud only (ROLE_EXECUTABLES): the pod executes model output, and the
+# read-only posture command_policy enforces is the view it gets. A demo aid
+# until declarative profiles carry a session's identity and tools.
+CALLER_ROLE_SESSION = "session"
+
+# The TokenReview user.extra key under which the API server names the Pod a
+# projected token is bound to.
+TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
 
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
 # a way that cannot tell those two apart.
-CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
+CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT, CALLER_ROLE_SESSION)
+
+# Which executables a role may hand to /v1/exec. A role absent here keeps
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
+# narrowed to the two CLIs that reach a cluster read-only. Today the route
+# carries exactly those two, so this check stands behind the route's own
+# refusal: widening the route never widens a session.
+ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
+    CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+}
+
+
+def executable_permitted(role: str, executable: str) -> bool:
+    """Whether ``role`` may run ``executable`` through /v1/exec."""
+    narrowed = ROLE_EXECUTABLES.get(role)
+    return narrowed is None or executable in narrowed
+
+
+# The kubectl flags a session caller may pass. An allowlist, for the reason
+# command_policy gives for the read verbs: the broker runs kubectl in its own
+# container, so any flag that names a file or a URL -- `-f`, `-k`, the
+# `*-file=` output formats, and whatever a future kubectl adds -- is read by
+# the BROKER, and a denylist of spellings is something pflag's grammar walks
+# around (`-Af <path>` clusters a boolean in front of the file flag). Streaming
+# flags (`--watch`, `logs --follow`) are not here either: each holds one of the
+# broker's command slots until the deadline, and a session shares that pool
+# with the platform agent's shell. Everything not listed is refused by name,
+# so a new flag is a review rather than a hole. The shell keeps kubectl's
+# whole surface; its clones and slots are its own.
+SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
+    "--namespace", "--selector", "--field-selector", "--context", "--kubeconfig",
+    "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
+    "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
+    "--api-group", "--template",
+})
+# Verbs a session may not run even though they are reads: both wait by
+# default (`rollout status` watches until the rollout completes, `wait` until
+# its condition or `--timeout`), and the broker lifts its one-shot deadline for
+# them, so each would hold a broker slot for as long as the caller likes.
+# `--timeout` and `--request-timeout` are kept out of the flags above for the
+# same reason: naming a bound is how a caller opts out of the broker's.
+SESSION_KUBECTL_REFUSED_VERBS: frozenset[tuple[str, ...]] = frozenset({("wait",), ("rollout", "status")})
+SESSION_KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
+    "--all-namespaces", "--show-labels", "--show-kind", "--no-headers",
+    "--previous", "--timestamps", "--prefix", "--all-containers",
+    "--ignore-not-found", "--ignore-errors", "--show-managed-fields",
+    "--containers", "--namespaced", "--client", "--help",
+})
+# pflag shorthands the session may use, by the long flag they stand for. The
+# cluster walk below reads a single-dash token character by character, as
+# command_policy._kubectl_refuses_identity_change does: each boolean consumes
+# nothing, the first value-taking shorthand swallows the rest of the token or
+# the next argv element.
+SESSION_KUBECTL_SHORTHANDS: dict[str, str] = {
+    "n": "--namespace", "l": "--selector", "o": "--output", "c": "--container",
+    "A": "--all-namespaces", "p": "--previous", "h": "--help",
+}
+# `--output` values that are formats, not files. The `*-file=` variants
+# (`go-template-file`, `jsonpath-file`, `custom-columns-file`, `templatefile`)
+# read the named path on the broker and are not here.
+SESSION_KUBECTL_OUTPUT_FORMATS: frozenset[str] = frozenset({"json", "yaml", "wide", "name"})
+SESSION_KUBECTL_OUTPUT_PREFIXES: tuple[str, ...] = ("jsonpath=", "custom-columns=", "go-template=", "template=")
+
+
+def _session_output_permitted(value: str) -> bool:
+    return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
+
+
+def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
+    """The first kubectl flag a session caller may not pass, or None.
+
+    Only the session role's kubectl is narrowed; every other role and every
+    other executable keeps the executor's behaviour. Returns the flag as a
+    name (`-f`, `--output`), never the value beside it, for the refusal
+    message and the audit line.
+    """
+    if role != CALLER_ROLE_SESSION or not argv or argv[0] != "kubectl":
+        return None
+    tokens = argv[1:]
+    index = 0
+    pending: str | None = None  # a value-taking flag whose value is the next token
+    words: list[str] = []  # bare words in order: the verb first
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if pending is not None:
+            if pending == "--output" and not _session_output_permitted(token):
+                return pending
+            pending = None
+            continue
+        if token == "--":
+            break
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name in SESSION_KUBECTL_BOOLEAN_FLAGS:
+                continue
+            if name in SESSION_KUBECTL_VALUE_FLAGS:
+                if separator:
+                    if name == "--output" and not _session_output_permitted(value):
+                        return name
+                else:
+                    pending = name
+                continue
+            return name
+        if token.startswith("-") and len(token) > 1:
+            cluster = token[1:]
+            position = 0
+            while position < len(cluster):
+                shorthand = cluster[position]
+                long_name = SESSION_KUBECTL_SHORTHANDS.get(shorthand)
+                if long_name is None:
+                    return "-" + shorthand
+                if long_name in SESSION_KUBECTL_BOOLEAN_FLAGS:
+                    position += 1
+                    continue
+                attached = cluster[position + 1:]
+                if attached.startswith("="):
+                    attached = attached[1:]
+                if attached:
+                    if long_name == "--output" and not _session_output_permitted(attached):
+                        return long_name
+                else:
+                    pending = long_name
+                break
+            continue
+        # A bare word: the verb, a resource, a name. The read-verb policy
+        # downstream decides what the verb may do; the two verbs that wait
+        # are refused here, by name, before it.
+        words.append(token)
+        if len(words) <= 2 and tuple(words) in SESSION_KUBECTL_REFUSED_VERBS:
+            return " ".join(words)
+    return None
+
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
@@ -547,7 +838,7 @@ CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
-    # one credential, two subscriptions — while each side's event routes
+    # one credential, one relay instance per install — while each side's event routes
     # stay its own. _validate_route_roles below enforces that order, and the
     # shape of every entry, at import; do not sort this table.
     ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
@@ -555,7 +846,7 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
-    ("/v1/exec", (CALLER_ROLE_SHELL,)),
+    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -640,6 +931,31 @@ def required_roles(path: str) -> tuple[str, ...]:
 # imposes anyway.
 MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 
+# A successful forge credential refresh satisfies subsequent refresh requests
+# for the same provider arriving within this window, for any repository the
+# helper reported as scoped into the token it installed -- avoiding redundant
+# token mints when concurrent cron jobs wake on the same tick. A repository
+# outside that reported set runs the helper again, and because the forge CLI
+# holds a single token slot per provider (e.g. github.com), the new mint's
+# scope replaces the previous one's coalesce window entirely.
+FORGE_REFRESH_COALESCE_SECONDS = 30.0
+
+# Why a route refresher waiting for the refresh lock stopped waiting.
+REFRESH_LOCK_HUNG_UP_TEXT = "the caller disconnected while waiting for the refresh lock"
+REFRESH_LOCK_WAIT_TEXT = (
+    "a {provider} credential refresh waited {seconds}s for another refresh to finish; retry shortly"
+)
+REFRESH_YIELDED_WAIT_REASON = (
+    "a {provider} credential refresh waited {seconds}s, for the child memory budget and then for "
+    "a vcs request's refresh it stepped aside for"
+)
+REFRESH_YIELDED_WAIT_TEXT = REFRESH_YIELDED_WAIT_REASON + "; retry shortly"
+# Refused by the budget on the reservation after the yield: the same reason,
+# with the figures the budget refusal prints.
+REFRESH_YIELDED_BUDGET_WAIT_TEXT = (
+    REFRESH_YIELDED_WAIT_REASON + "; the child memory budget is {budget_in_use}; retry shortly"
+)
+
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
 # whatever else it is in; `context` is one in `context_repos` alone; the third
 # is neither. Only the content workspace's clone reads the answer.
@@ -652,11 +968,13 @@ _managed_repository_lock = threading.Lock()
 
 
 def managed_repositories() -> frozenset[str]:
-    """The `owner/name` slugs this install is configured to act on, lowercased.
+    """The repositories this install is configured to act on, as `host/path` keys.
 
     Read from the same mounted ConfigMap `github_token_refresh` already reads to
-    widen token scoping, through the same helper, so there is one parser and one
-    notion of what counts as a managed GitHub repository.
+    widen token scoping, through `gitops_workspace.get_managed_repo_keys`, so
+    there is one parser. Keyed by host as well as path because two forges can
+    each have an `acme/infra`, and a gate that compared paths alone would let
+    a registration on one forge admit the other forge's repository.
 
     Raises rather than returning empty when the list cannot be read. The two
     outcomes are not the same: an empty list is an install with nothing
@@ -665,11 +983,11 @@ def managed_repositories() -> frozenset[str]:
     Returning empty for both would make them indistinguishable in the log at the
     moment an operator most needs to tell them apart.
     """
-    return _cached_repository_slugs("_managed_repository_cache", "get_managed_github_repos")
+    return _cached_repository_slugs("_managed_repository_cache", "get_managed_repo_keys")
 
 
 def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str]:
-    """One ConfigMap list, lowercased and cached for MANAGED_REPOSITORY_CACHE_SECONDS.
+    """One ConfigMap list's keys, cached for MANAGED_REPOSITORY_CACHE_SECONDS.
 
     The cache is a named module global rather than a dict entry because tests
     (and anyone invalidating by hand) reset it by assigning `None` to that
@@ -683,28 +1001,83 @@ def _cached_repository_slugs(cache_name: str, reader_name: str) -> frozenset[str
             return cached[1]
     import gitops_workspace
 
-    slugs = frozenset(slug.lower() for slug in getattr(gitops_workspace, reader_name)())
+    # Not lowercased here: the reader already lowercased each key's host and
+    # path, and its leading provider must keep the case the entry was written
+    # with, or an entry typed `GitHub` would count as `github`.
+    slugs = frozenset(getattr(gitops_workspace, reader_name)())
+    _warn_on_unserved_types(slugs)
     with _managed_repository_lock:
         globals()[cache_name] = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
     return slugs
 
 
-def repository_is_managed(repository: str) -> bool:
-    """Is ``repository`` one this install registered?
+_warned_repository_types: set[str] = set()
 
-    Compared case-insensitively because GitHub treats owner and repository names
-    that way, and the two sides of this comparison are written by different
-    people: the slug in the request comes from a git remote or a model, and the
-    one in the ConfigMap from whoever registered it.
+
+def _warn_on_unserved_types(keys: frozenset[str]) -> None:
+    """Say, once per spelling, that an entry's `type` names no forge built here.
+
+    The key leads with the type exactly as written, so `GitLab` or
+    `gitlab-selfmanaged` is registered, listed, and never matched by any
+    forge's key: every verb on it is refused as not managed, with nothing
+    pointing at the entry. A diagnostic only; it never changes the keys.
     """
-    return repository.lower() in managed_repositories()
+    try:
+        served = {forge.name for forge in forge_registry().forges}
+    except Exception:  # noqa: BLE001 - the registry has its own refusals
+        return
+    for key in keys:
+        kind = key.split(":", 1)[0]
+        if kind in served or kind in _warned_repository_types:
+            continue
+        _warned_repository_types.add(kind)
+        LOGGER.warning(
+            "repository entries typed %r match no forge this install serves (%s); "
+            "they admit nothing until the type names one",
+            kind,
+            ", ".join(sorted(served)) or "none",
+        )
+
+
+def _repository_key(repository: str, forge: providers.Forge | None) -> str:
+    """`provider:host/path` for ``repository`` on ``forge``, or on the install's one forge.
+
+    The provider is part of the key, not only the host: an entry counts for the
+    forge it was registered as and no other, so an entry typed for one provider
+    that happens to name another provider's host admits nothing. A caller that
+    resolved the repository passes the forge it resolved to. One that holds a
+    bare path -- the content workspace, which serves one forge -- gets the
+    install's only forge; with more than one there is no such thing, and asking
+    is a bug the caller has to fix, so it raises, which every gate below treats
+    as an unreadable list and refuses.
+    """
+    if forge is None:
+        forge = forge_registry().default
+        if forge is None:
+            raise LookupError(f"{repository} names no forge and this install has no one forge")
+    if not forge.hosts:
+        raise LookupError(f"{forge.name} serves no host to key {repository} under")
+    # The path and host compare case-insensitively; the provider does not,
+    # because `gitops_workspace` keeps an entry's `type` exactly as written.
+    return f"{forge.name}:" + f"{forge.hosts[0]}/{repository}".lower()
+
+
+def repository_is_managed(repository: str, forge: providers.Forge | None = None) -> bool:
+    """Is ``repository`` on ``forge`` one this install registered?
+
+    Compared case-insensitively because both forges this is written for treat
+    names that way, and the two sides of this comparison are written by
+    different people: the repository in the request comes from a git remote or
+    a model, and the one in the ConfigMap from whoever registered it.
+    """
+    return _repository_key(repository, forge) in managed_repositories()
 
 
 _context_repository_cache: tuple[float, frozenset[str]] | None = None
 
 
 def context_repositories() -> frozenset[str]:
-    """The `owner/name` slugs registered under `context_repos`, lowercased.
+    """The repositories registered under `context_repos`, as `provider:host/path` keys.
 
     The list the agent may only *read*: the second key of the same ConfigMap,
     through the same module and with the same cache window as the managed list,
@@ -712,10 +1085,10 @@ def context_repositories() -> frozenset[str]:
     that separation is the safety property. Raises when unreadable, for the
     reason `managed_repositories` gives.
     """
-    return _cached_repository_slugs("_context_repository_cache", "get_context_github_repos")
+    return _cached_repository_slugs("_context_repository_cache", "get_context_repo_keys")
 
 
-def repository_role(repository: str) -> str:
+def repository_role(repository: str, forge: providers.Forge | None = None) -> str:
     """Which list ``repository`` is registered in: managed, context, or neither.
 
     Managed wins. A repository in both lists is one the install writes to, and
@@ -725,21 +1098,42 @@ def repository_role(repository: str) -> str:
     question `commit`, `push`, the API routes and the refresh route ask, and
     `ROLE_CONTEXT` is not an answer any of them accepts.
     """
-    if repository_is_managed(repository):
+    if repository_is_managed(repository, forge):
         return ROLE_MANAGED
-    if repository.lower() in context_repositories():
+    if _repository_key(repository, forge) in context_repositories():
         return ROLE_CONTEXT
     return ROLE_UNREGISTERED
 
 
-def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The credential the broker's own clone of ``repository`` presents.
+def _provider_forge(provider: str) -> providers.Forge:
+    """The configured forge called ``provider``, or a refusal.
 
-    A context repository gets the forge's read-only credential; anything else
-    gets none, and that "none" is not the same thing for the two remaining
-    roles. A managed repository rides the ambient write credential the CLI
-    installed, as it always has, so the broker adds nothing. An unregistered
-    one is a public upstream read with no credential at all, as it always was.
+    For the privileged operations, which are handed a provider name and a path
+    by a caller that has already resolved them. A provider this install did not
+    build is refused rather than read as the install's one forge: answering for
+    it from another forge's list is how a registration on one forge would
+    admit a name on another.
+    """
+    for forge in forge_registry().forges:
+        if forge.name == provider:
+            return forge
+    raise PermissionError(f"{provider} is not a forge this install serves")
+
+
+def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
+    """The credential the broker's clone, fetch or push of ``repository`` presents.
+
+    Asked at `open`, and again before every fetch and push of a handle whose
+    credential is a stored token, so a repository unregistered meanwhile stops
+    getting it. By role:
+
+    - managed: on a forge whose credential is a token an administrator stored
+      (GitLab), that token, through the forge's helper; on GitHub, nothing --
+      the clone and push ride the ambient write credential the CLI installed,
+      as they always have;
+    - context: the forge's read-only credential, and never the write token; a
+      forge that offers none clones with no credential;
+    - unregistered: no credential at all, a public upstream read.
 
     An unreadable list is logged and answered with no credential rather than
     raised: this is not an authorization check -- `open` has none by design --
@@ -748,7 +1142,19 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     anyway.
     """
     try:
-        role = repository_role(repository)
+        forge, repo = registry.resolve(repository)
+    except providers.WorkspaceError as exc:
+        # Not the lists: the name does not resolve to a forge this install
+        # serves (a bare name with more than one forge, or none built).
+        LOGGER.warning(
+            "content workspace open repo=%s role=unknown: the repository does not "
+            "resolve to a forge this install serves code=%s; cloning without a credential",
+            repository,
+            exc.fields.get("code"),
+        )
+        return providers.NoCredential()
+    try:
+        role = repository_role(repo, forge)
     except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
         LOGGER.warning(
             "content workspace open repo=%s role=unknown: the repository lists "
@@ -757,10 +1163,129 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
             type(exc).__name__,
         )
         return providers.NoCredential()
-    LOGGER.info("content workspace open repo=%s role=%s", repository, role)
-    if role != ROLE_CONTEXT or registry.default is None:
+    LOGGER.info("content workspace credential repo=%s role=%s", repository, role)
+    if role == ROLE_MANAGED and _holds_stored_token(forge):
+        # A forge whose credential is a token an administrator stored has no
+        # ambient helper behind it, so a managed repository's clone, fetch and
+        # push present the token themselves, through the forge's helper.
+        return forge.credential
+    if role != ROLE_CONTEXT:
         return providers.NoCredential()
-    return registry.default.read_credential(repository)
+    # A context repository gets the forge's read-only credential, and never
+    # the write token: a forge that offers none -- GitLab's stored token has
+    # no read-only variant here -- clones it with no credential, which reads a
+    # public repository and refuses a private one at the clone.
+    credential = forge.read_credential(repo)
+    if isinstance(credential, providers.NoCredential) and _holds_stored_token(forge):
+        LOGGER.warning(
+            "content workspace open repo=%s role=context: the %s forge offers no "
+            "read-only credential and its stored token can write, so the clone "
+            "presents none; a private repository will refuse it",
+            repository, forge.name,
+        )
+    return credential
+
+
+def _holds_stored_token(forge: providers.Forge) -> bool:
+    """Whether ``forge`` presents a stored token rather than a minted one.
+
+    GitHub's is brokered: minted per repository, and installed for git by the
+    CLI, so the broker's own clones of a managed repository ride it ambiently.
+    A forge whose credential is neither brokered nor absent has nothing ambient
+    behind it, and its clones carry the credential themselves.
+    """
+    credential = getattr(forge, "credential", None)
+    return credential is not None and not isinstance(
+        credential, (providers.BrokeredCredential, providers.NoCredential)
+    )
+
+
+#: The forge a bare `owner/name` means to the content workspace. A
+#: host-qualified name is cloned from the forge that serves its host.
+CONTENT_WORKSPACE_PROVIDER = "github"
+
+
+def _hosted(repository: object, provider: str) -> object:
+    """A bare `owner/name` put on ``provider``'s host; anything else unchanged.
+
+    For callers that know their forge but were handed a name without a host:
+    the content workspace, which is GitHub by construction, and the
+    `/v1/github/refresh` alias, which older agent images call with a bare slug.
+    With one forge the registry would have read the name the same way; with
+    two it refuses a hostless name, rightly for a caller that does not know
+    which forge it means. A provider this install did not build leaves the
+    name as it was, for the registry to refuse in its own words.
+    """
+    if not provider or not isinstance(repository, str):
+        return repository
+    # Hostless as the parser reads it, not by counting slashes: `owner/name.git`
+    # and `owner/name/` are bare names, `gitlab.com/group` is not.
+    ref = repo_ref.try_parse(repository)
+    if ref is None or ref.host or len(ref.segments) != 2:
+        return repository
+    # Only when exactly one built forge carries the provider: with two (say
+    # gitlab.com and a self-managed instance) a bare name means neither, and
+    # picking the first would place it on a host the caller never named.
+    forges = [forge for forge in forge_registry().forges if forge.name == provider]
+    if len(forges) != 1 or not forges[0].hosts:
+        return repository
+    return f"https://{forges[0].hosts[0]}/{'/'.join(ref.segments)}"
+
+
+def _workspace_credential(registry: providers.Registry, repository: str) -> providers.Credential:
+    """The content workspace's clone credential: `read_credential_for` on its forge.
+
+    ``repository`` is the store's canonical name: a bare `owner/name` is
+    GitHub's, and anything else names its host and resolves to the forge that
+    serves it. A bare name on an install that built no GitHub forge has none to
+    read with, and would otherwise resolve to whatever single forge the install
+    does serve -- a credential for another host, on a github.com clone. That
+    clone proceeds without one, as an unregistered repository's does, and the
+    log says why.
+    """
+    if not _is_bare_name(repository):
+        return read_credential_for(registry, repository)
+    try:
+        _provider_forge(CONTENT_WORKSPACE_PROVIDER)
+    except PermissionError:
+        LOGGER.warning(
+            "content workspace open repo=%s: this install serves no %s forge and the "
+            "content workspace clones %s repositories only; cloning without a credential",
+            repository, CONTENT_WORKSPACE_PROVIDER, CONTENT_WORKSPACE_PROVIDER,
+        )
+        return providers.NoCredential()
+    return read_credential_for(registry, _hosted(repository, CONTENT_WORKSPACE_PROVIDER))
+
+
+def _is_bare_name(repository: object) -> bool:
+    """Whether ``repository`` is a bare `owner/name`: GitHub's, to the workspace."""
+    import content_workspace
+
+    return isinstance(repository, str) and content_workspace.is_bare_github_name(repository)
+
+
+def _workspace_locate(repository: str) -> tuple[str, str]:
+    """A host-qualified repository's canonical name and clone URL, for the store.
+
+    Resolved through the forges this install serves, so the forge parses the
+    name -- nesting, allowed paths -- and composes the URL; the caller names a
+    repository and never a host or a URL. GitHub's comes back as the bare
+    `owner/name` the store has always keyed it by, so `github.com/owner/name`
+    and `owner/name` are one repository there.
+    """
+    import content_workspace
+
+    try:
+        forge, path = forge_registry().resolve(repository)
+        if forge.name == CONTENT_WORKSPACE_PROVIDER:
+            return path, f"https://github.com/{path}.git"
+        # Inside the same refusal: the placeholder for a forge this install
+        # names but has no credential for parses the name and refuses here.
+        return f"{forge.hosts[0]}/{path}", forge.clone_url(path)
+    except providers.WorkspaceError as exc:
+        raise content_workspace.ContentWorkspaceError(
+            f"{repository} is not a repository on a forge this install serves: {exc}"
+        ) from exc
 
 
 def require_managed_workspace(store, handle: object) -> None:
@@ -785,8 +1310,37 @@ def require_managed_workspace(store, handle: object) -> None:
     import content_workspace
 
     repository = store.get(handle).repo
+    # A bare `owner/name` is GitHub's whatever else the install serves: the
+    # store cloned it from github.com. Asked of the GitHub forge by name, since
+    # with a second forge there is no install-wide default to fall back on. An
+    # install that built no GitHub forge has nothing to write it through, which
+    # is a refusal of this repository -- the list itself is readable, so not
+    # "unavailable". A host-qualified name was cloned from its own forge, and
+    # is asked of that forge.
+    if not _is_bare_name(repository):
+        try:
+            forge, path = forge_registry().resolve(repository)
+        except providers.WorkspaceError as exc:
+            raise content_workspace.RepositoryNotManaged(
+                f"{repository} is not on a forge this install serves"
+            ) from exc
+        _require_managed(content_workspace, path, forge, repository)
+        return
     try:
-        permitted = repository_is_managed(repository)
+        forge = _provider_forge(CONTENT_WORKSPACE_PROVIDER)
+    except PermissionError as exc:
+        raise content_workspace.RepositoryNotManaged(
+            f"{repository} cannot be written through the content workspace: it serves "
+            f"{CONTENT_WORKSPACE_PROVIDER} repositories only, and this install serves "
+            f"no {CONTENT_WORKSPACE_PROVIDER} forge"
+        ) from exc
+    _require_managed(content_workspace, repository, forge, repository)
+
+
+def _require_managed(content_workspace, path: str, forge: providers.Forge, shown: str) -> None:
+    """Refuse unless ``path`` on ``forge`` is managed; an unreadable list refuses too."""
+    try:
+        permitted = repository_is_managed(path, forge)
     except Exception as exc:
         LOGGER.warning(
             "refusing a workspace write: the managed-repository list could not "
@@ -798,7 +1352,7 @@ def require_managed_workspace(store, handle: object) -> None:
         ) from exc
     if not permitted:
         raise content_workspace.RepositoryNotManaged(
-            f"{repository} is not one of the repositories this agent manages; "
+            f"{shown} is not one of the repositories this agent manages; "
             "register it in the gitops-state ConfigMap first"
         )
 
@@ -829,6 +1383,21 @@ DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"
 # list naming it.
 DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
+# The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
+# names it in the log when the error's own ErrorInfo did not, so the line says
+# what to grant rather than only that something was refused.
+PUBSUB_PULL_PERMISSION = "pubsub.subscriptions.consume"
+# The HTTP status google.api_core gives a PermissionDenied (its ``code``).
+PUBSUB_PERMISSION_DENIED_STATUS = 403
+# Bounds the server's message in a pull-failure log line. Pub/Sub's messages
+# are one sentence ("User not authorized to perform this action.", "Resource
+# not found (resource=...)"); the cap is for the message nobody has seen yet.
+PUBSUB_ERROR_MESSAGE_MAX_CHARS = 160
+# Bounds a subscription path in a log line. The longest legal one is
+# "projects/" + a 30-character project id + "/subscriptions/" + a
+# 255-character name, 309 characters.
+PUBSUB_SUBSCRIPTION_MAX_CHARS = 320
+
 
 class AuthenticationError(Exception):
     """The caller could not be identified.
@@ -839,22 +1408,143 @@ class AuthenticationError(Exception):
     """
 
 
-class CommandSlotUnavailable(RuntimeError):
-    """A request waited COMMAND_SLOT_WAIT_SECONDS without reaching a free slot.
+def child_memory_limit_bytes(
+    environ: "Mapping[str, str] | None" = None,
+    cgroup_path: "str | Path" = CGROUP_MEMORY_MAX_PATH,
+) -> int | None:
+    """The container's memory limit in bytes, or None when the budget is off.
 
-    Slots go in arrival order, so this is the request that has waited longest,
-    whether the slots never freed or freed only for the requests ahead of it.
-    Answered 503 rather than run anyway: a request past the cap is the one that
+    Reads the operator's Downward API variable first, then the cgroup file. A
+    variable set to anything but a positive integer (`0`, `1Gi`, text) is
+    logged once and ignored, and the file is read as though it were unset. The
+    file answers None for anything that is not a positive integer: `max`, a
+    file that is not there. None is "admission by slot alone, as before this
+    budget", logged once by the executor; it is never an error, because a
+    broker that refuses to start over a sizing hint is worse than one that runs
+    unbudgeted.
+    """
+    source = os.environ if environ is None else environ
+    raw = (source.get(ENV_MEMORY_LIMIT_BYTES) or "").strip()
+    if raw:
+        limit = _positive_int(raw)
+        if limit is not None:
+            return limit
+        LOGGER.warning(
+            "%s=%r is not a positive integer byte count; ignoring it", ENV_MEMORY_LIMIT_BYTES, raw
+        )
+    try:
+        raw = Path(cgroup_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == CGROUP_NO_LIMIT:
+        return None
+    return _positive_int(raw)
+
+
+def _positive_int(raw: str) -> int | None:
+    """`raw` as an int when it is a positive integer, else None."""
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
+    """The smallest container limit at which the budget admits
+    BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
+    per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
+    return (
+        BROKER_RESIDENT_RESERVE_BYTES
+        + CONTENT_WORKSPACE_RESERVE_BYTES
+        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
+    )
+
+
+class CommandSlotUnavailable(RuntimeError):
+    """A request waited out its admission bound without being admitted.
+
+    Admission covers the slot cap and the child memory budget alike, and the
+    message names whichever held the request. Admission goes in arrival order,
+    so this is the request that has waited longest, whether the slots or the
+    budget never freed or freed only for the requests ahead of it. Answered
+    503 rather than run anyway: a request past either bound is the one that
     would take the container over its memory limit, and an OOM kill fails every
     request in flight for every caller, not just this one.
     """
 
 
+def session_slot_limit_from_env() -> int:
+    """The session role's concurrent-command bound, from the env or the default.
+
+    Anything that is not a positive integer falls back to the default with a
+    warning, so a typo narrows rather than opens: the default is the small
+    number, and an unset or broken knob is never "unlimited".
+    """
+    raw = os.getenv(ENV_SESSION_MAX_CONCURRENT_COMMANDS, "").strip()
+    if not raw:
+        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        LOGGER.warning(
+            "%s=%r is not a positive integer; using the default of %d",
+            ENV_SESSION_MAX_CONCURRENT_COMMANDS, raw, DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+        )
+        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+    return value
+
+
+class SessionSlots:
+    """The session role's bounded share of the command pool.
+
+    Only CALLER_ROLE_SESSION is counted; every other role passes through to
+    the pool unchanged. A session at its bound is refused immediately with
+    CommandSlotUnavailable, which the exec route already answers as busy, so
+    the shim prints why and the model reports it rather than retrying.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def acquire(self, role: str) -> Iterator[None]:
+        if role != CALLER_ROLE_SESSION:
+            yield
+            return
+        with self._lock:
+            if self._in_flight >= self.limit:
+                raise CommandSlotUnavailable(
+                    f"the session role is limited to {self.limit} concurrent command(s) through the "
+                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes"
+                )
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
 class CallerHungUp(Exception):
-    """The caller closed its connection while its request waited for a slot.
+    """The caller closed its connection while its request waited for admission
+    (a slot, room under the child memory budget, or both).
 
     Nothing to run and nobody to answer: the route logs it and returns, and the
     slot goes to a caller that is still there.
+    """
+
+
+class AdmissionYielded(Exception):
+    """A queued request stepped aside for another caller that should go first.
+
+    Raised only to a caller that asked to be woken when that happens
+    (`_admit`'s `yield_when`), before it was admitted; never answered to a
+    client.
     """
 
 
@@ -897,6 +1587,12 @@ class Principal:
     be. "" means no role was established, which is the ``NullAuthenticator``
     case and reaches every route, because that authenticator is only sound
     behind a Unix socket where the filesystem is the access control.
+
+    ``pod`` is the name of the Pod the token was projected into, from the
+    TokenReview's ``user.extra``. It is for the audit line, not for policy: a
+    session Pod is one conversation, so it is what traces a brokered command
+    back to the conversation that asked for it. "" when the token is not
+    Pod-bound.
     """
 
     workload: str
@@ -904,11 +1600,18 @@ class Principal:
     groups: tuple[str, ...] = ()
     caller: str | None = None
     role: str = ""
+    pod: str = ""
 
     def describe(self) -> str:
+        # The pod is deliberately NOT here. This string is the `principal`
+        # field of every tool_execution_audit record, and the shell's token is
+        # pod-bound too, so folding the pod in would turn an identity every
+        # log filter keys on into a composite for every brokered command. The
+        # pod travels in the record's own `pod` field (_tool_audit).
+        described = self.workload
         if self.caller:
-            return f"{self.workload} (caller {self.caller})"
-        return self.workload
+            described = f"{described} (caller {self.caller})"
+        return described
 
 
 class NullAuthenticator:
@@ -947,6 +1650,14 @@ class ServiceAccountAuthenticator:
     the answer rather than guessed from the request. A projected token carries
     exactly one audience, so exactly one can come back; more than one is a
     disagreement with that assumption rather than a wider grant, and is refused.
+
+    ``session_callers`` binds the session role to its ServiceAccounts in both
+    directions, because a pod chooses the audience it projects. A caller named
+    there may present only the session audience, so a session pod that
+    projected the shell audience does not get the shell role; and when the set
+    is non-empty, the session audience is refused to anyone not named in it.
+    Empty leaves the audience alone deciding, which is the pre-binding
+    behaviour an older operator's rendering still gets.
     """
 
     authenticates = True
@@ -961,6 +1672,7 @@ class ServiceAccountAuthenticator:
         token_file: str,
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
+        session_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -970,6 +1682,7 @@ class ServiceAccountAuthenticator:
             raise ValueError("the Kubernetes API server address is not configured")
         self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
+        self.session_callers = session_callers
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -1051,9 +1764,9 @@ class ServiceAccountAuthenticator:
         try:
             # Inside the try: a missing or unreadable ca.crt raises
             # FileNotFoundError here, and an OSError escaping this method is
-            # not an AuthenticationError — it would reach
-            # socketserver.handle_error as a traceback and a dropped
-            # connection, where the caller deserves a 401.
+            # not an AuthenticationError — the handler's read guard would end
+            # the request as a dropped connection with no 401, where the
+            # caller deserves one.
             context = ssl.create_default_context(cafile=self.ca_file or None)
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds, context=context
@@ -1096,12 +1809,21 @@ class ServiceAccountAuthenticator:
         username = user.get("username") or ""
         if username not in self.allowed_callers:
             raise AuthenticationError("the authenticated caller is not permitted")
+        role = self.audience_roles[matched[0]]
+        if username in self.session_callers and role != CALLER_ROLE_SESSION:
+            raise AuthenticationError("a session caller may present only the session audience")
+        if role == CALLER_ROLE_SESSION and self.session_callers and username not in self.session_callers:
+            raise AuthenticationError("the session audience is only for session callers")
         groups = user.get("groups") or []
+        extra = user.get("extra") or {}
+        pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
+        pod = pod_names[0] if isinstance(pod_names, list) and pod_names else ""
         return Principal(
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
-            role=self.audience_roles[matched[0]],
+            role=role,
+            pod=pod if isinstance(pod, str) else "",
         )
 
 
@@ -1145,6 +1867,13 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
     # set-to-the-default have to be distinguishable, and after os.getenv applies
     # a default they are not.
     chat_audience = os.getenv("CREDENTIAL_PROXY_CHAT_AUDIENCE", "").strip()
+    # The ServiceAccounts the session role is bound to. Read raw like the
+    # audiences: unset is the older operator's rendering, and means no binding.
+    session_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_SESSION_CALLERS", "").split(",")
+        if caller.strip()
+    )
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -1165,6 +1894,21 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif a2a_audience:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
+        session_audience = os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip()
+        if session_audience and session_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE equals the %s audience; the session "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[session_audience] or CALLER_ROLE_SHELL,
+            )
+        elif session_audience:
+            audience_roles[session_audience] = CALLER_ROLE_SESSION
+            if not session_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_SESSION_AUDIENCE is set but CREDENTIAL_PROXY_SESSION_CALLERS "
+                    "is not; any allowed caller presenting the session audience gets the session "
+                    "role, and nothing keeps a session caller off the other audiences"
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -1175,9 +1919,16 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the a2a-chat role only exists once the chat audience split does, "
                 "so the a2a audience is ignored"
             )
+        if os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip():
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the session role only exists once the chat audience split does, "
+                "so the session audience is ignored"
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
+        session_callers=session_callers,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(
@@ -1259,6 +2010,17 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_port = 8642
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self) -> None:
+        # The guard the credentialed and metrics handlers carry: a peer that
+        # resets while its request line is read, or while a 401 is on its
+        # way, is a debug line and a closed connection, not a handler fault
+        # for the server's error hook to log with a traceback.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("api request not answered type=%s", type(exc).__name__)
 
     def do_GET(self) -> None:  # noqa: N802
         self._proxy()
@@ -1669,6 +2431,66 @@ def _chat_error_fields(exc: Exception) -> dict[str, Any] | None:
     reason = getattr(response, "reason", None)
     if reason:
         fields["reason"] = str(reason)
+    return fields
+
+
+def _pubsub_pull_failure_fields(exc: Exception) -> dict[str, Any]:
+    """Return what a failed Pub/Sub pull can say about itself, for the log.
+
+    google.api_core errors carry the HTTP status as ``code``, and an IAM
+    refusal carries an ErrorInfo whose ``reason`` and ``metadata`` name the
+    refused permission. Read by attribute, so a transport fault without them
+    still yields its type. The server message is kept, sanitized and
+    capped: it is what separates a refusal from a missing subscription. A
+    RetryError's ``cause`` is named by type. The exception's ``str`` is not
+    used, because it also prints the details list.
+    No credential reaches any of these fields: they are what the server said
+    about the caller, never what the caller sent.
+    """
+    fields: dict[str, Any] = {"type": type(exc).__name__}
+    try:
+        status: int | None = int(getattr(exc, "code", None))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        status = None
+    if status is not None:
+        fields["code"] = status
+    reason = getattr(exc, "reason", None)
+    if reason:
+        fields["reason"] = _sanitize_for_logging(str(reason))
+    metadata = getattr(exc, "metadata", None)
+    permission = metadata.get("permission") if hasattr(metadata, "get") else None
+    if permission:
+        fields["permission"] = _sanitize_for_logging(str(permission))
+    elif status == PUBSUB_PERMISSION_DENIED_STATUS:
+        fields["permission"] = f"{PUBSUB_PULL_PERMISSION} (what a pull needs; the error named none)"
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        fields["message"] = _sanitize_for_logging(message, PUBSUB_ERROR_MESSAGE_MAX_CHARS)
+    # A retryable error that outlasts the pull's retry deadline arrives as a
+    # RetryError with no code of its own; the error it gave up on is the
+    # useful part.
+    cause = getattr(exc, "cause", None)
+    if isinstance(cause, BaseException):
+        fields["cause"] = type(cause).__name__
+    return fields
+
+
+def _log_chat_pull_failure(label: str, relay: Any, exc: Exception) -> dict[str, Any]:
+    """Log one failed Chat event pull naming the subscription and the refusal.
+
+    Returns the fields so the caller can hand the type and status back to
+    the puller. The subscription is a resource name, not a credential.
+    """
+    fields = _pubsub_pull_failure_fields(exc)
+    subscription = _sanitize_for_logging(
+        str(getattr(relay, "subscription_path", "")), PUBSUB_SUBSCRIPTION_MAX_CHARS
+    )
+    LOGGER.warning(
+        "%s event pull failed subscription=%s %s",
+        label,
+        subscription,
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
     return fields
 
 
@@ -2370,9 +3192,12 @@ FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 # import its CLI side into the broker.
 FORGE_READ_ONLY_FLAG = "--read-only"
 
-# How much of a failed helper's stderr reaches the broker log. The full text is
+# How much of a helper's stderr reaches the broker log. The full text is
 # bounded only by the executor's output ceiling, which is not a log line; this
-# runs on every failed cron tick.
+# runs on every failed cron tick and on every refresh. The tail, not the head:
+# the helper logs each step as it goes and names the outcome on its last line,
+# so a long run-up (a wide managed-repository list, a Minty retry) would
+# otherwise push the one line that says what happened out of the log.
 FORGE_HELPER_LOG_DETAIL_CHARS = 1000
 
 # What may be spliced into that filename. Closed, anchored and lowercase: a
@@ -2781,8 +3606,10 @@ def _detect_repo_default_branch(
     Reads refs/remotes/<remote>/HEAD directly without subprocess or network calls.
     On repositories with non-standard default trunks, this local detection acts as a
     cooperative guard against accidental pushes; authoritative protection against
-    deliberate workspace ref manipulation requires setting CREDENTIAL_PROXY_BASE_BRANCH
-    or GITOPS_BASE_BRANCH.
+    deliberate workspace ref manipulation comes from a configured base instead:
+    CREDENTIAL_PROXY_BASE_BRANCH or GITOPS_BASE_BRANCH, or a repository's pinned
+    base from --pinned-bases / CREDENTIAL_PROXY_PINNED_BASES, each of which is
+    protected on every push whatever the clone's refs say.
 
     `remote` comes from the agent's argv. Only a value that stays under
     `refs/remotes/` once joined is looked up. A URL in that slot never reached
@@ -2870,6 +3697,10 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
         elif norm_override.startswith("heads/"):
             norm_override = norm_override[len("heads/"):]
         protected.add(norm_override)
+    # A pin is stored in its one canonical spelling (`parse_pinned_bases`), so
+    # it is protected under exactly the name proposals target.
+    pinned = getattr(CredentialProxyHandler, "pinned_bases", None) or {}
+    protected.update(configured.lower() for configured in pinned.values() if configured)
 
     has_tags = False
     positional: list[str] = []
@@ -2976,18 +3807,24 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
                 "`git push` with bare 'HEAD' refspec is refused: specify an explicit "
                 "destination branch (e.g. 'HEAD:platform-agent/<name>')."
             )
-        norm_target = target.strip()
-        if norm_target.lower().startswith("refs/heads/"):
-            norm_target = norm_target[len("refs/heads/"):]
-        elif norm_target.lower().startswith("heads/"):
-            norm_target = norm_target[len("heads/"):]
+        # git matches a destination case-sensitively, so `Heads/x` is the
+        # branch `Heads/x` while `heads/x` may be `x`. The prefix is stripped
+        # in any case, as before, but the name as written is checked too, so a
+        # protected branch spelt with such a prefix is not read away to another.
+        written = target.strip()
+        candidates = [written]
+        if written.lower().startswith("refs/heads/"):
+            candidates.insert(0, written[len("refs/heads/"):])
+        elif written.lower().startswith("heads/"):
+            candidates.insert(0, written[len("heads/"):])
 
-        if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
-            return (
-                f"`git push` to protected branch '{norm_target}' is refused: changes to "
-                "base or run branches must be proposed via pull request and merged through "
-                "the approved workflow."
-            )
+        for norm_target in candidates:
+            if norm_target.casefold() in protected or norm_target.casefold().startswith("run/"):
+                return (
+                    f"`git push` to protected branch '{norm_target}' is refused: changes to "
+                    "base or run branches must be proposed via pull request and merged through "
+                    "the approved workflow."
+                )
     return None
 
 
@@ -3368,6 +4205,15 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
+# What `/v1/exec` runs for the sandbox, enforced here because the client is
+# only a convenience: anything holding the sandbox's token can post its own
+# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# reached through the verbs, which run them on the broker's own behalf. `git`
+# here would run under the broker's credential helper, and a read such as
+# `ls-remote` is no write for a lease to fence.
+EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl")
+
+
 def broker_executables() -> tuple[str, ...]:
     """What the credentialed process may run at all.
 
@@ -3378,13 +4224,14 @@ def broker_executables() -> tuple[str, ...]:
     read as one decision and was two.
 
     `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` is on both for now -- the broker issues it on its own
-    behalf for the verbs, and the sandbox shim still forwards it for the
-    shipped callers, whose move onto the verbs is what retires the forwarding
-    (see deploy/sandbox/Dockerfile). What this list decides on its own is the
-    forge CLI: one is here only if some forge this install built declares one,
-    so an install whose forges all speak HTTP grants no forge binary rather
-    than inheriting the union of every binary any forge could want.
+    runs them. `git` and any forge CLI are here for the broker's own use -- it
+    issues them on its own behalf for the verbs. `/v1/exec` refuses both
+    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
+    request reaches neither. What this list
+    decides on its own is the forge CLI: one is here only if some forge this
+    install built declares one, so an install whose forges all speak HTTP
+    grants no forge binary rather than inheriting the union of every binary
+    any forge could want.
     """
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 
@@ -3673,6 +4520,15 @@ def _capture_output(
     )
 
 
+@dataclass(eq=False)
+class _AdmissionTicket:
+    """A request's place in the admission queue. Compared by identity; the
+    kind is kept so a slot-less reserver can tell whether only the slot cap
+    holds the tickets ahead of it (`CommandExecutor._admit`)."""
+
+    takes_slot: bool
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = broker_executables()
 
@@ -3684,6 +4540,7 @@ class CommandExecutor:
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
+        memory_limit_bytes: int | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
@@ -3701,10 +4558,59 @@ class CommandExecutor:
         # refused as one that had just arrived.
         self._slot_condition = threading.Condition()
         self._slots_in_use = 0
-        self._slot_queue: collections.deque[object] = collections.deque()
+        self._slot_queue: collections.deque[_AdmissionTicket] = collections.deque()
         # The deadline the commands of the request on this thread share; set by
         # `request_slot` for as long as the slot is held, read by `_execute`.
         self._request_budget = threading.local()
+        # The child memory budget (design §2.2). None disables it: admission
+        # is then by slot alone, which is what every broker did before the
+        # budget and what a broker with no known limit still does. Derived in
+        # `serve` and handed in explicitly, never read here, so an executor a
+        # test constructs is budgeted only if the test says so.
+        self.memory_limit_bytes = memory_limit_bytes
+        self.children_budget_bytes: int | None = None
+        if memory_limit_bytes is not None:
+            self.children_budget_bytes = (
+                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
+            )
+        # Bytes reserved by admitted requests right now; guarded by
+        # `_slot_condition` like the slot count, because admission reads both.
+        self._reserved_bytes = 0
+        # The degenerate case (§2.3) warns once per process, not once per request.
+        self._budget_warned = False
+        floor = child_memory_budget_floor_bytes(max_output_bytes)
+        if memory_limit_bytes is not None and memory_limit_bytes < floor:
+            # Treated as absent: a budget that admits fewer than
+            # BUDGET_MINIMUM_ADMITTED_REQUESTS serialises every brokered
+            # command. `memory_limit_bytes` keeps the value read.
+            self.children_budget_bytes = None
+            LOGGER.warning(
+                "child memory budget disabled: the container limit of %d MiB is under the floor "
+                "of %d MiB at which the budget admits %d requests at once; admission is by slot "
+                "alone, as without a budget. Raise the proxy container's memory limit (on GKE "
+                "Autopilot without bursting, its memory request, which the limit follows).",
+                memory_limit_bytes // MEBIBYTE,
+                floor // MEBIBYTE,
+                BUDGET_MINIMUM_ADMITTED_REQUESTS,
+            )
+        elif self.children_budget_bytes is None:
+            LOGGER.info(
+                "child memory budget disabled: no container memory limit known (%s unset or not a "
+                "positive integer, and %s unreadable or unlimited); admission is by slot alone",
+                ENV_MEMORY_LIMIT_BYTES,
+                CGROUP_MEMORY_MAX_PATH,
+            )
+        else:
+            LOGGER.info(
+                "child memory budget enabled limit=%dMiB children=%dMiB child_reserve=%dMiB "
+                "request_cost=%dMiB (admits %d requests at once beside the slot cap of %d)",
+                memory_limit_bytes // MEBIBYTE,
+                self.children_budget_bytes // MEBIBYTE,
+                REQUEST_CHILD_MEMORY_RESERVE_BYTES // MEBIBYTE,
+                self._request_cost_bytes(takes_slot=True) // MEBIBYTE,
+                self.requests_the_budget_admits(),
+                max_concurrent_commands,
+            )
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -3798,6 +4704,14 @@ class CommandExecutor:
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
         self._kubeconfig_lock = threading.Lock()
+        # Serialises forge credential refreshes so concurrent callers do not
+        # race on the global .gitconfig lock file or forge CLI state.
+        self._forge_refresh_lock = threading.Lock()
+        # vcs verbs waiting for that lock, guarded by `_slot_condition`: a route
+        # refresher waiting for the budget under the lock yields it to them.
+        self._covered_refresh_waiter_count = 0
+        self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
+        self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -3935,8 +4849,47 @@ class CommandExecutor:
             return self._slots_in_use
 
     @property
+    def reserved_bytes(self) -> int:
+        """Bytes the admitted requests have reserved for their children right now."""
+        with self._slot_condition:
+            return self._reserved_bytes
+
+    def _request_cost_bytes(self, takes_slot: bool) -> int:
+        """What one more admitted request costs the budget: its child reserve,
+        plus the broker's own output allowance if it also takes a slot."""
+        cost = REQUEST_CHILD_MEMORY_RESERVE_BYTES
+        if takes_slot:
+            cost += OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes
+        return cost
+
+    def _budget_in_use_text(self) -> str:
+        """The budget's use as `_fits_budget` counts it, for the refusal and
+        the wait log: reservations plus the output allowance of the slots in
+        use, so the figure printed is the figure the check compared. Called
+        under `_slot_condition`."""
+        output_allowance = OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+        return (
+            f"{(self._reserved_bytes + output_allowance) // MEBIBYTE} MiB in use of "
+            f"{(self.children_budget_bytes or 0) // MEBIBYTE} MiB: "
+            f"{self._reserved_bytes // MEBIBYTE} MiB reserved for children, "
+            f"{output_allowance // MEBIBYTE} MiB of output allowance for "
+            f"{self._slots_in_use} requests"
+        )
+
+    def requests_the_budget_admits(self) -> int | None:
+        """How many slot-taking requests fit the budget at once; None when it is off.
+
+        The number the startup line prints and the operator's sizing test
+        derives the same way, so the two can be compared.
+        """
+        if self.children_budget_bytes is None:
+            return None
+        return max(0, self.children_budget_bytes // self._request_cost_bytes(takes_slot=True))
+
+    @property
     def queued_requests(self) -> int:
-        """How many requests are waiting for a slot right now."""
+        """How many requests are waiting for admission right now, whether for a
+        slot or for room under the child memory budget."""
         with self._slot_condition:
             return len(self._slot_queue)
 
@@ -3954,7 +4907,13 @@ class CommandExecutor:
         callers rather than the cap. The other routes take no slot: the forge
         refresh is a short call to the minter, the content workspace's git is
         serialised by the store's own lock, and the Cloud API relay answers
-        from a bounded read of its own.
+        from a bounded read of its own. The forge refresh reserves child memory
+        without a slot when it will run its helper; the content workspace's git
+        takes neither a slot nor a reservation, because the store's lock
+        serialises it and the budget carries it as a fixed term
+        (`_outside_budget`). Admission also requires the request's child memory
+        reservation to fit the budget (`_fits_budget`), in the same queue and
+        under the same wait.
 
         Slots go in arrival order. The wait is woken every
         COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
@@ -3974,51 +4933,238 @@ class CommandExecutor:
         end to end -- longer than the idle time Envoy allows the stream in
         front of the broker, which is sized against this one.
         """
+        with self._admit(takes_slot=True, caller=caller):
+            yield
+
+    @contextlib.contextmanager
+    def reserve_child_memory(
+        self,
+        caller: socket.socket | None = None,
+        yield_when: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        """Hold a child memory reservation without a slot, for a route that
+        spawns but holds no output (the forge refresh, §2.1). Same queue, same
+        wait, same refusal and hang-up handling as `request_slot` while the
+        budget is on, except that it is admitted past slot-takers the full
+        slot cap holds (`_admit`). With the budget off it takes no queue at all and only
+        marks the thread as covered, so `_execute` takes no transient
+        reservation; `caller`, `yield_when` and `deadline` are then unused.
+        `yield_when` and `deadline` are passed to `_admit`."""
+        with self._admit(
+            takes_slot=False, caller=caller, yield_when=yield_when, deadline=deadline
+        ):
+            yield
+
+    def _fits_budget(self, takes_slot: bool) -> bool:
+        """Whether one more request fits the child memory budget right now.
+
+        Called under `_slot_condition`. With the budget off, always. The
+        output term is charged for the slots that would be in use after this
+        admission, not for the cap, so two requests in flight are not billed
+        for eight. The degenerate case -- nothing admitted and this request
+        alone does not fit -- admits with a warning logged once per process:
+        otherwise a limit small enough to make the budget negative would
+        refuse every command forever, which is worse than the OOM it exists to
+        prevent (§2.3). The operator's sizing test keeps its own numbers off
+        this branch.
+        """
+        if self.children_budget_bytes is None:
+            return True
+        needed = (
+            self._reserved_bytes
+            + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+            + self._request_cost_bytes(takes_slot)
+        )
+        if needed <= self.children_budget_bytes:
+            return True
+        if self._reserved_bytes == 0 and self._slots_in_use == 0:
+            if not self._budget_warned:
+                LOGGER.warning(
+                    "one request's cost of %d MiB exceeds the child memory budget of %d MiB "
+                    "(limit %d MiB); admitting it alone rather than refusing every command. "
+                    "Raise the container's memory limit.",
+                    needed // MEBIBYTE,
+                    self.children_budget_bytes // MEBIBYTE,
+                    (self.memory_limit_bytes or 0) // MEBIBYTE,
+                )
+                self._budget_warned = True
+            return True
+        return False
+
+    def _refusal_text(self, takes_slot: bool) -> str:
+        """Why a request still queued at the bound is refused, named for what
+        holds it now. Called under `_slot_condition`.
+
+        The budget when this request does not fit it; the slot cap when it
+        takes a slot and none is free. Otherwise this request fits and is
+        clear of the slot cap, and only the queue ahead of it holds it. With
+        the budget on, that queue is held by the budget: a slot-taker here has
+        a free slot, so what is ahead of it lacks only budget, and a slot-less
+        reserver is admitted past tickets the slot cap alone holds (`_admit`).
+        The text says so, and never that this request waited without fitting.
+        """
+        slots_full = self._slots_in_use >= self.max_concurrent_commands
+        # With nothing admitted `_fits_budget` would take its degenerate
+        # branch and log; this request fits trivially then anyway.
+        nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
+        fits = nothing_admitted or self._fits_budget(takes_slot)
+        if not fits:
+            return (
+                f"the credential proxy is at its child memory budget "
+                f"({self._budget_in_use_text()}) and this request "
+                f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
+            )
+        if takes_slot and slots_full:
+            # Worded for the queue: slots may well have freed in the meantime
+            # and gone to earlier arrivals, so "none finished" would be false
+            # for a request that was overtaken rather than starved.
+            return (
+                f"the credential proxy is at its limit of "
+                f"{self.max_concurrent_commands} concurrent commands and this "
+                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                f"free slot; retry shortly"
+            )
+        if self.children_budget_bytes is not None:
+            holder = f"waiting for its child memory budget ({self._budget_in_use_text()})"
+        else:
+            holder = f"waiting on its limit of {self.max_concurrent_commands} concurrent commands"
+        return (
+            f"the credential proxy's admission queue is held by requests {holder} and this "
+            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
+        )
+
+    @contextlib.contextmanager
+    def _outside_budget(self) -> Iterator[None]:
+        """Spawns inside this block are the content workspace's, covered by
+        the fixed CONTENT_WORKSPACE_RESERVE_BYTES term rather than a
+        reservation (§2.1): the store's lock is the bound and the reserve is
+        its size, and a wait for admission under that lock would stall every
+        verb behind it, reads included."""
+        previous = getattr(self._request_budget, "exempt", False)
+        self._request_budget.exempt = True
+        try:
+            yield
+        finally:
+            self._request_budget.exempt = previous
+
+    def _only_the_slot_cap_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
+        """Whether every ticket ahead of `ticket` takes a slot while the slots
+        are full. Those wait on the slot cap, not the budget, so a slot-less
+        reserver admitted past them takes nothing they are waiting for (§2.3).
+        Called under `_slot_condition`."""
+        if self._slots_in_use < self.max_concurrent_commands:
+            return False
+        for ahead in self._slot_queue:
+            if ahead is ticket:
+                return True
+            if not ahead.takes_slot:
+                return False
+        return False
+
+    @contextlib.contextmanager
+    def _admit(
+        self,
+        takes_slot: bool,
+        caller: socket.socket | None,
+        yield_when: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        """Admit one request: a slot if `takes_slot`, and a child memory
+        reservation whenever the budget is on. One arrival-order queue for
+        both kinds, with one exception: a slot-less reserver that fits the
+        budget is admitted past tickets ahead of it that are all slot-takers
+        held by a full slot cap, because it competes with them for nothing.
+        Behind a ticket the budget holds, order is kept, since a reserver
+        admitted first would take budget that ticket is waiting for. With the
+        budget off a slot-less reserver has nothing to wait for and skips the
+        queue, as the routes that take no slot always have.
+
+        `yield_when`, if given, is called under `_slot_condition` each time the
+        wait wakes; when it returns true the request leaves the queue
+        unadmitted with AdmissionYielded, before anything is reserved.
+        `deadline`, if given, is the monotonic time the wait is refused at, in
+        place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
+        same here, and the one caller that passes it, a route refresher's
+        reservation after its yield, rewords it (`_refresh_under_lock`)."""
+        if not takes_slot and self.children_budget_bytes is None:
+            previously_reserved = getattr(self._request_budget, "reserved", False)
+            try:
+                self._request_budget.reserved = True
+                yield
+            finally:
+                self._request_budget.reserved = previously_reserved
+            return
         queued_at = time.monotonic()
-        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        ticket = object()
+        if deadline is None:
+            deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        ticket = _AdmissionTicket(takes_slot)
+        # Set if this slot-taking request ever found the slot cap full while it
+        # waited. The wait log names the slot cap only then; otherwise, with the
+        # budget on, what held it was the budget, directly or through the
+        # budget-held tickets ahead of it.
+        saw_slots_full = False
         with self._slot_condition:
             self._slot_queue.append(ticket)
             try:
-                while not (
-                    self._slot_queue[0] is ticket
-                    and self._slots_in_use < self.max_concurrent_commands
-                ):
+                while True:
+                    eligible = self._slot_queue[0] is ticket or (
+                        not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket)
+                    )
+                    slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
+                    if eligible and slot_free and self._fits_budget(takes_slot):
+                        break
+                    if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
+                        saw_slots_full = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        # Worded for the queue: slots may well have freed in
-                        # the meantime and gone to earlier arrivals, so "none
-                        # finished" would be false for a request that was
-                        # overtaken rather than starved.
-                        raise CommandSlotUnavailable(
-                            f"the credential proxy is at its limit of "
-                            f"{self.max_concurrent_commands} concurrent commands and this "
-                            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
-                            f"free slot; retry shortly"
-                        )
+                        raise CommandSlotUnavailable(self._refusal_text(takes_slot))
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        raise CallerHungUp("the caller disconnected while queued for a slot")
-                self._slots_in_use += 1
+                        held_by_slots = takes_slot and (
+                            saw_slots_full or self.children_budget_bytes is None
+                        )
+                        raise CallerHungUp(
+                            "the caller disconnected while queued for "
+                            + ("a slot" if held_by_slots else "the memory budget")
+                        )
+                    if yield_when is not None and yield_when():
+                        raise AdmissionYielded("another caller needs to go first")
+                if takes_slot:
+                    self._slots_in_use += 1
+                reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
+                self._reserved_bytes += reserved
             finally:
                 # Admitted or leaving, the ticket comes out and the next in
                 # line is woken to look again.
                 self._slot_queue.remove(ticket)
                 self._slot_condition.notify_all()
-        self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+        previously_reserved = getattr(self._request_budget, "reserved", False)
         try:
+            if takes_slot:
+                self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+            self._request_budget.reserved = True
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                LOGGER.info(
-                    "request waited %dms for a slot (all %d slots were busy)",
-                    waited_ms,
-                    self.max_concurrent_commands,
-                )
+                if self.children_budget_bytes is not None and not saw_slots_full:
+                    with self._slot_condition:
+                        in_use = self._budget_in_use_text()
+                    LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
+                else:
+                    LOGGER.info(
+                        "request waited %dms for a slot (all %d slots were busy)",
+                        waited_ms,
+                        self.max_concurrent_commands,
+                    )
             yield
         finally:
-            self._request_budget.deadline = None
+            self._request_budget.reserved = previously_reserved
+            if takes_slot:
+                self._request_budget.deadline = None
             with self._slot_condition:
-                self._slots_in_use -= 1
+                if takes_slot:
+                    self._slots_in_use -= 1
+                self._reserved_bytes -= reserved
                 self._slot_condition.notify_all()
 
     def bootstrap(self, command: str) -> None:
@@ -4193,8 +5339,13 @@ class CommandExecutor:
         Slots are a request's, not a command's (`request_slot`), so a helper
         takes none of its own: it runs inside whichever request needed it -- a
         vcs verb refreshing its credential -- or, from the refresh route and
-        the cron behind it, inside none. It is a short call to the minter
-        either way, not a listing.
+        the cron behind it, inside none. A call that no reservation covers
+        takes a transient one in `_execute` for the helper's lifetime; on the
+        refresh route, which the cron reaches over HTTP
+        (github_token_refresh.py), `refresh_forge_credential` takes the
+        refresh lock first, reserves under it for the helper it will run, and
+        yields the lock to a vcs verb that needs a refresh while it waits.
+        It is a short call to the minter either way, not a listing.
         """
         return self._execute(argv, cwd=cwd)
 
@@ -4216,7 +5367,7 @@ class CommandExecutor:
 
         Three things are enforced here rather than assumed:
 
-        * the subcommand is one of the twelve this product issues, checked
+        * the subcommand is one of `WORKSPACE_GIT_SUBCOMMANDS`, checked
           against the argv as parsed rather than as composed, so a later edit
           that threads a caller's string into one of these vectors is refused
           instead of run;
@@ -4249,12 +5400,13 @@ class CommandExecutor:
                 f"`git {subcommand}` is not one of the subcommands the broker "
                 "issues on its own behalf"
             )
-        return self._execute(
-            [executable_path, *argv[1:]],
-            cwd=str(cwd),
-            containment_root=self.content_workspace_root,
-            extra_config=tuple(config),
-        )
+        with self._outside_budget():
+            return self._execute(
+                [executable_path, *argv[1:]],
+                cwd=str(cwd),
+                containment_root=self.content_workspace_root,
+                extra_config=tuple(config),
+            )
 
     def execute_vcs_git(
         self,
@@ -4266,8 +5418,8 @@ class CommandExecutor:
         """git the version-control broker issues, in its own scratch tree.
 
         A third door rather than a widening of the second. The broker needs
-        `bundle`, `init`, `remote` and `ls-remote`, which content-passing does
-        not, and putting them on one list would grant each path the other's
+        `bundle`, `init` and `remote`, which content-passing does not, and
+        putting them on one list would grant each path the other's
         subcommands for no reason beyond sharing a method.
 
         `config` is what the forge's credential asked for on this invocation --
@@ -4350,7 +5502,47 @@ class CommandExecutor:
             argv, result.exit_code, result.stdout, result.stderr
         )
 
-    def refresh_forge_credential(self, provider: str, repository: str) -> None:
+    @property
+    def _refresh_lock(self) -> threading.Lock:
+        if getattr(self, "_forge_refresh_lock", None) is None:
+            self._forge_refresh_lock = threading.Lock()
+        return self._forge_refresh_lock
+
+    @property
+    def _covered_refresh_waiters(self) -> int:
+        """vcs verbs waiting for `_refresh_lock`; read and written under
+        `_slot_condition`."""
+        if getattr(self, "_covered_refresh_waiter_count", None) is None:
+            self._covered_refresh_waiter_count = 0
+        return self._covered_refresh_waiter_count
+
+    @_covered_refresh_waiters.setter
+    def _covered_refresh_waiters(self, count: int) -> None:
+        self._covered_refresh_waiter_count = count
+
+    @property
+    def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
+        if getattr(self, "_last_forge_refresh", None) is None:
+            self._last_forge_refresh = {}
+        return self._last_forge_refresh
+
+    @property
+    def _refresh_failure_cache(self) -> dict[tuple[str, str], tuple[float, Exception]]:
+        if getattr(self, "_last_forge_refresh_failure", None) is None:
+            self._last_forge_refresh_failure = {}
+        return self._last_forge_refresh_failure
+
+    def request_deadline(self) -> float | None:
+        """The monotonic deadline of the request slot this thread holds, or None.
+
+        What `_execute` caps each command to; handed to the in-process forge
+        transport so its calls share the same per-request bound.
+        """
+        return getattr(getattr(self, "_request_budget", None), "deadline", None)
+
+    def refresh_forge_credential(
+        self, provider: str, repository: str, caller: socket.socket | None = None
+    ) -> None:
         """Make this install's credential for `repository` current, or raise.
 
         The privileged operation a `BrokeredCredential` names and does not
@@ -4362,11 +5554,308 @@ class CommandExecutor:
         Whether the repository is one this install acts on is settled here too,
         for the reason `_repository_is_permitted` gives: this is the call that
         spends the token, so it is the call that has to ask.
+
+        Where the budget is charged (§2.1): called from inside a vcs request,
+        this runs under that request's reservation and takes none. It reads
+        the coalesce cache first without the lock, and otherwise waits for the
+        lock as long as it takes. Called from the refresh route, which
+        holds no slot, it reads the coalesce cache first without the lock --
+        the common case for the sandbox `gh` wrapper and the fleet-audit skill,
+        which call it before every credentialed step -- and re-raises a failure
+        recorded since it arrived. Otherwise it takes the lock first, watched
+        like admission: CommandSlotUnavailable once COMMAND_SLOT_WAIT_SECONDS
+        have passed since arrival, CallerHungUp when `caller`, the route's
+        connection, hangs up. Under the lock it repeats both checks, and only
+        then, with the budget on, reserves for the helper it is about to run,
+        on the reservation's own clock. So only the caller that runs the helper
+        ever holds a reservation; every other refresher waits on the lock
+        holding nothing and coalesces on the result. A route holder waiting for
+        the budget yields the lock to a vcs verb that needs a refresh: the
+        verb's reservation already covers the helper, so it runs it, while the
+        route caller waits for the verb to hold the lock, queues behind it, and
+        coalesces on its result -- both waits on one bound of
+        COMMAND_SLOT_WAIT_SECONDS from the yield, since the budget wait ran on
+        its own clock and may have spent the arrival bound. Otherwise the knot would hold until the route
+        caller's refusal: the verb waits on the lock, and the holder waits for
+        budget the verb holds. It yields once: a caller whose re-check is
+        still stale after the yield (the verb refreshed another org, or its
+        helper timed out) reserves on what remains of the yield bound and does
+        not yield again: a vcs verb that counts itself during that second wait
+        holds the budget the wait needs, so the caller steps aside for good,
+        told busy, and the verb runs the helper under its own reservation.
+        A second route refresher still waits on the lock unreserved. A route caller refused past that bound is told it stepped
+        aside, with the seconds it spent since arrival, not the lock-wait
+        text. A refresher behind a
+        helper that runs past the bound is told busy even though the helper
+        lands the token seconds later; the client reports a failed refresh,
+        and its next call coalesces on the fresh token.
         """
         helper = self._forge_helper(provider)
-        if not repository_is_managed(repository):
+        forge = _provider_forge(provider)
+        if not repository_is_managed(repository, forge):
             raise PermissionError(f"{repository} is not a repository this install manages")
-        self._run_forge_helper(provider, helper, [repository], "credential refresh")
+        if not isinstance(forge.credential, providers.BrokeredCredential):
+            # Nothing to make current: see `_handle_forge_refresh`.
+            return
+        clean_repo = repository.strip().lower()
+        org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
+        failure_key = (provider, org)
+        queued_at = time.monotonic()
+        # getattr: an executor built without `__init__`, as the lock and caches
+        # below allow for, has no budget and nothing reserved.
+        request_budget = getattr(self, "_request_budget", None)
+        covered = getattr(request_budget, "reserved", False) or getattr(
+            request_budget, "exempt", False
+        )
+        if covered:
+            if self._refresh_is_current(provider, clean_repo):
+                return
+            # Counted while waiting, so a route holder parked in the budget
+            # wait yields the lock; uncounted only once acquired, so a count
+            # of zero means every such verb holds or has held it.
+            with self._slot_condition:
+                self._covered_refresh_waiters += 1
+                self._slot_condition.notify_all()
+            try:
+                self._refresh_lock.acquire()
+            finally:
+                with self._slot_condition:
+                    self._covered_refresh_waiters -= 1
+                    self._slot_condition.notify_all()
+            try:
+                self._refresh_under_lock(
+                    provider, helper, repository, clean_repo, failure_key, queued_at
+                )
+            finally:
+                self._refresh_lock.release()
+            return
+        if self._refresh_is_current(provider, clean_repo):
+            return
+        failure = self._refresh_failure_cache.get(failure_key)
+        if failure is not None and failure[0] >= queued_at:
+            raise failure[1]
+        budget_on = getattr(self, "children_budget_bytes", None) is not None
+        self._acquire_refresh_lock(provider, queued_at + COMMAND_SLOT_WAIT_SECONDS, caller)
+        holding = True
+        try:
+            if self._refresh_under_lock(
+                provider, helper, repository, clean_repo, failure_key, queued_at,
+                reserve=budget_on, caller=caller,
+            ):
+                # A vcs verb, admitted and covered, needs the lock: it runs the
+                # helper under its own reservation. Hand it the lock, wait until
+                # it holds it, and queue behind it to coalesce on its result,
+                # on a bound of its own from the yield: the budget wait ran on
+                # its own clock and may have spent the arrival bound.
+                self._refresh_lock.release()
+                holding = False
+                yield_deadline = time.monotonic() + COMMAND_SLOT_WAIT_SECONDS
+                self._await_covered_refreshers(
+                    provider, yield_deadline, caller, yielded_since=queued_at
+                )
+                self._acquire_refresh_lock(
+                    provider, yield_deadline, caller, yielded_since=queued_at
+                )
+                holding = True
+                # One yield. If the re-check is still stale -- the verb
+                # refreshed another org, or its helper timed out -- the second
+                # budget wait runs on what remains of the yield bound, so the
+                # whole wait stays inside the three bounds the client's timeout
+                # is derived from; and it does not yield again: a verb that
+                # counts itself during it holds the budget it needs, so the
+                # caller is refused as stepped aside and the lock goes to the
+                # verb, rather than being held against it to the deadline.
+                self._refresh_under_lock(
+                    provider, helper, repository, clean_repo, failure_key, queued_at,
+                    reserve=budget_on, caller=caller,
+                    deadline=yield_deadline, allow_yield=False,
+                )
+        finally:
+            if holding:
+                self._refresh_lock.release()
+
+    def _acquire_refresh_lock(
+        self,
+        provider: str,
+        deadline: float,
+        caller: socket.socket | None,
+        *,
+        yielded_since: float | None = None,
+    ) -> None:
+        """Take `_refresh_lock` for a route caller: in COMMAND_SLOT_POLL_SECONDS
+        pieces, raising CallerHungUp if `caller` hangs up and
+        CommandSlotUnavailable once `deadline` passes -- with the yielded text
+        when `yielded_since`, the arrival of a caller re-taking the lock after
+        stepping aside for a vcs verb, is set."""
+        if self._refresh_lock.acquire(blocking=False):
+            return
+        while not self._refresh_lock.acquire(
+            timeout=max(0.0, min(COMMAND_SLOT_POLL_SECONDS, deadline - time.monotonic()))
+        ):
+            if caller is not None and _caller_has_gone(caller):
+                raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
+            if time.monotonic() >= deadline:
+                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider, yielded_since))
+
+    @staticmethod
+    def _refresh_lock_wait_text(
+        provider: str,
+        yielded_since: float | None = None,
+        budget_in_use: str | None = None,
+    ) -> str:
+        """The refusal for a route refresher that waited out its bound: for the
+        refresh lock before reserving, or -- `yielded_since` set -- after
+        stepping aside for a vcs verb, a wait that also spent the budget wait,
+        so it names the seconds actually spent since that arrival. With
+        `budget_in_use` too, the post-yield reservation was what refused, and
+        the budget's figures follow."""
+        if yielded_since is not None:
+            seconds = int(time.monotonic() - yielded_since)
+            if budget_in_use is not None:
+                return REFRESH_YIELDED_BUDGET_WAIT_TEXT.format(
+                    provider=provider, seconds=seconds, budget_in_use=budget_in_use
+                )
+            return REFRESH_YIELDED_WAIT_TEXT.format(provider=provider, seconds=seconds)
+        return REFRESH_LOCK_WAIT_TEXT.format(provider=provider, seconds=COMMAND_SLOT_WAIT_SECONDS)
+
+    def _await_covered_refreshers(
+        self,
+        provider: str,
+        deadline: float,
+        caller: socket.socket | None,
+        *,
+        yielded_since: float | None = None,
+    ) -> None:
+        """Wait until every vcs verb counted in `_covered_refresh_waiters`
+        holds or has held `_refresh_lock`, so a route caller that yielded it
+        does not re-take it first. Bounded, watched and worded like
+        `_acquire_refresh_lock`."""
+        with self._slot_condition:
+            while self._covered_refresh_waiters > 0:
+                if caller is not None and _caller_has_gone(caller):
+                    raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(provider, yielded_since)
+                    )
+                self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
+
+    def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
+        """The coalesce check, readable without the lock: the cache entry is a
+        tuple replaced whole, so a reader sees the old one or the new one."""
+        now = time.monotonic()
+        current = self._refresh_cache.get(provider)
+        if current is None:
+            return False
+        last_refresh, cached_scoped = current
+        return clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS
+
+    def _budget_in_use_text_locked(self) -> str:
+        """`_budget_in_use_text` taken under `_slot_condition`, for a refusal
+        built outside it."""
+        with self._slot_condition:
+            return self._budget_in_use_text()
+
+    def _refresh_under_lock(
+        self,
+        provider: str,
+        helper: Path,
+        repository: str,
+        clean_repo: str,
+        failure_key: tuple[str, str],
+        queued_at: float,
+        reserve: bool = False,
+        caller: socket.socket | None = None,
+        deadline: float | None = None,
+        allow_yield: bool = True,
+    ) -> bool:
+        """The serialised part of `refresh_forge_credential`, called with
+        `_refresh_lock` held: re-check the coalesce cache, honour the failure
+        memo, and run the helper -- under a child memory reservation taken
+        here, after both checks, when `reserve` is set, refused at `deadline`
+        when given.
+
+        True when the reservation wait yielded to a vcs verb waiting for the
+        lock and the helper did not run; the caller hands that verb the lock.
+        With `allow_yield` false -- the reservation after the one yield -- a
+        verb counting itself ends the attempt instead: CommandSlotUnavailable,
+        the stepped-aside text, so the lock is never held across a budget
+        wait against a verb that holds the budget. False otherwise.
+
+        With `deadline` given -- the reservation after a yield -- a refusal
+        says the caller stepped aside, with the seconds since `queued_at` and
+        the budget's figures, rather than `_admit`'s text, which names
+        COMMAND_SLOT_WAIT_SECONDS: the wait on this leg was shorter."""
+        if self._refresh_is_current(provider, clean_repo):
+            return False
+        failure = self._refresh_failure_cache.get(failure_key)
+        if failure is not None:
+            failed_at, exc = failure
+            if failed_at >= queued_at:
+                raise exc
+        with contextlib.ExitStack() as admission:
+            if reserve:
+                try:
+                    admission.enter_context(
+                        self.reserve_child_memory(
+                            caller=caller,
+                            yield_when=lambda: self._covered_refresh_waiters > 0,
+                            deadline=deadline,
+                        )
+                    )
+                except AdmissionYielded as exc:
+                    # Raised only by `_admit`, before it admits, so this
+                    # catches the entry and nothing the helper raises.
+                    if allow_yield:
+                        return True
+                    # After the one yield: a vcs verb that holds the budget
+                    # this wait needs is waiting on the lock this caller
+                    # holds. Holding it to the deadline would be the knot the
+                    # yield exists to untie, so the caller steps aside for
+                    # good: the lock is released by the route, the verb runs
+                    # the helper under its own reservation, and the client is
+                    # told busy and retries, coalescing if the verb's token
+                    # was its own.
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(
+                            provider,
+                            yielded_since=queued_at,
+                            budget_in_use=self._budget_in_use_text_locked(),
+                        )
+                    ) from exc
+                except CommandSlotUnavailable as exc:
+                    if deadline is None:
+                        raise
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(
+                            provider,
+                            yielded_since=queued_at,
+                            budget_in_use=self._budget_in_use_text_locked(),
+                        )
+                    ) from exc
+            try:
+                result = self._run_forge_helper(
+                    provider, helper, [repository], "credential refresh", log_success=True
+                )
+            except Exception as e:
+                # The helper may have replaced the slot before it failed; a
+                # stale entry would coalesce the next caller onto a token that
+                # is not theirs.
+                self._refresh_cache.pop(provider, None)
+                if not isinstance(e, TimeoutError):
+                    self._refresh_failure_cache[failure_key] = (time.monotonic(), e)
+                raise
+            self._refresh_failure_cache.pop(failure_key, None)
+            scoped = frozenset(
+                line.strip().lower()
+                for line in (result.stdout or "").splitlines()
+                if line.strip()
+            )
+            if not scoped:
+                scoped = frozenset([clean_repo])
+            self._refresh_cache[provider] = (time.monotonic(), scoped)
+        return False
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
@@ -4381,7 +5870,12 @@ class CommandExecutor:
         return Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
 
     def _run_forge_helper(
-        self, provider: str, helper: Path, arguments: list[str], action: str
+        self,
+        provider: str,
+        helper: Path,
+        arguments: list[str],
+        action: str,
+        log_success: bool = False,
     ) -> ExecutionResult:
         """Run a forge helper after its caller has settled admission, or raise.
 
@@ -4389,26 +5883,33 @@ class CommandExecutor:
         strategy that asked to be made current and silently was not is a 401
         later, from inside a clone, that reads like the repository is gone.
 
-        A failure's detail is logged here and not returned: it crosses back
+        The helper's stderr is logged here and not returned: it crosses back
         into the sandbox otherwise, and this is the one place a broker outage is
-        diagnosable. Redacted before it is bounded, so a token cut in half by
-        the slice is not what survives. `action` names the operation in the log
-        line and the exception, and nothing else about the two operations
-        differs on this path.
+        diagnosable. A failure at WARNING; with `log_success`, a success at INFO
+        too, because the refresh helper says there which branch minted the
+        identity token and how long it took, and a refresh that fell through to
+        gcloud and still succeeded is only visible from that line. The read-only
+        mint, one per clone, asks for no such line. Redacted before it is
+        bounded, so a token cut in half by the slice is not what survives.
+        `action` names the operation in the log line and the exception.
         """
         if not helper.is_file():
             raise RuntimeError(f"no credential refresh helper for {provider}")
         result = self.execute_internal([str(helper), *arguments])
+        detail = redact_credentials(result.stderr.strip())[-FORGE_HELPER_LOG_DETAIL_CHARS:]
         if result.exit_code != 0:
-            detail = redact_credentials(result.stderr.strip())
             LOGGER.warning(
                 "%s %s exited %d%s",
                 provider,
                 action,
                 result.exit_code,
-                f": {detail[:FORGE_HELPER_LOG_DETAIL_CHARS]}" if detail else "",
+                f": {detail}" if detail else "",
             )
+            if result.timed_out:
+                raise TimeoutError(f"{action} timed out")
             raise RuntimeError(f"{action} failed")
+        if log_success and detail:
+            LOGGER.info("%s %s: %s", provider, action, detail)
         return result
 
     def mint_read_credential(self, provider: str, repository: str) -> str:
@@ -4429,16 +5930,19 @@ class CommandExecutor:
 
         The token comes back on stdout and is returned, never logged: what the
         helper wrote to stderr is logged redacted on failure, as the refresh
-        path does, and stdout is not.
+        path does (and, unlike it, not on success), and stdout is not.
         """
         helper = self._forge_helper(provider)
-        if repository_role(repository) != ROLE_CONTEXT:
+        if repository_role(repository, _provider_forge(provider)) != ROLE_CONTEXT:
             raise PermissionError(
                 f"{repository} is not a context repository of this install"
             )
-        result = self._run_forge_helper(
-            provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
-        )
+        # Reached only from the store's `open` and `commit`, under its lock:
+        # the fixed workspace term covers it, as it does the store's git.
+        with self._outside_budget():
+            result = self._run_forge_helper(
+                provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
+            )
         token = result.stdout.strip()
         if not token:
             raise RuntimeError("read-only credential mint returned no token")
@@ -4892,11 +6396,17 @@ class CommandExecutor:
         `caller` is the connection the command answers, if it answers one; see
         `_capture_output`. Internal callers leave it unset.
 
-        No concurrency slot is taken here. A slot is a request's, held by the
-        route from admission until the response is written (`request_slot`),
-        so every command a request runs -- the kubeconfig cache-fill made under
-        `_kubeconfig_lock` included -- is covered by the one its request holds,
-        and no lock is ever held while waiting for a slot.
+        No concurrency slot is taken here, and no reservation on a thread that
+        already holds one: a slot and a child memory reservation are a
+        request's, held by the route from admission until the response is
+        written (`request_slot`), so every command a request runs -- the
+        kubeconfig cache-fill made under `_kubeconfig_lock` included -- is
+        covered by the one its request holds, and no lock is held while waiting
+        for admission. The one exception is the refresh route, which holds
+        `_refresh_lock` across its budget wait and yields it to a vcs verb that
+        needs a refresh (`refresh_forge_credential`). While the budget is on, a thread that holds no
+        reservation and is not the store's takes a transient one for the
+        child's lifetime.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root
@@ -4945,23 +6455,45 @@ class CommandExecutor:
             # back timed out rather than running past what the request was
             # allowed.
             effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
-        started = time.monotonic()
-        process = subprocess.Popen(
-            argv,
-            cwd=command_cwd,
-            env=command_environment,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        # Every child the broker starts while serving comes through here, with
+        # two deliberate exemptions (design §2.1): the bootstrap command, which
+        # runs before the broker serves anything, and `_read_repo_alias`'s
+        # `git config`, a few hundred KB over in milliseconds. A thread that holds
+        # a reservation (a route admitted it) or runs the store's git (exempt,
+        # covered by the fixed term) spawns under that; any other thread takes
+        # a transient reservation for the child's lifetime, with the same wait
+        # and the same refusal, so a route that forgets to reserve is throttled
+        # rather than uncounted. A caller that reaches this point uncovered
+        # while holding a lock would wait for the budget under that lock,
+        # which is why every route reserves before it takes one -- except the
+        # refresh route, which reserves under the refresh lock and yields the
+        # lock to a vcs verb that needs it (`refresh_forge_credential`).
+        covered = getattr(self._request_budget, "reserved", False) or getattr(
+            self._request_budget, "exempt", False
         )
-        captured = _capture_output(
-            process,
-            stdin=stdin.encode("utf-8") if stdin is not None else None,
-            limit=self.max_output_bytes,
-            timeout=effective_timeout,
-            caller=caller,
+        admission = (
+            contextlib.nullcontext()
+            if covered or self.children_budget_bytes is None
+            else self.reserve_child_memory(caller=caller)
         )
+        with admission:
+            started = time.monotonic()
+            process = subprocess.Popen(
+                argv,
+                cwd=command_cwd,
+                env=command_environment,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            captured = _capture_output(
+                process,
+                stdin=stdin.encode("utf-8") if stdin is not None else None,
+                limit=self.max_output_bytes,
+                timeout=effective_timeout,
+                caller=caller,
+            )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
@@ -4994,7 +6526,11 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
-def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
+def build_workspace_store(
+    executor: CommandExecutor,
+    base_branch: str = "",
+    pinned_bases: Mapping[tuple[str, str], str] | None = None,
+):
     """The content-passing store, or None when the feature is off.
 
     Returning None rather than an inert object is deliberate: the handler tests
@@ -5021,13 +6557,24 @@ def build_workspace_store(executor: CommandExecutor, base_branch: str = ""):
         executor.workspace_dir,
         executor.execute_workspace_git,
         base_branch=base_branch,
-        credential_for=lambda repository: read_credential_for(registry, repository),
+        # Lifted to the host the workspace clones from, for the reason
+        # `require_managed_workspace` gives: a bare name does not resolve once
+        # the install serves a second forge.
+        credential_for=lambda repository: _workspace_credential(registry, repository),
+        # A repository named with its host is cloned from the forge that serves
+        # it, which composes the URL; a bare `owner/name` stays GitHub's.
+        locate=_workspace_locate,
+        pinned_bases=pinned_bases,
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
 
 
-def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
+def build_vcs_broker(
+    executor: CommandExecutor,
+    base_branch: str = "",
+    pinned_bases: Mapping[tuple[str, str], str] | None = None,
+):
     """The version-control broker. Always built; there is no switch.
 
     Unlike the content workspace this has no off state. It is the forge-neutral
@@ -5051,13 +6598,93 @@ def build_vcs_broker(executor: CommandExecutor, base_branch: str = ""):
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
         base_branch=base_branch,
+        http_timeout=executor.timeout_seconds,
+        http_max_bytes=executor.max_output_bytes,
+        request_deadline=executor.request_deadline,
+        pinned_bases=pinned_bases,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
         executor.vcs_root,
         ",".join(sorted(forge.name for forge in broker.registry.forges)) or "none",
     )
+    # In the background: a forge that is slow to answer must not hold the
+    # broker's start, and the answer is a log line either way.
+    threading.Thread(target=lambda: warn_on_credential_reach(broker), daemon=True).start()
     return broker
+
+
+def warn_on_credential_reach(broker) -> None:
+    """Log, once, every repository a forge's credential reaches and this install
+    does not manage.
+
+    A token an administrator stored -- a personal access token above all --
+    reaches whatever its account can see. The broker refuses every repository
+    outside the managed list either way; this is so the install can see the
+    breadth it is relying on that refusal for, and narrow the account. Never
+    refuses, never raises: a forge that cannot answer is logged as such.
+    """
+    for forge in broker.registry.forges:
+        try:
+            answer = broker.credential_reach(forge)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, not a control
+            # The guidance detail, when there is one, is the reason -- a
+            # refused connection, an untrusted certificate -- and is what an
+            # operator acts on; it carries no token. A broker refusal with no
+            # detail -- a token file that is missing or empty -- says its
+            # reason in the message and its code, which name the host and
+            # never the token.
+            fields = getattr(exc, "fields", None) or {}
+            detail = fields.get("detail", "")
+            if not detail and isinstance(exc, providers.WorkspaceError):
+                detail = f"{fields.get('code', '')}: {exc}".strip(": ")
+            LOGGER.warning(
+                "could not ask what the %s credential for %s reaches type=%s%s",
+                forge.name,
+                ",".join(forge.hosts),
+                type(exc).__name__,
+                f" detail={detail}" if detail else "",
+            )
+            continue
+        if answer is None:
+            continue
+        paths, cut_short = answer
+        try:
+            managed = managed_repositories()
+        except Exception as exc:  # noqa: BLE001 - nothing to compare against
+            LOGGER.warning("credential reach not compared: the managed list is unreadable type=%s", type(exc).__name__)
+            continue
+        extra = sorted(
+            path for path in paths if _repository_key(path, forge) not in managed
+        )
+        if not paths:
+            # Not reassuring: a token that belongs to nothing cannot reach the
+            # managed repositories either, and this line is where an operator
+            # finds that out before the first verb does.
+            LOGGER.warning(
+                "the %s credential for %s reaches no repositories at all; every call "
+                "to this forge's managed repositories will be refused by the forge "
+                "until its account or token is given access to them",
+                forge.name, forge.hosts[0],
+            )
+            continue
+        if not extra:
+            LOGGER.info(
+                "the %s credential for %s reaches %s%d repositories, all of them managed",
+                forge.name, forge.hosts[0], "at least " if cut_short else "", len(paths),
+            )
+            continue
+        LOGGER.warning(
+            "the %s credential for %s reaches %s%d repositories this install does not "
+            "manage (the broker refuses each of them; an account that belongs only to "
+            "the managed repositories narrows the token): %s%s",
+            forge.name,
+            forge.hosts[0],
+            "at least " if cut_short else "",
+            len(extra),
+            ", ".join(_sanitize_for_logging(path) for path in extra[:20]),
+            " ..." if len(extra) > 20 else "",
+        )
 
 
 def read_only_enforced() -> bool:
@@ -5120,14 +6747,18 @@ def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
     # lines in text-mode consumers.
     #
     # Cs is here for the opposite reason: a lone surrogate does not forge a
-    # record, it deletes one. json.loads turns "\\ud800" into a real lone
-    # surrogate, which no UTF-8 encoder will accept, so the handler raises
-    # UnicodeEncodeError, logging prints "--- Logging error ---" to stderr and
-    # drops the record - while the request it was supposed to describe carries
-    # on and succeeds. An authenticated caller could execute a command and
-    # leave no exec line behind. Verified against a byte-encoding handler; a
-    # StringIO one does not reproduce it, which is why the unit tests below
-    # write through a real UTF-8 encoder.
+    # record, it deletes one under a text formatter. json.loads turns
+    # "\\ud800" into a real lone surrogate, which no UTF-8 encoder will
+    # accept, so a text-formatting handler raises UnicodeEncodeError, logging
+    # prints "--- Logging error ---" to stderr and drops the record - while
+    # the request it was supposed to describe carries on and succeeds. The
+    # deployed JsonLineFormatter escapes a lone surrogate and keeps the record
+    # (FormatterTest in test_credential_proxy_audit_json hands it one); the
+    # strip is what keeps the property under a text formatter a test or a
+    # local run installs.
+    # Verified against a byte-encoding handler; a StringIO one does not
+    # reproduce it, which is why the unit tests below write through a real
+    # UTF-8 encoder.
     filtered = ''.join(
         c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')
     )
@@ -5324,6 +6955,80 @@ def _tool_labels(argv: list[str]) -> tuple[str, str]:
     return tool, LABEL_OTHER
 
 
+class JsonLineFormatter(logging.Formatter):
+    """One JSON object per record, on one line, for Cloud Logging and a SIEM behind it.
+
+    `severity` is the level under Cloud Logging's name, `timestamp` the record's
+    time in UTC, `message` the text every existing reader greps for, and an
+    `audit` mapping passed through `extra` is merged in at the top level so a
+    tool-execution record's fields are queryable as jsonPayload.<field> rather
+    than parsed out of the text. json.dumps escapes every newline a traceback or
+    a caller's text could carry, so the one-record-one-line property the audit
+    trail depends on holds by construction rather than by sanitising each site.
+    """
+
+    converter = time.gmtime
+    default_time_format = LOG_TIME_FORMAT
+    default_msec_format = LOG_MSEC_FORMAT
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            LOG_SEVERITY_KEY: record.levelname,
+            LOG_TIMESTAMP_KEY: self.formatTime(record),
+            LOG_LOGGER_KEY: record.name,
+            LOG_MESSAGE_KEY: record.getMessage(),
+        }
+        audit = getattr(record, AUDIT_EXTRA_KEY, None)
+        if isinstance(audit, Mapping):
+            for key, value in audit.items():
+                payload.setdefault(key, value)
+        if record.exc_info:
+            payload[LOG_EXCEPTION_KEY] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, separators=(",", ":"))
+
+
+def _tool_audit(
+    status: str,
+    request_id: str,
+    principal: str,
+    tool: str,
+    subcommand: str,
+    *,
+    exit_code: int | None = None,
+    duration_ms: int | None = None,
+    rule: str | None = None,
+    pod: str = "",
+) -> dict[str, Any]:
+    """The `audit` mapping of one tool-execution record.
+
+    Only identifiers and outcomes: the request id, the verified principal, the
+    tool and subcommand as the metrics label them (a closed vocabulary, never the
+    argv), the outcome and, where there is one, the exit code, the duration and
+    the policy rule. No argument, path, stdin or output is ever here, so there is
+    nothing in the record for a `--token` to leak through.
+    """
+    record: dict[str, Any] = {
+        "event_type": TOOL_EXECUTION_AUDIT_EVENT,
+        "request_id": request_id,
+        "principal": principal,
+        "tool": tool,
+        "subcommand": subcommand,
+        "status": status,
+    }
+    if pod:
+        # The caller's pod, from the TokenReview's pod-name extra: every
+        # session pod shares one ServiceAccount, so this is what ties a
+        # brokered command back to a conversation.
+        record["pod"] = pod
+    if exit_code is not None:
+        record["exit_code"] = exit_code
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+    if rule:
+        record["rule"] = rule
+    return record
+
+
 def _escape_label_value(value: str) -> str:
     # Every label value today is a static enum or a vocabulary word, none of
     # which carries these characters. Kept because the exposition format's
@@ -5386,7 +7091,7 @@ class ProxyMetrics:
         for (tool, subcommand, status), count in invocations:
             lines.append(
                 f'{TOOL_INVOCATIONS_METRIC}{{tool="{_escape_label_value(tool)}",'
-                f'subcommand="{_escape_label_value(subcommand)}",status="{_escape_label_value(status)}"}} {count}'
+                f'subcommand="{_escape_label_value(subcommand)}",{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
             )
         lines += [
             f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool.",
@@ -5408,16 +7113,21 @@ class ProxyMetrics:
                 f'{PROXY_REQUESTS_METRIC}{{endpoint="{_escape_label_value(endpoint)}",'
                 f'status_code="{_escape_label_value(status_code)}"}} {count}'
             )
+        lines += [
+            f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
+            f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
+            f"{PROCESS_START_TIME_METRIC} {PROCESS_START_TIME_SECONDS!r}",
+        ]
         return "\n".join(lines) + "\n"
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
     """The metrics-only listener: GET /metrics, and nothing else.
 
-    Unauthenticated, like /healthz on the credentialed listener, because the
-    scraper is the managed-Prometheus collector, which holds no caller token;
-    the operator's NetworkPolicy on this pod is what bounds who reaches the
-    port. It serves the registry the credentialed handler writes and holds no
+    Unauthenticated, like /healthz on the credentialed listener, because its
+    readers, the managed-Prometheus collector and the operator's usage
+    poller, hold no caller token; the operator's NetworkPolicy on this pod is
+    what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
     route, credential or policy of its own, which is why it may bind a TCP
     port the credential runtime otherwise refuses to (see serve). Bounded
     because it shares the process with that handler: MetricsServer admits
@@ -5454,8 +7164,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
         # method: a peer that hangs up before the reply is on the wire (a
         # collector's aborted scrape, a probe at a path this listener does not
         # serve, a method it does not implement) is a debug line and a closed
-        # connection, not the traceback the server prints for an exception
-        # out of a handler. The next scrape reads the same counters.
+        # connection, not a handler fault for the server's error hook to log
+        # with a traceback. The next scrape reads the same counters.
         try:
             super().handle_one_request()
         except OSError as exc:
@@ -5480,7 +7190,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         return
 
 
-class MetricsServer(ThreadingHTTPServer):
+class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
     """ThreadingHTTPServer with a ceiling on live connections.
 
     The stdlib server starts one thread per accepted connection with no cap,
@@ -5538,13 +7248,17 @@ def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
+    # The session role's bounded share of the command pool, installed by main
+    # beside the executor; None (the route tests' stand-ins) means unbounded.
+    session_slots: "SessionSlots | None" = None
     max_request_bytes: int
     slack_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
-    # The A2A gateway's own relay instance, on its own subscription. Two
-    # consumers on one subscription split deliveries randomly, so the A2A
-    # routes never touch chat_relay and vice versa; only the /v1/chat/api
+    # The A2A gateway's relay instance. Two consumers on one subscription
+    # split deliveries randomly, so the operator arms exactly one instance per
+    # install (the mode chooses which) and the A2A routes never touch
+    # chat_relay and vice versa; only the /v1/chat/api
     # passthrough is shared, because both instances hold the same app
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
@@ -5555,6 +7269,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # answers 503.
     api_relay: GoogleApiRelay | None = None
     base_branch: str = ""
+    # (forge host, path) -> the base every proposal onto that repository must
+    # target, from `parse_pinned_bases`. Each pinned branch is also protected
+    # from a direct push, as `base_branch` is; see `providers.pinned_base`.
+    pinned_bases: Mapping[tuple[str, str], str] = {}
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
     # which is what lets a migrating client detect support by asking rather than
@@ -5638,7 +7356,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         )
         return False
 
-    def _repository_is_permitted(self, repository: str) -> bool:
+    def _repository_is_permitted(
+        self, repository: str, forge: providers.Forge | None = None
+    ) -> bool:
         """Answer 403 and return False unless this install registered ``repository``.
 
         The broker is where this belongs and where it has not been until now.
@@ -5653,7 +7373,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         it was in the log: an authorization check that fails open is not one.
         """
         try:
-            permitted = repository_is_managed(repository)
+            permitted = repository_is_managed(repository, forge)
         except Exception as exc:
             LOGGER.warning(
                 "refusing a repository request: the managed-repository list "
@@ -5710,12 +7430,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             if self.a2a_chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat relay disabled"})
                 return
+            # The subscription rides every answer, so the gateway can name
+            # what it pulls: it is configured with the relay URL only.
+            subscription = getattr(self.a2a_chat_relay, "subscription_path", "")
             try:
                 event = self.a2a_chat_relay.pull()
-                self._json(HTTPStatus.OK, {"event": event})
+                self._json(HTTPStatus.OK, {"event": event, "subscription": subscription})
             except Exception as exc:
-                LOGGER.warning("a2a chat event pull failed: %s", type(exc).__name__)
-                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat event pull failed"})
+                fields = _log_chat_pull_failure("a2a chat", self.a2a_chat_relay, exc)
+                pubsub = {key: fields[key] for key in ("type", "code") if key in fields}
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {
+                        "error": "a2a chat event pull failed",
+                        "subscription": subscription,
+                        "pubsub": pubsub,
+                    },
+                )
             return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
@@ -5725,7 +7456,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 event = self.chat_relay.pull()
                 self._json(HTTPStatus.OK, {"event": event})
             except Exception as exc:
-                LOGGER.warning("chat event pull failed: %s", type(exc).__name__)
+                _log_chat_pull_failure("chat", self.chat_relay, exc)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
         if self.path != HEALTHZ_PATH:
@@ -5808,12 +7539,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         # Sanitized here rather than at each of the eight log sites below, and
-        # sanitized at all because it is caller-supplied text going into a
-        # line-oriented formatter. A newline in it ends the record and starts a
-        # new one, so an unsanitized requestId lets the caller write a whole
-        # forged entry into the audit trail - including one naming a
-        # ServiceAccount that made no request. It is never echoed back to the
-        # client, so narrowing it costs nothing.
+        # sanitized at all because it is caller-supplied text going into the
+        # log. The deployed formatter is JSON and escapes a newline, but the
+        # sanitiser is what bounds the length, strips the control characters,
+        # and holds for a text formatter a test or a local run installs: an
+        # unsanitized requestId under one lets the caller write a whole forged
+        # entry into the audit trail - including one naming a ServiceAccount
+        # that made no request. It is never echoed back to the client, so
+        # narrowing it costs nothing.
         #
         # This is one route into the log, not all of them. The access line goes
         # through log_message above, which had the same defect from an
@@ -5827,26 +7560,41 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # this route and for every other authenticated one by _authenticated —
         # is the value they would read. Today it is what the audit trail
         # records and nothing else.
+        # Decided once, before any gate: every outcome below is counted and
+        # audited under the same two labels, and a refused executable is
+        # counted as `other` rather than under its own name.
+        tool_label, subcommand_label = _tool_labels(argv)
+        # PRINCIPAL_LOG_LENGTH rather than the default 64: this value comes
+        # from the TokenReview, not from the request, and a truncated identity
+        # is an audit line that names the wrong ServiceAccount.
+        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
+
+        def audit(status: str, **fields: Any) -> dict[str, Any]:
+            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
+
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
             request_id,
-            # 512 rather than the default 64: this value comes from the
-            # TokenReview, not from the request, and a truncated identity is
-            # an audit line that names the wrong ServiceAccount.
-            _sanitize_for_logging(principal.describe(), max_length=512),
+            principal_label,
             # Logged before the allowlist check below, so at this point it is
             # arbitrary caller text and gets the same treatment as request_id.
             _sanitize_for_logging(argv[0]),
+            extra=audit(AUDIT_STATUS_STARTED),
         )
         # Decided once, before any gate: every outcome below is counted under
-        # the same two labels, and a refused executable is counted as `other`
-        # rather than under its own name.
+        # the same two labels. An executable outside the image's allowlist is
+        # counted as `other`; one the image has but this route refuses (git)
+        # is counted under its own name.
         tool_label, subcommand_label = _tool_labels(argv)
-        if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
+        if (
+            argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES
+            or argv[0] not in EXEC_ROUTE_EXECUTABLES
+        ):
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,
                 _sanitize_for_logging(argv[0]),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_EXECUTABLE_ALLOWLIST),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -5854,15 +7602,63 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "executable.allowlist",
+                    "rule": RULE_EXECUTABLE_ALLOWLIST,
                     "message": "Executable is not supported by the credential proxy.",
+                },
+            )
+            return
+        if not executable_permitted(principal.role, argv[0]):
+            LOGGER.warning(
+                "executable refused for role request_id=%s role=%s executable=%s",
+                request_id,
+                principal.role,
+                _sanitize_for_logging(argv[0]),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_EXECUTABLE),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_CALLER_EXECUTABLE,
+                    "message": (
+                        f"The {principal.role} caller may run only "
+                        f"{', '.join(sorted(ROLE_EXECUTABLES[principal.role]))} through the credential proxy."
+                    ),
+                },
+            )
+            return
+        refused_flag = session_kubectl_flag_refusal(principal.role, argv)
+        if refused_flag is not None:
+            LOGGER.warning(
+                "flag refused for role request_id=%s role=%s executable=%s flag=%s",
+                request_id,
+                principal.role,
+                _sanitize_for_logging(argv[0]),
+                refused_flag,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_KUBECTL_FLAG),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_CALLER_KUBECTL_FLAG,
+                    "message": (
+                        f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
+                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
+                        "not available to a session)."
+                    ),
                 },
             )
             return
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
-                "command blocked request_id=%s rule=%s", request_id, rule.rule_id
+                "command blocked request_id=%s rule=%s", request_id, rule.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=rule.rule_id),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -5883,31 +7679,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # the lease check because it does not depend on the working directory.
         violation = git_argument_violation(argv)
         if violation is not None:
-            LOGGER.warning("git argument refused request_id=%s", request_id)
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
-            self._json(
-                HTTPStatus.FORBIDDEN,
-                {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.argument.refused",
-                    "message": violation,
-                },
-            )
-            return
-
-        # Not a policy rule: the policy matches on argv alone, and this refusal
-        # turns on the working directory as well.
-        if hasattr(self.executor, "resolve_git_command"):
-            violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
-        else:
-            violation = self.executor.git_lease_violation(argv, cwd)
-            exec_argv = argv
-        if violation is not None:
             LOGGER.warning(
-                "git lease refused request_id=%s cwd=%s",
-                request_id,
-                _sanitize_for_logging(cwd or "", max_length=256),
+                "git argument refused request_id=%s", request_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -5915,35 +7689,76 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.workspace.lease",
+                    "rule": RULE_GIT_ARGUMENT_REFUSED,
                     "message": violation,
                 },
             )
-            return
-
-        # Runs after the credential denylist above, so rules like
-        # `kubernetes.token-disclosure` keep their own ids and messages rather
-        # than being reported as read-only refusals. For example, `kubectl create
-        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
-        # be refused by the denylist with that rule id. If the gate ran first, it
-        # would refuse as `kubernetes.read-only`, losing the specific rule.
-        refusal_result = read_only_refusal(argv)
-        if refusal_result is None and exec_argv != argv:
-            refusal_result = read_only_refusal(exec_argv)
-        if refusal_result is not None:
-            refusal, log_hint = refusal_result
-            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
-            LOGGER.warning(
-                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
-            )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
-            self._json(HTTPStatus.FORBIDDEN, refusal)
             return
 
         try:
+            # Not a policy rule: the policy matches on argv alone, and this
+            # refusal turns on the working directory as well. Inside the try
+            # with the command it gates: a cwd no path can hold (an embedded
+            # NUL) raises ValueError out of the resolution below and takes
+            # the containment rejection with the other caller errors, so the
+            # request ends with a response and the trail with a terminal
+            # record rather than an exception out of the handler.
+            try:
+                if hasattr(self.executor, "resolve_git_command"):
+                    violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
+                else:
+                    violation = self.executor.git_lease_violation(argv, cwd)
+                    exec_argv = argv
+            except OSError as exc:
+                # A cwd the broker cannot read -- a directory the agent named
+                # that stat refuses -- is the caller's path to fix, not a
+                # broker fault: the same rejection as a path outside the
+                # workspace, not the 500 an exception out of the command gets.
+                raise ValueError(f"cwd cannot be read: {type(exc).__name__}") from exc
+            if violation is not None:
+                LOGGER.warning(
+                    "git lease refused request_id=%s cwd=%s",
+                    request_id,
+                    _sanitize_for_logging(cwd or "", max_length=256),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_WORKSPACE_LEASE),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": RULE_GIT_WORKSPACE_LEASE,
+                        "message": violation,
+                    },
+                )
+                return
+
+            # Runs after the credential denylist above, so rules like
+            # `kubernetes.token-disclosure` keep their own ids and messages rather
+            # than being reported as read-only refusals. For example, `kubectl create
+            # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+            # be refused by the denylist with that rule id. If the gate ran first, it
+            # would refuse as `kubernetes.read-only`, losing the specific rule.
+            refusal_result = read_only_refusal(argv)
+            if refusal_result is None and exec_argv != argv:
+                refusal_result = read_only_refusal(exec_argv)
+            if refusal_result is not None:
+                refusal, log_hint = refusal_result
+                safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
+                LOGGER.warning(
+                    "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint,
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=refusal["rule"]),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return
+
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
-            with self._request_slot():
+            # The session role's own bound is taken first, so a session past
+            # its share never queues for the pool the shell shares.
+            with self._session_slot(principal.role), self._request_slot():
                 result = self.executor.execute(
                     exec_argv,
                     stdin=stdin,
@@ -5962,6 +7777,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         "disconnected and the command was killed",
                         request_id,
                         result.duration_ms,
+                        extra=audit(AUDIT_STATUS_ABANDONED, duration_ms=result.duration_ms),
                     )
                     # No response is written, so log_request never counts this
                     # request; the invocation and its duration are counted here
@@ -5975,6 +7791,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     result.exit_code,
                     result.duration_ms,
                     result.truncated,
+                    extra=audit(AUDIT_STATUS_COMPLETED, exit_code=result.exit_code, duration_ms=result.duration_ms),
                 )
                 # A non-zero exit is `error` here even though the response is
                 # `completed`: the response reports that the broker ran the
@@ -6001,17 +7818,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 if result.kubeconfig:
                     response["kubeconfig"] = result.kubeconfig
                 self._json(HTTPStatus.OK, response)
-        except CallerHungUp:
+        except CallerHungUp as exc:
+            # The exception names what the request was queued for: a slot, or
+            # the child memory budget.
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
             LOGGER.info(
-                "command abandoned request_id=%s: the caller disconnected while queued "
-                "for a slot; the command was not started",
+                "command abandoned request_id=%s: %s; the command was not started",
                 request_id,
+                exc,
+                extra=audit(AUDIT_STATUS_ABANDONED),
             )
             return
         except CommandSlotUnavailable as exc:
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
-            LOGGER.warning("command queued too long request_id=%s", request_id)
+            LOGGER.warning(
+                "command queued too long request_id=%s: %s", request_id, exc,
+                extra=audit(AUDIT_STATUS_BUSY),
+            )
             self._busy(exc)
             return
         except scoped_sa_pool.PoolRefusal as exc:
@@ -6022,13 +7845,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # generic policy block, and so that a test can assert on the reason
             # rather than on a status code every other gate also returns.
             LOGGER.warning(
-                # The message embeds the scope key, which is built from the
+                # The message embeds the cluster the request resolved to, built from the
                 # `current-context` of a kubeconfig the agent wrote. Same
                 # reasoning as the ValueError handler below: an unsanitised
                 # value here forges log records.
+                #
+                # The cap is raised above the default under the rule in
+                # `_sanitize_for_logging`'s docstring: every variable part of
+                # the message is a name component the pool validated against
+                # `[a-z0-9-]` and its 63-character bound before interpolating
+                # it, so the agent chooses nothing in the line beyond which
+                # cluster it named, and the line fits at the bound.
                 "scoped service account refused request_id=%s reason=%s",
                 request_id,
-                _sanitize_for_logging(str(exc), max_length=256),
+                _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_SCOPED_SA_UNMAPPED_SCOPE),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -6036,7 +7867,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "gcp.scoped-sa.unmapped-scope",
+                    "rule": RULE_SCOPED_SA_UNMAPPED_SCOPE,
                     "message": str(exc),
                 },
             )
@@ -6051,6 +7882,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command rejected request_id=%s reason=%s",
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
+                extra=audit(AUDIT_STATUS_REJECTED),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -6060,6 +7892,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command failed request_id=%s type=%s",
                 request_id,
                 type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(
@@ -6373,7 +8206,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         store = self.workspaces
         if route == "open":
             requested = payload.get("repo")
-            if not is_valid_repository(requested):
+            # A bare `owner/name` is held to the GitHub slug rule it always was;
+            # a host-qualified name goes on to the store, which asks the forge
+            # that serves it and refuses anything no served forge owns.
+            # Two segments and no host is a GitHub slug; anything that names a
+            # host, or nests deeper, is for the forges this install serves.
+            ref = repo_ref.try_parse(requested) if isinstance(requested, str) else None
+            slug = ref is not None and not ref.host and len(ref.segments) == 2
+            if ref is None or (slug and not is_valid_repository(requested)):
                 # A ContentWorkspaceError rather than a ValueError, though both
                 # answer 400. `credential_proxy_client.workspaces_available`
                 # probes this route with an empty repo to find out whether the
@@ -6383,7 +8223,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 # keeps the refusal on the same exception family as the write
                 # gate below, so a caller catching one catches both.
                 raise content_workspace.ContentWorkspaceError(
-                    "repo must be owner/name"
+                    "repo must be owner/name, or a repository on a forge this install serves"
                 )
             # No managed-repository gate here. `inspect-repository` exists to
             # read code this install does not manage -- a dependency, an
@@ -6477,7 +8317,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(content_length))
             if not isinstance(payload, dict):
                 raise ValueError("request body must be an object")
-            forge, repository = forge_registry().resolve(payload.get("repository"))
+            forge, repository = forge_registry().resolve(
+                # The forge the request names, whether the route implies it
+                # (the alias) or the body says it (`/v1/forge/refresh`).
+                _hosted(payload.get("repository"), provider or str(payload.get("provider") or ""))
+            )
             named = provider or payload.get("provider") or forge.name
             if named != forge.name:
                 raise ValueError(
@@ -6490,11 +8334,47 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
 
-        if not self._repository_is_permitted(repository):
+        if not self._repository_is_permitted(repository, forge):
+            return
+
+        # A host this install recognises and has no forge for answers with its
+        # own gap, the same 501 the verb that follows would give -- not as a
+        # forge with nothing to refresh, which it is not: it has no credential.
+        if isinstance(forge, providers.StubForge):
+            unsupported = providers.ForgeUnsupported(f"{forge.name}: {forge.missing[0]}")
+            self._json(HTTPStatus(unsupported.status), _redacted_fields(unsupported))
+            return
+
+        # A forge whose credential strategy is not a brokered one has nothing
+        # to make current -- a stored token is read from its file on every
+        # call -- and says so, rather than running a helper it does not ship
+        # and reporting the absence as an outage.
+        if not isinstance(forge.credential, providers.BrokeredCredential):
+            self._json(HTTPStatus.OK, {"status": "nothing to refresh", "forge": forge.name})
             return
 
         try:
-            self.executor.refresh_forge_credential(forge.name, repository)
+            self.executor.refresh_forge_credential(
+                forge.name, repository, caller=getattr(self, "connection", None)
+            )
+        except CallerHungUp as exc:
+            # Queued for the refresh lock or the child memory budget, and
+            # gone before the helper ran: nothing to answer, as on the exec
+            # route. The exception names the wait.
+            LOGGER.info(
+                "%s credential refresh abandoned: %s; the helper was not started",
+                forge.name,
+                exc,
+            )
+            return
+        except CommandSlotUnavailable as exc:
+            # The bounded wait for the refresh lock, or the budget's refusal
+            # (§2.3): the same 503 the exec and vcs routes answer, rather than
+            # the generic branch's 502 that would read as a failed mint. The
+            # exception names which.
+            LOGGER.warning("%s credential refresh queued too long: %s", forge.name, exc)
+            self._busy(exc)
+            return
         except PermissionError:
             # `refresh_forge_credential` asks the managed list too, because the
             # in-process callers do not come through here. Reaching it from this
@@ -6584,30 +8464,30 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     return
                 # The managed-repository control, on the same footing as
                 # `require_managed_workspace` on the content routes: the broker
-                # holds the forge credential, so "is this a repository we write
-                # to" can only be answered here. Nothing downstream answers it
+                # holds the forge credential, so "is this a repository we act
+                # on" can only be answered here. Nothing downstream answers it
                 # -- a forge is handed a repository and spends the token on it
-                # -- so this is the whole of the check for these routes.
+                # -- so this is the whole of the check for these routes, reads
+                # included (see `vcs_broker.UNGATED_VERBS`).
                 #
                 # Resolved rather than compared as given, because the managed
-                # list holds slugs and a caller may name a repository by URL.
-                # Resolving here also rejects a host this install serves no
-                # credential for before the write verb is entered, which is the
-                # same order `/v1/forge/refresh` uses.
-                if verb in vcs_broker.WRITE_VERBS:
+                # list holds `provider:host/path` keys and a caller may name a
+                # repository by URL. Resolving here also rejects a host this
+                # install serves no credential for before the verb is entered,
+                # which is the same order `/v1/forge/refresh` uses.
+                if verb not in vcs_broker.UNGATED_VERBS:
                     try:
-                        _, repository = self.vcs.registry.resolve(payload.get("repository"))
+                        forge, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
                         return
-                    if not self._repository_is_permitted(repository):
+                    if not self._repository_is_permitted(repository, forge):
                         return
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
-        except CallerHungUp:
-            LOGGER.info(
-                "vcs %s abandoned: the caller disconnected while queued for a slot", verb
-            )
+        except CallerHungUp as exc:
+            # The exception names what the request was queued for.
+            LOGGER.info("vcs %s abandoned: %s", verb, exc)
             return
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
@@ -6647,7 +8527,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # and the body is drained before the answer, or a caller still
             # sending a large one would see the connection reset in place of
             # the 503.
-            LOGGER.warning("command queued too long verb=%s", verb)
+            LOGGER.warning("command queued too long verb=%s: %s", verb, exc)
             drain_request_body(self, body_limit)
             self._busy(exc)
             return
@@ -6834,6 +8714,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 body["slack"] = fields
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
+    def handle_one_request(self) -> None:
+        # A peer that resets the connection while its request is being read,
+        # or before an error page is on the wire, is a debug line and a closed
+        # connection, as on the metrics listener; the exception would
+        # otherwise leave the handler and reach the server's error hook. No
+        # audit record is lost: every site logs before its response is
+        # written, and _json guards its own writes.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("request not answered type=%s", type(exc).__name__)
+
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         # send_response calls this for every response this listener writes --
         # the 401 an unauthenticated caller gets, the relay's direct writes and
@@ -6849,11 +8742,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler.log_request passes self.requestline through
         # here verbatim, and this runs on every response - including the 401 an
-        # unauthenticated caller gets. A vertical tab in the request line is
-        # enough to end the record and start another, so an unauthenticated
-        # caller could write a whole audit-shaped line of its own. The request
-        # line's own tokenizer stops at whitespace, which limits the shape of
-        # the forgery and does not prevent it.
+        # unauthenticated caller gets. The deployed formatter is JSON and keeps
+        # a vertical tab in the request line inside the one record; the
+        # sanitiser bounds the length, strips the control characters, and
+        # holds for a text formatter a test or a local run installs, under
+        # which that vertical tab would end the record and let an
+        # unauthenticated caller start an audit-shaped line of its own.
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
@@ -6883,6 +8777,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
             )
 
+    def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
+        """The session role's bounded share, or nothing for every other role."""
+        slots = getattr(self, "session_slots", None)
+        if slots is None:
+            return contextlib.nullcontext()
+        return slots.acquire(role)
+
     def _request_slot(self) -> contextlib.AbstractContextManager:
         """This request's concurrency slot, watched on this connection.
 
@@ -6899,10 +8800,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return contextlib.nullcontext()
 
     def _busy(self, exc: CommandSlotUnavailable) -> None:
-        """Answer a broker at its concurrency cap, on whichever route asked.
+        """Answer a broker at its concurrency cap or child memory budget, on
+        whichever route asked.
 
-        Not a refusal of what was asked and not a fault: the command past the
-        cap is the one that would take the container over its memory limit.
+        Not a refusal of what was asked and not a fault: the command past
+        either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
         failure.
@@ -6930,7 +8832,7 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
+    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
     LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
     return server
 
@@ -6948,6 +8850,106 @@ def reachable_off_pod(args: argparse.Namespace) -> bool:
         return True
     envoy_address = os.getenv("CREDENTIAL_PROXY_ENVOY_ADDRESS", "").strip()
     return bool(envoy_address) and envoy_address not in {"127.0.0.1", "::1", "localhost"}
+
+
+def parse_pinned_bases(raw: str) -> dict[tuple[str, str], str]:
+    """(forge host, path) -> pinned base, from --pinned-bases.
+
+    The operator renders the value from every repository in the PlatformAgent's
+    `spec.integration.repositories` that sets `baseBranch`, as a JSON array of
+    `{"repository": "https://<host>/<path>", "branch": "<name>"}`. A pin that
+    does not parse would match nothing and turn that repository's base off
+    without a word, so anything short of a clean parse is refused at boot like
+    any other bad boot value: malformed JSON, an entry without a stated host,
+    a repository no forge this install serves reads as one, a branch git would
+    not take, or one repository pinned twice.
+
+    Each repository is read the way a request for it is read: by the forge
+    whose hosts include the stated host, through that forge's own `parse`. It
+    is kept under that forge's canonical host and the path `parse` answers,
+    which is the pair `providers.pinned_base` is asked about, so another
+    spelling of the host (`www.github.com`) is the same pin and a path of a
+    depth the forge never reads (`https://github.com/acme`) is refused rather
+    than kept to match nothing. So is a path the forge reads as another
+    repository when it is asked for it (`foo.git.git`, which reads back as
+    `foo`).
+
+    The branch is kept in its one canonical spelling: a single leading
+    `refs/heads/` is removed, and a value that starts with `heads/`, or with
+    `refs/heads/` followed by `refs/heads/` or `heads/`, is refused. Every door
+    compares against the stored name as it is, so a pin is protected under
+    exactly the name proposals are told to target.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+
+    def refuse(detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"invalid --pinned-bases / CREDENTIAL_PROXY_PINNED_BASES: {detail}; "
+            'expected a JSON array of {"repository": "https://<host>/<path>", '
+            '"branch": "<name>"}'
+        )
+
+    try:
+        entries = json.loads(text)
+    except ValueError as exc:
+        raise refuse("not JSON") from exc
+    if not isinstance(entries, list):
+        raise refuse("not an array")
+    forges = providers.Registry().forges
+    pins: dict[tuple[str, str], str] = {}
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise refuse(f"{entry!r} is not an object")
+        repository, branch = entry.get("repository"), entry.get("branch")
+        ref = repo_ref.try_parse(repository)
+        if ref is None or not ref.host_stated:
+            raise refuse(f"{repository!r} is not a repository URL with a host")
+        host = ref.host.casefold()
+        forge = next(
+            (f for f in forges if host in (h.casefold() for h in f.hosts)), None
+        )
+        if forge is None:
+            raise refuse(
+                f"{repository!r} is on {ref.host}, which is not a host of any "
+                "forge this install serves"
+            )
+        canonical_host = forge.hosts[0]
+        try:
+            path = forge.parse(repository.strip())
+            again = forge.parse(f"https://{canonical_host}/{path}")
+        except providers.WorkspaceError as exc:
+            raise refuse(str(exc)) from exc
+        if again != path:
+            raise refuse(
+                f"{repository!r} names {path}, which {forge.name} reads as "
+                f"{again} when it is asked for, so no request could match it"
+            )
+        if isinstance(branch, str):
+            branch = branch.strip()
+            rest = (
+                branch[len(PINNED_BASE_REF_PREFIX):]
+                if branch.startswith(PINNED_BASE_REF_PREFIX)
+                else branch
+            )
+            if rest.startswith(PINNED_BASE_REFUSED_PREFIXES):
+                raise refuse(
+                    f"the branch of {repository}, {branch!r}, does not name one "
+                    "branch: give the bare name, or refs/heads/ once before it"
+                )
+            branch = rest
+        try:
+            branch = providers.validate_branch(branch, f"the branch of {repository}")
+        except providers.WorkspaceError as exc:
+            raise refuse(str(exc)) from exc
+        key = (canonical_host.casefold(), path.casefold())
+        if key in seen:
+            raise refuse(f"{repository} is pinned more than once")
+        seen.add(key)
+        pins[(canonical_host, path)] = branch
+    return pins
 
 
 def resolve_role() -> str:
@@ -6971,8 +8973,8 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     """Return the legacy and A2A Chat subscription names, refusing one shared.
 
     Two relay instances pulling one subscription split its deliveries between
-    them at random — the exact failure the A2A path's own subscription exists
-    to prevent — so pointing both env vars at the same subscription is refused
+    them at random, and the operator arms exactly one instance per install (the
+    mode chooses which), so pointing both env vars at the same subscription is refused
     at startup rather than discovered as every other ask going missing. The
     comparison is on the fully qualified name, the way GoogleChatRelay
     resolves it: a short name and its projects/… spelling are one subscription.
@@ -6989,7 +8991,7 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
         raise RuntimeError(
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
             "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
-            "split its deliveries, so the A2A consumer needs its own"
+            "split its deliveries; arm one relay instance per install"
         )
     return chat_subscription, a2a_subscription
 
@@ -7030,19 +9032,32 @@ def serve(args: argparse.Namespace) -> None:
         max_concurrent_commands=getattr(
             args, "max_concurrent_commands", DEFAULT_MAX_CONCURRENT_COMMANDS
         ),
+        # The container's limit, through the operator's Downward API variable
+        # or the cgroup file; None, and the budget is off (design §2.4).
+        memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
         or os.getenv("GITOPS_BASE_BRANCH", "")
     ).strip()
+    CredentialProxyHandler.pinned_bases = parse_pinned_bases(
+        getattr(args, "pinned_bases", "") or ""
+    )
+    for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
+        LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
     CredentialProxyHandler.workspaces = build_workspace_store(
-        executor, base_branch=CredentialProxyHandler.base_branch
+        executor,
+        base_branch=CredentialProxyHandler.base_branch,
+        pinned_bases=CredentialProxyHandler.pinned_bases,
     )
     CredentialProxyHandler.vcs = build_vcs_broker(
-        executor, base_branch=CredentialProxyHandler.base_branch
+        executor,
+        base_branch=CredentialProxyHandler.base_branch,
+        pinned_bases=CredentialProxyHandler.pinned_bases,
     )
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
@@ -7059,7 +9074,7 @@ def serve(args: argparse.Namespace) -> None:
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
-    # The A2A gateway's own subscription on the same topic and credential;
+    # The A2A gateway's relay instance on the same topic and credential;
     # armed independently so an install can run either consumer alone.
     if chat_project and a2a_subscription:
         CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
@@ -7118,7 +9133,7 @@ def serve(args: argparse.Namespace) -> None:
             os.umask(previous_umask)
         LOGGER.info("credential proxy listening on unix socket %s", socket_path)
     else:
-        server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)
+        server = ThreadingTCPHTTPServer((args.host, args.port), CredentialProxyHandler)
         LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
     # Last, once the credentialed server holds its socket: a scrape never sees
     # a half-configured broker, and a port collision costs the metrics rather
@@ -7251,12 +9266,57 @@ def parse_args() -> argparse.Namespace:
         ),
         help="Protected GitOps base branch that agents may not push to directly",
     )
+    parser.add_argument(
+        "--pinned-bases",
+        default=os.getenv("CREDENTIAL_PROXY_PINNED_BASES", ""),
+        help=(
+            'JSON array of {"repository": "https://<host>/<path>", "branch": '
+            '"<name>"}: every proposal onto that repository must target that '
+            "branch, and no agent may push to it directly; unset leaves every "
+            "repository's own default in charge"
+        ),
+    )
     return parser.parse_args()
 
 
+def configure_logging(stream: TextIO = sys.stdout) -> None:
+    """One JSON object per line on `stream`, at the level LOG_LEVEL names.
+
+    The audit trail is this container's primary output, and a SIEM behind Cloud
+    Logging reads its fields rather than parsing them out of text
+    (JsonLineFormatter). The GKE log agent reads stdout and stderr alike, so
+    the stream changes nothing for it. A LOG_LEVEL that names no level logs at
+    INFO with a record saying so, rather than leaving a traceback out of
+    basicConfig before any handler exists.
+    """
+    requested = os.getenv(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL).strip().upper() or DEFAULT_LOG_LEVEL
+    level = requested if isinstance(logging.getLevelName(requested), int) else DEFAULT_LOG_LEVEL
+    json_handler = logging.StreamHandler(stream)
+    json_handler.setFormatter(JsonLineFormatter())
+    logging.basicConfig(level=level, handlers=[json_handler], force=True)
+    if level != requested:
+        LOGGER.warning("%s=%r names no log level; logging at %s", LOG_LEVEL_ENV, requested, level)
+
+
+def main(stream: TextIO = sys.stdout) -> int:
+    """Serve, and log a refusal to start as one record.
+
+    Every refusal `serve` makes before it opens a listener -- an unsupported
+    role or authentication mode, a listener reachable off the Pod with no
+    authenticator, a failed bootstrap command -- would otherwise leave the
+    process through the interpreter's default hook as a plain-text traceback
+    on the same container log the JSON records go to, on every restart of a
+    crash-looping broker. Caught here, it is one ERROR record with the
+    traceback inside it, and the exit status still says the start failed.
+    """
+    configure_logging(stream)
+    try:
+        serve(parse_args())
+    except Exception as exc:
+        LOGGER.exception("credential proxy failed to start type=%s", type(exc).__name__)
+        return EXIT_STARTUP_FAILURE
+    return 0
+
+
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    serve(parse_args())
+    sys.exit(main())

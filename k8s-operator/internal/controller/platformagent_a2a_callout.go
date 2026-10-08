@@ -19,9 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +48,14 @@ import (
 // gracefully degraded. Established connections and the client resilience
 // contract are what make that acceptable at this stage. A hardened HA callout
 // is production posture, not part of the dev toggle.
+//
+// The rollout strategy covers a rollout and nothing else. A node drain evicts
+// through the eviction API, which reads PodDisruptionBudgets and not Deployment
+// strategies, so the budget below is what stops a drain taking the second
+// replica while the first is still rescheduling, and the spread is what keeps
+// the two off one node in the first place. The verifier carries the same pair
+// (platformagent_a2a_verifier.go); the value here is argued for the callout on
+// its own terms rather than copied.
 
 // a2aIdentityMapSchemaAnnotation carries a2aIdentityMapSchema onto the callout
 // pod template.
@@ -99,6 +109,20 @@ const (
 	a2aCalloutImageName   = "a2a-authcallout"
 	a2aCalloutImageEnvVar = "A2A_CALLOUT_IMAGE"
 
+	// a2aCalloutReservedPrincipalsEnvVar names the callout's list of static
+	// principal names (renderA2AReservedPrincipals). The callout refuses to
+	// start without it, so it and the image that reads it ship together.
+	a2aCalloutReservedPrincipalsEnvVar = "A2A_RESERVED_PRINCIPALS"
+
+	// a2aCalloutReservedAddresseesEnvVar names the callout's list of
+	// addressee names (renderA2AReservedAddressees). The callout refuses to
+	// start without it, so it and the image that reads it ship together.
+	a2aCalloutReservedAddresseesEnvVar = "A2A_RESERVED_ADDRESSEES"
+
+	// a2aReservedAddresseesSeparator joins the list. The callout's
+	// authcallout.ParseReservedAddressees splits on a bare comma.
+	a2aReservedAddresseesSeparator = ","
+
 	// a2aBusTokenAudience is the audience every bus token is bound to.
 	//
 	// Load-bearing rather than cosmetic. A TokenReview that requests no
@@ -120,6 +144,67 @@ const (
 	// a2aCalloutStatusPort serves readiness, liveness and the served map
 	// version.
 	a2aCalloutStatusPort = 8080
+
+	// a2aCalloutPDBMaxUnavailable is the budget's one field: maxUnavailable
+	// 1, the same number as the verifier's, chosen for the callout's reasons.
+	//
+	// The two replicas are one NATS queue group, and one ready member answers
+	// every authorization request on the bus by itself. So one eviction at a
+	// time costs the bus nothing it needs: the drain evicts one callout, the
+	// survivor answers every CONNECT, and the second eviction is refused
+	// (429, which kubectl drain and the node upgraders retry) until the
+	// replacement is Ready. Ready here is /readyz, which is "serving a map
+	// AND attached to the bus" (a2a/authcallout/status.go), so the drain
+	// waits for exactly the condition under which a callout answers. What
+	// the window does cost: the evicted process closes its connection on
+	// SIGTERM without draining, so an authorization request it had in hand
+	// goes unanswered, and that one client's CONNECT fails and is retried,
+	// which lands on the survivor. Established connections are untouched;
+	// the callout is consulted only when a client connects or reconnects.
+	//
+	// The stricter budgets were considered and rejected. maxUnavailable 0
+	// (or minAvailable 2) would refuse every eviction of a callout pod, so
+	// no node holding one could ever drain, upgrade or scale down without a
+	// human deleting the budget. minAvailable 1 is the same number today and
+	// the wrong field: obtainability_audit_sop.md §3.3 and §3.4, where
+	// minAvailable over a replica count that has since dropped to one is the
+	// budget that wedges every drain on the cluster. maxUnavailable follows
+	// the Deployment's scale instead, so whatever the count, one eviction is
+	// always allowed whenever every replica is ready. A percentage would
+	// round to the same 1 and say less.
+	//
+	// What it can hold, stated rather than implied: the eviction of the one
+	// READY callout while the other is not ready (Pending, pulling, or not
+	// yet attached). That is the last authorizer on the bus, and refusing
+	// to take it is the point of the budget. The hold ends when the second
+	// replica becomes Ready, with no edit to the budget, which needs a node
+	// other than the one draining to put it on. Where there is none — a
+	// single-node install, or a cluster whose only other schedulable node
+	// is cordoned — the replacement stays Pending and a drain that honours
+	// budgets waits until the node is uncordoned or the drain overrides the
+	// budget (kubectl drain --disable-eviction; a managed node upgrade after
+	// its own budget timeout). Without the budget that drain would finish
+	// and take the bus's last authorizer with it; the verifier's budget
+	// behaves the same way on the same clusters. It never holds when both
+	// replicas are unready (the eviction policy on buildA2ACalloutPDB), and
+	// never because the replica count changed.
+	a2aCalloutPDBMaxUnavailable = 1
+
+	// The spread, on the verifier's terms (a2aVerifierSpreadTopologyKey has
+	// the full argument): one entry, maxSkew 1, keyed on the node, because
+	// the failure it guards is one node's drain taking both replicas and a
+	// zone key is satisfied by two pods on one node.
+	a2aCalloutSpreadTopologyKey = "kubernetes.io/hostname"
+	a2aCalloutSpreadMaxSkew     = 1
+	// a2aCalloutSpreadMatchLabelKey scopes the skew to one ReplicaSet, so a
+	// MaxSurge 1 rollout over two nodes cannot end with both new callouts on
+	// one node (the verifier's constant walks the sequence). The field is on
+	// by default from Kubernetes 1.27 (MatchLabelKeysInPodTopologySpread),
+	// inside the chart's 1.29 floor (charts/kube-agents/Chart.yaml,
+	// kubeVersion ">=1.29.0-0"); on a server with that gate off the API
+	// server drops the field at admission silently, and the floor is what
+	// rules that case out.
+	a2aCalloutSpreadMatchLabelKey = "pod-template-hash"
 )
 
 func a2aCalloutImage() string {
@@ -277,6 +362,103 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 // what is bus-specific is the name set a2aBusCredentialVolumeNames builds, not
 // the removal.
 
+// a2aExecutorSidecarEnv is the environment the operator owes any executor
+// riding spec.deployment.sidecars, and the reason it owes it is that the pod
+// cannot supply either value on its own.
+//
+// POD_NAMESPACE is the scope. capabilityScope (a2a/cmd/hermes-bridge/main.go)
+// resolves the scope the executor is checked at from A2A_AUTHORITY_SCOPE, then
+// POD_NAMESPACE, then the kubelet's namespace file -- and that last rung does
+// not exist in this pod. buildPodTemplateSpec sets AutomountServiceAccountToken
+// false, so the kubelet projects no serviceaccount directory at all and the
+// read returns ENOENT. capabilityScope then does the correct thing and returns
+// an empty scope rather than guessing a namespace, an empty scope is contained
+// by nothing, and every `platform` task on a default install is refused at the
+// first turn. The downward API is the one source that cannot be wrong here.
+//
+// A2A_CAPABILITY_REQUIRED is the mixed-version switch, and it is rendered for
+// the reason the gateway's copy of it is: both halves have to read one value or
+// they drift. The gateway passes its own resolved setting to the session pods
+// it spawns (a2a/gateway/spawn.go), which covers the delegated route; the
+// bridge reads its own container's environment, so the default route needs the
+// operator to put it there. Without this an install that relaxed the gateway
+// gets a bridge that still refuses every capability-less submission -- the
+// half-armed state the single switch exists to make unreachable.
+//
+// Rendered onto every CR-authored sidecar rather than onto one matched by name.
+// Matching `hermes-bridge` would make a renamed container silently take the
+// ENOENT path again, which is the failure this repairs.
+//
+// The two are NOT merged the same way, and the difference is the point.
+//
+// A2A_CAPABILITY_REQUIRED is the override: a CR that sets it on its own sidecar
+// has re-created exactly the half-armed drift the single switch exists to make
+// unreachable, so the operator's value wins. The name is private to this
+// product, so nothing else can be reading it for its own reasons.
+//
+// POD_NAMESPACE is a default: an explicit CR value wins. It is the most
+// conventional downward-API name in Kubernetes and plenty of off-the-shelf
+// containers read it, so clobbering it on every sidecar overrides user intent
+// on a name this product does not own. An earlier version of this function did
+// exactly that and justified it as "inert in a container that does not read
+// them", which is true of the switch and false of this one. Nor is the override
+// a control: capabilityScope prefers A2A_AUTHORITY_SCOPE over POD_NAMESPACE,
+// sidecar env is unscreened by the webhook on purpose (a2a/docs/hermes-bridge.md),
+// and so whoever writes the sidecar can already name any scope they like. The
+// override bought nothing and cost a silent clobber. The bridge sets neither
+// name, so it still takes the downward API and still gets the ENOENT repair.
+func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
+	if len(containers) == 0 {
+		return containers
+	}
+	out := make([]corev1.Container, 0, len(containers))
+	for _, c := range containers {
+		// Both built per container, not hoisted. mergeEnvVars returns one of
+		// its arguments by reference when the other is empty, so a hoisted
+		// slice would leave every sidecar with no env of its own sharing one
+		// backing array and one *EnvVarSource.
+		namespaceDefault := []corev1.EnvVar{
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.namespace",
+			}}},
+		}
+		switchOverride := []corev1.EnvVar{
+			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		}
+		// mergeEnvVars' second argument wins, so the nesting IS the
+		// precedence: the container's own env beats the namespace default,
+		// and the switch beats both.
+		c.Env = mergeEnvVars(mergeEnvVars(namespaceDefault, c.Env), switchOverride)
+		out = append(out, c)
+	}
+	return out
+}
+
+// a2aReservedAddressees is every addressee whose task subjects are keyed on a
+// fixed name, which a narrowed pod may therefore not be named after.
+//
+// A narrowed user is named for its pod, and the callout keys its task subjects
+// on that name: events, the consumers over `.in`, the capability verify and
+// reply subjects. A pod named after an addressee is handed that addressee's
+// subjects, so it can read the prompts sent to it and publish its events.
+//
+// On this render the set is one name. The gateway's A2A_DEFAULT_ADDRESSEE is
+// not rendered, so it keeps its own default, and the bridge's grants name
+// a2aBridgeAddressee and nothing else, which is also the bridge's
+// BRIDGE_PROFILE default. TestTheCalloutReservesTheConfiguredAddressees holds
+// this list to every addressee the bridge's grants name and to both defaults in
+// the a2a module, so widening the grant means adding the name here. Session pods are addressees
+// too, but under gateway-minted names, which are not reserved because each is
+// the name of the pod that is that addressee.
+func a2aReservedAddressees() []string {
+	return []string{a2aBridgeAddressee}
+}
+
+// renderA2AReservedAddressees is the callout's A2A_RESERVED_ADDRESSEES value.
+func renderA2AReservedAddressees() string {
+	return strings.Join(a2aReservedAddressees(), a2aReservedAddresseesSeparator)
+}
+
 // buildA2ACalloutServiceAccount is the identity the callout runs as. It is not
 // a bus identity: the callout authenticates to NATS with a password, because it
 // cannot authenticate through itself.
@@ -418,13 +600,29 @@ func buildA2ACalloutRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role
 	}
 }
 
+// a2aCalloutPodSelector is the one label set that names the callout's pods and
+// nothing else in the namespace. The Deployment, its Service, the
+// PodDisruptionBudget and the spread constraint all select on it through this
+// function, so a budget cannot drift onto a selector the pods no longer match.
+// Deliberately not a2aLabels, which every component of the next stack shares:
+// a budget keyed on those would count the verifier's and the gateway's pods
+// toward the callout's allowance.
+//
+// A fresh map on every call, because the Deployment builder extends its copy
+// into the pod labels.
+func a2aCalloutPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	return map[string]string{"app": a2aCalloutName(agent)}
+}
+
 // buildA2ACalloutDeployment renders the service.
 func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aCalloutName(agent)
 	labels := a2aLabels(agent, "callout")
-	selector := map[string]string{"app": name}
+	selector := a2aCalloutPodSelector(agent)
 	podLabels := a2aLabels(agent, "callout")
-	podLabels["app"] = name
+	for k, v := range selector {
+		podLabels[k] = v
+	}
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -457,7 +655,23 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					},
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:           name,
+					ServiceAccountName: name,
+					// Two replicas on two nodes, so that the drain the budget
+					// rate-limits is a drain of one of them. Advisory
+					// (ScheduleAnyway), not required: a single-node dev
+					// install has to come up, and a required hostname spread
+					// would leave its second replica Pending forever. And
+					// with the MaxUnavailable 0 / MaxSurge 1 strategy above a
+					// roll needs a third callout pod to schedule while the
+					// two old ones hold their nodes, which a DoNotSchedule
+					// spread on a two-node cluster has nowhere to put.
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           a2aCalloutSpreadMaxSkew,
+						TopologyKey:       a2aCalloutSpreadTopologyKey,
+						WhenUnsatisfiable: corev1.ScheduleAnyway,
+						LabelSelector:     &metav1.LabelSelector{MatchLabels: a2aCalloutPodSelector(agent)},
+						MatchLabelKeys:    []string{a2aCalloutSpreadMatchLabelKey},
+					}},
 					AutomountServiceAccountToken: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
@@ -496,10 +710,28 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: "A2A_AUTHMAP_NAME", Value: a2aAuthMapName(agent)},
 							{Name: "A2A_AUTHMAP_KEY", Value: a2aAuthMapKey},
 							{Name: "A2A_TOKEN_AUDIENCE", Value: a2aBusTokenAudience},
-							// The seeds. This Deployment is the only thing
-							// that mounts them, and the issuer is the key
-							// that decides what every connection on this bus
-							// may do.
+							// The static nats.conf users, which no identity map
+							// carries: a narrowed pod named after one would
+							// hold its inbox. Plain names, no password.
+							{Name: a2aCalloutReservedPrincipalsEnvVar, Value: renderA2AReservedPrincipals(agent)},
+							// The addressees whose task subjects are keyed
+							// on a fixed name: a narrowed pod named after
+							// one would be handed them. Plain names.
+							{Name: a2aCalloutReservedAddresseesEnvVar, Value: renderA2AReservedAddressees()},
+							// The seeds. This Deployment is the only
+							// thing that reads them, and the issuer is the
+							// key that decides what every connection on
+							// this bus may do.
+							//
+							// They arrive as environment variables, which
+							// is weaker than a projected file: secretKeyRef
+							// keeps the value out of the pod spec and out
+							// of `describe`, but env is inherited by every
+							// child process and lands in core dumps. A
+							// projected 0400 file is the shape this wants;
+							// changing it is a custody fix of its own and
+							// is tracked with the rotation gap, not done
+							// here.
 							{Name: "A2A_ISSUER_SEED", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCalloutKeysName(agent)},
 								Key:                  a2aCalloutIssuerSeedKey,
@@ -563,12 +795,63 @@ func buildA2ACalloutService(agent *agentv1alpha1.PlatformAgent) *corev1.Service 
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, "callout")},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: map[string]string{"app": name},
+			Selector: a2aCalloutPodSelector(agent),
 			Ports: []corev1.ServicePort{{
 				Name:       "status",
 				Port:       a2aCalloutStatusPort,
 				TargetPort: intstr.FromInt32(a2aCalloutStatusPort),
 			}},
+		},
+	}
+}
+
+// buildA2ACalloutPDB is the eviction-side half of the callout's availability
+// statement. The rollout strategy keeps a ROLLOUT from dropping to zero ready
+// callouts; nothing in a Deployment keeps a node DRAIN from doing it, because
+// the eviction API consults PodDisruptionBudgets and nothing else, and neither
+// budget the operator rendered before this one (the platform budget on
+// `app: <agent>-gateway`, the verifier's on its own pods) selects these pods —
+// obtainability_audit_sop.md §3.3's `no-pdb` finding.
+//
+// How it composes with that strategy. The two never act on the same request:
+// a rollout deletes pods through the ReplicaSet controller and is neither
+// blocked nor slowed by the budget, and the budget governs evictions only.
+// The budget's allowance is computed against the Deployment's scale (two), so
+// while a rollout's surge pod is up and ready there are three healthy pods
+// and two evictions allowed, which still leaves one ready authorizer; outside
+// a rollout one eviction is allowed, and only while both replicas are ready.
+// a2aCalloutPDBMaxUnavailable has the argument for the value.
+//
+// Name and selector come from the Deployment's helpers, so the teardown
+// deletes the budget by the Deployment's name and the budget cannot be left
+// selecting pods a later edit relabelled. Labelled as a callout object so the
+// teardown's residue sweep sees it.
+func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aCalloutName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "callout"),
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: ptr.To(intstr.FromInt32(a2aCalloutPDBMaxUnavailable)),
+			Selector:       &metav1.LabelSelector{MatchLabels: a2aCalloutPodSelector(agent)},
+			// AlwaysAllow rather than the IfHealthyBudget default, for the
+			// verifier's reason. /readyz needs the bus connection, and the
+			// bus is a one-replica StatefulSet, so while it is down, or its
+			// PVC is Pending, BOTH callouts are Running and NotReady. Under
+			// the default that is currentHealthy 0 against desiredHealthy
+			// 1, zero disruptions allowed, and every eviction of either pod
+			// refused until the bus returns: a budget holding a node's drain
+			// to protect an authorizer for a bus that is not there. The same
+			// holds for a release whose map both replicas refuse (the
+			// a2aIdentityMapSchema comment), where the outage is already
+			// total. A Running pod that is not Ready may be evicted
+			// regardless, and maxUnavailable 1 still governs the ready ones,
+			// which are the only ones answering. On by default since 1.27,
+			// inside the chart's 1.29 floor.
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
 		},
 	}
 }
@@ -599,11 +882,23 @@ func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent
 		buildA2ACalloutRole(agent),
 		buildA2ACalloutRoleBinding(agent),
 		callout,
+		// The budget after the Deployment whose pods it selects, as the
+		// verifier's is.
+		buildA2ACalloutPDB(agent),
 		buildA2ACalloutService(agent),
 	}
 	for _, obj := range owned {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return 0, err
+		}
+		// A hand-set minAvailable on the budget would make every forced
+		// apply merge to both fields and be refused, failing this step and
+		// everything after it in reconcileA2A on every pass; the clear is
+		// reconcileA2AVerifier's, for the same reason.
+		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+				return 0, err
+			}
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return 0, fmt.Errorf("failed to apply A2A callout %T: %w", obj, err)

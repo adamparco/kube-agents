@@ -171,6 +171,87 @@ locals {
       image = { repository = "${local.third_party_registry}/cert-manager-startupapicheck" }
     }
   })]
+
+  # Whether the CR this composition renders will say the drift detector is on,
+  # by either door that reaches the field. extra_helm_values is a second values
+  # document Helm deep-merges over the computed one (helm_release.kube_agents
+  # below), and its own description names the harness knobs as what it is for,
+  # so platformAgent.harness.driftDetector.enabled set there starts the detector
+  # without enable_drift_detector ever being read. The preconditions below are
+  # about what the detector will then do, not about which variable asked for it,
+  # so they test this rather than the flag.
+  #
+  # tobool inside the try, not outside: a leaf the type cannot hold ("yes", 1)
+  # then fails the lookup and leaves this false, where an uncaught conversion
+  # would abort the plan with a type error instead of the message the
+  # precondition owes. Such a value reaches the CRD, which rejects it.
+  #
+  # `== true` inside the try for the same reason, against the one input that
+  # is neither a boolean nor a conversion failure: null. tobool(null) does not
+  # error -- it converts, and a null of type bool comes back -- so the try has
+  # nothing to catch and hands a null to `||`, whose arguments may not be
+  # null. The plan then aborts on this local, naming no variable, and it does
+  # so whichever way enable_drift_detector is set: OpenTofu evaluates both
+  # operands. That leaf is the chart's own idiom, not a typo --
+  # charts/kube-agents/values.yaml ships `driftDetector.enabled: null`,
+  # values.schema.json types it ["boolean","null"], and the chart README says
+  # null is how a knob is omitted so the CRD's default applies -- so an
+  # operator copying the block into extra_helm_values to set gitopsManagers,
+  # which this composition does not expose, writes exactly that. `null == true`
+  # is false rather than null, so the comparison turns the one value the
+  # conversion accepts and the operator did not ask for into "not requested".
+  drift_detector_requested = (
+    var.enable_drift_detector ||
+    try(tobool(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) == true, false)
+  )
+
+  # The same leaf, read a second time, for what the local above cannot say:
+  # extra_helm_values does not only ask for the detector, it can also
+  # countermand enable_drift_detector. The block above renders `enabled: true`
+  # into the computed document and extra_helm_values is the second one, so the
+  # provider's later-document-wins merge hands whatever the leaf holds
+  # straight to the CR. A null deletes the field -- Helm's coalesce drops a
+  # nil user key and the chart's compactFields drops what is then missing --
+  # and the CRD's default false applies; a false arrives as false. Either way
+  # enable_drift_detector is true in the tfvars, the sink, topic and
+  # subscription are provisioned and billing, the CR does not start the
+  # detector, and nothing says so. That is the state the two preconditions
+  # below already refuse, reached by a third door, and the only one of the
+  # three where the operator did ask for the detector.
+  #
+  # `!= true` rather than a test for null, because false countermands exactly
+  # as null does and arrives by the same paste. A leaf the type cannot hold
+  # ("yes", "true") is refused here too, which is a better message than the
+  # one values.schema.json gives for it further in and arrives before the
+  # apply starts. Comparing across types is safe -- a string is not equal to a
+  # bool, so it lands on `!= true` rather than raising.
+  #
+  # can() as well as try(), to tell a leaf that is present and null from one
+  # that is absent. Absent is the ordinary case and must not be refused:
+  # nothing overrides the computed document and `enabled: true` reaches the
+  # CR.
+  #
+  # The second clause is the same door one level up: `driftDetector = null`
+  # reaches the identical end state and the first clause cannot see it, because
+  # attribute access on null raises and the can() that tolerates an absent leaf
+  # swallows a present null parent with it. Coalesce deletes a nil-valued key
+  # where the chart default is a table, and the template's `| default dict`
+  # then renders no driftDetector block at all -- no enabled, and no
+  # subscription either -- so the ingress bills and nothing reads it.
+  #
+  # The "absent" sentinel is what separates "the key is there and is null" from
+  # "the key is not there": try returns the sentinel in the second case, and a
+  # sentinel that is not null cannot collide with the value being tested for. A
+  # non-null non-map parent is deliberately not caught here -- coalesce keeps a
+  # scalar and values.schema.json types driftDetector as object, so the release
+  # fails validation with a message of its own.
+  extra_helm_values_countermands_detector = (
+    var.enable_drift_detector && (
+      (can(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) &&
+      try(var.extra_helm_values.platformAgent.harness.driftDetector.enabled, null) != true) ||
+      try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
+    )
+  )
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -261,30 +342,30 @@ module "gke_backup_plan" {
   encryption_key      = var.backup_encryption_key
 }
 
-locals {
-  # Indexed by the same key the kube-agents-iam module uses, so the emails
-  # coming back out of the module can be rejoined with the tuple that produced
-  # them without re-deriving anything.
-  scoped_pool_entries = {
-    for cluster in var.scoped_clusters :
-    "projects/${cluster.project_id}/locations/${cluster.location}/clusters/${cluster.cluster_name}" => cluster
-  }
-}
-
 # The two scope selectors that are not containers, resolved to projects at
-# plan time. Called with no depends_on and no input a managed resource
-# produces, on purpose: module.kube_agents_iam below carries a module-level
-# depends_on, which would defer a data source inside it to apply time on a
-# first install or on any upgrade that enables an API, and the bindings keyed
-# on the resolved projects would then fail the plan as unknown. Here the reads
-# happen on every plan, and a read the planning identity cannot make fails
-# the plan with the selector named, before anything is applied.
+# plan time, and -- while the scoped service account pool is armed -- each
+# declared folder's and organisation's members, listed for the pool with the
+# reconcile's own Asset Inventory search. Called with no depends_on and no
+# input a managed resource produces, on purpose: module.kube_agents_iam below
+# carries a module-level depends_on, which would defer a data source inside it
+# to apply time on a first install or on any upgrade that enables an API, and
+# the bindings keyed on the resolved projects would then fail the plan as
+# unknown. Here the reads happen on every plan, and a read the planning
+# identity cannot make fails the plan with the selector or container named,
+# before anything is applied.
 module "scope_resolver" {
   source = "../../modules/kube-agents-scope-resolver"
 
   shared_vpc_hosts = var.scope.shared_vpc_hosts
   metrics_scopes   = var.scope.metrics_scopes
   exclude_projects = var.scope.exclude.projects
+  member_cap       = var.scope.max_projects
+  # The containers are read for the pool alone (their grant is on the
+  # container and inherited, so nothing is bound per member): listed only
+  # while the pool is armed, and no container is read while it is off.
+  folders                = var.scope.folders
+  organizations          = var.scope.organizations
+  list_container_members = var.scoped_pool_enabled
   # The consumer project of the reads: the management project, whose APIs
   # this composition enables (and install.sh pre-enables before a first apply,
   # since the reads run in the plan).
@@ -294,15 +375,23 @@ module "scope_resolver" {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id      = var.project_id
-  namespace       = var.namespace
-  project_roles   = local.agent_project_roles
-  scoped_clusters = var.scoped_clusters
-  scope           = var.scope
+  project_id    = var.project_id
+  namespace     = var.namespace
+  project_roles = local.agent_project_roles
+  scope         = var.scope
+  # The scoped service account pool, derived in the module from the same
+  # scope object: armed by the switch alone, never by the scope.
+  scoped_pool_enabled      = var.scoped_pool_enabled
+  scoped_pool_max_accounts = var.scoped_pool_max_accounts
   # What the selectors resolved to, from the module above; the IAM module
   # binds these and refuses a selector with no entry.
   scope_selector_members = module.scope_resolver.members
-  service_account_id     = var.agent_service_account_id
+  # What each declared container held while the pool is armed, from the same
+  # module; the IAM module gives each a pool account and nothing else, and
+  # refuses an armed pool beside a container with no entry. Empty while the
+  # pool is off.
+  scope_container_members = module.scope_resolver.container_members
+  service_account_id      = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
   # description in variables.tf says why it exists and what bounds it.
@@ -388,15 +477,20 @@ module "chat_pubsub" {
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
 # and pull subscription, and the sink-writer and detector IAM. The three names
-# are composition variables, as the stockout trio's are, because lifecycle.sh
-# adopts them by name and a second install in the project has to be able to
-# name its own; the module's defaults decide the rest (retention, backoff, and
+# are composition variables, as the stockout trio's are, because a second
+# install in the project has to be able to name its own -- lifecycle.sh's
+# guard_drift_adoption refuses an apply that would otherwise find all three
+# there and import them; the module's defaults decide the rest (retention, backoff, and
 # the cluster scope, every GKE cluster in the project). The consumer,
 # k8s-operator/cmd/drift-detector, ships in the images and starts in the
 # gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;
 # this flag provisions its input and passes the subscription's name into that
-# block (the harness values below), and leaves enabling the detector to
-# extra_helm_values (docs/designs/drift-detection.md).
+# block (the harness values below), and enable_drift_detector is what starts
+# the consumer (docs/designs/drift-detection.md). The two are separate so that
+# the ingress can be provisioned on its own; the other order is refused by a
+# helm_release precondition below, because the harness block that carries
+# enabled is written only when this flag is on, so the composition would
+# otherwise accept the second variable and silently do nothing with it.
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
@@ -406,7 +500,22 @@ module "drift_pubsub" {
   topic_name                     = var.drift_pubsub_topic
   subscription_name              = var.drift_pubsub_subscription
   sink_name                      = var.drift_pubsub_sink
+  topic_publishers               = var.drift_pubsub_topic_publishers
 
+  # Exposed because the module's sink postcondition names them in its error:
+  # a project whose sink reports some other writer identity fails that check on
+  # every plan from then on, and the operator it tells to set the override has
+  # only this composition to set it in.
+  sink_writer_identity_override = var.drift_pubsub_sink_writer_identity_override
+  sink_drain_duration           = var.drift_pubsub_sink_drain_duration
+
+  # Defers data.google_project.this inside the module to apply time whenever
+  # any member of required_apis has a planned change, which makes the sink's
+  # publish grant "(known after apply)" and -- member being ForceNew -- plans
+  # it for replacement while the sink stays live. See the note on the grant in
+  # the module's main.tf; narrowing this list to the three APIs the module
+  # needs does not help, because Terraform resolves an indexed depends_on
+  # reference to the whole resource.
   depends_on = [google_project_service.required]
 }
 
@@ -621,6 +730,19 @@ resource "helm_release" "kube_agents" {
           projectId = local.vertex_project
           location  = local.vertex_location
         }
+      } : {},
+      # Only while on, so an install that never turns redaction on renders the
+      # gateway ConfigMap, and its checksum, exactly as before. Unset rule keys
+      # are dropped: yamlencode writes them as null, which the chart refuses.
+      var.litellm_redaction.enabled ? {
+        redaction = {
+          enabled = true
+          ip = {
+            action     = var.litellm_redaction.ip_action
+            allowCidrs = var.litellm_redaction.allow_cidrs
+          }
+          rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
+        }
       } : {}
     )
     platformAgent = {
@@ -654,12 +776,16 @@ resource "helm_release" "kube_agents" {
         # rename to it. Only when the module exists -- the chart renders a
         # driftDetector block into the CR as soon as one field is set, and an
         # install that never asked for drift detection should not carry one
-        # (the chart's platform-agent-cr.yaml says why). Whether the detector
-        # starts is spec.harness.driftDetector.enabled, which this composition
-        # does not set; extra_helm_values reaches it.
+        # (the chart's platform-agent-cr.yaml says why).
+        #
+        # enabled is null rather than false when the detector is off, so the
+        # CRD's own default applies and the rendered CR is byte-identical to
+        # what an ingress-only install produced before this variable existed.
+        # The chart's compactFields drops nulls; it does not drop false.
         var.enable_drift_pubsub ? {
           driftDetector = {
             subscription = module.drift_pubsub[0].subscription_name
+            enabled      = var.enable_drift_detector ? true : null
           }
         } : {}
       )
@@ -686,19 +812,22 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
-        # The mapping the credential broker selects from. It has to reach the
-        # cluster as data rather than being recomputed there: the broker refuses
-        # a scope it has no entry for, so a second implementation of the naming
-        # rule would turn a mismatch into a refusal at request time instead of a
-        # diff at plan time.
-        scopedServiceAccounts = [
-          for key in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
-            projectId           = local.scoped_pool_entries[key].project_id
-            location            = local.scoped_pool_entries[key].location
-            clusterName         = local.scoped_pool_entries[key].cluster_name
-            serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
-          }
-        ]
+        # The mapping the credential broker selects from, one row per project
+        # the module provisioned a member for. It has to reach the cluster as
+        # data rather than being recomputed there: the broker refuses a
+        # project it has no entry for, so a second implementation of the
+        # naming rule would turn a mismatch into a refusal at request time
+        # instead of a diff at plan time. `enabled` is the arming switch the
+        # operator reads; the list is empty while it is false.
+        scopedServiceAccountPool = {
+          enabled = var.scoped_pool_enabled
+          serviceAccounts = [
+            for project_id in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
+              projectId           = project_id
+              serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[project_id]
+            }
+          ]
+        }
       }
       # The same object the IAM module bound above, so the CR declares no
       # project the module did not also bind. Always rendered, empty lists
@@ -713,6 +842,7 @@ resource "helm_release" "kube_agents" {
         organizations  = var.scope.organizations
         sharedVpcHosts = var.scope.shared_vpc_hosts
         metricsScopes  = var.scope.metrics_scopes
+        maxProjects    = var.scope.max_projects
         exclude = {
           projects = var.scope.exclude.projects
           clusters = [
@@ -848,6 +978,61 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
+    }
+
+    # What this refuses is an install that asks for the detector without the
+    # subscription it reads, which is silent whichever door asked. Through
+    # enable_drift_detector: driftDetector, enabled included, is written inside
+    # the enable_drift_pubsub ternary above, so with the ingress off the field
+    # is never rendered, the apply succeeds, nothing is provisioned, nothing
+    # starts, and the only evidence is a variable that did nothing. Through
+    # extra_helm_values (local.drift_detector_requested above): the field is
+    # rendered, the detector starts, and it retries a pull against a
+    # subscription that was never created for the life of a pod that stays
+    # Ready -- k8s-operator/cmd/drift-detector/README.md says the subscription
+    # is not checked at startup. Refused rather than warned about, unlike
+    # check "slack_tokens_present" above, because a Slack install with no
+    # tokens says so in the pod log and neither of these leaves a trace
+    # anywhere.
+    #
+    # The ternary is what keeps a driftDetector block out of the CR of an
+    # install that never asked for drift detection, and this is what keeps
+    # asking for it half-way from being accepted. Neither replaces the other.
+    precondition {
+      condition     = !local.drift_detector_requested || var.enable_drift_pubsub
+      error_message = "the drift detector requires enable_drift_pubsub, whether it was asked for with enable_drift_detector or with platformAgent.harness.driftDetector.enabled through extra_helm_values: it reads the Pub/Sub subscription that flag provisions. Without it the flag renders no driftDetector block at all and does nothing, and extra_helm_values renders one this composition cannot point at a subscription, leaving the detector pulling one that does not exist with the pod Ready. Neither says anything. Through the installer, ENABLE_DRIFT_DETECTOR=true sets both."
+    }
+
+    # The operator's own gate, brought forward to the plan. A numeric
+    # project_id works everywhere else in this composition -- gcloud resolves
+    # a project number, and the credential proxy and the context name both
+    # take one -- but driftDetectorEnabled() in the operator refuses it
+    # (k8s-operator/internal/controller/platformagent_manifests.go), because
+    # the join matches it against each audit record's project_id, which is
+    # always the ID. Left to run, such an install provisions the whole ingress
+    # -- a sink exporting every GKE cluster in the project into a subscription
+    # that retains 31 days and never expires -- and starts no consumer, with a
+    # Ready pod and no report to tell anyone.
+    precondition {
+      condition     = !local.drift_detector_requested || !can(regex("^[0-9]+$", var.project_id))
+      error_message = "the drift detector requires project_id to be the project ID, not the project number: it matches it against each audit record's project_id, which is always the ID, so the operator refuses to start it and the ingress bills for a stream nothing reads."
+    }
+
+    # The third route to that same ingress-without-a-consumer, and the one the
+    # other two cannot see: here the flag is set, the ingress is asked for by
+    # the same variable that asks for the detector, and the CR is what
+    # disagrees. local.extra_helm_values_countermands_detector above has the
+    # merge that does it and why false is refused alongside null.
+    #
+    # Refused rather than stripped from the document. Silently dropping the
+    # leaf would give this operator what they almost certainly meant, and it
+    # would also make extra_helm_values the one values document this
+    # composition edits before passing on -- so the next operator to set a
+    # leaf it disagrees with would have no way to tell whether it arrived.
+    # Saying which line to delete costs one apply and keeps that contract.
+    precondition {
+      condition     = !local.extra_helm_values_countermands_detector
+      error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
     }
   }
 }

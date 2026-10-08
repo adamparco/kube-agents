@@ -2219,6 +2219,25 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=True)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
+        self.assertTrue(hits[0]["_autopilot_bumped"])
+
+    def test_a_major_the_delta_earned_is_not_marked_as_bumped(self):
+        """Only a grade the bump supplied is held out of the sweep. A delta
+        worth a node is `major` on any cluster and promotes on its own."""
+        pod = self.deployment_pod()
+        peaks = {("default", "api-1"): (0.9, 3072.0)}
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                [hit] = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=autopilot)
+                self.assertEqual(hit["severity"], "major")
+                self.assertFalse(hit["_autopilot_bumped"])
+
+    def test_a_minor_off_autopilot_is_not_marked_as_bumped(self):
+        pod = self.deployment_pod(cpu_req="3", mem_req="6Gi")
+        peaks = {("default", "api-1"): (0.1, 100.0)}
+        [hit] = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(hit["severity"], "minor")
+        self.assertFalse(hit["_autopilot_bumped"])
 
     def test_the_excerpt_names_the_window_it_rests_on(self):
         pod = self.deployment_pod()
@@ -2553,13 +2572,17 @@ class OverrequestResizeIsANoOpTest(unittest.TestCase):
 
 
 class IdleWorkloadTest(unittest.TestCase):
-    """§3.13 -- the population §3.1 measures correctly and then cannot act on.
+    """§3.13 -- the population §3.1 measures correctly and then will not act on.
 
     Every fixture here is a controller `check_overrequest` sees, agrees is
-    idle, and drops because `ceil(peak x 2)` clamps up to the 50m/64Mi it
-    already declares. `test_the_partition_with_overrequest_is_exact` is the
-    load-bearing one: the two checks must never both fire on an object, or the
-    report asks a reader to shrink and delete the same Deployment.
+    idle, and proposes no resize for, on one of three arms: the floor-bound
+    arm, where `ceil(peak x 2)` clamps up to the 50m/64Mi (or LimitRange
+    default) it already declares; the materiality arm, where the only
+    dimension it could shrink would save less than 100m/128Mi; and the
+    `Guaranteed` arm, where §3.1 declines to turn a week of idleness into a
+    limit. `test_the_partition_with_overrequest_is_exact` is the load-bearing
+    one: the two checks must never both fire on an object, or the report asks
+    a reader to shrink and delete the same Deployment.
     """
 
     NS = "hello-world"
@@ -3403,12 +3426,13 @@ class UnderrequestTest(unittest.TestCase):
         under its bare name and does not.
         """
         pods = [
-            self.pod(ns="tenant-a", name="redis-0", owner_name="redis"),
-            self.pod(ns="tenant-b", name="redis-0", owner_name="redis"),
+            self.pod(ns="tenant-a", name="redis-0", owner_kind="StatefulSet", owner_name="redis"),
+            self.pod(ns="tenant-b", name="redis-0", owner_kind="StatefulSet", owner_name="redis"),
         ]
         means = {("tenant-a", "redis-0"): 900.0, ("tenant-b", "redis-0"): 900.0}
         hits = self.check(pods, means)
         self.assertEqual(sorted(h["namespace"] for h in hits), ["tenant-a", "tenant-b"])
+        self.assertEqual({h["object"] for h in hits}, {"StatefulSet/redis"})
         # Each finding measures only its own namespace's replica: one pod at
         # 900 MiB against one 512Mi request, not two summed to 1800.
         for hit in hits:
@@ -4083,7 +4107,11 @@ class UnsizedWorkloadTest(unittest.TestCase):
         manifest declares none, so the number is being paid for either way."""
         pod = self.pod()
         peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
-        self.assertEqual(self.check([pod], peaks, autopilot=True)[0]["severity"], "major")
+        [hit] = self.check([pod], peaks, autopilot=True)
+        self.assertEqual(hit["severity"], "major")
+        self.assertTrue(hit["_autopilot_bumped"])
+        [hit] = self.check([pod], peaks, autopilot=False)
+        self.assertFalse(hit["_autopilot_bumped"])
 
     def test_it_never_reaches_critical(self):
         """§3 caps a manifest remediation below `critical`, which opens a
@@ -5124,6 +5152,78 @@ class CollectClusterTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
         self.assertIn("ingress", seen[0][2].split(","))
+
+    def bump_candidates(self, autopilot):
+        unsized = UnsizedWorkloadTest().pod()
+        over = OverrequestTest().deployment_pod(cpu_req="3", mem_req="6Gi")
+        session = usage_session(
+            ("argocd", "argocd-repo-server-1", 0.01, 64.0),
+            ("default", "api-1", 0.1, 100.0),
+        )
+        entry, _ = self.run_with(
+            dump_items=[unsized, over],
+            session=session,
+            cluster={**self.CLUSTER, "autopilot": autopilot},
+        )
+        return {c["check"]: c for c in entry["candidates"]}
+
+    def test_an_autopilot_bumped_sizing_finding_is_marked_for_triage(self):
+        """The bump lifts both §3.1 and §3.12 to `major`, which clears the
+        sweep's floor. The marker is what keeps a platform attribute from
+        opening a pull request by itself."""
+        candidates = self.bump_candidates(autopilot=True)
+        for check in ("overrequest", "unsized-workload"):
+            with self.subTest(check=check):
+                self.assertEqual(candidates[check]["severity"], "major")
+                self.assertEqual(candidates[check]["needs_triage"], fw.AUTOPILOT_BUMP_TRIAGE)
+
+    def test_the_same_findings_off_autopilot_carry_no_marker(self):
+        candidates = self.bump_candidates(autopilot=False)
+        for check in ("overrequest", "unsized-workload"):
+            with self.subTest(check=check):
+                self.assertEqual(candidates[check]["severity"], "minor")
+                self.assertIsNone(candidates[check]["needs_triage"])
+
+    def test_the_bump_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift here would mark
+        the finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertEqual(fw.AUTOPILOT_BUMP_TRIAGE, "autopilot-bumped")
+        self.assertIn(fw.AUTOPILOT_BUMP_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertIn(fw.IDLE_SERVICE_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(fw.IDLE_STANDDOWN_TRIAGE, "scale-to-zero")
+        self.assertIn(fw.IDLE_STANDDOWN_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(fw.GUARANTEED_QOS_TRIAGE, "guaranteed-qos")
+        self.assertIn(fw.GUARANTEED_QOS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_a_stand_down_no_service_selects_is_marked_scale_to_zero(self):
+        """No Service means no `service-fronted` marker, but the fix still
+        takes the controller to zero on an idle reading, which is a judgement
+        the sweep must not make for a reader."""
+        idle = IdleWorkloadTest()
+        entry, _ = self.run_with(
+            dump_items=[idle.pod(), obj("Deployment", "hello-world", ns=idle.NS, **{"spec.replicas": 1})],
+            session=usage_session((idle.NS, idle.POD, 0.0021, 6.0)),
+        )
+        found = [c for c in entry["candidates"] if c["check"] == "idle-workload"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["needs_triage"], fw.IDLE_STANDDOWN_TRIAGE)
+
+    def test_a_guaranteed_overrequest_is_marked_guaranteed_qos(self):
+        """Wins over the bump marker on Autopilot, too: the model needs it to
+        publish the fix as `manual`, and both keep it out of the sweep."""
+        over = OverrequestTest().deployment_pod(cpu_req="3", mem_req="6Gi", cpu_lim="3", mem_lim="6Gi")
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                entry, _ = self.run_with(
+                    dump_items=[over],
+                    session=usage_session(("default", "api-1", 0.1, 100.0)),
+                    cluster={**self.CLUSTER, "autopilot": autopilot},
+                )
+                found = [c for c in entry["candidates"] if c["check"] == "overrequest"]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0]["needs_triage"], fw.GUARANTEED_QOS_TRIAGE)
 
     def test_every_outcome_publishes_the_mode(self):
         # The mode is a cluster property `enumerate_clusters` already resolved,
@@ -7287,6 +7387,7 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             "GITOPS_CLUSTER_TREE_ROOT",
             "GITOPS_CLUSTER_TREE_DEPTH",
             "GIT_DIR_NAME",
+            "MIRROR_RELEASES_WITHHELD_MARKER",
             "KCC_API_GROUP_SUFFIX",
             "_HELM_RELEASE_ANNOTATION",
             "_HELM_NAMESPACE_ANNOTATION",
@@ -7790,6 +7891,72 @@ class RefusedProjectIdTest(unittest.TestCase):
             with self.subTest(stderr=stderr):
                 self.assertEqual(fw.refusal_owner("acme-prod", stderr, run=run), (True, ""))
 
+
+
+class ContentModeWorkspaceTest(unittest.TestCase):
+    """In content mode `--workspace` is an empty scratch directory; the repository is in the broker.
+
+    `fleet_waste.py` borrows `collect.py`'s mirror rather than walking the
+    empty directory, so the cost stream's candidates carry `declaration` there
+    as the other streams' do.
+    """
+
+    def test_main_indexes_the_broker_mirror_not_the_scratch_directory(self):
+        import collect
+
+        seen = {}
+
+        def fake_collect_fleet(project, workspace=None):
+            seen["workspace"] = workspace
+            seen["files"] = sorted(str(p.relative_to(workspace)) for p in workspace.rglob("*.yaml"))
+            return {"clusters": []}
+
+        def fake_mirror(repo, dest):
+            seen["repo"] = repo
+            (dest / "clusters" / "a").mkdir(parents=True)
+            (dest / "clusters" / "a" / "w.yaml").write_text("kind: Deployment\n")
+            return True
+
+        with TemporaryDirectory() as tmp:
+            scratch = Path(tmp) / "scratch"
+            scratch.mkdir()
+            with patch.object(fw, "collect_fleet", side_effect=fake_collect_fleet), \
+                    patch.object(collect, "broker_repo", return_value="example-org/infra"), \
+                    patch.object(collect, "broker_mirror", side_effect=fake_mirror), \
+                    patch("sys.stdout"):
+                fw.main(["--workspace", str(scratch)])
+            self.assertEqual(list(scratch.iterdir()), [], "nothing lands in the remediation workspace")
+        self.assertEqual(seen["repo"], "example-org/infra")
+        self.assertNotEqual(seen["workspace"], scratch)
+        self.assertEqual(seen["files"], ["clusters/a/w.yaml"])
+
+    def test_a_clone_is_walked_directly(self):
+        seen = {}
+        with TemporaryDirectory() as tmp:
+            clone = Path(tmp)
+            (clone / fw.GIT_DIR_NAME).mkdir()
+            with patch.object(fw, "collect_fleet", side_effect=lambda p, workspace=None: seen.update(w=workspace) or {"clusters": []}), \
+                    patch("sys.stdout"):
+                fw.main(["--workspace", str(clone)])
+        self.assertEqual(seen["w"], clone)
+
+    def test_a_failed_mirror_is_not_indexed(self):
+        import collect
+
+        seen = {}
+
+        def partial_mirror(repo, dest):
+            (dest / "half.yaml").write_text("kind: Deployment\n")
+            return False
+
+        with TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            with patch.object(fw, "collect_fleet", side_effect=lambda p, workspace=None: seen.update(w=workspace) or {"clusters": []}), \
+                    patch.object(collect, "broker_repo", return_value="example-org/infra"), \
+                    patch.object(collect, "broker_mirror", side_effect=partial_mirror), \
+                    patch("sys.stdout"):
+                fw.main(["--workspace", str(scratch)])
+        self.assertIsNone(seen["w"], "a failed mirror indexes nothing, not the scratch")
 
 if __name__ == "__main__":
     unittest.main()

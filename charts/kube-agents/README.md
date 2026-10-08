@@ -246,9 +246,10 @@ because YAML reads the bare word as a boolean and the render refuses it) and
 `litellm.redaction.ip.allowCidrs` govern IP literals; `litellm.redaction.rules`
 adds named `literal` or `pattern` rules with a `mask` or `pseudonym` action, and
 a name, action or source the chart does not accept fails the render. Off by
-default, and the rendered config is unchanged while it is; the feature is
-chart-only, so with it on the gateway diverges from the kustomize dev base,
-which carries no redaction. The site's
+default, and the rendered config is unchanged while it is. `install.sh` sets it
+from the `LITELLM_REDACTION_*` keys in `install.env`, through the Terraform
+example's `litellm_redaction` variable; the kustomize dev base carries no
+redaction, so with it on the gateway diverges from that base. The site's
 [inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)
 owns what is redacted, what is not (responses, chat egress) and why a
 pseudonymised identifier is one the agent cannot act on; the site's
@@ -396,9 +397,14 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation and request metrics from its metrics-only port 8766. The
-operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
-on those ports either way; the value only decides whether a scrape is configured.
+tool-invocation and request metrics from its metrics-only port 8766, and the A2A
+gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
+terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
+that one selects no pod). The operator's policies on all three pods admit the
+collector's namespace, `gke-gmp-system`, on those ports either way, and on the
+first two they admit the operator's own pods as well; the value only decides
+whether a scrape is configured, and the operator's own read of the two counters
+into `status.usage` does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
@@ -494,6 +500,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   declared and none is GitHub fails the render, since minty issues GitHub App
   tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
+  `platformAgent.integration.repositories[].baseBranch`, on a gitops or
+  managed repository, names the branch every pull request onto it must
+  target, enforced by the credential broker; unset means the repository's
+  own default branch. A context repository may not set it. The alias has no
+  place for it, so a repository that sets one renders as the lists, and on a
+  live install the render fails unless the installed CRD has the field. A
+  repository registered only in the ConfigMap is not pinned. The
+  [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)
+  describes what the broker does with it.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
@@ -512,6 +527,31 @@ field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
+
+`platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
+container, the broker that runs every credentialed command in a pod of its own.
+It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
+key is set, and the operator merges it over its defaults per key, so
+`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+is canonical for the defaults, what the operator refuses and how it reports it,
+and the Autopilot warnings;
+[the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
+has the arithmetic behind the memory floor. The chart fails the render on an
+override the operator would refuse, on a quantity it cannot read, and on any key
+under `resources` other than `requests`, `limits` and `claims` (`limit:` for
+`limits:`), which the CRD would prune silently. A quantity with more than 15
+significant digits is refused at render as well: the chart compares quantities as
+float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
+comparison matches the operator's for every decimal value within the cap. A
+binary-suffixed value within float64 rounding (about one part in 10^16) of a
+decimal one can compare equal to it; the operator decides that pair. The quota
+preflight sums the
+override merged over the operator's defaults. On an existing install, apply the
+chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
+does): against a CRD that predates `spec.deployment.credentialProxy`, the API
+server would prune the value silently while the release record kept it, so the
+chart looks up the installed CRD and fails the upgrade instead.
 
 #### PlatformAgent annotations
 
@@ -589,9 +629,11 @@ Five knobs need context beyond the chart:
   [`terraform/modules/drift-pubsub`](../../terraform/modules/drift-pubsub/)
   applied against the project first.
   [`terraform/examples/full-install`](../../terraform/examples/full-install/README.md#drift-audit-log-ingress)
-  does that as part of its own apply when `enable_drift_pubsub = true`; an
-  install that renders this chart without the composition applies the module
-  itself. The chart does not check, and neither does
+  does that as part of its own apply when `enable_drift_pubsub = true`, and
+  writes this value itself from `enable_drift_detector`, refusing an apply that
+  asks for the second without the first; an install that renders this chart
+  without the composition applies the module itself. The chart does not check,
+  and neither does
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
@@ -607,15 +649,30 @@ When `plugins.stockoutInvestigator.enabled=true`, the chart automatically seeds 
 
 ### Scoped service accounts
 
-`platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
-may read to the Google service account that reads it. Empty is the default and
-should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
-non-empty list arms the credential broker onto identities that can read
-nothing, and every cluster read fails — a mapped cluster gets a powerless
-token and a `Forbidden` from GKE, an unmapped one is refused by the broker
-before any GKE call. The
-`terraform/examples/full-install` composition fills it in from its
-`scoped_service_accounts` output when `scoped_clusters` is set. See the site's
+`platformAgent.security.scopedServiceAccountPool` maps each GCP project the
+agent may read to the Google service account that reads its clusters, and
+`enabled` under it arms the credential broker onto that mapping. The list
+alone arms nothing: the `terraform/examples/full-install` composition fills
+`serviceAccounts` in from its `scoped_service_accounts` output and passes
+`scoped_pool_enabled` through as `enabled`, so the mapping can be declared
+while the switch stays off. Off is the default and should stay off: the
+accounts hold no IAM grant as of 2026-08-12, so an armed pool puts the broker
+onto identities that can read nothing, and every cluster read fails — a mapped
+project gets a powerless token and a `Forbidden` from GKE, an unmapped one is
+refused by the broker before any GKE call. `enabled: true` with an empty list
+is refused at install. So is `enabled: true` against a live `PlatformAgent` CRD
+that predates the field: `helm upgrade` does not apply `crds/`, and an older
+CRD would admit the CR with the block pruned, leaving the broker on the agent's
+own identity while the release record says armed, so the chart looks the CRD
+up and fails the render until `kubectl apply --server-side -f
+charts/kube-agents/crds/` has run. One retired key is tolerated for a
+release: every release the composition applied before the pool moved to
+projects recorded `platformAgent.security.scopedServiceAccounts: []`, and a
+harness- or operator-mode retag re-applies the recorded values over this
+chart after checking them against its schema, so the schema admits that key
+only as an empty list, which renders nothing, and refuses a populated one by
+name — that was a pool armed under the old per-cluster field, and the install
+takes `--upgrade-mode=full` so `install.env` renders the new one. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
@@ -625,7 +682,7 @@ for what the pool does and does not bound.
 folders, organisations, Shared VPC hosts and Metrics Scopes, beyond the project the agent runs
 in, whose GKE clusters get a Cluster Agent, and the projects and clusters it leaves unmanaged (the
 [CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
-documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included (`folders`, `organizations`, `sharedVpcHosts` and `metricsScopes` only when the value carries the key, so a release record written before the chart knew them re-renders without them and a retag's patch leaves the CR's lists alone; the composition always passes all four; the reverse holds too: a chart rolled back past the keys patches them off a CR that carries them, which an operator that knows them renders as emptied lists, a drop, so take the block off the CR first as the CRD page says), because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included (`folders`, `organizations`, `sharedVpcHosts`, `metricsScopes` and `maxProjects` only when the value carries the key, so a release record written before the chart knew them re-renders without them and a retag's patch leaves the CR's lists alone; the composition always passes all five; the reverse holds too: a chart rolled back past the keys patches them off a CR that carries them, which an operator that knows them renders as emptied lists, a drop, and the cap as its default of 100, so take the block off the CR first as the CRD page says), because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
 `terraform/examples/full-install` composition always passes a map, so on that path a project
 leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
 The agent's service account needs the read roles in each project named, the read roles plus
@@ -680,7 +737,12 @@ have no replica count to multiply, and the pre-delete cleanup hook Job (one pod,
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
-it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
+merged over its footprint entry per key, as the operator renders it, so a raised limit is
+summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+as a request of that size too, because the operator renders no ephemeral-storage request and
+the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
+outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to

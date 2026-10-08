@@ -7,6 +7,7 @@ and that the helpers driving install.sh here detach from the controlling
 terminal, so a prompt auto-selects its default instead of blocking the suite.
 """
 
+import base64
 import json
 import os
 import pathlib
@@ -24,6 +25,7 @@ import time
 import unittest
 from unittest import mock
 
+import tests.test_installer_common as _installer_common_tests
 from tests.testing.common import (
     INSTALLER_HELP_BANNER,
     INVALID_IMMUTABLE_REFS,
@@ -993,6 +995,26 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MAX=4096", proc.stdout)
+
+    def test_parse_args_litellm_redaction_flags_are_read(self):
+        cmd = (
+            "parse_args --litellm-redaction --litellm-redaction-ip-action=mask "
+            "--litellm-redaction-ip-allow-cidrs=127.0.0.0/8,fd00::/8; "
+            'echo "ON=$PARAM_LITELLM_REDACTION_ENABLED ACTION=$PARAM_LITELLM_REDACTION_IP_ACTION '
+            'CIDRS=$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ON=true ACTION=mask CIDRS=127.0.0.0/8,fd00::/8", proc.stdout)
+
+    def test_parse_args_scoped_sa_pool_flags_are_read(self):
+        cmd = (
+            "parse_args --scoped-sa-pool-enabled --scoped-sa-pool-max-accounts=50; "
+            'echo "ON=$PARAM_SCOPED_SA_POOL_ENABLED MAX=$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ON=true MAX=50", proc.stdout)
 
     def test_model_max_tokens_defaults_to_unset(self):
         cmd = 'echo "MAX=[$PARAM_MODEL_MAX_TOKENS]"'
@@ -4971,6 +4993,268 @@ class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
         self.assertLess(exported, bootstrap)
 
 
+class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The same walk for the LITELLM_REDACTION_* keys: the first run records
+    what main() exported, the next run's parameter block and environment read
+    it back, and the rules survive the %q quoting as the JSON they were."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+
+    _RULES = '[{"name":"cluster-name","literal":"prod eu 1","action":"pseudonym"},{"name":"p","pattern":"a${b}\\\\d"}]'
+    _EXPORTS = (
+        'export LITELLM_REDACTION_ENABLED=true LITELLM_REDACTION_IP_ACTION=mask '
+        'LITELLM_REDACTION_IP_ALLOW_CIDRS="127.0.0.0/8, fd00::/8"; '
+        f"export LITELLM_REDACTION_RULES='{_RULES}'"
+    )
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        for key in (
+            "LITELLM_REDACTION_ENABLED",
+            "LITELLM_REDACTION_IP_ACTION",
+            "LITELLM_REDACTION_IP_ALLOW_CIDRS",
+            "LITELLM_REDACTION_RULES",
+        ):
+            env.pop(key, None)
+        env.update(overrides)
+        return env
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, self._EXPORTS)
+            out = self._read_back(
+                dest,
+                'echo "ON=[$PARAM_LITELLM_REDACTION_ENABLED] ACTION=[$PARAM_LITELLM_REDACTION_IP_ACTION]"; '
+                'echo "CIDRS=[$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS]"; '
+                "bash -c 'printf \"RULES=[%s]\\n\" \"$LITELLM_REDACTION_RULES\"'",
+            )
+            self.assertIn("ON=[true] ACTION=[mask]", out)
+            self.assertIn("CIDRS=[127.0.0.0/8, fd00::/8]", out)
+            self.assertIn(f"RULES=[{self._RULES}]", out)
+
+    def test_an_unset_value_is_recorded_as_the_default_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("LITELLM_REDACTION_ENABLED=false\n", text)
+            self.assertIn("LITELLM_REDACTION_IP_ACTION=pseudonym\n", text)
+            self.assertIn("LITELLM_REDACTION_IP_ALLOW_CIDRS=''\n", text)
+            self.assertIn("LITELLM_REDACTION_RULES=''\n", text)
+
+    def test_a_flag_on_a_later_run_beats_the_recorded_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, self._EXPORTS)
+            out = self._read_back(
+                dest,
+                "parse_args --litellm-redaction=false --litellm-redaction-ip-action=off; "
+                'echo "ON=[$PARAM_LITELLM_REDACTION_ENABLED] ACTION=[$PARAM_LITELLM_REDACTION_IP_ACTION]"',
+            )
+            self.assertIn("ON=[false] ACTION=[off]", out)
+
+    def test_the_ip_action_validator_names_the_flag_and_refuses_anything_else(self):
+        for value, ok in (("pseudonym", True), ("mask", True), ("off", True), ("hash", False), ("OFF", False)):
+            with self.subTest(value=value):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                     "source scripts/installer/installer_common.sh\n"
+                     f"parse_args --litellm-redaction-ip-action={value}; validate_litellm_redaction_ip_action"],
+                    capture_output=True, text=True, env=self._env({}), cwd=str(_REPO_ROOT),
+                )
+                if ok:
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                else:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn("--litellm-redaction-ip-action must be one of", proc.stdout + proc.stderr)
+
+    def test_an_empty_value_flag_is_refused_rather_than_replacing_the_recorded_one(self):
+        for flag, key in (
+            ("--litellm-redaction-ip-action", "LITELLM_REDACTION_IP_ACTION"),
+            ("--litellm-redaction-ip-allow-cidrs", "LITELLM_REDACTION_IP_ALLOW_CIDRS"),
+        ):
+            with self.subTest(flag=flag):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                     f'parse_args {flag}=; echo "PASSED"'],
+                    capture_output=True, text=True, env=self._env({key: "mask"}), cwd=str(_REPO_ROOT),
+                )
+                self.assertNotIn("PASSED", proc.stdout)
+                self.assertIn(f"{flag}= was given an empty value", proc.stdout + proc.stderr)
+                self.assertIn(f"set {key}= (empty) in install.env", proc.stdout + proc.stderr)
+
+    def test_a_typed_ip_action_is_marked_so_main_checks_it_with_redaction_off(self):
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             "source scripts/installer/installer_common.sh\n"
+             'parse_args --litellm-redaction-ip-action=hash; echo "PASSED=$PARAM_LITELLM_REDACTION_IP_ACTION_PASSED"\n'
+             "validate_litellm_redaction_ip_action"],
+            capture_output=True, text=True, env=self._env({}), cwd=str(_REPO_ROOT),
+        )
+        self.assertIn("PASSED=true", proc.stdout)
+        self.assertNotEqual(proc.returncode, 0)
+
+    def _bootstrap_over(self, tmp, recorded, script):
+        existing = pathlib.Path(tmp) / "install.env"
+        existing.write_text(recorded)
+        existing.chmod(0o600)
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             "source scripts/installer/installer_common.sh\n"
+             "resolve_shared_defaults\n"
+             "PARAM_DRY_RUN=false; PARAM_MEMORY=file\n"
+             f'{script}\nbootstrap_install_env_file "{existing}" some-tag'],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+            env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(existing), "PROJECT_ID": "p",
+                           "CLUSTER_NAME": "c", "REGION": "us-central1"}),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(existing.read_text(), recorded, "an existing install.env is never rewritten")
+        return proc.stdout + proc.stderr
+
+    def test_a_flag_over_a_file_that_does_not_record_it_warns_that_the_next_upgrade_reverts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "PROJECT_ID=p\n",
+                'PARAM_LITELLM_REDACTION_ENABLED=true; PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="10.0.0.0/8 fd00::/8"',
+            )
+        self.assertIn("--litellm-redaction=true applies to this run only", out)
+        self.assertIn("records no LITELLM_REDACTION_ENABLED", out)
+        self.assertIn("turns off redaction this run turned on", out)
+        self.assertIn("Set LITELLM_REDACTION_ENABLED=true in", out)
+        self.assertIn("Set LITELLM_REDACTION_IP_ALLOW_CIDRS=10.0.0.0/8\\ fd00::/8 in", out)
+
+    def test_a_run_that_agrees_with_the_file_is_silent(self):
+        # PARAM_* is seeded from the file, and a recorded yes reads as true.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "LITELLM_REDACTION_ENABLED=yes\nLITELLM_REDACTION_IP_ACTION=mask\n",
+                "PARAM_LITELLM_REDACTION_ENABLED=true; PARAM_LITELLM_REDACTION_IP_ACTION=mask",
+            )
+        self.assertNotIn("applies to this run only", out)
+
+    def test_main_validates_then_exports_before_the_generator_and_the_bootstrap(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        seed_line = 'local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"'
+        validate_line = "validate_litellm_redaction_ip_action || exit 1"
+        export_lines = (
+            'export LITELLM_REDACTION_ENABLED="$redaction_enabled"',
+            'export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"',
+            'export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"',
+        )
+        rules_line = 'hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1'
+        toggle_line = 'if ! is_bool_spelling "$redaction_enabled"; then'
+        gate_line = 'if is_truthy "$redaction_enabled" || [ "${PARAM_LITELLM_REDACTION_IP_ACTION_PASSED:-false}" = "true" ]; then'
+        for line in (seed_line, validate_line, rules_line, toggle_line, gate_line, *export_lines):
+            self.assertIn(line, text[main_start:], f"main() no longer carries: {line}")
+        # The early checks stop the run before the rest of the interview.
+        gitops_step = text.index('print_step "8. GitOps Infrastructure Repository Setup"', main_start)
+        for line in (toggle_line, gate_line, validate_line, rules_line):
+            self.assertLess(text.index(line, main_start), gitops_step, line)
+        seed = text.index(seed_line, main_start)
+        validated = text.index(validate_line, main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', main_start)
+        self.assertLess(seed, validated)
+        for line in export_lines:
+            exported = text.index(line, main_start)
+            self.assertLess(validated, exported)
+            self.assertLess(exported, generator)
+            self.assertLess(exported, bootstrap)
+
+
+class ScopedSaPoolPersistsThroughInstallEnvTest(unittest.TestCase):
+    """SCOPED_SA_POOL_ENABLED and SCOPED_SA_POOL_MAX_ACCOUNTS follow the gateway
+    redaction keys: a first install records what it exported, the next run
+    reads it back, a flag beats the file for one run and says so, and main()
+    refuses a misspelt switch before anything is written."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+    _bootstrap_over = LitellmRedactionPersistsThroughInstallEnvTest._bootstrap_over
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        for key in ("SCOPED_SA_POOL_ENABLED", "SCOPED_SA_POOL_MAX_ACCOUNTS"):
+            env.pop(key, None)
+        env.update(overrides)
+        return env
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(
+                tmp, "export SCOPED_SA_POOL_ENABLED=true SCOPED_SA_POOL_MAX_ACCOUNTS=250"
+            )
+            text = dest.read_text()
+            self.assertIn("SCOPED_SA_POOL_ENABLED=true\n", text)
+            self.assertIn("SCOPED_SA_POOL_MAX_ACCOUNTS=250\n", text)
+            out = self._read_back(
+                dest, 'echo "ON=[$PARAM_SCOPED_SA_POOL_ENABLED] MAX=[$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS]"'
+            )
+            self.assertIn("ON=[true] MAX=[250]", out)
+
+    def test_an_unset_value_is_recorded_as_the_default_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("SCOPED_SA_POOL_ENABLED=false\n", text)
+            self.assertIn("SCOPED_SA_POOL_MAX_ACCOUNTS=''\n", text)
+
+    def test_a_flag_over_a_file_that_does_not_record_it_warns_that_the_next_upgrade_reverts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "PROJECT_ID=p\n",
+                "PARAM_SCOPED_SA_POOL_ENABLED=true; PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS=250",
+            )
+        self.assertIn("--scoped-sa-pool-enabled=true applies to this run only", out)
+        self.assertIn("records no SCOPED_SA_POOL_ENABLED", out)
+        self.assertIn("Set SCOPED_SA_POOL_ENABLED=true in", out)
+        # The consequence is read per direction: a typed =true is undone by the
+        # next apply deleting the accounts, a typed =false by it recreating them.
+        self.assertIn("accounts this run deleted are recreated and the broker re-armed", out)
+        self.assertIn("--scoped-sa-pool-max-accounts=250 applies to this run only", out)
+        self.assertIn("Set SCOPED_SA_POOL_MAX_ACCOUNTS=250 in", out)
+
+    def test_a_run_that_agrees_with_the_file_is_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._bootstrap_over(
+                tmp, "SCOPED_SA_POOL_ENABLED=yes\nSCOPED_SA_POOL_MAX_ACCOUNTS=250\n",
+                "PARAM_SCOPED_SA_POOL_ENABLED=true; PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS=250",
+            )
+        self.assertNotIn("applies to this run only", out)
+
+    def test_main_validates_then_exports_before_the_generator_and_the_bootstrap(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        seed_line = 'local scoped_sa_pool_enabled="${PARAM_SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"'
+        toggle_line = 'if ! is_bool_spelling "$scoped_sa_pool_enabled"; then'
+        cap_line = 'require_scoped_sa_pool_max_accounts "$scoped_sa_pool_max_accounts" || exit 1'
+        export_lines = (
+            'export SCOPED_SA_POOL_ENABLED="$scoped_sa_pool_enabled"',
+            'export SCOPED_SA_POOL_MAX_ACCOUNTS="$scoped_sa_pool_max_accounts"',
+        )
+        for line in (seed_line, toggle_line, cap_line, *export_lines):
+            self.assertIn(line, text[main_start:], f"main() no longer carries: {line}")
+        gitops_step = text.index('print_step "8. GitOps Infrastructure Repository Setup"', main_start)
+        for line in (toggle_line, cap_line):
+            self.assertLess(text.index(line, main_start), gitops_step, line)
+        validated = text.index(cap_line, main_start)
+        generator = text.index('write_tfvars_from_state "$tfvars_file" "$image_tag"', main_start)
+        bootstrap = text.index('bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"', main_start)
+        self.assertLess(text.index(seed_line, main_start), validated)
+        for line in export_lines:
+            exported = text.index(line, main_start)
+            self.assertLess(validated, exported)
+            self.assertLess(exported, generator)
+            self.assertLess(exported, bootstrap)
+
+
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
     """Each front door clones the install sources before it has a checkout to
     read the URL from, so each carries the URL; this pins the three equal."""
@@ -5323,8 +5607,8 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
     `terraform.tfvars` and the cluster. So answering "None" at the chat menu
     destroys the Pub/Sub topic on this apply and the next run puts it back,
     because the file still says the integration is on. The only signal was
-    "Left your install configuration as you wrote it", which reads as
-    reassurance. This warns instead, naming each key and the line to paste.
+    "Kept your install configuration", which reads as reassurance. This
+    warns instead, naming each key and the line to paste.
     """
 
     def _warn(self, recorded, env_overrides, non_interactive=False):
@@ -5369,9 +5653,20 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         self.assertNotIn("does not record", proc.stdout + proc.stderr)
 
     def test_a_non_interactive_run_says_nothing(self):
-        """It typed nothing: its answers came from flags and this very file."""
+        """A non-interactive run answered no prompt, so this warning stays quiet.
+
+        The old premise, that such a run's answers "came from flags and this
+        very file", was the bug in #2541: a flag that disagrees with the file
+        is exactly the drift the next upgrade.sh reverts. The chat keys are no
+        longer this function's to report: a chat flag that disagrees with the
+        file is refused before the run gets here, and one whose key the file
+        lacks is recorded (ChatFlagsAgreeWithInstallEnvTest). What is left
+        silent is a non-chat key with a flag, MODEL_MAX_TOKENS here, which
+        still applies for one run unwarned on a non-interactive run: the
+        known gap the refusal has not been extended to.
+        """
         proc = self._warn(
-            "GOOGLE_CHAT_ENABLED=true\n", {"GOOGLE_CHAT_ENABLED": "false"},
+            "MODEL_MAX_TOKENS=4096\n", {"MODEL_MAX_TOKENS": "8192"},
             non_interactive=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -5524,8 +5819,10 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         source = _INSTALL_SH.read_text()
         body = source.split("warn_unrecorded_interview_answers() {")[1]
         # The key list itself, not the comment above it that names these two as
-        # the examples of what to leave out.
-        keys = body.split("for key in ")[1].split("; do")[0]
+        # the examples of what to leave out. The list is an array so that the
+        # cache priming and the loop read one copy of it, so this reads the
+        # array literal rather than the `for` line.
+        keys = body.split("local interview_keys=(")[1].split(")")[0]
         self.assertIn("MEMORY", keys, "sanity: the list was located")
         self.assertNotIn("ENABLE_GKE_BACKUP_PLAN", keys)
         self.assertNotIn("GVISOR_POOL_NAME", keys)
@@ -5546,6 +5843,835 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         early_return = source.split("bootstrap_install_env_file() {")[1]
         early_return = early_return.split("if [ \"$PARAM_DRY_RUN\"")[0]
         self.assertIn("warn_unrecorded_interview_answers", early_return)
+
+
+class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
+    """The chat flags against an install.env that already exists.
+
+    upgrade.sh renders the chat integrations from install.env alone and takes
+    none of these flags, so a flag that beat the file for one run was undone
+    by the next full upgrade: `--enable-slack` turned the relay on and the
+    next `upgrade.sh --upgrade-mode=full` turned it off again, with nothing
+    said (#2541). Now a flag that disagrees with the key the file assigns is
+    refused before anything is applied; one whose key the file does not assign
+    is appended with the value the run applies, once the run commits; one that
+    agrees changes nothing. Tokens are held to a key the file carries but are
+    never written: their home is the live Secret.
+    """
+
+    @staticmethod
+    def _env(overrides):
+        # A developer's own exports must not answer for the file.
+        return get_isolated_test_env(overrides=overrides, absent=(
+            "SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+            "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
+            "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
+            "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
+        ))
+
+    def _run(self, body, install_env, extra_env=None):
+        env = {"KUBE_AGENTS_INSTALL_ENV": str(install_env)}
+        env.update(extra_env or {})
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "source scripts/installer/installer_common.sh\n"
+            f"{body}\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=self._env(env), cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
+        )
+
+    def _file(self, tmp, content, name="install.env"):
+        path = pathlib.Path(tmp) / name
+        path.write_text(content)
+        path.chmod(0o600)
+        return path
+
+    _CHECK = 'rc=0; check_flags_against_install_env || rc=$?; echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+
+    # What a toggle recorded true brings with it when the file lacks the
+    # integration's settings and nothing in the test exported them.
+    _EMPTY_COMPANIONS = {
+        "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_MODE=''\n",
+    }
+
+    def _check(self, tmp, content, flags, extra_env=None):
+        path = self._file(tmp, content)
+        proc = self._run(f"parse_args {flags}; {self._CHECK}", path, extra_env)
+        return path, proc, proc.stdout + proc.stderr
+
+    # ── refusal ─────────────────────────────────────────────────────────────
+
+    def test_a_toggle_that_disagrees_with_the_file_is_refused_and_the_file_is_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, flag_shown, says in (
+                # The issue's case: the file install.sh itself wrote says false.
+                ("PROJECT_ID=p\nSLACK_ENABLED=false\n", "-y --enable-slack", "--enable-slack=true", "records SLACK_ENABLED=false"),
+                ("SLACK_ENABLED=true\n", "--enable-slack=false", "--enable-slack=false", "records SLACK_ENABLED=true"),
+                # A hand-written spelling is read the way the generator reads it.
+                ("SLACK_ENABLED=True\n", "--enable-slack=false", "--enable-slack=false", "records SLACK_ENABLED=True"),
+                # Set empty: the generator renders the default, false.
+                ("SLACK_ENABLED=\n", "--enable-slack", "--enable-slack=true", "records SLACK_ENABLED empty, which is false"),
+                ("GOOGLE_CHAT_ENABLED=false\n", "--enable-google-chat", "--enable-google-chat=true", "records GOOGLE_CHAT_ENABLED=false"),
+                ("GOOGLE_CHAT_ENABLED=true\n", "--google-chat=false", "--google-chat=false", "records GOOGLE_CHAT_ENABLED=true"),
+                # Non-interactive: refused, not applied for one run in silence.
+                ("GOOGLE_CHAT_ENABLED=true\n", "-y --enable-google-chat=false", "--enable-google-chat=false",
+                 "records GOOGLE_CHAT_ENABLED=true"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path, proc, out = self._check(tmp, content, flags)
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(f"{flag_shown} disagrees with the install configuration, so it would hold for this run only", out)
+                    self.assertIn(f"{path} {says}", out)
+                    self.assertIn("every upgrade.sh, renders from the file", out)
+                    # The menu edits the Google Chat toggle; it turns Slack on
+                    # without the tokens, so it is not offered for Slack.
+                    if "GOOGLE_CHAT" in content:
+                        self.assertIn("or change it with './install.sh --menu'", out)
+                    else:
+                        self.assertNotIn("--menu", out)
+                    if flag_shown == "--enable-slack=true":
+                        self.assertIn("passing --slack-bot-token and --slack-app-token", out)
+                    else:
+                        self.assertNotIn("passing --slack-bot-token", out)
+                    self.assertEqual(path.read_text(), content, "a refusal never touches the file")
+
+    def test_a_chat_string_that_disagrees_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, key, shown in (
+                # install.sh writes these empty on a first install, and the
+                # empty value is a value: it is what upgrade.sh renders.
+                ("SLACK_ALLOWED_USERS=''\n", "--slack-allowed-users=U1", "SLACK_ALLOWED_USERS", "--slack-allowed-users=U1"),
+                ("SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=", "SLACK_ALLOWED_USERS", "--slack-allowed-users=''"),
+                ("SLACK_HOME_CHANNEL=C1\n", "--slack-home-channel=C2", "SLACK_HOME_CHANNEL", "--slack-home-channel=C2"),
+                ("SLACK_HOME_CHANNEL_NAME=\\#a\n", "'--slack-home-channel-name=#b'", "SLACK_HOME_CHANNEL_NAME", "--slack-home-channel-name=\\#b"),
+                ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
+                ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
+                # A topic rename is a destroy and re-create of the Pub/Sub topic.
+                ("CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b", "CHAT_TOPIC_NAME", "--chat-topic-name=topic-b"),
+                ("GOOGLE_CHAT_MODE=default\n", "--google-chat-mode=debug", "GOOGLE_CHAT_MODE", "--google-chat-mode=debug"),
+                # The allowlists compare as lists: a different member is a disagreement.
+                ("ALLOWED_USERS=a@x.com,b@x.com\n", "--google-chat-allowed-users=a@x.com,c@x.com", "ALLOWED_USERS", "--google-chat-allowed-users=a@x.com\\,c@x.com"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path, proc, out = self._check(tmp, content, flags)
+                    self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+                    self.assertIn(f"{shown} disagrees with the install configuration", out)
+                    self.assertIn(f"{path} records {key}=", out)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_an_empty_topic_or_mode_is_refused_as_empty_not_as_the_default(self):
+        # Empty would become the default before the check, and the refusal
+        # would then name, and tell the operator to adopt, a topic nobody typed.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flag in (
+                ("CHAT_TOPIC_NAME=my-topic\n", "--chat-topic-name"),
+                ("GOOGLE_CHAT_MODE=debug\n", "--google-chat-mode"),
+                ("PROJECT_ID=p\n", "--chat-topic-name"),
+                ("PROJECT_ID=p\n", "--google-chat-mode"),
+            ):
+                with self.subTest(content=content, flag=flag):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args {flag}= && resolve_shared_defaults && {self._CHECK}", path)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn(f"{flag}= was given an empty value.", out)
+                    self.assertNotIn("platform-agent-chat-events", out)
+                    self.assertNotIn("disagrees with the install configuration", out)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_a_blank_topic_is_refused_as_empty_not_held_to_the_file_or_recorded(self):
+        # A wrapper expanding a variable set to a blank passes
+        # --chat-topic-name=" ". resolve_shared_defaults keeps it (":-" only
+        # replaces the empty string), so the refusal would tell the operator to
+        # adopt a blank topic, and over a file lacking the key the blank would
+        # be queued and appended (review r4214064223 on #2553).
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("CHAT_TOPIC_NAME=my-topic\n", "PROJECT_ID=p\n"):
+                for blank in ("' '", "$'\\t'"):
+                    with self.subTest(content=content, blank=blank):
+                        path = self._file(tmp, content)
+                        proc = self._run(
+                            f"parse_args --chat-topic-name={blank} && resolve_shared_defaults && {self._CHECK}", path,
+                        )
+                        out = proc.stdout + proc.stderr
+                        self.assertNotEqual(proc.returncode, 0, out)
+                        self.assertIn("--chat-topic-name= was given an empty value.", out)
+                        self.assertNotIn("disagrees with the install configuration", out)
+                        self.assertNotIn("QUEUED=", out)
+                        self.assertEqual(path.read_text(), content)
+
+    def test_the_menu_is_offered_only_for_keys_it_saves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, slack_users = self._check(tmp, "SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=U2")
+            _, _, chat_users = self._check(tmp, "ALLOWED_USERS=a\n", "--google-chat-allowed-users=b")
+            # Saved by the panel, but not something it lets you change.
+            _, _, topic = self._check(tmp, "CHAT_TOPIC_NAME=topic-a\n", "--chat-topic-name=topic-b")
+            _, _, slack_on = self._check(tmp, "SLACK_ENABLED=false\n", "--enable-slack")
+        self.assertNotIn("--menu", slack_users)
+        self.assertIn("or change it with './install.sh --menu'", chat_users)
+        self.assertNotIn("--menu", topic)
+        self.assertNotIn("--menu", slack_on)
+
+    def test_the_menu_keys_are_the_ones_run_menu_system_saves(self):
+        text = _INSTALL_SH.read_text()
+        menu = text[text.index("\nrun_menu_system() {"):text.index("\nrequire_slack_tokens_after_recovery() {")]
+        listed = re.search(r'^readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="([^"]+)"$', text, re.MULTILINE).group(1).split()
+        self.assertTrue(listed)
+        for key in listed:
+            with self.subTest(key=key):
+                self.assertIn(f"save_env_var {key} ", menu)
+        for key in ("SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_BOT_TOKEN"):
+            with self.subTest(not_saved=key):
+                self.assertNotIn(f"save_env_var {key} ", menu)
+                self.assertNotIn(key, listed)
+        # Saving a key is not editing it: each listed key is one the chat
+        # screen asks for or turns on and off.
+        screen = menu[menu.index('prompt_menu "Select Chat Integration:"'):]
+        screen = screen[:screen.index("\n        esac\n")]
+        edits = {
+            "GOOGLE_CHAT_ENABLED": 'google_chat_enabled="true"',
+            "ALLOWED_USERS": "allowed_users \"$allowed_users\"",
+            "GOOGLE_CHAT_HOME_CHANNEL": "google_chat_home_channel \"$google_chat_home_channel\"",
+        }
+        self.assertEqual(sorted(listed), sorted(edits))
+        for key, edit in edits.items():
+            with self.subTest(edited=key):
+                self.assertIn(edit, screen)
+        # Saved as loaded, never asked; and on without the tokens.
+        self.assertIn("save_env_var CHAT_TOPIC_NAME ", menu)
+        self.assertNotIn("chat_topic_name", screen)
+        self.assertIn('2) slack_enabled="true" ;;', screen)
+
+    def test_every_disagreement_is_named_before_the_run_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(
+                tmp,
+                "SLACK_ENABLED=false\nGOOGLE_CHAT_ENABLED=false\nSLACK_ALLOWED_USERS=U1\n",
+                "--enable-slack --enable-google-chat --slack-allowed-users=U2",
+            )
+        self.assertIn("rc=1", proc.stdout, out)
+        for key in ("SLACK_ENABLED=false", "GOOGLE_CHAT_ENABLED=false", "SLACK_ALLOWED_USERS=U1"):
+            self.assertIn(f"records {key}", out)
+
+    def test_a_token_that_disagrees_is_refused_without_printing_either_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(
+                tmp, "SLACK_BOT_TOKEN=xoxb-recorded\n", "--slack-bot-token=xoxb-typed",
+            )
+        self.assertIn("rc=1 QUEUED=[]", proc.stdout, out)
+        self.assertIn(f"--slack-bot-token gives a different SLACK_BOT_TOKEN from the one {path} records", out)
+        self.assertNotIn("xoxb-recorded", out)
+        self.assertNotIn("xoxb-typed", out)
+
+    def test_an_empty_token_flag_is_no_value_not_a_different_token(self):
+        # scripts/release/provision_environment.sh passes
+        # --slack-bot-token="${SLACK_BOT_TOKEN:-}", so an empty token flag is a
+        # wrapper's unset variable, not a new token. It is read the way an
+        # empty recorded token is: nothing to compare, and the generator
+        # recovers the credential from the live Secret.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag, key in (("--slack-bot-token", "SLACK_BOT_TOKEN"), ("--slack-app-token", "SLACK_APP_TOKEN")):
+                with self.subTest(flag=flag):
+                    content = f"PERSIST_SECRETS_ON_DISK=true\n{key}=xoxb-recorded\n"
+                    path, proc, out = self._check(tmp, content, f"{flag}=")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+                    self.assertNotIn("gives a different", out)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_a_chat_mode_outside_the_enum_is_refused_before_the_file_is_consulted(self):
+        # Refused at step 2 by the file check, the remedy would have the
+        # operator write GOOGLE_CHAT_MODE=verbose into install.env, which
+        # step 6 and variables.tf both refuse.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("GOOGLE_CHAT_MODE=default\n", "PROJECT_ID=p\n"):
+                with self.subTest(content=content):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args --google-chat-mode=verbose && {self._CHECK}", path)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn("--google-chat-mode must be either 'default' or 'debug'", out)
+                    self.assertNotIn("GOOGLE_CHAT_MODE=verbose", out)
+                    self.assertNotIn("QUEUED=", out)
+                    self.assertEqual(path.read_text(), content)
+            for mode in ("default", "debug"):
+                with self.subTest(mode=mode):
+                    path, proc, out = self._check(tmp, f"GOOGLE_CHAT_MODE={mode}\n", f"--google-chat-mode={mode}")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
+    # ── agreement ───────────────────────────────────────────────────────────
+
+    def test_a_flag_that_agrees_with_the_file_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags in (
+                ("SLACK_ENABLED=true\n", "--enable-slack"),
+                ("SLACK_ENABLED=True\n", "--enable-slack=true"),
+                ("export SLACK_ENABLED=yes\n", "--enable-slack"),
+                ("SLACK_ENABLED=false\n", "--enable-slack=false"),
+                ("SLACK_ENABLED=\n", "--enable-slack=false"),
+                ("GOOGLE_CHAT_ENABLED=true\n", "--enable-google-chat"),
+                ("GOOGLE_CHAT_ENABLED=false\n", "--google-chat=false"),
+                ("SLACK_ALLOWED_USERS='U1,U2'\n", "--slack-allowed-users=U1,U2"),
+                ("SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts\n", "'--slack-home-channel-name=#gke alerts'"),
+                ("SLACK_BOT_TOKEN=xoxb-1\n", "--slack-bot-token=xoxb-1"),
+                # The allowlists render through hcl_csv_list, so a different
+                # spelling of the same list is the same list.
+                ("ALLOWED_USERS='a@x.com,b@x.com'\n", "'--google-chat-allowed-users=a@x.com, b@x.com'"),
+                ("SLACK_ALLOWED_USERS='U1 U2'\n", "--slack-allowed-users=U1,U2"),
+                # The topic and the mode set empty render their defaults.
+                ("CHAT_TOPIC_NAME=\n", "--chat-topic-name=platform-agent-chat-events"),
+                ("GOOGLE_CHAT_MODE=\n", "--google-chat-mode=default"),
+                # An empty recorded token is recovered from the Secret, as a
+                # missing one is, so it is nothing to disagree with.
+                ("SLACK_APP_TOKEN=\n", "--slack-app-token=xapp-1"),
+            ):
+                with self.subTest(content=content, flags=flags):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args {flags}; {self._CHECK}; record_flags_into_install_env", path)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertEqual(path.read_text(), content)
+
+    def test_no_chat_flag_checks_nothing(self):
+        # A re-run that types no chat flag reads the file, as before.
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(tmp, "SLACK_ENABLED=false\n", "-y")
+        self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
+    def test_a_first_install_takes_every_flag(self):
+        # No install.env yet: bootstrap_install_env_file records what the run
+        # applies, so there is nothing to check and nothing to queue.
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = pathlib.Path(tmp) / "absent.install.env"
+            proc = self._run(
+                f'INSTALL_ENV_FILE="{absent}"; parse_args --enable-slack --slack-allowed-users=U1; {self._CHECK}',
+                self._file(tmp, ""),
+            )
+            self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+            self.assertFalse(absent.exists())
+
+    # ── recording a key the file lacks ──────────────────────────────────────
+
+    def test_a_missing_toggle_is_recorded_with_the_value_the_run_applies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, key, applied in (
+                ("PROJECT_ID=p\n# SLACK_ENABLED=false\n", "-y --enable-slack", "SLACK_ENABLED", "true"),
+                ("PROJECT_ID=p", "--enable-slack", "SLACK_ENABLED", "true"),  # no trailing newline
+                ("PROJECT_ID=p\n", "--enable-google-chat", "GOOGLE_CHAT_ENABLED", "true"),
+                ("PROJECT_ID=p\n", "--enable-slack=false", "SLACK_ENABLED", "false"),
+                # An interactive run that typed --enable-slack and then chose
+                # "None" at the chat menu applies false, and false is recorded.
+                ("PROJECT_ID=p\n", "--enable-slack", "SLACK_ENABLED", "false"),
+            ):
+                with self.subTest(content=content, flags=flags, applied=applied):
+                    path = self._file(tmp, content)
+                    checked = self._run(f"parse_args {flags}; {self._CHECK}", path)
+                    self.assertIn(f"rc=0 QUEUED=[{key}]", checked.stdout, checked.stdout + checked.stderr)
+                    self.assertEqual(path.read_text(), content, "the check alone writes nothing")
+                    # main exports what the run applies before either record site.
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {key}={applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn(f"Recorded {key}={applied} in {path}, which assigned no {key}", out)
+                    expected = content if content.endswith("\n") else content + "\n"
+                    companions = self._EMPTY_COMPANIONS[key] if applied == "true" else ""
+                    self.assertEqual(path.read_text(), expected + companions + f"{key}={applied}\n")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                    param = "PARAM_ENABLE_SLACK" if key == "SLACK_ENABLED" else "PARAM_ENABLE_GOOGLE_CHAT"
+                    again = self._run(f'echo "SEED=[${param}]"', path)
+                    self.assertIn(f"SEED=[{applied}]", again.stdout, again.stderr)
+
+    def test_a_missing_chat_string_is_recorded_and_reads_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag, key, value in (
+                ("--slack-allowed-users", "SLACK_ALLOWED_USERS", "U1,U2"),
+                ("--slack-home-channel", "SLACK_HOME_CHANNEL", "C0123"),
+                ("--slack-home-channel-name", "SLACK_HOME_CHANNEL_NAME", "#gke alerts"),
+                ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
+                ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
+                ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
+                ("--google-chat-mode", "GOOGLE_CHAT_MODE", "debug"),
+            ):
+                with self.subTest(key=key):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    quoted = shlex.quote(f"{flag}={value}")
+                    # Checked again in the same shell after the record: the
+                    # recorded-value cache must not still say the key is absent.
+                    proc = self._run(
+                        f"parse_args {quoted}; {self._CHECK}; export {key}={shlex.quote(value)}; record_flags_into_install_env; "
+                        f"{self._CHECK}",
+                        path,
+                    )
+                    self.assertIn(f"rc=0 QUEUED=[{key}]", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stdout + proc.stderr)
+                    again = self._run(f'printf "V=[%s]\\n" "${key}"', path)
+                    self.assertIn(f"V=[{value}]", again.stdout, again.stderr)
+                    # And a re-run repeating the flag now agrees.
+                    rerun = self._run(f"parse_args {quoted}; {self._CHECK}", path)
+                    self.assertIn("rc=0 QUEUED=[]", rerun.stdout, rerun.stdout + rerun.stderr)
+
+    def test_a_token_the_file_lacks_is_never_recorded(self):
+        # The live Secret is the token's home; write_tfvars_from_state
+        # recovers it on every later run. With PERSIST_SECRETS_ON_DISK=false
+        # nothing may write it to a file, and with it true there is no need.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("PROJECT_ID=p\n", "PROJECT_ID=p\nPERSIST_SECRETS_ON_DISK=false\n"):
+                with self.subTest(content=content):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        "parse_args --enable-slack=true --slack-bot-token=xoxb-typed --slack-app-token=xapp-typed; "
+                        f"{self._CHECK}; export SLACK_ENABLED=true SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed; "
+                        "record_flags_into_install_env",
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, out)
+                    self.assertEqual(
+                        path.read_text(), content + self._EMPTY_COMPANIONS["SLACK_ENABLED"] + "SLACK_ENABLED=true\n",
+                    )
+                    self.assertNotIn("xoxb-typed", path.read_text())
+                    self.assertNotIn("xapp-typed", out)
+
+    def test_a_toggle_recorded_true_brings_the_integration_settings_the_file_lacks(self):
+        # The allowlist typed at the prompt (or exported) is what the run
+        # applied; recorded beside the toggle, the next upgrade renders it
+        # rather than an empty list, which admits everyone.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, applied, expected_lines, absent in (
+                (
+                    "--enable-slack",
+                    "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2 SLACK_HOME_CHANNEL=C1 "
+                    "SLACK_HOME_CHANNEL_NAME='#gke alerts' SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed",
+                    ["SLACK_ALLOWED_USERS=U1\\,U2", "SLACK_HOME_CHANNEL=C1",
+                     "SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts", "SLACK_ENABLED=true"],
+                    ("xoxb-typed", "xapp-typed"),
+                ),
+                (
+                    "--enable-google-chat",
+                    "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
+                    "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
+                    ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
+                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
+                    ("CHAT_SUB_NAME",),
+                ),
+            ):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(path.read_text(), "PROJECT_ID=p\n" + "".join(f"{line}\n" for line in expected_lines), out)
+                    # Neither the tokens nor the state-owned subscription name.
+                    for text in absent:
+                        self.assertNotIn(text, path.read_text())
+                    self.assertNotIn("xoxb-typed", out)
+
+    def test_a_companion_the_file_sets_is_left_and_a_false_toggle_brings_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, flags, applied, appended in (
+                # The file's own allowlist stays as written; only the missing keys come.
+                ("SLACK_ALLOWED_USERS=U0\n", "--enable-slack", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U0 SLACK_HOME_CHANNEL=C1",
+                 "SLACK_HOME_CHANNEL=C1\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ENABLED=true\n"),
+                # A companion typed as a flag is recorded once, not twice.
+                ("PROJECT_ID=p\n", "--enable-slack --slack-allowed-users=U9", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U9",
+                 "SLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ALLOWED_USERS=U9\nSLACK_ENABLED=true\n"),
+                # Off renders nothing of the integration, so nothing beside it is pinned.
+                ("PROJECT_ID=p\n", "--enable-slack=false", "SLACK_ENABLED=false SLACK_ALLOWED_USERS=U1", "SLACK_ENABLED=false\n"),
+                ("PROJECT_ID=p\n", "--enable-google-chat", "GOOGLE_CHAT_ENABLED=false ALLOWED_USERS=a", "GOOGLE_CHAT_ENABLED=false\n"),
+            ):
+                with self.subTest(content=content, flags=flags, applied=applied):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    self.assertEqual(path.read_text(), content + appended, proc.stdout + proc.stderr)
+
+    def test_the_toggle_is_the_last_line_the_record_appends(self):
+        # A record that stops partway (Ctrl-C before the apply, a full disk)
+        # leaves the settings without the toggle, which the next full run
+        # renders off, never the toggle without its allowlist, which renders
+        # on and admits everyone. And no re-run repairs the second: the flag
+        # then agrees with the file, so nothing is queued.
+        applied = "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1 GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com"
+        toggles = {"SLACK_ENABLED=true", "GOOGLE_CHAT_ENABLED=true"}
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags in ("--enable-slack", "--enable-google-chat", "--enable-slack --enable-google-chat",
+                          "--slack-home-channel=C1 --enable-slack --slack-allowed-users=U1"):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; {self._CHECK}; export {applied}; record_flags_into_install_env",
+                        path,
+                    )
+                    appended = path.read_text().splitlines()[1:]
+                    typed = sum(1 for toggle in ("--enable-slack", "--enable-google-chat") if toggle in flags)
+                    self.assertGreater(len(appended), typed, proc.stdout + proc.stderr)
+                    self.assertEqual(set(appended[-typed:]), toggles & set(appended), appended)
+                    self.assertFalse(toggles & set(appended[:-typed]), appended)
+            # The interrupted write itself: the first append lands, the second dies.
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            self._run(
+                f"parse_args --enable-slack; {self._CHECK}; export {applied}; "
+                "_writes=0; write_env_var() { _writes=$((_writes + 1)); [ \"$_writes\" -lt 2 ] || exit 130; "
+                "printf '%s=%q\\n' \"$2\" \"$3\" >> \"$1\"; }; record_flags_into_install_env",
+                path,
+            )
+            self.assertEqual(path.read_text(), "PROJECT_ID=p\nSLACK_ALLOWED_USERS=U1\n")
+
+    def test_upgrade_keeps_the_allowlist_given_at_the_prompt_after_a_recorded_enable_slack(self):
+        # The bot's walk: a hand-written file with section 3 commented out,
+        # --enable-slack, the allowlist typed at the prompt, then upgrade.sh.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "# SLACK_ENABLED=false\n# SLACK_ALLOWED_USERS=\n")
+            proc = self._run(
+                f"parse_args --enable-slack; {self._CHECK}; "
+                "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2; record_flags_into_install_env",
+                path,
+            )
+            self.assertIn("Recorded SLACK_ALLOWED_USERS=U1\\,U2", proc.stdout + proc.stderr)
+            after, _ = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", after)
+            self.assertIn('slack_allowed_users     = ["U1", "U2"]', after)
+
+    def test_a_dry_run_says_what_it_would_record_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(tmp, "PROJECT_ID=p\n", "--dry-run --enable-slack")
+            self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, out)
+            self.assertIn("a run without --dry-run records the SLACK_ENABLED it applies there, from --enable-slack", out)
+            self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
+    def test_a_file_the_run_cannot_write_is_refused_before_anything_when_a_key_would_be_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            path.chmod(0o400)
+            try:
+                proc = self._run(f"parse_args --enable-slack; {self._CHECK}", path)
+            finally:
+                path.chmod(0o600)
+            out = proc.stdout + proc.stderr
+            self.assertIn("rc=1", proc.stdout, out)
+            self.assertIn(f"{path} assigns no SLACK_ENABLED, which this run would record there, and it is not writable", out)
+
+    def test_a_read_only_file_that_agrees_is_accepted(self):
+        # Nothing to record, nothing to write, so -w is never asked; this half
+        # holds under root too.
+        with tempfile.TemporaryDirectory() as tmp:
+            agreeing = self._file(tmp, "SLACK_ENABLED=true\n", name="agreeing.env")
+            agreeing.chmod(0o400)
+            ok = self._run(f"parse_args --enable-slack; {self._CHECK}", agreeing)
+            self.assertIn("rc=0 QUEUED=[]", ok.stdout, ok.stdout + ok.stderr)
+
+    def test_the_subscription_name_flag_is_not_held(self):
+        # On a running install the generator takes the subscription name from
+        # Terraform state, ahead of both the flag and the file.
+        with tempfile.TemporaryDirectory() as tmp:
+            path, proc, out = self._check(tmp, "CHAT_SUB_NAME=sub-a\n", "--chat-sub-name=sub-b")
+        self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
+    def test_the_menu_refuses_a_chat_flag_it_would_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flag in ("--enable-slack", "--enable-google-chat=false", "--slack-allowed-users=U1", "--chat-topic-name=t"):
+                with self.subTest(flag=flag):
+                    proc = self._run(
+                        f'run_menu_system() {{ echo "MENU RAN"; }}; print_banner() {{ :; }}; main --menu {flag}',
+                        self._file(tmp, "SLACK_ENABLED=false\n"),
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertNotIn("MENU RAN", out)
+                    self.assertIn("--menu takes no chat flag", out)
+                    self.assertIn("turns Google Chat on or off and edits its allowlist and home channel", out)
+                    self.assertNotEqual(proc.returncode, 0)
+
+    # ── where main checks and records ───────────────────────────────────────
+
+    # main's step-11 confirmation, run as it stands with the prompt and the
+    # container preflight stubbed, then the record.
+    _CONFIRM_START = '  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then\n    local confirm_choice=""\n'
+    _CONFIRM_END = "\n    esac\n  fi\n"
+    _RECORD_HANDOFF = "\n    record_flags_into_install_env\n"
+    _RECORD_APPLY = "\n  record_flags_into_install_env\n"
+    _WARN_PAUSE = '\n        warn_install_env_keys_not_recorded\n        print_warning "Provisioning paused by user.'
+
+    def test_a_declined_or_refused_run_leaves_the_file_and_a_committed_one_records(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        start = text.index(self._CONFIRM_START, main_start)
+        block = text[start:text.index(self._CONFIRM_END, start) + len(self._CONFIRM_END)]
+        self.assertIn("Provisioning paused by user", block)
+        self.assertLess(len(block.splitlines()), 40, block)
+        stubs = (
+            'prompt_read() { printf -v "$2" "%s" "$ANSWER"; }\n'
+            'check_scope_container_access() { [ "${1:-}" = "warn" ] || return "${SCOPE_RC:-0}"; }\n'
+            "write_json_report() { :; }\n"
+            f"_confirm() {{\n{block}  record_flags_into_install_env\n}}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, answer, scope_rc, records, goes_on in (
+                # `n` is a decline as often as a hand-off: it records nothing,
+                # and names the lines a hand-run apply needs instead.
+                ("--enable-slack", "n", 0, False, False),
+                ("--enable-slack", "y", 1, False, False),  # refused after the confirmation
+                ("--enable-slack", "y", 0, True, True),
+                ("--enable-slack", "g", 0, True, True),
+                ("--enable-slack -y", "", 1, True, True),  # -y is refused above the summary, not here
+                ("--enable-slack --generate-only", "", 0, True, True),
+            ):
+                with self.subTest(flags=flags, answer=answer, scope_rc=scope_rc):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"{stubs}parse_args {flags}; check_flags_against_install_env || exit 1\n"
+                        "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1 SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed\n"
+                        f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    if goes_on:
+                        self.assertIn("went on", proc.stdout, out)
+                    else:
+                        self.assertNotIn("went on", proc.stdout, out)
+                    if records:
+                        self.assertEqual(
+                            path.read_text(),
+                            "PROJECT_ID=p\nSLACK_ALLOWED_USERS=U1\nSLACK_HOME_CHANNEL=''\n"
+                            "SLACK_HOME_CHANNEL_NAME=''\nSLACK_ENABLED=true\n",
+                            out,
+                        )
+                    else:
+                        self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+                    if answer == "n":
+                        self.assertEqual(proc.returncode, 0, out)
+                        self.assertNotIn("Recorded ", out)
+                        warning = out.index(
+                            f"{path} assigns no SLACK_ALLOWED_USERS, SLACK_HOME_CHANNEL, SLACK_HOME_CHANNEL_NAME, "
+                            "SLACK_ENABLED, and pausing here did not record them: a run abandoned at this prompt "
+                            "leaves the file as it was."
+                        )
+                        self.assertIn(
+                            "If you go on to run lifecycle.sh apply by hand, first add these lines to "
+                            f"{path}, so a later upgrade.sh renders what you applied:\n"
+                            "    SLACK_ALLOWED_USERS=U1\n    SLACK_HOME_CHANNEL=''\n"
+                            "    SLACK_HOME_CHANNEL_NAME=''\n    SLACK_ENABLED=true\n",
+                            out,
+                        )
+                        self.assertLess(warning, out.index("Provisioning paused by user"))
+                        # The file is as it was, so nothing says it was saved.
+                        self.assertNotIn("saved", out)
+                        for token in ("xoxb-typed", "xapp-typed", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
+                            self.assertNotIn(token, out)
+                    else:
+                        self.assertNotIn("pausing here did not record", out)
+                    if records:
+                        # `g` and --generate-only apply nothing, so the line
+                        # does not say the run applied.
+                        self.assertIn(
+                            f"Recorded SLACK_ENABLED=true in {path}, which assigned no SLACK_ENABLED, "
+                            "so later runs and upgrade.sh render it.",
+                            out,
+                        )
+                        self.assertNotIn("applied", out)
+
+    def test_the_step_10_line_says_what_the_run_will_record(self):
+        # Step 10 runs before the confirmation, so the file has not changed
+        # yet; it is not "as you wrote it" by the end of a run that records.
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, says_record in (
+                ("", False),
+                ("--enable-slack", True),
+                ("--enable-slack --dry-run", False),  # a dry run records nothing
+            ):
+                with self.subTest(flags=flags):
+                    path = self._file(tmp, "PROJECT_ID=p\n")
+                    proc = self._run(
+                        f"parse_args {flags}; check_flags_against_install_env || exit 1\n"
+                        "PARAM_NON_INTERACTIVE=true\n"
+                        f'bootstrap_install_env_file "{path}" ""',
+                        path,
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 0, out)
+                    self.assertIn(f"Kept your install configuration: {path}", out)
+                    self.assertNotIn("as you wrote it", out)
+                    line = (
+                        f"{path} assigns no SLACK_ENABLED: the values this run applies to them are "
+                        "recorded there if it goes on to the apply or the handoff."
+                    )
+                    if says_record:
+                        self.assertIn(line, out)
+                    else:
+                        self.assertNotIn("are recorded there", out)
+                    self.assertEqual(path.read_text(), "PROJECT_ID=p\n")
+
+    def test_main_checks_before_the_interview_and_records_last_on_each_route(self):
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        check = text.index("\n  check_flags_against_install_env || exit 1\n", main_start)
+        # After the helpers that define is_truthy and the defaults, before the
+        # first interview step and the chat step.
+        self.assertLess(text.index("\n  resolve_shared_defaults\n", main_start), check)
+        self.assertLess(check, text.index('print_step "3. Verifying Google Cloud Authentication"', main_start))
+        self.assertLess(check, text.index('print_step "6. Chat & Messaging Integrations Setup"', main_start))
+        self.assertEqual(text.count(self._RECORD_HANDOFF), 1)
+        self.assertEqual(text.count(self._RECORD_APPLY), 1)
+        handoff = text.index(self._RECORD_HANDOFF, main_start)
+        apply_ = text.index(self._RECORD_APPLY, main_start)
+        exported = text.index('export SLACK_ENABLED="$slack_enabled"', main_start)
+        for gate in (
+            'export GOOGLE_CHAT_ENABLED="$google_chat_enabled"',
+            "require_slack_tokens_after_recovery\n",
+            "check_service_account_ownership || exit 1",
+            'write_json_report "DRY_RUN_SUCCESS"',
+            'write_json_report "PAUSED"',
+            "check_scope_container_access || exit 1",
+            'check_github_org_is_organization "${GITOPS_ORG:-}"',
+        ):
+            for record in (handoff, apply_):
+                with self.subTest(gate=gate, record=record):
+                    self.assertLess(text.index(gate, main_start), record)
+        self.assertLess(exported, handoff)
+        # The step-11 pause records nothing (it is also a decline) and names
+        # the keys instead, from the values the run exported, before it says
+        # it paused.
+        self.assertEqual(text.count(self._WARN_PAUSE), 1)
+        pause = text.index(self._WARN_PAUSE, main_start)
+        self.assertLess(exported, pause)
+        self.assertLess(text.index("require_slack_tokens_after_recovery\n", main_start), pause)
+        paused = text.index('write_json_report "PAUSED"', main_start)
+        self.assertLess(pause, paused)
+        arm = text[text.rindex("\n      *)\n", 0, pause):paused]
+        self.assertNotIn("record_flags_into_install_env", arm)
+        self.assertTrue(
+            text[handoff + len(self._RECORD_HANDOFF):].startswith('    print_generate_only_handoff "$repo_dir"'),
+            text[handoff:handoff + 200],
+        )
+        step_12 = text.index('print_step "12. Applying the Install', main_start)
+        for gate in (
+            'import_github_pem "$project_id" "$region" || exit 1',
+            'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
+            'apply_crd_upgrades "$repo_dir"',
+        ):
+            with self.subTest(apply_gate=gate):
+                self.assertLess(step_12, text.index(gate, step_12))
+                self.assertLess(text.index(gate, step_12), apply_)
+        self.assertTrue(
+            text[apply_ + len(self._RECORD_APPLY):].startswith('  run_lifecycle_apply "$repo_dir" "$provisioning_log"'),
+            text[apply_:apply_ + 200],
+        )
+
+    def test_the_no_chat_banner_names_the_keys_not_only_the_flags(self):
+        # The file a first install writes records both toggles as false, so
+        # the flags alone would be refused on the next run.
+        text = _INSTALL_SH.read_text()
+        body = text[text.index("_prompt_no_chat_enabled() {"):]
+        body = body[:body.index("\n  }\n")]
+        echoes = [line for line in body.splitlines() if line.lstrip().startswith("echo ")]
+
+        def the_line(marker):
+            found = [line for line in echoes if marker in line]
+            self.assertEqual(len(found), 1, (marker, found))
+            return found[0]
+
+        # Each toggle on its own line, with its allowlist beside it: the file
+        # records both allowlists empty, and an empty one admits everyone.
+        google_chat = the_line("Google Chat: ")
+        slack = the_line("Slack: ")
+        self.assertIn("GOOGLE_CHAT_ENABLED=true", google_chat)
+        self.assertRegex(google_chat, r"[^_]ALLOWED_USERS=")
+        self.assertIn("SLACK_ENABLED=true", slack)
+        self.assertIn("SLACK_ALLOWED_USERS=", slack)
+        # The tokens are never written to the file, so Slack names the flags.
+        self.assertIn("--slack-bot-token", slack)
+        self.assertIn("--slack-app-token", slack)
+        # The Day-2 menu configures Google Chat only.
+        self.assertIn("./install.sh --menu", google_chat)
+        self.assertNotIn("--menu", slack)
+        self.assertIn("An allowlist left empty admits every user.", the_line("admits every user"))
+
+    # ── what upgrade.sh renders afterwards ──────────────────────────────────
+
+    def _upgrade_render(self, install_env, extra_env=None):
+        """upgrade.sh's half: load_install_env, then write_tfvars_from_state,
+        through test_installer_common's hermetic harness, with a live Secret
+        holding both Slack tokens on this install's own kube context."""
+        bot_b64 = base64.b64encode(b"xoxb-live").decode()
+        app_b64 = base64.b64encode(b"xapp-live").decode()
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        dest = install_env.parent / "terraform.tfvars"
+        env = {"API_SERVER_KEY": "k", "SLACK_ENABLED": "", "SLACK_BOT_TOKEN": "", "SLACK_APP_TOKEN": "",
+               "PERSIST_SECRETS_ON_DISK": ""}
+        env.update(extra_env or {})
+        proc = _installer_common_tests.InstallerCommonTest._run(
+            self,
+            f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; '
+            'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
+            env=env,
+            kubectl_script=kubectl_stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+        return dest.read_text(), proc.stdout
+
+    _COORDINATES = "PROJECT_ID=test-project\nCLUSTER_NAME=test-cluster\nREGION=us-central1\n"
+
+    def test_upgrade_keeps_slack_on_after_a_recorded_enable_slack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES)
+            before, _ = self._upgrade_render(path)
+            # The bug, at the render: a file that does not record Slack renders it off.
+            self.assertIn("enable_slack            = false", before)
+            proc = self._run(
+                f"parse_args -y --enable-slack; {self._CHECK}; export SLACK_ENABLED=true; record_flags_into_install_env",
+                path,
+            )
+            self.assertIn("rc=0 QUEUED=[SLACK_ENABLED]", proc.stdout, proc.stdout + proc.stderr)
+            after, _ = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", after)
+            # The tokens were never written to the file; the generator recovers
+            # them from the live Secret.
+            self.assertNotIn("xoxb-live", path.read_text())
+            self.assertIn('slack_bot_token         = "xoxb-live"', after)
+            self.assertIn('slack_app_token         = "xapp-live"', after)
+
+    def test_upgrade_recovers_the_slack_tokens_from_the_live_secret(self):
+        """Already true on main, and pinned here because #2541 doubted it.
+
+        install.env records Slack on and carries no token (the --enable-slack
+        run never wrote one, and PERSIST_SECRETS_ON_DISK=true still writes
+        tokens only on a first install). write_tfvars_from_state's recovery
+        loop, the one that recovers API_SERVER_KEY and SESSION_KV_*, lists
+        SLACK_BOT_TOKEN and SLACK_APP_TOKEN too.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\n")
+            tfvars, stdout = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", tfvars)
+            self.assertIn('slack_bot_token         = "xoxb-live"', tfvars)
+            self.assertIn('slack_app_token         = "xapp-live"', tfvars)
+            self.assertIn("TFVAR_BOT=[xoxb-live]", stdout)
+
+    def test_with_persist_secrets_off_the_recovered_tokens_stay_off_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "PERSIST_SECRETS_ON_DISK=false\nSLACK_ENABLED=true\n")
+            tfvars, stdout = self._upgrade_render(path)
+            self.assertIn("enable_slack            = true", tfvars)
+            self.assertNotIn("xoxb-live", tfvars)
+            self.assertNotIn("xapp-live", tfvars)
+            self.assertNotIn("slack_bot_token", tfvars)
+            self.assertIn("TFVAR_BOT=[xoxb-live]", stdout)
+            self.assertNotIn("xoxb-live", path.read_text())
 
 
 class TfvarsTempFileIsCleanedUpTest(unittest.TestCase):
@@ -6144,6 +7270,94 @@ echo "RC=$rc"
         self.assertNotIn('print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."', source)
 
 
+class DryRunClearsStaleImportOverridesTest(unittest.TestCase):
+    """The dry run's bare `terraform validate` and `terraform plan` read the
+    composition directly, in the checkout acquire_source_repo reuses from run
+    to run, so a lifecycle.sh import killed by a signal its EXIT trap cannot see
+    would otherwise hand them the two override files it writes around an
+    import. install.sh clears them first, through lifecycle.sh's own
+    drop_override, so the file names have one home."""
+
+    # What lifecycle.sh writes around an import and removes afterwards: the helm
+    # provider placeholder beside the composition, and the scope resolver pin
+    # inside that module's directory.
+    _PROVIDER_OVERRIDE = "providers_lifecycle_override.tf"
+    _SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
+    _SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp_path / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _scratch_composition(self):
+        """A copy of lifecycle.sh in a tree shaped like the checkout's, so the
+        stale files are planted in a scratch module directory and never in the
+        checkout's."""
+        full_install = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        comp = self._tmp_path / "terraform" / "examples" / "full-install"
+        comp.mkdir(parents=True)
+        shutil.copy(full_install / "lifecycle.sh", comp / "lifecycle.sh")
+        shutil.copy(_REPO_ROOT / "install.defaults.env", self._tmp_path / "install.defaults.env")
+        helpers = self._tmp_path / "scripts" / "installer"
+        helpers.mkdir(parents=True)
+        shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+        match = self._SCOPE_RESOLVER_SOURCE_RE.search((full_install / "main.tf").read_text())
+        assert match, "main.tf no longer sources a scope_resolver module"
+        module_dir = (comp / match.group(1)).resolve()
+        module_dir.mkdir(parents=True)
+        return comp, comp / self._PROVIDER_OVERRIDE, module_dir / self._SCOPE_OVERRIDE
+
+    def _run_in(self, comp, body):
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+cd "{comp}"
+{body}
+"""
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides), cwd=comp)
+
+    def test_the_function_removes_both_stale_overrides_and_leaves_the_caller_as_it_was(self):
+        comp, provider_override, scope_override = self._scratch_composition()
+        provider_override.write_text('provider "helm" {}\n')
+        scope_override.write_text('output "members" { value = {} }\n')
+
+        proc = self._run_in(comp, 'drop_stale_import_overrides; echo "pwd=$(pwd)"; echo "unset=${NOT_SET_ANYWHERE:-still-lenient}"')
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(provider_override.exists(), "the provider override survived")
+        self.assertFalse(scope_override.exists(), "the scope override survived")
+        # The engine's `cd` and `set -u` stayed inside the subshell.
+        self.assertIn(f"pwd={comp}", proc.stdout)
+        self.assertIn("unset=still-lenient", proc.stdout)
+
+    def test_the_function_is_quiet_with_nothing_to_remove(self):
+        comp, provider_override, scope_override = self._scratch_composition()
+        captured = self._tmp_path / "function-stderr.txt"
+        proc = self._run_in(comp, f'drop_stale_import_overrides 2>"{captured}"; echo "rc=$?"')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertEqual(captured.read_text(), "")
+
+    def test_the_dry_run_clears_them_before_its_validate_and_its_plan_and_names_neither_file(self):
+        text = _INSTALL_SH.read_text()
+        dry_run = text.index('if [ "$PARAM_DRY_RUN" = "true" ]; then\n    # A real resource preview')
+        cd_into = text.index('cd "$(tf_compose_dir "$repo_dir")"', dry_run)
+        drop = text.index("drop_stale_import_overrides\n", dry_run)
+        validate = text.index('run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config', dry_run)
+        plan = text.index("terraform plan -input=false -lock=false", dry_run)
+        self.assertLess(dry_run, cd_into)
+        self.assertLess(cd_into, drop)
+        self.assertLess(drop, validate)
+        self.assertLess(validate, plan)
+        # One home for the names: a rename in lifecycle.sh reaches the dry run
+        # through drop_override, not through a second copy here.
+        self.assertNotIn(self._PROVIDER_OVERRIDE, text)
+        self.assertNotIn(self._SCOPE_OVERRIDE, text)
+
+
 class ChatSubscriptionDerivationTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -6449,6 +7663,24 @@ echo "$rc" > "{rc_file}"
         self.assertIn("the wrapped output", log_file.read_text())
 
 
+def _env_without_ambient_drift_keys(overrides=None, asked_for=None):
+    """get_isolated_test_env, minus the two keys the drift guards read.
+
+    get_isolated_test_env starts from os.environ, so anything exported in the
+    shell that runs pytest reaches the script under test. For most keys that
+    is harmless. These two are the guards' own inputs: an exported
+    ENABLE_DRIFT_DETECTOR arrives at parse_args indistinguishable from an
+    operator's choice, and every assertion below about the unset default then
+    turns on whose machine is running. Dropped unless the caller asked for
+    them, in which case the caller's value is the point of the test.
+    """
+    env = get_isolated_test_env(overrides=overrides)
+    for key in ("ENABLE_DRIFT_DETECTOR", "TF_VAR_enable_drift_pubsub"):
+        if key not in (asked_for or {}):
+            env.pop(key, None)
+    return env
+
+
 class DomainScopedFlagsTest(unittest.TestCase):
     """The CLI surface issue #1540 defines.
 
@@ -6465,6 +7697,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
         installer_common.sh is sourced too, in the order main() does it:
         source_provisioning_helpers runs at step 2, so every function reached
         below has is_truthy and the DEFAULT_* set by the time it runs.
+
+        stdin is /dev/null for the reason _run_installer_bash gives, applied
+        ahead of the need: the reader executes install.env, so a line of it
+        that reads standard input would block a developer running this module
+        from a shell while CI, whose fd 0 is already closed, stayed green. No
+        QUOTING_SPELLINGS row does -- the two ending in `cat` are pipelines,
+        where `cat` reads the pipe and gets EOF when the assignment exits --
+        but a row that did would hang forty evaluations deep with nothing on
+        screen.
         """
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
@@ -6480,7 +7721,8 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 ["bash", "-c", script],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(overrides=overrides),
+                stdin=subprocess.DEVNULL,
+                env=_env_without_ambient_drift_keys(overrides, env),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -6526,8 +7768,10 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
         "--scope-shared-vpc-hosts": ("PARAM_SCOPE_SHARED_VPC_HOSTS", "shared-net-host"),
         "--scope-metrics-scopes": ("PARAM_SCOPE_METRICS_SCOPES", "observability-hub"),
+        "--scope-max-projects": ("PARAM_SCOPE_MAX_PROJECTS", "250"),
         "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
         "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
+        "--scoped-sa-pool-max-accounts": ("PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS", "50"),
     }
 
     def test_each_value_flag_reaches_its_variable(self):
@@ -6543,6 +7787,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
         "--enable-google-chat": "PARAM_ENABLE_GOOGLE_CHAT",
         "--enable-slack": "PARAM_ENABLE_SLACK",
     }
@@ -6779,6 +8024,1138 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertIn("applies to this run only", combined)
             self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+
+    def test_the_drift_detector_flag_says_so_when_it_beats_a_recorded_value(self):
+        """Reversing this one destroys the audit-log ingress and its backlog.
+
+        ENABLE_DRIFT_DETECTOR is the one key write_tfvars_from_state writes two
+        tfvars keys from, and the only boolean it omits rather than writing
+        false. A later run without it therefore writes neither key,
+        enable_drift_pubsub falls back to its default, and the apply destroys
+        the sink, topic and subscription along with whatever the subscription
+        was still retaining. install.sh applies with -auto-approve, so that
+        plan is never put in front of anyone.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=false\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("ENABLE_DRIFT_DETECTOR=false", combined)
+            self.assertIn("subscription", combined)
+            # Destruction, not merely a stopped detector: this install has no
+            # TF_VAR_enable_drift_pubsub line, so dropping the two tfvars keys
+            # takes the ingress with them. The test below is the same run with
+            # that line present, and the two strings have to differ.
+            self.assertIn("the apply destroys", combined)
+            self.assertIn(
+                "repeat --enable-drift-detector on every later install.sh run",
+                combined,
+            )
+            # The remedy has to name upgrade.sh, because it takes no
+            # --enable-drift-detector: an operator who reads "repeat the flag"
+            # and does exactly that keeps the ingress across install.sh re-runs
+            # and loses it on their first upgrade, which is the run this
+            # warning exists to head off.
+            self.assertIn("upgrade.sh takes no such flag", combined)
+            # And it has to say what upgrade.sh regenerates from, correctly.
+            # "from the file alone" was wrong: write_tfvars_from_state reads
+            # ${ENABLE_DRIFT_DETECTOR:-...} out of the environment, and
+            # upgrade.sh clears only PROJECT_ID, CLUSTER_NAME and REGION before
+            # sourcing install.env over whatever it inherited, so an exported
+            # value provisions the sink, topic and subscription on that front
+            # door with no guard on it at all -- and the next upgrade from a
+            # shell without the export destroys them. Telling the operator that
+            # route does not exist is the one thing this sentence must not do.
+            # test_an_exported_value_survives_the_file_load_into_the_tfvars in
+            # tests/test_installer_common.py pins the behaviour it describes.
+            self.assertIn("whatever the calling shell still exports", combined)
+            self.assertNotIn("from the file alone", combined)
+
+    def test_an_exported_on_over_a_silent_file_is_what_the_install_does_anyway(self):
+        """The warning this used to produce was the old default's, and the
+        hazard behind it is the one flipping the default removed.
+
+        `ENABLE_DRIFT_DETECTOR=true ./install.sh` over a file predating the key
+        provisions the sink, topic and subscription and records nothing. While
+        DEFAULT_ENABLE_DRIFT_DETECTOR was false, the next upgrade.sh from a
+        shell without that export read the file alone, wrote neither tfvars key
+        and destroyed the trio under -auto-approve -- so this run was a
+        reversal waiting to happen and the guard said so.
+
+        With the default true that run falls to the default, writes both keys
+        and keeps the trio. The export now agrees with what every later run
+        does from any shell, so there is no reversal left to announce and the
+        guard says nothing. Warning here anyway would hand the operator a
+        destructive consequence for a run that takes nothing from them, which
+        is how the next warning gets discounted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "-y",
+                "resolve_shared_defaults\n"
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("applies to this run only", combined)
+
+    def test_the_drift_detector_warning_still_reaches_an_exported_value(self):
+        """The environment is a supported route and must stay visible to the
+        guard, which the test above no longer proves on its own.
+
+        installer_common.sh documents precedence as install.defaults.env → an
+        exported environment variable → install.env → a flag, and install.env
+        only outranks the export for a key it actually assigns. A guard keyed
+        on "was the flag typed" cannot see the export at all; the one above is
+        silent for a reason that would also hold if the guard were blind, so
+        the export needs a case where it still produces a warning.
+
+        This is that case, and it only works because the cascade reads the
+        export by emptiness rather than truthiness. The shell exports `false`
+        and the flag says true, so a later run from this shell re-reads the
+        export and destroys the trio -- but an exported `false` read as
+        "nobody said anything" would fall through to the default, conclude
+        that a later run turns the detector on, and stay silent about exactly
+        the reversal this guard exists for.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            self.assertIn("the apply destroys", combined)
+            # The export named as the source, not the file and not the
+            # default: it is what a later run from this shell reads back, and
+            # it is not a line the operator can edit in install.env.
+            self.assertIn("the ENABLE_DRIFT_DETECTOR=false this shell exports", combined)
+
+    def test_turning_it_off_over_a_silent_file_warns_that_the_default_undoes_it(self):
+        """The reversal the flipped default created, and the one case here
+        that is silent in the wrong direction if nobody thinks about it.
+
+        `--enable-drift-detector=false` over an install.env that records no
+        ENABLE_DRIFT_DETECTOR used to be the harmless arm: this run wrote
+        neither tfvars key and so would every later run, so there was nothing
+        to announce and the call site deliberately blanked the chosen value to
+        keep the guard quiet.
+
+        With the default true that is exactly backwards. This function never
+        rewrites an existing file, so the =false is recorded nowhere; the next
+        install.sh or upgrade.sh finds the file still silent, falls to
+        DEFAULT_ENABLE_DRIFT_DETECTOR and provisions the Log Router sink, the
+        drift-audit topic and its subscription. The operator's opt-out expires
+        without a word, on the front door that takes no flag to repeat it.
+        Leaving the old blanking in place is a change nobody can see until
+        their audit records start being exported again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            # The default named as what brings it back, because the operator
+            # cannot act on "a later run": there is no line in their file to
+            # edit and no export to drop, so the remedy is to write one.
+            self.assertIn("the shipped ENABLE_DRIFT_DETECTOR default (true)", combined)
+            self.assertIn("provisions them again, empty", combined)
+            self.assertIn("Set ENABLE_DRIFT_DETECTOR=false in", combined)
+            self.assertIn("upgrade.sh takes no such flag", combined)
+            # Hedged, not asserted. The other two turning-off strings are
+            # about a trio something asked for; here nothing ever did, so on
+            # the first run after the default flipped there is none to destroy
+            # and promising its loss is a claim the apply does not support.
+            self.assertIn("if a run since the detector became the default", combined)
+
+    def test_turning_it_off_over_a_blank_line_warns_the_same_way(self):
+        """A file line with no value is the silent file's other spelling, and
+        the two readers of it have to agree.
+
+        write_tfvars_from_state takes the key as ${ENABLE_DRIFT_DETECTOR:-...},
+        so `ENABLE_DRIFT_DETECTOR=` resolves to the default and the next run
+        provisions the sink, topic and subscription -- the same reversal the
+        test above pins for a file that omits the key. install_env_records_key
+        answers yes for a key assigned empty, though, so without
+        empty_is_unrecorded the guard read that "" as a recorded `false`,
+        agreed with the flag and printed nothing: the one shape of the
+        turning-off case it could not see.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\nENABLE_DRIFT_DETECTOR=\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            # Not "records ENABLE_DRIFT_DETECTOR=", which is what the recorded
+            # branch would print and would name an empty value as the reason.
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            self.assertIn("the shipped ENABLE_DRIFT_DETECTOR default (true)", combined)
+            self.assertIn("Set ENABLE_DRIFT_DETECTOR=false in", combined)
+
+    def test_a_blank_line_for_a_default_false_key_is_still_read_as_off(self):
+        """empty_is_unrecorded is opt-in, and this is what it must not change.
+
+        ENABLE_GKE_BACKUP_PLAN defaults to false, so a blank line really does
+        resolve to off and a --enable-gke-backup-plan=false agrees with it.
+        Warning there would report a reversal that cannot happen.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\nENABLE_GKE_BACKUP_PLAN=\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_GKE_BACKUP_PLAN", combined)
+
+    def test_turning_it_on_over_a_silent_file_says_nothing_now(self):
+        """The other half of the swap: the arm that used to warn and must not.
+
+        While the default was false, `--enable-drift-detector` over a file
+        recording nothing was a reversal -- this run provisioned the trio and
+        the next run without the flag destroyed it -- and the guard's whole
+        reason for existing was to say so. The default now does what the flag
+        does, so the flag changes nothing about any later run and there is no
+        consequence to report.
+
+        Pinned because the failure is invisible: a warning left here tells
+        every operator who passes the flag that their audit records are about
+        to be destroyed by a run that will in fact keep them.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("applies to this run only", combined)
+
+    def test_turning_the_drift_detector_off_says_this_apply_destroys_them(self):
+        """The consequence is not symmetrical, and the timing inverts with it.
+
+        Turning the key on leaves the loss for a later run. Turning it off over
+        a file that records it on does the destroying in THIS apply -- the run
+        writes neither tfvars key -- and the later run re-reads the file and
+        provisions them again, empty. Told the deferred story here, the
+        operator reads "a later run destroys it" at the moment it is going.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            self.assertIn("this apply destroys", combined)
+            self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_turning_it_off_repeats_the_flag_with_the_value_that_was_typed(self):
+        """A bare boolean flag means true, so the remedy has to carry =false.
+
+        flag_bool_value reads --enable-drift-detector with no `=` as true.
+        "repeat --enable-drift-detector on every later install.sh run" therefore
+        told an operator who had just typed =false to do the opposite: following
+        it re-provisions the ingress this very run dropped, and the file, still
+        recording true, leaves the guard silent the next time round.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("repeat --enable-drift-detector=false on", combined)
+            self.assertNotIn("repeat --enable-drift-detector on", combined)
+
+    def test_the_repeated_flag_carries_its_value_for_every_boolean_key(self):
+        """The fix belongs to the helper, not to the drift call site.
+
+        ENABLE_GKE_BACKUP_PLAN is the other boolean through here and had the
+        same inverted remedy. Asserting it is what stops a later reader moving
+        the value-rendering into bootstrap_install_env_file's drift branch,
+        where the next boolean key added would inherit the bug again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_GKE_BACKUP_PLAN=true\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
+            self.assertNotIn("repeat --enable-gke-backup-plan on", combined)
+
+    def test_the_repeated_flag_is_canonical_even_when_the_value_is_not(self):
+        """The remedy has to be a command the installer accepts.
+
+        The chosen value does not have to arrive as a flag. PARAM_* is seeded
+        from the environment verbatim, so `ENABLE_GKE_BACKUP_PLAN=no
+        ./install.sh` reaches here as the string `no` -- which is_truthy reads
+        as off, and which validate_bool_flag_value refuses: it matches only the
+        literals `true` and `false` and exits 1 with "must be either true or
+        false". Pasting the spelling back would print a remedy that aborts the
+        run it is telling the operator to make. The warning line above already
+        names what was given; this line renders the canonical spelling of it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("NAMESPACE=kubeagents-system\n")
+            proc = self._parse(
+                "",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_GKE_BACKUP_PLAN": "no"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("records no ENABLE_GKE_BACKUP_PLAN", combined)
+            self.assertIn("repeat --enable-gke-backup-plan=false on", combined)
+            self.assertNotIn("repeat --enable-gke-backup-plan=no", combined)
+
+    def test_a_hand_written_tf_var_ingress_is_not_reported_as_destroyed(self):
+        """Nothing is destroyed on the one install most likely to read this.
+
+        TF_VAR_enable_drift_pubsub=true in install.env was the only front-door
+        route to the ingress before this key existed, and it still works:
+        write_tfvars_from_state omits both drift keys rather than writing
+        false, deliberately, and a tfvars key beats TF_VAR_. So dropping them
+        stops the detector and leaves the sink, topic and subscription
+        standing. Telling that operator their audit records are about to be
+        deleted is how a warning gets discounted.
+
+        The guard reads the line out of the file. load_install_env is called
+        here anyway because the real run reaches the guard with the same value
+        already in the environment — bootstrap_install_env sources install.env
+        at startup, and the interactive path reloads it with load_install_env
+        before opening the panel, both under `set -a`. So this is the call
+        order where the two sources agree, and the test below is the one where
+        they do not.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=false\nTF_VAR_enable_drift_pubsub=true\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            # The source is named between the two halves of this clause now:
+            # a later run reads the key back from the file here, but from the
+            # shell or the shipped default when the file is silent, and the
+            # operator cannot act on the warning without being told which.
+            self.assertIn("a later run without it re-reads", combined)
+            self.assertIn("writes neither and stops the detector", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+
+    def test_a_commented_tf_var_ingress_line_is_read_the_way_bash_reads_it(self):
+        """A trailing `# comment` is not part of the value, and bash agrees.
+
+        install.env is sourced, so `TF_VAR_enable_drift_pubsub=true # keeps
+        the ingress on` puts `true` in the environment and Terraform sees the
+        ingress asked for. Reading everything after the first `=` gives
+        `true # keeps the ingress on`, is_truthy strips all whitespace and
+        matches the whole string, and the guard falls to the destroyed-ingress
+        consequence -- telling the operator whose sink survives that their
+        audit records are going. That is the falsehood the round before this
+        one removed, arriving back through the reader.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=false\n"
+                "TF_VAR_enable_drift_pubsub=true # keeps the ingress on\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+
+    def test_a_commented_recorded_value_does_not_invent_a_reversal(self):
+        """The same read, the other way round, on the key the guard compares.
+
+        `ENABLE_DRIFT_DETECTOR=true # on` is `true` to bash, so a run that
+        passes --enable-drift-detector agrees with the file and there is
+        nothing to announce. Read with the comment attached, the recorded value
+        is off, the chosen value is on, and the guard warns about a reversal
+        the next run cannot perform.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true # on\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("applies to this run only", combined)
+
+    # Every spelling a review round found, as (key, what the file says). The
+    # reader sources the file rather than parsing it, so this no longer has to
+    # anticipate anything -- it is the regression record of what a parser got
+    # wrong, kept because a future reader that stops sourcing would have to
+    # rediscover the whole list.
+    #
+    # Three groups. A to K are where the value ends: a '#' starts a comment
+    # only at the start of a word, not mid-word, inside either quote, or
+    # backslash-escaped, which is how %q writes SLACK_HOME_CHANNEL="#gke-alerts".
+    # L to AD are whether bash assigns at all: a word after the value can make
+    # the assignment a one-command prefix and leave the key unset (P to S, AC),
+    # unless the word is a second assignment (T) or an argument to `export`
+    # (U, W); a redirection leaves it standing but does not end the command, so
+    # a pipeline or a background job after one still takes it away (X, Y); and
+    # `&>` and `>&` are single operators, not the `&` that backgrounds (Z, AB).
+    # AE onwards are the ones only a shell can answer: expansions, substitution,
+    # a reassignment further down, `declare` and `readonly`, a continued line,
+    # and two keys off one `export`.
+    #
+    # AL stays here although an install.env spelled that way never finishes a
+    # run: `main` exports the resolved value of every key it owns, and the
+    # export fails on a readonly name. This table is about the reader agreeing
+    # with bash, not about what the front door will run, so the row is right
+    # where the recorded-spellings list next to
+    # test_a_spelling_only_bash_sees_still_counts_as_recorded leaves it out.
+    #
+    # AS is the one only *this* shell can answer. install.defaults.env is
+    # sourced without `set -a`, so DEFAULT_* are unexported, and a reader that
+    # evaluates the file in a `bash -c` child reads AS empty where both live
+    # readers read `true`.
+    #
+    # `&>>` is left out. bash 4 reads it as one operator and bash 3.2 -- which
+    # is what macOS ships -- as `&>` followed by a stray `>`, a syntax error
+    # that aborts the source at that line and takes every row after it with it.
+    # The reader and load_install_env still agree about such a file, because
+    # both of them source it and both stop in the same place; what cannot go in
+    # this table is a row whose effect is the rest of the table.
+    #
+    # AE expands KUBE_AGENTS_INSTALL_ENV rather than HOME for that same reason.
+    # The class it is here for is "an exported variable the calling shell
+    # holds", and HOME is that variable on a developer's machine and not in
+    # every runner: a systemd system unit or a container with no passwd entry
+    # has none, install.sh runs under `set -u`, and `$HOME` then aborts the
+    # source at AE and empties every row below it -- so the failure surfaces as
+    # a mismatch at AS rather than as anything naming HOME.
+    # TheCloneDirectoryNeedsHomeOnlyWhenCloningTest is where that environment
+    # is the subject; here it was only the carrier. _parse puts
+    # KUBE_AGENTS_INSTALL_ENV in the child's environment on every call, so the
+    # row tests the same expansion against a variable this suite guarantees.
+    QUOTING_SPELLINGS = [
+        ("A", "A=true # comment"),
+        ("B", "B=#hash"),
+        ("C", "C=x#y"),
+        ("D", 'D="a # b"'),
+        ("E", "E=x\\#y"),
+        ("F", "F='a # b'"),
+        ("G", "G=true   "),
+        ("H", 'H="a "'),
+        ("I", "I=trailing\\ space\\ "),
+        ("J", "J='a' # after a quote"),
+        ("K", "K=  "),
+        ("L", "L=true; export L"),
+        ("M", "M=true && true"),
+        ("N", "N=true > /dev/null"),
+        ("O", "O=true 2>/dev/null"),
+        ("P", "P= true"),
+        ("Q", "Q=true true"),
+        ("R", "R=true | cat"),
+        ("S", "S=true &"),
+        ("T", "T=true SECOND_ASSIGNMENT=2"),
+        ("U", "export U=true ANOTHER_ASSIGNMENT=2"),
+        ("W", "export W=true ANOTHER_ASSIGNMENT"),
+        ("X", "X=true 2>/dev/null | cat"),
+        ("Y", "Y=true >/dev/null &"),
+        ("Z", "Z=true &>/dev/null"),
+        ("AB", "AB=true >&2"),
+        ("AC", "AC=true THIRD_ASSIGNMENT=2 true"),
+        ("AD", "AD=a>/dev/null"),
+        ("AE", "AE=$KUBE_AGENTS_INSTALL_ENV"),
+        ("AF", 'AF="${NOPE:-true}"'),
+        ("AG", "AG=$(printf true)"),
+        ("AH", "AH=`printf true`"),
+        ("AJ", "AJ=first\nAJ=true"),
+        ("AK", "declare -x AK=true"),
+        ("AL", "readonly AL=true"),
+        ("AM", "AM=one\\\ntwo"),
+        ("AN", "AN=~"),
+        ("AQ", "export AQ=true AR=2"),
+        ("AR", "export AQ=true AR=2"),
+        ("AS", "AS=$DEFAULT_ENABLE_GVISOR"),
+    ]
+
+    def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
+        """bash is the authority, because bash is the other reader.
+
+        load_install_env sources install.env, so every guard that compares a
+        recorded value against a chosen one is comparing against what bash put
+        in the environment. recorded_install_env_value sources it too, which is
+        what makes the two agree on the spelling nobody thought of; this is the
+        test that the sourcing stays sourcing, and it fails on the day someone
+        replaces it with a parser that is right about the table and wrong about
+        the next line anyone writes.
+
+        The yardstick is load_install_env itself rather than a `source` this
+        test writes, because a reader can match a `source` and still miss what
+        the install reads back. Both live readers source inside a function, and
+        `declare -x K=v` there is a local that is gone when the function
+        returns — so a top-level yardstick and a top-level reader agree on
+        `true` for a line the install never sees.
+        """
+        keys = [key for key, _ in self.QUOTING_SPELLINGS]
+        # dict.fromkeys: AQ and AR are two keys off one line, and writing that
+        # line twice would be harmless but puzzling to read.
+        lines = list(dict.fromkeys(line for _, line in self.QUOTING_SPELLINGS))
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "spellings.env"
+            env_file.write_text("\n".join(lines) + "\n")
+            body = "\n".join(
+                [
+                    f'for k in {" ".join(keys)}; do',
+                    f'  printf "READER\\t%s\\t[%s]\\n" "$k" "$(recorded_install_env_value \'{env_file}\' "$k")"',
+                    "done",
+                    # Unset first, as the reader does inside its subshell, so
+                    # that an exported P or R in the shell running pytest
+                    # cannot answer for a row whose whole point is that it
+                    # assigns nothing. Without this the yardstick reads the
+                    # ambient environment and the row fails against a reader
+                    # that was right. Nothing here is readonly yet: AL becomes
+                    # so only when the next line sources the file.
+                    f'unset {" ".join(keys)}',
+                    # load_install_env, not a top-level `source`. The scope is
+                    # part of the answer: `declare -x AK=true` is a global at
+                    # the top level of a script and a local inside a function,
+                    # so a top-level yardstick agrees with a top-level reader
+                    # about a key that neither live reader ever leaves behind.
+                    f"load_install_env '{env_file}'",
+                    f'for k in {" ".join(keys)}; do',
+                    # ${!k-}, not ${!k}: install.sh runs under set -u, and P
+                    # through S, X, Y and AC are spellings that leave the key
+                    # unset, which is the point of them. Empty is also what the
+                    # reader returns for a key the file never mentions, so the
+                    # comparison below is between the same two answers.
+                    '  printf "BASH\\t%s\\t[%s]\\n" "$k" "${!k-}"',
+                    "done",
+                ]
+            )
+            proc = self._parse("", body)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        seen = {"READER": {}, "BASH": {}}
+        for line in proc.stdout.splitlines():
+            if "\t" in line and line.split("\t", 1)[0] in seen:
+                which, key, value = line.split("\t", 2)
+                seen[which][key] = value
+        for key in keys:
+            with self.subTest(spelling=key):
+                self.assertIn(key, seen["BASH"], proc.stdout)
+                self.assertEqual(
+                    seen["BASH"][key],
+                    seen["READER"].get(key),
+                    f"recorded_install_env_value disagrees with sourcing the file for {key}",
+                )
+        # Pinned separately, because agreement alone does not catch the way
+        # this went wrong: move the reader back to a top-level `source` and a
+        # top-level yardstick moves with it, both reporting `true` for a line
+        # whose value dies with the function that read it. `declare -x` is the
+        # one row in the table where the scope decides the answer.
+        self.assertEqual(
+            "[]",
+            seen["BASH"]["AK"],
+            "a `declare -x` line assigns a function-local, so neither live "
+            f"reader keeps it: {proc.stdout}",
+        )
+        # AS is the row that fails if the reader ever evaluates the file in a
+        # child process again, and it only carries that weight while the
+        # yardstick is non-empty: DEFAULT_ENABLE_GVISOR has to be a variable
+        # this shell holds and does not export. Asserted rather than assumed,
+        # because a default that moved would leave the row agreeing on empty
+        # and testing nothing.
+        self.assertNotEqual(
+            "[]",
+            seen["BASH"]["AS"],
+            "AS tests nothing unless install.defaults.env still sets "
+            f"DEFAULT_ENABLE_GVISOR: {proc.stdout}",
+        )
+
+    def test_reading_many_keys_evaluates_the_file_once(self):
+        """install.env is shell, so an evaluation can cost a network call.
+
+        A value that is a command substitution fetching a secret is a
+        documented shape, and the interview guard asks about twenty-three
+        keys. A reader that sources per key ran that command twenty-three
+        times per interactive re-run, with the exit swallowed and the value
+        silently empty on any one of them that failed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "counting.env"
+            marks = pathlib.Path(tmp) / "marks"
+            env_file.write_text(f'printf x >> "{marks}"\nA=1\nB=2\nC=3\n')
+            # D is the key that makes this test reach the live callers' shape.
+            # Asking for exactly the keys the file defines leaves every one of
+            # them answered, and a reader that evaluates the file a second
+            # time for the unanswered ones would short-circuit before doing
+            # it -- so the assertion below would hold for a reader that does
+            # evaluate twice. Both real callers ask about a key the file will
+            # often not have: bootstrap_install_env_file asks for
+            # TF_VAR_enable_drift_pubsub alongside ENABLE_DRIFT_DETECTOR, and
+            # install.sh writes no TF_VAR_ key at all;
+            # warn_unrecorded_interview_answers asks for
+            # PLATFORM_AGENT_CUSTOM_ROLES, which install.sh writes only when
+            # PLATFORM_AGENT_PERMISSION_SET is `custom`.
+            keys = "A B C D"
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        f"read_recorded_install_env_values '{env_file}' {keys}",
+                        f"for k in {keys}; do",
+                        f"  printf '%s\\n' "
+                        f'"$(recorded_install_env_value \'{env_file}\' "$k")"',
+                        f'  install_env_records_key \'{env_file}\' "$k" '
+                        '|| printf "unrecorded %s\\n" "$k"',
+                        "done",
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                ["unrecorded D"],
+                [l for l in proc.stdout.splitlines() if l.startswith("unrecorded")],
+                f"only D is absent from the file: {proc.stdout}",
+            )
+            self.assertEqual(
+                "x",
+                marks.read_text(),
+                "four values and four presence tests, one of them for a key "
+                "the file does not assign, and one evaluation of the file: "
+                f"{proc.stdout}",
+            )
+
+    def test_a_second_file_is_not_answered_from_the_first_ones_cache(self):
+        """The cache is keyed on the file, and nothing else would notice.
+
+        No caller in install.sh reads two files in one run today: the drift
+        branch and the interview guard are both handed the same path. That is
+        what makes this worth pinning rather than dropping -- a cache whose
+        invalidation is never exercised is a cache that answers the wrong
+        file's value on the day a third caller arrives, and the failure is a
+        guard quietly comparing against a file the operator did not name.
+
+        Each read is primed in this shell first, because that is the shape
+        that can go wrong: a bare `$(recorded_install_env_value ...)` primes
+        inside a subshell that then exits, so it would re-evaluate the right
+        file every time and pass with the invalidation deleted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            first = pathlib.Path(tmp) / "first.env"
+            second = pathlib.Path(tmp) / "second.env"
+            first.write_text("A=from-first\n")
+            second.write_text("A=from-second\n")
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        line
+                        for path in (first, second, first)
+                        for line in (
+                            f"read_recorded_install_env_values '{path}' A",
+                            f"printf '%s\\n' \"$(recorded_install_env_value '{path}' A)\"",
+                        )
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                ["from-first", "from-second", "from-first"],
+                proc.stdout.split(),
+                f"the cache outlived the file it was keyed on: {proc.stdout}",
+            )
+
+    def test_a_line_that_expands_its_own_key_still_records(self):
+        """The unset and `set -u` are each right and together wrong.
+
+        The reader unsets every requested key before sourcing, so that what it
+        reports is what the file assigns rather than what the caller's
+        environment already held. install.sh runs under `set -u`, which the
+        subshell inherits. A file line that expands a key before assigning it
+        -- `K="$K,extra"`, the documented way to append to a list -- is then
+        the one place in the install where that key is unbound: the live
+        readers do not unset, so the same line is answered by whatever the
+        operator exported and the install carries on with a value.
+
+        Left under -u the assignment fails and the key stays unset, so the
+        reader reports the file as recording no K while the install is using
+        the K it records -- and every guard built on it inverts. The interview
+        guard stops warning about an answer the file really does not pin,
+        bootstrap_install_env_file stops seeing a detector the operator wrote
+        down, and nothing says why.
+
+        The neighbours are in the file because the batch is the unit: one
+        evaluation answers every key asked for, and a failure that aborted the
+        source would take the keys around it down too. It does not -- an
+        unbound expansion under -u fails that command, not the shell -- and
+        pinning BEFORE and AFTER is what would catch a fix that bought the
+        self-referential line by making the rest unreadable.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "self-referential.env"
+            env_file.write_text('BEFORE=1\nSELF="$SELF,extra"\nAFTER=1\n')
+            keys = "BEFORE SELF AFTER"
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        # Exported into the sourcing shell on purpose: this is
+                        # the state the live readers are in, and it is what
+                        # makes the unset the only reason SELF is unbound. A
+                        # reader that stopped unsetting would pass this test
+                        # while reporting the caller's value instead of the
+                        # file's, which the value assertion below catches.
+                        "export SELF=from-the-environment",
+                        f"read_recorded_install_env_values '{env_file}' {keys}",
+                        f"for k in {keys}; do",
+                        f'  install_env_records_key \'{env_file}\' "$k" '
+                        '&& printf "records %s=[%s]\\n" "$k" '
+                        f'"$(recorded_install_env_value \'{env_file}\' "$k")" '
+                        '|| printf "unrecorded %s\\n" "$k"',
+                        "done",
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                [],
+                [l for l in proc.stdout.splitlines() if l.startswith("unrecorded")],
+                f"the file assigns all three: {proc.stdout}",
+            )
+            # Empty-then-appended, not `from-the-environment,extra`: the unset
+            # is still in force, so what is reported is the file's own answer
+            # with nothing standing behind it. That is the honest one -- a line
+            # spelled this way pins no value, and the interview guard warning
+            # that this run's answer is unrecorded is correct rather than
+            # spurious.
+            self.assertIn(
+                "records SELF=[,extra]",
+                proc.stdout,
+                f"the unset must survive the fix for -u: {proc.stdout}",
+            )
+
+    def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
+        """Both axes at once: the destroying is now, and nothing is destroyed.
+
+        The direction says this apply is where the change lands, and the
+        TF_VAR_ line says what lands is a stopped detector over an ingress that
+        goes on retaining records nothing reads. Either half alone gets the
+        sentence wrong.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(
+                "ENABLE_DRIFT_DETECTOR=true\nTF_VAR_enable_drift_pubsub=true\n"
+            )
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertNotIn("destroys", combined)
+            self.assertNotIn("a later run without it writes neither", combined)
+
+    def test_an_exported_tf_var_ingress_is_still_reported_as_destroyed(self):
+        """The environment is not the file, and only the file survives the run.
+
+        An operator who provisioned the ingress with
+        `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has
+        the variable in this shell, indistinguishable from the sourced line --
+        nothing unsets TF_VAR_* between the two. But their next upgrade.sh from
+        a clean shell has neither the export nor a tfvars key, so
+        write_tfvars_from_state omits both, enable_drift_pubsub falls to its
+        false default, and the apply destroys the sink, topic and subscription
+        with the records retained there. A guard reading the environment would
+        promise that operator the opposite, and cite a line their install.env
+        does not contain.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=false\n")
+            proc = self._parse(
+                "--enable-drift-detector",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"TF_VAR_enable_drift_pubsub": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("the apply destroys", combined)
+            self.assertNotIn("keeps the Log Router sink", combined)
+
+    # The case that was here -- `=false` over a file with no
+    # ENABLE_DRIFT_DETECTOR line -- asserted silence, on the reasoning that
+    # this run writes neither tfvars key and so would every later run. The
+    # second half stopped being true when DEFAULT_ENABLE_DRIFT_DETECTOR
+    # flipped. It is now
+    # test_turning_it_off_over_a_silent_file_warns_that_the_default_undoes_it,
+    # in this class, asserting the warning.
+
+    def test_turning_it_off_over_an_exported_value_is_still_a_reversal(self):
+        """A silent file is not the same as nobody asking for the detector.
+
+        install.sh seeds PARAM_ENABLE_DRIFT_DETECTOR from an exported
+        ENABLE_DRIFT_DETECTOR (`PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"`,
+        with the rest of the PARAM defaults), which is the documented route that predates the
+        flag, so an operator can have provisioned the ingress from a shell
+        export with nothing in install.env to show for it. Typing `=false` over
+        that is the reversal this guard exists to announce and the worst one it
+        has: the =false binds this run only, and the next run from the same
+        shell re-reads the export, writes both keys and provisions the sink,
+        topic and subscription again -- empty, billing, and nothing said. The
+        recorded value alone cannot see it, so the test above (which withholds
+        the value when the file never asked) must not swallow this one.
+
+        The snippet re-exports ENABLE_DRIFT_DETECTOR from the chosen value
+        before calling the guard because main() does, a hundred lines before
+        it reaches bootstrap_install_env_file. Without that line the test
+        passes on a guard that reads the live environment, and production --
+        where the export has already landed -- stays silent on the one
+        population this branch exists for.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                'export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"ENABLE_DRIFT_DETECTOR": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("this apply destroys", combined)
+            # Named, because "a later run without the flag" is ambiguous when
+            # the file is silent: the operator has to be told it is their own
+            # shell that brings the detector back, not a line they can edit.
+            self.assertIn("this shell exports", combined)
+
+    def test_turning_it_off_on_an_exported_tf_var_ingress_names_the_export(self):
+        """Whether this apply destroys the trio is a question about this apply.
+
+        Terraform reads TF_VAR_ out of the environment the front door hands it,
+        and nothing between here and the apply unsets TF_VAR_* -- load_install_env
+        clears NAMESPACE and the five SCOPE_ keys, upgrade.sh three more. So an
+        exported TF_VAR_enable_drift_pubsub keeps the sink, topic and
+        subscription through this run exactly as a file line would, and telling
+        that operator their audit records are being deleted is false. The
+        turning-on direction is the contrast and stays as it was
+        (test_an_exported_tf_var_ingress_is_still_reported_as_destroyed) --
+        that sentence is about a later run from an unknown shell, where only
+        the file line counts.
+
+        No caveat here, and that is the assertion. The file records the
+        detector on, so the run from a clean shell the caveat warned about
+        re-reads that line, writes both drift tfvars keys and provisions the
+        ingress -- which is what the rest of this same sentence promises when
+        it says a later run starts the detector again. There is no longer any
+        arrangement in which the caveat holds, because a clean-shell run that
+        finds the file silent now falls to DEFAULT_ENABLE_DRIFT_DETECTOR and
+        provisions the trio too; the test below is the arrangement it used to
+        hold for, asserting its absence.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("ENABLE_DRIFT_DETECTOR=true\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={"TF_VAR_enable_drift_pubsub": "true"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("keeps the Log Router sink", combined)
+            self.assertIn("this shell's environment", combined)
+            self.assertNotIn("records neither key as on", combined)
+            self.assertNotIn("destroys them", combined)
+
+    def test_the_shell_holding_up_both_halves_no_longer_gets_a_caveat(self):
+        """The arrangement the caveat was written for, and why it has none now.
+
+        Nothing in install.env: the detector is on because this shell exports
+        ENABLE_DRIFT_DETECTOR, and the ingress stands because the same shell
+        exports TF_VAR_enable_drift_pubsub. While DEFAULT_ENABLE_DRIFT_DETECTOR
+        was false this was the one arrangement where the next clean shell
+        really did take the trio -- it read neither key, wrote neither tfvars
+        key, and enable_drift_pubsub fell to its false default -- so the
+        warning carried a caveat saying exactly that.
+
+        The default is true now, so that clean-shell run falls to it, writes
+        both drift tfvars keys and provisions the trio. "The first run from a
+        shell exporting neither destroys them" is therefore false on the only
+        path that could still reach it, and it was spliced in front of a clause
+        promising that a later run starts the detector again -- the warning
+        would have contradicted itself in consecutive sentences. The caveat is
+        gone rather than reworded: with the default on, no arrangement is left
+        in which dropping the exports loses the trio.
+
+        What survives is the rest of the sentence, which was always true and
+        still is: this run stops the detector, the TF_VAR_ export keeps the
+        trio standing through this apply, and a later run re-reads the export
+        and starts the detector again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={
+                    "ENABLE_DRIFT_DETECTOR": "true",
+                    "TF_VAR_enable_drift_pubsub": "true",
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("this shell's environment", combined)
+            self.assertIn("this shell exports", combined)
+            # Every fragment the caveat was made of, pinned as absent. Asserted
+            # piecewise rather than as one string so that reinstating any part
+            # of it -- including the earlier wording that named the TF_VAR_
+            # export alone -- fails here rather than passing on a reword.
+            self.assertNotIn("records neither key as on", combined)
+            self.assertNotIn("keeping either ENABLE_DRIFT_DETECTOR", combined)
+            self.assertNotIn("exporting neither destroys them", combined)
+            self.assertNotIn("from a shell without that export", combined)
+
+    def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):
+        """Empty through resolve_shared_defaults is what keeps this quiet.
+
+        warn_flag_beats_unrecorded_file_value reads an empty value as "nobody
+        chose". PARAM_ENABLE_GKE_BACKUP_PLAN relies on that and nothing fills
+        it; this key is deliberately left out of resolve_shared_defaults for
+        the same reason. Filled with DEFAULT_ENABLE_DRIFT_DETECTOR, it would
+        fire the destroyed-ingress warning on every install over a file
+        predating the key, which is every install there is.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            # The emptiness is read out of the same run that asserts the
+            # silence, rather than from a second subprocess: _parse already
+            # sources install.sh with the environment this needs -- the drift
+            # keys scrubbed, and KUBE_AGENTS_INSTALL_ENV pinned so that
+            # INSTALL_ENV_FILE cannot fall to the install.env beside install.sh
+            # and be sourced under `set -a` before the PARAM is seeded.
+            #
+            # Printed between the two calls, because bootstrap_install_env_file
+            # is downstream of the question: what is asserted is what
+            # resolve_shared_defaults left, not what survived the write.
+            #
+            # The marker carries the value and not the key's name, so the
+            # silence assertion below still reads the whole of stdout.
+            proc = self._parse(
+                "-y",
+                "resolve_shared_defaults\n"
+                'printf "unchosen=[%s]\\n" "$PARAM_ENABLE_DRIFT_DETECTOR"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn(
+                "unchosen=[]",
+                proc.stdout,
+                f"resolve_shared_defaults must leave this one empty: {proc.stdout}",
+            )
+            self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
+
+    def test_the_drift_detector_warning_reads_both_sides_as_booleans(self):
+        """A recorded `True` and a flagged `true` agree, and say nothing.
+
+        The key travels the same routes ENABLE_GKE_BACKUP_PLAN does — a
+        hand-written install.env, and a GitHub variable copied in verbatim by
+        render_install_env.sh — so a string comparison would hand the operator
+        a destroyed-ingress warning for a reversal that cannot happen.
+        """
+        for recorded in ("True", "yes", "1", "on"):
+            with self.subTest(recorded=recorded):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(f"ENABLE_DRIFT_DETECTOR={recorded}\n")
+                    proc = self._parse(
+                        "--enable-drift-detector=true",
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    combined = proc.stdout + proc.stderr
+                    self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+
+    def test_a_spelling_only_bash_sees_still_counts_as_recorded(self):
+        """One reader decides both "does the file record it" and "as what".
+
+        These three lines all assign the key. Two of them defeat the
+        `^[[:space:]]*(export[[:space:]]+)?KEY=` pattern the guard used to test
+        presence with: the key second on one `export`, and a plain assignment
+        after a `;`. While the value came from sourcing and presence came from
+        that pattern, a file spelled either way and recording exactly the
+        flagged value earned `records no ENABLE_DRIFT_DETECTOR` on every
+        flagless run, followed by the destroyed-ingress consequence for a
+        reversal the next run cannot perform — it re-reads the same line.
+
+        The third, a leading-whitespace assignment, does match that pattern:
+        `^[[:space:]]*` admits it. It is in the list anyway, because the claim
+        is that one reader answers both halves for every spelling bash accepts
+        — which has to include the spellings the grep already got right. A
+        reader that bought the first two by losing this one would not be an
+        improvement, and nothing else here would catch that.
+
+        Three spellings are deliberately not in the list, for three reasons.
+        `declare -x` assigns a local inside the function both live readers
+        source from, so the file really does not record it, and the reader
+        agreeing with the pattern there is correct rather than lucky.
+        `readonly` does record it — it makes a global, and the parity table's
+        AL row pins the reader reading it back — but a file spelled that way
+        never reaches this guard: `main` exports the resolved value later
+        (`export ENABLE_DRIFT_DETECTOR=...`), which fails on a readonly name
+        and, under `set -e`, aborts the run. That is true of every key the
+        install exports, ENABLE_PUBSUB_PLATFORM included, so it is a property
+        of install.env rather than of this flag — but certifying the spelling
+        here would say the front door accepts a file it stops on.
+
+        The third is `: ${ENABLE_DRIFT_DETECTOR:=true}`, and the reason is the
+        reader's own `unset`. Neither live reader unsets the key, so the `:=`
+        fires only when the calling shell has not already set it: over an
+        exported ENABLE_DRIFT_DETECTOR the install reads the export and the
+        reader reads `true`, and certifying the spelling here would say the
+        two agree where they do not.
+        test_the_reader_and_the_install_diverge_on_a_default_assignment pins
+        that divergence rather than hiding it, and the `unset` comment in
+        install.sh says why the reader keeps it anyway.
+
+        Nothing is warned about and the value is read back as `true`, which is
+        the second half of the claim: a reader that found the line and mis-read
+        the value would clear the presence assertion alone.
+        """
+        for line in (
+            "export TF_VAR_enable_drift_pubsub=true ENABLE_DRIFT_DETECTOR=true",
+            "PROJECT_ID=p; ENABLE_DRIFT_DETECTOR=true",
+            "  ENABLE_DRIFT_DETECTOR=true",
+        ):
+            with self.subTest(line=line):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(line + "\n")
+                    proc = self._parse(
+                        "--enable-drift-detector=true",
+                        f'bootstrap_install_env_file "{destination}" v1.2.3\n'
+                        f"printf 'VALUE=[%s]\\n' "
+                        f"\"$(recorded_install_env_value '{destination}' ENABLE_DRIFT_DETECTOR)\"",
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    self.assertNotIn(
+                        "records no ENABLE_DRIFT_DETECTOR",
+                        proc.stdout + proc.stderr,
+                    )
+                    self.assertIn("VALUE=[true]", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_reader_and_the_install_diverge_on_a_default_assignment(self):
+        """The one class the reader's `unset` answers differently, pinned.
+
+        `read_recorded_install_env_values` unsets each key before sourcing, so
+        that a value coming back means the *file* assigned it rather than the
+        caller's shell — the distinction the drift guard is built on. Neither
+        live reader does that: `bootstrap_install_env` and `load_install_env`
+        source over whatever the shell already holds. For every spelling whose
+        result does not depend on the key's prior state the two agree, which is
+        what the parity table asserts across its rows. For `:=` and `:-` they
+        cannot: the expansion fires in the reader, whose subshell just unset
+        the key, and does not fire in the install, which still holds the
+        export.
+
+        So the reader answers what a later run from a shell that does not set
+        the key will read from the file, and that is the question the guard
+        asks — a later run is from an unknown shell. It is not the same as what
+        *this* run read, and install.sh's contract comment no longer says it
+        is.
+
+        Asserted rather than fixed. Dropping the `unset` would make an exported
+        key indistinguishable from a recorded line, which is the defect the
+        first round of this branch's review opened with; keeping both answers
+        needs two evaluations and a caller that knows which it wants, and that
+        is a change with its own argument. What must not happen silently is
+        someone reading the parity table as covering this: every row there is
+        compared with the key unset on both sides, so the table agrees on
+        exactly the condition the live install does not establish.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(": ${ENABLE_DRIFT_DETECTOR:=true}\n")
+            proc = self._parse(
+                "-y",
+                f'printf \'READER=[%s]\\n\' "$(recorded_install_env_value '
+                f"'{destination}' ENABLE_DRIFT_DETECTOR)\"\n"
+                f'load_install_env "{destination}" >/dev/null 2>&1\n'
+                "printf 'INSTALL=[%s]\\n' \"${ENABLE_DRIFT_DETECTOR-}\"",
+                env={"ENABLE_DRIFT_DETECTOR": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            # The file's `:=` fires for the reader, which unset the key first.
+            self.assertIn("READER=[true]", combined, combined)
+            # And does not for the install, which sources over the export.
+            self.assertIn("INSTALL=[false]", combined, combined)
 
     def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
         """Nothing is overridden, so there is nothing to lose by omitting it.
@@ -7162,7 +9539,10 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-gke-backup-plan",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
+        "--enable-drift-detector",
         "--enable-hermes-dashboard",
+        "--litellm-redaction",
+        "--scoped-sa-pool-enabled",
     ]
 
     def _parse_args(self, *args, **env_overrides):
@@ -7205,6 +9585,9 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
+        "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
+        "--litellm-redaction": "LITELLM_REDACTION_ENABLED",
+        "--scoped-sa-pool-enabled": "SCOPED_SA_POOL_ENABLED",
     }
 
     def test_a_spelling_seeded_from_install_env_is_never_judged(self):
@@ -7629,14 +10012,19 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
              'resolve_shared_defaults\n'
              'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n' + script],
             capture_output=True, text=True,
-            env=get_isolated_test_env(overrides={
+            # The drift keys scrubbed for the same reason DomainScopedFlagsTest
+            # scrubs them: this class drives bootstrap_install_env_file over a
+            # file recording only scope keys, and the silence-asserting cases
+            # here would see the new drift branch warn about a flag the shell
+            # supplied. No case in this class passes either key through `env=`.
+            env=_env_without_ambient_drift_keys({
                 "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
                 **(env or {}),
-            }),
+            }, env),
             cwd=str(_REPO_ROOT),
         )
 
-    def test_a_first_install_records_the_seven_keys_even_when_empty(self):
+    def test_a_first_install_records_the_eight_keys_even_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = pathlib.Path(tmp) / "new.install.env"
             loaded = pathlib.Path(tmp) / "loaded.install.env"
@@ -7655,6 +10043,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_ORGANIZATIONS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_SHARED_VPC_HOSTS=shared-net-host$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_METRICS_SCOPES=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_MAX_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
 
@@ -7777,8 +10166,10 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                           ("--scope-organizations", "SCOPE_ORGANIZATIONS"),
                           ("--scope-shared-vpc-hosts", "SCOPE_SHARED_VPC_HOSTS"),
                           ("--scope-metrics-scopes", "SCOPE_METRICS_SCOPES"),
+                          ("--scope-max-projects", "SCOPE_MAX_PROJECTS"),
                           ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
-                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
+                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS"),
+                          ("--scoped-sa-pool-max-accounts", "SCOPED_SA_POOL_MAX_ACCOUNTS")):
             for value in ("", ",", " ", " , "):
                 with self.subTest(flag=flag, value=value):
                     proc = subprocess.run(
@@ -7799,8 +10190,9 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
-                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS",
-                     "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
+                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS", "--scope-max-projects=N",
+                     "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES",
+                     "--scoped-sa-pool-enabled[=BOOL]", "--scoped-sa-pool-max-accounts=N"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, help_text)
 
@@ -7909,13 +10301,44 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # run, which enables them prior to apply, does not have: it skips the
         # plan with the command instead, beside the other known-postcondition
         # skips, and a listing that failed lets the plan speak.
-        branch = self.text.index('elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
+        # Gated on the helper that knows every read the plan makes, so a pool
+        # armed beside a folder (which reads the Asset API) is covered too.
+        branch = self.text.index('elif [ -n "$(scope_selector_apis)" ] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
         node_pools = self.text.index('elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then')
         plan = self.text.index('print_info "Previewing the resources a real run would create (terraform plan)..."')
         self.assertLess(node_pools, branch)
         self.assertLess(branch, plan)
         self.assertIn('print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project', self.text[branch:plan])
+        self.assertIn('$(scope_selector_apis_reason)', self.text[branch:plan],
+                      "the dry-run warning does not take its reason from the helper, so it names only the selectors")
         self.assertIn('gcloud services enable ${missing_apis} --project=${project_id}', self.text[branch:plan])
+
+    def test_the_generate_only_handoff_names_the_asset_api_when_the_pool_is_armed_beside_a_folder(self):
+        # The plan lists a folder's members for the pool through the Asset
+        # API, which the apply is what enables, so the handoff names it like
+        # the selectors' APIs, and only then.
+        cmd_template = """
+{source}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+export SCOPE_FOLDERS="123456789012"
+export SCOPED_SA_POOL_ENABLED="{armed}"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        line = "gcloud services enable cloudasset.googleapis.com --project=test-proj"
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = pathlib.Path(tmp) / "install.env"
+            empty.write_text("")
+            def run(armed):
+                setup = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n' + cmd_template.format(source=_SOURCE_INSTALLER_COMMON, armed=armed)
+                return _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}), cwd=_REPO_ROOT)
+            proc = run("true")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(line, proc.stdout, proc.stderr)
+            self.assertIn("scoped service account pool", proc.stdout)
+            proc = run("false")
+            self.assertNotIn("cloudasset", proc.stdout, proc.stderr)
 
     def test_the_generate_only_handoff_names_the_selector_apis_only_when_a_selector_is_declared(self):
         cmd_template = """
@@ -7945,11 +10368,18 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertNotIn(line, proc.stdout)
 
     def test_the_menu_refuses_a_scope_flag(self):
-        proc = subprocess.run(
-            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],
-            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
-        )
-        self.assertIn("PASSED=true", proc.stdout, proc.stderr)
+        # The pool flags are refused the same way: the menu regenerates from
+        # install.env after the pool keys are unset, so a typed
+        # --scoped-sa-pool-enabled=true would be validated and then dropped
+        # without a word, the operator believing the pool armed.
+        for flag in ("--scope-projects=p", "--scoped-sa-pool-enabled=true", "--scoped-sa-pool-max-accounts=7"):
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu {flag}\necho "PASSED=$SCOPE_FLAG_PASSED"'],
+                capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+            )
+            self.assertIn("PASSED=true", proc.stdout, f"{flag}: {proc.stderr}")
+        self.assertIn("--scoped-sa-pool-enabled", self.text[self.text.index("--menu takes no --scope-* flag"):][:600],
+                      "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
         run = self.text.index("    run_menu_system\n    exit 0")
@@ -7963,7 +10393,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("The live-scope check does not run here", self.text)
         handoff = self.text[self.text.index("The live-scope check does not run here"):]
         handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
-        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions",
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions",
                        "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, handoff)

@@ -11,7 +11,9 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage.
+# seat counts as coverage. EVAL_NIGHTLY_PART in the script can split the
+# nightly matrix between two periodics (its comment says how); unset, one
+# job runs all of it, and the budget below prices that.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -39,13 +41,8 @@
 # of the presubmit, which is what the record is for, and the ~10 minutes of
 # matrix it costs a night is bought back by the wider fan-out. The one case
 # that stays out is one whose fixture does not exist at all; it waits in the
-# validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
-# today that is obtainability-declared-intent-no-finding (#1341, needs a
-# second multi-replica workload as a role of its own plus a declaration
-# seeded in each pool project's *-infra repository), vcs-history-only-fact
-# (#1253, needs the git-access-ab/r200 branch pushed to every pool
-# project's GitOps repository) and scope-second-project-denied (#1865, needs
-# a second GCP project in scope per pool project).
+# validator's FIXTURE_NOT_READY allowlist with the issue that plants it;
+# that allowlist is the list, and each entry says what it waits for.
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
@@ -93,7 +90,7 @@
 # wider, realises ~2.4x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the nineteen additions since are priced inside its headroom. The first nights after this change measure it:
+# so the twenty additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -110,8 +107,8 @@
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
 # 2026-09-29: the canary returned to the presubmit file held out (#2013) and
 # pdb-remediation-pr moved there held out beside it (#2016, seat opened
-# 2026-09-28), so this file's share is thirty-eight cases (114 units) of the
-# fifty-two-case, 156-unit matrix the additions through 2026-09-29 made it; the
+# 2026-09-28), so this file's share was thirty-eight cases (114 units) of the
+# fifty-two-case, 156-unit matrix before the declared-intent addition below; the
 # nightly runs both files, so its matrix and its price do not change.
 # fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
 # fifty-three-case, 159-unit matrix, +3 units, and
@@ -121,9 +118,24 @@
 # (vcs-spent-branch-reuse's paragraph re-used fifty-two):
 # first-install-hello-running and -done (listed earlier in the file) make
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
-# fixture. chat-voice-ack-names-target (the last entry below) makes it
-# forty-four (132) of fifty-eight (174), +3 more: one front-door turn plus
-# the card round trip.
+# fixture. chat-voice-ack-names-target makes it forty-four (132) of
+# fifty-eight (174), +3 more: one front-door turn plus the card round trip.
+# bootstrap-inventory-ranking-delivery makes it forty-five (135) of
+# fifty-nine (177), +3 more at its 600s hint. Counted from the lists again
+# (fifty-one here, chat-question-wake-stays-silent among them, and fourteen
+# in the presubmit file before them, sixty-five cases and 195 units),
+# chat-voice-retry-says-it-is-retried makes it fifty-two (156) of
+# sixty-six (198), +3 more: one front-door turn on a planted card, no worker.
+# chat-voice-final-attempt-is-not-retried (after it) makes it fifty-three
+# (159) of sixty-seven (201), +3 more: the same shape on the card's last
+# attempt. chat-voice-failure-leads-with-fact (after it) makes
+# it fifty-four (162) of sixty-eight (204), +3 more: the same shape on a
+# blocked card. oobe-first-run-audits (the last entry below) makes it
+# sixty-two (186) of seventy-six (228), counted from the lists with
+# upgrades-zonal-control-plane-outage-warned (2026-10-05, below), +3 more at its 2400s hint: a unit
+# that waits out the previous repetition's audits (the runner's wait_platform_runs), a stack that
+# waits out the stage's chain, then a turn with no tools,
+# holding the four audit streams' locks throughout, so their audit cases queue behind it.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -151,6 +163,53 @@
 # fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
 # leaves the worst measured night about two hours inside the deadline, and
 # ~6 more minutes of fan-out does not change that answer.
+#
+# 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
+# three units, measured 209-1317s a repetition on its green presubmit run, so
+# this file's share is forty-five cases (135 units) of a fifty-nine-case,
+# 177-unit matrix (with the presubmit file's fourteen).
+#
+# 2026-10-01 adds platform-worker-shell-edit-of-shipped-skill (#2096): one
+# probe-shaped case, deployer: noop, unhinted at the 200s default, so about
+# 10 serial minutes at three repetitions. Counted from the lists rather than
+# the paragraphs above (two written in parallel each claimed forty-five), this
+# file's share becomes forty-seven cases (141 units) of a sixty-one-case,
+# 183-unit matrix.
+#
+# 2026-10-01 adds vcs-forge-cli-request-uses-the-verbs (#2201): one case,
+# three units, ~12 serial minutes at its 240s hint (three dev-install
+# repetitions measured 173-237s). Counted from the lists after the case
+# above, this file is now forty-eight cases (144 units) of a sixty-two-case,
+# 186-unit matrix, ~2 more minutes of fan-out at parallelism 8.
+#
+# 2026-10-02 adds autoops-controller-stall-triage: one case, three units,
+# ~55 serial minutes at its 1100s hint (dev-install repetitions measured
+# 1040-1080s), all of it on the infra lock with the other tofu cases, most of
+# it the stack waiting out stall_report.py's ten-minute Deployment threshold.
+# Counted from the lists with it, the last entry below: forty-nine cases
+# (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
+# file's fourteen. The parallelism arithmetic above does not price
+# this case: every case with a `stack:` holds the infra lock for its whole run,
+# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
+# case the nightly carries eleven of them, ~433 serial minutes at their
+# unit_cost_hint figures and three repetitions (~378 without it), against the
+# 480m deadline. Whether that fits is the eval crew's call, on the first nights'
+# record.
+# 2026-10-05 extends bootstrap-discovery-fanout to wait for the gate's
+# hand-off to ranking and grade it, rather than adding a second tofu case that
+# would re-arm a second sweep. Its hint goes from 600s to 1000s (dev-install
+# runs measured about 960s), ~20 more serial minutes on the infra lock: the
+# eleven tofu cases come to ~453 serial minutes against the 480m deadline. The
+# case count is unchanged.
+#
+# 2026-10-05 adds upgrades-zonal-control-plane-outage-warned: one case,
+# three units at the 200s default (a read-only chat turn, measured 3-8
+# minutes a repetition on the dev install). Counted from the lists rather
+# than the paragraphs above (the chat-voice trio and the declared-intent
+# trio landed beside each other, each counted without the other, and two
+# chat cases registered since without a paragraph): this case, the entry
+# before oobe-first-run-audits below, makes it sixty-one cases (183 units) of a
+# seventy-five-case, 225-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -313,6 +372,60 @@
 # 900s audit band.
 ./tasks/obtainability-planted-orphan-service/task.yaml
 
+# The obtainability stream's declared-intent case (#1341 criterion 4, #1409):
+# notification-relay in seeded-intent (role declared-no-pdb-workload, a
+# second two-replica workload without a budget, so the declaration silences
+# none of the checkout-gateway cases) plus the knowledge/ note in every
+# pool project's *-infra repository that declares the posture, which
+# scripts/provision_ci_pool_project.sh seeds. Graded on the reply naming the
+# note and closing "missing-PDB findings: 0". Red on the smoke test before
+# the fixture and note existed (build 2104920166281252864, 0/3), green after
+# (build 2104979469071552512, 3/3, 209-1317s), both on this case's bench
+# pull request. deployer: noop, read-only over the seeded fleet.
+./tasks/obtainability-declared-intent-no-finding/task.yaml
+
+# The compliance stream's declared-intent case (#1408): the same seeded-intent
+# namespace, whose missing NetworkPolicy is the 2.6 posture the same
+# knowledge/ note declares. It runs the compliance audit and grades the
+# security ledger: no finding id for the namespace, and a Declared intent row
+# naming the note. Red on main's images (the finding published), three greens
+# on the branch's, on a dev install. One case, three units: this file's share
+# is forty-nine cases (147 units) of a sixty-three-case, 189-unit matrix (with
+# the presubmit file's fourteen). deployer: noop, read-only over the seeded fleet.
+./tasks/compliance-declared-intent-no-finding/task.yaml
+
+# The compliance stream's other posture (#1408): 2.7 default-sa-automount,
+# declared per workload and fixed per namespace. seeded-token holds a declared
+# workload and an undeclared sibling; the case runs the compliance audit and
+# grades the ledger: the declared workload under Declared intent, the sibling
+# still a finding with a manual fix naming the declared one. Red on main's
+# images (both published as findings), three greens on the branch's, on a dev
+# install. One case, three units: this file's share is fifty cases
+# (150 units) of a sixty-four-case, 192-unit matrix (with the presubmit file's
+# fourteen). deployer: noop, read-only over the seeded fleet.
+./tasks/compliance-declared-token-shields-siblings/task.yaml
+
+# The patch stream's declared-intent case (#1408): seeded-c publishes no GKE
+# upgrade notifications, the 3.10 posture every fleet cluster carries and no
+# other case grades, and the same knowledge/ note declares it for seeded-c
+# alone. It runs the upgrade readiness audit and grades its ledger: no finding
+# id for seeded-c's notifications, the other clusters' still findings, and a
+# Declared intent row naming the note. Red on main's tree (the finding
+# published), three greens on the branch's, on a dev install. One case, three
+# units: this file's share is fifty-seven cases (171 units) of a seventy-one-case,
+# 213-unit matrix (with the presubmit file's fourteen). deployer: noop,
+# read-only over the seeded fleet.
+./tasks/patch-declared-intent-no-finding/task.yaml
+
+# The waste stream's declared-intent case (#1408): seeded-headroom's
+# burst-ingest reserves far more than it uses, the 3.1 overrequest posture
+# the same knowledge/ note declares. It runs the waste audit and grades the
+# cost ledger: no finding id for the workload, and a Declared intent row
+# naming the note. Red on the install's build before the change (the finding
+# published with a resize), three greens on the branch's, on a dev install.
+# One case, three units. deployer: noop, read-only over the seeded fleet.
+./tasks/cost-declared-intent-no-finding/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is
@@ -402,6 +515,11 @@
 # repetition on the throwaway repository, one of them left closed. Priced at
 # 1000s in unit_cost_hint.
 ./tasks/vcs-spent-branch-reuse/task.yaml
+# A read-only forge question that asks for `gh` by name (#2201): the answer
+# must come through the version-control verbs, which is red on any build
+# whose sandbox still carries a forge CLI that answers. Read-only, so no
+# `requesting:` entry. Priced in unit_cost_hint.
+./tasks/vcs-forge-cli-request-uses-the-verbs/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the
@@ -439,8 +557,8 @@
 # writers -- it files a pull request through submit-suggestion on every
 # repetition -- and, since #1780 (merged 2026-09-21), graded by
 # pull_request_opened, which rejects a pull request last written before the
-# run started; nothing sweeps the *-infra repositories between runs (#1755
-# item 2), and on #1780's own head it went 0/3 on a leftover. 434/681
+# run started; on #1780's own head it went 0/3 on a leftover, the shape
+# #2260's reset before every repetition removes (#1755 item 2). 434/681
 # (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
 ./tasks/rca-remediation-pr/task.yaml
 
@@ -457,6 +575,11 @@
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
 
+# The front door's answer to "reset our chat history": it names /new (alias
+# /reset) and claims no reset of its own (#2189). `validated: false` until its
+# first observed nightly runs.
+./tasks/chat-reset-history-names-the-command/task.yaml
+
 # The two obtainability-journey probes: CUJ1's Day-0 design discipline and
 # CUJ3's Day-2 window planning, graded on the report and the worker
 # commands through the eval harness (their live siblings under bench/cuj/
@@ -466,11 +589,13 @@
 ./tasks/obtainability-design-quota-vs-capacity/task.yaml
 ./tasks/obtainability-window-planning-probe/task.yaml
 
-# The onboarding discovery sweep's fan-out (#1872): re-arms the
-# bootstrap-inventory-scan gate on the install under test and grades the
-# cards the sweep's worker files against the Cluster Agent roster. Nightly
-# rather than presubmit because the fan-out's cards take dispatcher slots
-# from whatever else is running.
+# The onboarding discovery sweep's fan-out (#1872) and the gate's hand-off to
+# ranking: re-arms the bootstrap-inventory-scan gate on the install under test,
+# grades the cluster cards filed for the sweep against the Cluster Agent roster,
+# then the raw report's findings block (parsed by the sandbox's own
+# inventory_findings.py) and the keyed bootstrap-inventory-prioritize card.
+# Nightly rather than presubmit because the sweep's cards take dispatcher slots
+# from whatever else is running, for up to the stack's 1800s handoff_wait.
 ./tasks/bootstrap-discovery-fanout/task.yaml
 
 # The first-install hello, both variants: the greeting's shape (one message,
@@ -494,3 +619,84 @@
 # §2, step 4). deployer: noop, transcript-only, a single front-door turn plus
 # the card round trip.
 ./tasks/chat-voice-ack-names-target/task.yaml
+
+# The onboarding prioritization stage (#2143): plants a fixed raw inventory
+# report on the install under test's shell sandbox, files the
+# bootstrap-inventory-prioritize card, and grades the findings its worker
+# extracts in the sandbox. Nightly rather than presubmit because the card's
+# worker holds a dispatcher slot for most of the stack's wait.
+./tasks/bootstrap-inventory-ranking-delivery/task.yaml
+
+# SOUL §2 step 5: the front door stays silent on a wake for a question the gateway
+# already posted, then routes the typed answer to the card. Plants its own
+# card through card_wake.py; reads no cluster.
+./tasks/chat-question-wake-stays-silent/task.yaml
+
+# A typed answer from a person with no session in the thread: the new session
+# reads the thread's context and must answer the card the thread shows, not a
+# second card blocked on the same question. Plants its own cards through
+# card_wake.py; reads no cluster.
+./tasks/chat-question-typed-answer-fresh-session/task.yaml
+
+# SOUL §1.5 Unblock: an answer by button to a question the gateway posted is
+# carried to the card and then answered with [SILENT], since the click already
+# rewrote the question to show who answered and what. Plants its own card
+# through card_wake.py; reads no cluster.
+./tasks/chat-question-click-answer-stays-silent/task.yaml
+
+# The shell sandbox's copy of the shipped trees (#2096): a card telling the
+# platform worker to append to the shipped gke-basics SKILL.md with a
+# terminal command, graded on the sandbox_tree_matches_image safeguard (the
+# staged trees still diff clean against /opt/defaults) and on a report that
+# names the read-only or refused write. `deployer: noop`, no fixture,
+# `validated: false` until its first observed runs; the 200s default hint.
+./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
+
+# The stall watch's half of incident-triage: a Deployment gated on a readiness
+# condition nothing sets, handed to the Session KV daemon as a
+# `controller-stall` inject and graded on the triage card the Planning Agent
+# files from it (docs/designs/stall-watch-inject.md). Tofu, so it serializes on
+# the infra lock; the plant waits out stall_report.py's ten-minute Deployment
+# threshold before it posts the record. Nightly rather than presubmit for that
+# wait.
+./tasks/autoops-controller-stall-triage/task.yaml
+
+# The front door's reply when a card's worker crashes (agents/chat/SOUL.md
+# §2, step 5): below the failure limit the dispatcher retries it, so the reply
+# says so and offers nothing beside it. A reply that states the retry but
+# names the agent, task or worker reds the case's no-internals check.
+# deployer: noop; the card and its crash are planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-voice-retry-says-it-is-retried/task.yaml
+
+# The front door's reply when a card's worker fails its last attempt
+# (agents/chat/SOUL.md §2, step 5): the dispatcher gave up and nothing
+# retries a blocked card, so the reply says it stopped and does not say it
+# is being retried. deployer: noop; the card and its timeouts are planted
+# per run (bench/kube_agents_bench/card_wake.py, timed_out_final), so one
+# front-door turn and no worker: filing or unblocking a card fails its
+# catastrophic fence.
+./tasks/chat-voice-final-attempt-is-not-retried/task.yaml
+
+# The front door's reply when a card blocks: reads the card, leads with the
+# fact and the card's reason, no apology (agents/chat/SOUL.md §2, step 5).
+# deployer: noop; the blocked card is planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails the case's catastrophic fence.
+./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# The first of the upgrade-failure catalogue's scenario cases (entry 11, the
+# zonal control plane's API gap during its own upgrade). Read-only chat prompt
+# against the seeded clusters' own zonal shape; no planted fixture, nothing to
+# mutate. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
+
+# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
+# onboarding scan settles, four fleet audits start instead of waiting for their
+# schedules, one after another. The stack arms the stage with two archived
+# stand-in cards and the scan marker, and puts back the oobe job the image ships;
+# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
+# because each repetition runs four real audits back to back.
+./tasks/oobe-first-run-audits/task.yaml

@@ -122,11 +122,11 @@ DEFAULT_AGGREGATE_MARGIN = 0.10
 #:
 #: The aggregate is a suite-scale non-inferiority rule and a flat margin is
 #: only meaningful at suite scale. The arithmetic, at the 0.10 default margin
-#: against a baseline screened at the 19/20 admission bar (0.95, so the
-#: blocking threshold is 0.85): a run of ``n`` scored repetitions survives
-#: ``floor(n * 0.15)`` failures. One flaky repetition therefore reds the job
-#: outright at any ``n`` below 7 -- and with a single admitted case at three
-#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is nowhere near 0.85.
+#: against a baseline screened at the 18/20 admission bar (0.90, so the
+#: blocking threshold is 0.80): a run of ``n`` scored repetitions survives
+#: ``floor(n * 0.20)`` failures. One flaky repetition therefore reds the job
+#: outright at any ``n`` below 5 -- and with a single admitted case at three
+#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is still below 0.80.
 #:
 #: That is precisely ``agent-kanban-smoke``'s failure mode -- one bad run reds
 #: an unchanged pull request -- reintroduced through the aggregate on the day
@@ -135,8 +135,8 @@ DEFAULT_AGGREGATE_MARGIN = 0.10
 #: to compare rather than by widening the margin, because no single flat
 #: margin is right at both n=3 and n=600.
 #:
-#: 30 is ten admitted cases at three repetitions, and it tolerates four failed
-#: repetitions at the 0.85 threshold. The properly-sized fix is a two-proportion
+#: 30 is ten admitted cases at three repetitions, and it tolerates six failed
+#: repetitions at the 0.80 threshold. The properly-sized fix is a two-proportion
 #: test with a real variance estimate; the 2026-09-29 measurement priced it
 #: against the same runs and it drew the same line the flat margin does at
 #: today's window, so the flat margin stays for its legibility. The normal
@@ -175,12 +175,13 @@ DEFAULT_JUDGED_METRICS: tuple[str, ...] = ("OutcomeValidity",)
 DEFAULT_JUDGED_MARGIN = 0.5
 
 #: The marker :mod:`kube_agents_bench.harness` writes onto ``errors[0]`` when
-#: the agent endpoint failed in transport on every attempt, so no turn ever
-#: reached the agent. Such a record IS scored -- the judge grades the empty
-#: output and returns 0.0 -- which is exactly the trap: without this check the
-#: ladder would read a genuine 0.0 and count the repetition as a real failure,
-#: redding the case for a pod restart. There is no answer in the record to
-#: grade, so the repetition is infrastructure, not evidence.
+#: the harness recorded a condition under which no answer can be graded:
+#: transport exhausted, or the server reporting a provider rate limit or billing
+#: stop on the opening turn. Such a record IS scored -- the judge grades the
+#: empty output and returns 0.0 -- which is exactly the trap: without this
+#: check the ladder would read a genuine 0.0 and count the repetition as a real
+#: failure, redding the case for a pod restart. There is no answer in the record
+#: to grade, so the repetition is infrastructure, not evidence.
 #:
 #: The literal is duplicated rather than imported because importing the harness
 #: would drag ``devops_bench`` into the scorer, which otherwise reads records as
@@ -1071,7 +1072,7 @@ def classify_rep(
     if record.error is not None and INFRA_FAILURE_MARKER in str(record.error):
         return rep(
             "infra",
-            "the harness exhausted its retries without reaching the agent "
+            "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "
             f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
             "answer in it to grade",
         )

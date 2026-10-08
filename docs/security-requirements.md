@@ -75,13 +75,13 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee, with one operator-enforced carve-out inside it: an administrator-supplied volume whose source would deliver the A2A bus credential to a second container, or a volume or mount named `a2a-bus-token`, is refused at admission, and on an install running the A2A surface stripped from the render as well (the same Secrets read through `env` are not, which is the supported route for the bridge sidecar). The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee, with one operator-enforced carve-out inside it: an administrator-supplied volume whose source would deliver the A2A bus credential to a second container, or a volume or mount named `a2a-bus-token`, is refused at admission, and on an install running the A2A surface stripped from the render as well (the same Secrets read through `env` are not, which is the supported route for a CR-declared bridge sidecar). The operator-managed exceptions are the audience-bound projected ServiceAccount token the `platform-agent` container presents to the credential broker and, under the unsupported `mode: next` toggle, a second one bound to the `a2a-bus` audience; see the discussion below. Under `mode: next` the operator also renders the Hermes bridge (`hermes-bridge`) into the agent Pod itself, unless the CR declares its own, and that container is operator-generated, so it is a further operator-managed exception: it receives the static `bridge` principal's NATS password (`NATS_PASSWORD`, a `secretKeyRef` to the `bridge-password` key of the A2A credentials Secret) and, optionally, the activity-hook signing key (`A2A_ACTIVITY_SECRET`, key `bridge-activity-key`), and it copies from the `platform-agent` container the `SESSION_KV_API_KEY` and `SESSION_KV_SALT` Secret references, the credential-broker projected token mount, and the shell sandbox SSH client key mount, along with `API_SERVER_KEY`, which is a loopback sentinel rather than a secret. It never receives the `a2a-bus` token. See [`a2a/docs/hermes-bridge.md`](../a2a/docs/hermes-bridge.md), "Where it runs".
 - Credentialed commands execute in the credential broker Pod, not in the agent sandbox.
 - The credential broker receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support. The one non-CLI interface is the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by a code allowlist (`agents/platform/scripts/api_policy.py`) and open to the shell role only; see [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md).
+- The current command proxy supports `gcloud` and `kubectl`. Additional CLIs require explicit proxy support. The one non-CLI interface is the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by a code allowlist (`agents/platform/scripts/api_policy.py`) and open to the shell role only; see [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md).
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the
@@ -92,8 +92,11 @@ sandbox is a StatefulSet of its own, and the agent gateway is a third. `sharePro
 unset in every configuration.
 
 The broker authenticates every caller. A caller presents an audience-bound projected ServiceAccount
-token (one hour; the audience is per pod, `kubeagents-credential-proxy` for the sandbox and
-`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the broker verifies
+token (one hour; the audience is per pod: `kubeagents-credential-proxy` for the sandbox,
+`kubeagents-credential-proxy-chat` for the gateway, and, under the operator's
+`A2A_SESSION_CLUSTER_VIEW` flag, `kubeagents-credential-proxy-session` for the session pods,
+bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes)
+as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path on that listener but `/healthz`;
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP
 listener in the pod is the runtime's metrics-only one on 8766, unauthenticated like
@@ -101,9 +104,11 @@ listener in the pod is the runtime's metrics-only one on 8766, unauthenticated l
 vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
 time with a ten-second deadline on each, and is the one port the broker's
 NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
-collector runs, and to no other peer
-([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
-allowlist names the gateway's ServiceAccount and the sandbox's and does not vary on which one
+collector runs, and to the operator's own pods, selected by namespace and pod label, which
+read the counters into the `PlatformAgent`'s `status.usage`; both are readers of counters, and
+no other peer reaches it by selector; the site's security reference states the one residual above one replica ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
+allowlist names the gateway's ServiceAccount and the sandbox's (and, under that flag, the
+session pods') and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a
 multi-tenancy control rather than an agent-containment one.
 The token crosses the cluster network in cleartext. And the sandbox holds that token, so it holds a

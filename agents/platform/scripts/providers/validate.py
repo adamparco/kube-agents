@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The eight validators every forge's verbs run on their arguments.
+"""The validators every forge's verbs run on their arguments.
 
 Shared rather than per-forge because the thing being validated is the caller's
 request, not the forge's API. `limit` bounds a page because a listing nobody
@@ -16,7 +16,7 @@ because it is the one on the side that holds the credential.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Mapping
 
 import repo_ref
 from workspace_paths import WorkspaceError
@@ -29,11 +29,21 @@ from workspace_paths import WorkspaceError
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+#: The one spelling of a branch, besides the bare name, that is stripped before
+#: it is compared: `refs/heads/x` names the branch `x`. `heads/x` is not read as
+#: `x`, because a forge sends a base on as the name it was given, and `heads/x`
+#: is a branch anyone may push.
+BRANCH_REF_PREFIXES = ("refs/heads/",)
+
 # How many items a listing returns. One page, deliberately: paginating walks
 # every page of an issue tracker, which is minutes of API calls and a response
 # no caller reads to the end. A truncated listing says that it is truncated.
 DEFAULT_PAGE_SIZE = 30
 MAX_PAGE_SIZE = 100
+# A conversation is the exception: it is one thread, not a tracker, and the
+# caller reading it is deciding which requests it has already answered, so its
+# markers on a later page have to be seen. Read page by page up to this.
+MAX_CONVERSATION_SIZE = 1000
 
 
 def validate_branch(value: Any, field: str = "branch") -> str:
@@ -55,6 +65,48 @@ def validate_branch(value: Any, field: str = "branch") -> str:
     ):
         raise WorkspaceError(f"{field} is not an acceptable branch name")
     return value
+
+
+def short_branch(name: str) -> str:
+    """`refs/heads/x` names the branch `x`; compare it as `x`."""
+    short = name.strip()
+    for prefix in BRANCH_REF_PREFIXES:
+        if short.startswith(prefix):
+            return short[len(prefix):]
+    return short
+
+
+def pinned_base(
+    pins: Mapping[tuple[str, str], str] | None, host: str, repo: object
+) -> str | None:
+    """The branch every proposal onto `repo` must target, or None.
+
+    `pins` maps a repository to its base, keyed as
+    `credential_proxy.parse_pinned_bases` keys it: the canonical host of the
+    repository's forge (its first listed host) and the path that forge's own
+    `parse` reads. The operator renders one entry for each repository in the
+    PlatformAgent's `spec.integration.repositories` that sets `baseBranch`.
+    Every other repository, and every install that configures none, answers
+    None, which leaves the remote's own default in charge.
+
+    `host` and `repo` are the same reading of the request: the canonical host
+    of the forge it resolved to and that forge's `parse` of it. A pin and a
+    request for one repository are then one pair however either was spelled,
+    so another spelling of the host or a path of another depth cannot fail to
+    match. Both halves are compared casefolded, and the same path on another
+    host is another repository.
+
+    The branch is returned as stored. It was put in its one canonical
+    spelling at boot, and the callers compare against it exactly, because git
+    branch names are case-sensitive.
+    """
+    if not pins or not isinstance(repo, str) or not isinstance(host, str):
+        return None
+    wanted = (host.casefold(), repo.casefold())
+    for (pinned_host, pinned_path), branch in pins.items():
+        if (pinned_host.casefold(), pinned_path.casefold()) == wanted:
+            return branch or None
+    return None
 
 
 def validate_revision(value: Any, field: str = "baseRevision") -> str:
@@ -85,6 +137,15 @@ def validate_limit(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise WorkspaceError("limit must be a positive number of items")
     return min(value, MAX_PAGE_SIZE)
+
+
+def validate_comment_limit(value: Any) -> int:
+    """`validate_limit` for a conversation read, bounded by the thread size."""
+    if value is None:
+        return DEFAULT_PAGE_SIZE
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise WorkspaceError("limit must be a positive number of items")
+    return min(value, MAX_CONVERSATION_SIZE)
 
 
 def validate_page(value: Any) -> int:

@@ -97,3 +97,23 @@ plugins:
 # to publish a Python-toolchain line that is factually wrong on this image.
 agent:
   environment_probe: false
+
+# Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
+# prompt; rationale lives in agents/platform/config.yaml, which pins the same
+# value. SOUL.md here sits just under Hermes's 20,000 fallback, so without the pin
+# the next edit to it would start cutting its middle. Cluster profiles already on
+# the volume get this key from the entrypoint's back-fill in the cluster loop.
+context_file_max_chars: 100000
+
+# Auxiliary tasks: disable Hermes auxiliary title generation (issue #2523).
+# After turn 1, Hermes fires a background _generate_session_title call with
+# reasoning_config: {enabled: false} (reasoning_effort: "minimal"). On Vertex AI
+# Gemini 3.x Flash, LiteLLM maps this to thinkingLevel: "minimal", which Vertex
+# rejects with HTTP 400 (unsupported thinking level). On Claude models, LiteLLM
+# maps "minimal" to thinking budget 1024, burning reasoning tokens on every session.
+# While the admin console Chat page and Hermes dashboard sidecar display session
+# titles when available (falling back to user message preview), disabling titling
+# avoids runtime 400 errors and token waste across all profiles.
+auxiliary:
+  title_generation:
+    enabled: false

@@ -4,11 +4,14 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -28,6 +31,10 @@ const attributionSaltLen = 32
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
+// field's comment carries the rationale.
+const defaultDelegationDepthMax = 3
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -46,6 +53,20 @@ const defaultInjectPrincipalMapPath = "/etc/a2a/inject-principal-map/principals"
 const (
 	defaultWorkerRepository = "ghcr.io/gke-labs/kube-agents/a2a-worker"
 	defaultWorkerTag        = "latest"
+)
+
+// defaultA2ADoorPrincipalMapPath is the same for the A2A door's map: its own
+// file, keys prefixed a2a:, for the reason the inject door's is.
+const defaultA2ADoorPrincipalMapPath = "/etc/a2a/a2a-door-principal-map/principals"
+
+// metricsPortEnv names the metrics listener's port (see MetricsPath in
+// metrics.go). Unset or empty means no listener, the broker's rule for
+// CREDENTIAL_PROXY_METRICS_PORT; metricsPortMin and metricsPortMax are the
+// range a set value has to fall in.
+const (
+	metricsPortEnv = "A2A_METRICS_PORT"
+	metricsPortMin = 1
+	metricsPortMax = 65535
 )
 
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
@@ -108,6 +129,27 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
+	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
+	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
+	// It is the only admission gate (beside the gateway's refusal of another
+	// workspace's member); Slack's mapping table (PrincipalMapPath) is an
+	// optional override that attributes a listed sender by an IdP identity.
+	// Member ids compare exactly.
+	SlackAllowedUsers []string
+	// SlackAllowAllUsers disables the Slack allowlist, stated explicitly -
+	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
+	// workspace's member is still refused.
+	SlackAllowAllUsers bool
+
+	// TargetAllowedUsers is the per-target, per-backend trusted-human
+	// allowlist a session's delegation is checked against: target ->
+	// backend -> ids in that backend's vocabulary. Only "platform" is
+	// populated from env today (EnvTargetAllowedUsersGchat/Slack); an absent
+	// pair means all authenticated users, and a present pair whose list is
+	// empty means nobody. The A2A door's backend ("a2a") is the exception:
+	// no pair for it means nobody (doorUnlisted). See allowlist.go.
+	TargetAllowedUsers map[string]map[string][]string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
 	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
@@ -141,6 +183,41 @@ type Config struct {
 	// sender could hold -- the property the Discord mapping table has and
 	// the reason the gateway spec calls that table a feature.
 	InjectPrincipalMapPath string
+
+	// A2ADoorListen is the A2A door's HTTP listen address (A2A_DOOR_LISTEN),
+	// and setting it arms the door. Like the inject door it is a side door,
+	// not a backend: it can be armed beside a real backend or alone, and it
+	// is not counted by the one-real-backend guard because it consumes
+	// nothing and competes for nothing. See a2a/gateway/a2adoor.go.
+	A2ADoorListen string
+
+	// A2ADoorToken is the bearer token the door requires on every RPC
+	// request (A2A_DOOR_TOKEN); the agent card is the one unauthenticated
+	// route. No unauthenticated mode for the RPCs, for the inject door's
+	// reason: the port-forward path is served from inside the pod, past
+	// the NetworkPolicy.
+	A2ADoorToken string
+
+	// A2ADoorPrincipalMapPath is the door's OWN principal map
+	// (A2A_DOOR_PRINCIPAL_MAP): keys prefixed a2a:, values eval-only
+	// identities, never a fallback to the chat map or the inject map. The
+	// developer identity class (ID tokens) arrives as a second resolver
+	// beside this file, not as an entry in it.
+	A2ADoorPrincipalMapPath string
+
+	// A2ADoorPublicURL is the URL the agent card advertises for the door's
+	// JSON-RPC endpoint (A2A_DOOR_PUBLIC_URL): what a client reaches it at,
+	// which behind a port-forward or an ingress is not the listen address.
+	// Empty makes the card advertise the address it was fetched from.
+	A2ADoorPublicURL string
+
+	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
+	// zero means no listener. It binds every interface, because its caller
+	// is the managed-Prometheus collector on the pod network, and serves
+	// MetricsPath and nothing else. It may not be either door's port: a door
+	// that lost its port to this listener would fail to bind, and a door
+	// that won it would be what the collector's NetworkPolicy rule admits.
+	MetricsPort int
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
@@ -200,19 +277,25 @@ type Config struct {
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration
 
-	// AskTTL bounds the active task's `ask` copy in session-state
-	// (A2A_ASK_TTL). The copy's stated justification — the same text rides
-	// the W-bounded stream and the copy dies at the terminal event — holds
-	// only where a terminal event is guaranteed, and the spec names the
-	// case where it is not (a wedged adapter, until every pod carries its
-	// deadline; fixed-route executors have no janitor until stage 3). So
-	// the record gets an independent bound: the reap scan clears an ask
-	// older than this, leaving the task record itself intact. Unset means
-	// 24h — far above any legitimate task's runtime, well under the
-	// stream's 72h retention, so the KV copy always has the shorter
-	// horizon the content posture claims. Raising it toward the stream
-	// retention erodes exactly that claim; lowering it only trims how long
-	// a status card can echo the ask.
+	// AskTTL bounds the copies of a turn that session-state keeps past the
+	// bus (A2A_ASK_TTL): the active task's `ask` copy, and each task history
+	// entry's requester (backend and pseudonymized subject) and attribution,
+	// aged by the entry's StartedAt. The ask copy's stated justification —
+	// the same text rides the W-bounded stream and the copy dies at the
+	// terminal event — holds only where a terminal event is guaranteed, and
+	// the spec names the case where it is not (a wedged adapter, until every
+	// pod carries its deadline; fixed-route executors have no janitor until
+	// stage 3). So the record gets an independent bound: the reap scan
+	// clears an ask, and a history entry's requester and attribution, once
+	// they are this old (exactly this old included), leaving the task record
+	// and the history entry themselves intact. Unset means 24h — far above
+	// any legitimate task's runtime, well under the stream's 72h retention,
+	// so the KV copies always have the shorter horizon the content posture
+	// claims. Raising it toward the stream retention erodes exactly that
+	// claim; lowering it trims how long a status card can echo the ask, and
+	// how long after a turn a child task can still be minted on its behalf:
+	// past the TTL the entry has no requester to check, so a delegation from
+	// it is refused.
 	AskTTL time.Duration
 
 	// SessionTTL bounds the lifetime of idle session records in session-state
@@ -274,6 +357,15 @@ type Config struct {
 	// earlier and in one place.
 	SessionServiceAccount string
 
+	// SessionClusterView gives spawned session pods the temporary read-only
+	// cluster view: a projected token for the credential broker's session
+	// audience, the broker's URL, and Bash in the worker. Rendered by the
+	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// exactly the inert one. CredentialProxyURL is where the shim dials;
+	// New refuses the view without it.
+	SessionClusterView bool
+	CredentialProxyURL string
+
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
 	// It ships false: for one TASKS retention window after an install takes
@@ -282,6 +374,32 @@ type Config struct {
 	// every recent task non-terminal. Flip it no earlier than one retention
 	// window (72h at the dev default) after the split reaches the install.
 	StrictEventsWriter bool
+
+	// AuthorityTier and AuthorityScope are what the gateway mints a task's
+	// root capability at: the ceiling for this agent, from which every hop
+	// can only narrow.
+	//
+	// They come from the environment because there is nowhere better yet.
+	// 02-agent-personas §9 puts `tier` and `scope` on the Agent CRD, and
+	// that CRD does not exist — PlatformAgent carries neither, and inventing
+	// them on it is an API change this card is not. The operator renders
+	// neither — so the defaults below are what every rendered install runs
+	// on, not a local-run convenience, and they are deliberately the
+	// narrowest thing that could be true: the ceiling an operator has not
+	// chosen must not be a generous one.
+	AuthorityTier  capability.Tier
+	AuthorityScope capability.Scope
+
+	// CapabilityOptional relaxes exactly one thing: what happens when this
+	// gateway cannot mint. Zero value — the safe one — refuses the turn.
+	// Set, a mint failure logs and the envelope goes out with `grants: null`,
+	// which is the pre-A3b shape, for an install whose bus has no `cap`
+	// bucket yet. The executor has the matching knob and the operator renders
+	// both from A2A_CAPABILITY_REQUIRED, so the two halves cannot drift.
+	//
+	// It is NOT a switch for enforcement. A capability that exists is always
+	// checked, and no configuration makes a refused verb run.
+	CapabilityOptional bool
 
 	// MaxSessions caps how many session pods run concurrently, gateway-wide
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
@@ -302,16 +420,29 @@ type Config struct {
 	// ignores its own cap and cannot ignore that one), which is also what
 	// bounds the count-then-create race between concurrent conversations.
 	MaxSessions int
+
+	// DelegationDepthMax bounds how deep a delegation chain may run
+	// (A2A_DELEGATION_DEPTH_MAX). A human turn is depth 0, a child its
+	// parent's depth plus one, and a turn already at the bound may not
+	// delegate again. One child at a time means the chain is a line, and
+	// this bounds its length: a harness that delegates in a loop stops at
+	// the bound instead of walking the session cap.
+	//
+	// Zero means 3. FromEnv refuses a value under 1 rather than clamping
+	// it: 0 would be "delegation off", which is a different switch
+	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
+	DelegationDepthMax int
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when the inject side door is the only way in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) is the only way
+// in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //
-// The door is deliberately not one of the answers. It can be armed beside
-// any one backend, so "which backend is this gateway" and "is the door open"
-// are two questions, and collapsing them is what would make the door
+// The doors are deliberately not among the answers. Either can be armed
+// beside any one backend, so "which backend is this gateway" and "is a door
+// open" are two questions, and collapsing them is what would make a door
 // exclusive again.
 func (c *Config) Backend() string {
 	switch {
@@ -321,8 +452,8 @@ func (c *Config) Backend() string {
 		return slackBackend
 	case c.DiscordToken != "":
 		return discordBackend
-	case c.InjectListen != "":
-		// No real backend: the door is the whole of the ingress, and the
+	case c.InjectListen != "" || c.A2ADoorListen != "":
+		// No real backend: a door is the whole of the ingress, and the
 		// attribution on a message that comes through it is the door's own.
 		return ""
 	default:
@@ -337,6 +468,9 @@ func (c *Config) Backend() string {
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
+// A2ADoorArmed reports whether the A2A door is open.
+func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -344,8 +478,8 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
-		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
-		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
+		SlackBotToken:    pyStrip(os.Getenv("SLACK_BOT_TOKEN")),
+		SlackAppToken:    pyStrip(os.Getenv("SLACK_APP_TOKEN")),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
@@ -354,6 +488,11 @@ func FromEnv() (*Config, error) {
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
+		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
+		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
+		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		CapabilityOptional:    capability.OptionalFromEnv(),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -363,9 +502,37 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.TargetAllowedUsers = map[string]map[string][]string{}
+	platformLists := map[string][]string{}
+	// Set is a list, even set empty: the operator renders the var empty for
+	// a CR list of blanks, which admits nobody. Unset is no list.
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersGchat); ok {
+		platformLists[gchatBackend] = append([]string{}, splitList(raw)...)
+	}
+	if raw, ok := os.LookupEnv(EnvTargetAllowedUsersSlack); ok {
+		platformLists[slackBackend] = append([]string{}, splitList(raw)...)
+	}
+	if len(platformLists) > 0 {
+		cfg.TargetAllowedUsers[targetPlatform] = platformLists
+	}
+	for _, u := range strings.Split(os.Getenv("A2A_SLACK_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.SlackAllowedUsers = append(cfg.SlackAllowedUsers, u)
+		}
+	}
+	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
+	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
+	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
+	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
+	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
+	metricsPort, err := metricsPortFromEnv(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MetricsPort = metricsPort
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
@@ -395,8 +562,9 @@ func FromEnv() (*Config, error) {
 	if cfg.DiscordToken != "" {
 		armed = append(armed, "DISCORD_TOKEN")
 	}
-	// The inject door is NOT in that list, decided 2026-09-17 on the design
-	// doc's review. The guard exists so that arming two backends cannot leave
+	// The doors (inject, A2A) are NOT in that list, decided 2026-09-17 on
+	// the design doc's review for the inject door and holding for its
+	// sibling. The guard exists so that arming two backends cannot leave
 	// one of them silently unconsumed: two processes on one Chat relay
 	// durable split its event deliveries, and the symptom is a gateway that
 	// looks healthy and answers half the messages. A local HTTP door has no
@@ -416,11 +584,11 @@ func FromEnv() (*Config, error) {
 		// inject-only when it does, and says so on the door's read route,
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
-		if cfg.InjectListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), or A2A_INJECT_LISTEN (the dev-only inject side door)")
+		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" {
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), or A2A_DOOR_LISTEN (the A2A door for agent callers)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside any one of them", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
@@ -430,11 +598,21 @@ func FromEnv() (*Config, error) {
 	if cfg.InjectListen != "" && cfg.InjectToken == "" {
 		return nil, fmt.Errorf("A2A_INJECT_TOKEN is required when A2A_INJECT_LISTEN is set: the inject door authenticates every request with a bearer token, because neither its loopback bind nor the NetworkPolicy in front of it governs the port-forward path its caller uses")
 	}
+	if cfg.A2ADoorListen != "" && cfg.A2ADoorToken == "" {
+		return nil, fmt.Errorf("A2A_DOOR_TOKEN is required when A2A_DOOR_LISTEN is set: the A2A door authenticates every RPC request with a bearer token (the agent card alone is open), for the reason the inject door does; see Config.A2ADoorToken")
+	}
 	// Only when the spawn path is armed: a gateway that spawns nothing has
 	// no session identity to name, and demanding one would break every
 	// bridge-only install.
 	if cfg.SpawnSessions && cfg.SessionServiceAccount == "" {
 		return nil, fmt.Errorf("A2A_SESSION_SERVICE_ACCOUNT is required when A2A_SPAWN_SESSIONS is true; session pods authenticate to the bus as it, and there is no safe default")
+	}
+	cfg.defaultCapabilityCeiling()
+	// Validated at boot rather than at mint: a bad tier or scope would
+	// otherwise surface as every task failing to start, one refusal at a
+	// time, with the cause in the gateway's logs and not the operator's.
+	if err := cfg.validateCapabilityCeiling(); err != nil {
+		return nil, err
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
@@ -453,6 +631,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	depthMax := envOr("A2A_DELEGATION_DEPTH_MAX", strconv.Itoa(defaultDelegationDepthMax))
+	dm, err := strconv.Atoi(depthMax)
+	if err != nil || dm < 1 {
+		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
+	}
+	cfg.DelegationDepthMax = dm
 	ttl := envOr("A2A_IDLE_TTL", "30m")
 	d, err := time.ParseDuration(ttl)
 	if err != nil {
@@ -544,9 +728,94 @@ func FromEnv() (*Config, error) {
 	return cfg, nil
 }
 
+// metricsPortFromEnv reads A2A_METRICS_PORT: zero when unset or empty, else
+// a port in range that neither door's listen address already names. A bad
+// value refuses the boot, like every other setting FromEnv reads; the
+// operator renders a valid one, so only a hand edit reaches these refusals.
+func metricsPortFromEnv(cfg *Config) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(metricsPortEnv))
+	if raw == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < metricsPortMin || port > metricsPortMax {
+		return 0, fmt.Errorf("%s %q: need a port in %d-%d", metricsPortEnv, raw, metricsPortMin, metricsPortMax)
+	}
+	for _, door := range []struct{ name, listen string }{
+		{"the inject door", cfg.InjectListen},
+		{"the A2A door", cfg.A2ADoorListen},
+	} {
+		if door.listen == "" {
+			continue
+		}
+		// Compared as the number net.Listen will bind, not as the string:
+		// net.LookupPort is the parse net.Listen runs on the port, so a
+		// zero-padded, signed or named spelling of this port is caught here
+		// rather than as a door that loses the bind to this listener. An
+		// address or port it cannot read is skipped, because the door's own
+		// net.Listen refuses it the same way when it binds; that failure is
+		// the door's, and not a collision with this listener.
+		_, doorPortRaw, err := net.SplitHostPort(door.listen)
+		if err != nil {
+			continue
+		}
+		if doorPort, err := net.LookupPort("tcp", doorPortRaw); err == nil && doorPort == port {
+			return 0, fmt.Errorf("%s %d is the port %s listens on (%q); the metrics listener needs a port of its own", metricsPortEnv, port, door.name, door.listen)
+		}
+	}
+	return port, nil
+}
+
+// pyStrip trims what Python's str.strip() trims and nothing more. The Slack
+// pair is the one credential the gateway shares with the broker, which reads
+// the same Secret keys with .strip() (credential_proxy.py); reading them the
+// same way keeps a value that worked under `today` (a trailing newline from
+// --from-file or an `echo` without -n) working under `next`. Python's
+// whitespace is Go's unicode.IsSpace plus the four separators U+001C-U+001F.
+func pyStrip(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
+	})
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+// defaultCapabilityCeiling fills the tier and scope the gateway mints under.
+// Tests and embedders build Config directly, bypassing FromEnv, and the
+// ceiling is inherited by every hop of every task, so the unset value has to
+// be the narrowest thing that is certainly true rather than the widest thing
+// that would work.
+func (c *Config) defaultCapabilityCeiling() {
+	if c.AuthorityTier == "" {
+		c.AuthorityTier = capability.TierDeveloperTeam
+	}
+	if c.AuthorityScope == "" {
+		c.AuthorityScope = capability.NamespaceScope(c.Namespace)
+	}
+}
+
+// validateCapabilityCeiling runs the ceiling through the same validation a
+// minted entry gets, so a bad tier or scope is a boot failure the operator
+// sees rather than a per-task refusal in the gateway's log.
+func (c *Config) validateCapabilityCeiling() error {
+	// The namespace first, because it is the rung the default ceiling is
+	// built from and Entry.Validate cannot speak for it: a namespace with an
+	// even number of separators makes a scope that validates cleanly as a
+	// DIFFERENT ceiling, so running the Entry check alone would pass the
+	// gateway out of boot minting against something nobody chose. Checked
+	// even when A2A_AUTHORITY_SCOPE is set, because an explicit scope does
+	// not make a malformed namespace correct -- it only hides it here.
+	if err := capability.ValidateNamespace(c.Namespace); err != nil {
+		return fmt.Errorf("POD_NAMESPACE: %w", err)
+	}
+	e := capability.Entry{Tier: c.AuthorityTier, Scope: c.AuthorityScope, Delegate: "boot-check"}
+	if err := e.Validate(); err != nil {
+		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
+	}
+	return nil
 }

@@ -32,6 +32,10 @@ const (
 	// dial, adapter and run failures all leave through it, each having
 	// logged its own reason at the site that found it.
 	exitFailure = 1
+
+	// metricsUnavailableAlert is the one line a metrics listener that could
+	// not start leaves, whichever step refused it.
+	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics until it restarts, and conversations are unaffected"
 )
 
 func main() {
@@ -52,6 +56,47 @@ func run() int {
 		return exitFailure
 	}
 	return 0
+}
+
+// buildAdapters puts the configured chat backend and the console adapter
+// behind one mux. The console runs whenever the gateway runs: its identity
+// renders under mode next like the rest of the bus, and a render that
+// predates it surfaces as a logged refusal on the console subscription, not a
+// boot failure (spec-chatops-gateway.md, "The console adapter"). With no real
+// backend (an inject-only eval install) the console is the only chat backend
+// and is returned alone, since a mux of one would need a key for nothing.
+func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+	console, err := gateway.NewConsoleAdapter(cfg.NATSURL, natsOpts, log)
+	if err != nil {
+		return nil, err
+	}
+	if primary == nil {
+		return console, nil
+	}
+	return gateway.NewMultiAdapter(cfg.Backend(), "console", map[string]gateway.Adapter{
+		cfg.Backend(): primary,
+		"console":     console,
+	}, log)
+}
+
+// composeAdapters is the whole stack the gateway drives: the chat backends
+// behind the mux, and the doors (inject, A2A), when armed, beside the mux
+// rather than inside it. The order matters. The gateway finds the door's
+// ProbeSink, TaskObserver and InboundObserver by type assertion on the top
+// of the stack, and the side door implements them for exactly that reason
+// (sidedoor.go). MultiAdapter has no ProbeSink or InboundObserver and its
+// prefix dispatch has no key for an inject: or a2a: conversation. It does pass
+// TaskObserver and SessionLookupSink on to the chat backend, which is how
+// the Slack adapter below it learns its session threads.
+func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, doors []gateway.DoorSpec, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
+	chat, err := buildAdapters(cfg, primary, natsOpts, log)
+	if err != nil {
+		return nil, err
+	}
+	if len(doors) == 0 {
+		return chat, nil
+	}
+	return gateway.WithSideDoors(chat, doors, log), nil
 }
 
 // realMain is the gateway from configuration to shutdown. Every failure is
@@ -90,15 +135,25 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// FromEnv already enforced at most one real backend, and that the door
 	// carries a token if it is armed at all.
 	backend := cfg.Backend()
+	// One set of counters for the whole process: the gateway counts what it
+	// relays, the Chat adapter counts its pulls, and the metrics listener
+	// serves both (gateway/metrics.go).
+	metrics := gateway.NewMetrics()
 	var adapter gateway.Adapter
 	switch backend {
 	case "gchat":
-		adapter, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+		var chat *gateway.GoogleChatAdapter
+		chat, err = gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
+		if err == nil {
+			chat.SetMetrics(metrics)
+			adapter = chat
+		}
 	case "slack":
 		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 	case "":
-		// No real backend: the inject door is the only ingress, which is what
-		// lets an eval install's gateway start at all (#1660).
+		// No real backend: the doors (inject, A2A) and the console are the
+		// only ingresses, which is what lets an eval install's gateway start
+		// at all (#1660).
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}
@@ -110,13 +165,36 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// of the above, and the composite routes by conversation key. Dev and
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
 	// token only under its eval flag. See a2a/gateway/inject.go.
+	var doors []gateway.DoorSpec
 	if cfg.InjectArmed() {
-		door, derr := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
-		if derr != nil {
-			log.Error("inject door", "err", derr)
-			return derr
+		door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		if err != nil {
+			log.Error("inject door", "err", err)
+			return err
 		}
-		adapter = gateway.WithSideDoor(adapter, door, log)
+		doors = append(doors, gateway.InjectDoorSpec(door))
+	}
+	// The A2A door is the same kind of thing for an agent caller: armed
+	// beside either backend or alone, routed by its own key prefix, its
+	// callers resolved through its own map. See a2a/gateway/a2adoor.go.
+	if cfg.A2ADoorArmed() {
+		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
+			PublicURL:        cfg.A2ADoorPublicURL,
+			DefaultAddressee: cfg.DefaultAddressee,
+			TaskDeadline:     cfg.TaskDeadline,
+			Logger:           log,
+		})
+		if err != nil {
+			log.Error("A2A door", "err", err)
+			return err
+		}
+		doors = append(doors, gateway.A2ADoorSpec(door))
+	}
+
+	adapter, err = composeAdapters(cfg, adapter, doors, natsOpts, log)
+	if err != nil {
+		log.Error("console adapter", "err", err)
+		return err
 	}
 
 	gw, err := gateway.New(gateway.Options{
@@ -125,6 +203,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		Config:  cfg,
 		Logger:  log,
 		Backend: backend,
+		Metrics: metrics,
 	})
 	if err != nil {
 		log.Error("gateway", "err", err)
@@ -135,12 +214,43 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"nats", cfg.NATSURL,
 		"backend", backend,
 		"injectDoor", cfg.InjectArmed(),
+		"a2aDoor", cfg.A2ADoorArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
-	if err := gw.Run(ctx); err != nil && ctx.Err() == nil {
+	return serve(ctx, cfg, metrics, log, gw.Run)
+}
+
+// serve is realMain's last step: the metrics listener beside the gateway,
+// then the gateway until ctx is done. run is gw.Run; it is a parameter so a
+// test can reach this step without a bus and see that a metrics listener
+// which cannot start leaves its ALERT line and does not stop the gateway.
+func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger, run func(context.Context) error) error {
+	startMetricsListener(ctx, cfg, metrics, log)
+	if err := run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("gateway exited", "err", err)
 		return err
 	}
 	return nil
+}
+
+// startMetricsListener serves the counters on A2A_METRICS_PORT when it is
+// set, on a goroutine of its own. Never fatal, the broker's rule for its own
+// listener: a port that will not bind costs the gateway its metrics, not the
+// conversations it exists to carry, and the ALERT line is the signal.
+func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger) {
+	if cfg.MetricsPort == 0 {
+		log.Info("metrics listener disabled: A2A_METRICS_PORT is unset")
+		return
+	}
+	srv, err := gateway.NewMetricsServer(cfg.MetricsPort, metrics, log)
+	if err != nil {
+		log.Error(metricsUnavailableAlert, "err", err)
+		return
+	}
+	go func() {
+		if err := srv.Run(ctx); err != nil {
+			log.Error(metricsUnavailableAlert, "err", err)
+		}
+	}()
 }

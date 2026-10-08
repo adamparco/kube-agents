@@ -18,10 +18,11 @@ resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
 produced the run: the presubmit gate, or the nightly periodic below),
 `runs[].has_build_log` plus the `runs[].pod_*` trio (how the build ended,
 from Prow's podinfo.json -- read only for a build that looks like a lost
-pod, below), `runs[].merge_conflict` (below) and `releases[]`
-(release-candidate eval runs, below).
+pod, below), `runs[].merge_conflict` (below), `runs[].eval_outcome` with
+`runs[].not_evaluated` (the suite's own not-evaluated verdict, below) and
+`releases[]` (release-candidate eval runs, below).
 
-Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
+Three tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
 gate matrix on every pull request; the nightly periodic
 (ci-kube-agents-eval-nightly, EVAL_TIER=nightly in the same script) runs the
 full catalogue against main once a day, with no pull request. Both archive
@@ -29,7 +30,12 @@ the same artifact layout, so both parse through build_run; the tier travels
 on the run so every consumer can keep the nightly out of the gate's verdicts
 (tiers.py). Prow's build ids are one global, start-ordered sequence, so the
 newest presubmit id sits far above every nightly id and a shared watermark
-would skip every night: each source keeps its own.
+would skip every night: each source keeps its own. The GitLab lane
+(pull-kube-agents-smoke-test-gitlab, --gitlab-pr-glob) is a third source of
+the same shape as the presubmit's -- pull-request builds, read through the
+job's directory index -- tagged tier `gitlab` with a watermark of its own,
+for the same reason: it runs rarely, so its newest id sits far below the
+presubmit's.
 
 A build whose node went NotReady mid-run (2026-09-11: twelve runs on five
 nodes, #1478) leaves finished.json (`failure`), podinfo.json and no
@@ -43,6 +49,32 @@ A pull request that will not merge into main leaves the same zero-task
 FAILURE (2026-09-15: #1569, #1572, #1575, reported as an infrastructure
 degradation; #1608). clone-records.json is read for those builds too, and
 `merge_conflict` says which of the two it was.
+
+A run the suite could not evaluate -- an admitted case, or every case, lost
+every repetition to infrastructure -- ends with the same `PR Smoke Test
+Evaluation Failed` anchors on its final line, with `NOT EVALUATED` between
+them, and `outcome: not_evaluated` in the `eval-verdict.json` that
+`bench-gate suite` wrote into the job's artifacts (hack/ci-eval-pr.sh,
+announce_suite_verdict). The line alone is not trusted: for a build whose
+final line carries the marker, that one artifact is read as well, and only
+when its `outcome` agrees and it names at least one case id under
+`not_evaluated` does the run carry `eval_outcome: "not_evaluated"` and those
+ids -- the same double check the script makes before it prints the marker,
+plus the list: the suite names every gradable case or the admitted ones it
+lost on that shape (scoring.py, grade_suite), both non-empty, so an artifact
+with the outcome word and no usable id is hand-written or corrupted, and
+recording it would headline "0 gate cases lost". The same outcome word and marker also end an
+inject-lane run whose every case was set aside as not graded on its
+transport (scoring.py, `nothing_gradable`): that artifact names nothing
+under `not_evaluated` and the cases under `not_graded`, and the script's
+final line says so instead of naming infrastructure. Nothing was lost on
+such a run and a retest would not change it, so the collector keeps it on
+the plain RED (graded_nothing, with a note on stderr) rather than recording
+an infrastructure loss the pages would tell the author to retest; a lane
+for that shape is the next-mode view's (#2008). `eval_verdict` stays `RED`
+in every case, so a reader of that field alone keeps working; the consumers
+that tell a not-evaluated run from a red one (classify.py, gate_comment.py)
+read `eval_outcome`.
 
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
@@ -72,6 +104,17 @@ Sources:
               failure IS the refusal line: a stall, not an absent job.
   --nightly-job  the job name recorded on nightly runs (`runs[].job`);
               defaults to the prefix's last path segment.
+  --nightly-writers-prefix  the same, for the nightly's writers periodic
+              (a night split across two jobs; nightly.py joins the two
+              builds into one night). Given without a value it is
+              DEFAULT_NIGHTLY_WRITERS_PREFIX; omitted, no writers scan. It
+              is read the three ways above against a watermark of its own,
+              so until a writers build is on record a listing failure other
+              than a hang is a note, and its job is always the prefix's
+              last segment. nightly.py files a run as the writers part only
+              under DEFAULT_NIGHTLY_WRITERS_JOB, so a prefix ending in any
+              other job is collected but reported as the main part, and is
+              warned about.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
               directory/<job>/: one small `<build_id>.txt` object per build
               holding the gs:// path of that build's directory (plus a
@@ -175,6 +218,15 @@ SCHEMA_VERSION = 1
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
 NIGHTLY_LOGS_ROOT = "gs://kube-agents-evals-nightly-logs/logs"
 DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
+# The nightly's second periodic when a night is split across two pool
+# projects (#2467): the cases that request a pull request, on a project of
+# their own, logging to the same bucket. Its runs are tier `nightly` too,
+# told apart by their job (nightly.py, NIGHTLY_WRITERS_JOB), and it keeps a
+# watermark of its own: both jobs start at 00:00 UTC, and the shorter
+# writers build, recorded first, must not lift the main job's watermark
+# over a main build the listing has not named yet.
+DEFAULT_NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
+DEFAULT_NIGHTLY_WRITERS_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_JOB}/"
 # Where Prow's Spyglass shows a build directory: the gs:// path after the
 # scheme, so a link follows the bucket the build was read from.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
@@ -250,6 +302,38 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # the health adjudicator needs to tell a lost pod from a clone failure.
 PODINFO_FILE = "podinfo.json"
 BUILD_LOG_FILE = "build-log.txt"
+# The suite's own verdict, written by `bench-gate suite --json-out` into
+# the job's artifacts and uploaded by Prow beside the log (module
+# docstring). Read only for a build whose final line carries the marker
+# between its anchors -- one extra object for those builds, none for any
+# other -- and honoured only when its `outcome` is the word below, which is
+# scoring.py's SUITE_OUTCOME_NOT_EVALUATED and hack/ci-eval-pr.sh's
+# EVAL_VERDICT_OUTCOME_NOT_EVALUATED.
+EVAL_VERDICT_FILE = "artifacts/eval-verdict.json"
+NOT_EVALUATED_MARKER = "NOT EVALUATED"
+EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
+# The artifact's two lists (scoring.py, SuiteVerdict.to_dict). Two writers
+# share the outcome word: weather that took an admitted case or every case
+# names the lost cases under `not_evaluated`; an inject-lane run whose every
+# case was set aside as not graded on its transport names nothing there and
+# the cases under `not_graded`. hack/ci-eval-pr.sh's announce_suite_verdict
+# tells them apart on the two lists before it prints its final line, and
+# graded_nothing() below is that test; only the first shape is recorded.
+NOT_EVALUATED_KEY = "not_evaluated"
+NOT_GRADED_KEY = "not_graded"
+# The artifact is written by the checkout under test, so its `not_evaluated[]`
+# strings are the pull request's to choose, and they end up in backticks in
+# the comment the health bot posts. Only a string shaped like a case id is
+# kept -- the case-id grammar SCHEMA.md states for the pages (`caseIdRe` in
+# template/pages.js): the charset a `bench/tasks/<id>` directory name draws
+# from, with no whitespace, no backtick and no `@`, at most 80 characters, so
+# an id the pages link is one the collector keeps -- and the list is cut at
+# the size a suite could name; the rest is dropped as malformed detail, the
+# way a non-string entry already is. Same idea as the log parser's `\S+`
+# task names and the excerpt scrub in gate_comment.py. Matched with
+# `fullmatch`: a `$` anchor under `match` admits one trailing newline.
+_CASE_ID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+NOT_EVALUATED_MAX_CASES = 64
 # Prow's clone-records.json: `[{refs, commands[], failed}]`. Read for the
 # zero-task FAILURE builds, to separate a pull request that would not merge
 # into its base from a setup crash.
@@ -271,6 +355,10 @@ CONTAINER_RUNNING = "running"
 # The build log is the largest object read; a transient gsutil failure on it
 # alone would otherwise look exactly like a pod that never uploaded one.
 LOG_READ_ATTEMPTS = 2
+# The verdict artifact gets the same second attempt: a transient miss on it
+# would otherwise record a not-evaluated run as the hard red for good, since
+# a recorded build is never re-read.
+VERDICT_READ_ATTEMPTS = LOG_READ_ATTEMPTS
 # Prow's job verdict for a failed build, as finished.json spells it (also
 # seen lowercase in the wild; compared case-insensitively).
 FINISHED_FAILURE = "FAILURE"
@@ -477,6 +565,7 @@ def parse_build_log(text: str) -> dict:
     current = None  # the task the next rep grading line belongs to
     eval_verdict = None
     eval_duration_s = None
+    not_evaluated_line = False
     for line in text.splitlines():
         # The agent's own words first, and consumed whole: every other
         # pattern below that is an unanchored `search` (the lease, the final
@@ -519,13 +608,77 @@ def parse_build_log(text: str) -> dict:
         if m:
             eval_verdict = m.group("verdict")
             eval_duration_s = int(m.group("duration"))
+            # The classification words sit between the anchors (module
+            # docstring); the line only says which builds to read the
+            # verdict file for.
+            not_evaluated_line = NOT_EVALUATED_MARKER in line
             current = None  # nothing after the verdict is grading detail
     return {
         "project": project,
         "tasks": tasks,
         "eval_verdict": eval_verdict,
         "eval_duration_s": eval_duration_s,
+        "not_evaluated_line": not_evaluated_line,
     }
+
+
+def load_eval_verdict(text: str | None) -> dict | None:
+    """The parsed `eval-verdict.json` when it is an object whose `outcome`
+    is `not_evaluated`, else None: a missing or malformed file, or any other
+    outcome. The caller then records the run as the plain RED its final
+    line's `Failed` word already says, never a not-evaluated one on the
+    line's word alone."""
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+    except (ValueError, RecursionError):
+        # The artifact is the checkout's own. json.loads raises
+        # RecursionError, not ValueError, past its nesting depth, and an
+        # exception here would escape build_run and drop the build from the
+        # sweep; malformed means the plain RED, whatever the malformation.
+        return None
+    if not isinstance(doc, dict) or doc.get("outcome") != EVAL_OUTCOME_NOT_EVALUATED:
+        return None
+    return doc
+
+
+def graded_nothing(doc: dict) -> bool:
+    """True for the inject lane's shape of the outcome: nothing under
+    `not_evaluated` and something under `not_graded` (NOT_GRADED_KEY). The
+    same test hack/ci-eval-pr.sh makes before it prints the "not graded on
+    this transport" final line rather than the infrastructure one; the two
+    ask for opposite actions (a roster, or a rerun), so that shape is not
+    recorded as an infrastructure loss."""
+    return not doc.get(NOT_EVALUATED_KEY) and bool(doc.get(NOT_GRADED_KEY))
+
+
+def not_evaluated_ids(doc: dict) -> list[str]:
+    """The case ids under `not_evaluated`. A list that is absent or
+    malformed reads as empty, and an entry that is not shaped like a case id
+    (`_CASE_ID_SHAPE`) is dropped. Empty is not recorded: build_run keeps
+    such a build on the plain RED (module docstring), because the suite
+    always names a case on the infrastructure shape."""
+    named = doc.get(NOT_EVALUATED_KEY)
+    if not isinstance(named, list):
+        return []
+    return [case for case in named if isinstance(case, str) and _CASE_ID_SHAPE.fullmatch(case)][:NOT_EVALUATED_MAX_CASES]
+
+
+def parse_eval_verdict(text: str | None) -> list[str] | None:
+    """The case ids a not-evaluated `eval-verdict.json` names, or None.
+
+    None for a missing or malformed file, for any other `outcome`, for the
+    inject lane's graded-nothing shape (graded_nothing), and for an
+    infrastructure-shape artifact that names no case id: the caller then
+    records the run as the plain RED its final line's `Failed` word already
+    says. build_run reads the pieces itself so its stderr line can say
+    which of the three it was.
+    """
+    doc = load_eval_verdict(text)
+    if doc is None or graded_nothing(doc):
+        return None
+    return not_evaluated_ids(doc) or None
 
 
 def _iso(ts) -> str | None:
@@ -628,7 +781,7 @@ def build_run(
     Returns None when the build has no parseable finished.json -- the run is
     still in flight or never finished uploading, so there is nothing final to
     record. `tier` and `job` are the source's, not the build's: the same
-    artifact layout parses for both tiers, and a nightly build has no pull
+    artifact layout parses for every tier, and a nightly build has no pull
     request whatever its metadata says.
     """
     finished_text = read("finished.json")
@@ -659,6 +812,49 @@ def build_run(
             break
     parsed = parse_build_log(log_text or "")
     result = finished.get("result")
+
+    # The suite's own verdict (module docstring): one read of the artifact,
+    # only for a build whose final line says NOT EVALUATED, and only
+    # recorded when the artifact agrees. A line without an agreeing file
+    # is the plain RED the line's `Failed` word already says, with a
+    # warning so a renamed artifact cannot silently turn every such run
+    # back into a hard failure.
+    suite: dict = {}
+    if parsed["not_evaluated_line"]:
+        verdict_text = None
+        for _attempt in range(VERDICT_READ_ATTEMPTS):
+            verdict_text = read(EVAL_VERDICT_FILE)
+            if verdict_text is not None:
+                break
+        doc = load_eval_verdict(verdict_text)
+        if doc is None:
+            print(
+                f"warning: build {build_id}: the final line says {NOT_EVALUATED_MARKER} but"
+                f" {EVAL_VERDICT_FILE} is missing or does not agree; recorded as a plain RED",
+                file=sys.stderr,
+            )
+        elif graded_nothing(doc):
+            # The inject lane's shape (module docstring): not weather, and
+            # the run page and the comment have no lane for it yet, so it
+            # stays the plain RED rather than telling the author to retest.
+            print(
+                f"note: build {build_id}: {EVAL_VERDICT_FILE} says every case was not graded on"
+                f" its transport ({NOT_GRADED_KEY} named, {NOT_EVALUATED_KEY} empty); recorded as a"
+                " plain RED, which is not an infrastructure loss",
+                file=sys.stderr,
+            )
+        elif not not_evaluated_ids(doc):
+            # The infrastructure shape with nothing usable under the key
+            # (module docstring): the suite names at least one case there,
+            # so this is not its artifact. Recording it would headline
+            # "0 gate cases lost" and tell the author to retest.
+            print(
+                f"warning: build {build_id}: {EVAL_VERDICT_FILE} says {EVAL_OUTCOME_NOT_EVALUATED} but"
+                f" names no case id under {NOT_EVALUATED_KEY}; recorded as a plain RED",
+                file=sys.stderr,
+            )
+        else:
+            suite = {"eval_outcome": EVAL_OUTCOME_NOT_EVALUATED, NOT_EVALUATED_KEY: not_evaluated_ids(doc)}
 
     # How the build ended (module docstring). A build that ran has a log and
     # costs no extra read; the two shapes a lost pod leaves -- no log at all,
@@ -740,6 +936,7 @@ def build_run(
         "eval_verdict": _EVAL_VERDICT_BY_WORD.get(parsed["eval_verdict"]),
         "duration_s": duration_s,
         "tasks": parsed["tasks"],
+        **suite,
         **ended,
     }
 
@@ -1363,6 +1560,19 @@ def discovery_index(glob: str, index_prefix: str | None) -> str | None:
     return f"{m.group('root')}/{INDEX_DIRECTORY_SEGMENT}/{m.group('job')}/"
 
 
+def _unlisted_is_note(allowed: bool, after_build: int | None, stderr: str | None) -> bool:
+    """The nightly's rule (runs_from_periodic), for a source that must never
+    stop the gate's dashboard publishing: with nothing of it on record any
+    failed listing is a note (the job may not exist yet); with a watermark,
+    only a listing that matched no objects is (its index purged or moved,
+    the job renamed, while a run from before sits on record) -- any other
+    failure is the bucket or the grant failing, the warning line. A timeout
+    is the warning line either way, from _gsutil_call."""
+    if not allowed:
+        return False
+    return after_build is None or bool(_NO_OBJECTS.search(stderr or ""))
+
+
 def runs_from_index(
     index_prefix: str,
     gsutil: str = "gsutil",
@@ -1370,6 +1580,8 @@ def runs_from_index(
     since_cutoff: datetime | None = None,
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    unlisted_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds through Prow's per-job directory index, then read them.
 
@@ -1377,12 +1589,16 @@ def runs_from_index(
     names, one pointer read per admitted build (concurrent), then the same
     per-build reads as the glob path. A failed listing is a warning and an
     empty result -- the refresh workflow greps for that warning and refuses
-    to publish, so a stall never republishes old runs as fresh.
+    to publish, so a stall never republishes old runs as fresh -- unless
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
     """
     prefix = index_prefix.rstrip("/") + "/"
-    listing = _gsutil(["ls", prefix], gsutil)
+    listing, stderr = _gsutil_call(["ls", prefix], gsutil)
     if listing is None:
-        print(f"warning: gsutil ls failed for {prefix}; nothing new this scan", file=sys.stderr)
+        if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+            print(f"note: directory index {prefix} did not list (no builds yet, or moved); nothing from it this scan", file=sys.stderr)
+        else:
+            print(f"warning: gsutil ls failed for {prefix}; nothing new this scan", file=sys.stderr)
         return []
     wanted = sorted(
         (b for b in _index_build_ids(listing) if _admitted(b, after_build, retry_builds)),
@@ -1402,7 +1618,7 @@ def runs_from_index(
                 candidates.append((build_id, base))
             elif retry and unfinished is not None:
                 unfinished.add(build_id)
-    return _read_builds(candidates, gsutil, since_cutoff, unfinished)
+    return _read_builds(candidates, gsutil, since_cutoff, unfinished, tier=tier)
 
 
 def runs_from_gcs(
@@ -1412,21 +1628,28 @@ def runs_from_gcs(
     since_cutoff: datetime | None = None,
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    unlisted_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds by listing the build-directory glob(s), then read them.
 
     The whole-archive listing grows with the archive and times out past
     ~1700 builds, so this is the cold-sweep path; an incremental scan goes
-    through runs_from_index.
+    through runs_from_index. A glob that does not list is the `warning:
+    gsutil ls ... failed` line the refresh workflow refuses on, unless
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
     """
     runs = []
     for glob in pr_globs:
-        listing = _gsutil(["ls", glob], gsutil)
+        listing, stderr = _gsutil_call(["ls", glob], gsutil)
         if listing is None:
-            print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
+            if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+                print(f"note: glob {glob} did not list (no builds yet, or unreadable); nothing from it this scan", file=sys.stderr)
+            else:
+                print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
             continue
         candidates = _build_dirs_in_listing(listing, after_build, retry_builds)
-        runs.extend(_read_builds(candidates, gsutil, since_cutoff, unfinished))
+        runs.extend(_read_builds(candidates, gsutil, since_cutoff, unfinished, tier=tier))
     return runs
 
 
@@ -1439,6 +1662,11 @@ def _build_dirs_in_listing(
         for build_id, line in _build_dirs(listing)
         if _admitted(build_id, after_build, retry_builds)
     ]
+
+
+def _periodic_job(prefix: str) -> str:
+    """A periodic's job name: its log prefix's last segment."""
+    return prefix.rstrip("/").rsplit("/", 1)[-1]
 
 
 def runs_from_periodic(
@@ -1472,7 +1700,7 @@ def runs_from_periodic(
     the warning line either way.
     """
     prefix = prefix.rstrip("/") + "/"
-    job = job or prefix.rstrip("/").rsplit("/", 1)[-1]
+    job = job or _periodic_job(prefix)
     listing, stderr = _gsutil_call(["ls", prefix], gsutil)
     if listing is None:
         if after_build is not None and not _NO_OBJECTS.search(stderr or ""):
@@ -1774,9 +2002,11 @@ def collect(
     index_prefix: str | None = None,
     nightly_prefix: str | None = None,
     nightly_job: str | None = None,
+    nightly_writers_prefix: str | None = None,
     rc_globs: list[str] | None = None,
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
+    gitlab_globs: list[str] | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -1787,7 +2017,8 @@ def collect(
     # the index off, anything else is listed as given. nightly_prefix is
     # what asks for the nightly periodic to be scanned at all (None: it is
     # not), the way --pr-glob asks for the presubmit; nightly_job labels
-    # the runs it yields.
+    # the runs it yields. nightly_writers_prefix asks the same for the
+    # writers periodic, whose job is its prefix's last segment.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
@@ -1795,21 +2026,39 @@ def collect(
     # pending_builds entry carries the tier, so a consumer whose columns are
     # the presubmit's (the Grid) can keep a night in flight off them.
     nightly_pending: set[str] = set()
+    gitlab_pending: set[str] = set()
     # And where each of those sits, as Spyglass shows it: the prior's entry
     # when it carried one, else the prefix this scan listed the build under.
     nightly_pending_urls: dict[str, str] = {}
     # One watermark per source. Prow's build ids are one global sequence
     # ordered by start, so the newest presubmit id (dozens of builds a day)
     # is normally above every nightly id (one a day); the newest id on
-    # record says what one source has seen, not the other.
+    # record says what one source has seen, not the other. The nightly's
+    # two periodics are two sources (DEFAULT_NIGHTLY_WRITERS_JOB): a
+    # nightly run of the writers job counts towards its watermark, every
+    # other nightly run towards the main one's, as all of them did before
+    # the split.
+    writers_job = _periodic_job(nightly_writers_prefix) if nightly_writers_prefix else DEFAULT_NIGHTLY_WRITERS_JOB
+    if writers_job != DEFAULT_NIGHTLY_WRITERS_JOB:
+        # nightly.py tells the writers part by this job name alone.
+        print(
+            f"warning: --nightly-writers-prefix {nightly_writers_prefix} names"
+            f" job {writers_job}, not {DEFAULT_NIGHTLY_WRITERS_JOB}; the report"
+            " files its runs as the main part",
+            file=sys.stderr,
+        )
     after_build = None
     nightly_after = None
+    writers_after = None
+    gitlab_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
             prior = prior_data["runs"]
             after_build = newest_build_id(tiers.presubmit_runs(prior))
-            nightly_after = newest_build_id(tiers.nightly_runs(prior))
+            nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") != writers_job])
+            writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
+            gitlab_after = newest_build_id(tiers.gitlab_runs(prior))
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -1825,6 +2074,8 @@ def collect(
                     nightly_pending.add(entry["build_id"])
                     if isinstance(entry.get("log_url"), str):
                         nightly_pending_urls[entry["build_id"]] = entry["log_url"]
+                elif isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_gitlab(entry):
+                    gitlab_pending.add(entry["build_id"])
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 gsutil calls per archived build. Bound the recovery
@@ -1861,6 +2112,9 @@ def collect(
             glob_only.append(glob)
         elif prefix not in indexes:
             indexes.append(prefix)
+    # The presubmit's retries are its own pending builds; a GitLab or nightly
+    # one is retried by its source, which knows where it lives.
+    presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending)
     for prefix in indexes:
         fresh.extend(
             runs_from_index(
@@ -1868,7 +2122,7 @@ def collect(
                 gsutil,
                 after_build=after_build,
                 since_cutoff=since_cutoff,
-                retry_builds=frozenset(retry),
+                retry_builds=presubmit_retry,
                 unfinished=unfinished,
             )
         )
@@ -1879,29 +2133,86 @@ def collect(
                 gsutil,
                 after_build=after_build,
                 since_cutoff=since_cutoff,
-                retry_builds=frozenset(retry),
+                retry_builds=presubmit_retry,
                 unfinished=unfinished,
             )
         )
-    # The nightly periodic, above its own watermark. The shared retry list
-    # is safe to hand over whole: a pending id is only re-read where its
-    # source's listing names it, and no id is in both listings.
-    nightly_fresh: list[dict] = []
-    if nightly_prefix:
+    # The GitLab lane: pull-request builds of its own job, read through the
+    # job's directory index above the lane's own watermark, tagged tier
+    # gitlab; its unfinished builds are tagged the same on pending_builds,
+    # so the right source retries them and they never raise the presubmit's
+    # watermark.
+    gitlab_fresh: list[dict] = []
+    if gitlab_globs:
         listed_before = set(unfinished)
-        nightly_fresh = runs_from_periodic(
-            nightly_prefix,
-            gsutil,
-            after_build=nightly_after,
-            since_cutoff=since_cutoff,
-            retry_builds=frozenset(retry),
-            unfinished=unfinished,
-            job=nightly_job,
+        gitlab_retry = frozenset(b for b in retry if b in gitlab_pending)
+        gitlab_indexes: list[str] = []
+        gitlab_glob_only: list[str] = []
+        # An explicit --index-prefix is the presubmit's index; the lane's is
+        # derived from its own glob (an empty string still disables both).
+        # Unlike the presubmit, the lane takes its index on the cold path
+        # too: the archive-wide glob walks every pull request's directory
+        # (minutes, growing with the archive, past the listing timeout near
+        # 1,700) on every tick until the lane's first run is on record,
+        # which for an on-demand lane is indefinitely, and a timeout is the
+        # refusal line. The index answers "nothing yet" in one flat listing,
+        # and that is a note. The glob is listed only when no index is
+        # derivable from it.
+        lane_index = index_prefix if index_prefix == "" else None
+        for glob in gitlab_globs:
+            prefix = discovery_index(glob, lane_index)
+            if prefix is None:
+                gitlab_glob_only.append(glob)
+            elif prefix not in gitlab_indexes:
+                gitlab_indexes.append(prefix)
+        # A lane that has not run yet, or whose index was purged or moved
+        # while a run sits on record, lists nothing: a note on either path,
+        # never the refusal line (_unlisted_is_note).
+        for prefix in gitlab_indexes:
+            gitlab_fresh.extend(
+                runs_from_index(
+                    prefix, gsutil, after_build=gitlab_after, since_cutoff=since_cutoff,
+                    retry_builds=gitlab_retry, unfinished=unfinished, tier=tiers.TIER_GITLAB,
+                    unlisted_is_note=True,
+                )
+            )
+        if gitlab_glob_only:
+            gitlab_fresh.extend(
+                runs_from_gcs(
+                    gitlab_glob_only, gsutil, after_build=gitlab_after, since_cutoff=since_cutoff,
+                    retry_builds=gitlab_retry, unfinished=unfinished, tier=tiers.TIER_GITLAB,
+                    unlisted_is_note=True,
+                )
+            )
+        gitlab_pending |= unfinished - listed_before
+        fresh.extend(gitlab_fresh)
+    # The nightly periodics, each above its own watermark. The shared retry
+    # list is safe to hand over whole: a pending id is only re-read where
+    # its source's listing names it, and no id is in two listings.
+    nightly_fresh: list[dict] = []
+    writers_fresh: list[dict] = []
+    for prefix, job, after, out in (
+        (nightly_prefix, nightly_job, nightly_after, nightly_fresh),
+        (nightly_writers_prefix, None, writers_after, writers_fresh),
+    ):
+        if not prefix:
+            continue
+        listed_before = set(unfinished)
+        out.extend(
+            runs_from_periodic(
+                prefix,
+                gsutil,
+                after_build=after,
+                since_cutoff=since_cutoff,
+                retry_builds=frozenset(retry),
+                unfinished=unfinished,
+                job=job,
+            )
         )
         nightly_pending |= unfinished - listed_before
         for build_id in unfinished - listed_before:
-            nightly_pending_urls.setdefault(build_id, spyglass_url(nightly_prefix.rstrip("/") + f"/{build_id}/"))
-        fresh.extend(nightly_fresh)
+            nightly_pending_urls.setdefault(build_id, spyglass_url(prefix.rstrip("/") + f"/{build_id}/"))
+        fresh.extend(out)
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
@@ -1912,6 +2223,18 @@ def collect(
                 f"; nightly scan resumed above build {nightly_after},"
                 f" {len(nightly_fresh)} new"
                 if nightly_prefix
+                else ""
+            )
+            + (
+                f"; writers scan resumed above build {writers_after},"
+                f" {len(writers_fresh)} new"
+                if nightly_writers_prefix
+                else ""
+            )
+            + (
+                f"; gitlab scan resumed above build {gitlab_after},"
+                f" {len(gitlab_fresh)} new"
+                if gitlab_globs
                 else ""
             )
             + ")",
@@ -1946,7 +2269,7 @@ def collect(
             {
                 "build_id": build_id,
                 "first_seen": pending[build_id],
-                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {}),
+                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {tiers.TIER_KEY: tiers.TIER_GITLAB} if build_id in gitlab_pending else {}),
                 **({"log_url": nightly_pending_urls[build_id]} if nightly_pending_urls.get(build_id) else {}),
             }
             for build_id in sorted(pending, key=int)
@@ -2001,6 +2324,18 @@ def main(argv: list[str] | None = None) -> int:
         " instead",
     )
     parser.add_argument(
+        "--gitlab-pr-glob",
+        action="append",
+        default=[],
+        metavar="GS_GLOB",
+        help="gsutil glob of the GitLab lane's Prow build dirs, e.g."
+        " gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/"
+        "pull-kube-agents-smoke-test-gitlab/* (repeatable). Read through"
+        " the job's own directory index, whole on a cold sweep and above its"
+        " own watermark after; its runs carry tier=gitlab and count in no"
+        " gate verdict",
+    )
+    parser.add_argument(
         "--index-prefix",
         default=None,
         metavar="GS_PREFIX",
@@ -2029,6 +2364,18 @@ def main(argv: list[str] | None = None) -> int:
         help="the job name recorded on nightly runs (runs[].job); default: the"
         f" last path segment of --nightly-prefix (i.e. {DEFAULT_NIGHTLY_JOB}"
         " for the default prefix)",
+    )
+    parser.add_argument(
+        "--nightly-writers-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_WRITERS_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the nightly's writers periodic (the second job of a"
+        " night split across two) from this Prow log prefix. Given without a"
+        f" value: {DEFAULT_NIGHTLY_WRITERS_PREFIX}. Omitted: no writers scan."
+        " Its runs are tier=nightly with the prefix's last segment as job, on"
+        " a watermark of their own",
     )
     parser.add_argument(
         "--from-dir",
@@ -2109,12 +2456,15 @@ def main(argv: list[str] | None = None) -> int:
         and args.from_dir is None
         and args.merge_with is None
         and args.nightly_prefix is None
+        and args.nightly_writers_prefix is None
         and not args.rc_glob
         and args.rc_from_dir is None
+        and not args.gitlab_pr_glob
     ):
         parser.error(
-            "nothing to collect: pass --pr-glob, --nightly-prefix, --from-dir,"
-            " --rc-glob, --rc-from-dir and/or --merge-with"
+            "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --nightly-prefix,"
+            " --nightly-writers-prefix, --from-dir, --rc-glob, --rc-from-dir"
+            " and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
@@ -2131,15 +2481,18 @@ def main(argv: list[str] | None = None) -> int:
         index_prefix=args.index_prefix,
         nightly_prefix=args.nightly_prefix,
         nightly_job=args.nightly_job,
+        nightly_writers_prefix=args.nightly_writers_prefix,
         rc_globs=args.rc_glob,
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,
+        gitlab_globs=args.gitlab_pr_glob,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     nightly = len(tiers.nightly_runs(data["runs"]))
+    gitlab = len(tiers.gitlab_runs(data["runs"]))
     print(
-        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly} presubmit,"
-        f" {nightly} nightly), {len(data['cases'])} cases,"
+        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly - gitlab} presubmit,"
+        f" {nightly} nightly, {gitlab} gitlab), {len(data['cases'])} cases,"
         f" {len(data.get('releases') or [])} releases,"
         f" {data['coverage']['domains_covered']}/{data['coverage']['domains_total']}"
         " domains covered",

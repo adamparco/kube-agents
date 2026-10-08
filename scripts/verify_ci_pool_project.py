@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import base64
+import contextlib
+import io
 import json
 import math
 import os
@@ -24,6 +26,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +37,49 @@ _UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+# The audit's own note parser, loaded when the declared-intent check runs so
+# the check reads a note exactly as the audit will, rather than a copy of it.
+_AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
+# The name the audit module is registered under when loaded by path; unregistered
+# in sys.modules, so it cannot shadow or be shadowed by an installed package.
+_AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
+# Every name the declared-intent check reads off the loaded module. Read once
+# at load, so a rename upstream is a loader failure (the check unverified with
+# the AttributeError named) and never a verdict on a repository's note.
+_AUDIT_REPORT_SYMBOLS = (
+    "parse_declarations",
+    "explain_empty_declarations",
+    "audit_declarable_checks",
+    "_declaration_key",
+    "DECLARATION_CLUSTER_FIELD",
+    "read_intent_paths",
+    "_under_prefixes",
+    "INTENT_FILE",
+)
+# The contents API answers `encoding: "none"` with an empty `content` for a
+# file over its inline limit (1 MiB); the raw media type returns the body
+# whole, and the audit reads the file whole from its clone.
+GITHUB_CONTENT_ENCODING_NONE = "none"
+GITHUB_RAW_MEDIA_TYPE = "application/vnd.github.raw+json"
+# What one read of a repository path settles. A refusal or a transient is
+# classified first, and absence only on gh's own 404 spelling, because
+# run_cmd's timeout text and gh's transport errors embed the URL, and so the
+# project id, which a bare `404` would match in a project named `...-404`.
+# Anything else gh refuses (a 409 on a repository with no commits, a 422) is
+# a failure the check reports, not an unread.
+GITHUB_PATH_PRESENT = "present"
+GITHUB_PATH_ABSENT = "absent"
+GITHUB_PATH_UNREAD = "unread"
+GITHUB_PATH_FAILED = "failed"
+# The body came back but is not UTF-8. run_cmd decodes strictly, so this is
+# caught in the reader rather than ending the verifier in a traceback.
+GITHUB_PATH_UNDECODABLE = "undecodable"
+# The contents API's `type` for a symlink at the last component of a path. The
+# audit's walk follows none, so a prefix that is one names nothing to it.
+GITHUB_CONTENT_TYPE_SYMLINK = "symlink"
+# The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
+GITOPS_REPO_ORG = "gke-agentic"
+GITOPS_REPO_SUFFIX = "-infra"
 # The runner refuses to write kubeconfigs on the caller's own credential unless
 # told to. The fleet check tells it: an operator, even a project owner, holds no
 # token-creator on the reader (roles/owner does not carry
@@ -63,6 +109,12 @@ CHECK_WARM_CACHE = "warm_cache"
 CHECK_GKE_AND_STATE = "gke_and_state"
 CHECK_SEEDED_FLEET = "seeded_fleet_fixtures"
 CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
+# The GitOps repository's default branch alone: one metadata read, apart from
+# the repo-and-App check because that one needs an org member's `gh` and this
+# one any credential the repository is visible to, which is what lets the
+# hourly pool-state scan run it (docs/ci-health.md, "The pool-state scan").
+CHECK_GITOPS_DEFAULT_BRANCH = "gitops_default_branch"
+CHECK_GITOPS_DECLARATION = "gitops_declaration"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
@@ -80,6 +132,8 @@ CHECK_IDS = (
     CHECK_GKE_AND_STATE,
     CHECK_SEEDED_FLEET,
     CHECK_GITHUB_REPO_AND_APP,
+    CHECK_GITOPS_DEFAULT_BRANCH,
+    CHECK_GITOPS_DECLARATION,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
@@ -100,6 +154,8 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GKE_AND_STATE: "GKE Clusters & Terraform State",
     CHECK_SEEDED_FLEET: "Seeded Fleet Fixtures",
     CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
+    CHECK_GITOPS_DEFAULT_BRANCH: "GitOps Repo Default Branch",
+    CHECK_GITOPS_DECLARATION: "GitOps Declared-Intent Note",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
@@ -108,17 +164,28 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
+# The default-branch read is `gh` too, and is left out of GITHUB_CHECKS on
+# purpose: the pool-state scan selects it, and a toolchain blocker would turn
+# a job without a GitHub credential into "not checked" on all of the scan's
+# checks. The check files its own unread instead, and the GCP checks still run.
 # The checks that read GCP, and so need a gcloud credential before they run:
 # every check but the mapping, which reads the checkout and the remote ref,
-# and the GitHub check, whose reads are all `gh`.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING} - GITHUB_CHECKS
+# the default-branch read, and the GitHub checks in GITHUB_CHECKS, whose reads
+# are all `gh`.
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
-# two GitHub checks (each needs a credential the health bot must not hold),
-# not the mapping (that is about the checkout, not the project), and not the
-# warm-cache check, whose read is in another project the bot holds nothing on.
-POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_TOKEN_MINTER_KMS)
+# GitHub-reading checks that need a credential the health bot must not hold
+# (an org member's `gh` for github_repo_and_app and gitops_declaration, the
+# ledger App's key for ledger_read_credential), not the minter's signing half
+# (token_minter; the scan runs token_minter_kms), not the mapping (that is
+# about the checkout, not the project), and not the warm-cache check, whose
+# read is in another project the bot holds nothing on. The GitOps
+# default-branch read is in: one metadata call the job makes with whatever
+# GitHub credential it carries (GITOPS_READ_TOKEN_ENV), and records as not
+# checked when it carries none.
+POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_TOKEN_MINTER_KMS)
 # --report's document (docs/ci-health.md, "The pool-state scan").
 REPORT_SCHEMA_VERSION = 1
 REPORT_STATUS_PASS = "pass"
@@ -155,7 +222,7 @@ REPAIR_CLEANUP_POLICY = "docs/ci-pool-projects.md section 4, Cleanup policy"
 REPAIR_HOST_CLUSTER = "docs/ci-pool-projects.md section 2 by hand, against the project's existing full-install state so its api_server_key is kept (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
 REPAIR_HOST_CMEK = "gcloud container clusters update platform-agent-host --database-encryption-key=<the project's key>, as install.sh does for an existing cluster (docs/ci-pool-projects.md section 2)"
 REPAIR_STATE_BUCKET = "gcloud storage buckets create gs://{project_id}-tf-state --project={project_id} --location=us-central1 --uniform-bucket-level-access && gcloud storage buckets update gs://{project_id}-tf-state --versioning (docs/ci-pool-projects.md section 2; not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
-REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
+REPAIR_FLEET_APPLY = "apply bench/tf/fleet to {project_id} from a main checkout: before registration, python3 hack/fleet_reconcile.py --project {project_id} --no-lease (Boskos does not hold it yet); once registered, the daily reconcile at 08:30 UTC re-applies it, or the same command without --no-lease, leased (bench/tf/fleet/README.md, State and reconcile)"
 # An absent service account. The platform GSA is the full-install
 # composition's; the LiteLLM GSA has a hand repair in the runbook.
 REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
@@ -247,6 +314,13 @@ REQUIRED_APIS = {
 }
 
 HOST_CLUSTER = "platform-agent-host"
+# seeded-d is deliberately absent. Pool projects applied before bench/tf/fleet
+# grew slot d do not have it, so listing it would make the hourly pool-state
+# scan report every one of them drifted and hold the presubmit gate DEGRADED
+# until the fleet is re-applied across the pool. The reconcile
+# (hack/fleet_reconcile.py --all, on merge and daily) creates it in each project it applies to,
+# since a new cluster plans as a create; add it here once that has reached
+# every project.
 EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
 
 # The two states scripts/installer/installer_common.sh accepts in
@@ -257,6 +331,33 @@ EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
 # the host cluster encrypted, so a state outside this set is drift, and a
 # name-only check would pass it.
 VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
+
+# The managed OpenTelemetry collection scope the host cluster must carry. The
+# operator's collector discovery (k8s-operator/internal/controller/telemetry.go)
+# finds the gke-managed-otel collector only on a cluster with this scope; on
+# any other it resolves status.telemetry.otlpEndpointSource to None, wires the
+# agent with OTEL_SDK_DISABLED=true, and the install exports no traces: the
+# project's Cloud Trace stays empty, and nothing on the lease says so. Neither
+# google provider has a field for it, so full-install cannot set it:
+# scripts/provision_ci_pool_project.sh sets it with a post-apply
+# `gcloud container clusters update --managed-otel-scope` (the value there is
+# a copy of this one, and the tests pin the two equal), and this is the read
+# half. The fleet clusters are not held to it: nothing reads their traces.
+HOST_OTEL_SCOPE = "COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+REPAIR_HOST_OTEL_SCOPE = (
+    f"gcloud container clusters update {HOST_CLUSTER} --project={{project_id}} --location=us-central1 "
+    f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
+)
+FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
+# Findings a leased run passes with. Every other finding reds the run that
+# leases the project -- a missing grant, API, key or cluster is a 403 or a
+# missing resource in the agent's transcript -- and the health bot's pool-drift
+# advice tells the pull request so. A host cluster without the scope installs,
+# serves and grades like any other; only its traces are missing. The bot reads
+# this set (scripts/eval_dashboard/pool_state.py `passes_leases`, for
+# health.py's rule 3e) before wording the advice, so a 403 on a project whose
+# findings are all here is reported as the change's to read, not the pool's.
+LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -270,6 +371,70 @@ DEFAULT_GITHUB_APP_ID = 4675512
 GITOPS_SEED_FILE = "README.md"
 GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
+# The declared-intent note provisioning seeds after the first commit
+# (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
+# declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
+# repository lacks it.
+GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+# The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
+# verifier prints is the note provisioning seeds; a test pins the two copies
+# to each other. The body read back is judged by the audit's parser, not
+# compared to this text.
+GITOPS_INTENT_NOTE_CONTENT = """---
+type: decision
+title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+declares:
+  - check: no-pdb
+    namespace: seeded-intent
+    object: Deployment/notification-relay
+  - check: netpol-missing
+    namespace: seeded-intent
+    object: Namespace/seeded-intent
+  - check: default-sa-automount
+    namespace: seeded-token
+    object: Deployment/token-reader
+  - check: no-notifications
+    namespace: ""
+    object: Cluster/seeded-c
+  - check: overrequest
+    namespace: seeded-headroom
+    object: Deployment/burst-ingest
+---
+
+`notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
+it is a stateless relay whose clients retry, and a budget would only slow node drains. The
+namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
+in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
+design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
+`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
+the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
+design: it is sized for an ingest burst the measured week does not show. The obtainability,
+compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
+than as findings."""
+# The declarations the audits' parser (audit_report.py parse_declarations) must
+# find in the note's `declares` list, each with the stream whose `declarable`
+# set is the policy for it. A file that has the path but not these declares
+# nothing, and the declared-intent cases fail on that project with a
+# presence-only check green -- which is why presence alone is not the check.
+# The nightly cases that fail on a project whose note is missing or unread,
+# named in this check's messages: the declared-intent case of each declaring
+# stream, and the exposure sweep, whose report must name the note's path.
+GITOPS_INTENT_NOTE_CASES = (
+    "obtainability-declared-intent-no-finding",
+    "obtainability-fleet-exposure-sweep",
+    "compliance-declared-intent-no-finding",
+    "compliance-declared-token-shields-siblings",
+    "patch-declared-intent-no-finding",
+    "cost-declared-intent-no-finding",
+)
+GITOPS_INTENT_NOTE_DECLARATIONS = (
+    ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
+    ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
+    ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
+    ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
+    ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+)
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -285,7 +450,8 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 GITHUB_APP_URL = "https://api.github.com/app"
 
 # The App the EVAL RUNNER grades ledger issues with (a mint pinned to reads; its
-# installation also holds issues: write, for hack/ci-eval-pr.sh's ledger reset),
+# installation also holds issues, pull_requests and contents write, for
+# hack/ci-eval-pr.sh's ledger reset and repository reset),
 # which is not the minter App above. hack/ci-eval-pr.sh mints an installation
 # token from it into BENCH_GITHUB_TOKEN before each devops-bench invocation; a
 # test pins these two to that script, so changing the App there cannot leave
@@ -298,8 +464,9 @@ GITHUB_INSTALLATION_TOKEN_URL = (
 # What this script's probe mint asks for: the same three reads the eval's
 # grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
 # holds the two equal). An omitted body would mint the installation's whole
-# grant, which since 2026-09-22 includes issues: write on every pool repository
-# for the ledger reset; a read probe has no business holding that.
+# grant, which includes issues: write (2026-09-22, the ledger reset) and
+# pull_requests and contents write (2026-10-01, the repository reset) on every
+# pool repository; a read probe has no business holding that.
 LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
 
 # Its private key, read from the cluster rather than the operator's disk: a
@@ -320,6 +487,27 @@ PROW_BUILD_CLUSTER_PROJECT = "kube-agents-prow"
 # repository's issues needs `issues: read`. The installation's repository list
 # needs only `metadata: read`, so it would have passed the evals-6 case.
 GITHUB_ISSUES_URL = "https://api.github.com/repos/{repo}/issues?per_page=1&state=all"
+
+# The branch every GitOps repository must default to. submit_suggestion.py
+# prepare starts each remediation workspace from the repository's default
+# branch, so a default moved onto an agent branch that already carries the fix
+# makes every rca write a no-op ("nothing to commit", a leftover proposal
+# quoted back) and the case reads 0/3 whatever the agent does. Four pool
+# repositories sat on a platform-agent/* default from 2026-08-28 to
+# 2026-09-30 and one on master, unseen; what moved them is not known (no
+# repository events; the org audit log needs an owner), so this read is the
+# net whatever the mover was, and #1970 (the broker refusing a proposal onto
+# any base but the configured one) is the guard on the product side. One
+# `gh api` read of the repository per project; a PATCH of the same field is
+# the repair, and that field needs repository admin, so an owner of
+# gke-agentic runs it. The repositories are private, so the read needs a
+# credential they are visible to, carried in GITOPS_READ_TOKEN_ENV (gh's own
+# variable).
+GITOPS_DEFAULT_BRANCH = "main"
+GITOPS_REPO_API_PATH = "repos/{repo}"
+GITOPS_READ_TOKEN_ENV = "GH_TOKEN"
+FINDING_GITOPS_DEFAULT_BRANCH = "gitops/default-branch"
+REPAIR_GITOPS_DEFAULT_BRANCH = "gh api -X PATCH repos/{repo} -f default_branch={branch}"
 
 # GitHub rejects an App JWT whose `exp` is more than ten minutes ahead. Building
 # the payload, shelling out to gcloud, and the round trip all elapse between
@@ -711,28 +899,48 @@ _UNREAD_PATTERNS = (
         r"\bgcloud crashed\b|Temporary failure in name resolution|Name or service not known|Connection reset by peer|Unable to find the server at",
         re.I,
     ),
+    # gh's own words for the same transport failures -- it never got an answer
+    # from api.github.com -- and the raw Go network errors it prints for a
+    # refused connection, a socket timeout or a TLS handshake that never
+    # completed. None of these is a resource's name.
+    re.compile(
+        r"error connecting to api\.github\.com|check your internet connection|githubstatus\.com|dial tcp \S*: (?:connect: )?(?:connection refused|i/o timeout|network is unreachable|no route to host)|dial tcp .*(?:connection refused|i/o timeout)|net/http: TLS handshake timeout|unexpected EOF|:\s*EOF\b|server closed idle connection",
+        re.I,
+    ),
 )
 
 # gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
-# for one the token's scopes do not reach. Only call sites that know a 404
-# cannot mean "absent" may use this; see check_github_repo_and_app.
+# for one the token's scopes do not reach. A call site may use this only when
+# it either knows a 404 cannot mean "absent" (check_github_repo_and_app) or
+# names both readings in what it reports (check_gitops_declaration).
 _GITHUB_NOT_FOUND = re.compile(r"\b404\b|\bnot found\b", re.I)
+# For the reads whose stderr can carry a URL (`gh api` on a repository path):
+# gh's own spelling of a 404, so a project id containing `-404-` inside a
+# transport error's URL is never read as absence, and gh's raw transport
+# shape, `Get "<url>": <Go error>`, which no allow-list of Go error texts
+# covers; every such line is a request that got no answer.
+_GH_NOT_FOUND_SPELLING = re.compile(r"\(HTTP 404\)|^gh: Not Found", re.M)
+_GH_TRANSPORT_LINE = re.compile(r'^(?:Get|Post|Put|Patch|Delete) "https?://[^"]*": ', re.M)
 
 # hack/fleet-kubeconfigs.sh reports a cluster it could not reach and a fleet
 # that is not what the catalog describes through the same "unresolved" count,
-# and only its warning text separates them. These four are the second kind: the
+# and only its warning text separates them. These five are the second kind: the
 # cluster list came back and what it held was wrong, which is a finding about
-# the project rather than about this run's credential. Their sources are
-# hack/fleet-kubeconfigs.sh lines 406, 411, 215 and 224.
+# the project rather than about this run's credential. Their sources are the
+# WARNING lines in _fleet_match_slots and write_fleet_kubeconfigs that do not
+# name a cluster it failed to open. The last is a slot no labelled cluster
+# resolved to while others did: a project applied before the catalog declared
+# the slot, or a slot whose cluster lost its labels.
 _FLEET_LOOKED_AND_FOUND_WRONG = re.compile(
     r"carries no clusters labelled"
     r"|none resolved to a catalog slot"
     r"|matches no slot the catalog declares"
-    r"|more than one labelled seeded cluster",
+    r"|more than one labelled seeded cluster"
+    r"|has no labelled seeded cluster for slot",
     re.I,
 )
 
-# ...except that a refused `clusters list` produces the first of those four
+# ...except that a refused `clusters list` produces the first of those five
 # anyway. hack/fleet-kubeconfigs.sh:370-373 sets `listing=""` when the call is
 # refused, which drives `labelled=0` and emits the byte-identical "carries no
 # clusters labelled" warning at :406 -- so read on its own, that string would
@@ -746,17 +954,17 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # reason and to the same effect, and so is one skipped because a temporary file
 # could not be created, or dropped because the file gcloud wrote could not be
 # rewritten to the reader's exec credential (a local fault, not a pool state).
-# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
+# Sources: the three per-cluster WARNING lines and the per-role read failure in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
-# role may be excused. Excusing on the *absence* of a "looked and found wrong"
-# warning instead reads absence of evidence as evidence, and there is a path
-# that produces neither: a slot whose cluster kept its name and lost its labels
-# never enters the listing, so no per-cluster warning names it, `labelled`
-# stays non-zero so :406 is silent, something else resolves so :411 is silent,
-# and its roles increment `unresolved` with nothing printed at all.
+# role may be excused: excusing on the *absence* of a "looked and found wrong"
+# warning reads absence of evidence as evidence. Presence is not enough on its
+# own either, because the notes describe the whole run rather than one slot: an
+# unreachable seeded-c prints one of these while slot d is simply missing. So
+# the script names a slot no labelled cluster resolved to, and that warning is
+# in the list above, where it fails the check whatever else went unreached.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to|could not be read from",
     re.I,
 )
 
@@ -893,7 +1101,7 @@ def _mapping_row_present(text: str, project_id: str) -> bool:
     body = _mapping_function_body(text)
     if body is None:
         return False
-    expected_repo = f"gke-agentic/{project_id}-infra"
+    expected_repo = _gitops_repo_slug(project_id)
     pattern = (
         rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s+"
         rf"([\"']){re.escape(expected_repo)}\1|"
@@ -1018,7 +1226,7 @@ def check_codebase_mapping(project_id: str) -> CheckResult:
     if _mapping_function_body(text) is None:
         return CheckResult("Codebase GitOps Mapping", False, "Could not find gitops_repo_for_project() in hack/ci-deploy.sh")
 
-    expected_repo = f"gke-agentic/{project_id}-infra"
+    expected_repo = _gitops_repo_slug(project_id)
     if not _mapping_row_present(text, project_id):
         return CheckResult(
             "Codebase GitOps Mapping",
@@ -1588,7 +1796,7 @@ def _host_cluster_node_members(project_id: str, project_number: str) -> Tuple[Li
     Read off the cluster rather than assumed. A pool created with
     --service-account runs as that account, and asserting the Compute default SA
     against such a cluster would report a failure the project does not have. The
-    seeded trio is deliberately not consulted: it runs its own
+    seeded fleet is deliberately not consulted: it runs its own
     seeded-fleet-nodes account and pulls no kube-agents image.
 
     One listing carries every cluster's pools, so no location is needed -- the
@@ -1845,9 +2053,9 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
 
 
 def check_gke_and_state(project_id: str) -> CheckResult:
-    """Verify the host cluster, its CMEK state, the trio's names, and the state bucket.
+    """Verify the host cluster, its CMEK state and managed-OTel scope, the seeded clusters' names, and the state bucket.
 
-    Names and encryption only. Whether the trio holds the planted fixtures is
+    Names, encryption and the host's telemetry scope only. Whether those clusters hold the planted fixtures is
     check_seeded_fleet_fixtures() below, and the two are far apart: an apply
     that created the clusters and died before the Kubernetes provider ran
     satisfies every assertion here.
@@ -1860,19 +2068,20 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     clusters_checked = False
     bucket_checked = False
 
-    # name and encryption state in one listing: a separate describe would need
-    # the cluster's location, which this call is what would have told us.
+    # name, encryption state and managed-OTel scope in one listing: a separate
+    # describe would need the cluster's location, which this call is what
+    # would have told us.
     rc, out, err = run_cmd([
         "gcloud", "container", "clusters", "list",
         f"--project={project_id}",
-        "--format=value(name,databaseEncryption.state)",
+        "--format=value(name,databaseEncryption.state,managedOpentelemetryConfig.scope)",
     ])
     if rc != 0:
         if not _record_unreadable(
             err,
             f"Failed listing clusters: {err.strip()}",
             f"Could not list the clusters in {project_id}, so neither the four expected clusters nor "
-            f"{HOST_CLUSTER}'s CMEK state was checked",
+            f"{HOST_CLUSTER}'s CMEK state and managed-OTel scope were checked",
             details,
             warnings,
         ):
@@ -1881,18 +2090,23 @@ def check_gke_and_state(project_id: str) -> CheckResult:
         partial = next((line.strip() for line in err.splitlines() if PARTIAL_LISTING_RE.search(line)), err.strip())
         warnings.append(Unread(
             f"Could not list all the clusters in {project_id} ({partial}), so neither the four expected "
-            f"clusters nor {HOST_CLUSTER}'s CMEK state was checked"
+            f"clusters nor {HOST_CLUSTER}'s CMEK state and managed-OTel scope were checked"
         ))
     else:
         clusters_checked = True
 
     encryption_by_cluster = {}
+    otel_scope_by_cluster = {}
     if clusters_checked:
         for line in out.splitlines():
             if not line.strip():
                 continue
-            fields = line.split()
+            # `value()` joins its columns with tabs and leaves an unset one
+            # empty, so the split is on the tab: a whitespace split would
+            # collapse an unset CMEK state and read the scope as the state.
+            fields = line.split("\t")
             encryption_by_cluster[fields[0]] = fields[1] if len(fields) > 1 else ""
+            otel_scope_by_cluster[fields[0]] = fields[2] if len(fields) > 2 else ""
 
         missing_clusters = EXPECTED_CLUSTERS - set(encryption_by_cluster)
         if missing_clusters:
@@ -1912,6 +2126,15 @@ def check_gke_and_state(project_id: str) -> CheckResult:
                     f"{', '.join(sorted(VALID_CMEK_STATES))}; full-install creates the host cluster "
                     "encrypted, so this is drift",
                     REPAIR_HOST_CMEK,
+                )
+            scope = otel_scope_by_cluster[HOST_CLUSTER]
+            if scope != HOST_OTEL_SCOPE:
+                passed = False
+                _drift(
+                    details, findings, FINDING_HOST_OTEL_SCOPE,
+                    f"{HOST_CLUSTER} managedOpentelemetryConfig.scope is '{scope or 'unset'}', not "
+                    f"{HOST_OTEL_SCOPE}; an install on it finds no managed collector and exports no traces",
+                    REPAIR_HOST_OTEL_SCOPE.format(project_id=project_id),
                 )
 
     # `buckets describe` needs storage.buckets.get, which `storage ls` does not,
@@ -1935,11 +2158,11 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     if not passed:
         message = "GKE/state resources missing"
     elif clusters_checked and bucket_checked:
-        message = f"All 4 clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
+        message = f"All {len(EXPECTED_CLUSTERS)} clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, managed-OTel scope, and state bucket present"
     else:
         verified = []
         unchecked = []
-        (verified if clusters_checked else unchecked).append("clusters and CMEK")
+        (verified if clusters_checked else unchecked).append("clusters, CMEK and managed-OTel scope")
         (verified if bucket_checked else unchecked).append("state bucket")
         prefix = f"{'; '.join(verified)} present; " if verified else ""
         message = f"{prefix}{'; '.join(unchecked)} not checked"
@@ -1951,8 +2174,8 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
     """Run hack/fleet-kubeconfigs.sh against the project and require every role.
 
     A cluster that exists is not a fixture that was planted, and the gap is not
-    hypothetical: an apply that created the trio and failed before the
-    Kubernetes provider ran leaves three clusters that answer every API call
+    hypothetical: an apply that created the clusters and failed before the
+    Kubernetes provider ran leaves clusters that answer every API call
     and hold none of the objects. check_gke_and_state() passes that project.
     Nothing then contradicts it until a lease draws the project, runs a fleet
     scenario, and every check on it reports `status: error` -- by which point
@@ -1976,7 +2199,7 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         return CheckResult(name, False, f"{_FLEET_CATALOG} declares no fixture roles")
 
     # kubectl is absent from check_toolchain() because every other check here is
-    # gcloud or gh. Without it every probe fails, all eight roles report as
+    # gcloud or gh. Without it every probe fails, every role reports as
     # unplanted, and the run states a confident and wrong verdict about a fleet
     # it never looked at.
     rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
@@ -2261,6 +2484,316 @@ def gitops_seed_command(repo_slug: str) -> str:
     )
 
 
+def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
+    """The `gh api` call that writes the declared-intent note, replacing it when `sha` names the copy there.
+
+    Self-contained on purpose: the note's text is inline, so the command works in
+    an operator's shell, where the provisioning script's variable does not exist.
+    """
+    replace = f"-f sha={sha} " if sha else ""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH} "
+        f"-f message=\"{GITOPS_INTENT_NOTE_MESSAGE}\" {replace}"
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_INTENT_NOTE_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
+def _gitops_repo_slug(project_id: str) -> str:
+    """The GitOps repository a pool project owns, `gke-agentic/<project>-infra`, as hack/ci-deploy.sh maps it."""
+    return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
+
+
+def _load_audit_report():
+    """The fleet-audit script as a module, proven able to run its note parser here.
+
+    Loading is not enough to know the parser can run: audit_report.py imports
+    nothing beyond the standard library at module level and imports PyYAML
+    and `workspace_paths` lazily inside its readers (`_read_declares`,
+    `read_intent_paths`), so on a machine without them the module loads and
+    the first import fires later, from inside the check's read of one
+    repository's file. Importing both here, and reading every name the check
+    uses, makes "the parser cannot run on this machine" one failure at one
+    place -- an ImportError or AttributeError from this function -- rather
+    than something a repository's file gets blamed for.
+    """
+    import importlib.util
+
+    import yaml  # noqa: F401  (the parser's dependency, proven present here)
+
+    spec = importlib.util.spec_from_file_location(_AUDIT_REPORT_MODULE_NAME, _AUDIT_REPORT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_AUDIT_REPORT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in _AUDIT_REPORT_SYMBOLS:
+        getattr(module, name)
+    # `read_intent_paths` imports this lazily too, from the sys.path entry the
+    # audit script adds for its own checkout; a checkout without it is the
+    # same machine fault as no PyYAML, proven here rather than blamed on a
+    # repository's intent file.
+    import workspace_paths  # noqa: F401
+
+    return module
+
+
+def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional[str]:
+    """Why an audit would not join one of `body`'s declarations to its fixture finding, or None when every one joins.
+
+    Not a copy of the parser: the note goes through the audit's own
+    `parse_declarations` once, over the union of the declarable sets of the streams in GITOPS_INTENT_NOTE_DECLARATIONS
+    (frontmatter delimiters, YAML and its error classes, `type`, `declares`,
+    the item shape, the `cluster` rule, that stream's `declarable` set) and
+    the surviving items are compared on the audit's own join key, which folds
+    `Deployment/notification-relay`, `deployment/notification-relay` and
+    `Deployment / notification-relay` to one. The join is the audit's too:
+    `apply_declarations` files clustered items under their cluster and the
+    rest fleet-wide, and a finding falls through to a fleet-wide entry, so a
+    declaration is good when ANY matching item is fleet-wide, whatever else
+    the note lists. A note the parser reads nothing from is explained by the
+    parser itself (`explain_empty_declarations`, the same ladder
+    `parse_declarations` walks), so the reason printed cannot drift from the
+    verdict.
+    """
+    if audit is None:
+        audit = _load_audit_report()
+    # One parse over the union of the streams' declarable sets, so the items
+    # are read in one pass and none draws another stream's note on stderr;
+    # each stream's item is then matched among the entries of its own check. The policy is still the audit's: a slug that leaves its stream's
+    # set leaves the union, and this check rejects the note the day the audit does.
+    declarable_by_stream = {stream: audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS}
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        if wanted_item["check"] not in declarable_by_stream[stream]:
+            return f"{wanted_item['check']} is no longer a check {stream} lets a declaration justify"
+    union = frozenset().union(*declarable_by_stream.values())
+    all_entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=union)
+    if not all_entries:
+        # The reason is the parser's own (`explain_empty_declarations` walks
+        # the ladder `parse_declarations` walks); None means the note had
+        # items and the parser skipped every one, logging a WARNING each.
+        reason = audit.explain_empty_declarations(body)
+        return reason or "the parser skipped every declares item (its WARNING lines above say why)"
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        entries = [e for e in all_entries if str(e.get("check", "")) == wanted_item["check"]]
+        wanted = audit._declaration_key(wanted_item, with_cluster=False)
+        matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
+        if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
+            continue
+        if matching:
+            clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
+            return (
+                f"its only matching {wanted_item['check']} declaration(s) name cluster {', '.join(clusters)}, so the "
+                "audit joins them to that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
+            )
+        return f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in {wanted_item['namespace'] or '(cluster)'}"
+    return None
+
+
+def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[str, str]:
+    """Read one path of the GitOps repository: (GITHUB_PATH_*, the body, or the reason it was not read).
+
+    The one reader for every path this check touches, so the note, the
+    intent file and each prefix classify a failure the same way. `raw` asks
+    for the file's bytes; without it the contents API's JSON object (or
+    list, for a directory) comes back, which is what a probe for a prefix's
+    existence needs, `type` included. The path is percent-encoded: the
+    audit's reader admits `#` in a prefix, which an unencoded URL would drop
+    as a fragment and probe a different path than the audit checks.
+    """
+    cmd = ["gh", "api"]
+    if raw:
+        cmd += ["-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}"]
+    try:
+        rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}"])
+    except UnicodeDecodeError as exc:
+        return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
+    if rc == 0:
+        return GITHUB_PATH_PRESENT, out
+    reason = _unread_reason(err or "")
+    if reason is not None:
+        return GITHUB_PATH_UNREAD, reason
+    if _GH_TRANSPORT_LINE.search(err or ""):
+        return GITHUB_PATH_UNREAD, (err or "").strip()
+    if _GH_NOT_FOUND_SPELLING.search(err or ""):
+        return GITHUB_PATH_ABSENT, ""
+    return GITHUB_PATH_FAILED, (err or "").strip()
+
+
+def _names_nothing_to_the_audit(contents_json: str) -> bool:
+    """Whether a present prefix is a symlink at its last component, which the audit's walk never enters."""
+    try:
+        payload = _load_json(contents_json)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get("type") == GITHUB_CONTENT_TYPE_SYMLINK
+
+
+def check_gitops_declaration(project_id: str) -> CheckResult:
+    """Verify the GitOps repository carries the declared-intent note, with the declaration in it.
+
+    Provisioning seeds it for a new project, and the provisioning script is not
+    re-run on a registered one, so a project registered before the note existed
+    fails here until someone runs the printed command. The body is read back
+    and held to the audit parser's rules, not just the path. A 404 names both
+    of its readings, because gh answers it for a private repository this token
+    cannot see as well as for a file that is not there. Every read goes
+    through `_gitops_path_state`, which classifies a refusal or a transient
+    before matching 404 (the repository check below deliberately does not,
+    and says why), so those leave the check unverified and anything else (a
+    409 on a repository with no commits, a 422) fails it.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
+    repo_slug = _gitops_repo_slug(project_id)
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what} in {repo_slug} could not be read: {reason}")], read=False)
+
+    def absent_note() -> CheckResult:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
+            f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
+            f"readable, {' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project until the note "
+            f"is seeded: {gitops_note_seed_command(repo_slug)}",
+        )
+
+    def failed(what: str, err: str) -> CheckResult:
+        return CheckResult(name, False, f"Could not read {what} in {repo_slug}: {err}")
+
+    state, out = _gitops_path_state(repo_slug, GITOPS_INTENT_NOTE_PATH)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(GITOPS_INTENT_NOTE_PATH, out)
+    if state == GITHUB_PATH_ABSENT:
+        return absent_note()
+    if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+        return failed(GITOPS_INTENT_NOTE_PATH, out)
+    try:
+        payload = _load_json(out)
+        sha = str(payload.get("sha") or "")
+        if payload.get("encoding") == GITHUB_CONTENT_ENCODING_NONE:
+            # Over the inline limit: the metadata carries no body. Read it the
+            # way the audit does, whole, rather than parse an empty string and
+            # tell the operator to overwrite a note the audit would have joined.
+            state, body = _gitops_path_state(repo_slug, GITOPS_INTENT_NOTE_PATH, raw=True)
+            if state == GITHUB_PATH_UNREAD:
+                return unread(f"{GITOPS_INTENT_NOTE_PATH} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_ABSENT:
+                return absent_note()
+            if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+                return failed(f"{GITOPS_INTENT_NOTE_PATH} (over the contents API's inline limit, read raw)", body)
+        else:
+            body = base64.b64decode(payload.get("content") or "").decode("utf-8")
+    except Exception as exc:
+        return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
+    # Two failures, two verdicts. The parser failing to LOAD -- no PyYAML, the
+    # audit script missing, a name the check reads renamed; _load_audit_report
+    # proves all three before returning -- is a fact about this machine, so the
+    # check is unread. The parser RAISING on this file -- PyYAML's safe
+    # constructors raise KeyError on `!!bool maybe` and AttributeError on
+    # `!!timestamp later`, outside the set parse_declarations catches -- is a
+    # fact about the note: the audit reads no declaration from it, so the check
+    # fails with the replace command, naming the exception.
+    try:
+        audit = _load_audit_report()
+    except Exception as exc:
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: could not load the audit's note parser for {GITOPS_INTENT_NOTE_PATH}: {type(exc).__name__}: {exc}")],
+            read=False,
+        )
+    try:
+        problem = _note_declaration_problem(body, repo_slug, audit)
+    except Exception as exc:
+        problem = f"the audit's parser raises on it ({type(exc).__name__}: {exc})"
+    if problem:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audits do not read every declaration the fixture needs from it: "
+            f"{problem}. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
+        )
+    # The audit reads notes only under the paths `.kube-agents/intent.yaml`
+    # names, when the repository has one; a note outside that bound is never
+    # read, and a check that parsed it in isolation would pass a project the
+    # case fails on. The bound is read with the audit's own reader, over a
+    # copy of the one file, and membership is decided by the audit's own
+    # `_under_prefixes`; what the copy cannot answer, whether each prefix
+    # names anything at this commit, is read from the repository below.
+    state, intent_out = _gitops_path_state(repo_slug, audit.INTENT_FILE, raw=True)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(f"{audit.INTENT_FILE} (so whether it bounds the search away from the note is unknown)", intent_out)
+    if state == GITHUB_PATH_FAILED:
+        return failed(audit.INTENT_FILE, intent_out)
+    if state == GITHUB_PATH_UNDECODABLE:
+        # The audit's reader catches the same UnicodeDecodeError and searches
+        # the whole tree, note included; so does this verdict.
+        return CheckResult(
+            name,
+            True,
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration; its {audit.INTENT_FILE} is not UTF-8, "
+            f"which the audit reads as no bound, so it searches the whole tree, note included",
+        )
+    if state == GITHUB_PATH_ABSENT:
+        return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
+    try:
+        scratch = tempfile.TemporaryDirectory()
+        tree = Path(scratch.name)
+        intent_file = tree / audit.INTENT_FILE
+        intent_file.parent.mkdir(parents=True)
+        intent_file.write_text(intent_out, encoding="utf-8")
+    except OSError as exc:
+        # A scratch area this machine cannot write is a machine fault, unread
+        # like the loader's, never a verdict on the repository's file.
+        return unread(f"{audit.INTENT_FILE} (no writable temporary directory to hand it to the audit's reader)", f"{type(exc).__name__}: {exc}")
+    try:
+        with scratch, contextlib.redirect_stderr(io.StringIO()):
+            prefixes = audit.read_intent_paths(tree, repo_slug)
+    except Exception as exc:
+        # PyYAML's safe constructors raise outside the set the reader
+        # catches (`paths: !!bool maybe` is a KeyError); the audit stops on
+        # the same file, so the case fails on this project until it is fixed.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but the audit's reader stops on its "
+            f"{audit.INTENT_FILE} ({type(exc).__name__}: {exc}), and so does the audit; fix that file.",
+        )
+    if not prefixes or audit._under_prefixes(GITOPS_INTENT_NOTE_PATH, prefixes):
+        return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
+    # The audit applies a bound only when every prefix names something at
+    # this commit (its `_unmatched_prefixes`); one that names nothing, or is
+    # a symlink, discards the bound and the whole tree is searched, note
+    # included (directory mode; in content mode the broker withholds a
+    # symlink and the bound stands). Each prefix is read once. Two things
+    # this read cannot see: a symlink at an earlier component of a prefix,
+    # and a symlink the contents API resolves to its target file. The
+    # audit's walk follows neither.
+    for prefix in prefixes:
+        state, out = _gitops_path_state(repo_slug, prefix)
+        if state == GITHUB_PATH_UNREAD:
+            return unread(f"`{prefix}` from {audit.INTENT_FILE} (so whether the audit applies that bound is unknown)", out)
+        if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+            return failed(f"`{prefix}` from {audit.INTENT_FILE}", out)
+        if state == GITHUB_PATH_ABSENT or _names_nothing_to_the_audit(out):
+            return CheckResult(
+                name,
+                True,
+                f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration; its {audit.INTENT_FILE} names `{prefix}`, "
+                f"which names nothing the audit's walk enters at this commit (absent, or a symlink), so the audit discards the bound "
+                f"and searches the whole tree, note included",
+            )
+    return CheckResult(
+        name,
+        False,
+        f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
+        f"the audit's search to {', '.join(prefixes)}, every one of which exists, so the audit never reads the note and "
+        f"{' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project. Add `knowledge/` to that file's "
+        f"`paths`, or move the note under one of them.",
+    )
+
+
 def check_github_repo_and_app(
     project_id: str, app_id: int, repo_membership_confirmed: bool = False
 ) -> CheckResult:
@@ -2274,7 +2807,7 @@ def check_github_repo_and_app(
     warnings: List[str] = []
     passed = True
     attested = False
-    repo_slug = f"gke-agentic/{project_id}-infra"
+    repo_slug = _gitops_repo_slug(project_id)
 
     # Deliberately not routed through _record_unreadable. GitHub answers 404 for
     # a repository that does not exist and 404 for one the token cannot see, so
@@ -2400,6 +2933,49 @@ def check_github_repo_and_app(
         details=details,
         warnings=warnings,
     )
+
+
+def check_gitops_default_branch(project_id: str) -> CheckResult:
+    """The GitOps repository defaults to GITOPS_DEFAULT_BRANCH.
+
+    One metadata read. A read that did not happen -- no `gh`, no credential
+    (`gh` exits 4 and says so), a token the repository is invisible to (404,
+    which GitHub also answers for a repository that does not exist; the
+    repo-and-App check is the one that decides absence) -- is not checked,
+    with the reason, so the hourly scan says what it could not see instead of
+    reporting drift on every private repository its token cannot open.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DEFAULT_BRANCH]
+    repo_slug = _gitops_repo_slug(project_id)
+    rc, out, err = run_cmd(["gh", "api", GITOPS_REPO_API_PATH.format(repo=repo_slug), "--jq", ".default_branch"])
+    observed = out.strip()
+    if rc != 0 or not observed:
+        reason = _unread_reason(err) or (err.strip().splitlines() or [NO_OUTPUT_REASON])[-1].strip()[:200]
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(
+                f"Could not read {repo_slug}'s default branch (the read needs a GitHub credential in "
+                f"{GITOPS_READ_TOKEN_ENV} that the repository is visible to): {reason}"
+            )],
+            read=False,
+        )
+    if observed == GITOPS_DEFAULT_BRANCH:
+        return CheckResult(name, True, f"{repo_slug} defaults to {GITOPS_DEFAULT_BRANCH}")
+    details: List[str] = []
+    findings: List[Finding] = []
+    _drift(
+        details,
+        findings,
+        FINDING_GITOPS_DEFAULT_BRANCH,
+        f"Repository {repo_slug}'s default branch is {observed}, not {GITOPS_DEFAULT_BRANCH}: "
+        "submit_suggestion.py prepare starts every remediation workspace from it, so a fix "
+        "already on that branch is a no-op and the case fails on a leftover proposal (the "
+        "repair changes a field that needs repository admin: run it as an owner of gke-agentic)",
+        REPAIR_GITOPS_DEFAULT_BRANCH.format(repo=repo_slug, branch=GITOPS_DEFAULT_BRANCH),
+    )
+    return CheckResult(name, False, f"{repo_slug} does not default to {GITOPS_DEFAULT_BRANCH}", details=details, findings=findings)
 
 
 def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
@@ -2598,7 +3174,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     pass.
     """
     name = "Ledger Read Credential"
-    repo_slug = f"gke-agentic/{project_id}-infra"
+    repo_slug = _gitops_repo_slug(project_id)
 
     pem, reason = _read_ledger_app_key()
     if pem is None:
@@ -2795,9 +3371,11 @@ def _chart_pinned_key_version() -> Tuple[Optional[str], str]:
 
     Returns (version, detail); version is None when it cannot be read, and
     detail then says why. Parsed with a regex rather than a YAML library
-    because this script is deliberately dependency-free -- it is the first
-    thing an operator runs on a fresh machine, and a missing import here
-    would read as an unprovisioned project.
+    because this script is dependency-free everywhere a missing import would
+    read as an unprovisioned project -- it is the first thing an operator runs
+    on a fresh machine. The one exception is the declared-intent note check,
+    which loads the audit's parser and PyYAML lazily and reports "Not checked"
+    when it cannot, never a failure.
     """
     if not _CHART_VALUES.exists():
         return None, f"missing {_CHART_VALUES}"
@@ -3250,6 +3828,8 @@ def run_checks(
     run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
     run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))
     run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
+    run(CHECK_GITOPS_DEFAULT_BRANCH, lambda: check_gitops_default_branch(project_id))
+    run(CHECK_GITOPS_DECLARATION, lambda: check_gitops_declaration(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))

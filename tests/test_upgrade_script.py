@@ -541,6 +541,27 @@ class UpgradeRunContractTest(unittest.TestCase):
             with self.subTest(var=var):
                 self.assertIn(f'export {var}="$target_', source)
 
+    def test_the_upgrade_clearing_list_is_the_three_coordinates(self):
+        """What upgrade.sh does not clear is a sentence install.sh prints.
+
+        install.sh's unrecorded-value guard tells the operator that a key their
+        install.env does not record still reaches the next upgrade from the
+        shell that exports it. That is only true because upgrade.sh clears the
+        three coordinates and nothing else before sourcing the file: add
+        ENABLE_DRIFT_DETECTOR to this line and the guard is announcing a route
+        that no longer exists, with no other test in either suite noticing.
+        """
+        clears = [
+            line.strip()
+            for line in _UPGRADE_SH.read_text().splitlines()
+            if line.strip().startswith("unset ")
+        ]
+        self.assertIn("unset PROJECT_ID CLUSTER_NAME REGION", clears)
+        for line in clears:
+            with self.subTest(line=line):
+                self.assertNotIn("ENABLE_DRIFT_DETECTOR", line)
+                self.assertNotIn("TF_VAR_enable_drift", line)
+
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.
 
@@ -885,7 +906,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
     def test_upgrade_confirms_agent_image_before_rollout_status(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         confirm_idx = text.index('confirm_agent_image.sh" "$target_namespace" "$PLATFORM_AGENT_DEPLOYMENT"')
-        rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=900s')
+        rollout_idx = text.index('rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=1500s')
         self.assertLess(confirm_idx, rollout_idx)
 
     def test_the_harness_retag_uses_the_assembled_key_list(self):

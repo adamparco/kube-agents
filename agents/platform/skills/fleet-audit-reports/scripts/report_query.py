@@ -22,7 +22,8 @@ with the writer, and the writer is the only party that gets to define the
 envelope.
 
 A stream is stored once per repository it publishes to. Every subcommand but
-`streams` reads one of them: `--repo owner/name`, or the only one there is. A
+`streams` reads one of them: `--repo` (`owner/name`, `github.com/owner/name`,
+or `<host>/<path>` on another forge), or the only one there is. A
 stream with several and no `--repo` is refused with the list, rather than
 answered from whichever repository happens to sort first. An owner directory
 that cannot be listed makes the stream unreadable, as `streams` reports it:
@@ -202,9 +203,9 @@ def _unreadable_stream(root: str, audit_id: str, reason: str, **extra: object) -
 
 
 def _repos(root: str, audit_id: str) -> tuple[list[str], list[str]]:
-    """The stream's repositories, and a line per owner directory that could
-    not be listed: `repo_ids` drops those, and a repository hidden behind one
-    is unread, not absent."""
+    """The stream's lower-case repositories, as `project_stream` counts them,
+    and a line per owner directory that could not be listed: a repository
+    hidden behind one is unread, not absent."""
     try:
         dirs, unreadable = report_status.scan_repo_dirs(root, audit_id)
     except OSError as exc:
@@ -221,9 +222,12 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
     if repo is not None:
         try:
             path = report_status.store_path(root, audit_id, repo)
+            # The listing's spelling of that store: `github.com/owner/name`
+            # and `owner/name` open one directory and must answer alike.
+            repo = report_status.store_key(root, audit_id, repo)
         except ValueError as exc:
             raise QueryError(str(exc)) from exc
-        if repo.lower() not in repos:
+        if repo not in repos:
             # Its owner may not have listed: whether the directory is there is
             # the stat's to say, and a stat that fails is unread, not absent.
             try:
@@ -235,12 +239,12 @@ def _resolve_repo(root: str, audit_id: str, repo: str | None) -> str:
                     root, audit_id, report_status.os_reason(exc), repos=repos
                 ) from exc
             if is_repo and unreadable:
-                return repo.lower()
+                return repo
             raise QueryError(
                 f"no reports for {audit_id} in {repo}", repos=repos,
                 **_liveness(root, audit_id),
             )
-        return repo.lower()
+        return repo
     if unreadable:
         # "The only one there is" is not known while an owner is unlisted,
         # and none listed is not "no record".
@@ -761,7 +765,8 @@ def build_parser() -> argparse.ArgumentParser:
     repo_flag = argparse.ArgumentParser(add_help=False)
     repo_flag.add_argument(
         "--repo",
-        help="owner/name of the ledger's repository; required when the stream has several",
+        help="the ledger's repository: owner/name on GitHub, or <host>/<path> on another "
+        "forge; required when the stream has several",
     )
     run_flag = argparse.ArgumentParser(add_help=False)
     run_flag.add_argument(

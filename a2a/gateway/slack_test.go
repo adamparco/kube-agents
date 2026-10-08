@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +25,8 @@ import (
 // fakeSlackAPI fakes the five Web API calls the adapter makes; tests assert
 // on what was posted/updated.
 type fakeSlackAPI struct {
+	// team is the team id auth.test answers with.
+	team     string
 	posted   []struct{ channel, thread, text string }
 	updated  []struct{ channel, ts, text string }
 	members  []string
@@ -31,7 +35,7 @@ type fakeSlackAPI struct {
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
-	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage"}, nil
+	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage", TeamID: f.team}, nil
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
@@ -242,13 +246,11 @@ func TestSlackRunAuthTestHonoursCancel(t *testing.T) {
 	}
 }
 
-// TestSlackEmptyPrincipalMapWarnsAtBoot: the boot-time warning for an empty
-// map fires for every backend whose identity join IS the map — Slack as
-// much as Discord — and not for gchat, which never reads it. Nothing renders
-// the Slack map yet, so a Slack gateway with a missing map file is the
-// ordinary case until #2099, and it must not pass boot silently and then
-// drop every sender.
-func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
+// TestEmptyPrincipalMapBootNotice: an empty map is a WARN on Discord, whose
+// identity join IS the map and which drops every sender without it. On Slack
+// the map is an optional override, so an empty one is an INFO that says
+// listed senders are attributed by member id. gchat never reads it.
+func TestEmptyPrincipalMapBootNotice(t *testing.T) {
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -257,11 +259,13 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 
 	for _, tc := range []struct {
 		backend string
-		warns   bool
+		notice  string
+		level   slog.Level
+		found   bool
 	}{
-		{slackBackend, true},
-		{discordBackend, true},
-		{gchatBackend, false},
+		{slackBackend, "the Slack principal map is empty", slog.LevelInfo, true},
+		{discordBackend, "principal map is empty; every discord message", slog.LevelWarn, true},
+		{gchatBackend, "principal map is empty", 0, false},
 	} {
 		t.Run(tc.backend, func(t *testing.T) {
 			client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-"+tc.backend), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
@@ -280,12 +284,12 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 			if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: tc.backend, Logger: slog.New(logs)}); err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			lvl, found := logs.level("principal map is empty")
-			if found != tc.warns {
-				t.Fatalf("backend %q: empty-map warning found=%t, want %t", tc.backend, found, tc.warns)
+			lvl, found := logs.level(tc.notice)
+			if found != tc.found {
+				t.Fatalf("backend %q: empty-map notice found=%t, want %t", tc.backend, found, tc.found)
 			}
-			if found && lvl != slog.LevelWarn {
-				t.Fatalf("backend %q: empty-map notice at %v, want WARN", tc.backend, lvl)
+			if found && lvl != tc.level {
+				t.Fatalf("backend %q: empty-map notice at %v, want %v", tc.backend, lvl, tc.level)
 			}
 		})
 	}
@@ -345,6 +349,8 @@ func TestSlackGatewayDoesNotAdoptOnATasklessTurn(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -424,6 +430,56 @@ func TestSideDoorForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
 	}
 	if ttl != 7*time.Minute {
 		t.Fatalf("the idle TTL did not reach the Slack primary: sessionTTL = %v, want 7m", ttl)
+	}
+}
+
+// TestMuxForwardsObserverAndLookupToASlackPrimary: in production the Slack
+// adapter sits behind the console mux, alone or with the inject door above
+// it, so the gateway's TaskStarted and SetSessionLookup reach the mux first.
+// Dropping them there leaves no thread ever marked and the registry never
+// wired, and every unmentioned reply in a session thread drops.
+func TestMuxForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
+	for _, withDoor := range []bool{false, true} {
+		t.Run(map[bool]string{false: "mux on top", true: "door above the mux"}[withDoor], func(t *testing.T) {
+			a := newTestSlackAdapter(&fakeSlackAPI{})
+			mux, err := NewMultiAdapter(slackBackend, consoleBackend, map[string]Adapter{slackBackend: a, consoleBackend: newFakeAdapter()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var top Adapter = mux
+			if withDoor {
+				door, err := NewInjectAdapter("127.0.0.1:0", "side-door-test-token", time.Minute, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				top = WithSideDoor(mux, door, nil)
+			}
+			observer, ok := top.(TaskObserver)
+			if !ok {
+				t.Fatal("the stack must implement TaskObserver")
+			}
+			observer.TaskStarted("slack:C1/9.0", "task-chat")
+			observer.TaskStarted("console:tab-1", "task-console")
+			if len(a.sessionThreads) != 1 || !a.sessionThreads["C1/9.0"] {
+				t.Fatalf("TaskStarted did not reach the Slack adapter alone: sessionThreads = %v", a.sessionThreads)
+			}
+			observer.TaskAccepted("slack:C1/9.0", "task-chat")
+			observer.CancelPublished("slack:C1/9.0", "task-chat")
+			observer.TaskTerminal("slack:C1/9.0", "task-chat", lib.StateCompleted, TerminalFromExecutor, "")
+			observer.TaskStarted("noprefix", "task-x")
+
+			sink, ok := top.(SessionLookupSink)
+			if !ok {
+				t.Fatal("the stack must implement SessionLookupSink")
+			}
+			sink.SetSessionLookup(func(context.Context, string) (bool, time.Time, error) { return true, time.Time{}, nil }, 7*time.Minute)
+			a.mu.Lock()
+			forwarded, ttl := a.sessions != nil, a.sessionTTL
+			a.mu.Unlock()
+			if !forwarded || ttl != 7*time.Minute {
+				t.Fatalf("SetSessionLookup did not reach the Slack adapter: forwarded=%v ttl=%v", forwarded, ttl)
+			}
+		})
 	}
 }
 
@@ -634,6 +690,26 @@ func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
 
+// has reports whether any record carries the attribute key with value.
+func (h *recordingHandler) has(key, value string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key && a.Value.String() == value {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 // level reports the level of the first record whose message contains sub.
 func (h *recordingHandler) level(sub string) (slog.Level, bool) {
 	h.mu.Lock()
@@ -664,6 +740,92 @@ func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevent
 	return &slackevents.MessageEvent{
 		ChannelType: channelType, Channel: channel, User: user,
 		Text: text, TimeStamp: ts, ThreadTimeStamp: threadTS,
+	}
+}
+
+// TestSlackRefusesAnotherWorkspacesMember: a message whose sender belongs
+// to another workspace (Slack Connect) is not a turn, whatever the
+// allowlist says; a sender of ours in a shared channel, and any message
+// that names no sender workspace, still is.
+func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.teamID = "T0URS"
+	ctx := context.Background()
+	foreign := slackMsg("im", "D1", "UGUEST", "drain node 4", "1.0", "")
+	foreign.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, foreign); ok {
+		t.Error("a DM from another workspace's member was delivered as a turn")
+	}
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, mention); ok {
+		t.Error("a mention from another workspace's member in a shared channel was delivered as a turn")
+	}
+	ours := slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet?", "3.0", "")
+	ours.UserTeam = "T0URS"
+	if _, ok := a.inbound(ctx, ours); !ok {
+		t.Error("our own member's mention in a shared channel was refused")
+	}
+	if _, ok := a.inbound(ctx, slackMsg("im", "D2", "U2", "hello", "4.0", "")); !ok {
+		t.Error("a DM that names no sender workspace was refused")
+	}
+	// A shape that names the sender's workspace only in the message's own
+	// team field is still checked.
+	teamOnly := slackMsg("im", "D4", "UGUEST", "drain node 4", "4.5", "")
+	teamOnly.Message = &slack.Msg{Team: "T0THER"}
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	if _, ok := a.inbound(ctx, teamOnly); ok {
+		t.Error("a message naming another workspace in its team field alone was delivered")
+	}
+	if !logs.has("messageTeam", "T0THER") {
+		t.Error("the refusal's log line does not name the workspace from the team field")
+	}
+	a.log = slog.Default()
+	// A guest's reply in a thread the gateway already holds as a session
+	// thread, which needs no mention, and a guest's file share, take the
+	// same refusal.
+	a.sessionThreads["C1/100.1"] = true
+	reply := slackMsg("channel", "C1", "UGUEST", "and node 5", "6.0", "100.1")
+	reply.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, reply); ok {
+		t.Error("another workspace's member steered a session thread")
+	}
+	share := slackMsg("im", "D5", "UGUEST", "see attached", "7.0", "")
+	share.SubType, share.UserTeam = "file_share", "T0THER"
+	if _, ok := a.inbound(ctx, share); ok {
+		t.Error("another workspace's member's file share was delivered")
+	}
+	// No team id from auth.test: a message that names a sender workspace
+	// cannot be shown to be ours, so it is refused.
+	a.teamID = ""
+	unknown := slackMsg("im", "D3", "U3", "hello", "5.0", "")
+	unknown.UserTeam = "T0URS"
+	if _, ok := a.inbound(ctx, unknown); ok {
+		t.Error("with no team id known, a message naming a sender workspace was delivered")
+	}
+}
+
+// TestSlackConnectedRecordsTheTeam: auth.test's team id is what the
+// workspace check compares against.
+func TestSlackConnectedRecordsTheTeam(t *testing.T) {
+	api := &fakeSlackAPI{team: "T0URS"}
+	a := newTestSlackAdapter(api)
+	auth, err := api.AuthTestContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.connected(auth)
+	if a.teamID != "T0URS" {
+		t.Errorf("teamID = %q, want auth.test's T0URS", a.teamID)
+	}
+	// No team id: the check fails closed, and says so once at WARN.
+	logs := &recordingHandler{}
+	b := newTestSlackAdapter(&fakeSlackAPI{})
+	b.log = slog.New(logs)
+	b.connected(&slack.AuthTestResponse{UserID: "UBOT"})
+	if lvl, found := logs.level("auth.test returned no team id"); !found || lvl != slog.LevelWarn {
+		t.Errorf("no team id: warning found=%t level=%v, want WARN", found, lvl)
 	}
 }
 
@@ -888,6 +1050,208 @@ func TestToMrkdwn(t *testing.T) {
 		"<!channel> deploy done": "&lt;!channel&gt; deploy done",
 		"ping <@U999> now":       "ping &lt;@U999&gt; now",
 		"a & b < c":              "a &amp; b &lt; c",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnConvertsProseAfterAChunkedFence: Gateway.post splits a result
+// with chatChunks(text, discordChunk) and the adapter translates each chunk
+// on its own, so the chunker closes a fenced block it cuts and reopens it in
+// the next chunk (TestChatChunksKeepFencesBalanced). The prose after the
+// block then converts -- bold and links -- rather than riding to the end of
+// the chunk as the content of a fence opened by the block's orphan closer.
+// The fence lines before it are untouched.
+func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
+	big := "```\n" + strings.Repeat("log line\n", 300) + "```\n**Summary:** see [runbook](https://x.example/r)"
+	chunks := chatChunks(big, discordChunk)
+	last := chunks[len(chunks)-1]
+	if !strings.HasSuffix(last, "**Summary:** see [runbook](https://x.example/r)") {
+		t.Fatalf("the last chunk does not carry the summary: %q", last)
+	}
+	got := toMrkdwn(last)
+	wantTail := "```\n*Summary:* see <https://x.example/r|runbook>"
+	if !strings.HasSuffix(got, wantTail) {
+		t.Errorf("the summary after the cut block was not converted:\n got %q\nwant suffix %q", got, wantTail)
+	}
+	fence := strings.TrimSuffix(last, "**Summary:** see [runbook](https://x.example/r)")
+	if !strings.HasPrefix(got, fence) {
+		t.Errorf("the fence lines before the summary were altered:\n got %q\nwant prefix %q", got, fence)
+	}
+}
+
+// TestToMrkdwnRewritesBoldOnlyOnClosedPairs: the bold rewrite used to be a
+// whole-string "**" -> "*", and executor output is full of "**" that is not
+// bold -- a Python **kwargs, a **/*.yaml glob, a horizontal rule -- so the
+// user read an altered answer. A pair is "**" on both sides of
+// one-line content that starts and ends on a non-space, non-star character;
+// "***" on both sides is the bold-italic form and becomes *_x_*. Anything
+// else -- an opener that never closes on its line, a triple closed by a
+// double, stars around spaces -- is left as written. Code spans (fenced,
+// double-backtick, inline) are verbatim, and the only rewrite that reaches
+// them is the control-sequence escaping, which is not a markdown rule.
+func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
+	cases := map[string]string{
+		// The issue's rows: none of these is a bold pair.
+		"**kwargs":                "**kwargs",
+		"**/*.yaml":               "**/*.yaml",
+		"a ** b":                  "a ** b",
+		"***":                     "***",
+		"def f(*args, **kwargs):": "def f(*args, **kwargs):",
+		// Bold-italic is the one triple that is a pair, and a single star
+		// inside a pair is emphasis inside it, not a second pair.
+		"***x***":                     "*_x_*",
+		"**Note: *not* recommended**": "*Note: *not* recommended*",
+		// Code spans are verbatim: inline, double-backtick, fenced, and a
+		// fence that never closes (it runs to the end, as CommonMark reads it).
+		"`**x**`":                              "`**x**`",
+		"``a ` **x**``":                        "``a ` **x**``",
+		"```\n**x**\n```":                      "```\n**x**\n```",
+		"```yaml\npaths: [\"**/*.yaml\"]\n```": "```yaml\npaths: [\"**/*.yaml\"]\n```",
+		"```\nunclosed fence **x**":            "```\nunclosed fence **x**",
+		// A pair beside a code span is still rewritten; the span is not.
+		"**a** and `**b**` and **c**":                "*a* and `**b**` and *c*",
+		"**bold** then ```**code**``` then **bold**": "*bold* then ```**code**``` then *bold*",
+		// A pair that wraps a code span still converts (only its own stars
+		// change), a link whose label holds a code span still converts, and
+		// a link written inside a code span is code, not a link.
+		"**`kubectl get pods`**":    "*`kubectl get pods`*",
+		"see **`values.yaml`** for": "see *`values.yaml`* for",
+		// And still converts when the span it wraps holds a `**` of its
+		// own: the closer is sought outside code spans, so the span's
+		// stars are neither a closer nor altered. The same span with no
+		// pair around it, or with an opener that never closes, is as
+		// written.
+		"**`**kwargs`**":                            "*`**kwargs`*",
+		"use **`**kwargs`** for":                    "use *`**kwargs`* for",
+		"**see `a**b`**":                            "*see `a**b`*",
+		"pass `**kwargs` through":                   "pass `**kwargs` through",
+		"**`**kwargs` unclosed":                     "**`**kwargs` unclosed",
+		"[`kubectl`](https://x.example/p)":          "<https://x.example/p|`kubectl`>",
+		"run `[x](https://x.example/p)` as written": "run `[x](https://x.example/p)` as written",
+		// Escaping is not a markdown rule and still reaches code: a
+		// prompt-injected <!channel> in a code span must not ping the room.
+		"<!channel> in `**code**`": "&lt;!channel&gt; in `**code**`",
+		// One exponent is not a pair; two on a line are one to CommonMark
+		// as well, and the adapter reads the markdown rather than guessing
+		// at Python. Pinned so the residue is a decision, not a surprise.
+		"2**8":            "2**8",
+		"x = a**2 + b**2": "x = a*2 + b*2",
+		// Not pairs: an opener that closes on a later line, stars around
+		// spaces, a triple closed by a double and the reverse.
+		"**open here\nclosed** there": "**open here\nclosed** there",
+		"** x **":                     "** x **",
+		"***x**":                      "***x**",
+		"**x***":                      "**x***",
+		// Single-star and underscore emphasis are not this rewrite's: Slack
+		// reads *x* as bold and _x_ as italic, and both pass through as today.
+		"*x* and _y_": "*x* and _y_",
+		// A markdown link's destination is never altered: a pair whose stars
+		// sit inside it is left alone, while a pair that wraps the whole
+		// link still converts, since only its own stars change.
+		"[doc](https://x.example/**a**/b)": "<https://x.example/**a**/b|doc>",
+		"**[doc](https://x.example/p)**":   "*<https://x.example/p|doc>*",
+		// A `**` inside a code span does not open a pair, and one inside a
+		// link's destination does not close one: the pair is read from the
+		// stars outside both, as CommonMark reads it (`a**b**` is bold b).
+		"`**`a**b**":                           "`**`a*b*",
+		"**x [doc](https://x.example/**a) y**": "*x <https://x.example/**a|doc> y*",
+		// A bare URL is not a shape the adapter recognises (Slack auto-links
+		// it), so a closed pair inside one is rewritten exactly as before.
+		"see https://x.example/**a**/b": "see https://x.example/*a*/b",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnRefusesURLShapedLabelsNamingAnotherHost: Slack renders a
+// link's label, so [https://good.example](https://evil.example) read as a
+// link to good.example that opened evil.example -- the pipe refusal
+// (TestToMrkdwnRefusesPipesInsideLinkURLs) closes only the split-at-pipe
+// route to the same display. A label that is itself URL-shaped and names a
+// host other than the destination's is refused: the markdown is left as
+// written, escaped, and no <...|...> is produced. The check is on the host,
+// case-insensitively and without the port, for every URL a label carries
+// anywhere in it, read as the label renders (emphasis and code marks and
+// invisible format characters removed); a label that is prose is prose.
+func TestToMrkdwnRefusesURLShapedLabelsNamingAnotherHost(t *testing.T) {
+	cases := map[string]string{
+		"[https://good.example](https://evil.example)":            "[https://good.example](https://evil.example)",
+		"[https://good.example/path](https://evil.example/login)": "[https://good.example/path](https://evil.example/login)",
+		"[http://good.example](https://evil.example)":             "[http://good.example](https://evil.example)",
+		// The same host is an honest label, whatever the case or path.
+		"[https://x.example/p](https://x.example/p)":     "<https://x.example/p|https://x.example/p>",
+		"[HTTPS://X.EXAMPLE/p](https://x.example/q?a=1)": "<https://x.example/q?a=1|HTTPS://X.EXAMPLE/p>",
+		// The URL is found anywhere in the label, so wrapping it in bold,
+		// italic, a space or escaped angle brackets does not get it past
+		// the check, and userinfo that reads as one host and parses as the
+		// other is refused outright.
+		"[**https://good.example**](https://evil.example)":          "[**https://good.example**](https://evil.example)",
+		"[_https://good.example_](https://evil.example)":            "[_https://good.example_](https://evil.example)",
+		"[ https://good.example](https://evil.example)":             "[ https://good.example](https://evil.example)",
+		"[<https://good.example>](https://evil.example)":            "[&lt;https://good.example&gt;](https://evil.example)",
+		"[https://good.example@evil.example](https://evil.example)": "[https://good.example@evil.example](https://evil.example)",
+		// A mark inside the URL renders away, so the label is read without
+		// it: after the scheme, splitting the scheme, or a zero-width space
+		// in it. A space after the scheme leaves a claim with no host.
+		"[https://**good.example**](https://evil.example)":   "[https://**good.example**](https://evil.example)",
+		"[https://*good.example*](https://evil.example)":     "[https://*good.example*](https://evil.example)",
+		"[https://_good.example_](https://evil.example)":     "[https://_good.example_](https://evil.example)",
+		"[https://`good.example`](https://evil.example)":     "[https://`good.example`](https://evil.example)",
+		"[**https**://good.example](https://evil.example)":   "[**https**://good.example](https://evil.example)",
+		"[https:**//**good.example](https://evil.example)":   "[https:**//**good.example](https://evil.example)",
+		"[`https`://good.example](https://evil.example)":     "[`https`://good.example](https://evil.example)",
+		"[https:/\u200b/good.example](https://evil.example)": "[https:/\u200b/good.example](https://evil.example)",
+		"[https:// good.example](https://evil.example)":      "[https:// good.example](https://evil.example)",
+		// Every URL in the label is checked, not the first.
+		"[https://evil.example or https://good.example](https://evil.example)": "[https://evil.example or https://good.example](https://evil.example)",
+		// The same host, bolded, on another port, or followed by sentence
+		// punctuation, is still an honest label.
+		"[**https://x.example**](https://x.example/p)":        "<https://x.example/p|*https://x.example*>",
+		"[https://good.example](https://good.example:8443/x)": "<https://good.example:8443/x|https://good.example>",
+		"[Read https://x.example.](https://x.example)":        "<https://x.example|Read https://x.example.>",
+		"[https://x.example, the docs](https://x.example/p)":  "<https://x.example/p|https://x.example, the docs>",
+		// A bare hostname is not URL-shaped; that label is prose to this
+		// check, the same as "the doc". So is a scheme Slack would not
+		// auto-link; the check reads a URL, not a lookalike.
+		"[good.example](https://evil.example)":        "<https://evil.example|good.example>",
+		"[https:/good.example](https://evil.example)": "<https://evil.example|https:/good.example>",
+		// A refused link beside an honest one: only the honest one converts.
+		"[ok](https://x.example/p) and [https://good.example](https://evil.example)": "<https://x.example/p|ok> and [https://good.example](https://evil.example)",
+	}
+	for in, want := range cases {
+		got := toMrkdwn(in)
+		if got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+		// Belt and braces, for the URL-shaped labels: no live link to the
+		// other host survives.
+		if strings.Contains(in, "https://good.example") && strings.Contains(got, "<https://evil.example") {
+			t.Errorf("toMrkdwn(%q) = %q produced a live link whose label names another host", in, got)
+		}
+	}
+}
+
+// TestToMrkdwnKeepsBalancedParenthesesInLinkURLs: the URL class used to end
+// at the first ")", so a Wikipedia-style destination with a parenthesised
+// segment converted to a link to a 404 with a stray ")" after it. CommonMark
+// admits balanced parentheses in a destination; one level is admitted here,
+// and the pipe refusal still holds inside the group.
+func TestToMrkdwnKeepsBalancedParenthesesInLinkURLs(t *testing.T) {
+	cases := map[string]string{
+		"[Foo](https://en.wikipedia.org/wiki/Foo_(bar))":                "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"[Foo](https://en.wikipedia.org/wiki/Foo_(bar)) and (an aside)": "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo> and (an aside)",
+		"[a](https://x.example/p) (b)":                                  "<https://x.example/p|a> (b)",
+		// Unbalanced: not a link, left as written.
+		"[a](https://x.example/(p)": "[a](https://x.example/(p)",
+		// A pipe inside the group is still refused.
+		"[a](https://x.example/p(q|https://good.example))": "[a](https://x.example/p(q|https://good.example))",
 	}
 	for in, want := range cases {
 		if got := toMrkdwn(in); got != want {
@@ -1912,6 +2276,8 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
+		// U1 is listed; U9, below, is not, and is the unverified sender.
+		SlackAllowedUsers: []string{"U1"},
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -1952,7 +2318,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		t.Errorf("the registry was consulted %d times for the follow-up, want 1 — the cache was empty and it is the only source", consulted)
 	}
 
-	// An unmapped sender's ask starts nothing, so it marks nothing.
+	// An unlisted sender's ask starts nothing, so it marks nothing.
 	g.handleInbound(InboundMessage{Conversation: "slack:C1/300.1", Kind: "group", AuthorID: "U9", MessageID: "6.0", Text: "drain node 4"})
 	a.mu.Lock()
 	v, cached := a.sessionThreads["C1/300.1"]
@@ -2002,6 +2368,8 @@ func TestSlackGatewayIdleThreadNeedsAFreshMention(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          ttl,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2113,6 +2481,8 @@ func TestSlackGatewayDetachedTaskIsNotARunningTask(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          ttl,
 		AttributionSalt:  []byte("test-salt"),
+		// The CR-level gate is not under test here; the map is.
+		SlackAllowAllUsers: true,
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2160,4 +2530,289 @@ func TestSlackGatewayDetachedTaskIsNotARunningTask(t *testing.T) {
 	if held, _, err := a.sessions(ctx, conv); err != nil || !held {
 		t.Fatalf("a running task must keep the thread a session thread past any TTL: held=%v err=%v", held, err)
 	}
+}
+
+// startSlackGateRig is startGchatRig for the Slack backend: a principal map
+// file mapping U1 and U2 (both would resolve), the Slack allowlist pair as
+// given, and a fake adapter whose roster is the two of them.
+func startSlackGateRig(t *testing.T, allowed []string, allowAll bool) *rig {
+	t.Helper()
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U1 test:one\nU2 test:two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	if err != nil {
+		t.Fatalf("executor client: %v", err)
+	}
+	t.Cleanup(bus.Close)
+
+	adapter := newFakeAdapter()
+	adapter.roster = []string{"U1", "U2"}
+	cfg := &Config{
+		NATSURL:            url,
+		PrincipalMapPath:   mapFile,
+		DefaultAddressee:   "platform",
+		IdleTTL:            30 * time.Minute,
+		AttributionSalt:    []byte("test-salt"),
+		SlackAllowedUsers:  allowed,
+		SlackAllowAllUsers: allowAll,
+	}
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: slackBackend})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _ = g.Run(ctx) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
+}
+
+func slackAuthorityOf(t *testing.T, r *rig) Authority {
+	t.Helper()
+	origin := r.awaitTask(t, "platform")
+	var auth Authority
+	if err := json.Unmarshal(origin.Authority, &auth); err != nil {
+		t.Fatalf("authority block: %v", err)
+	}
+	return auth
+}
+
+// TestSlackMappedAndAllowedSenderIsAdmitted: the sender passes both gates
+// and resolves through the map, as before the allowlist was carried.
+func TestSlackMappedAndAllowedSenderIsAdmitted(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0", Text: "how is the fleet?"}
+	auth := slackAuthorityOf(t, r)
+	if want := NewPseudonymizer([]byte("test-salt")).Hash("test:one"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want the mapped principal's hash %q", auth.Requester.Principal, want)
+	}
+}
+
+// TestSlackMappedButDisallowedSenderDropsVisiblyOnce: Chat's rule, carried
+// to Slack. A member the map resolves but spec.integration.slack.allowedUsers
+// does not list is refused exactly as an unmapped sender is (the same
+// once-per-sender notice, naming the sender's id), and no task is published.
+// Member ids compare exactly: "u2" is not "U2".
+func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "u2"}, false)
+	for _, id := range []string{"1.0", "2.0"} {
+		r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: id, Text: "do a thing"}
+	}
+	waitFor(t, "the unverified-sender notice", func() bool { return len(r.adapter.postTexts()) >= 1 })
+	time.Sleep(200 * time.Millisecond)
+	posts := r.adapter.postTexts()
+	if len(posts) != 1 {
+		t.Fatalf("posts = %v, want exactly one notice for two messages", posts)
+	}
+	if !strings.Contains(posts[0], "can't verify") || !strings.Contains(posts[0], "U2") {
+		t.Errorf("notice %q should be the unverified-sender notice naming the sender", posts[0])
+	}
+	if want := "an admin has to add you to " + unverifiedRemedyFor(slackBackend) + "."; !strings.HasSuffix(posts[0], want) {
+		t.Errorf("notice %q should be the one an unmapped Slack sender gets, ending %q", posts[0], want)
+	}
+	if !strings.Contains(posts[0], "allowed users list") {
+		t.Errorf("notice %q should name the Slack allowlist among the remedies", posts[0])
+	}
+	if got := len(inSubjectEnvelopes(t, r.url, "platform")); got != 0 {
+		t.Errorf("%d task envelopes published for a disallowed sender", got)
+	}
+}
+
+// TestSlackListedUnmappedSenderIsAttributedByMemberID: the map is an
+// override, not a gate. A listed sender it does not name is admitted and
+// attributed slack:<member id>, with the verifiedBy that says no map was
+// consulted, and they are in their own audience under that same principal.
+func TestSlackListedUnmappedSenderIsAttributedByMemberID(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D9", Kind: "dm", AuthorID: "U9", MessageID: "1.0", Text: "do a thing"}
+	auth := slackAuthorityOf(t, r)
+	ps := NewPseudonymizer([]byte("test-salt"))
+	if want := ps.Hash(slackMemberPrincipalPrefix + "U9"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want the pseudonym of %q", auth.Requester.Principal, slackMemberPrincipalPrefix+"U9")
+	}
+	if auth.Requester.VerifiedBy != slackMemberVerifiedBy {
+		t.Errorf("verifiedBy = %q, want %q (no map was consulted)", auth.Requester.VerifiedBy, slackMemberVerifiedBy)
+	}
+	if !slices.Contains(auth.Audience.Roster, auth.Requester.Principal) {
+		t.Errorf("the requester's principal %q is not in their own audience %v", auth.Requester.Principal, auth.Audience.Roster)
+	}
+}
+
+// TestSlackPartialMapAttributesEachSenderItsOwnWay: with a map naming U1
+// and not U9, U1 is attributed by the map and U9 by member id, and each
+// authority block says which.
+func TestSlackPartialMapAttributesEachSenderItsOwnWay(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
+	for _, tc := range []struct{ id, principal, verifiedBy string }{
+		{"U1", "test:one", slackVerifiedBy},
+		{"U9", slackMemberPrincipalPrefix + "U9", slackMemberVerifiedBy},
+	} {
+		if got := r.g.resolvePrincipal(slackBackend, tc.id); got != tc.principal {
+			t.Errorf("%s resolved to %q, want %q", tc.id, got, tc.principal)
+		}
+		if got := r.g.verifiedByOf(slackBackend, tc.principal); got != tc.verifiedBy {
+			t.Errorf("%s: verifiedBy = %q, want %q", tc.id, got, tc.verifiedBy)
+		}
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0", Text: "do a thing"}
+	auth := slackAuthorityOf(t, r)
+	if auth.Requester.Principal != NewPseudonymizer([]byte("test-salt")).Hash("test:one") || auth.Requester.VerifiedBy != slackVerifiedBy {
+		t.Errorf("the mapped sender's requester = %+v, want the map's principal and %q", auth.Requester, slackVerifiedBy)
+	}
+}
+
+// TestSlackMapCannotAssertTheMemberIDPrefix: a map value carrying the
+// reserved prefix is refused, so no principal a map entry made can claim to
+// be a bare member id, and the mistake is a lockout, not a grant.
+func TestSlackMapCannotAssertTheMemberIDPrefix(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U5 "+slackMemberPrincipalPrefix+"U1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := LoadPrincipalMap(mapFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &Gateway{pm: pm, slackAllowAll: true, log: slog.Default()}
+	if got := g.resolvePrincipal(slackBackend, "U5"); got != "" {
+		t.Errorf("a map value carrying %q resolved to %q; it must be refused", slackMemberPrincipalPrefix, got)
+	}
+	if got := g.resolvePrincipal(slackBackend, ""); got != "" {
+		t.Errorf("an empty member id resolved to %q", got)
+	}
+	// The notice such a member gets must point at the map entry, since they
+	// are already on the list.
+	if remedy := unverifiedRemedyFor(slackBackend); !strings.Contains(remedy, "principal map") {
+		t.Errorf("the Slack remedy %q does not name the principal map", remedy)
+	}
+}
+
+// TestSlackRosterRefusesTheReservedPrefixSilently: the roster resolves every
+// channel member on every turn, so a reserved-prefix map entry is refused
+// there without a log line; the requester path is where it is logged.
+func TestSlackRosterRefusesTheReservedPrefixSilently(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U5 "+slackMemberPrincipalPrefix+"U1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := LoadPrincipalMap(mapFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &recordingHandler{}
+	g := &Gateway{pm: pm, slackAllowAll: true, log: slog.New(logs)}
+	if got := g.rosterResolver(slackBackend)("U5"); got != "" {
+		t.Errorf("the roster resolved a reserved-prefix entry to %q", got)
+	}
+	if _, found := logs.level("reserved member-id prefix"); found {
+		t.Error("the roster path logged the reserved-prefix refusal; it must be silent")
+	}
+	if got := g.resolvePrincipal(slackBackend, "U5"); got != "" {
+		t.Errorf("the requester path resolved a reserved-prefix entry to %q", got)
+	}
+	if lvl, found := logs.level("reserved member-id prefix"); !found || lvl != slog.LevelError {
+		t.Errorf("the requester path's refusal: found=%t level=%v, want ERROR", found, lvl)
+	}
+}
+
+// TestSlackAllowAllAdmitsEverySender: allow-all lifts the list, the only
+// gate: a mapped sender is attributed by the map, an unmapped one by member
+// id.
+func TestSlackAllowAllAdmitsEverySender(t *testing.T) {
+	r := startSlackGateRig(t, nil, true)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: "1.0", Text: "hello"}
+	auth := slackAuthorityOf(t, r)
+	if want := NewPseudonymizer([]byte("test-salt")).Hash("test:two"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want %q", auth.Requester.Principal, want)
+	}
+	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != slackMemberPrincipalPrefix+"U9" {
+		t.Errorf("allow-all resolved an unmapped sender to %q, want %q", p, slackMemberPrincipalPrefix+"U9")
+	}
+}
+
+// TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone: Chat's posture for
+// the shape the operator renders from a degenerate CR list.
+func TestSlackEmptyAllowlistWithoutAllowAllDropsEveryone(t *testing.T) {
+	r := startSlackGateRig(t, nil, false)
+	for _, id := range []string{"U1", "U2"} {
+		if p := r.g.resolvePrincipal(slackBackend, id); p != "" {
+			t.Errorf("%s resolved to %q with an empty allowlist and allow-all off", id, p)
+		}
+	}
+}
+
+// TestSlackRosterDoesNotAttributeADisallowedMember: the roster is read under
+// the same gate as the requester, so a mapped member the allowlist refuses
+// is recorded by backend id, not named by the principal the map would give.
+func TestSlackRosterDoesNotAttributeADisallowedMember(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/1.0", Kind: "group", AuthorID: "U1", MessageID: "1.0", Text: "how is the fleet?"}
+	auth := slackAuthorityOf(t, r)
+	ps := NewPseudonymizer([]byte("test-salt"))
+	roster := strings.Join(auth.Audience.Roster, ",")
+	if !strings.Contains(roster, ps.Hash("test:one")) {
+		t.Errorf("roster %v is missing the allowed requester's principal", auth.Audience.Roster)
+	}
+	if strings.Contains(roster, ps.Hash("test:two")) {
+		t.Errorf("roster %v names the disallowed member's mapped principal", auth.Audience.Roster)
+	}
+	if !strings.Contains(roster, ps.Hash("U2")) {
+		t.Errorf("roster %v should carry the disallowed member by backend id", auth.Audience.Roster)
+	}
+	rec, err := r.g.reg.Get(context.Background(), "slack:C1/1.0")
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	if strings.Contains(strings.Join(rec.Roster, ","), ps.Hash("test:two")) {
+		t.Errorf("session record roster %v names the disallowed member's mapped principal", rec.Roster)
+	}
+}
+
+// TestSlackWorkspaceCheckReadsADecodedEvent: the workspace check on events
+// decoded the way Socket Mode delivers them (json into
+// slackevents.MessageEvent), not built by hand. slack-go decodes a plain
+// message's top-level fields into MessageEvent.Message as well, so the
+// message's own team field is read even when user_team is absent.
+func TestSlackWorkspaceCheckReadsADecodedEvent(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.teamID = "T0URS"
+	decode := func(raw string) *slackevents.MessageEvent {
+		t.Helper()
+		var m slackevents.MessageEvent
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("decoding %s: %v", raw, err)
+		}
+		return &m
+	}
+	for _, tc := range []struct {
+		name, raw string
+		turn      bool
+	}{
+		{"team only, foreign", `{"type":"message","channel":"D1","channel_type":"im","user":"UGUEST","text":"drain node 4","ts":"1.0","team":"T0THER"}`, false},
+		{"user_team, foreign", `{"type":"message","channel":"D2","channel_type":"im","user":"UGUEST","text":"drain node 4","ts":"2.0","team":"T0URS","user_team":"T0THER"}`, false},
+		{"ours", `{"type":"message","channel":"D3","channel_type":"im","user":"U1","text":"how is the fleet","ts":"3.0","team":"T0URS"}`, true},
+		{"no workspace named", `{"type":"message","channel":"D4","channel_type":"im","user":"U1","text":"hello","ts":"4.0"}`, true},
+	} {
+		m := decode(tc.raw)
+		if _, ok := a.inbound(context.Background(), m); ok != tc.turn {
+			t.Errorf("%s: delivered=%v, want %v (Message.Team=%q, UserTeam=%q)", tc.name, ok, tc.turn, teamOf(m), m.UserTeam)
+		}
+	}
+}
+
+func teamOf(m *slackevents.MessageEvent) string {
+	if m.Message == nil {
+		return "<nil Message>"
+	}
+	return m.Message.Team
 }

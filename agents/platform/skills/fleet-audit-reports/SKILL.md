@@ -1,6 +1,6 @@
 ---
 name: fleet-audit-reports
-description: Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran.
+description: Answer a question about a past autonomous fleet audit from the on-pod report store — what a stream last found, how many criticals are open, what changed between two runs, which clusters were skipped or only partly covered, and when each stream last ran. Never the answer to a request to run an audit: a run collects, publishes and opens its fixes through the fleet-audit skill.
 ---
 
 # fleet-audit-reports — Reading What the Audits Found
@@ -20,7 +20,7 @@ repository — a stream publishes one ledger per managed repository:
 
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
-`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_closed`, `silent_ok`,
+`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
 `document`, and sometimes `ledger_document`.
 
@@ -75,7 +75,9 @@ object per call.
   Arguments that do not parse are the exception: argparse prints usage to stderr and stdout is
   empty. Every answer carries an `error` key, null on success. `streams` exits 2 when any one stream is
   unreadable; its other rows still stand — report them and name the unreadable ones.
-- Every subcommand but `streams` takes `--repo owner/name`. Leave it off when the stream has
+- Every subcommand but `streams` takes `--repo`, the repository as the managed list or the `repos`
+  list names it: `owner/name` (or `github.com/owner/name`) on GitHub, `<host>/<path>` for a
+  repository on another forge. Leave it off when the stream has
   published to one repository; when it has published to several, the answer is exit 2 with the
   `repos` to choose from — ask which, or run once per repository, never pick one silently.
 - `--run` takes a stamp from `runs`, with or without the `.json`. Default is the newest run:

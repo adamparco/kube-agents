@@ -183,7 +183,16 @@ env:
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  # The GitLab lane (kube-agents#2394): the same matrix against a pool
+  # project's GitLab repository, collected as tier gitlab with a watermark
+  # of its own and shown in the Brief's "GitLab lane" section only.
+  GITLAB_PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
+  # The nightly's writers periodic, the second job of a night split across
+  # two, in the same bucket. Until it has run the prefix holds no objects,
+  # and until a writers build is on record any other listing failure but a
+  # hang is a note too: it has a watermark of its own.
+  NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -317,7 +326,9 @@ jobs:
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
+            --gitlab-pr-glob "$GITLAB_PR_GLOB" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
+            --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
@@ -762,7 +773,7 @@ jobs:
           import json
           doc = json.load(open("work/fixture-state.json"))
           s = doc["summary"]
-          print("{checked} of {projects} projects checked; drifted on {drifted_projects}; roles healthy {healthy}, drifted {drifted}, not checked {not_checked}".format(**s))
+          print("{checked} of {projects} projects checked; drifted on {drifted_projects}; roles healthy {healthy}, drifted {drifted}, absent {absent}, not checked {not_checked}".format(**s))
           for project, entry in sorted(doc["projects"].items()):
               drifted = [r for r, v in entry["roles"].items() if v["state"] == "drifted"]
               if drifted or entry.get("error"):
@@ -785,6 +796,14 @@ jobs:
       # exits non-zero here.
       - name: Scan every pool project's shape
         if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
+        env:
+          # The verifier's gitops_default_branch check reads each private
+          # *-infra repository's metadata with `gh`; the workflow token sees
+          # none of them, so the read needs a credential of its own, with
+          # metadata read on gke-agentic's *-infra repositories and nothing
+          # else. Until the secret exists this is empty, the check records
+          # "not checked" naming the need, and the GCP checks run regardless.
+          GH_TOKEN: ${{ secrets.GITOPS_METADATA_READ_TOKEN }}
         run: |
           timeout "$POOL_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/pool_state.py \
             --out work/pool-state.json \

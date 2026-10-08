@@ -20,7 +20,8 @@ periodics' readings (`--periodics-dir`, scripts/eval_dashboard/periodics.py)
 -- health.json out (abridged; SCHEMA.md has every key)::
 
     {state, since, cause, failing_cases, evidence, advice, slow, pool,
-     fixture_state, pool_state, periodics, periodics_read, periodics_since,
+     fixture_state, pool_state, periodics, periodics_read, periodics_runs,
+     periodics_streaks, periodics_since,
      metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
@@ -92,6 +93,10 @@ SHARED_BREAK = "shared_break"
 STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
+# runs[].eval_outcome, as the collector writes it from the suite's own
+# eval-verdict.json (SCHEMA.md): the run could not be evaluated. Carried on
+# Run for gate_comment.py; no rule here reads it.
+EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
 FIXTURE_DRIFT = "fixture_drift"
 # Rule 3e (#1967): the hourly pool-state scan found a pool project no longer
 # shaped the way the verifier requires -- a role missing or extra, an API
@@ -207,6 +212,24 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # "inside the storm" for recovery purposes (rule 6): one or two infra reps
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
+
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
 
 # --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
 # Incident: the platform agent's kanban dispatcher stalls under load ("ready
@@ -349,7 +372,9 @@ FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
 # consecutive scans, or on three projects in one (#1927's shape was all 30).
 # A run that leases a drifted project fails on the missing grant with a 403
 # in the agent's transcript, not on the change; the run-based rules see that
-# red, this one names the cause and carries the repair.
+# red, this one names the cause and carries the repair. A finding the verifier
+# lists in LEASE_SILENT_FINDINGS (pool_state.passes_leases) reds no run, and
+# the advice for it says the opposite: a red on such a project is the change's.
 POOL_STATE_LABEL = "pool-state"
 # The verifier's synthesised finding for a check that failed with nothing more
 # specific to say: `<check>/failed` (REPORT_FINDING_FAILED in
@@ -508,11 +533,24 @@ ADVICE_LOST_PODS = (
 UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
-    " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
+    " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
     " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
+)
+# The same condition when every firing finding is one a leased run passes
+# with (pool_state.passes_leases): the pool is drifted and the repair is the
+# pool owner's as before, but no red on a pull request is the pool's.
+ADVICE_POOL_DRIFT_SILENT = (
+    "No run reds from {findings} on {projects}: an install there passes its lease with that gap,"
+    " so a 403 or a missing-resource red on one of them is your change's to read, not the pool's."
+    " The pool owner's repair is in pool-state.json per project; nothing on your side waits for it."
+)
+# Appended when loud and silent findings fire together: ADVICE_POOL_DRIFT then
+# names only the loud ones and the projects they are on.
+ADVICE_POOL_DRIFT_SILENT_TAIL = (
+    " {findings} reds no run: an install passes its lease with that gap, so a red on a project with only that finding is yours to read."
 )
 ADVICE_CEILING = (
     "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
@@ -545,13 +583,16 @@ STEP_RE = re.compile(r"(\d+)([mh])")
 # fixture is a week of real data.json, ten times smaller compressed.
 GZIP_SUFFIX = ".gz"
 # How many characters of a repetition's reason the fixture trimmer keeps:
-# every phrase STORM_REASON_RE matches sits inside the first 96 characters
-# of the harness's phrasings, and the dashboard keeps 300.
-TRIM_REASON_CHARS = 96
+# every phrase STORM_REASON_RE and REPLAY_ERROR_RE matches sits inside the
+# first 128 characters of the harness's phrasings, and the dashboard keeps 300.
+TRIM_REASON_CHARS = 128
 # The optional run fields (SCHEMA.md) the trimmer carries when the source has
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
 ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
+# The suite's own verdict (SCHEMA.md, `eval_outcome`): kept by --trim so a
+# fixture cut from a data.json holding a not-evaluated run replays as one.
+SUITE_FIELDS = ("eval_outcome", "not_evaluated")
 
 UTC = timezone.utc
 
@@ -597,15 +638,19 @@ def rep_kind(rep: dict) -> str:
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
     before #1184, classified `infra` after it -- the text is the same).
+    A harness-declared replay error (#2328) is a graded fail, not a storm.
     """
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
@@ -643,7 +688,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -671,6 +716,15 @@ class Run:
         # without the key is unknown, not "no verdict": it never makes a kill.
         self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
         self.eval_verdict_recorded = "eval_verdict" in run
+        # True when the suite's own verdict said the run could not be
+        # evaluated (SCHEMA.md, `eval_outcome`), with the case ids it named.
+        # Absent reads as a run the suite graded, as every record did before
+        # the field existed. Keyed on Prow's FAILURE like the other shapes
+        # below: the suite prints its line minutes before the job ends, so a
+        # build Prow aborted in that tail carries the field and is an abort.
+        self.not_evaluated = self.result == RUN_FAILURE and run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
+        named = run.get("not_evaluated")
+        self.not_evaluated_cases = [str(c) for c in named if isinstance(c, str)] if isinstance(named, list) else []
 
     @property
     def full(self) -> bool:
@@ -1091,7 +1145,10 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     {project: {unit: [what the scan observed]}} for those and `repairs`
     {project: {unit: repair}}; `read` is {project: [what the scan could read
     there]} and `reads` the subset of it the firing units need, which is
-    what rule 6's exit checks against a later scan.
+    what rule 6's exit checks against a later scan. `passes_leases` is the
+    drifted units, firing or not, a leased run passes with (the pool scan's
+    LEASE_SILENT_FINDINGS; a fleet scan has none), `reds_runs` the rest, and
+    `reds_runs_projects` the drifted projects one of those is on.
     """
     out = {
         "fires": False,
@@ -1100,6 +1157,8 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "unknown": False,
         "scanned_at": None,
         "unread_units": 0,
+        "absent_units": 0,
+        "absent_projects": 0,
         "roles": [],
         "projects": [],
         "drift": {},
@@ -1107,6 +1166,9 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "reads": {},
         "current": {},
         "read": {},
+        "passes_leases": [],
+        "reds_runs": [],
+        "reds_runs_projects": [],
         "checked": 0,
         "total": 0,
         "scanned": [],
@@ -1130,6 +1192,10 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     out["partial"] = bool(scope_key) and state_doc.get(scope_key) == getattr(module, "SCOPE_SELECTED", None)
     out["checked"] = module.checked_projects(state_doc)
     out["unread_units"] = module.unread_units(state_doc)
+    # The fleet scan tells a fixture the stack has not planted from a read
+    # that failed; the pool scan has no such state.
+    out["absent_units"] = module.absent_units(state_doc) if hasattr(module, "absent_units") else 0
+    out["absent_projects"] = module.absent_projects(state_doc) if hasattr(module, "absent_projects") else 0
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
         out["stale"] = True
         age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
@@ -1146,6 +1212,15 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     current = module.drift_map(state_doc)
     previous = module.previous_drift_map(state_doc)
     out["current"] = current
+    passes_leases = getattr(module, "passes_leases", None)
+    out["passes_leases"] = sorted(
+        {unit for units in current.values() for unit in units if passes_leases is not None and passes_leases(unit)}
+    )
+    # The split is made here, once, and carried in the documents: the
+    # advice, the Chat sentence, the digest line and the issue body read it
+    # rather than each deciding which projects the 403 sentence covers.
+    out["reds_runs"] = sorted({unit for units in current.values() for unit in units if unit not in out["passes_leases"]})
+    out["reds_runs_projects"] = sorted(project for project, units in current.items() if any(unit in out["reds_runs"] for unit in units))
     # The checks failing per project, for the exit of a `<check>/failed`
     # unit; a fleet scan's units are its roles, so its failing set is current.
     out["failing"] = module.failing_map(state_doc) if hasattr(module, "failing_map") else current
@@ -1221,8 +1296,12 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
     for run in full_runs:
         # A killed run that recorded cases (#1875) stays in the population --
         # its collapse still makes another PR's red shared -- but is never the
-        # PR's own: the kill is the gate's, whatever those cases did.
-        if run.result != RUN_FAILURE or run.deadline_kill:
+        # PR's own: the kill is the gate's, whatever those cases did. So does a
+        # run the suite could not evaluate (SCHEMA.md, `eval_outcome`): the
+        # suite certified nothing, its roster may not have counted the case
+        # the dashboard's admits, and the run page and the Reds tile already
+        # count it among the gate's.
+        if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
         if mine and all(prs_by_case[case] == {run.pr} for case in mine):
@@ -1533,6 +1612,10 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
         return None
+    # An UNMEASURED artifact still carries the days that did read; the headline
+    # must not quote one above the note that says the wait is unknown.
+    if artifact.get("verdict") == POOL_UNMEASURED:
+        return None
     # The newest judged row, not the newest row. The producer withholds a
     # verdict below its sample floor, and at 13:00 UTC today's row holds only
     # the overnight runs -- one slow run would otherwise be the morning's
@@ -1722,12 +1805,41 @@ def advice_for(
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
     if condition == POOL_DRIFT:
-        incident = incident or {}
-        return ADVICE_POOL_DRIFT.format(
-            findings=", ".join(incident.get("roles") or []) or "the findings",
+        return _pool_drift_advice(incident or {})
+    return ADVICE_SETUP
+
+
+def pool_drift_split(incident: dict) -> tuple[list[str], list[str], list[str]]:
+    """(findings a leased run reds on, findings it passes with, projects one
+    of the former is on), as assess() carried them in the incident. An
+    incident written before the split was carried (a held one from an
+    earlier tick) has no classification, so every finding is one a run reds
+    on and every project is named: the wording from before the split."""
+    findings = list(incident.get("roles") or [])
+    projects = list(incident.get("projects") or [])
+    loud = list(incident["reds_runs"]) if "reds_runs" in incident else findings
+    silent = list(incident.get("passes_leases") or [])
+    loud_projects = list(incident["reds_runs_projects"]) if "reds_runs_projects" in incident else projects
+    return loud, silent, loud_projects
+
+
+def _pool_drift_advice(incident: dict) -> str:
+    """ADVICE_POOL_DRIFT names the findings a leased run reds on and the
+    projects they are on; a finding a leased run passes with gets the
+    opposite advice, on its own or as a tail after the others."""
+    loud, silent, loud_projects = pool_drift_split(incident)
+    if silent and not loud:
+        return ADVICE_POOL_DRIFT_SILENT.format(
+            findings=", ".join(silent),
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
-    return ADVICE_SETUP
+    text = ADVICE_POOL_DRIFT.format(
+        findings=", ".join(loud) or "the findings",
+        projects=_project_list(loud_projects) or "the drifted projects",
+    )
+    if silent:
+        text += ADVICE_POOL_DRIFT_SILENT_TAIL.format(findings=", ".join(silent))
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -1773,7 +1885,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     elif r3e["fires"]:
         # Below fixture drift: a drifted fixture reds the cases that read it,
         # a drifted grant reds whatever the agent asks of it; both are the
-        # pool's and neither is a run-based signal.
+        # pool's and neither is a run-based signal. A finding a leased run
+        # passes with (`passes_leases`) reds nothing, and the advice says so.
         state, condition = DEGRADED, POOL_DRIFT
         cause = CAUSE_POOL_DRIFT.format(findings=", ".join(r3e["roles"]), projects=len(r3e["projects"]))
     else:
@@ -1851,6 +1964,15 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
             "drift": r3e["drift"],
             "repairs": r3e["repairs"],
             "reads": r3e["reads"],
+            # The firing findings a leased run passes with, the ones it reds
+            # on, and the firing projects one of the latter is on: the
+            # advice, the Chat sentence and the issue body word the
+            # consequence from these three and classify nothing themselves.
+            "passes_leases": [unit for unit in r3e["roles"] if unit in r3e["passes_leases"]],
+            "reds_runs": [unit for unit in r3e["roles"] if unit not in r3e["passes_leases"]],
+            "reds_runs_projects": [
+                project for project in r3e["projects"] if any(unit not in r3e["passes_leases"] for unit in r3e["drift"].get(project) or {})
+            ],
         }
     else:
         incident = None
@@ -2229,7 +2351,16 @@ def adjudicate(
     # The wall clock, as the pool note's: a job that stopped is measured
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
-    watched = periodics.assess(readings, pool_clock, prev_notes)
+    # Per job, consecutive failed checks (and per project, for the message),
+    # so a ten-minute job's single flap is not news and two in a row are. The
+    # counts live in the previous health.json; a tick that could not fetch it
+    # starts them over, which would hide a told, still-failing job for a tick
+    # or two, so on that tick the thresholds are off: a failed build is a note,
+    # and the poster, which keys on the verdict, does not re-announce one it
+    # has told.
+    streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
+    superseded = periodics.superseded_jobs(readings, (prev or {}).get("periodics_superseded"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None, superseded=superseded)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2264,6 +2395,9 @@ def adjudicate(
         "pool": pool,
         "periodics": watched,
         "periodics_read": sorted(readings),
+        "periodics_runs": periodics.runs(readings),
+        "periodics_superseded": superseded,
+        "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
@@ -2299,7 +2433,12 @@ def scan_block(scan_result: dict) -> dict | None:
         "projects": scan_result["total"],
         "checked": scan_result["checked"],
         "unread_units": scan_result.get("unread_units", 0),
+        "absent_units": scan_result.get("absent_units", 0),
+        "absent_projects": scan_result.get("absent_projects", 0),
         "drifted": scan_result["current"],
+        "passes_leases": scan_result.get("passes_leases", []),
+        "reds_runs": scan_result.get("reds_runs", []),
+        "reds_runs_projects": scan_result.get("reds_runs_projects", []),
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],
         "reason": scan_result["reason"],
@@ -2418,7 +2557,7 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
             # Kept as written so a fixture cut from a two-tier data.json
             # replays the same filter the live tick applies.
             entry[tiers.TIER_KEY] = run[tiers.TIER_KEY]
-        for key in ENDED_FIELDS:
+        for key in ENDED_FIELDS + SUITE_FIELDS:
             if key in run:
                 entry[key] = run[key]
         runs.append(entry)

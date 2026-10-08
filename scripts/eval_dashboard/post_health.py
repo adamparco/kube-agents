@@ -95,11 +95,11 @@ try:
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly, periodics
-    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
+    from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_drift_split, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
 
@@ -228,13 +228,45 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # Where the fleet scan's grant and semantics are written down, for the
 # message that says the scan is blind.
 FIXTURE_SCAN_DOC = "docs/ci-health.md"
-FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects named."
+FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner."
+# A reconcile run older than this is printed with its date in the digest.
+RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
 # project for every named finding, and what was observed for a check that
 # failed without naming one; the bot's own issue does too when it filed one
 # (an adopted human issue, or a failed filing, does not). The space is told
 # where to look rather than what to type.
 POOL_REPAIR_HINT = "Pool owner: the repair command per project (or, for a check that failed without naming one, what was observed) is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one."
+# The consequence of a pool drift for a pull request, by whether a leased run
+# reds on the findings; health.py's incident and `pool_state` block carry the
+# split (pool_drift_split: `reds_runs`, `passes_leases` from the verifier's
+# LEASE_SILENT_FINDINGS, and `reds_runs_projects`). The default reading sends
+# a real 403 to the pool, so a finding a run passes with is said the other
+# way round; beside findings that do red a run, the 403 sentence counts only
+# the projects one of those is on, and the exception follows it.
+POOL_REDS_RUNS = " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
+POOL_REDS_RUNS_BESIDE = (
+    " a 403 or a missing-resource red from a run that leased a project with {findings} ({count} of the {total}) is the pool's, not the code;"
+    " {silent} reds no run, so a red on one of the others is the code's to read."
+)
+POOL_PASSES_LEASES = (
+    " no run reds from {findings}: an install there passes its lease with that gap,"
+    " so a 403 or a missing-resource red on one of those projects is the code's to read, not the pool's."
+)
+POOL_RETEST = "Retest once the pool owner has run the repair."
+POOL_NO_RETEST = "Nothing on a pull request waits for the repair."
+# The change post's header for the condition. DEGRADED's is "flaky" because
+# every other condition's remedy is a retest, and render_change's other
+# branches inline it; a drift made only of findings a leased run passes with
+# asks for no retest, so its header says so before the sentence does.
+POOL_DRIFT_HEADER = "🟡 *Smoke gate: flaky*"
+POOL_DRIFT_SILENT_HEADER = "🟡 *Smoke gate: pool drifted, runs unaffected*"
+POOL_DIGEST_REDS_RUNS = " a 403 from a run that leased one of them is the pool's, not the code."
+POOL_DIGEST_REDS_RUNS_BESIDE = (
+    " a 403 from a run that leased a project with {findings} ({count} of the {total}) is the pool's, not the code;"
+    " {silent} reds no run, so a 403 on one of the others is the code's to read."
+)
+POOL_DIGEST_PASSES_LEASES = " no run reds from that; a 403 on one of them is the code's to read."
 
 # Rule 8 sends the reader somewhere. The build cluster is named by its real
 # identifiers because `build-kube-agents` is Prow's context alias for it
@@ -642,11 +674,28 @@ def pool_drift_sentence(health: dict, since: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
     projects = list(incident.get("projects") or [])
-    return (
+    loud, silent, loud_projects = pool_drift_split(incident)
+    head = (
         f"pool {plural(len(findings), 'finding')} {', '.join(findings) or '(unnamed)'}"
         f" on {len(projects)} pool {plural(len(projects), 'project')} since {since};"
-        " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
     )
+    if silent and not loud:
+        return head + POOL_PASSES_LEASES.format(findings=", ".join(silent))
+    if silent:
+        return head + POOL_REDS_RUNS_BESIDE.format(findings=", ".join(loud), count=len(loud_projects), total=len(projects), silent=", ".join(silent))
+    return head + POOL_REDS_RUNS
+
+
+def pool_drift_passes_leases(health: dict) -> bool:
+    """Whether every firing pool finding is one a leased run passes with:
+    the one split the header and the retest line both turn on."""
+    loud, silent, _ = pool_drift_split(health.get("incident") or {})
+    return bool(silent) and not loud
+
+
+def pool_drift_retest(health: dict) -> str:
+    """Whether a pull request has anything to wait for."""
+    return POOL_NO_RETEST if pool_drift_passes_leases(health) else POOL_RETEST
 
 
 def cause_sentence(health: dict) -> str:
@@ -720,7 +769,8 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the pool owner has run the repair. {POOL_REPAIR_HINT}{tracking}"]
+        header = POOL_DRIFT_SILENT_HEADER if pool_drift_passes_leases(health) else POOL_DRIFT_HEADER
+        lines = [f"{header} — {cause_sentence(health)} {pool_drift_retest(health)} {POOL_REPAIR_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))
@@ -917,69 +967,233 @@ def periodic_key(note: dict) -> str:
     return str(note.get("verdict"))
 
 
+# The token episode is tracked apart from the job's own: a TOKEN note rides a
+# passed build, so it can alternate with the sweep's FAILED note inside one
+# rotation window, and each must be said once and cleared once.
+TOKEN_TOLD_SUFFIX = "#token"
+
+
+def told_key(job: str, note: dict) -> str:
+    """The poster's memory key for a note: the job, or the job's token episode."""
+    return f"{job}{TOKEN_TOLD_SUFFIX}" if note.get("verdict") == periodics.VERDICT_TOKEN else job
+
+
+def told_job(key: str) -> str:
+    return key[: -len(TOKEN_TOLD_SUFFIX)] if key.endswith(TOKEN_TOLD_SUFFIX) else key
+
+
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
     """The notes not yet told this episode, by job: never told, told with
     another verdict, or told and since read clean (the clear's send failed,
-    so the told key stayed) and failing again."""
+    so the told key stayed) and failing again. A TOKEN note is its own
+    episode: a FAILED note between two sightings of the same due token does
+    not make the second one news."""
     told = (prev or {}).get("periodics_told") or {}
     clean_seen = set((prev or {}).get("periodics_clean_seen") or [])
     return {
         job: note
         for job, note in (health.get("periodics") or {}).items()
-        if told.get(job) != periodic_key(note) or job in clean_seen
+        if told.get(told_key(job, note)) != periodic_key(note) or told_key(job, note) in clean_seen
     }
+
+def _superseded_map(health: dict) -> dict:
+    """health.json's `periodics_superseded`: `{job: {build, recovery}}`; an
+    older document's list form reads as nothing decided."""
+    value = health.get("periodics_superseded")
+    return value if isinstance(value, dict) else {}
 
 
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
-    """The jobs the space was told about that a reading now shows clean."""
+    """The told keys whose episode ended: a job the space was told about whose
+    latest read build passed, or a token episode whose latest read build
+    passed with its GitLab report read and naming no token. Read and not noted
+    is not enough: a failed build under the job's threshold writes no note
+    either, and is not a recovery. A TOKEN note on the job does not keep the
+    job's own FAILED episode open, and a FAILED note does not end the token's."""
     told = (prev or {}).get("periodics_told") or {}
     current = health.get("periodics") or {}
     read = set(health.get("periodics_read") or [])
-    return sorted(job for job in told if job in read and job not in current)
+    runs = health.get("periodics_runs") or {}
+
+    superseded = _superseded_map(health)
+
+    def open_now(key):
+        note = current.get(told_job(key))
+        if not isinstance(note, dict):
+            return False
+        is_token = note.get("verdict") == periodics.VERDICT_TOKEN
+        return is_token == key.endswith(TOKEN_TOLD_SUFFIX)
+
+    def recovered(key):
+        # Its own passed build, or the tick's decision that a later pass of
+        # the job that supersedes it reached its projects. A silence (a
+        # later failed daily) is not a recovery and clears nothing. The token
+        # episode is about the credential, so only a passed build whose
+        # GitLab report was read and names no token ends it: a build whose
+        # report was not read says nothing about the token.
+        job = told_job(key)
+        run = runs.get(job) or {}
+        if key.endswith(TOKEN_TOLD_SUFFIX):
+            return bool(run.get("passed")) and run.get(periodics.KEY_TOKENS_CURRENT) is True
+        return bool(run.get("passed")) or bool((superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY))
+
+    return sorted(key for key in told if told_job(key) in read and not open_now(key) and recovered(key))
+
+def _job_words(job: str, note: dict | None = None) -> dict:
+    """The message words for a job: from its note when there is one, else from
+    the watched table, else the bare job name (a job the table no longer lists)."""
+    periodic = periodics.WATCHED_BY_JOB.get(job)
+    words = {
+        "label": periodic.label if periodic else job,
+        "place": periodic.place if periodic else job,
+        "absence": periodic.absence if periodic else "its runs are failing",
+        "presence": periodic.presence if periodic else "its runs pass again",
+        "does": periodic.does if periodic else "",
+        "effect": periodic.effect if periodic else "",
+        "runbook": periodic.runbook if periodic else "",
+    }
+    for key in words:
+        if note and note.get(key):
+            words[key] = note[key]
+    return words
+
+
+def _periodic_footer(words: dict, history_url: str) -> str:
+    runbook = f"Runbook: {words['runbook']} · " if words.get("runbook") else ""
+    return f"{runbook}Build: {history_url}"
 
 
 def render_periodic(health: dict, prev: dict | None) -> str:
-    """One block per job with news: what failed, the projects it names, where
-    the recovery is written, and the job's history."""
+    """One block per job with news, four lines each: where and what stopped
+    happening; which job, what it does, which run and how it failed; what that
+    costs and the scope; the runbook and the build."""
     blocks = []
     for job, note in sorted(periodic_news(health, prev).items()):
         when = clock(parse_iso(note.get("finished_at")))
+        words = _job_words(job, note)
+        does = f"`{job}` {words['does']}." if words.get("does") else f"`{job}`."
+        effect = f"Effect: {words['effect']} {periodics.SCOPE_LINE}" if words.get("effect") else periodics.SCOPE_LINE
+        footer = _periodic_footer(words, note["history_url"])
         if note.get("verdict") == periodics.VERDICT_STALE:
             if note.get("finished_at"):
-                blocks.append(
-                    f"⚪ *{note['label']} stopped* — last finished run {when}; `{job}` has finished nothing in {note['stale_after_h']}h."
-                    f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
-                )
+                middle = f"Its last finished run was {when} (build {note['build']}); nothing has finished in {note['stale_after_h']}h. If the next one doesn't land, it needs checking."
             else:
-                blocks.append(
-                    f"⚪ *{note['label']}: last run's finish time unreadable* — build {note['build']} finished, but its finished.json gives no time for it,"
-                    f" so the {note['stale_after_h']}h window cannot be measured. Someone check the job.\n{note['history_url']}"
-                )
+                window = f"the {note['stale_after_h']}h window cannot be measured" if note.get("stale_after_h") is not None else "it cannot be placed in time"
+                middle = f"Build {note['build']} finished, but its finished.json gives no time for it, so {window}. Someone check the job."
+            blocks.append("\n".join([f"⚪ *{words['place']}: {_stale_headline(words, note)}.*", f"{does} {middle}", effect, footer]))
+            continue
+        if note.get("verdict") == periodics.VERDICT_TOKEN:
+            # The run passed; the credential it reports on is the news.
+            lines = [f"🟡 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}) passed, and its GitLab report names:"]
+            lines.extend(f"- {line}" for line in note.get("detail") or [])
+            lines.append(f"Effect: {words['effect']} {periodics.SCOPE_LINE}" if words.get("effect") else periodics.SCOPE_LINE)
+            lines.append(footer)
+            blocks.append("\n".join(lines))
             continue
         dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
-        lines = [f"🟠 *{note['label']} failed* — build {note['build']} at {when}{dry}."]
+        how = f": {note['summary']}" if note.get("summary") else ""
+        lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
         lines.extend(f"- {line}" for line in note.get("detail") or [])
-        lines.append(f"Recovery: {note['doc']}.")
-        lines.append(note["history_url"])
+        lines.append(effect)
+        lines.append(footer)
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
 def render_periodic_clear(health: dict, prev: dict | None) -> str:
-    return "\n".join(
-        f"✅ *{periodics.WATCHED_BY_JOB[job].label if job in periodics.WATCHED_BY_JOB else job} passed again* — its latest run finished clean."
-        for job in periodic_clears(health, prev)
-    )
-
-
-def periodic_digest_lines(health: dict) -> list[str]:
+    """One line per job that passed again: where, what resumed, and what the
+    run did when its report says."""
     lines = []
-    for _, note in sorted((health.get("periodics") or {}).items()):
-        if note.get("verdict") == periodics.VERDICT_STALE:
-            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
-            lines.append(f"⚪ {note['label']}: {last}.")
+    runs = health.get("periodics_runs") or {}
+    superseded = _superseded_map(health)
+    for key in periodic_clears(health, prev):
+        job = told_job(key)
+        words = _job_words(job)
+        run = runs.get(job) or {}
+        if (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_RECOVERY) and not run.get("passed"):
+            # Cleared by the superseding job's later run: that run is the
+            # evidence, not the failed build being cleared. The run the
+            # decision was made on, carried with it: this tick may not have
+            # read the daily, or may have read a later build.
+            other = periodics.SUPERSEDED_BY.get(job, "")
+            theirs = (superseded.get(job) or {}).get(periodics.SUPERSEDED_KEY_BY) or runs.get(other) or {}
+            when = clock(parse_iso(theirs.get("finished_at"))) if theirs.get("finished_at") else "?"
+            did = f": {theirs['summary']}" if theirs.get("summary") else " finished clean"
+            lines.append(f"✅ *{words['place']}: {words['presence']}.* `{job}`'s build {run.get('build')} failure is cleared by `{other}`'s {when} run (build {theirs.get('build')}){did}.")
+            continue
+        when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
+        if key.endswith(TOKEN_TOLD_SUFFIX):
+            # What was told was the credential, so what clears is the credential.
+            lines.append(f"✅ *{words['place']}: {periodics.TOKEN_PRESENCE}.* `{job}`'s {when} run (build {run.get('build')}) names no token to rotate.")
+            continue
+        did = run.get("summary")
+        # A passed build has a finish time (none is STALE and noted), so
+        # `when` is there. The job by name: the reconciles share a place and
+        # a presence.
+        tail = f" `{job}`'s {when} run (build {run.get('build')}): {did}." if did else f" `{job}`'s {when} run (build {run.get('build')}) finished clean."
+        lines.append(f"✅ *{words['place']}: {words['presence']}.*{tail}")
+    return "\n".join(lines)
+
+
+def reconcile_run_lines(health: dict, now: datetime | None = None) -> list[str]:
+    """One line per reconcile job's latest finished run: when, which build,
+    passed or failed, dry run or not, and what it did. The team's answer to
+    "did the fleet get applied", whether or not anything is wrong. A run
+    older than a day carries its date: the postsubmit has no cadence, and
+    last month's merge must not read as this morning's run."""
+    lines = []
+    for job, run in sorted((health.get("periodics_runs") or {}).items()):
+        words = periodics.RECONCILE_RUN_WORDS.get(job)
+        if not words or not isinstance(run, dict):
+            continue
+        finished = parse_iso(run.get("finished_at"))
+        if finished is None:
+            when = f"{words} (build {run.get('build')}, finish time unknown)"
+        elif _is_dated(finished, now):
+            when = f"{words} {dated_clock(finished, now)} (build {run.get('build')})"
         else:
-            lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")
+            when = f"{words} at {clock(finished)} (build {run.get('build')})"
+        verdict = "passed" if run.get("passed") else "failed"
+        dry = " (a dry run: nothing was applied)" if run.get("dry_run") else ""
+        did = f": {run['summary']}" if run.get("summary") else ""
+        lines.append(f"🔁 *Seeded-fleet reconcile:* {when} {verdict}{dry}{did}.")
+    return lines
+
+
+def _is_dated(finished: datetime, now: datetime | None) -> bool:
+    return now is not None and now - finished > RECONCILE_RUN_DATED_AFTER
+
+
+def dated_clock(finished: datetime | None, now: datetime | None) -> str:
+    """A finish time for the digest: the clock alone within a day, the
+    weekday and date before it past that, so last month's on-merge run does
+    not read as this morning's."""
+    if finished is None:
+        return "?"
+    if _is_dated(finished, now):
+        return f"on {finished.astimezone(LOCAL_TZ).strftime('%a %b %-d')} {clock(finished)}"
+    return clock(finished)
+
+
+def _stale_headline(words: dict, note: dict) -> str:
+    """"has stopped running" is a claim only about a job with a cadence; a
+    cadence-less job whose build carries no finish time is said as that."""
+    if note.get("stale_after_h") is None and not note.get("finished_at"):
+        return f"{words['label']}'s latest build cannot be placed in time"
+    return f"{words['label']} has stopped running"
+
+
+def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str]:
+    lines = reconcile_run_lines(health, now)
+    for job, note in sorted((health.get("periodics") or {}).items()):
+        words = _job_words(job, note)
+        if note.get("verdict") == periodics.VERDICT_STALE:
+            last = f"last finished run {dated_clock(parse_iso(note.get('finished_at')), now)}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
+            lines.append(f"⚪ {words['place']}: {_stale_headline(words, note)}; {last}.")
+        elif note.get("verdict") == periodics.VERDICT_TOKEN:
+            lines.append(f"🟡 {words['place']}: {words['absence']} (build {note['build']} passed {dated_clock(parse_iso(note.get('finished_at')), now)}; {'; '.join(note.get('detail') or [])}); {note['history_url']}")
+        else:
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
     return lines
 
 
@@ -1026,15 +1240,25 @@ def pool_state_digest_line(health: dict) -> str | None:
     drifted = block.get("drifted") or {}
     if drifted:
         findings = sorted({finding for findings in drifted.values() for finding in findings})
+        # The block carries the same split as the incident, over every
+        # drifted project rather than the firing ones.
+        loud, silent, loud_projects = pool_drift_split(dict(block, roles=findings, projects=sorted(drifted)))
+        if silent and not loud:
+            consequence = POOL_DIGEST_PASSES_LEASES
+        elif silent:
+            consequence = POOL_DIGEST_REDS_RUNS_BESIDE.format(findings=", ".join(loud), count=len(loud_projects), total=len(drifted), silent=", ".join(silent))
+        else:
+            consequence = POOL_DIGEST_REDS_RUNS
         return (
             f"🧭 *Pool projects:* {len(drifted)} of {checked} checked pool projects drifted at {when}"
-            f" ({', '.join(findings)}); a 403 from a run that leased one of them is the pool's, not the code."
+            f" ({', '.join(findings)});{consequence}"
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
     if unread:
-        # A project counts as checked when one check read anything; a scan
-        # that read little must not be reported as a clean bill.
+        # A project counts as checked when one GCP check read anything (the
+        # GitHub read alone does not count); a scan that read little must
+        # not be reported as a clean bill.
         return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'check')} not read in full{unchecked}."
     return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, every one shaped as the verifier requires{unchecked}."
 
@@ -1061,6 +1285,20 @@ def fixture_digest_line(health: dict) -> str | None:
             f" ({', '.join(roles)}); a red on a case that depends on {plural(len(roles), 'it', 'them')} there is the fixture, not the code."
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
+    unread = int(block.get("unread_units") or 0)
+    absent = int(block.get("absent_units") or 0)
+    # A project counts as checked when one role was read or seen absent. A fixture the stack
+    # has not planted there (or something destroyed) is absent: a rollout the
+    # next reconcile finishes, said apart from a read that failed, which is
+    # not a fixture in its designed state either way.
+    clauses = []
+    if absent:
+        absent_projects = int(block.get("absent_projects") or 0)
+        clauses.append(f"{absent} {plural(absent, 'fixture')} absent on {absent_projects} {plural(absent_projects, 'project')} (not applied there yet, or destroyed), the next reconcile plants them")
+    if unread:
+        clauses.append(f"{unread} {plural(unread, 'role')} not read")
+    if clauses:
+        return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {'; '.join(clauses)}{unchecked}."
     return f"🧭 *Seeded fleet:* {checked} of {total} pool projects checked at {when}, every fixture in its designed state{unchecked}."
 
 
@@ -1187,7 +1425,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     pool_projects = pool_state_digest_line(health)
     if pool_projects:
         lines.append(pool_projects)
-    lines.extend(periodic_digest_lines(health))
+    lines.extend(periodic_digest_lines(health, now))
     lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
@@ -1436,18 +1674,18 @@ def run(
     if KIND_PERIODIC_CLEAR in kinds and KIND_PERIODIC_CLEAR not in sent:
         clean_seen.update(cleared)
     if KIND_PERIODIC_CLEAR in sent:
-        for job in cleared:
-            periodics_told.pop(job, None)
-            clean_seen.discard(job)
+        for key in cleared:
+            periodics_told.pop(key, None)
+            clean_seen.discard(key)
     if KIND_PERIODIC in sent:
         for job, note in (health.get("periodics") or {}).items():
-            periodics_told[job] = periodic_key(note)
-            clean_seen.discard(job)
+            periodics_told[told_key(job, note)] = periodic_key(note)
+            clean_seen.discard(told_key(job, note))
     # A job no longer watched is never read again, so it would never clear.
-    for job in list(periodics_told):
-        if job not in periodics.WATCHED_BY_JOB:
-            periodics_told.pop(job)
-            clean_seen.discard(job)
+    for key in list(periodics_told):
+        if told_job(key) not in periodics.WATCHED_BY_JOB:
+            periodics_told.pop(key)
+            clean_seen.discard(key)
     source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,

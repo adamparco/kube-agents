@@ -4,7 +4,7 @@
 
 **Cron:** id `gcp-networking-fabric-audit`, schedule `0 8 * * *` (daily 08:00 UTC).
 
-**Data sources:** `gcloud compute networks ...`, `gcloud compute routers ...`, `gcloud compute forwarding-rules ...`, and `gcloud compute security-policies ...` across all managed fleet projects (`GCP_PROJECT_ID` and `MONITORED_PROJECT_IDS`).
+**Data sources:** `gcloud compute networks ...`, `gcloud compute routers ...`, `gcloud compute forwarding-rules ...`, and `gcloud compute security-policies ...`, run once per project in the resolved project scope (§1). Check 2.1 runs through `networking_audit.py`, which also reads `gcloud container clusters list`, `gcloud compute instances list` and `gcloud compute addresses list`.
 
 ---
 
@@ -27,22 +27,33 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 
 ### 1. Enumerate the target fleet
 
+**Resolve the project scope first.** The scope is the host project (`gcloud config get-value project`) plus every project `gcloud projects list --format="value(projectId)"` returns. Run every collection command once per project, passing `--project` explicitly — the ambient default silently audits one project and reports the result as a fleet sweep. The scope is what the agent's identity can read, so an operator narrows it by narrowing the IAM grant. A listing that exits non-zero, or that returns without the host project, cannot say how many other projects exist: sweep the projects you have and add one `scope.skipped` entry, `{"cluster": "project/UNENUMERATED_PROJECTS", "reason": "<the listing's rc and stderr excerpt, or the host project it omitted>"}`, so the run publishes as partial rather than as the whole fleet. A run narrowed on request — someone asks for one project, or a helper script is given `--project-id` or `MONITORED_PROJECT_IDS` — records the same entry with the reason `scope narrowed to <projects> on request`: it read no other project, and without the entry `finish` resolves every ledger finding on a project the run never looked at. A project where the API this audit reads is disabled (`SERVICE_DISABLED`, `accessNotConfigured`, `has not been used in project`) holds nothing to audit and counts as empty, not skipped: recording it as a loss would pin every run partial for as long as the project exists. That holds only when the refusal names this project — its id, or the number `gcloud projects describe <project> --format='value(projectNumber)'` prints. A refusal naming another project, such as the credential's quota project, says nothing about this one: record it in `scope.skipped` as a failed read.
+
 ```bash
-gcloud compute networks subnets list --format=json
+HOST=$(gcloud config get-value project)
+LISTED=$(gcloud projects list --format="value(projectId)")
+PROJECTS=$(printf '%s\n' "$HOST" $LISTED | sort -u)
+for PROJECT in $PROJECTS; do
+  gcloud compute networks subnets list --project="$PROJECT" --format=json
+done
 ```
 
-- Target every VPC subnet across fleet projects. Record `{name, location, project, checks_run}` into `scope.clusters`, formatting `name` as unique `<project>/<region>/<subnet>` (or project-scoped target `project/<project-id>`).
+- Target every VPC subnet across the resolved projects. Record `{name, location, project, checks_run}` into `scope.clusters`, formatting `name` as unique `<project>/<region>/<subnet>` (or project-scoped target `project/<project-id>`). Check 2.1's helper writes the subnet entries for every subnet it can count, and lists none for the proxy-only, PSC and NAT subnets it skips (2.1); you write the `project/<id>` ones.
 - **`checks_run` is mandatory on every scope entry:** Each entry is an object `{"check": "<slug>", "command": "<literal command>"}` naming the exact inspection command executed on that target.
-- A project or target you cannot reach goes in `scope.skipped` with a reason string. If a target is partially readable, record the refusal in its `limitations` string. Declare structurally inapplicable checks in `checks_not_applicable`.
+- A project or target you cannot reach goes in `scope.skipped` with a reason string, **and the sweep continues** — one project's permission error never decides the outcome for the rest of the fleet. If a target is partially readable, record the refusal in its `limitations` string. Declare structurally inapplicable checks in `checks_not_applicable`.
 
 ### 2. Diagnostic checks roster
+
+Run every check once per project in §1's scope, with `$PROJECT` set to that project for the whole pass, except 2.1: its helper sweeps the whole scope itself in one run. After §1's loop the variable holds the last project listed, so a check run outside a per-project pass reads that one project and reports it as the fleet.
 
 #### 2.1 Subnet primary and secondary IP range exhaustion (`subnet-ip-exhaustion`)
 
 - **Severity**: `critical`
-- **Command**: `gcloud compute networks subnets list-usable --project=$PROJECT --format=json`
+- **Command**: `python3 ./skills/gcp-networking-fabric-audit/scripts/networking_audit.py --check subnet-ip-exhaustion --output /opt/data/scratch/networking_subnets.json` — run it once, not inside a per-project pass: it resolves §1's project scope itself and sweeps every project in it. `gcloud compute networks subnets list-usable` returns ranges but no usage, so it cannot answer this check.
+- **What it measures**: Pod (secondary) ranges from GKE's own utilization fields in `gcloud container clusters list` (`defaultPodIpv4RangeUtilization`, each node pool's `podIpv4RangeUtilization`, `additionalPodRangesConfig`), which count allocated per-node blocks, the unit that runs out. Primary ranges as a lower bound: the unique internal IPs held by VM NICs, reserved internal addresses and forwarding rules, plus the 4 addresses GCP reserves in every range; serverless connectors and Google-managed endpoints are not counted. It skips proxy-only, PSC and NAT subnets (a `purpose` other than `PRIVATE` or `PRIVATE_RFC_1918`): Google manages their allocations and no read can count them, so they appear nowhere in the document — not measured, not as a gap. A Shared VPC host subnet is measured against the clusters and VMs of every project in scope, not only the host's, and a Pod range whose host subnet could not be listed is still reported, as an entry whose `limitations` says so.
 - **Condition**: Subnet primary or secondary Pod IP range has < 15% available IP address capacity remaining.
-- **Remediation**: Expand subnet CIDR or allocate additional secondary IP range in Terraform VPC definition.
+- **Merge**: Copy the helper's `<project>/<region>/<subnet>` entries from `scope.clusters`, its `subnet-ip-exhaustion` findings and its `scope.skipped` entries (`<project>/UNENUMERATED_SUBNETS` for a project whose subnets could not be listed, `<project>/UNREAD_SUBNET_USAGE` for a project whose usage reads failed but which owns no subnet entry to name them on) into findings.json unchanged, apart from §3's remediation promotion. Keep each subnet entry's `limitations` — it names the read of that subnet's own project that failed, such as Pod ranges not read. A `project/UNENUMERATED_PROJECTS` row your document already carries is not added twice. Do not put `subnet-ip-exhaustion` on a `project/<id>` entry's `checks_run`; it stays in that entry's `checks_not_applicable`, as §4's example shows. If the helper exits non-zero or writes no file, the check did not run: leave it out of every `checks_run`, and move it from each `project/<id>` entry's `checks_not_applicable` to that entry's `limitations` with the error, so the run publishes as partial. Never record it as run.
+- **Remediation**: Expand subnet CIDR or allocate additional secondary IP range in Terraform VPC definition. The helper writes `kind: manual`; promote a finding to `kind: manifest` per §3 only once you have found the Terraform file that defines the subnet.
 
 #### 2.2 Cloud NAT gateway port allocation saturation (`cloud-nat-exhaustion`)
 
@@ -103,7 +114,7 @@ Every finding must conform to the full findings schema:
         "checks_run": [
           {
             "check": "subnet-ip-exhaustion",
-            "command": "gcloud compute networks subnets list-usable --project=proj-1 --format=json"
+            "command": "gcloud compute networks subnets list --project=proj-1 '--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)' && gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools)' && gcloud compute instances list --project=proj-1 '--format=json(networkInterfaces[].networkIP,networkInterfaces[].subnetwork)' && gcloud compute addresses list --project=proj-1 --filter=addressType=INTERNAL '--format=json(address,subnetwork)' && gcloud compute forwarding-rules list --project=proj-1 '--format=json(IPAddress,subnetwork)'"
           }
         ],
         "checks_not_applicable": [
@@ -161,19 +172,19 @@ Every finding must conform to the full findings schema:
     {
       "check": "subnet-ip-exhaustion",
       "severity": "critical",
-      "title": "Subnet gke-pods-subnet has < 10% secondary IP addresses remaining",
+      "title": "Pod range gke-pods of subnet gke-pods-subnet in us-central1 has 6% available",
       "cluster": "proj-1/us-central1/gke-pods-subnet",
-      "namespace": "default",
-      "object": "Subnet/gke-pods-subnet",
-      "impact": "Pod scheduling will fail when secondary IP allocation is exhausted.",
+      "namespace": "",
+      "object": "SecondaryRange/gke-pods",
+      "impact": "GKE cannot add nodes that take their Pod block from gke-pods once it is fully allocated, so autoscaling and surge upgrades on those node pools fail.",
       "evidence": {
-        "command": "gcloud compute networks subnets describe gke-pods-subnet --region=us-central1 --project=proj-1 --format=json",
-        "excerpt": "ipCidrRange: 10.0.0.0/20"
+        "command": "gcloud container clusters list --project=proj-1 '--format=json(name,location,subnetwork,networkConfig,ipAllocationPolicy,nodePools)'",
+        "excerpt": "Pod range gke-pods (10.4.0.0/18): GKE reports 93.8% allocated (cluster prod-1, node pool default-pool); about 4 more /24 node blocks fit"
       },
       "recommendation": {
-        "action": "Add an additional secondary IP range to gke-pods-subnet in Terraform.",
-        "rationale": "Prevents pod provisioning stockouts during horizontal scaling.",
-        "risk": "Requires cluster pod CIDR expansion."
+        "action": "Add an additional Pod range to cluster prod-1 (additionalPodRangesConfig), or lower maxPodsPerNode on new node pools so each node takes a smaller block.",
+        "rationale": "GKE allocates one fixed block of the Pod range per node, whatever the node runs.",
+        "risk": "An additional range needs unused VPC space that overlaps no other range; maxPodsPerNode applies only to new node pools, so existing pools must be recreated to benefit."
       },
       "remediation": {
         "kind": "manifest",
@@ -204,7 +215,7 @@ Every finding must conform to the full findings schema:
 ## Red Lines
 
 - **Read-only audit.** Never delete VPC subnets, modify live firewall rules, or tear down NAT gateways directly.
-- **No hand-written issues or PRs.** `audit_report.py` owns the entire git/GitHub write path.
+- **No hand-written issues or PRs.** `audit_report.py` owns the entire git and forge write path.
 - **Never print raw credentials.** Secret tokens, certificates, private keys, and authorization headers must never reach an excerpt.
 - **No unstable finding identity.** Name the durable resource identifier (`Subnet/<name>`, `Router/<name>`), never an ephemeral execution timestamp.
 - **Never emit a manifest that directly deletes a network or subnet.** Deletion remediations are `kind: manual` or `kind: gcloud` only.

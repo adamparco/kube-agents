@@ -1,20 +1,46 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+
+	"github.com/gke-labs/kube-agents/a2a/gateway"
 )
+
+// startTestServerReadyTimeout bounds how long a test waits for the embedded
+// nats-server to accept connections before failing loudly instead of hanging.
+const startTestServerReadyTimeout = 10 * time.Second
 
 // unreachableNATSURL is a loopback port nothing listens on. lib.Connect
 // dials once with no retry-on-failed-connect, so a refused port fails the
 // dial immediately rather than waiting out a timeout.
 const unreachableNATSURL = "nats://127.0.0.1:1"
+
+// TestMain clears every door knob for the package: the cases below pin what
+// changes which FromEnv error fires, and a developer's exported door pair
+// (what running the gateway locally with a door needs) would otherwise skip
+// the "no chat backend" refusal or add a token refusal before the dial. One
+// place, so the next knob cannot reopen this per test.
+func TestMain(m *testing.M) {
+	for _, k := range []string{"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL", "A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP"} {
+		os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
 
 // realMain's first call is gateway.FromEnv, and every case below is refused
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to
@@ -158,5 +184,257 @@ func TestRunExitsNonZeroOnConfigError(t *testing.T) {
 	t.Setenv("SLACK_APP_TOKEN", "")
 	if got := run(); got != exitFailure {
 		t.Errorf("run() = %d, want %d", got, exitFailure)
+	}
+}
+
+// startTestServer starts an embedded, no-auth nats-server on a random port
+// for buildAdapters tests that need a real bus but no gateway config.
+func startTestServer(t *testing.T) *natsserver.Server {
+	t.Helper()
+	opts := &natsserver.Options{
+		Host:     "127.0.0.1",
+		Port:     -1,
+		NoLog:    true,
+		NoSigs:   true,
+		StoreDir: t.TempDir(),
+	}
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(startTestServerReadyTimeout) {
+		t.Fatal("nats-server not ready")
+	}
+	t.Cleanup(s.Shutdown)
+	return s
+}
+
+// fakePrimary is a gateway.Adapter stand-in for buildAdapters tests: it
+// proves the primary backend is still reachable through the mux without
+// standing up a real Discord or Google Chat adapter.
+type fakePrimary struct{ posts []string }
+
+func newFakePrimary() *fakePrimary { return &fakePrimary{} }
+
+func (f *fakePrimary) Run(ctx context.Context, handler func(gateway.InboundMessage)) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakePrimary) Post(conversation, text string) (string, error) {
+	f.posts = append(f.posts, conversation)
+	return "1", nil
+}
+
+func (f *fakePrimary) Edit(conversation, messageID, text string) error {
+	return nil
+}
+
+func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
+	return nil, true, nil
+}
+
+func (f *fakePrimary) OpenDirect(userID string) (string, error) {
+	return "", nil
+}
+
+// TestBuildAdaptersIncludesTheConsole proves buildAdapters wires both the
+// configured chat backend and the console adapter behind one mux: a post to
+// either backend's prefix must reach it (spec-chatops-gateway.md, "The
+// console adapter").
+func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
+	s := startTestServer(t)
+	cfg := &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x"}
+	primary := newFakePrimary()
+	m, err := buildAdapters(cfg, primary, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Post("console:tab-1", "hi"); err != nil {
+		t.Errorf("console not wired: %v", err)
+	}
+	if _, err := m.Post("discord:g/c", "hi"); err != nil {
+		t.Errorf("primary not wired: %v", err)
+	}
+}
+
+// TestComposeAdaptersKeepsTheDoorOnTop builds the stack realMain drives with
+// both doors in it, the case nothing else exercises. The inject door has to
+// sit above the mux: the gateway finds its probe and observers by type
+// assertion on the top of the stack, and the mux has no key for an inject:
+// conversation. Both shapes are covered, the door beside a real backend and
+// the inject-only eval install, where the console is the only chat backend.
+func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
+	s := startTestServer(t)
+	for _, tc := range []struct {
+		name    string
+		cfg     *gateway.Config
+		primary *fakePrimary
+	}{
+		{"beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token"}, newFakePrimary()},
+		{"inject only", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token"}, nil},
+		{"both doors beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token", A2ADoorListen: "127.0.0.1:0", A2ADoorToken: "token"}, newFakePrimary()},
+		{"both doors alone", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token", A2ADoorListen: "127.0.0.1:0", A2ADoorToken: "token"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			door, err := gateway.NewInjectAdapter(tc.cfg.InjectListen, tc.cfg.InjectToken, time.Second, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var primary gateway.Adapter
+			if tc.primary != nil {
+				primary = tc.primary
+			}
+			doors := []gateway.DoorSpec{gateway.InjectDoorSpec(door)}
+			if tc.cfg.A2ADoorArmed() {
+				a2a, err := gateway.NewA2ADoor(tc.cfg.A2ADoorListen, tc.cfg.A2ADoorToken, gateway.A2ADoorOptions{DefaultAddressee: "platform"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				doors = append(doors, gateway.A2ADoorSpec(a2a))
+			}
+			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := a.(gateway.ProbeSink); !ok {
+				t.Error("the door's ProbeSink is hidden: the gateway cannot hand it the probe")
+			}
+			if _, ok := a.(gateway.TaskObserver); !ok {
+				t.Error("the door's TaskObserver is hidden: its requests never see their task")
+			}
+			if _, ok := a.(gateway.InboundObserver); !ok {
+				t.Error("the door's InboundObserver is hidden: its drops and turn ends go unreported")
+			}
+			id, err := a.Post("inject:case-1", "hi")
+			if err != nil || !strings.HasPrefix(id, "inj-") {
+				t.Errorf("inject post = %q, %v; want the door's own message id", id, err)
+			}
+			if _, err := a.Post("console:tab-1", "hi"); err != nil {
+				t.Errorf("console not wired: %v", err)
+			}
+			if tc.cfg.A2ADoorArmed() {
+				id, err := a.Post("a2a:caller:ctx-1", "hi")
+				if err != nil || !strings.HasPrefix(id, "a2a-") {
+					t.Errorf("a2a post = %q, %v; want the A2A door's own message id", id, err)
+				}
+			}
+			if tc.primary != nil {
+				if _, err := a.Post("discord:g/c", "hi"); err != nil {
+					t.Errorf("primary not wired: %v", err)
+				}
+				if len(tc.primary.posts) != 1 || tc.primary.posts[0] != "discord:g/c" {
+					t.Errorf("primary saw posts %v, want only discord:g/c", tc.primary.posts)
+				}
+			}
+		})
+	}
+}
+
+// syncBuffer is an io.Writer a logger on another goroutine can write to
+// while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// alertErr returns the err attribute of the first metricsUnavailableAlert
+// record in a JSON log, and whether there is one.
+func alertErr(t *testing.T, logged string) (string, bool) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+			Err   string `json:"err"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		if rec.Msg == metricsUnavailableAlert && rec.Level == "ERROR" {
+			return rec.Err, true
+		}
+	}
+	return "", false
+}
+
+// A port that will not bind costs the gateway its metrics, not the
+// conversations: serve must log the ALERT line and still run the gateway,
+// and return what the gateway returns rather than the listener's error.
+// The port case holds the metrics port with a listener of the test's own on
+// every interface, as NewMetricsServer binds, so Run's net.Listen fails with
+// EADDRINUSE on its goroutine. The constructor case reaches the other
+// swallowed error, a port NewMetricsServer refuses.
+func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
+	held, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("holding a port: %v", err)
+	}
+	t.Cleanup(func() { held.Close() })
+	heldPort := held.Addr().(*net.TCPAddr).Port
+
+	for _, tc := range []struct {
+		name    string
+		port    int
+		wantErr string
+	}{
+		{"port already bound", heldPort, fmt.Sprintf("metrics listener on :%d", heldPort)},
+		{"port the constructor refuses", 70000, "metrics listener port 70000 is not in"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var logged syncBuffer
+			log := slog.New(slog.NewJSONHandler(&logged, nil))
+			cfg := &gateway.Config{MetricsPort: tc.port}
+
+			// The stub gateway runs until the ALERT is logged (or 10s pass),
+			// so the listener's failure lands while the gateway is running,
+			// which is the production order; then it returns nil, as gw.Run
+			// does on a clean shutdown, and the checks below say which half
+			// is missing.
+			reached := false
+			run := func(context.Context) error {
+				reached = true
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, ok := alertErr(t, logged.String()); ok {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return nil
+			}
+
+			if err := serve(ctx, cfg, gateway.NewMetrics(), log, run); err != nil {
+				t.Fatalf("serve returned %v, want nil: a metrics listener that cannot start must not end the gateway", err)
+			}
+			if !reached {
+				t.Fatal("serve returned without running the gateway")
+			}
+			got, ok := alertErr(t, logged.String())
+			if !ok {
+				t.Fatalf("no %q line logged; log:\n%s", metricsUnavailableAlert, logged.String())
+			}
+			if !strings.Contains(got, tc.wantErr) {
+				t.Errorf("ALERT err = %q, want it to name %q", got, tc.wantErr)
+			}
+		})
 	}
 }

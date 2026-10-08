@@ -914,7 +914,14 @@ main() {
   # Blanking the two selectors also means the destroy makes none of the
   # plan-time lookups, so a host or scope this identity can no longer read
   # cannot refuse the teardown either.
-  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_MAX_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  # Gateway redaction, for the same reason: the generator refuses a misspelt
+  # toggle or a malformed rule, and the gateway goes with the release.
+  export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""
+  # The scoped service account pool, likewise: the generator refuses a
+  # misspelt switch or a malformed cap, and the destroy removes the members
+  # in state whatever these say.
+  export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

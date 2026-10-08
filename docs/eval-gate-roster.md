@@ -14,8 +14,8 @@ carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusio
 `hack/eval/inject-lane-safeguards.yaml`, a new
 case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
-page lives under `docs/` on purpose: the script's step-0 revalidation treats `docs/` as
-inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
+page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
+`docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
 against this prose costs no eval run
 ([#1179](https://github.com/gke-labs/kube-agents/issues/1179)), which is exactly what
 roster-comment edits used to cost.
@@ -52,7 +52,10 @@ selects who decides, and it defaults to `roster`:
   `bench/kube_agents_bench/baselines.py` still computes what the store would do and
   reports it per case — `would-admit` and `would-demote` for a full window
   (`EVAL_ADMISSION_MIN_RUNS` runs, default 20, at the current key, above or below the
-  `EVAL_ADMISSION_RATE` bar), `collecting` for a partial one, `stale` for evidence only at a
+  `EVAL_ADMISSION_RATE` bar, 0.90 since 2026-09-29 so that it is the same ≥ 90 % bar the
+  held-out entries below hold a case to; the measurement it was set from is
+  [on #1493](https://github.com/gke-labs/kube-agents/issues/1493#issuecomment-5892741229)),
+  `collecting` for a partial one, `stale` for evidence only at a
   superseded key, `none` for nothing — and a roster edit cites that sentence. Nothing the
   nightly appends changes which cases block.
 - **`record`**: the store decides once it holds a full window for a case, either way — a
@@ -126,8 +129,8 @@ with a filed issue naming the exit condition:
   collapse. Its own record was 12/13 clean before the storms; 434 of 681 graded presubmit
   repetitions 2026-09-15 to 09-22. Since [#1780](https://github.com/gke-labs/kube-agents/pull/1780)
   (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request last
-  written before the run started, and nothing sweeps the `*-infra` repositories between runs
-  ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
+  written before the run started; since #2260 the job empties the `*-infra` repository before
+  every repetition ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist; pdb-remediation-pr
   is back in the presubmit held out (seat opened 2026-09-28, below), which changes nothing here until
@@ -176,18 +179,23 @@ case, and builds the record step 3 reads at presubmit volume instead of one nigh
 The Cases page reads it as held out, undated: it was never on the roster. Enters the roster
 when #2016 step 3 holds: three clean days at ≥ 90 % of graded repetitions under
 `pull_request_opened` with no all-reps collapse, infra classes the harness excludes not
-counted. One miss shape the seat will show is graded and counts against the case: a job's three
-repetitions share the leased repository, the sweep closes leftovers between leases and not
-between them, and submit-suggestion derives its branch from the change, so repetitions 2 and 3
-meet repetition 1's open pull request. A repetition that pushes its own commit onto that pull
-request passes (#1832 grades the head commit, which must be no older than the repetition's
-start); one that only links the sibling's pull request fails, and that miss is the case's own,
+counted. One miss shape the seat showed before #2260 was graded and counted against the case: a
+job's three repetitions shared the leased repository, the sweep closed leftovers between leases
+and not between them, and submit-suggestion derives its branch from the change, so repetitions 2
+and 3 met repetition 1's open pull request. A repetition that pushed its own commit onto that pull
+request passed (#1832 grades the head commit, which must be no older than the repetition's
+start); one that only linked the sibling's pull request failed, and that miss was the case's own,
 not infra. On the old record's two best nights three of six repetitions linked a pull request
 they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `evals-6-infra`
 #43, #46, then leftover #12), so a reading in the 50–67 % band is the isolation design
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
-it is agent regression; step 3 either counts it, grades repetition 1 only, or sweeps between
-repetitions, and says which. The roster edit (step 4, an eval-crew approval) takes
+it is agent regression. Step 3's choice was the third of counting it, grading repetition 1 only,
+or sweeping between repetitions: since [#2260](https://github.com/gke-labs/kube-agents/issues/2260)
+the job empties the repository before every repetition of a case that requests a pull request,
+so the shape no longer arises and a reading in that band is regression.
+`pull_request_opened`'s `accepts_stream_pull_request` is not a
+fourth answer here: it widens only a fleet audit's stream, and this case has no ledger and
+opens submit-suggestion branches. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
 beside fleet-audits.
 
@@ -382,8 +390,9 @@ path, and grading its answer alone would pass a premise the case does not have t
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
-fixture to an issue. An entry is not a demotion: the case stays in `presubmit-cases.txt` and on
-the blocking roster, runs on every pull request over the api transport, and can still red one.
+fixture to an issue. An entry is not a demotion: the case keeps its api-lane seat, so a
+presubmit case stays in `presubmit-cases.txt` and on the blocking roster, runs on every pull
+request over the api transport, and can still red one, and a nightly case still runs every night.
 The file needs the normal approvers, not the eval-crew rule, for the same reason
 `nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
 
@@ -397,7 +406,8 @@ request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is.
 under `bench/tasks/` and the api lane are untouched. A case that requests a pull request (a
 `pull_request_opened` or `pull_request_diff_contains` check of its own) is allowed the ones its
 reply names, and because the fan-out runs cases side by side against one repository, the script
-runs those cases in a second phase after every other unit has finished, one at a time and each
+runs those cases in a second phase after every other unit has finished (on both lanes since
+#2260, for the repository reset's sake), one at a time and on the inject lane each
 after a settle as long as the check's clock-skew tolerance, so a repetition that requests
 nothing never shares the repository with one that writes by design and no window reaches back
 into the unit before.
@@ -465,7 +475,17 @@ to have shown all of the following first, and the decision is still a team one a
    `EVAL_ADMISSION_RATE` sits above it: two consecutive nights on the same `main` commit are
    the "run it twice, see how much it moves" calibration
    [`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2 asks for, and a
-   bar below the noise floor demotes cases for weather.
+   bar below the noise floor demotes cases for weather. Read once so far, on 2026-09-29
+   ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)): over the four full-matrix
+   nights since oss-test-infra#2707, 20 of the 45 cases with all four nights moved 0 points
+   and 31 moved at most one repetition, so the bar moved from 0.95 (19 of 20, a number nobody
+   had chosen from data) to 0.90, the bar the entries above already hold a case to. At 0.95
+   the record would have demoted 6 of the 12 roster cases (17/21, 19/21, 18/21, 18/21, 18/20,
+   16/20); at 0.90 it demotes 4, and the two that flip are the ones one miss short of the
+   old bar. This item is not "holds" yet: one reading, and the four that remain below the
+   bar are not one story — the two crashloop cases miss this week only, capacity misses in
+   both weeks, and upgrades-lagging-master-probe's misses are all from 09-20 to 09-25 with
+   12 of 12 since.
 
 Switching before 2 holds leaves a listed case with no full window with the list (the list
 is the fallback in `record` mode) but hands every full-window case to the record the same

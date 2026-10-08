@@ -231,8 +231,21 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
         self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
 
+    def routed_git(self):
+        # `/v1/exec` refuses `git` before either git gate, so admit it to count
+        # what those gates refuse.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        return mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed)
+
+    def test_git_counts_as_blocked_on_the_exec_route(self):
+        status, body = self.post(["git", "status"])
+        self.assertEqual(403, status)
+        self.assertEqual("executable.allowlist", body.get("rule"))
+        self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="status", status="blocked"))
+
     def test_a_refused_git_argument_counts_as_blocked(self):
-        status, body = self.post(["git", "-c", "x=y", "status"])
+        with self.routed_git():
+            status, body = self.post(["git", "-c", "x=y", "status"])
         self.assertEqual(403, status)
         self.assertEqual("git.argument.refused", body.get("rule"))
         self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="status", status="blocked"))
@@ -240,7 +253,8 @@ class ToolInvocationCountingTest(_BrokerFixture):
     def test_a_git_write_outside_a_lease_counts_as_blocked(self):
         # No cwd, so the command would run at the shared workspace root, which
         # the lease floor refuses for a write.
-        status, body = self.post(["git", "commit", "-m", "x"])
+        with self.routed_git():
+            status, body = self.post(["git", "commit", "-m", "x"])
         self.assertEqual(403, status)
         self.assertEqual("git.workspace.lease", body.get("rule"))
         self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="commit", status="blocked"))
@@ -370,6 +384,18 @@ class MetricsListenerTest(unittest.TestCase):
         with contextlib.redirect_stderr(captured), self.assertNoLogs(credential_proxy.LOGGER, level="DEBUG"):
             urllib.request.urlopen(self.endpoint + "/metrics").read()
         self.assertEqual("", captured.getvalue())
+
+    def test_the_process_start_time_is_exported_once_and_never_moves(self):
+        """The gauge the operator's usage poller reads: a plausible time, typed, constant across scrapes."""
+        first = _parse(urllib.request.urlopen(self.endpoint + "/metrics").read().decode("utf-8"))
+        second = _parse(urllib.request.urlopen(self.endpoint + "/metrics").read().decode("utf-8"))
+        start = _series(first, credential_proxy.PROCESS_START_TIME_METRIC)
+        self.assertIsNotNone(start, "no process_start_time_seconds line")
+        self.assertEqual(start, credential_proxy.PROCESS_START_TIME_SECONDS)
+        self.assertEqual(start, _series(second, credential_proxy.PROCESS_START_TIME_METRIC))
+        self.assertLess(abs(time.time() - start), 24 * 3600, "the start time is not this process's")
+        body = urllib.request.urlopen(self.endpoint + "/metrics").read().decode("utf-8")
+        self.assertIn(f"# TYPE {credential_proxy.PROCESS_START_TIME_METRIC} gauge", body)
 
     def test_two_scrapes_of_an_idle_registry_are_identical(self):
         first = urllib.request.urlopen(self.endpoint + "/metrics").read()
@@ -773,7 +799,7 @@ class FaultOutcomeTest(unittest.TestCase):
             return error.code, json.loads(error.read())
 
     def test_a_pool_refusal_counts_as_blocked(self):
-        status, body = self._post_with(scoped_sa_pool.PoolRefusal("no member covers the scope"))
+        status, body = self._post_with(scoped_sa_pool.PoolRefusal("no scoped service account for project p (cluster projects/p/locations/l/clusters/c): refused; the broker will not fall back to the ambient credential. Declare the project in spec.scope and apply, or exclude the cluster."))
         self.assertEqual(403, status)
         self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"))
         families = _parse(CredentialProxyHandler.metrics.render())
@@ -883,7 +909,7 @@ class ServeWiringTest(unittest.TestCase):
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
                     mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", unix_server), \
-                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
                     mock.patch.object(credential_proxy, "start_metrics_listener", started), \

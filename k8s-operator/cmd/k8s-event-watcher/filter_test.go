@@ -16,6 +16,7 @@ package main
 
 import (
 	"testing"
+	"time"
 )
 
 func TestFilterDecide(t *testing.T) {
@@ -249,6 +250,296 @@ func TestFilterDecide(t *testing.T) {
 				imagePullTransientMinCount: tc.pullMin,
 			})
 			f := newFilter(cfg)
+			if gate := f.Decide(tc.event); gate != tc.wantGate {
+				t.Errorf("Decide(%+v) = %q; want %q", tc.event, gate, tc.wantGate)
+			}
+		})
+	}
+}
+
+// TestFilterDecideFailedScheduling walks the gate that keeps FailedScheduling
+// from opening a card per routine scale-up. The clock is pinned so the hold
+// and the staleness check age against known values.
+func TestFilterDecideFailedScheduling(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	fs := func(count int, mark scaleUpMark) TriageEvent {
+		return TriageEvent{
+			Key:       EventKey{UID: "pod-1", Reason: "FailedScheduling"},
+			Namespace: "default",
+			Name:      "api",
+			Message:   "0/3 nodes are available: 3 Insufficient cpu.",
+			LastSeen:  now,
+			Count:     count,
+			ScaleUp:   mark,
+		}
+	}
+	triggered := func(age time.Duration) scaleUpMark {
+		return scaleUpMark{Verdict: scaleUpTriggered, At: now.Add(-age)}
+	}
+	declined := func(age time.Duration) scaleUpMark {
+		return scaleUpMark{Verdict: scaleUpDeclined, At: now.Add(-age)}
+	}
+	stale := fs(9, scaleUpMark{})
+	stale.LastSeen = now.Add(-failedSchedulingStaleAfter - time.Second)
+	untimed := fs(2, scaleUpMark{})
+	untimed.LastSeen = time.Time{}
+	staleButDeclined := fs(9, declined(time.Minute))
+	staleButDeclined.LastSeen = now.Add(-failedSchedulingStaleAfter - time.Second)
+	untimedDeclined := fs(1, declined(time.Minute))
+	untimedDeclined.LastSeen = time.Time{}
+	sightedAt := func(ev TriageEvent, at time.Time) TriageEvent {
+		ev.LastSeen = at
+		return ev
+	}
+	// What an Autopilot cluster with no user workloads emits for GKE's own
+	// system pods: kube-scheduler's no-nodes text on a cluster discovery
+	// described as Autopilot, and whatever NAP has said about the pod —
+	// nothing, on a real one. The reporter is set to "default-scheduler"
+	// because that is what twelve of the fifteen pending system pods on a
+	// measured zero-node Autopilot cluster report, the kube-system addons
+	// being pinned to it; the gate must not depend on the other one.
+	autopilot := func(count int, mark scaleUpMark) TriageEvent {
+		ev := fs(count, mark)
+		ev.Namespace = "kube-system"
+		ev.Name = "kube-dns-5dd46df686-p68z4"
+		ev.Reporter = "default-scheduler"
+		ev.Message = noNodesAvailableMessage
+		ev.Autopilot = true
+		return ev
+	}
+	onStandard := func(ev TriageEvent) TriageEvent {
+		ev.Autopilot = false
+		return ev
+	}
+	reportedBy := func(ev TriageEvent, reporter string) TriageEvent {
+		ev.Reporter = reporter
+		return ev
+	}
+	saying := func(ev TriageEvent, message string) TriageEvent {
+		ev.Message = message
+		return ev
+	}
+
+	tests := []struct {
+		name        string
+		minCount    int
+		hold        time.Duration
+		disableHold bool
+		event       TriageEvent
+		wantGate    filterGate
+	}{
+		// The count backstop, with no autoscaler verdict on record.
+		{name: "count 1 is held", event: fs(1, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+		{name: "count 2 is held", event: fs(2, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+		{name: "count 3 is held", event: fs(3, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+		{name: "count 4 is held", event: fs(4, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+		{name: "count 5 fires", event: fs(5, scaleUpMark{}), wantGate: gateAccepted},
+		{name: "count 0 fails open", event: fs(0, scaleUpMark{}), wantGate: gateAccepted},
+		{name: "threshold 1 restores firing on the first event", minCount: 1, event: fs(1, scaleUpMark{}), wantGate: gateAccepted},
+		{name: "an explicit threshold is honoured", minCount: 8, event: fs(7, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+
+		// A live TriggeredScaleUp holds regardless of count; an expired one does not.
+		{name: "triggered mark holds count 5", event: fs(5, triggered(time.Minute)), wantGate: gateScaleUpHold},
+		{name: "triggered mark holds count 50", event: fs(50, triggered(14*time.Minute)), wantGate: gateScaleUpHold},
+		{name: "triggered mark at the hold boundary still holds", event: fs(5, triggered(defaultScaleUpHold)), wantGate: gateScaleUpHold},
+		{name: "expired triggered mark falls back to the count and fires", event: fs(5, triggered(defaultScaleUpHold+time.Second)), wantGate: gateAccepted},
+		{name: "expired triggered mark falls back to the count and holds", event: fs(2, triggered(defaultScaleUpHold+time.Second)), wantGate: gateFailedSchedulingMinCount},
+		{name: "a shorter hold expires sooner", hold: time.Minute, event: fs(5, triggered(2*time.Minute)), wantGate: gateAccepted},
+
+		// The mark is aged against the event's own sighting, not the clock.
+		// After a restart the informer replays a scheduled pod's last
+		// FailedScheduling with its sighting fixed at the end of the
+		// scale-up; judged by the clock the mark has expired while the
+		// sighting is not yet stale, and the count would fire.
+		{name: "replayed event sighted inside the hold is held after the mark has aged past it", event: sightedAt(fs(5, triggered(defaultScaleUpHold+time.Second)), now.Add(-14*time.Minute)), wantGate: gateScaleUpHold},
+		{name: "replayed event sighted just inside the hold is held however old the mark", event: sightedAt(fs(50, triggered(defaultScaleUpHold+14*time.Minute)), now.Add(-14*time.Minute)), wantGate: gateScaleUpHold},
+		{name: "replayed event sighted past the hold falls through to the count", event: sightedAt(fs(5, triggered(defaultScaleUpHold+time.Minute)), now.Add(-30*time.Second)), wantGate: gateAccepted},
+		{name: "event sighted before its mark is held", event: sightedAt(fs(5, triggered(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateScaleUpHold},
+
+		// NotTriggerScaleUp short-circuits the count.
+		{name: "declined mark passes count 1", event: fs(1, declined(time.Second)), wantGate: gateAccepted},
+		{name: "declined mark passes count 0", event: fs(0, declined(time.Second)), wantGate: gateAccepted},
+		{name: "declined mark passes however old", event: fs(1, declined(23*time.Hour)), wantGate: gateAccepted},
+		{name: "declined mark passes an untimed event", event: untimedDeclined, wantGate: gateAccepted},
+
+		// The verdict qualifies only a sighting made later than it. After a
+		// restart the informer replays the object the scheduler last bumped
+		// before the autoscaler ruled; for a pod placed or deleted before the
+		// next retry it is the only one, and passing it on the decline would
+		// open a card for a pod that is no longer pending. The core/v1
+		// recorder stamps to the second and a fast autoscaler declines in the
+		// second of the attempt that drew it, so an equal timestamp is that
+		// attempt, not a retry.
+		{name: "event sighted before its decline falls through to the count and is held", event: sightedAt(fs(1, declined(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateFailedSchedulingMinCount},
+		{name: "event sighted before its decline falls through to the count and fires", event: sightedAt(fs(5, declined(time.Minute)), now.Add(-2*time.Minute)), wantGate: gateAccepted},
+		{name: "event sighted in the second of its decline is the attempt that drew it and is held", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute)), wantGate: gateFailedSchedulingMinCount},
+		{name: "event sighted a second after its decline passes", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute+time.Second)), wantGate: gateAccepted},
+		// An events.k8s.io/v1 sighting carries microseconds; the autoscaler's
+		// core/v1 stamp is whole seconds. Both are read to the second, so a
+		// sighting 400ms into the decline's second is still that attempt.
+		{name: "microsecond sighting in the second of its decline is the attempt that drew it and is held", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute+400*time.Millisecond)), wantGate: gateFailedSchedulingMinCount},
+		{name: "microsecond sighting in the second after its decline passes", event: sightedAt(fs(1, declined(2*time.Minute)), now.Add(-2*time.Minute+time.Second+400*time.Millisecond)), wantGate: gateAccepted},
+		{name: "microsecond sighting before a decline read as now, in its second, is held", event: sightedAt(fs(1, declined(2*time.Minute-700*time.Millisecond)), now.Add(-2*time.Minute+400*time.Millisecond)), wantGate: gateFailedSchedulingMinCount},
+
+		// An event the scheduler stopped re-emitting describes a pod that is
+		// no longer pending, whatever the count or the marks say.
+		{name: "stale event is held at any count", event: stale, wantGate: gateFailedSchedulingStale},
+		{name: "stale event is held despite a decline", event: staleButDeclined, wantGate: gateFailedSchedulingStale},
+		{name: "unknown timestamp is not stale", event: untimed, wantGate: gateFailedSchedulingMinCount},
+
+		// An Autopilot cluster scaled to zero nodes. The scheduler retries
+		// GKE's own system pods forever, so the count backstop is what the
+		// hold has to beat: held at any count, including one past the
+		// threshold and one high enough that the cards on staging opened.
+		{name: "autopilot scale-to-zero is held past the count backstop", event: autopilot(50, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held at the count backstop", event: autopilot(5, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held below the count backstop", event: autopilot(1, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "autopilot scale-to-zero is held on an uncounted event", event: autopilot(0, scaleUpMark{}), wantGate: gateAutopilotScaleToZero},
+		{name: "surrounding whitespace does not defeat the message match", event: saying(autopilot(50, scaleUpMark{}), " "+noNodesAvailableMessage+"\n"), wantGate: gateAutopilotScaleToZero},
+
+		// All three conditions are required. Zero nodes on Standard is a fault
+		// and still fires; a pod that does not fit the nodes there are carries
+		// a fit error, not the no-nodes text.
+		{name: "a standard cluster with no nodes still fires", event: onStandard(autopilot(50, scaleUpMark{})), wantGate: gateAccepted},
+		{name: "a fit error on an autopilot cluster still fires", event: saying(autopilot(50, scaleUpMark{}), "0/3 nodes are available: 3 Insufficient cpu."), wantGate: gateAccepted},
+		{name: "a message that merely quotes the no-nodes text still fires", event: saying(autopilot(50, scaleUpMark{}), "scheduler said \"no nodes available to schedule pods\" earlier"), wantGate: gateAccepted},
+
+		// The reporter decides nothing here, which is the correction to the
+		// first cut: on Autopilot the kube-system addons are pinned to
+		// "default-scheduler" and only the pods outside it report the
+		// Autopilot scheduler, so keying on the reporter held three of the
+		// fifteen pods measured on a real cluster and passed the rest.
+		{name: "the autopilot scheduler's own pods are held", event: reportedBy(autopilot(50, scaleUpMark{}), "gke.io/optimize-utilization-scheduler"), wantGate: gateAutopilotScaleToZero},
+		{name: "an unreported no-nodes event on autopilot is held", event: reportedBy(autopilot(50, scaleUpMark{}), ""), wantGate: gateAutopilotScaleToZero},
+		{name: "the autopilot scheduler on a standard cluster still fires", event: reportedBy(onStandard(autopilot(50, scaleUpMark{})), "gke.io/optimize-utilization-scheduler"), wantGate: gateAccepted},
+
+		// The autoscaler's verdicts outrank the hold, because a verdict means
+		// NAP is managing the pod: the hold reaches only pods it has ignored.
+		{name: "a decline passes an autopilot no-nodes event", event: autopilot(1, declined(time.Minute)), wantGate: gateAccepted},
+		{name: "a live scale-up holds an autopilot no-nodes event on its own terms", event: autopilot(50, triggered(time.Minute)), wantGate: gateScaleUpHold},
+		{name: "an expired scale-up sends an autopilot no-nodes event to the count backstop", event: autopilot(50, triggered(defaultScaleUpHold+time.Second)), wantGate: gateAccepted},
+
+		// The staleness check runs first, so a replayed event from a cluster
+		// that has since scaled up is held as stale rather than as autopilot.
+		{name: "a stale autopilot event is held as stale", event: sightedAt(autopilot(50, scaleUpMark{}), now.Add(-failedSchedulingStaleAfter-time.Second)), wantGate: gateFailedSchedulingStale},
+
+		// The opt-out restores the count backstop and nothing else.
+		{name: "the opt-out fires an autopilot event past the backstop", disableHold: true, event: autopilot(50, scaleUpMark{}), wantGate: gateAccepted},
+		{name: "the opt-out still holds an autopilot event below the backstop", disableHold: true, event: autopilot(1, scaleUpMark{}), wantGate: gateFailedSchedulingMinCount},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// scaleUpReasons, not nil: the Autopilot hold switches itself off
+			// unless both autoscaler reasons are on the allow-list, because
+			// only then can "no verdict on record" mean the autoscaler was
+			// silent rather than unheard. nil here falls back to
+			// defaultReasons, which carries neither, and every autopilot case
+			// below would be exercising the disabled path by accident.
+			f := newFilter(newFilterConfig(scaleUpReasons, nil, nil, filterThresholds{
+				failedSchedulingMinCount:        tc.minCount,
+				scaleUpHold:                     tc.hold,
+				disableAutopilotScaleToZeroHold: tc.disableHold,
+			}))
+			f.now = func() time.Time { return now }
+			if gate := f.Decide(tc.event); gate != tc.wantGate {
+				t.Errorf("Decide(count=%d, mark=%+v, lastSeen=%v) = %q; want %q", tc.event.Count, tc.event.ScaleUp, tc.event.LastSeen, gate, tc.wantGate)
+			}
+		})
+	}
+}
+
+// TestAutopilotHoldNeedsTheAutoscalerReasons pins that the hold switches itself
+// off unless the watcher can actually hear a cluster-autoscaler verdict.
+//
+// The hold reads "no verdict on record" as "the autoscaler is ignoring this
+// pod", and a verdict only reaches the memo through an event whose reason is
+// allowed — RecordScaleUpMark admits one only when Decide returns
+// gateScaleUpMark, and Decide stops a disallowed reason at gateReason first.
+// With the marks off the list every Autopilot no-nodes event looks unruled,
+// including a pod the autoscaler declined, and the hold has no count or
+// deadline to release it. defaultReasons carries neither mark, so the binary's
+// own default --reason is one of the configurations this covers.
+func TestAutopilotHoldNeedsTheAutoscalerReasons(t *testing.T) {
+	// A pod NAP has actually declined, on an Autopilot cluster with no nodes:
+	// the case that must still open a card however the reasons are configured.
+	declined := TriageEvent{
+		Key:       EventKey{UID: "pod-1", Reason: reasonFailedScheduling},
+		Namespace: "team-a",
+		Name:      "api",
+		Message:   noNodesAvailableMessage,
+		Autopilot: true,
+		Count:     50,
+		LastSeen:  time.Unix(1_700_000_000, 0),
+	}
+
+	for _, tc := range []struct {
+		name     string
+		reasons  []string
+		wantHold bool
+	}{
+		{name: "both marks allowed", reasons: scaleUpReasons, wantHold: true},
+		{name: "no marks allowed", reasons: []string{reasonFailedScheduling}, wantHold: false},
+		{name: "only the trigger allowed", reasons: []string{reasonFailedScheduling, reasonTriggeredScaleUp}, wantHold: false},
+		{name: "only the decline allowed", reasons: []string{reasonFailedScheduling, reasonNotTriggerScaleUp}, wantHold: false},
+		{name: "the shipped defaults carry neither", reasons: nil, wantHold: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newFilterConfig(tc.reasons, nil, nil, filterThresholds{})
+			if cfg.autopilotScaleToZeroHold != tc.wantHold {
+				t.Fatalf("autopilotScaleToZeroHold = %t; want %t", cfg.autopilotScaleToZeroHold, tc.wantHold)
+			}
+
+			// The consequence, not just the flag: with the hold off, the
+			// declined pod reaches the count backstop and fires, which is
+			// what it did before this gate existed.
+			f := newFilter(cfg)
+			f.now = func() time.Time { return declined.LastSeen }
+			gate := f.Decide(declined)
+			want := gateAutopilotScaleToZero
+			if !tc.wantHold {
+				want = gateAccepted
+			}
+			if gate != want {
+				t.Errorf("Decide(declined-looking pod) = %q; want %q", gate, want)
+			}
+		})
+	}
+}
+
+// TestFilterDecideScaleUpMarks pins how the two autoscaler reasons move through
+// the gates: admitted by --reason they stop at gateScaleUpMark, so they are
+// counted and recorded but never forwarded; left off it, or in an excluded
+// namespace, they stop earlier and the dispatcher records nothing.
+func TestFilterDecideScaleUpMarks(t *testing.T) {
+	mark := func(reason, ns string) TriageEvent {
+		return TriageEvent{Key: EventKey{UID: "pod-1", Reason: reason}, Namespace: ns, Type: "Normal", Count: 1, Reporter: scaleUpReporter}
+	}
+	reportedBy := func(ev TriageEvent, reporter string) TriageEvent {
+		ev.Reporter = reporter
+		return ev
+	}
+	tests := []struct {
+		name       string
+		reasons    []string
+		excludedNS []string
+		event      TriageEvent
+		wantGate   filterGate
+	}{
+		{name: "TriggeredScaleUp on the list is a mark", reasons: []string{"FailedScheduling", "TriggeredScaleUp", "NotTriggerScaleUp"}, event: mark("TriggeredScaleUp", "default"), wantGate: gateScaleUpMark},
+		{name: "NotTriggerScaleUp on the list is a mark", reasons: []string{"FailedScheduling", "TriggeredScaleUp", "NotTriggerScaleUp"}, event: mark("NotTriggerScaleUp", "default"), wantGate: gateScaleUpMark},
+		{name: "TriggeredScaleUp off the list is dropped by reason", reasons: []string{"FailedScheduling"}, event: mark("TriggeredScaleUp", "default"), wantGate: gateReason},
+		{name: "a mark from an excluded namespace stops at the namespace gate", reasons: []string{"FailedScheduling", "NotTriggerScaleUp"}, excludedNS: []string{"kube-system"}, event: mark("NotTriggerScaleUp", "kube-system"), wantGate: gateNamespaceExcluded},
+		{name: "the default list carries neither mark", event: mark("NotTriggerScaleUp", "default"), wantGate: gateReason},
+		// The reason alone is not a verdict: a mark that names another reporter,
+		// or none, is dropped before the dispatcher records anything.
+		{name: "a TriggeredScaleUp from another reporter is not a mark", reasons: scaleUpReasons, event: reportedBy(mark("TriggeredScaleUp", "default"), "my-operator"), wantGate: gateScaleUpMarkReporter},
+		{name: "a NotTriggerScaleUp with no reporter is not a mark", reasons: scaleUpReasons, event: reportedBy(mark("NotTriggerScaleUp", "default"), ""), wantGate: gateScaleUpMarkReporter},
+		{name: "the reporter check comes after the namespace gates", reasons: scaleUpReasons, excludedNS: []string{"kube-system"}, event: reportedBy(mark("TriggeredScaleUp", "kube-system"), "my-operator"), wantGate: gateNamespaceExcluded},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFilter(newFilterConfig(tc.reasons, nil, tc.excludedNS, filterThresholds{}))
 			if gate := f.Decide(tc.event); gate != tc.wantGate {
 				t.Errorf("Decide(%+v) = %q; want %q", tc.event, gate, tc.wantGate)
 			}

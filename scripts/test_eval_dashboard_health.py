@@ -178,6 +178,61 @@ class RepKinds(unittest.TestCase):
         self.assertEqual(health.rep_kind({"result": "fail", "reason": None}), "fail")
         self.assertEqual(health.rep_kind({"result": "pass", "reason": None}), "pass")
 
+    def test_a_broken_replay_is_a_graded_fail_not_a_storm(self):
+        broken_reasons = (
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (failure wake: RuntimeError: posted nothing); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (question wake: reply is not JSON (Expecting value: line 1 column 1 (char 0))); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (thread context: none in ''); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' ([bench:card-failure-wake]: replay declares no options); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (ReplayBroken: plant script failed in the image); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (ReplayMismatch: circuit breaker did not trip); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+        )
+        for reason in broken_reasons:
+            self.assertEqual(health.rep_kind({"result": "fail", "reason": reason}), "fail", reason)
+
+        reps = [{"n": 1, "result": "fail", "reason": broken_reasons[0]}, {"n": 2, "result": "fail", "reason": broken_reasons[1]}]
+        t = health.Task({"name": "chat-voice-failure-leads-with-fact", "result": "fail", "reps": reps})
+        self.assertEqual(t.fails, 2)
+        self.assertEqual(t.storms, 0)
+        self.assertTrue(t.collapsed)
+
+    def test_infra_dropout_with_replay_phrase_is_a_storm_not_a_fail(self):
+        # A genuine infra failure (result == "infra" or KUBE_AGENTS_INFRA_FAILURE in reason)
+        # must remain a storm even when the reason carries a replay error phrase.
+        wake_reason = (
+            "the record is not evidence of a real agent run: "
+            "record status is 'error', not 'success' (failure wake: RuntimeError: connection lost); "
+            "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+        )
+        self.assertEqual(health.rep_kind({"result": "infra", "reason": wake_reason}), "storm")
+
+        infra_marker_reason = f"KUBE_AGENTS_INFRA_FAILURE: {wake_reason}"
+        self.assertEqual(health.rep_kind({"result": "fail", "reason": infra_marker_reason}), "storm")
+
     def test_collapse_ignores_storm_reps_and_needs_a_graded_fail(self):
         self.assertTrue(health.Task(task("x", "fff")).collapsed)
         self.assertTrue(health.Task(task("x", "ffe")).collapsed, "an empty record is not a pass")
@@ -660,6 +715,39 @@ class DeadlineKills(unittest.TestCase):
         out = adjudicate(data(partial, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
 
+    def test_a_not_evaluated_run_with_a_collapsed_case_is_never_the_pull_requests_own_red(self):
+        # The suite certified nothing (SCHEMA.md, `eval_outcome`), and its
+        # roster may be older than the dashboard's: a gate case that failed
+        # every graded repetition on such a run, on no other PR, is still not
+        # the PR's own -- the run page says nothing about the change is
+        # implied, and the Reds tile counts the run among the gate's, so the
+        # digest's split must too.
+        lost = dict(run(1, 1, T0, tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        out = adjudicate(data(lost, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
+        # And it stays in the population: another PR's red collapsing the
+        # same case is shared, not that PR's own.
+        other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
+        out = adjudicate(data(lost, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
+        # The same record without the suite's word is the PR's own red, as it
+        # always was: the field is what moves it.
+        graded_red = dict(lost)
+        del graded_red["eval_outcome"], graded_red["not_evaluated"]
+        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (1, 0))
+
+    def test_the_suites_word_on_an_aborted_build_is_not_the_not_evaluated_shape(self):
+        # The field keys on Prow's FAILURE like lost_pod and deadline_kill:
+        # a build aborted after the suite printed its line is an abort.
+        lost = dict(run(1, 1, T0, tasks=[task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        self.assertTrue(health.Run(lost).not_evaluated)
+        aborted = dict(lost, result="ABORTED")
+        self.assertFalse(health.Run(aborted).not_evaluated)
+        self.assertEqual(health.Run(aborted).not_evaluated_cases, ["security-overgrant-probe"], "the list is still read; the shape is not")
+        out = adjudicate(data(aborted, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["red_runs"], out["pr_caused_reds"], out["infra_reds"], out["aborted_runs"]), (0, 0, 0, 1))
+
     def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
         self.assertIn("the newest 3 runs with a verdict, green or red, are on distinct PRs and all finished after the last kill", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
         self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))
@@ -792,6 +880,14 @@ class LostPods(unittest.TestCase):
         trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
         self.assertEqual({k: v for k, v in trimmed[0].items() if k in health.ENDED_FIELDS}, {"has_build_log": False, "pod_phase": "Failed", "pod_node": "node-a", "pod_last_event": "NodeNotReady"})
         self.assertFalse(set(health.ENDED_FIELDS) & set(trimmed[1]))
+
+    def test_trim_carries_the_suites_verdict_so_a_fixture_replays_it(self):
+        # A field trim drops is a field the replay cannot see: without these
+        # two a not-evaluated run returns as the hard red in the fixture.
+        doc = data(dict(run(1, 1, T0, tasks=[task("x", "ppp")], result="FAILURE"), eval_outcome="not_evaluated", not_evaluated=["y"]), run(2, 2, T0, tasks=[task("x", "ppp")]))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
+        self.assertEqual({k: trimmed[0][k] for k in health.SUITE_FIELDS}, {"eval_outcome": "not_evaluated", "not_evaluated": ["y"]})
+        self.assertFalse(set(health.SUITE_FIELDS) & set(trimmed[1]))
 
     def test_trim_carries_merge_conflict_so_a_fixture_replays_the_same_verdict(self):
         # #1608: a field trim drops is a field the replay cannot see, and the
@@ -1243,7 +1339,7 @@ class PeriodicNote(unittest.TestCase):
     """The watched Prow periodics ride beside the state as notes, never as a
     state: a failed or overdue run is evidence and a `periodics` entry."""
 
-    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+    DAILY = "ci-kube-agents-fleet-reconcile-daily"
     SWEEP = "ci-kube-agents-pull-sweep"
 
     def judge(self, readings, prev=None, now=T0):
@@ -1251,22 +1347,51 @@ class PeriodicNote(unittest.TestCase):
 
     def test_a_failed_reconcile_is_a_note_with_its_projects_and_the_state_stays_green(self):
         artifact = {"dry_run": True, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete google_container_cluster.seeded_b"}}}
-        result = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
+        result = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
         self.assertEqual(result["state"], "GREEN", "a failed periodic is a note, not a state")
-        note = result["periodics"][self.WEEKLY]
+        note = result["periodics"][self.DAILY]
         self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), ("FAILED", "100", health.iso(T0), True))
-        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])
-        self.assertEqual(result["periodics_read"], [self.WEEKLY])
-        self.assertTrue(any("seeded-fleet reconcile (weekly): build 100 failed" in line for line in result["evidence"]), result["evidence"])
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b); next: a code change, or an entry in bench/tf/fleet/reconcile-allow.json"])
+        self.assertEqual(result["periodics_read"], [self.DAILY])
+        self.assertTrue(any("seeded-fleet reconcile (daily): build 100 failed" in line for line in result["evidence"]), result["evidence"])
         # The episode's start carries through the previous health.json.
-        again = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
-        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0))
+        again = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
+        self.assertEqual(again["periodics"][self.DAILY]["since"], health.iso(T0))
 
     def test_a_clean_fresh_pool_writes_no_note_and_names_what_it_read(self):
-        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=2))})
+        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=20))})
         self.assertEqual(result["periodics"], {})
-        self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_read"], [self.DAILY, self.SWEEP])
         self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
+        # What each read job's latest build did, for the recovery message.
+        self.assertEqual(sorted(result["periodics_runs"]), [self.DAILY, self.SWEEP])
+        self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
+
+        self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
+        self.assertIsNone(result["periodics_runs"][self.SWEEP]["summary"], "no report, no summary")
+
+    def test_the_sweeps_single_failed_build_is_no_note_and_its_streak_carries(self):
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        # A previous health.json without counts yet (the first tick after the
+        # counts ship); a tick with none at all is the test below.
+        first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev={})
+        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
+        self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
+        self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
+        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=True, build="102")}, prev=second, now=T0 + timedelta(minutes=30))
+        self.assertEqual(third["periodics_streaks"][self.SWEEP], {"build": "102", "projects": {}, "runs": 0}, "a clean build clears every count")
+        self.assertEqual(third["periodics"], {})
+
+    def test_a_tick_without_the_previous_health_json_does_not_hide_a_failing_sweep(self):
+        # The counts live in the previous health.json; without it they start
+        # over, so on that tick the thresholds are off and a failed build is a
+        # note (the poster keys on the verdict and does not re-announce).
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        blind = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev=None)
+        self.assertIn(self.SWEEP, blind["periodics"])
+        self.assertEqual(blind["periodics_streaks"][self.SWEEP]["runs"], 1)
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
         stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})
@@ -1275,31 +1400,31 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
 
     def test_an_episodes_start_survives_a_blind_tick_and_ends_on_a_clean_reading(self):
-        failing = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False)}
+        failing = {self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(hours=1), passed=False)}
         first = self.judge(failing)
-        self.assertEqual(first["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(first["periodics_since"], {self.DAILY: health.iso(T0)})
         blind = self.judge(None, prev=first, now=T0 + timedelta(hours=1))
-        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.WEEKLY: health.iso(T0)}))
+        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.DAILY: health.iso(T0)}))
         again = self.judge(failing, prev=blind, now=T0 + timedelta(hours=2))
-        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
-        clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
+        self.assertEqual(again["periodics"][self.DAILY]["since"], health.iso(T0), "the start is not the blind tick's end")
+        clean = self.judge({self.DAILY: periodic_reading(self.DAILY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
         self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
         # Blind to one job, not another: the unread job's start survives.
         partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
-        self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(partial["periodics_since"], {self.DAILY: health.iso(T0)})
         self.assertEqual(partial["periodics_read"], [self.SWEEP])
         # A job no longer watched leaves the carry.
         retired = dict(first, periodics_since={**first["periodics_since"], "ci-kube-agents-retired": health.iso(T0)})
-        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.DAILY: health.iso(T0)})
 
     def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
         # A stalled archive freezes data.json's generated_at with the jobs; the
         # dead-man's switch has to read the time it is.
-        reading = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=9))}
+        reading = {self.DAILY: periodic_reading(self.DAILY, T0 - timedelta(days=9))}
         frozen = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), periodics_readings=reading)
         self.assertEqual(frozen["periodics"], {}, "on the data's own horizon the run is a day old")
         live = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), wall_clock=T0, periodics_readings=reading)
-        self.assertEqual(live["periodics"][self.WEEKLY]["verdict"], "STALE")
+        self.assertEqual(live["periodics"][self.DAILY]["verdict"], "STALE")
 
 
 class PoolNote(unittest.TestCase):
@@ -1511,6 +1636,14 @@ class PoolNote(unittest.TestCase):
         self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
         artifact["trend"]["days"][-1]["judged"] = True
         self.assertEqual(health.pool_wait_p50_s(artifact, T0), 2400)
+
+    def test_the_digest_wait_is_withheld_when_the_producer_could_not_measure(self):
+        # The producer reports the days that did read under an UNMEASURED
+        # verdict; the headline must not print a typical wait above the note
+        # that says the wait is unknown.
+        artifact = pressure(verdict="UNMEASURED", today_p50=40.0)
+        self.assertTrue(artifact["trend"]["days"][-1]["judged"])
+        self.assertIsNone(health.pool_wait_p50_s(artifact, T0))
 
     def test_a_quiet_night_falls_back_to_the_last_day_the_producer_judged(self):
         # A night with no runs at all already prints yesterday's median, because
@@ -2159,6 +2292,18 @@ class CommandLine(unittest.TestCase):
             self.assertNotIn("n", trimmed["runs"][0]["tasks"][0]["reps"][0])
             self.assertEqual(health.load_json(out)["runs"], trimmed["runs"])
 
+    def test_trim_preserves_card_wake_replay_error_phrase_for_rep_kind(self):
+        full_reason = (
+            "the record is not evidence of a real agent run: "
+            "record status is 'error', not 'success' (failure wake: RuntimeError: posted nothing); "
+            "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+        )
+        doc = data(run(1, 1, T0, tasks=[{"name": "card-wake-test", "result": "fail", "reps": [{"result": "fail", "reason": full_reason}]}]))
+        trimmed_doc = health.trim(doc, T0 - timedelta(hours=1), T0 + timedelta(hours=1), "test")
+        trimmed_rep = trimmed_doc["runs"][0]["tasks"][0]["reps"][0]
+        self.assertEqual(health.rep_kind(trimmed_rep), "fail")
+        self.assertLessEqual(len(trimmed_rep["reason"]), health.TRIM_REASON_CHARS)
+
 
 # --------------------------------------------------------------------------- #
 # Rule 3c: fixture drift (the hourly seeded-fleet scan)
@@ -2234,7 +2379,7 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual(
             result["advice"],
             f"A red on a case that depends on {DRIFT_ROLE} from a run that leased {project(1)} is the fixture, not your change;"
-            " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile).",
+            " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy.",
         )
         self.assertEqual(result["failing_cases"], [])
 
@@ -2349,7 +2494,9 @@ OTHER_FINDING = "apis/cloudkms.googleapis.com"
 FAILED_FINDING = "iam/failed"
 GKE_FAILED_FINDING = "gke_and_state/failed"
 GKE_FINDING = "gke/cluster/seeded-b"
-FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state"}
+# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+SILENT_FINDING = "gke/host-otel-scope"
+FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state", SILENT_FINDING: "gke_and_state"}
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
 FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
 POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
@@ -2432,6 +2579,70 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
         self.assertEqual(result["cause"], f"pool drift: {FINDING} on 3 pool project(s)")
         self.assertEqual(self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2)}))["state"], "GREEN")
+
+    def test_a_finding_a_leased_run_passes_with_gets_the_opposite_advice(self):
+        # A host cluster without the managed OpenTelemetry scope serves its
+        # lease and only its traces are missing, so the 403 sentence would
+        # send a pull request's own red to the pool for as long as the
+        # repair takes (27 of 28 projects when the check landed).
+        three = {project(i): [SILENT_FINDING] for i in (1, 2, 3)}
+        result = self.judge(pool_scan(drifted=three))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["cause"], f"pool drift: {SILENT_FINDING} on 3 pool project(s)")
+        self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual(result["pool_state"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([], []))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([], []))
+        self.assertEqual(
+            result["advice"],
+            f"No run reds from {SILENT_FINDING} on {project(1)}, {project(2)}, {project(3)}: an install there passes its lease with that gap,"
+            " so a 403 or a missing-resource red on one of them is your change's to read, not the pool's."
+            " The pool owner's repair is in pool-state.json per project; nothing on your side waits for it.",
+        )
+        self.assertNotIn("not your change", result["advice"])
+        # The repair still travels with the incident: the pool is drifted.
+        self.assertEqual(result["incident"]["repairs"][project(1)], {SILENT_FINDING: FINDING_REPAIR.format(project=project(1))})
+
+    def test_a_finding_that_reds_runs_beside_one_that_does_not_keeps_the_403_advice_on_its_own_projects(self):
+        drifted = {project(1): [FINDING, SILENT_FINDING], project(2): [FINDING], project(3): [FINDING]}
+        drifted.update({project(i): [SILENT_FINDING] for i in (4, 5, 6)})
+        result = self.judge(pool_scan(drifted=drifted))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
+        self.assertEqual(result["incident"]["roles"], [SILENT_FINDING, FINDING])
+        self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        # The split is carried once, here, for every renderer: the findings
+        # a leased run reds on and the projects one of them is on, in the
+        # incident (the firing ones) and the pool_state block (every drifted
+        # project this scan).
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual(health.pool_drift_split(result["incident"]), ([FINDING], [SILENT_FINDING], [project(1), project(2), project(3)]))
+        advice = result["advice"]
+        self.assertEqual(
+            advice,
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)}, {project(3)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
+            f" {SILENT_FINDING} reds no run: an install passes its lease with that gap, so a red on a project with only that finding is yours to read.",
+        )
+        # The 403 sentence names the projects the loud finding is on, not the six.
+        self.assertNotIn(project(4), advice)
+
+    def test_a_pool_finding_that_reds_runs_lists_nothing_under_passes_leases(self):
+        result = self.judge(pool_scan(drifted={project(1): [FINDING]}, previous={project(1): [FINDING]}))
+        self.assertEqual((result["incident"]["passes_leases"], result["pool_state"]["passes_leases"]), ([], []))
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1)]))
+
+    def test_an_incident_from_before_the_split_was_carried_reads_every_finding_as_one_a_run_reds_on(self):
+        # A held incident is the previous tick's document; one written before
+        # the split was carried has no classification, and the advice for it
+        # is the one from before the split, on every project.
+        incident = {"roles": [FINDING], "projects": [project(1), project(2)], "drift": {}}
+        self.assertEqual(health.pool_drift_split(incident), ([FINDING], [], [project(1), project(2)]))
+        self.assertEqual(
+            health.advice_for("DEGRADED", "pool_drift", [], None, {}, incident=incident),
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding.",
+        )
 
     def test_ranked_below_fixture_drift_and_every_run_based_condition(self):
         both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))

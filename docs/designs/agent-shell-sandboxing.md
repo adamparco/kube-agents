@@ -254,8 +254,8 @@ through the sandbox rather than by reading:
   pod](#kanban_completeartifacts-checks-the-file-on-the-wrong-pod), where the quiet
   half is now closed and the loud one is not.
 
-A fourth is a different shape, and worse, because it fails work that was
-otherwise succeeding — see [One connection under every
+A fourth is a different shape, and worse, because it failed work that was
+otherwise succeeding until the agent image patched its trigger — see [One connection under every
 environment](#one-connection-under-every-environment) below.
 
 Three workarounds carry the design past them. The sandbox image's
@@ -296,13 +296,18 @@ task its own `SSHEnvironment`, but derives the `ssh` `ControlPath` from
 operator publishes one host, one user and one port for the whole agent. Every
 concurrent task therefore multiplexes over a single master connection.
 
-Teardown is per environment and not per connection. `cleanup()` runs
-`ssh -O exit` against that shared path, which drops the master and kills every
-session riding it. A sibling task that was mid-command loses it: exit 255, empty
-stderr, no indication that another task's teardown is what ended it. Three things
-call `cleanup()` — the idle reaper, `close_environment` when the agent closes,
-and the environment's `__del__` — and with `delegation.max_concurrent_children`
-at 3, the reaper reaches that state whenever one child idles while another works.
+Teardown is per environment and not per connection. `cleanup()` ran
+`ssh -O exit` against that shared path, which dropped the master and killed every
+session riding it. A sibling task that was mid-command lost it: exit 255, empty
+stderr, no indication that another task's teardown is what ended it. The callers
+of `cleanup()` that reach the shared environment include the process's atexit
+sweep (`cleanup_all_environments`), the environment's `__del__` and the idle
+reaper. The per-turn teardown (`turn_finalizer` → `cleanup_task_resources` →
+`cleanup_vm`) and `AIAgent.close()` pop the turn's task id (a fresh uuid in a
+worker, the session id in the gateway) or the session id, while the terminal tool
+registers the environment under `session:<key>` or `default`, so they miss it. The first is the frequent one: kanban workers are subprocesses, so
+the master died when a worker that had run a command exited normally while
+another was mid-command (#2174).
 
 The operator's managed terminal block sets `lifetime_seconds` to 30 days, which
 takes the reaper out of the picture. It is a number and not an off switch
@@ -310,7 +315,9 @@ because Hermes takes an int here and has no sentinel for never; at that size the
 only environments the reaper can still collect are ones whose process has
 outlived a month of rollouts, which nothing here does. Nothing is reclaimed by
 reaping in this topology anyway — the far side is a StatefulSet pod that stays up
-either way — so the timeout was buying nothing and costing the race.
+either way — so the timeout was buying nothing and costing the race. With
+`cleanup()` patched below, the reaper no longer reaches the master; the value
+stays because reaping reclaims nothing.
 
 Two ways of breaking the sharing itself were tried and rejected. Pointing
 `ControlPath` at somewhere unbindable fails hard rather than falling back to a
@@ -319,18 +326,32 @@ root-owned file at the socket path so the socket can never be created fails
 because `cleanup()` unlinks that path, and the sandbox entrypoint runs as an
 unprivileged uid that cannot write a file the shell user could not then remove.
 
-What remains is the other two triggers. A process that exits still tears down
-its environment and still drops the shared master, so a delegated worker
-finishing while a sibling works can still cut the sibling's command — kanban
-workers are subprocesses that share the same socket directory, so they are the
-realistic case. Closing that needs a per-environment `ControlPath` in Hermes,
-which is an upstream change and not one this repository will carry as a patch.
+What remains is the teardown itself, and with no sandbox-side lever left (above)
+the agent image patches it
+(`deploy/docker/patches/apply_ssh_shared_master.py`): `cleanup()` keeps its
+sync-back and leaves the shared master alone, so an exiting process no longer
+cuts a sibling's command; `ControlPersist=300` reaps the master once nothing has
+used it for five minutes. The eviction path after an `EnvironmentConnectionError`
+is left as it is: nothing reaches it with a registered ssh environment, because a
+connection failure during construction fires before registration and the sync,
+foreground and background-spawn paths catch their own errors. A prompt-time
+probe's master is its own and is closed as before. The terminal tool also labels
+the shape when it does occur: a foreground ssh result with exit 255 and no cwd marker (the
+wrapper prints the marker after the command, so a command's own 255 carries one
+unless the command text keeps the marker from being printed: a top-level `exit`
+or `exec`, or a failing command under `set -e`, ends the wrapper shell first, and
+a closed stdout drops the printf) gets a
+`hint`, unless upstream already attached a hint to the output, saying the
+connection was closed under the command or never opened, and that it may have
+run. A per-environment `ControlPath` would remove the sharing itself and is
+upstream's to make.
 
 ### What the credential proxy is for
 
-`kubectl`, `gcloud`, `gh`, and `git` are not real binaries in the agent image. They are
-symlinks to `credential-proxy-exec`, a client that forwards the argv to the proxy and
-returns its output. The agent composes a command; something else runs it, holding the
+`kubectl` and `gcloud` are not real binaries in the sandbox. They are symlinks to
+`credential-proxy-exec`, a client that forwards the argv to the proxy and returns its
+output. The sandbox's `git` is a real, local one that holds no credential, there is no
+`gh`, and forge work goes through the version-control verbs, which the broker runs. The agent composes a command; something else runs it, holding the
 credential.
 
 That gives three properties: the credential material never enters the agent's address
@@ -523,8 +544,9 @@ Nothing crosses as a path any more:
 - **A kubeconfig crosses as a context name, not a file.** The shim reads `current-context`
   in its own pod and sends the string; the broker validates it with `parse_gke_context` and
   regenerates the file itself with `gcloud container clusters get-credentials`. Naming a
-  cluster is not choosing an account: `scoped_sa_pool` maps the name to a service account,
-  and a name with no entry is refused rather than falling back to the wide credential.
+  cluster is not choosing an account: `scoped_sa_pool` maps the cluster's project to a service
+  account, and a cluster in a project with no entry is refused rather than falling back to the
+  wide credential.
 - **A document crosses on fd 0.** `--body-file -` and `kubectl apply -f -` are what a
   caller writes; `reads_stdin` in the shim matches the flag and forwards the stream.
 - **`git` crosses as content.** The broker owns the only checkout, and the agent hands it
@@ -766,12 +788,11 @@ and the tool refusing is what decides it. It costs
 less than the earlier paragraph priced a read-only tree at: entrypoint step
 2.6a replaces every specialist profile's `skills/` from the image on each
 start, so what `skill_manage` authors there was never durable. The sandbox's
-copy of the same trees is still writable by what runs in the sandbox (a shell
-command, `execute_code`, or a file tool writing through a symlink made there,
-which the gateway-side guard cannot see) for as long as that sandbox pod runs;
-that edit never reaches the gateway and is replaced from the image when the
-sandbox restarts. Leaving that copy root-owned would close it
-(gke-labs/kube-agents#2096).
+copy of the same trees is closed at the sandbox end instead: it is root-owned
+and mounted read-only, so what runs there (a shell command, `execute_code`, or
+a file tool writing through a symlink made there, which the gateway-side guard
+cannot see) cannot rewrite it either; see "The delivered trees are read-only
+mounts" below.
 
 Two things the sandbox-end closure does not close. Skills are not the only executable content under
 `~/.hermes`, so the guarantee rests on the directory being unwritable rather
@@ -1180,16 +1201,20 @@ is not the answer either: the check is opt-in and an empty value skips it entire
 which drops the guardrail rather than moving it.
 
 The operator therefore writes it out, in `buildPodTemplateSpec` and only when the
-sandbox is enabled, naming the sandbox's two writable directories: `/opt/data`, and
-`/home/agent` for the commands that land in the home. Since the sandbox's data volume
-now carries the `/opt/data` path itself, the interesting half of that is the home — but
-the value is written rather than left to the image default so the policy is visible in
-the pod spec rather than inherited from a base image two repositories away. It gives up
-no isolation. With `backend: ssh` the file tools cannot reach the agent pod's
-filesystem at all, so the roots they are checked against should describe the filesystem
-they actually write to. `TestSandboxRepointsTheWriteSafeRoot` asserts the variable is
-absent with the sandbox off, is exactly these two paths with it on, and names nothing
-that does not resolve in the sandbox.
+sandbox is enabled, naming the sandbox's writable data directory: `/opt/data`.
+The home is root-owned in the container image (see
+[The agent home is root-owned](#the-agent-home-is-root-owned)) and is not a durable write
+destination, so `/home/agent` is omitted here (#2284). This ensures write attempts naming
+`/home/agent/...` fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the gateway's
+prefix check rather than failing on directory mode in the sandbox, and refusal errors
+do not list the ephemeral home as an allowed root. (Writes to `~` expand in the agent
+process against `HOME` under the data volume — by default `/opt/data/home` — and are
+admitted under `/opt/data`). The value is written rather than left to the image default so
+the policy is visible in the pod spec rather than inherited from a base image two
+repositories away. It gives up no isolation. With `backend: ssh` the file tools cannot
+reach the agent pod's filesystem at all, so the roots they are checked against should
+describe the filesystem they actually write to. `TestSandboxRepointsTheWriteSafeRoot`
+asserts the variable is exactly `shellSandboxDataPath` on the agent container.
 
 One thing this does not cover: the credential denylist that sits alongside the check
 (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.docker`) is still expressed against the
@@ -1198,25 +1223,52 @@ wrong if the sandbox ever holds credentials of its own.
 
 ### Where the model's files go
 
-The sandbox has three directories that matter and only one of them keeps anything.
+The directories that matter in the sandbox are these. The `<tree>` row is `skills`, `scripts` and `governance`, under both `/opt/data` and
+`/opt/data/profiles/platform`; see
+[The delivered trees are read-only mounts](#the-delivered-trees-are-read-only-mounts).
 
-| Path                    | Backing                        | Owner    | What it is                      |
-| ----------------------- | ------------------------------ | -------- | ------------------------------- |
-| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                |
-| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                |
-| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home    |
-| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                   |
-| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs |
+| Path                    | Backing                        | Owner    | What it is                        |
+| ----------------------- | ------------------------------ | -------- | --------------------------------- |
+| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                  |
+| `/opt/data/<tree>`      | `data` PVC, read-only mounts   | root     | the image's skills, scripts, SOPs |
+| `/home/agent`           | the container's ephemeral disk | root     | the login's home                  |
+| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home      |
+| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                     |
+| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs   |
 
-**The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
-it for a non-interactive `ssh host cmd`, and the model can delete Debian's
-non-interactive guard — so a shim planted there is executed for anything that logs in as
-`agent`. Putting that file on a volume would make the hijack outlive a pod recycle. It
-does not, and that is the arrangement working.
+#### The agent home is root-owned
 
-**A durable home was the other option and it loses more than it gains.** The interesting
-files under a home are the dotfiles, and those are exactly what the previous paragraph
-wants thrown away. The model's actual output has somewhere better to be.
+Every session in the pod logs in as `agent` and shares `/home/agent` for as long as the
+container lives. Several programs load code from a home without being asked:
+
+- bash reads `~/.bashrc` for the `bash -c` that sshd starts the `ForceCommand` with,
+  before `session-command.sh` runs.
+- A login shell (`bash -l`, which Hermes uses for its session snapshot) reads
+  `~/.bash_profile`, `~/.bash_login` or `~/.profile`, and Debian's stock `.profile` puts
+  `~/bin` first on `PATH`.
+- python3 imports `usercustomize` and runs `.pth` files from the user site-packages under
+  `~/.local`, ahead of the `/opt/defaults/scripts` entry shared scripts append to
+  `sys.path`.
+
+When `agent` owned the home, a session could plant any of these, and every later session
+in the pod ran it until the container restarted. So the image creates the home root-owned
+and `0755`, with no skeleton files, and `.ssh` and the `authorized_keys` in it root-owned
+too. sshd's `StrictModes` accepts root ownership at every level, and nothing that runs in
+the sandbox needs to write the home: Hermes works in `TERMINAL_CWD` and `/tmp`, the
+credential-proxy client writes under `$HERMES_HOME`, and `vcs_client.py` points `HOME` at
+a scratch directory of its own.
+
+Environment variables were the other option: `PYTHONNOUSERSITE=1` in the `SetEnv` drop-in,
+and `--norc --noprofile` for the session's bash. They cannot reach the first route, which
+runs before anything this image controls sets an option, and any such list is only as
+complete as the routes someone thought of. A directory the model cannot write covers every
+loader at once. `deploy/sandbox/smoke-test.sh` sections 3 and 3b check that a session
+cannot create a startup file, `~/bin` or the user site-packages directory, or add a key.
+
+The home is still on the container's disk, but nothing the model writes can land in it.
+The model's actual output has somewhere better to be.
+
+#### The working directory and the data volume
 
 **Which leaves `TERMINAL_CWD`.** Hermes' `ssh` backend defaults its working directory to
 `~` (`tools/terminal_tool.py`), so with an ephemeral home and nothing pointing elsewhere,
@@ -1234,17 +1286,20 @@ narrowed by anything.
 as well, named in 59 files across `agents/`, and the alternative was a sandbox path that
 no existing SOP, skill or model-written script would resolve. The cost is one path naming
 two different directories on two different volumes, and one rule that follows from it:
-**no handoff may assume write-here-read-there.** Nothing is copied between them and
-nothing can read across, so a script that writes `/opt/data/x` in the agent pod and reads
+**no handoff may assume write-here-read-there.** Only what the sentences below name crosses between
+them, so a script that writes `/opt/data/x` in the agent pod and reads
 `/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
-the path itself looking wrong. One thing crosses, and only one: a file a finished card
-names in `artifacts` is copied sandbox-to-gateway for the length of its delivery and
-deleted after, which is
+the path itself looking wrong. What crosses sandbox-to-gateway is read by name. A file a finished card names in `artifacts` is copied for the length of its
+delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
-built for that one caller. Nothing crosses the other way, and nothing crosses because a path
+built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once
+its markers say a delivery is due, as the bootstrap onboarding section below describes.
+What crosses the other way is `sandbox_mirror.py`'s work, described above: it copies the
+working directories once on first start, and on every start and each new profile it creates
+the profile's working directories and copies each Cluster Agent's identity file. Nothing
+crosses because a path
 happened to match. The entrypoint writes a `.sandbox` marker into the
-sandbox's copy, which is how a script or a person tells which side they are on. The
-bootstrap inventory handoff is the known case; it has its own issue.
+sandbox's copy, which is how a script or a person tells which side they are on.
 
 The kubeconfig the platform MCP server writes stays out of `/opt/data` for the reason
 under [The SSH principal cannot be the shell user](#the-ssh-principal-cannot-be-the-shell-user):
@@ -1253,18 +1308,20 @@ can author is arbitrary code execution as `hermes`. `/opt/data` is now durable a
 as model-writable, which makes it a worse place for that file rather than a better one.
 
 **The same rule reaches what an agent-pod caller executes here, not just what it reads.**
-The shared scripts are staged twice. `/opt/data/scripts` is the model's copy — that is
-the path every SKILL.md names, the entrypoint replaces it from the image on each start,
-and an edit the model makes to it stands until then. `/opt/vcs/libexec/platform` is the
-second copy, root-owned and mode 0755, and it is the one a caller that logs in as
-`hermes` runs: the pull-request and issue crons forward a forge verb into this container
-rather than holding a forge CLI themselves, and running the model's copy over that
-session would be the credential handed to whatever the model last wrote there. The whole
-import closure is staged, because `sys.path[0]` is the script's own directory and a
-module missing from the root-owned copy would be found in the model's one instead. The
-build proves the staging is complete by importing each entry point and reading `__file__`
-off every module that loaded: one that resolved outside the root-owned copy and the
-standard library fails the image. What those scripts put on `sys.path` themselves — the
+The shared scripts are staged twice. `/opt/data/scripts` is the copy every SKILL.md
+names. Under the operator it is a read-only mount the model cannot edit or move; outside
+the operator's StatefulSet it is a root-owned copy inside a directory the model owns, so
+the model can rename it aside and put its own in its place until the next start.
+`/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
+one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
+forge verb into this container rather than holding a forge CLI themselves, and running
+the data volume's copy over that session would hand the credential to whatever sits at
+that path. The read-only mount narrows that to the fallback, and the second copy stays
+as defence in depth. The whole import closure is staged, because `sys.path[0]` is the
+script's own directory and a module missing from the root-owned copy would be found in
+the data volume's one instead. The build proves the staging is complete by importing
+each entry point and reading `__file__` off every module that loaded: one that resolved
+outside the root-owned copy and the standard library fails the image. What those scripts put on `sys.path` themselves — the
 two agent-pod directories they use to find their siblings — is left off when the file
 they are running from is the root-owned copy, so a gap a later edit opens has nothing
 model-writable to fall through to.
@@ -1323,10 +1380,11 @@ prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
 exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
 
 The dividing line is who can provoke the failure, not how bad it looks. Everything under
-the sandbox's `/opt/data` is owned by uid 1000 and the volume outlives the pod, so the model
-decides what the next root-run start finds there — and while any non-zero exit was fatal, a
-single `touch /opt/data/scratch` or `rm -f /opt/data/.sandbox` from a sandbox shell was a
-permanent `CrashLoopBackOff` on the gateway. Nothing on either side cleared it, and the
+the sandbox's `/opt/data` except the image's trees is owned by uid 1000 and the volume
+outlives the pod, so the model decides what the next root-run start finds there — and
+while any non-zero exit was fatal, a single `touch /opt/data/scratch` or
+`rm -f /opt/data/.sandbox` from a sandbox shell was a permanent `CrashLoopBackOff` on
+the gateway. Nothing on either side cleared it, and the
 agent could not repair what had to be running to be asked. Nothing has been copied at either
 of those points, so nothing is lost by coming up without them and retrying next start.
 
@@ -1388,13 +1446,14 @@ reconcile that would take the agent down with it.
 
 ### What persists, and for how long
 
-| Thing             | Mechanism                                 | Lifetime               |
-| ----------------- | ----------------------------------------- | ---------------------- |
-| Files             | the sandbox's `data` volume, `/opt/data`  | the sandbox's lifetime |
-| Working directory | in-band stdout marker, tracked in Hermes  | the task's environment |
-| Environment vars  | `export -p` snapshot file in the sandbox  | the sandbox's lifetime |
-| Shell processes   | nothing — every call is a fresh `bash -c` | one command            |
-| Background jobs   | only if explicitly detached               | until the pod restarts |
+| Thing                 | Mechanism                                 | Lifetime                     |
+| --------------------- | ----------------------------------------- | ---------------------------- |
+| Files                 | the sandbox's `data` volume, `/opt/data`  | the sandbox's lifetime       |
+| Skills, scripts, SOPs | the image, staged read-only on the volume | re-staged at every pod start |
+| Working directory     | in-band stdout marker, tracked in Hermes  | the task's environment       |
+| Environment vars      | `export -p` snapshot file in the sandbox  | the sandbox's lifetime       |
+| Shell processes       | nothing — every call is a fresh `bash -c` | one command                  |
+| Background jobs       | only if explicitly detached               | until the pod restarts       |
 
 Sandbox lifetime should be tied to the agent, not to the conversation. The agent is a
 long-running operator, not a session; a per-conversation sandbox would throw away
@@ -1645,14 +1704,14 @@ that expects to _read_ something the agent pod put at `/opt/data` still finds no
 Enumerating what the sandbox legitimately needs sorts the references into six classes
 with four delivery mechanisms.
 
-| What                                         | Where it comes from                                | Why                                           |
-| -------------------------------------------- | -------------------------------------------------- | --------------------------------------------- |
-| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                             | read into the prompt, never through the shell |
-| Skills, including their `scripts/`           | baked at `/opt/defaults`, synced by the entrypoint | the existing sync delivers the wrong tree     |
-| Governance SOPs                              | the same bake and sync                             | static, versioned with the repo               |
-| The shell-invoked subset of `scripts/`       | the same bake and sync, as an allowlist            | static, and the subset is small               |
-| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod             | per-install content, rendered by the operator |
-| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                  | data, not delivery                            |
+| What                                         | Where it comes from                                      | Why                                           |
+| -------------------------------------------- | -------------------------------------------------------- | --------------------------------------------- |
+| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                                   | read into the prompt, never through the shell |
+| Skills, including their `scripts/`           | baked at `/opt/defaults`, staged read-only on the volume | the existing sync delivers the wrong tree     |
+| Governance SOPs                              | the same bake and staging                                | static, versioned with the repo               |
+| The shell-invoked subset of `scripts/`       | the same bake and staging, as an allowlist               | static, and the subset is small               |
+| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod                   | per-install content, rendered by the operator |
+| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                        | data, not delivery                            |
 
 **The persona stays behind, and that is a property rather than an omission.** Nothing
 writes `SOUL.md` through the shell. The only writer is
@@ -1689,20 +1748,22 @@ and puts it in the prompt, and every path a `SKILL.md` then names resolves throu
 `HERMES_HOME` or `TERMINAL_CWD` — both `/opt/data` in the sandbox, and both the baked
 tree.
 
-**Skills, governance and the shared scripts are baked, and synced onto the volume by
-the entrypoint.** Baking them at `/opt/data` directly does not work: the StatefulSet
+**Skills, governance and the shared scripts are baked, and staged onto the volume at
+every pod start.** Baking them at `/opt/data` directly does not work: the StatefulSet
 mounts a PVC over that path and the image's copy disappears under it. This is the
 problem the agent image already solved, and the sandbox uses the same shape — the
-image stages at `/opt/defaults`, and `deploy/sandbox/entrypoint.sh` copies it onto the
-volume on every start, before sshd is exec'd.
+image stages at `/opt/defaults`, and `deploy/sandbox/entrypoint.sh`, run as an init
+container, copies it onto the volume before the shell container starts. The shell
+container then mounts each tree read-only.
 
-The sync replaces rather than merges. Copying over the top leaves a skill deleted from
-the image, or a script renamed in it, sitting on the volume for as long as the PVC
-lives and looking current. That makes the trees image-owned, and they are not the
-model's to change: the personas forbid it, because an edit made anyway is run by every
-later session in the pod until the next restart. To debug a script, copy it to
-`/opt/data/scratch` and run the copy. Model-written files belong in `/opt/data/scratch`
-and `/opt/data/gitops`, which the sync does not touch.
+The staging replaces rather than merges. Copying over the top leaves a skill deleted
+from the image, or a script renamed in it, sitting on the volume for as long as the PVC
+lives and looking current. That makes the trees image-owned, and the shell sees them
+root-owned and read-only: the model's write to a file fails with `Permission denied`,
+and creating or removing one fails with `Read-only file system`, as does any write by
+root. To debug a script, copy it to `/opt/data/scratch` and run the copy.
+Model-written files belong in `/opt/data/scratch` and `/opt/data/gitops`, which the
+staging does not touch.
 
 Extending Hermes' sync to cover governance and scripts was the alternative, and it
 keeps one mechanism instead of two. It was rejected before the measurement above and
@@ -1716,9 +1777,12 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
-`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`
-and `stall_report.py` — the entry points an agent is told to run, plus the transitive
-closure of what they import.
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
+`stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import. Only `inventory_findings.py extract` works
+there: `register` and `ranked` call the Session KV server on the agent pod's loopback and
+exit 13 from the sandbox, and the prioritization SOP answers that exit by ranking from its own
+scores and writing the report without the findings queue.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
 earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
@@ -1730,8 +1794,9 @@ qualifying question is the one the cron section below already asks — does it n
 agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
 databases, Hermes' own Python namespace.
 
-Two scripts fail an agent that runs them from the shell: `cluster_agent_profile.py` and
-`cluster_agent_reconcile.py`. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
+Three scripts fail an agent that runs them from the shell: `cluster_agent_profile.py`,
+`cluster_agent_reconcile.py`, and `eod_report_generator.py`, which reads the session
+database and is named by its SOP for a hand run. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
@@ -1742,10 +1807,11 @@ deleting a profile still has no tool.
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
 reads the allowlist out of the Dockerfile and checks it against the agents' own
-instructions: every shared script named by a runtime path is baked or stubbed, the
-allowlist is closed under import, and nothing on it names an interpreter the sandbox
-does not have. Adding a skill that calls a new shared script fails that test rather
-than failing in a pod.
+instructions, which include the governance SOPs a card's worker follows and the Planning
+Agent's tree (`agents/chat/`) that writes those cards: every shared script named by a runtime path is
+baked or stubbed, the allowlist is closed under import, and nothing on it names an
+interpreter the sandbox does not have. Adding a skill that calls a new shared script
+fails that test rather than failing in a pod.
 
 **`SETTINGS.md` is mounted, at `/opt/data/SETTINGS.md`.** Its content is per-install:
 the operator renders it from `spec.integration.github.gitRepo` into an
@@ -1793,6 +1859,115 @@ in the four imports a third-party module, so neither image cares which Python an
 `python:3.14-slim` has no `/usr/bin/python3` at all, so there was nothing to fall
 through to.
 
+#### The delivered trees are read-only mounts
+
+A tree the model can write is a tree it can rewrite for the agent. A `SKILL.md` it edits
+is instructions the next worker follows, and a script it edits under `/opt/data/scripts`
+runs the next time a skill names it. Re-staging undoes an edit only at the next pod
+start, and every command until then runs the model's version. So under the operator the
+model cannot change the trees at all.
+
+The operator's StatefulSet does this in two steps, from constants in
+[`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go).
+An init container, `prepare-image-trees`, runs the sandbox image with
+`--prepare-image-trees` and mounts only the data volume, at `/opt/data`. For each home
+root, `/opt/data` and `/opt/data/profiles/platform`, it removes a symlink on every path
+that is about to become a mount point and moves aside a non-directory where a home root
+belongs. It then deletes whatever is at `skills`, `scripts` and `governance`, file or
+directory, and puts fresh copies from `/opt/defaults` there, owned by root and not
+writable by group or other. It refuses to run when `/opt/defaults` holds no tree, and it
+exits before writing anything to the root filesystem. The shell container then mounts each of the six `<home>/<tree>` paths as a
+read-only `subPath` of the same volume, and mounts `profiles` and `profiles/platform`
+read-write over themselves. Kubelet resolves a container's `subPath` mounts when it
+creates that container, which is after the init container has finished, and no model
+code runs in the pod before then.
+
+That turns each route the model had into an error. A write to a staged file (`>>`, a
+file tool writing through a symlink in scratch) gets `EACCES`, because the model does
+not own it; creating or removing a file in a tree (`sed -i`'s temporary file, `rm`)
+gets `EROFS`, which is also what a uid that passes the permission check gets, root
+included. The shell has no `CAP_SYS_ADMIN` to remount. Renaming or removing a tree
+gets `EBUSY`, because the tree is a mount point. Renaming `profiles` or
+`profiles/platform` gets `EBUSY` for the same reason, and `/opt/data` is the volume's
+own mount point.
+
+The shell's entrypoint does not assume the mounts are there. The operator sets
+`SANDBOX_IMAGE_TREES=read-only-mounts` on the shell container, and with it set the
+entrypoint requires every `<home>/<tree>` to appear in `/proc/self/mountinfo` as a mount
+point with `ro` in its options, and every directory between `/opt/data` and a home to be
+a mount point. If one does not, it exits 1 naming the path and the sandbox does not
+start, so a missing mount fails as loudly as a writable one. It also refuses to start when
+`/opt/defaults` holds no tree, missing or empty, since the per-tree check would then pass
+with nothing to check. The cost is
+that a mount problem takes the whole shell down instead of running with the gap.
+`SANDBOX_HOME_ROOTS` is set on both containers from the same constant that generates the
+mounts, so the init container stages exactly the paths the shell checks.
+
+**The ancestors are mount points because `rename(2)` checks only the entry it renames.**
+Linux's `vfs_rename` and gVisor's `PrepareRenameDentry` both refuse to move a mount point,
+and neither looks at what is mounted below the directory being moved. Without the two
+self-mounts, `mv /opt/data/profiles /opt/data/x && mkdir -p
+/opt/data/profiles/platform/scripts` succeeds: the read-only mounts travel with the
+renamed directory, and the path every SOP names is now a directory the model created.
+Every directory strictly between `/opt/data` and a tree has to be a mount of the data
+volume for the tree mounts to hold. An operator test asserts that for every read-only
+tree mount the builder renders, so a home added without its pins fails the tests.
+
+**Root ownership alone does not hold.** A root-owned tree stops an in-place edit, but
+`/opt/data` and the home roots belong to uid 1000, and renaming an entry needs write
+permission on the directory that holds it, not on the entry. The model could move the
+root-owned tree aside, create its own at the same path, and the next command would run
+it. Making the parent directories root-owned or sticky instead changes the ownership
+rules for all of `/opt/data`, which the model needs to own, and keeps the guarantee in
+the entrypoint's bash rather than in the pod spec.
+
+**Image volumes were not used.** A Kubernetes `image` volume would mount the trees
+read-only straight from an OCI image, with no staging step. GKE Autopilot's Warden does
+not admit them, they are not enabled by default below Kubernetes 1.35, and they mount
+`noexec`, so a shared script could not run by its path.
+
+**The source is the data volume, not an `emptyDir`.** Staging into three `emptyDir`
+volumes would keep the tree bytes off the model's PVC, but it depends on an `emptyDir`
+written by an init container reaching the shell container intact under gVisor, which has
+not been tested. The ancestor pins are `subPath` mounts of the data volume anyway, so
+staging on it uses one mechanism for both. It also adds no pod volume and no
+`sizeLimit`, and it keeps a rollback simple: an older entrypoint runs as root, so its
+`rm -rf` and `cp` replace root-owned trees as readily as agent-owned ones. A volume that
+still holds agent-owned copies from an older sandbox has them replaced in place rather
+than hidden under a mount.
+
+**The pins cost a filesystem boundary.** `/opt/data`, `/opt/data/profiles` and
+`/opt/data/profiles/platform` are separate mounts, so `rename(2)` from one to another
+returns `EXDEV` (`Invalid cross-device link`). `mv` falls back to a copy and a delete;
+`os.replace` and `os.rename` do not. Every `os.replace` in the shipped scripts renames a
+temporary file inside one directory, so none of them crosses. `rm -rf /opt/data/profiles`
+from the shell stops partway, at the first mount point.
+
+**Outside the operator's StatefulSet the trees are only root-owned.** With
+`SANDBOX_IMAGE_TREES` unset (a plain `docker run`, or an operator from before the mounts)
+nothing made the mounts, so the entrypoint stages the trees itself as root-owned copies
+and logs that rename-aside is still possible. In-place edits are refused there; moving a
+tree aside is not.
+
+**The operator and the sandbox image move together.** An operator that renders the init
+container needs a sandbox image that knows `--prepare-image-trees`. A CR or
+`AGENT_SANDBOX_IMAGE` that pins an older sandbox image under this operator leaves the
+init container failing and the shell never starting: the older entrypoint ignores the
+argument, runs its own staging, and exits on the `authorized_keys` the init container
+does not mount, so the error names a missing key rather than the version skew. The other direction is safe: a
+newer image under an older operator gets no `SANDBOX_IMAGE_TREES` and takes the
+fallback.
+
+**The home directory is covered by its ownership, not by a mount.** A module in the
+user site-packages directory, or a shell startup file, would be code that later `agent`
+sessions run without any tree changing. The image makes `/home/agent` root-owned with
+no dotfiles instead; see [The agent home is root-owned](#the-agent-home-is-root-owned).
+
+**`/opt/defaults` is root-owned in the image.** It is the source every start copies
+from, and several shared scripts append `/opt/defaults/scripts` to `sys.path`, so a
+writable `/opt/defaults` would let the model shadow a module those scripts import. The
+build fails if anything under it is not owned by root or is writable by group or other.
+
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
 A `no_agent` cron job — one carrying a `script` rather than a `prompt` — is unaffected
@@ -1814,14 +1989,14 @@ into that directory and then register a cron job pointing at it. With file tools
 to the sandbox it cannot, which raises the stakes on the `sync_back` channel above:
 whatever that syncs back must not be able to land in a scripts directory.
 
-What it does break is bootstrap onboarding, and quietly. The inventory pipeline
+What it broke was bootstrap onboarding, and quietly. The inventory pipeline
 straddles the boundary in the wrong direction: `INVENTORY.raw.md` is written by the
 `platform` kanban worker and `INVENTORY.md` by the prioritization worker — both agent
-turns, so both writes now go to the sandbox, where `/opt/data` neither exists nor is
-writable. The readers did not move. `bootstrap_delivery.py` and `bootstrap_scan_gate.py`
-are `no_agent` scripts hardcoding `/opt/data/INVENTORY*.md` on the PVC, so the delivery
-job ticks every minute against a file that will never appear. A silent run is its normal
-no-op, so onboarding simply never delivers and nothing logs an error.
+turns, so both writes go to the sandbox's `/opt/data`. The readers did not move.
+`bootstrap_delivery.py` and `bootstrap_scan_gate.py` were `no_agent` scripts that read
+`/opt/data/INVENTORY*.md` on the PVC, so the delivery job ticked every minute against a
+file that never appeared there. A silent run is its normal no-op, so onboarding never
+delivered and nothing logged an error.
 
 **Moving the scripts into the sandbox was the obvious fix and does not work.** The
 mechanism is sound — `subprocess.run(capture_output=True)` returns stdout verbatim and
@@ -1860,6 +2035,27 @@ sandbox — so the split is one function, `run_resolver_poll`, becoming an `ssh`
 That split is now the smaller half of what has already happened. `resolver.py` reaches
 `gh` through `sandbox_exec.run`, so every `gh` call the poll makes executes in the
 sandbox today; what is left to move is the script around them.
+
+`bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
+`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+first; only once they say a delivery is due does it read `INVENTORY.md` out of the
+sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
+and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as `agent`,
+for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
+`agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
+because a failing `no_agent` script posts an alert to the user's chat on every tick it
+fails. A read that reaches the sandbox and does not return the report fails the run with
+the reason, as an unreadable report does on the agent pod, instead of waiting on it
+silently. The next tick reads again, so a passing read failure clears and a lasting one alerts on
+each tick until it is fixed. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on
+the PVC from the moment the card is filed, so the report files it also checks add
+nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
+which is wrong about the pod and right about the path the worker must write.
+
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
+picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
+as though the scan were still running. The report still arrives on the next delivery
+tick.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -1903,8 +2099,8 @@ sandbox has `/opt/data/tmp/t_384aaaba` and `/opt/data/gitops/t_dc3f1647`, and a
 used only to narrow that set, never to add to it, so the account the model owns can at
 worst hide a directory from the sweep.
 
-It connects as `agent` rather than `hermes`, which is the one place in the repository
-that does, and the reason is permissions: the workspaces are `agent:agent 755` to the
+It connects as `agent` rather than `hermes`, as `cluster_agent_profile.py` and
+`bootstrap_delivery.py` also do, and the reason is permissions: the workspaces are `agent:agent 755` to the
 leaves, so uid 1001 cannot unlink inside them. The alternative was a shared group, a
 setgid workspaces root and a `umask 002` for every session, which grants the trusted
 account standing write access to the model's tree in order to delete from it — a wider
@@ -2048,13 +2244,16 @@ whatever it needs to, on a different machine. The only thing that machine change
 the model's code is now on it too, which means trusted execution there needs a principal
 the model cannot influence. It does not have one today.
 
-`terminal.ssh_user` is `agent`, uid 1000 — the user whose shell the model drives, whose
-home directory it writes to, and who owns `/home/agent/.bashrc`. Bash sources `.bashrc`
-for a non-interactive `ssh host cmd`, so an agent-side caller that reaches into the
-sandbox as `agent` executes the model's startup file before its own command. The stock
-Debian guard at the top of that file returns early for non-interactive shells and hides
-this, but the model owns the file and can delete the guard; moving an `export` above it
-is enough to prove the mechanism, and the environment does cross.
+`terminal.ssh_user` is `agent`, uid 1000 — the user whose shell the model drives. When
+this was written, it also owned `/home/agent/.bashrc`, and bash sources `.bashrc` for a
+non-interactive `ssh host cmd`, so an agent-side caller that reached into the sandbox as
+`agent` executed the model's startup file before its own command. The stock Debian guard
+at the top of that file returned early for non-interactive shells and hid this, but the
+model owned the file and could delete the guard; moving an `export` above it was enough
+to prove the mechanism, and the environment did cross. The home is root-owned now
+([The agent home is root-owned](#the-agent-home-is-root-owned)), but the caller would
+still share a uid with every process the model starts and work in directories the model
+owns, so the principal stays separate.
 
 The consequence is not that the model gains a capability. It already has a shell in the
 sandbox and can run `kubectl` there whenever it likes. The consequence is that it can
@@ -2220,11 +2419,13 @@ are questions about this pod that a file in the other one cannot answer.
 
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
-directory nothing else reads. Every other agent-side reader still looks on the
-gateway's volume and still finds nothing, and generalising this — a tool the model
-can call to bring a file across on demand, with a landing directory that persists
-past a single delivery — is a decision about the boundary that still wants its own
-design.
+directory nothing else reads. The one other agent-side reader that crosses is
+`bootstrap_delivery.py`, which reads the single file it posts, `INVENTORY.md`, by
+name once its markers say a delivery is due, and lands nothing on disk. Every other
+agent-side reader still looks on the gateway's volume and still finds nothing, and
+generalising either — a tool the model can call to bring a file across on demand,
+with a landing directory that persists past a single delivery — is a decision about
+the boundary that still wants its own design.
 
 ### Three of the proxy's five roles move
 
@@ -2293,9 +2494,10 @@ than starting a proxy that fails every command.
 Federation returns access tokens. GitHub is reached through a different kind of
 credential: `github_token_refresh.py` presents a Google **ID** token to the token broker,
 whose scope rule matches on `assertion.email`, and the broker answers with a
-repository-scoped installation token. Under the metadata server `gcloud auth
-print-identity-token` mints that ID token. Under an `external_account` credential the same
-command refuses outright — _Invalid account type for `--audiences`. Requires valid service
+repository-scoped installation token. Without a federated credential the script asks the
+metadata server for that ID token directly, and runs `gcloud auth print-identity-token` only
+when the metadata server answers nothing usable or is twice too slow. Under an `external_account` credential
+that gcloud command refuses outright — _Invalid account type for `--audiences`. Requires valid service
 account._ — so a federated broker could reach GCP and not GitHub, which surfaces as
 `could not read Username for 'https://github.com'` from a `git` that never had a
 credential helper configured.
@@ -2313,7 +2515,7 @@ email, which is what
 [`configmap.yaml.template`](../../k8s-operator/config/integrations/github/configmap.yaml.template)
 already matches on — so no broker-side configuration changes when an install moves the
 proxy into the sandbox pod. The function returns `None` under any other credential type,
-which leaves every other placement on the gcloud path unchanged.
+which leaves every other placement on the metadata-server path, with gcloud behind it.
 
 `wif_credentials.py` is on the sandbox image's allowlist COPY as well as the proxy's,
 because `github_token_refresh.py` imports it at module scope and that script is baked into
@@ -2337,9 +2539,10 @@ Emptying the gateway pod of credentials breaks the one class of work that still 
 there. A roster entry marked `no_agent` runs as a Python subprocess on the gateway rather
 than as a model turn, and at the time touched neither the terminal backend nor the
 sandbox. `refresh_git_credentials` in `agents/platform/scripts/github_token_refresh.py`
-prefers `CREDENTIAL_PROXY_URL` and falls back to `gcloud auth print-identity-token`; with
-the variable gone from the gateway and no `gcloud` in the agent image, both branches are
-now dead and the job fails with `No such file or directory: 'gcloud'`. On the reference
+prefers `CREDENTIAL_PROXY_URL` and, at the time, fell back to `gcloud auth
+print-identity-token` (it now asks the metadata server first); with the variable gone from
+the gateway and no `gcloud` in the agent image, both branches were dead and the job failed
+with `No such file or directory: 'gcloud'`. On the reference
 install this surfaced as the shipped GitHub repo watcher failing on every ten-minute tick
 from the moment these images went live. Model-driven crons are unaffected: their shell work
 runs on the sandbox terminal backend, where the shims reach the broker's Service.
@@ -2372,13 +2575,13 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, and, once the operator renders it, the A2A gateway's. The operator grants
+the same listener, when the next stack takes Google Chat, the A2A gateway's, and, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session pods'. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
 minted for `kubeagents-credential-proxy`, the gateway's for
-`kubeagents-credential-proxy-chat`, the A2A gateway's, once rendered, for whatever
-`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names, and the `TokenReview` response echoes which
+`kubeagents-credential-proxy-chat`, the A2A gateway's for `kubeagents-credential-proxy-a2a-chat`, and the `TokenReview` response echoes which
 audience it validated. A username cannot do this job: the gateway shares its ServiceAccount with the
 broker because the Workload Identity binding names it, so the two Pods are one identity at
 the `TokenReview` layer. The audience is chosen by the operator, per Pod, and the API server
@@ -2392,7 +2595,14 @@ had and nothing checked. The same table carries a third role, `a2a-chat`, for th
 gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
 role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
-apart from the legacy chat one. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session)`, and
+within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
+Pod picks the audience it projects, the role is also bound to the caller:
+`CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
+the session audience, and no other caller may present that audience
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
@@ -2477,13 +2687,17 @@ produce no symptom.
 broker that ran git of its own would have had the same problem one container over. Every git
 in the product is agent-issued: the skills call `gitops_workspace.run_git`, which posts to
 `/v1/exec`, which reaches `CommandExecutor.execute`. The broker's own non-agent-selectable
-path is `execute_internal`, and its only caller is `/v1/github/refresh`, which runs
-`git config --get remote.origin.url` and nothing else. The content workspaces run their git
+path is `execute_internal`, which runs the provider's own credential helper from the broker
+image and nothing else. It is reached three ways, none of them with agent-supplied argv: the
+credential refresh route (`/v1/forge/refresh`, with `/v1/github/refresh` kept as an alias), the
+in-process refresh a version-control verb makes before it spends the credential, and the
+read-only mint for a context-repository clone. The content workspaces run their git
 through `execute_workspace_git`, which shares `_execute` with the agent-facing path — so it
 inherits the same hardened environment — but is not reachable from `/v1/exec` and takes no
 agent-supplied argv: the subcommands are literals in `content_workspace.py`, and the only
 caller-supplied strings in them are a validated branch name and validated repository-relative
-paths. That separation is what lets the agent-facing git surface go to zero once the skills
+paths. The clone URL is never one of them: the broker composes it from a validated `owner/name`
+for GitHub, or the forge that owns a host-qualified name composes it. That separation is what lets the agent-facing git surface go to zero once the skills
 migrate, rather than going to zero by accident.
 
 **What runs which way.** Both mechanisms are live at once, because a fleet does not upgrade
@@ -2836,6 +3050,10 @@ anyway is in [The Session KV store](#the-session-kv-store).
   of the `sync_back` question above.
 - **Whether `sync_back` should be on at all.** Stated above as an open decision, not
   a resolved one.
+- **The read-only tree mounts under gVisor.** The entrypoint's gate reads
+  `/proc/self/mountinfo`, so it depends on the sentry listing the `subPath` mounts with
+  `ro`, and the `EBUSY` on the trees and their pinned ancestors depends on its rename
+  check. Both follow from the sentry's code and have not been run on a sandboxed pod.
 - **Whether the operator should own the sandbox at all**, or whether it belongs to a
   second controller with its own lifecycle. Reconciling it alongside the gateway is
   the smaller change and the one sketched; it also means a bad sandbox spec is a
@@ -2849,8 +3067,9 @@ anyway is in [The Session KV store](#the-session-kv-store).
 - **The SSH helper reaches the sandbox, and the commands behind it now run.**
   `agents/platform/scripts/sandbox_exec.py` routes every credentialed call site that
   runs in the agent pod (the `gitops_workspace._read_state_key` kubectl fallback aside),
-  and the `hermes` account, its authorised key and the `.bashrc` isolation are covered
-  by `make docker-smoke-sandbox`. When the helper landed, a routed `gcloud` or `kubectl`
+  and the `hermes` account, its authorised key and the root-owned home that closes the
+  `.bashrc` route are covered by `make docker-smoke-sandbox`. When the helper landed, a
+  routed `gcloud` or `kubectl`
   stopped at `CREDENTIAL_PROXY_URL is not configured`, so the connection was proven and
   the command behind it was not; since then `stall-watch`, a shipped roster entry, runs `gcloud container clusters
 get-credentials` and `kubectl` behind it on every tick, and `github_token_refresh.py`'s
@@ -2866,20 +3085,13 @@ get-credentials` and `kubectl` behind it on every tick, and `github_token_refres
   `_thread_kubeconfig_path` still describes the older check and is what is left to update.
 - **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
   earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
-  pod's PVC and shells out to `hermes`, so it is one of the two scripts the sandbox
+  pod's PVC and shells out to `hermes`, so it is one of the three scripts the sandbox
   stubs rather than bakes. The four skills that tell the model to run it by its runtime
   path therefore stop at the stub's message instead of reaching the kubeconfig problem
   at all. Both want the same fix — per-profile directories on the sandbox side, and an
   MCP tool that lets the model ask the agent pod to create a profile rather than
   running a script that has to live there. Inventing that layout inside a call site was
   the alternative, and it is how two layouts end up shipping.
-- **The bootstrap handoff is designed and unimplemented.** `no_agent` scripts stay in the
-  agent pod, and six of them (`kanban-workspace-gc`, `cluster-agent-reconcile`,
-  `stall-watch`, `github-repo-watcher` and `chat-delivery-watch` through `forge.py`, and
-  `github_token_refresh.py`'s forward) reach the sandbox through `sandbox_exec` from a
-  shipped roster, so cron against a sandboxed agent is exercised.
-  What is not is the bootstrap handoff the section above specifies. Onboarding is broken
-  until it lands, and broken silently.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
   backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
   would be a hole rather than a degradation.

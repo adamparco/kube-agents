@@ -46,9 +46,20 @@ type TriageEvent struct {
 	// They also give the agent what it needs to build a gke_<project>_<location>_<cluster>
 	// context and actually reach the cluster the event came from. Empty for the
 	// direct --in-cluster cluster, which is the one the agent already points at.
-	Cluster       string
-	Project       string
-	Location      string
+	Cluster  string
+	Project  string
+	Location string
+	// Autopilot says the cluster above is a GKE Autopilot cluster, carried on
+	// the event because one filter serves every cluster's dispatcher and so
+	// cannot ask which one it is looking at. Read by the FailedScheduling
+	// gate alone: an Autopilot cluster with no user workloads scales itself
+	// to zero nodes by design, where a Standard cluster at zero nodes is a
+	// fault, and the two are indistinguishable from the event otherwise.
+	// Carried from the describe call cluster discovery already makes. A
+	// direct --in-cluster entry that no profile covers has no describe behind
+	// it and reads false; see targetCluster.Autopilot for why that costs
+	// nothing, and for the covered case, which does carry the bit.
+	Autopilot     bool
 	Namespace     string
 	KindOfObject  string
 	Name          string
@@ -64,6 +75,13 @@ type TriageEvent struct {
 	// counter is separate — see dedup.go.
 	Count int
 	Type  string
+	// Reporter names the component that recorded the event: source.component
+	// on the core/v1 shape, reportingController when only that is set. The
+	// author of an event writes both, so this authenticates nothing; it is
+	// what lets the filter take a TriggeredScaleUp or NotTriggerScaleUp as
+	// cluster-autoscaler's verdict only when it says it is the autoscaler's
+	// (scaleUpReporter in scaleup.go), rather than on the reason alone.
+	Reporter string
 	// PullClass and PullCause are the only fields not read off the
 	// *corev1.Event. The dispatcher fills them in for image-pull failures
 	// by resolving the event's message through pullClassMemo, because the
@@ -74,6 +92,11 @@ type TriageEvent struct {
 	// See pullfailure.go.
 	PullClass pullClass
 	PullCause string
+	// ScaleUp is cluster-autoscaler's latest verdict on the pod, stamped by
+	// the dispatcher on FailedScheduling events only, from the marks it
+	// recorded off the pod's TriggeredScaleUp and NotTriggerScaleUp events.
+	// The zero mark means the autoscaler has said nothing. See scaleup.go.
+	ScaleUp scaleUpMark
 }
 
 // InjectPayload is the JSON body POSTed to

@@ -58,6 +58,12 @@ LOSTPOD_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / 
 BUILD_1118_LOST = "2098383791838990336"  # PR 1118, NodeNotReady 2h08m in, no build-log.txt
 BUILD_1446_CLONE_FAILED = "2098418565454499840"  # PR 1446, clone failed (merge conflict) in 0s
 
+# The one DERIVED build (SCHEMA.md, Fixtures): the suite's not-evaluated
+# verdict -- NOT EVALUATED on the final line, artifacts/eval-verdict.json
+# agreeing -- which no real build carried when the fixture was written.
+NOTEVAL_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_notevaluated"
+BUILD_1782_NOT_EVALUATED = "2101862036789329920"  # one admitted case lost every repetition
+
 # The three real builds, oldest first (started.json timestamps).
 BUILD_956_TRUNCATED = "2092688354838581248"  # PR 956, deadline hit before verdict
 BUILD_998_INFRA = "2093030474753511424"  # PR 998, compliance canary infra-failed
@@ -1000,17 +1006,20 @@ class TestIndexDiscovery(_MergeBase):
 # test can tell a derived job from a hardcoded one.
 FAKE_NIGHTLY_JOB = "ci-fake-eval-nightly"
 FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
+# The writers periodic of a night split across two jobs, under its live job
+# name: nightly.py tells the parts apart by that name.
+FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
     """The nightly periodic beside the presubmit: same parser, its own tier,
     no pull request, its own watermark, and never the refusal line."""
 
-    def place_nightly_build(self, build) -> pathlib.Path:
+    def place_nightly_build(self, build, periodic=FAKE_NIGHTLY_PREFIX) -> pathlib.Path:
         """Copy fixture `build` under the periodic's prefix (one directory per
         build, as Prow archives a periodic) and refresh latest-build.txt."""
         root = self.bucket_root()
-        prefix = root / FAKE_NIGHTLY_PREFIX[len(FAKE_BUCKET):]
+        prefix = root / periodic[len(FAKE_BUCKET):]
         prefix.mkdir(parents=True, exist_ok=True)
         dst = prefix / build
         shutil.copytree(TESTDATA / build, dst)
@@ -1211,6 +1220,88 @@ class TestNightlySource(_MergeBase):
             self.assertEqual(cases[name]["last3"], [])
         # And the pooled numbers a consumer used to read stay the presubmit's.
         self.assertEqual(sum(c["runs_on_record"] for c in cases.values()), 11)
+
+    def test_the_writers_prefix_is_collected_beside_the_main_one(self):
+        """A night split across two jobs: both prefixes are listed, both
+        builds are nightly runs, each with its own job and link."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_INFRA)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil)
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
+            BUILD_998_INFRA: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers"),
+        })
+        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}")
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_JOB, nightly.NIGHTLY_WRITERS_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/")
+        self.assertNotIn("--nightly-writers-prefix", stderr)
+
+    def test_a_writers_prefix_naming_another_job_is_warned_about(self):
+        """nightly.py files a run as the writers part by the job name alone,
+        so a prefix ending in another job would be reported as main nights."""
+        gsutil, _ = self.fake_gsutil([])
+        other = f"{FAKE_BUCKET}logs/my-writers/"
+        _, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=other, gsutil=gsutil)
+        self.assertIn(f"warning: --nightly-writers-prefix {other} names job my-writers, not ci-kube-agents-eval-nightly-writers", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_each_nightly_job_resumes_above_its_own_watermark(self):
+        """Both jobs start at 00:00 UTC and the writers build finishes first:
+        its id on record must not lift the main job's watermark over a main
+        build the listing names later, nor the other way round."""
+        gsutil, _ = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)  # main: below the writers id on record
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)  # writers: above the main id on record
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [
+            {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
+            {"build_id": "2093040000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers", "pr": None, "tasks": []},
+        ]
+        merged, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, since_days=10000,
+        )
+        self.assertNotIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "below the writers' own watermark")
+        self.assertIn(BUILD_956_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
+        self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
+        self.assertIn("writers scan resumed above build 2093040000000000000, 0 new", stderr)
+
+    def test_a_writers_prefix_with_no_writers_on_record_is_a_note(self):
+        """Until a writers build is on record, its prefix failing to list is
+        the job not existing yet, whatever the main job has on record: a
+        note, never the refusal line."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_WRITERS_PREFIX
+        self.place_nightly_build(BUILD_998_INFRA)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"note: nightly prefix {FAKE_WRITERS_PREFIX} did not list", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        # Once one is on record, the same failure is the refusal line.
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="2", tier="nightly", pr=None, job="ci-kube-agents-eval-nightly-writers"))
+        _, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_WRITERS_PREFIX}", stderr)
+
+    def test_an_unfinished_writers_build_rides_pending_with_its_link(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 0, 5, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil, now=now)
+        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}"
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
 
     def test_nightly_active_is_the_superset_matrix(self):
         data = collect.collect(from_dir=TESTDATA)
@@ -2014,6 +2105,379 @@ class TestPrMerged(unittest.TestCase):
         self.assertIs(runs[5]["pr_merged"], False)  # recent first resolution
         asked = {line.split()[2] for line in log.read_text().splitlines()}
         self.assertEqual(asked, {"30", "60"})
+
+
+
+class TestNotEvaluatedRun(unittest.TestCase):
+    """runs[].eval_outcome and runs[].not_evaluated (SCHEMA.md), from the
+    DERIVED build under testdata_notevaluated/ -- no real run had ended with
+    the verdict when it was written; SCHEMA.md's fixtures table says so. Its
+    final line carries NOT EVALUATED between the anchors and its
+    artifacts/eval-verdict.json says `outcome: not_evaluated`, the two facts
+    the collector requires together."""
+
+    def fixture(self):
+        return collect.runs_from_dir(NOTEVAL_TESTDATA)[0]
+
+    def test_the_suites_verdict_rides_beside_a_red_eval_verdict(self):
+        run = self.fixture()
+        self.assertEqual(run["build_id"], BUILD_1782_NOT_EVALUATED)
+        self.assertEqual((run["result"], run["eval_verdict"]), ("FAILURE", "RED"), "the line's Failed word still reads RED")
+        self.assertEqual(run["eval_outcome"], "not_evaluated")
+        self.assertEqual(run["not_evaluated"], ["security-overgrant-probe"])
+        self.assertEqual(run["duration_s"], 1631, "the anchors survive the words between them")
+        by_name = {t["name"]: t for t in run["tasks"]}
+        self.assertEqual(by_name["security-overgrant-probe"]["result"], "infra")
+        self.assertEqual([r["result"] for r in by_name["security-overgrant-probe"]["reps"]], ["infra", "infra", "infra"])
+        self.assertEqual(by_name["reliability-pdb-probe"]["result"], "pass")
+        self.assertEqual(
+            list(run),
+            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "eval_outcome", "not_evaluated", "has_build_log"],
+        )
+
+    def test_the_verdict_file_is_read_once_and_only_when_the_line_says_so(self):
+        asked = []
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+
+        def reader(name):
+            asked.append(name)
+            return inner(name)
+
+        run = collect.build_run(BUILD_1782_NOT_EVALUATED, reader)
+        self.assertEqual(asked.count("artifacts/eval-verdict.json"), 1)
+        self.assertEqual(run["eval_outcome"], "not_evaluated")
+        asked.clear()
+        plain = collect._dir_reader(TESTDATA / BUILD_998_FULL)
+
+        def plain_reader(name):
+            asked.append(name)
+            return plain(name)
+
+        run = collect.build_run(BUILD_998_FULL, plain_reader)
+        self.assertNotIn("artifacts/eval-verdict.json", asked, "a plain Failed line costs no extra read")
+        self.assertFalse({"eval_outcome", "not_evaluated"} & set(run))
+
+    def test_a_line_without_an_agreeing_file_is_a_plain_red_with_a_warning(self):
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        for label, verdict_text in (
+            ("missing", None),
+            ("malformed", "{"),
+            ("a red outcome", json.dumps({"green": False, "outcome": "red", "not_evaluated": []})),
+            ("not an object", json.dumps(["not_evaluated"])),
+            # json.loads raises RecursionError, not ValueError, past its
+            # nesting depth; the fallback must be the same plain RED, not
+            # a build_run exception that drops the build from the sweep.
+            ("nested past the decoder's depth", "[" * 100000),
+        ):
+            with self.subTest(label):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: verdict_text if name == "artifacts/eval-verdict.json" else inner(name))
+                self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
+                self.assertEqual(run["eval_verdict"], "RED")
+                self.assertIn("the final line says NOT EVALUATED but artifacts/eval-verdict.json is missing or does not agree", err.getvalue())
+
+    def test_a_transient_miss_on_the_artifact_gets_a_second_read(self):
+        # A recorded build is never re-read, so one failed object read must
+        # not record a not-evaluated run as the hard red for good.
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        misses = []
+
+        def reader(name):
+            if name == "artifacts/eval-verdict.json" and not misses:
+                misses.append(name)
+                return None
+            return inner(name)
+
+        run = collect.build_run(BUILD_1782_NOT_EVALUATED, reader)
+        self.assertEqual(misses, ["artifacts/eval-verdict.json"])
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+
+    def test_the_transport_shape_stays_a_plain_red_with_a_note(self):
+        # Two writers share the outcome word (hack/ci-eval-pr.sh,
+        # announce_suite_verdict): weather that took an admitted case names
+        # it under not_evaluated; an inject-lane run whose every case was
+        # set aside as not graded on its transport names nothing there and
+        # the cases under not_graded, and the script's final line says so.
+        # Nothing was lost on the second, and the pages' "retest once the
+        # environment is healthy" would be the opposite of the gate's own
+        # banner ("the lane's roster is what to fix"), so it is not recorded
+        # as an infrastructure loss.
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        transport_line = (
+            "❌ [2026-09-21T15:38:13Z] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded"
+            " on this transport (every objective check not applicable), so this run graded nothing and cannot certify green."
+            " Not a finding against the change and not an environment failure: the lane's roster is what to fix."
+            " See /logs/artifacts/eval-verdict.md (Total Duration: 1631s)"
+        )
+        log = inner("build-log.txt")
+        infra_line = next(l for l in log.splitlines() if "NOT EVALUATED" in l)
+        transport_log = log.replace(infra_line, transport_line)
+        self.assertNotEqual(log, transport_log)
+        artifact = json.dumps({"green": False, "outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["agent-kanban-smoke", "reliability-pdb-probe"]})
+        for label, log_text in (("the transport line", transport_log), ("the infrastructure line", log)):
+            with self.subTest(label):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    run = collect.build_run(
+                        BUILD_1782_NOT_EVALUATED,
+                        lambda name: artifact if name == "artifacts/eval-verdict.json" else log_text if name == "build-log.txt" else inner(name),
+                    )
+                self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
+                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1631))
+                self.assertIn("says every case was not graded on its transport", err.getvalue())
+                self.assertIn("recorded as a plain RED, which is not an infrastructure loss", err.getvalue())
+                self.assertNotIn("warning:", err.getvalue(), "a designed fallback, not a disagreeing artifact")
+        # The artifact decides, not the words on the line: the infra shape
+        # under the transport line is still the infra shape.
+        with contextlib.redirect_stderr(io.StringIO()):
+            run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: transport_log if name == "build-log.txt" else inner(name))
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+
+    def test_an_infrastructure_artifact_naming_no_case_id_is_a_plain_red_with_a_warning(self):
+        # scoring.py names every gradable case, or the admitted ones lost,
+        # under not_evaluated on the infrastructure shape -- never nothing.
+        # An artifact with the outcome word and no usable id is hand-written
+        # or corrupted; recorded, it headlined "Not evaluated: 0 gate cases
+        # lost every repetition to infrastructure", the Brief row "0 cases
+        # lost" and the comment "An admitted case lost", and told the author
+        # to retest. It stays the plain RED the line's Failed word says,
+        # with a warning that says why, distinct from the transport note.
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        for label, artifact in (
+            ("no list at all", {"green": False, "outcome": "not_evaluated"}),
+            ("an empty list", {"green": False, "outcome": "not_evaluated", "not_evaluated": []}),
+            ("not a list", {"green": False, "outcome": "not_evaluated", "not_evaluated": "security-overgrant-probe"}),
+            ("no id-shaped entry", {"green": False, "outcome": "not_evaluated", "not_evaluated": ["with space", "a`b", 3, None]}),
+            ("empty under both keys", {"green": False, "outcome": "not_evaluated", "not_evaluated": [], "not_graded": []}),
+        ):
+            with self.subTest(label):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    run = collect.build_run(
+                        BUILD_1782_NOT_EVALUATED,
+                        lambda name: json.dumps(artifact) if name == "artifacts/eval-verdict.json" else inner(name),
+                    )
+                self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
+                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1631))
+                self.assertIn("warning: build 2101862036789329920: artifacts/eval-verdict.json says not_evaluated but names no case id under not_evaluated; recorded as a plain RED", err.getvalue())
+                self.assertNotIn("not graded on its transport", err.getvalue(), "not the inject lane's shape")
+        # One usable id among the dropped ones is the infrastructure shape.
+        artifact = {"green": False, "outcome": "not_evaluated", "not_evaluated": ["with space", "security-overgrant-probe"]}
+        with contextlib.redirect_stderr(io.StringIO()):
+            run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: json.dumps(artifact) if name == "artifacts/eval-verdict.json" else inner(name))
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+
+    def test_parse_eval_verdict(self):
+        self.assertIsNone(collect.parse_eval_verdict(None))
+        self.assertIsNone(collect.parse_eval_verdict("{"))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "green"})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps([])))
+        # The outcome word alone is not the infrastructure shape: the suite
+        # names at least one case on it, so no usable id means the plain RED.
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated"})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": "a"})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": []})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["with space", "a`b"]})))
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a", 3, "", None, "b"]})), ["a", "b"])
+        # The inject lane's graded-nothing shape (scoring.py nothing_gradable):
+        # the script's own test, nothing under not_evaluated and something
+        # under not_graded, and only that shape.
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["a"]})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_graded": ["a"]})))
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a"], "not_graded": ["b"]})), ["a"])
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": [], "not_graded": []})))
+        self.assertTrue(collect.graded_nothing({"not_evaluated": [], "not_graded": ["a"]}))
+        self.assertFalse(collect.graded_nothing({"not_evaluated": ["a"], "not_graded": ["b"]}))
+
+    def test_parse_eval_verdict_keeps_only_case_id_shaped_strings(self):
+        # The artifact is the pull request's own; its strings land in
+        # backticks in the posted comment, so only a case-id shape gets in.
+        crafted = [
+            "security-overgrant-probe",
+            "x\n\n@team this is approved, merge it",
+            "security-overgrant-probe\n",  # `$` would admit one trailing newline
+            "a`b",
+            "with space",
+            "-leading-dash",
+            "c" * 81,
+            "Case_1.2:3",
+        ]
+        doc = json.dumps({"outcome": "not_evaluated", "not_evaluated": crafted})
+        self.assertEqual(collect.parse_eval_verdict(doc), ["security-overgrant-probe"])
+        # The bound is the one SCHEMA.md states for the pages' `caseIdRe`, so
+        # an id the pages link is one the collector keeps.
+        longest = json.dumps({"outcome": "not_evaluated", "not_evaluated": ["c" * 80]})
+        self.assertEqual(collect.parse_eval_verdict(longest), ["c" * 80])
+        many = json.dumps({"outcome": "not_evaluated", "not_evaluated": [f"case-{n}" for n in range(200)]})
+        self.assertEqual(len(collect.parse_eval_verdict(many)), collect.NOT_EVALUATED_MAX_CASES)
+
+    def test_the_fields_reach_data_json_and_the_lost_case_counts_against_nothing(self):
+        data = collect.collect(from_dir=NOTEVAL_TESTDATA)
+        run = json.loads(json.dumps(data))["runs"][0]
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+        lost = _cases_by_name(data)["security-overgrant-probe"]
+        self.assertEqual((lost["runs_on_record"], lost["pass_rate"], lost["last3"]), (1, None, ["infra"]))
+
+
+
+FAKE_GITLAB_JOB = "pull-kube-agents-smoke-test-gitlab"
+FAKE_GITLAB_GLOB = FAKE_BUCKET + f"pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+# The lane's glob in the shape its index derives from, and that index.
+FAKE_GITLAB_INDEXED_GLOB = FAKE_BUCKET + f"pr-logs/pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+FAKE_GITLAB_INDEX_PREFIX = FAKE_BUCKET + f"pr-logs/directory/{FAKE_GITLAB_JOB}/"
+
+
+class TestGitLabLane(_MergeBase):
+    """The GitLab lane (kube-agents#2394): a third source of pull-request
+    builds, tagged tier gitlab, with a watermark of its own, listed on the
+    Brief by itself and counted in no gate verdict."""
+
+    def place_gitlab_build(self, build, pr=998) -> pathlib.Path:
+        root = self.bucket_root()
+        dst = root / f"pull/gke-labs_kube-agents/{pr}/{FAKE_GITLAB_JOB}/{build}"
+        shutil.copytree(TESTDATA / build, dst)
+        return dst
+
+    def test_gitlab_builds_parse_with_their_tier_and_job_and_feed_no_case_history(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_gitlab_build(BUILD_998_FULL)
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        data, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil, now=now)
+        self.assertEqual([(r["build_id"], r["tier"], r["job"], r["pr"]) for r in data["runs"]], [(BUILD_998_FULL, "gitlab", FAKE_GITLAB_JOB, 998)])
+        self.assertEqual(tiers.gitlab_runs(data["runs"]), data["runs"])
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [], "the gate's filters never see it")
+        # The per-case record is the presubmit's and the nightly's; a GitLab
+        # run feeds neither, so a GitLab-only case is not on the Cases page.
+        self.assertEqual(data["cases"], [])
+
+    def test_each_source_resumes_above_its_own_watermark_gitlab_included(self):
+        """The newest presubmit id sits far above every GitLab id (the lane
+        runs rarely), so a shared watermark would skip every GitLab build."""
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA])  # presubmit candidate, old
+        self.place_gitlab_build(BUILD_956_TRUNCATED)  # the lowest id, under the GitLab job
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="",
+        )
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertEqual(by_id[BUILD_956_TRUNCATED]["tier"], "gitlab", "below the presubmit watermark, above the lane's own")
+        self.assertNotIn(BUILD_998_INFRA, by_id, "below the presubmit's own watermark: skipped")
+        self.assertIn(f"GCS scan resumed above build {BUILD_998_FULL}", stderr)
+        self.assertIn("gitlab scan resumed above build 1, 1 new", stderr)
+        # And the presubmit watermark ignores the lane's ids, as it ignores the nightly's.
+        self.assertEqual(collect.newest_build_id(tiers.presubmit_runs(merged["runs"])), int(BUILD_998_FULL))
+
+    def test_a_lane_that_has_not_run_yet_is_a_note_not_the_refusal_line(self):
+        """`gsutil ls` exits non-zero on a glob matching no objects, and the
+        refresh workflow refuses to publish on `warning: gsutil ls ... failed`;
+        until the lane's first build that must be a note, or every tick is red."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil)
+        self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_998_FULL])
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The presubmit's own glob keeps the warning: the gate's listing failing is a stall.
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gsutil=gsutil)
+        self.assertIn("warning: gsutil ls failed for", stderr)
+
+    def test_the_cold_path_lists_the_lanes_index_not_the_archive_wide_glob(self):
+        """With no lane run on record the archive-wide glob walks every pull
+        request's directory on every tick (bnaylor measured 2 min 15 s over
+        962 of them, read-only, against about 1 s for the index), and past
+        the listing timeout that is the refusal line, indefinitely for an
+        on-demand lane. The index answers "nothing yet" as a note, and lists
+        the first build when it lands."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the lane's index, cold")
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "never the archive-wide glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The first lane build lands: read through the index, no watermark yet.
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertEqual({r["build_id"]: r["tier"] for r in data["runs"]}, {BUILD_998_FULL: "presubmit", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text())
+
+    def test_a_known_but_empty_lane_index_is_a_note_and_a_denied_one_the_warning(self):
+        """The nightly's rule: once a lane run is on record its index is
+        listed, and an index that matched no objects (purged or moved while
+        the on-demand lane sat idle) must not stop the gate's dashboard
+        publishing for the weeks until the lane next builds; a listing that
+        fails any other way is the bucket or the grant, the refusal line."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the index path, not the glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        self.assertEqual(len(merged["runs"]), 2, "the old lane run stays on record")
+        # The glob path with a watermark (index disabled) is the same note.
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="")
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # Denied is not "no objects": with a run on record that is the warning line.
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_GITLAB_INDEX_PREFIX
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_DENY", None)
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_GITLAB_INDEX_PREFIX}", stderr)
+
+    def test_with_a_lane_run_on_record_the_lane_lists_its_own_index_not_the_presubmits(self):
+        """`--index-prefix` names the presubmit's index; handed to the lane it
+        would list every presubmit build above the lane's low watermark and
+        re-tag them gitlab, emptying the gate's history."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])  # in the presubmit's index
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual({r["build_id"]: r["tier"] for r in merged["runs"]}, {BUILD_998_FULL: "presubmit", "1": "gitlab", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text())
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "with a watermark the lane reads its index, not the glob")
+
+    def test_an_unfinished_gitlab_build_rides_pending_with_its_tier(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_gitlab_build(BUILD_998_FULL)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil, now=now)
+        self.assertEqual(data["runs"], [])
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+        # The tag survives a scan that lists nothing new, and the presubmit
+        # source never retries it: its retry set is the presubmit's own.
+        prior = self.write_prior(data)
+        gsutil, log = self.fake_gsutil([])
+        merged, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15), index_prefix="")
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+
+    def test_the_cli_takes_the_lane_glob_and_counts_it(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_gitlab_build(BUILD_998_FULL)
+        out = self.tmp / "out.json"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = collect.main(["--gitlab-pr-glob", FAKE_GITLAB_GLOB, "--gsutil", gsutil, "--gh", "", "--out", str(out), "--since-days", "100000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 presubmit, 0 nightly, 1 gitlab", stderr.getvalue())
+        self.assertEqual(json.loads(out.read_text())["runs"][0]["tier"], "gitlab")
 
 
 if __name__ == "__main__":

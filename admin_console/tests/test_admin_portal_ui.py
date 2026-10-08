@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import os
 import tempfile
 import unittest
+from concurrent.futures import wait
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -56,6 +58,20 @@ CLUSTER = "test-cluster-01"
 LOCATION = "us-east4"
 NAMESPACE = "kubeagents-system"
 TARGET = DeploymentTarget(PROJECT, CLUSTER, LOCATION, NAMESPACE)
+
+
+def query_param(app: AppTest, key: str) -> str:
+    """One query parameter's value, on either AppTest shape.
+
+    streamlit 1.65 returns the string.  Earlier versions return a
+    one-element list.
+    """
+    value = app.query_params[key]
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise AssertionError(f"{key} has {len(value)} values: {value!r}")
+        return value[0]
+    return value
 
 
 def connection_report(
@@ -638,14 +654,19 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         return app.session_state[CONNECTION_CONTROLLER_KEY]
 
     def finish_connection_job(self, app: AppTest) -> AppTest:
-        """Wait on the dependency itself, then let the UI consume its result."""
+        """Wait on the dependency itself, then let the UI consume its result.
+
+        A future that finished with an exception counts as done: the UI, not
+        the test, is what reads it, so the helper does not re-raise it.
+        """
         if CONNECTION_CONTROLLER_KEY not in app.session_state:
             app = app.run()
         controller = self.controller(app)
         if controller.job is None:
             return app
         job = controller.job
-        job.future.result(timeout=20)
+        done, _ = wait([job.future], timeout=20)
+        self.assertIn(job.future, done, "connection job did not finish in time")
         return app.run()
 
     def connect_project(self, app: AppTest) -> AppTest:
@@ -800,9 +821,9 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = self.finish_connection_job(app)
 
         self.assertEqual(self.controller(app).connected_target, TARGET)
-        self.assertEqual(app.query_params["project"], [PROJECT])
-        self.assertEqual(app.query_params["cluster"], [CLUSTER])
-        self.assertEqual(app.query_params["location"], [LOCATION])
+        self.assertEqual(query_param(app, "project"), PROJECT)
+        self.assertEqual(query_param(app, "cluster"), CLUSTER)
+        self.assertEqual(query_param(app, "location"), LOCATION)
         self.assertEqual([button.label for button in app.button].count("Connected"), 2)
         self.assertEqual(len(app.selectbox), 2)
         self.assertTrue(
@@ -991,6 +1012,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
 
     def test_revalidation_exception_retains_suspended_target(self):
+        release_check = Event()
+
+        def crashed_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            raise RuntimeError("probe crashed")
+
         app = self.app(connected=True)
         self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
         save_connection(
@@ -1000,9 +1027,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=RuntimeError("probe crashed"),
+            side_effect=crashed_check,
         ):
             app = app.run()
+            self.assertIsNotNone(self.controller(app).job)
+            release_check.set()
+            app = self.finish_connection_job(app)
 
         self.assertIsNone(self.controller(app).connected_target)
         saved = load_connection("admin@example.com")
@@ -1100,7 +1130,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = self.connect_project(self.app().run())
 
         self.assertIsNone(self.controller(app).connected_target)
-        self.assertEqual(app.query_params["cluster"], [detected_cluster])
+        self.assertEqual(query_param(app, "cluster"), detected_cluster)
         cluster = next(item for item in app.selectbox if item.label == "Cluster")
         self.assertEqual(cluster.value, f"{detected_cluster}|{LOCATION}")
         self.assertIsNone(run_checks.call_args.kwargs["expected_target"])
@@ -1114,7 +1144,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertFalse(any(item.label == "Project ID" for item in app.text_input))
         self.assertEqual(self.controller(app).project_id, "custom-project-01")
-        self.assertEqual(app.query_params["project"], ["custom-project-01"])
+        self.assertEqual(query_param(app, "project"), "custom-project-01")
 
     def test_invalid_custom_project_disables_connect(self):
         with patch(
@@ -1289,8 +1319,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertEqual(self.controller(app).connected_project, PROJECT)
         self.assertIsNone(self.controller(app).connected_target)
-        self.assertEqual(app.query_params["project"], [PROJECT])
-        self.assertEqual(app.query_params["cluster"], [CLUSTER])
+        self.assertEqual(query_param(app, "project"), PROJECT)
+        self.assertEqual(query_param(app, "cluster"), CLUSTER)
         self.assertEqual([button.label for button in app.button].count("Disconnect"), 1)
 
     def test_nested_disconnects_expose_only_one_action_at_a_time(self):
@@ -1309,7 +1339,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertIsNone(self.controller(app).connected_project)
         self.assertIsNone(self.controller(app).connected_target)
-        self.assertEqual(app.query_params["project"], [PROJECT])
+        self.assertEqual(query_param(app, "project"), PROJECT)
         self.assertNotIn("cluster", app.query_params)
         self.assertEqual(len(app.error), 0)
         self.assertFalse(
@@ -1353,8 +1383,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "Cluster investigation",
         )
         self.assertNotIn("chat_agent", app.query_params)
-        self.assertEqual(app.query_params["chat_window"], ["all"])
-        self.assertEqual(app.query_params["chat_session"], ["default:session-1"])
+        self.assertEqual(query_param(app, "chat_window"), "all")
+        self.assertEqual(query_param(app, "chat_session"), "default:session-1")
         self.assertNotIn("user@example.com", str(app.query_params))
         self.assertTrue(app.chat_input[0].disabled)
         self.assertTrue(
@@ -1376,8 +1406,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             ).click().run()
 
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.query_params["chat_page"], ["2"])
-        self.assertEqual(app.query_params["chat_session"], ["default:session-25"])
+        self.assertEqual(query_param(app, "chat_page"), "2")
+        self.assertEqual(query_param(app, "chat_session"), "default:session-25")
         self.assertEqual(len(app.dataframe[0].value), 5)
         self.assertTrue(
             any("Transcript for session-25" in item.value for item in app.markdown)
@@ -1458,7 +1488,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(self.controller(app).selected_target.cluster_name, CLUSTER)
-        self.assertEqual(app.query_params["cluster"], [CLUSTER])
+        self.assertEqual(query_param(app, "cluster"), CLUSTER)
         self.assertEqual(len(app.chat_message), 2)
 
     def test_portal_conversation_rehydrates_from_url_and_remains_writable(self):
@@ -1472,7 +1502,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.chat_message), 2)
-        self.assertEqual(app.query_params["chat_session"], ["default:portal_saved"])
+        self.assertEqual(query_param(app, "chat_session"), "default:portal_saved")
         self.assertFalse(app.chat_input[0].disabled)
         self.assertTrue(
             any("Battleship is healthy" in item.value for item in app.success)
@@ -1518,7 +1548,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.title[0].value, "Task Kanban")
-        self.assertEqual(app.query_params["kanban_task"], ["t_12345678"])
+        self.assertEqual(query_param(app, "kanban_task"), "t_12345678")
         self.assertTrue(
             any("Applications inspected" in item.value for item in app.success)
         )
@@ -1536,8 +1566,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             ).click().run()
 
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.query_params["kanban_page"], ["2"])
-        self.assertEqual(app.query_params["kanban_task"], ["t_00000025"])
+        self.assertEqual(query_param(app, "kanban_page"), "2")
+        self.assertEqual(query_param(app, "kanban_task"), "t_00000025")
         self.assertEqual(len(app.dataframe[0].value), 5)
         self.assertTrue(any(item.value == "Task 25" for item in app.subheader))
         self.assertTrue(
@@ -1573,7 +1603,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             self.assertEqual(len(app.dataframe[0].value), 50)
             next(button for button in app.button if button.label == "Next").click().run()
 
-        self.assertEqual(app.query_params["activity_page"], ["2"])
+        self.assertEqual(query_param(app, "activity_page"), "2")
         self.assertEqual(len(app.dataframe[0].value), 50)
         self.assertTrue(
             any("51–100 of 105" in item.value for item in app.caption)
@@ -1611,7 +1641,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.title[0].value, "Scheduled Cron")
         self.assertNotIn("cron_agent", app.query_params)
-        self.assertEqual(app.query_params["cron_window"], ["7d"])
+        self.assertEqual(query_param(app, "cron_window"), "7d")
         self.assertEqual(len(app.dataframe), 1)
         self.assertIn("Scheduler", app.dataframe[0].value.columns)
         execution_markup = next(
@@ -1647,6 +1677,44 @@ class AdminPortalFunctionalTest(unittest.TestCase):
                 os.chdir(original_cwd)
 
         self.assertEqual(len(app.exception), 0)
+
+
+class ProductTerminologyTest(unittest.TestCase):
+    """The console names the product, not the agent runtime it is built on (#1864)."""
+
+    def test_console_strings_do_not_show_the_runtime_name(self):
+        console = REPO_ROOT / "admin_console"
+        modules = sorted(
+            path
+            for path in console.rglob("*.py")
+            if "tests" not in path.relative_to(console).parts
+        )
+        self.assertTrue(modules)
+        for module in modules:
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+            # Only real docstrings are skipped: Streamlit renders any other
+            # bare string statement on the page.
+            docstrings = {
+                id(node.body[0].value)
+                for node in ast.walk(tree)
+                if isinstance(
+                    node,
+                    (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                )
+                and node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+            }
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and id(node) not in docstrings
+                ):
+                    # Case-sensitive on purpose: lowercase "hermes" is the
+                    # runtime's install path and OTel attribute prefix.
+                    with self.subTest(module=module.name, line=node.lineno):
+                        self.assertNotIn("Hermes", node.value)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,31 @@ unset _gke_dns_endpoint_helper
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
+# ─── Scope cap ─────────────────────────────────────
+# The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
+# and its default, which the live-scope check reads an absent key as.
+readonly SCOPE_MAX_PROJECTS_MIN=1
+readonly SCOPE_MAX_PROJECTS_MAX=5000
+readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+
+# ─── Scoped service account pool ──────────────────────────────────────────────
+# SCOPED_SA_POOL_ENABLED arms the pool (the composition's scoped_pool_enabled,
+# spec.security.scopedServiceAccountPool.enabled on the CR); off by default,
+# because a pool member holds no IAM grant yet. SCOPED_SA_POOL_MAX_ACCOUNTS is
+# the bound on the pool declared from the management project's free
+# service-account quota (scoped_pool_max_accounts); the module's default of
+# 100 is GCP's default quota, not the headroom, which the plan cannot read.
+readonly SCOPED_SA_POOL_ENABLED_DEFAULT="false"
+readonly SCOPED_SA_POOL_MAX_ACCOUNTS_MIN=1
+readonly SCOPED_SA_POOL_MAX_ACCOUNTS_DEFAULT=100
+# A pool member's account id starts with this prefix and its description
+# carries the install's identity (the agent's service account id) as a marker.
+# scoped_pool.tf writes the same two strings; check_service_account_ownership
+# lists members by them, since the installer cannot enumerate members from its
+# inputs (a selector's members are resolved inside the plan).
+readonly SCOPED_SA_POOL_ACCOUNT_ID_PREFIX="ka-"
+readonly SCOPED_SA_POOL_MEMBER_MARKER_FORMAT="Pool member of %s for "
+
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -156,12 +181,15 @@ readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
 readonly SCOPE_CONTAINER_ID_PATTERN='^[0-9]{1,20}$'
 # What check_scope_container_access verifies before an apply that binds a
 # container: the API the reconcile's container search calls, the permission
-# the applying identity needs on each container kind, the constraints an
-# organisation policy forbids an API through, and where the permission probe
-# is asked.
+# the applying identity needs on each container kind, the permission and the
+# role the same identity needs on every container while the pool lists its
+# members at plan time, the constraints an organisation policy forbids an API
+# through, and where the permission probe is asked.
 readonly SCOPE_ASSET_API="cloudasset.googleapis.com"
 readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
 readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
+readonly SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION="cloudasset.assets.searchAllResources"
+readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -196,6 +224,14 @@ readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACC
 # apply, and the dry-run skips its plan while one is off.
 readonly SCOPE_METRICS_SCOPE_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com"
 readonly SCOPE_SHARED_VPC_HOST_APIS="compute.googleapis.com"
+# The scoped service account pool, armed beside a folder or organisation,
+# lists the container's members in the same plan through the Asset API
+# (SCOPE_ASSET_API), which the composition otherwise enables for the
+# reconcile in the apply; so enable_scope_selector_apis treats the pair as a
+# third selector kind. The two clauses the enabling message names its reason
+# with, one per kind of plan-time read.
+readonly SCOPE_SELECTOR_READ_REASON="resolves the declared Shared VPC host or Metrics Scope"
+readonly SCOPE_POOL_CONTAINER_READ_REASON="lists the declared folder's or organisation's members for the scoped service account pool"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -302,6 +338,12 @@ is_valid_model_provider() {
 # reaches terraform.tfvars as a bare word HCL cannot parse.
 is_non_negative_integer() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# LITELLM_REDACTION_IP_ACTION: what the gateway does with IP literals, the
+# chart's litellm.redaction.ip.action.
+is_valid_redaction_ip_action() {
+  [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -414,6 +456,18 @@ is_truthy() {
   esac
 }
 
+# A spelling is_truthy reads as true, or one that plainly means false. For a
+# security toggle whose off state must not be reachable by a typo.
+is_bool_spelling() {
+  is_truthy "${1:-}" && return 0
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Nn] | 0 | [Oo][Ff][Ff]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Checks if GKE databaseEncryption.state is a valid CMEK-encrypted state.
 #   - ENCRYPTED: Standard CMEK database encryption state in GKE
 #   - ALL_OBJECTS_ENCRYPTION_ENABLED: GKE 1.35+ Application-layer Secrets Encryption
@@ -510,7 +564,11 @@ load_install_env() {
   # and the Day-2 menu the file is the only way in. A value inherited from the
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  # The scoped service account pool's switch and cap for the same reason: an
+  # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
+  # accounts the next run from a clean shell deletes again.
+  unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -534,7 +592,9 @@ load_install_env() {
 # The Day-2 control panel is the only caller, and it is the one place that may
 # write here: "Save & Apply Configuration Changes" is an explicit instruction
 # to record a change, not the installer quietly overwriting an input. install.sh
-# itself only ever creates the file when there is none.
+# itself creates the file when there is none, and otherwise only appends a chat
+# key the file does not assign (record_flags_into_install_env); it never
+# rewrites a line.
 #
 # No `export` keyword in the output: install.env is a dotenv, loaded with
 # `set -a`. The value is still %q-quoted, so spaces and quotes survive.
@@ -702,30 +762,6 @@ save_var() {
   chmod 600 "$VARS_FILE" 2>/dev/null || true
 
   umask "$old_umask"
-}
-
-save_secret_var() {
-  local var_name=$1
-  local var_val=$2
-  export "${var_name}=${var_val}"
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    return 0
-  fi
-  if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
-    save_var "$var_name" "$var_val"
-  else
-    if [ -f "$VARS_FILE" ]; then
-      local old_umask
-      old_umask=$(umask)
-      umask 077
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
-      chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
-      mv "$VARS_FILE.tmp" "$VARS_FILE"
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      umask "$old_umask"
-    fi
-  fi
 }
 
 # ─── Locations ────────────────────────────────────────────────────────────────
@@ -921,10 +957,11 @@ hcl_csv_list() {
   printf '%s]' "$out"
 }
 
-# The seven SCOPE_* keys as the composition's `scope` object: `projects`,
+# The eight SCOPE_* keys as the composition's `scope` object: `projects`,
 # `folders`, `organizations`, `shared_vpc_hosts`, `metrics_scopes` and
 # `exclude.projects` are lists like every other list key, `exclude.clusters`
-# is one project/location/cluster triple per entry. Always a full block, empty
+# is one project/location/cluster triple per entry, `max_projects` is the cap,
+# written only when SCOPE_MAX_PROJECTS is set. Always a full block, empty
 # lists included -- the reconcile reads an emptied projects list as the
 # declaration that drops projects, a container or selector leaving the list as
 # the declaration that retires its members, and a missing block as no
@@ -933,8 +970,43 @@ hcl_csv_list() {
 # require_scope_container_ids, and the patterns, caps and repeats the CRD
 # enforces are the module variable's validations, which fail the plan before
 # any binding.
+# SCOPE_MAX_PROJECTS is empty (the default cap) or a whole number within the
+# bounds the CRD puts on spec.scope.maxProjects, or the run stops before a
+# file is written and names the key and the bounds: the module's validation
+# would otherwise name neither. The digit count is checked before the
+# arithmetic: bash's base#digits wraps at 2^64 without a word, so a twenty-digit
+# value could otherwise read as one inside the bounds. $1 the value.
+require_scope_max_projects() {
+  local value="${1:-}" digits
+  [ -n "$value" ] || return 0
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    digits="$(printf '%s' "$value" | sed 's/^0*//')"
+    [ -n "$digits" ] || digits=0
+    if [ "${#digits}" -le "${#SCOPE_MAX_PROJECTS_MAX}" ] && [ "$((10#$digits))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$digits))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
+      return 0
+    fi
+  fi
+  print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# SCOPED_SA_POOL_MAX_ACCOUNTS is empty (the module's default) or a whole number
+# of at least one, or the run stops before a file is written and names the key:
+# the module's validation would name neither. No arithmetic, so no width to
+# overflow: the regex is the whole check. $1 the value.
+require_scoped_sa_pool_max_accounts() {
+  local value="${1:-}"
+  [ -n "$value" ] || return 0
+  [[ "$value" =~ ^0*[1-9][0-9]*$ ]] && return 0
+  print_error "SCOPED_SA_POOL_MAX_ACCOUNTS='${value}' is not a whole number of at least ${SCOPED_SA_POOL_MAX_ACCOUNTS_MIN}, the number of service accounts the scoped pool may create in the management project. Set one, or leave it empty for the default (${SCOPED_SA_POOL_MAX_ACCOUNTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# $8, the cap, is written only when set: unset, the module's and the CRD's
+# default (100) apply, and a tfvars that names no cap keeps reading the default
+# an operator never chose.
 hcl_scope_block() {
-  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}"
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}" max_projects="${8:-}"
   local clusters="[" first=true entry project location cluster had_noglob=false
   local IFS=$', \t\n'
   case "$-" in *f*) had_noglob=true ;; esac
@@ -948,10 +1020,73 @@ hcl_scope_block() {
   done
   $had_noglob || set +f
   clusters+="]"
-  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
-    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")" \
+    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")"
+  if [ -n "$max_projects" ]; then
+    printf '  max_projects     = %s\n' "$max_projects"
+  fi
+  printf '  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$exclude_projects")" "$clusters"
+}
+
+# LITELLM_REDACTION_RULES, a JSON array of rule objects, as an HCL list for the
+# composition's litellm_redaction.rules. Shape only -- a list of objects whose
+# keys are name, pattern, literal and action, each a string; the name, the one
+# source and the action are the variable's validations. Strings are re-escaped
+# rather than copied: a regular expression may hold ${ or %{, which HCL would
+# read as a template. Prints nothing and returns 1, naming the key, on a value
+# it cannot use. Caller defines print_error.
+hcl_redaction_rules() {
+  local rules_json="${1:-}" out
+  if ! out="$(trap - ERR; printf '%s' "$rules_json" | python3 -c '
+import json, sys
+try:
+    rules = json.load(sys.stdin)
+except ValueError as e:
+    sys.exit(f"is not valid JSON ({e})")
+if not isinstance(rules, list):
+    sys.exit("must be a JSON array of rule objects")
+def hcl(s):
+    out = []
+    for ch in s:
+        if ch in "\\\"":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return "\"" + "".join(out).replace("${", "$${").replace("%{", "%%{") + "\""
+items = []
+for i, rule in enumerate(rules):
+    if not isinstance(rule, dict):
+        sys.exit(f"entry {i} is not an object")
+    if "name" not in rule:
+        sys.exit(f"entry {i} has no name; every rule needs one")
+    unknown = sorted(set(rule) - {"name", "pattern", "literal", "action"})
+    if unknown:
+        sys.exit(f"entry {i} has unknown key(s) {unknown}; a rule takes name, pattern or literal, and action")
+    for key, value in rule.items():
+        if not isinstance(value, str):
+            sys.exit(f"entry {i}: {key} must be a string")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            sys.exit(f"entry {i}: {key} is not valid UTF-8 text (a lone \\u surrogate escape?)")
+    items.append("{ " + ", ".join(f"{k} = {hcl(v)}" for k, v in rule.items()) + " }")
+print("[" + ", ".join(items) + "]")
+' 2>&1)"; then
+    # To stderr: the caller runs this inside $(...), which would swallow it.
+    print_error "LITELLM_REDACTION_RULES ${out}. Fix it in install.env; the site's inference-gateway page shows the rule format." >&2
+    return 1
+  fi
+  printf '%s' "$out"
 }
 
 # Every SCOPE_FOLDERS and SCOPE_ORGANIZATIONS entry is a bare numeric ID, or
@@ -1016,14 +1151,22 @@ require_scope_cluster_triples() {
 #      holds the served one, and the retry must not read that as a hand edit;
 #   K  the scope the SCOPE_* keys declare now.
 #
-# Refused when L is present and non-empty, L != R and L != K: the CR carries a
+# Refused when L is present and non-empty (a list, an exclusion, or a cap off
+# the CRD's default), L != R and L != K: the CR carries a
 # declaration the installer did not write and the keys do not reproduce. Every
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
 # L, R and K are the projects, folders, organisations, Shared VPC hosts,
-# Metrics Scopes and exclusions: every list the chart renders, since a list it
-# renders is one the apply replaces.
+# Metrics Scopes and exclusions, every list the chart renders, since a list it
+# renders is one the apply replaces, the cap, which the apply sets the same
+# way (a CR at the CRD's default reads as the key unset), and the scoped
+# pool's switch, spec.security.scopedServiceAccountPool.enabled, which the
+# generator writes from SCOPED_SA_POOL_ENABLED alone (false when the key is
+# absent): a live true the key does not record would be disarmed by the apply,
+# its members destroyed and the broker put on the ambient credential, so it
+# weighs like a cap off the default, an armed pool alone included. The members
+# list is derived from the scope and is not compared.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1092,12 +1235,20 @@ print(max(served) if served else "")
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
-keys = sys.argv[3:10]
+keys = sys.argv[3:11]
+default_cap = int(sys.argv[11])
+pool_key_armed = sys.argv[12] == "true"
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
 
-def normalise(scope):
+def pool_armed(spec_or_values):
+    # spec.security.scopedServiceAccountPool.enabled on the CR, and the same
+    # path under platformAgent in the record; absent reads as false.
+    security = (spec_or_values or {}).get("security") or {}
+    return bool((security.get("scopedServiceAccountPool") or {}).get("enabled"))
+
+def normalise(scope, armed):
     scope = scope or {}
     exclude = scope.get("exclude") or {}
     clusters = sorted(
@@ -1109,28 +1260,35 @@ def normalise(scope):
         "organizations": sorted(set(scope.get("organizations") or [])),
         "sharedVpcHosts": sorted(set(scope.get("sharedVpcHosts") or [])),
         "metricsScopes": sorted(set(scope.get("metricsScopes") or [])),
+        "maxProjects": int(scope.get("maxProjects") or default_cap),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
+        "scopedPoolEnabled": bool(armed),
     }
 
 def is_empty(scope):
+    # Nothing live to protect: no list, no exclusion, the cap at the default
+    # the CRD sets, which is what the apply renders for a key left unset, and
+    # the pool off, which is what it renders for SCOPED_SA_POOL_ENABLED absent.
     return not (scope["projects"] or scope["folders"] or scope["organizations"]
                 or scope["sharedVpcHosts"] or scope["metricsScopes"]
-                or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+                or scope["exclude"]["projects"] or scope["exclude"]["clusters"]
+                or scope["maxProjects"] != default_cap
+                or scope["scopedPoolEnabled"])
 
 items = json.loads(cr_text).get("items") or []
 if len(items) > 1:
     sys.exit("more than one PlatformAgent is served: " + ", ".join(i["metadata"]["name"] for i in items))
-live_raw = items[0].get("spec", {}).get("scope") if items else None
-if live_raw is None:
-    print(ok)
-    sys.exit(0)
-live = normalise(live_raw)
+spec = items[0].get("spec") or {} if items else {}
+# A CR with no scope block normalises to the empty declaration, so the switch
+# is weighed whether or not a scope stands beside it.
+live = normalise(spec.get("scope"), pool_armed(spec))
 if is_empty(live):
     print(ok)
     sys.exit(0)
 def recorded(text):
-    raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
-    return normalise(raw) if raw is not None else None
+    values = (json.loads(text or "{}") or {}).get("platformAgent") or {}
+    raw = values.get("scope")
+    return normalise(raw, pool_armed(values)) if raw is not None else None
 
 records = [r for r in (recorded(record_text), recorded(served_text)) if r is not None]
 declared = normalise({
@@ -1139,11 +1297,12 @@ declared = normalise({
     "organizations": split(keys[2]),
     "sharedVpcHosts": split(keys[3]),
     "metricsScopes": split(keys[4]),
+    "maxProjects": int(keys[7]) if keys[7].strip() else default_cap,
     "exclude": {
         "projects": split(keys[5]),
         "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[6])],
     },
-})
+}, pool_key_armed)
 if live in records or live == declared:
     print(ok)
     sys.exit(0)
@@ -1156,7 +1315,13 @@ print("SCOPE_SHARED_VPC_HOSTS=" + json.dumps(" ".join(live["sharedVpcHosts"])))
 print("SCOPE_METRICS_SCOPES=" + json.dumps(" ".join(live["metricsScopes"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+# Always among the lines: when the cap is why the compare refused, the key the
+# operator has to change may be one they must blank, not set.
+print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"]) if live["maxProjects"] != default_cap else ""))
+# The same for the pool switch: blank when the live pool is off, so the lines
+# never reproduce a false, and the key an operator may have to blank is named.
+print("SCOPED_SA_POOL_ENABLED=" + json.dumps("true" if live["scopedPoolEnabled"] else ""))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" "$(hcl_bool "${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}")" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -1170,16 +1335,16 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   cr_name="${lines%%$'\n'*}"
   lines="${lines#*$'\n'}"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-    print_warning "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. A full upgrade would replace it, and the reconcile would retire the projects it drops; the plan below shows the change. Record the live declaration in install.env first:"
+    print_warning "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry (the scoped service account pool's switch counts as part of it). A full upgrade would replace it, and the reconcile would retire the projects it drops, or disarm the pool; the plan below shows the change. Record the live declaration in install.env first:"
   else
-    print_error "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. The first apply whose rendered scope differs from the recorded one replaces it, and the reconcile then retires the projects it drops, deleting their Cluster Agent profiles over its next two clean runs."
+    print_error "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry (the scoped service account pool's switch counts as part of it). The first apply whose rendered scope differs from the recorded one replaces it, and the reconcile then retires the projects it drops, deleting their Cluster Agent profiles over its next two clean runs; a pool armed on the CR that SCOPED_SA_POOL_ENABLED does not record is disarmed the same way, its members destroyed and the credential broker put on the agent's own credential."
     print_info "Record the live declaration in install.env and re-run:"
   fi
   while IFS= read -r first_line; do
     print_info "  ${first_line}"
   done <<<"$lines"
   [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
-  print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope to what install.env declares and re-run; the apply then renders the same value it already holds."
+  print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope (and spec.security.scopedServiceAccountPool.enabled) to what install.env declares and re-run; the apply then renders the same value it already holds."
   return 1
 }
 
@@ -1191,9 +1356,13 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
 # account, whose answer does not depend on who asks: (1) the Cloud Asset API
 # the reconcile's container search calls can be enabled in the host project,
 # meaning it is enabled already or no effective organisation policy forbids
-# it, and (2) this identity can set IAM policy on every container named, so
+# it, (2) this identity can set IAM policy on every container named, so
 # the apply does not stop partway with the API enabled and some containers
-# bound. Every container is probed and every failure named before the run
+# bound, and (3) while the scoped service account pool is armed
+# (scope_pool_lists_containers), this identity can search every container's
+# members through that API, which the plan does for the pool after
+# enable_scope_selector_apis has enabled it and refuses without. Every
+# container is probed and every failure named before the run
 # stops (docs/designs/multi-project-scope.md §6); a probe that cannot decide
 # (no curl, no token, a transport error) warns and lets the apply speak,
 # because an apply that fails to bind fails loudly, unlike the scope replace
@@ -1207,8 +1376,9 @@ check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
   local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
   [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
-  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason pool_lists=false
   identity="$(_scope_terraform_identity_label)"
+  ! scope_pool_lists_containers || pool_lists=true
   if [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
   fi
@@ -1246,6 +1416,14 @@ check_scope_container_access() {
         # granted answer passes silently.
         undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
       fi
+      $pool_lists || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can list the members of folders/${entry}${reason:+ ($reason)}")
+      fi
     done
     for entry in $organizations; do
       [ -n "$entry" ] || continue
@@ -1257,6 +1435,14 @@ check_scope_container_access() {
         # Undecided, and any status the probe does not define: nothing but a
         # granted answer passes silently.
         undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
+      fi
+      $pool_lists || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can list the members of organizations/${entry}${reason:+ ($reason)}")
       fi
     done
     $had_noglob || set +f
@@ -1277,10 +1463,19 @@ check_scope_container_access() {
   return 1
 }
 
+# True when the plan lists a container's members for the scoped service
+# account pool: SCOPED_SA_POOL_ENABLED is a true spelling and a folder or
+# organisation is declared. With the pool off no container is read at plan.
+scope_pool_lists_containers() {
+  is_truthy "${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}" || return 1
+  [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]
+}
+
 # Prints, space-separated, the APIs the plan reads for the selectors the
 # environment declares (SCOPE_METRICS_SCOPE_APIS for SCOPE_METRICS_SCOPES,
-# SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS); nothing when neither
-# is declared.
+# SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS, SCOPE_ASSET_API for
+# the pool's listing of a declared folder's or organisation's members);
+# nothing when none is declared.
 scope_selector_apis() {
   local apis=""
   if [[ "${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
@@ -1289,7 +1484,24 @@ scope_selector_apis() {
   if [[ "${SCOPE_SHARED_VPC_HOSTS:-}" == *[![:space:],]* ]]; then
     apis+="${apis:+ }$SCOPE_SHARED_VPC_HOST_APIS"
   fi
+  if scope_pool_lists_containers; then
+    apis+="${apis:+ }$SCOPE_ASSET_API"
+  fi
   printf '%s' "$apis"
+}
+
+# Prints what the plan does through the APIs scope_selector_apis names, as
+# the clause(s) after "the plan": the selector read, the pool's container
+# listing, or both joined; nothing when scope_selector_apis prints nothing.
+scope_selector_apis_reason() {
+  local reason=""
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    reason="$SCOPE_SELECTOR_READ_REASON"
+  fi
+  if scope_pool_lists_containers; then
+    reason+="${reason:+ and }$SCOPE_POOL_CONTAINER_READ_REASON"
+  fi
+  printf '%s' "$reason"
 }
 
 # Prints the APIs of scope_selector_apis not enabled in project $1,
@@ -1306,13 +1518,16 @@ scope_selector_apis_missing() {
 }
 
 # Enables, in the management project, whichever of the APIs the plan-time
-# resolution of the declared Shared VPC hosts or Metrics Scopes reads
-# (scope_selector_apis) is not enabled yet. The reads run in the plan and are
-# billed to that project, and the composition enables the APIs only in the
-# apply that follows, so a first install that declared a selector would
-# otherwise be refused at plan with the API reported disabled. Nothing is
-# called when every API is on already, which is every re-run and every Day-2
-# apply of an existing install, and nothing when no selector is declared. The
+# resolution of the declared Shared VPC hosts or Metrics Scopes reads, or the
+# scoped service account pool's listing of a declared folder's or
+# organisation's members (scope_selector_apis), is not enabled yet. The reads
+# run in the plan and are billed to that project, and the composition enables
+# the APIs only in the apply that follows, so a first install that declared a
+# selector, or armed the pool beside a container, would otherwise be refused
+# at plan with the API reported disabled. Nothing is called when every API is
+# on already, which is every re-run and every Day-2 apply of an existing
+# install, and nothing when no selector is declared and no container is
+# listed. The
 # enable runs as gcloud's active account, like the KMS enablement beside it;
 # a failure is a warning and the run goes on, because the plan reports a
 # disabled API with the same command as the remedy, and an account that
@@ -1321,16 +1536,17 @@ scope_selector_apis_missing() {
 # run, whose handoff names the command instead. $1 the project (PROJECT_ID by
 # default). Caller defines print_info / print_warning.
 enable_scope_selector_apis() {
-  [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] || return 0
-  local project="${1:-${PROJECT_ID:-}}" missing rc=0
+  [ -n "$(scope_selector_apis)" ] || return 0
+  local project="${1:-${PROJECT_ID:-}}" missing rc=0 reason
+  reason="$(scope_selector_apis_reason)"
   missing="$(scope_selector_apis_missing "$project")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     missing="$(scope_selector_apis)"
-    print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan's lookup of the declared Shared VPC host or Metrics Scope reads and which is idempotent..."
+    print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan reads when it ${reason}, and which is idempotent..."
   elif [ -z "$missing" ]; then
     return 0
   else
-    print_info "Enabling ${missing// /, } in project '${project}': the plan resolves the declared Shared VPC host or Metrics Scope through it, before the apply that would otherwise enable it..."
+    print_info "Enabling ${missing// /, } in project '${project}': the plan ${reason} through it, before the apply that would otherwise enable it..."
   fi
   # shellcheck disable=SC2086
   if ! (trap - ERR; gcloud services enable $missing --project="$project"); then
@@ -1852,9 +2068,10 @@ sys.exit(0)
 # tell a healthy install to delete its own account, so the check stands down
 # and says so. Caller defines print_error / print_info / print_warning.
 check_service_account_ownership() {
-  local in_state line label key account_id email state_rc=0
+  local in_state line label key account_id email state_rc=0 agent_id marker members
   local -a candidates=() foreign=()
-  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")
+  agent_id="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
+  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${agent_id}")
   if [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ]; then
     candidates+=("the GitHub token minter	GITHUB_MINTER_GSA_NAME	${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")
   fi
@@ -1878,6 +2095,28 @@ check_service_account_ownership() {
       foreign+=("${label}	${key}	${account_id}	${email}")
     fi
   done
+  # The scoped pool's members (scoped_pool.tf) are derived from the agent's id
+  # and cannot be enumerated from the installer's inputs, so they are discovered
+  # from GCP by the marker their description carries. Checked whether or not
+  # the pool is armed: a leftover member with this install's marker is the same
+  # lost-state case as a leftover agent account and 409s the moment the pool is
+  # armed, so it is listed in the same refusal. A list that fails (no
+  # permission, API off) counts as no members, as the describe's miss does.
+  # shellcheck disable=SC2059 # the format is the named constant
+  marker="$(printf "$SCOPED_SA_POOL_MEMBER_MARKER_FORMAT" "$agent_id")"
+  members="$(trap - ERR; gcloud iam service-accounts list --project "${PROJECT_ID}" \
+    --filter="email:${SCOPED_SA_POOL_ACCOUNT_ID_PREFIX}* AND description:\"${marker}\"" \
+    --format="value(email)" 2>/dev/null)" || members=""
+  while IFS= read -r email; do
+    [ -n "$email" ] || continue
+    account_id="${email%%@*}"
+    if printf '%s\n' "$in_state" | grep -Fxq "$account_id"; then
+      continue
+    fi
+    # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
+    # agent's, so renaming the agent is what un-collides them.
+    foreign+=("a scoped pool member	PLATFORM_AGENT_GSA_NAME	${account_id}	${email}")
+  done <<<"$members"
   [ "${#foreign[@]}" -eq 0 ] && return 0
 
   for line in ${foreign[@]+"${foreign[@]}"}; do
@@ -2816,6 +3055,39 @@ write_tfvars_from_state() {
   # terraform with a message naming neither the key nor the entry.
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
+  require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
+  # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
+  # regenerate from install.env without install.sh's checks. A misspelt toggle
+  # is refused rather than read as off, which would forward requests
+  # unredacted while the file says otherwise. While it is off the other three
+  # keys are inert, as they are in the chart, and are neither read nor checked.
+  local redaction_enabled="${LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  if ! is_bool_spelling "$redaction_enabled"; then
+    print_error "LITELLM_REDACTION_ENABLED='${redaction_enabled}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  local redaction_ip_action="" redaction_rules="[]"
+  if is_truthy "$redaction_enabled"; then
+    redaction_ip_action="${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+    if ! is_valid_redaction_ip_action "$redaction_ip_action"; then
+      print_error "LITELLM_REDACTION_IP_ACTION='${redaction_ip_action}' is not one of mask, pseudonym, off. Fix it in install.env."
+      return 1
+    fi
+    if [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
+      redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
+    fi
+  fi
+  # The scoped service account pool, for the same reason: a misspelt switch
+  # is refused rather than read as off, and a cap the module would refuse is
+  # named here with its key. The cap is checked whether or not the pool is
+  # armed, so turning the pool on later does not surface a line written long
+  # before.
+  local scoped_pool_enabled="${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
+  if ! is_bool_spelling "$scoped_pool_enabled"; then
+    print_error "SCOPED_SA_POOL_ENABLED='${scoped_pool_enabled}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
 
   local old_umask
   old_umask="$(umask)"
@@ -2869,6 +3141,27 @@ write_tfvars_from_state() {
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
     echo ""
+    echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
+    echo "# renders nothing into the chart while enabled is false."
+    if is_truthy "$redaction_enabled"; then
+      echo "litellm_redaction = {"
+      echo "  enabled     = true"
+      echo "  ip_action   = $(hcl_str "$redaction_ip_action")"
+      echo "  allow_cidrs = $(hcl_csv_list "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}")"
+      echo "  rules       = ${redaction_rules}"
+      echo "}"
+    else
+      echo "litellm_redaction = { enabled = false }"
+    fi
+    echo ""
+    echo "# The scoped service account pool (SCOPED_SA_POOL_ENABLED,"
+    echo "# SCOPED_SA_POOL_MAX_ACCOUNTS in install.env): one reader service account per"
+    echo "# project the plan lists in the scope block above, armed by this switch alone."
+    echo "scoped_pool_enabled      = $(hcl_bool "$scoped_pool_enabled")"
+    if [ -n "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" ]; then
+      echo "scoped_pool_max_accounts = ${SCOPED_SA_POOL_MAX_ACCOUNTS}"
+    fi
+    echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"
       echo "gemini_api_key    = $(hcl_str "${GEMINI_API_KEY:-}")"
@@ -2894,13 +3187,13 @@ write_tfvars_from_state() {
     echo "# The projects, folders, organisations, Shared VPC hosts and Metrics Scopes"
     echo "# beyond project_id whose GKE clusters get a Cluster Agent, and what to leave"
     echo "# unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS,"
-    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS,"
+    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
     echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
     echo "# the declaration the composition renders either way, empty lists included; an"
     echo "# emptied list is the declaration that drops what it named."
     hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
       "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" \
-      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
+      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
@@ -2957,6 +3250,31 @@ write_tfvars_from_state() {
     echo "# Optional AgentPlugins"
     echo "enable_pubsub_platform       = $(hcl_bool "${ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}")"
     echo "enable_stockout_investigator = $(hcl_bool "${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}")"
+    # Written only when on, and both keys together, which is the one place in
+    # this file that omits a key rather than writing false.
+    #
+    # enable_drift_pubsub is also reachable on its own as a TF_VAR_ line in
+    # install.env, and a tfvars key beats TF_VAR_. Writing "false" here
+    # unconditionally would therefore override an install already running the
+    # ingress that way and destroy its sink, topic and subscription on the next
+    # upgrade -- from a release note nobody read. Omitted, that install is
+    # untouched; the front doors turn drift detection off again by dropping
+    # both keys, which is the ordinary teardown the other flags get from
+    # writing false.
+    # is_truthy, not a compare against the lowercase literal: every other
+    # boolean here reaches hcl_bool -> is_truthy, which takes True/yes/y/1/on,
+    # and install.env is hand-written. A string compare would read
+    # ENABLE_DRIFT_DETECTOR=True as off and silently provision nothing
+    # (install.sh says the same about GOOGLE_CHAT_ENABLED, for the same
+    # reason).
+    if is_truthy "${ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"; then
+      echo ""
+      echo "# Out-of-band change detection: the audit-log ingress and the consumer"
+      echo "# that reads it. Both, because the detector reads the subscription the"
+      echo "# first one provisions and the composition refuses the apply otherwise."
+      echo "enable_drift_pubsub   = true"
+      echo "enable_drift_detector = true"
+    fi
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"

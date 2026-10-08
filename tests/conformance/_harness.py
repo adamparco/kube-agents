@@ -63,6 +63,9 @@ import credential_proxy  # noqa: E402
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
 
+# The same, for the Slack click handler imported by path.
+SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
+
 # The published site's content tree. A directory rather than a file, so it is
 # not a Source: D2's assertion is about every page, and a registry would need
 # editing for each page added. site_pages() below answers for the empty set
@@ -241,6 +244,16 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
     ),
+    # The A2A gateway's rendered ingress: its three fences and the gateway
+    # container's declared ports, written by an operator Go test
+    # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
+    # golden renders mode next. The anchors are the collector's namespace and
+    # the metrics port's name: lose either and C1's assertion has nothing to
+    # hold the fences to.
+    "a2a_gateway_ingress_fixture": Source(
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("kind: NetworkPolicy", "gke-gmp-system", "name: a2a-metrics"),
+    ),
     # The eval-only inject door. Two files, two modules: the operator decides
     # whether the door is rendered at all (Go module k8s-operator) and the
     # gateway decides what it does once it is (Go module a2a). A3's darkness
@@ -260,6 +273,49 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
+    # D1's identity-table check reads the two Roles the next stack mints that
+    # no golden renders (every golden is `mode: today`): the gateway's and the
+    # callout's. Anchored on the rule each one grants, so the extractor that
+    # reads them cannot return an empty body and pass.
+    "a2a_gateway_role": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
+    ),
+    # The operator-rendered Hermes bridge: built from the agent container, so
+    # what it drops from that copy is the whole of what keeps it a separate
+    # principal from the agent beside it.
+    "a2a_bridge_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
+    ),
+    "a2a_callout_role": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
+    ),
+    # The A2A door is the inject door's sibling for an agent caller, gated and
+    # resolved the same way; A3 reads the same two seams for it.
+    "a2a_door_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        (
+            "func a2aAgentDoorEnabled",
+            ") applyA2AAgentDoor(",
+            "a2aAgentDoorEnvVar =",
+        ),
+    ),
+    "a2a_door_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
+    ),
+    # The gateway's Slack identity rule: the allowlist gates, the map
+    # overrides, and the member id is the principal otherwise.
+    "a2a_slack_ingress": Source(
+        "a2a/gateway/slack.go",
+        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender(", "func (s *SlackAdapter) otherWorkspace("),
+    ),
+    "a2a_slack_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) slackPrincipal(", "slackMemberPrincipalPrefix"),
+    ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.
     "operator_labels": Source(
@@ -268,7 +324,27 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
-        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
+    ),
+    # The broker's shim, which the worker image carries as kubectl/gcloud and
+    # the spawner configures through three env names it spells itself.
+    "credential_proxy_client": Source(
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+    ),
+    # The gateway's env contract with the operator (module a2a reading what
+    # module k8s-operator renders). C1 pins the cluster-view names across the
+    # boundary; the anchors are the two names and a long-standing neighbour.
+    "a2a_gateway_config": Source(
+        "a2a/gateway/config.go",
+        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
+    ),
+    # The platform agent's allowlists as the gateway reads them: the per-target
+    # check a session's delegation is held to. The names cross the module
+    # boundary from the operator's render; C1 pins the pair.
+    "a2a_gateway_allowlist": Source(
+        "a2a/gateway/allowlist.go",
+        ("EnvTargetAllowedUsersGchat", "EnvTargetAllowedUsersSlack", "func (g *Gateway) targetAllows"),
     ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
@@ -296,6 +372,18 @@ SOURCES: dict[str, Source] = {
     "a2a_callout_rbac": Source(
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
+    ),
+    # A3 on a Slack button click (KAGE_SLACK_UX): the handler that turns a
+    # click on our choice buttons into the clicker's turn. The anchors are the
+    # call into the adapter's own interactive authorization and the return on
+    # its refusal, which is everything the A3 click test depends on.
+    "slack_ux_clicks": Source(
+        "deploy/docker/patches/slack_ux_clicks.py",
+        (
+            "def register(adapter",
+            "started = await adapter._begin_interaction(",
+            "if started is None:",
+        ),
     ),
     # A3's task-plane writer sets, and A5's split of the shared `worker`
     # credential into a callout principal for the agent container and a static
@@ -356,6 +444,9 @@ SOURCES: dict[str, Source] = {
             "a2aBusTokenAudience",
             "a2aBusTokenPath",
             "a2aBusTokenFile",
+            "a2aCalloutReservedPrincipalsEnvVar = ",
+            "a2aCalloutReservedAddresseesEnvVar = ",
+            "func buildA2ACalloutDeployment(",
             "a2aBusTokenVolume",
             "func a2aBusTokenVolumeSource(",
             "func a2aStripBusTokenMounts(",
@@ -406,6 +497,66 @@ SOURCES: dict[str, Source] = {
     "a2a_cli_main": Source(
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
+    ),
+    # --- the delegation primitive ------------------------------------------
+    # The reserved artifact name and its data shape, defined once so the
+    # worker-adapter and the gateway relay never spell either by hand (C1's
+    # "the delegate artifact is spelled once").
+    "a2a_payload": Source(
+        "a2a/lib/payload.go",
+        ('ArtifactDelegate = "delegate"', "type DelegateRequest struct {", "DelegateTextCap = "),
+    ),
+    # The worker-adapter's publish site: the one place a session's delegate
+    # ask becomes the reserved artifact on the bus.
+    "a2a_worker_adapter": Source(
+        "a2a/worker-adapter/adapter.go",
+        ("func (a *adapter) publishDelegate(", "func (a *adapter) publishArtifactPart("),
+    ),
+    # The worker-adapter's own share of the delegate-request check: the
+    # length cap, read through the shared constant rather than a hand-copied
+    # number, so the adapter and the gateway's second check (below) cannot
+    # silently disagree on what "too long" means.
+    "a2a_worker_adapter_delegate": Source(
+        "a2a/worker-adapter/delegate.go",
+        ("func validateDelegate(", "text is too long for a delegation"),
+    ),
+    # The MCP tool schema the session's harness is actually handed. It cannot
+    # reference lib.DelegateRequest's json tags -- it is a map[string]any
+    # literal, by necessity, since that is what go over stdio as the tool
+    # definition -- so its field names and lib.DelegateRequest's are two
+    # independent spellings of the same wire shape, and only a conformance
+    # test can hold them equal.
+    "a2a_worker_adapter_mcp": Source(
+        "a2a/worker-adapter/mcp.go",
+        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+    ),
+    # The gateway's side of the delegate artifact: the switch that routes it
+    # off the ordinary chat-rendering path, and the gateway's own copy of the
+    # length check the adapter already enforces (a defence that matters
+    # exactly because the adapter's is bypassable by anything that can reach
+    # the bus directly).
+    "a2a_gateway_relay": Source(
+        "a2a/gateway/relay.go",
+        ("g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)", "func (g *Gateway) applyArtifact("),
+    ),
+    "a2a_gateway_delegation": Source(
+        "a2a/gateway/delegation.go",
+        ("func (g *Gateway) handleDelegateRequest(", "lib.DelegateTextCap"),
+    ),
+    # The callout's reader of the static principal list and the fixed-name
+    # addressee list the operator renders into its Deployment. The operator
+    # half is operator_a2a_callout above (a2aCalloutReservedPrincipalsEnvVar,
+    # a2aCalloutReservedAddresseesEnvVar); the two modules cannot import each
+    # other, so C1 compares the two literals of each pair.
+    "a2a_callout_main": Source(
+        "a2a/cmd/authcallout/main.go",
+        (
+            "envReservedPrincipals = ",
+            "os.LookupEnv(envReservedPrincipals)",
+            "envReservedAddressees = ",
+            "os.LookupEnv(envReservedAddressees)",
+            "func run(",
+        ),
     ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
@@ -597,6 +748,21 @@ def gateway_redactor_module():
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
     sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def slack_ux_clicks_module():
+    """The Slack click handler the gateway runs, imported from the patch by path.
+
+    The image installs it as ``gateway/slack_ux_clicks.py``; the file it is
+    copied from is the one a test of who may click has to read.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SLACK_UX_CLICKS_MODULE_NAME, path_of("slack_ux_clicks"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SLACK_UX_CLICKS_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 

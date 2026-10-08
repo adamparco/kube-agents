@@ -88,6 +88,19 @@ type Config struct {
 	// expires means a map change never reaches anything already connected.
 	GrantTTL time.Duration
 
+	// ReservedPrincipals are the static nats.conf users a narrowed pod may
+	// not be named after (see reserved.go). Required: NewService refuses an
+	// empty list rather than serving a callout that reserves nothing. The
+	// identity map's own users are reserved too, but come from the map being
+	// served rather than from here.
+	ReservedPrincipals []string
+
+	// ReservedAddressees are the fixed-name addressees a narrowed pod may
+	// not be named after (see addressees.go). Required: NewService refuses
+	// an empty list rather than serving a callout that reserves none. They
+	// join ReservedPrincipals in the one set reservedAs checks.
+	ReservedAddressees []string
+
 	// Now is injectable for tests.
 	Now func() time.Time
 }
@@ -99,6 +112,7 @@ type Service struct {
 	issuer    nkeys.KeyPair
 	xkey      nkeys.KeyPair
 	grantTTL  time.Duration
+	reserved  map[string]reservedKind
 	now       func() time.Time
 	log       *slog.Logger
 }
@@ -134,11 +148,17 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		return nil, fmt.Errorf("issuer seed: %w", err)
 	}
 
+	reserved, err := reservedSet(cfg.ReservedPrincipals, cfg.ReservedAddressees)
+	if err != nil {
+		return nil, err
+	}
+
 	svc := &Service{
 		store:     store,
 		validator: validator,
 		issuer:    issuer,
 		grantTTL:  cfg.GrantTTL,
+		reserved:  reserved,
 		now:       cfg.Now,
 		log:       log,
 	}
@@ -312,7 +332,8 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		// refuses an unknown narrowing — so it exists for the case where
 		// this switch and the map's validation drift apart, and it refuses
 		// rather than falling through to the entry's empty grants, which
-		// would connect a client that then hangs on its first reply.
+		// would connect a client that is UNRESTRICTED rather than one that
+		// can do nothing. See the mint below for why.
 		switch id.Narrowing {
 		case NarrowingPod:
 			if err := validSessionName(att.PodName); err != nil {
@@ -324,16 +345,90 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			// The user is named for the pod, so `connz`, the $SYS
 			// advisories and the line below all say which session —
 			// otherwise every session on the bus is called "session".
-			grants, user = sessionGrants(att.PodName), att.PodName
+			g, err := sessionGrants(att.PodName)
+			if err != nil {
+				return "", nil, "", fmt.Errorf("%s narrows on the pod, but %w", att.ServiceAccount, err)
+			}
+			grants, user = g, att.PodName
 		default:
 			return "", nil, "", fmt.Errorf("%s names narrowing %q, which this callout does not implement", att.ServiceAccount, id.Narrowing)
 		}
+		// A narrowed user is named for its pod, and that name is both its
+		// inbox prefix and the addressee its task subjects are keyed on. A
+		// pod named after a static principal (the gateway, the bridge, web,
+		// console, seed) or after a user this map mints (the verifier, the
+		// agent, the provisioner) would be granted that principal's inbox,
+		// and could read or forge the JetStream replies delivered there. A
+		// pod named after a fixed-name addressee (the bridge's `platform`)
+		// would be handed that addressee's task events, its `.in` consumers
+		// and its verify subject. Checked after the switch so every narrowing
+		// is covered by one check, whatever derived the user, and against m,
+		// the snapshot the identity was resolved from.
+		if kind, ok := s.reservedAs(m, user); ok {
+			return "", nil, "", fmt.Errorf("%s narrows on pod %q, which is the name of %s; %s", att.ServiceAccount, user, kind, kind.copied())
+		}
 	}
 
+	// Deny-by-default is a property of a grant set with entries in it. An
+	// EMPTY list means the opposite, and the two sides are independent, so
+	// both halves of every resolved grant set must be non-empty however it
+	// was resolved — from the map or from a narrowing. ParseIdentityMap
+	// enforces this for mapped entries; the callout is the enforcement point
+	// and enforces it for all of them.
+	if len(grants.Publish) == 0 || len(grants.Subscribe) == 0 {
+		return "", nil, "", fmt.Errorf("%s resolved to %d publish and %d subscribe grants; a side with none would mint a client unrestricted on that side",
+			att.ServiceAccount, len(grants.Publish), len(grants.Subscribe))
+	}
+
+	return id.Account, permissionsFor(grants), user, nil
+}
+
+// permissionsFor turns a grant set into the permissions the user JWT carries.
+//
+// An empty allow list is not a closed one, and this is where that is made safe
+// rather than merely checked.
+//
+// nats-server reads an ABSENT list as "unrestricted" rather than as "nothing":
+// buildPermissionsFromJwt builds Permissions.Publish only when the publish
+// allow or deny list is non-empty, setPermissions then leaves perms.pub.allow
+// nil, and pubAllowedFullCheck returns true for every subject. Because the
+// sides are independent, a grant set carrying subscribes and no publishes
+// mints a client that may publish anywhere — including
+// $JS.API.STREAM.DELETE.TASKS — while its subscribes are still enforced, which
+// is the shape least likely to be noticed.
+//
+// Which disjunct fires is worth being exact about, because the two empty cases
+// are not the same mechanism. With BOTH sides empty, buildPermissionsFromJwt
+// returns nil and buildInternalNkeyUser falls back to the account's
+// default_permissions — unrestricted here only because no account in this
+// deployment defines any. With ONE side empty the permission object exists, so
+// c.perms is NOT nil and it is pubAllowedFullCheck's second disjunct
+// (allow == nil && deny == nil) that returns true. The deny below is what
+// makes both cases impossible, and it is the one-sided case it is really for.
+//
+// A deny of ">" is how the server itself spells "nothing":
+// processUserPermissionsTemplate appends exactly this when template expansion
+// turns a non-empty allow list into an empty one. (That path runs only for a
+// scoped signing key, so it is cited as the server's own spelling, not as code
+// that executes on this mint.) Doing it here rather than at the callers means
+// it holds for every path into the mint, including paths added later.
+//
+// This is defence in depth, not the enforcement: authorize refuses an empty
+// side before reaching here, and that refusal is what
+// TestAnEmptySideIsRefusedBeforeItCanBeMinted measures against a real server.
+// What this function guarantees is the shape of the credential if that refusal
+// is ever wrong, which TestPermissionsNeverLeaveASideEmpty pins directly.
+func permissionsFor(grants Grants) *jwt.Permissions {
 	p := &jwt.Permissions{}
 	p.Pub.Allow.Add(grants.Publish...)
 	p.Sub.Allow.Add(grants.Subscribe...)
-	return id.Account, p, user, nil
+	if len(p.Pub.Allow) == 0 {
+		p.Pub.Deny.Add(">")
+	}
+	if len(p.Sub.Allow) == 0 {
+		p.Sub.Deny.Add(">")
+	}
+	return p
 }
 
 // mint builds the user JWT the server will enforce.

@@ -9,14 +9,17 @@ deployments continue to use the direct path.
 
 import argparse
 import email.message
+import http.client
 import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Sequence
@@ -61,11 +64,6 @@ GH_TIMEOUT_RC = 124
 #: resolves there and is the one refresh_git_credentials forwards to.
 SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 
-#: Bounds the ssh hop around that forward. The broker's own retry budget bounds
-#: the work inside it; this is the 60s the in-pod HTTP branch allows plus room
-#: for the connection.
-SANDBOX_REFRESH_TIMEOUT_SECONDS = 90
-
 #: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
 #: github-minter.yaml). The write scope is what every managed repository rides;
 #: the read scope grants `contents: read` alone and is minted per clone of a
@@ -85,12 +83,135 @@ MINTY_REQUEST_TIMEOUT_SECONDS = 5
 CLI_SETUP_TIMEOUT_SECONDS = 15
 GCLOUD_TIMEOUT_SECONDS = 5
 
+#: Under a metadata-server identity the token gcloud prints comes from this
+#: endpoint, so it is asked directly: one GET answered in tens of milliseconds,
+#: where a cold gcloud process on a busy pod has taken longer than its five
+#: seconds and failed the refresh (#2175). `format=full` is what google-auth
+#: sends for gcloud, so the token is the same one. The address rather than
+#: `metadata.google.internal`, so the timeout covers the whole attempt: a name
+#: lookup has no bound of its own and walks the pod's search list when cluster
+#: DNS is down. A slow answer is retried once; a refused connection, an error
+#: status or an empty body falls through at once.
+METADATA_IDENTITY_URL = (
+    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity"
+)
+METADATA_FLAVOR_HEADER = {"Metadata-Flavor": "Google"}
+METADATA_TOKEN_FORMAT = "full"
+METADATA_TIMEOUT_SECONDS = 3
+METADATA_MAX_ATTEMPTS = 2
+METADATA_RETRY_DELAY_SECONDS = 0.5
+#: An identity token is a JWT of about a kilobyte; anything else at the
+#: address (an error page, a proxy's answer) is not a token and falls through.
+#: Each attempt runs under a wall-clock bound in a worker thread, because the
+#: socket timeout bounds each connect and receive and not the whole answer.
+METADATA_TOKEN_MAX_BYTES = 8192
+METADATA_READ_CHUNK_BYTES = 1024
+#: The shape the proxy's redactor uses for the same token: a JWT header is a
+#: JSON object, so its base64url begins `eyJ`, and no segment is short.
+JWT_SHAPE = re.compile(r"^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$")
+#: A credential file named by either of these is the identity gcloud presents,
+#: and it need not be the instance's: the metadata server is asked only when
+#: neither names one, so a host that pointed gcloud at a key keeps minting as
+#: that account. (The federated placement names its external_account file
+#: here and is served by fetch_identity_token before this is consulted.)
+CREDENTIAL_FILE_VARIABLES = ("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "GOOGLE_APPLICATION_CREDENTIALS")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx from the metadata address is an error, not a hop to follow."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: Opened without a proxy and without following redirects: the broker forwards
+#: HTTP_PROXY into this helper for its GitHub and Minty traffic, and a
+#: link-local metadata address must never be sent through it or lead anywhere
+#: else. Module-level so a test can stand in for it.
+metadata_open = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+
+#: How the broker identity token was minted on this run, for the one line the
+#: refresh writes last: the sidecar logs the tail of this helper's output, so
+#: the branch and its duration have to be on the last line to be read.
+identity_note = {"minted": "", "fell_through": ""}
+
 #: The retry policy for one Minty request, shared by the write and the read-only
 #: mint: three attempts, half a second before the second, doubling after.
 #: Bounded so the whole mint fits inside the broker's executor timeout.
 MINTY_MAX_ATTEMPTS = 3
 MINTY_INITIAL_DELAY_SECONDS = 0.5
 MINTY_BACKOFF_FACTOR = 2.0
+
+#: The worst case of the helper the broker runs for a refresh, once it starts,
+#: built from the bounds above so it moves when they do. The identity token is
+#: the slower of its two branches: federation's STS exchange and IAM call, or the
+#: metadata server's attempts followed by both gcloud forms gcloud_identity_token
+#: tries. Then the Minty attempts with their backoff, then the CLI steps
+#: (`gh auth login`, `git config --get-all`, `gh auth setup-git`), each under
+#: CLI_SETUP_TIMEOUT_SECONDS.
+WIF_IDENTITY_CALLS = 2
+GCLOUD_IDENTITY_FORMS = 2
+CLI_SETUP_STEPS = 3
+IDENTITY_TOKEN_BUDGET_SECONDS = max(
+    WIF_IDENTITY_CALLS * wif_credentials.TOKEN_REQUEST_TIMEOUT_SECONDS,
+    METADATA_MAX_ATTEMPTS * METADATA_TIMEOUT_SECONDS
+    + (METADATA_MAX_ATTEMPTS - 1) * METADATA_RETRY_DELAY_SECONDS
+    + GCLOUD_IDENTITY_FORMS * GCLOUD_TIMEOUT_SECONDS,
+)
+MINTY_RETRY_BUDGET_SECONDS = MINTY_MAX_ATTEMPTS * MINTY_REQUEST_TIMEOUT_SECONDS + sum(
+    MINTY_INITIAL_DELAY_SECONDS * MINTY_BACKOFF_FACTOR**retry
+    for retry in range(MINTY_MAX_ATTEMPTS - 1)
+)
+REFRESH_HELPER_BUDGET_SECONDS = (
+    IDENTITY_TOKEN_BUDGET_SECONDS
+    + MINTY_RETRY_BUDGET_SECONDS
+    + CLI_SETUP_STEPS * CLI_SETUP_TIMEOUT_SECONDS
+)
+
+#: How long the broker may hold a refresh at each of its two waits before the
+#: helper starts -- for the refresh lock, then for the child memory budget --
+#: each bounded by `COMMAND_SLOT_WAIT_SECONDS` in credential_proxy.py, which this
+#: mirrors. Declared here rather than imported because this script also runs in
+#: the sandbox image, which does not carry the broker.
+BROKER_ADMISSION_WAIT_SECONDS = 60
+
+#: The broker's wait after a refresh steps aside for a vcs verb's refresh: a
+#: route refresh holding the lock while it waits for the budget yields the lock,
+#: once, to a vcs request that needs a refresh, then waits for that request,
+#: re-takes the lock and, if its re-check is still stale, waits for the budget
+#: a second time without yielding -- all under one bound of
+#: `COMMAND_SLOT_WAIT_SECONDS` from the yield, which this mirrors.
+BROKER_YIELDED_WAIT_SECONDS = 60
+
+#: Room for the connection and the response on top of the waits.
+SIDECAR_REFRESH_MARGIN_SECONDS = 10
+
+#: The client's socket timeout on the refresh POST: every wait the broker may
+#: put a refresh through, then the helper, then the margin. Before its own
+#: helper starts, a refresh waits for the refresh lock behind another refresh,
+#: under a bound of COMMAND_SLOT_WAIT_SECONDS from arrival; then, holding the
+#: lock, for the child memory budget, under a bound of its own; and, if it steps
+#: aside for a vcs verb's refresh during that wait, which it does at most once,
+#: under a third bound counted from the yield, which covers the wait for the
+#: verb, re-taking the lock and any second budget wait. A refresh admitted late
+#: still runs the whole helper and answers 200 once the token has landed, so a
+#: client that gives up sooner reports a refresh that succeeded as failed. A
+#: refresher behind a helper that runs past the lock bound is told busy even
+#: though that helper lands the token seconds later; this client reports that
+#: as a failed refresh, and the next call coalesces on the fresh token.
+SIDECAR_REFRESH_TIMEOUT_SECONDS = (
+    BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_YIELDED_WAIT_SECONDS
+    + REFRESH_HELPER_BUDGET_SECONDS
+    + SIDECAR_REFRESH_MARGIN_SECONDS
+)
+
+#: Bounds the ssh hop around the gateway's forward to the sandbox, which runs
+#: this script there and so waits out the whole sidecar refresh; the margin is
+#: for the ssh connection.
+SANDBOX_HOP_MARGIN_SECONDS = 30
+SANDBOX_REFRESH_TIMEOUT_SECONDS = SIDECAR_REFRESH_TIMEOUT_SECONDS + SANDBOX_HOP_MARGIN_SECONDS
 
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
@@ -254,53 +375,185 @@ def get_current_git_repo(cwd: str | None = None) -> str | None:
     return None
 
 
-def broker_oidc_token() -> str:
-    """The Google OIDC identity token Minty authenticates the caller by.
+def describe_failure(exc: BaseException) -> str:
+    """A subprocess failure with what the command printed, not only its exit code.
 
-    Federation first, and only when the container is actually running on a
-    federated credential -- fetch_identity_token returns None otherwise and
-    this falls through to the metadata server via gcloud, which is what every
-    placement other than the co-located sandbox proxy uses. The federated
-    branch exists because gcloud refuses to mint an ID token from an
-    external_account credential at all, so without it the co-located proxy can
-    reach GCP but not GitHub.
+    `str(CalledProcessError)` is the exit status alone and `str(TimeoutExpired)`
+    the timeout alone; the stderr both carry is what says why, and it was being
+    dropped from every refresh failure the sidecar logged.
     """
-    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
-    if oidc_token:
-        log("Minted the broker OIDC token through Workload Identity Federation.")
-        return oidc_token
-    try:
-        res = subprocess.run(
-            [
-                "gcloud",
-                "auth",
-                "print-identity-token",
-                f"--audiences={TOKEN_BROKER_URL}",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=GCLOUD_TIMEOUT_SECONDS,
-        )
-        oidc_token = res.stdout.strip()
-    except Exception:
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    detail = (stderr or "").strip()
+    return f"{exc}: {detail}" if detail else str(exc)
+
+
+def metadata_identity_token(audience: str) -> str | None:
+    """The identity token for `audience` from the metadata server, or None.
+
+    None when the metadata server is not the identity here (refused, an error
+    status, a body that is not a JWT), and after `METADATA_MAX_ATTEMPTS` slow
+    answers; the caller falls through to gcloud either way, and the reason is
+    logged. Only a slow answer is retried: the others are a definite no.
+    """
+    query = urllib.parse.urlencode({"audience": audience, "format": METADATA_TOKEN_FORMAT})
+    request = urllib.request.Request(
+        f"{METADATA_IDENTITY_URL}?{query}", headers=METADATA_FLAVOR_HEADER
+    )
+    reason = ""
+    # Timed as one step, retry included, so the line says what the refresh
+    # spent here and not only what the last attempt did.
+    started = time.monotonic()
+    for attempt in range(1, METADATA_MAX_ATTEMPTS + 1):
+        try:
+            token = _bounded_attempt(request)
+            if not token:
+                reason = f"empty token after {time.monotonic() - started:.2f}s"
+                break
+            if not JWT_SHAPE.fullmatch(token):
+                reason = f"body is not a JWT ({len(token)} chars) after {time.monotonic() - started:.2f}s"
+                break
+            how = f"from the metadata server in {time.monotonic() - started:.2f}s" + (
+                f" (attempt {attempt})" if attempt > 1 else ""
+            )
+            identity_note["minted"] = how
+            log(f"Minted the broker OIDC token {how}.")
+            return token
+        # URLError covers a refused connection, an error status and a 3xx,
+        # OSError a socket timeout, HTTPException a body cut short, ValueError
+        # a body that is not UTF-8 or too large. urlopen wraps a timeout raised
+        # while connecting in URLError's `reason`; an attempt that outlives
+        # its bound is a TimeoutError from _bounded_attempt.
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+            reason = f"{exc} after {time.monotonic() - started:.2f}s"
+            slow = isinstance(exc, TimeoutError) or isinstance(
+                getattr(exc, "reason", None), TimeoutError
+            )
+            if not slow:
+                break
+            if attempt < METADATA_MAX_ATTEMPTS:
+                log(f"WARNING: metadata server identity token attempt {attempt} timed out; retrying.")
+        if attempt < METADATA_MAX_ATTEMPTS:
+            time.sleep(METADATA_RETRY_DELAY_SECONDS)
+    identity_note["fell_through"] = f"the metadata server gave none: {reason}"
+    log(f"WARNING: no identity token from the metadata server ({reason}); asking gcloud.")
+    return None
+
+
+def _bounded_attempt(request) -> str:
+    """One GET and its body under `METADATA_TIMEOUT_SECONDS` of wall clock.
+
+    The socket timeout bounds each connect and each receive, so a peer that is
+    slow between them (a header byte at a time) is never timed out by it; the
+    attempt runs in a worker thread and is given up on, as a slow answer, when
+    it outlives the bound. The thread then ends on its own next socket timeout,
+    which is well inside this short-lived helper's life.
+    """
+    outcome = {}
+
+    def work():
+        try:
+            with metadata_open(request, timeout=METADATA_TIMEOUT_SECONDS) as response:
+                outcome["body"] = _read_token_body(response)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=work, name="metadata-identity-token", daemon=True)
+    worker.start()
+    worker.join(METADATA_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise TimeoutError(f"attempt still running after {METADATA_TIMEOUT_SECONDS}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["body"]
+
+
+def _read_token_body(response) -> str:
+    """The response body as text, bounded in size and complete.
+
+    Read one receive at a time so a body that grows past a token's size is cut
+    off there, and refused when a Content-Length answer closed before it was
+    complete: read1 returns b"" at EOF without raising, and a token cut inside
+    its signature would otherwise pass the shape check and be sent to Minty.
+    """
+    chunks = []
+    size = 0
+    while True:
+        chunk = response.read1(METADATA_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > METADATA_TOKEN_MAX_BYTES:
+            raise ValueError(f"body larger than a token (over {METADATA_TOKEN_MAX_BYTES} bytes)")
+    if response.length:
+        raise http.client.IncompleteRead(b"".join(chunks), response.length)
+    return b"".join(chunks).decode("utf-8").strip()
+
+
+def gcloud_identity_token(audience: str) -> str:
+    """The identity token from `gcloud auth print-identity-token`, or raise.
+
+    With `--audiences` first, then without it for a credential that refuses
+    the flag. Each failure is kept with its stderr, so a timeout reads as a
+    timeout and a refusal as what gcloud said.
+    """
+    started = time.monotonic()
+    failures = []
+    for argv in (
+        ["gcloud", "auth", "print-identity-token", f"--audiences={audience}"],
+        ["gcloud", "auth", "print-identity-token"],
+    ):
         try:
             res = subprocess.run(
-                ["gcloud", "auth", "print-identity-token"],
+                argv,
                 capture_output=True,
                 text=True,
                 check=True,
                 timeout=GCLOUD_TIMEOUT_SECONDS,
             )
-            oidc_token = res.stdout.strip()
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to retrieve Google OIDC token via gcloud: {e}"
-            ) from e
+        except Exception as exc:  # noqa: BLE001 -- every failure is reported, with its stderr
+            failures.append(describe_failure(exc))
+            continue
+        oidc_token = res.stdout.strip()
+        if not oidc_token:
+            raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
+        how = f"through gcloud in {time.monotonic() - started:.2f}s"
+        if identity_note["fell_through"]:
+            how += f" ({identity_note['fell_through']})"
+        identity_note["minted"] = how
+        log(f"Minted the broker OIDC token {how}.")
+        return oidc_token
+    raise RuntimeError(
+        "Failed to retrieve Google OIDC token via gcloud "
+        f"after {time.monotonic() - started:.2f}s: " + "; ".join(failures)
+    )
 
-    if not oidc_token:
-        raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
-    return oidc_token
+
+def broker_oidc_token() -> str:
+    """The Google OIDC identity token Minty authenticates the caller by.
+
+    Federation first, and only when the container is actually running on a
+    federated credential -- fetch_identity_token returns None otherwise. The
+    federated branch exists because gcloud refuses to mint an ID token from an
+    external_account credential at all, so without it the co-located proxy can
+    reach GCP but not GitHub. Then the metadata server directly, which is what
+    every other placement runs on; gcloud last, for a host with neither.
+    """
+    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
+    if oidc_token:
+        identity_note["minted"] = "through Workload Identity Federation"
+        log("Minted the broker OIDC token through Workload Identity Federation.")
+        return oidc_token
+    configured = next((name for name in CREDENTIAL_FILE_VARIABLES if os.environ.get(name)), "")
+    if configured:
+        # Whatever that file names is the identity, not the instance's; only
+        # gcloud reads it.
+        identity_note["fell_through"] = f"{configured} names a credential file"
+        log(f"{configured} names a credential file; asking gcloud for the identity token.")
+        return gcloud_identity_token(TOKEN_BROKER_URL)
+    return metadata_identity_token(TOKEN_BROKER_URL) or gcloud_identity_token(TOKEN_BROKER_URL)
 
 
 def request_minty_token(
@@ -433,6 +686,38 @@ def mint_read_only_token(target_repo: str | None) -> str:
     return token
 
 
+class RefreshToken(str):
+    """An installation token that carries the repositories it was scoped for."""
+
+    scoped_repositories: tuple[str, ...]
+
+    def __new__(
+        cls,
+        token: str,
+        scoped_repositories: tuple[str, ...] | list[str] = (),
+    ) -> "RefreshToken":
+        obj = super().__new__(cls, token)
+        obj.scoped_repositories = tuple(scoped_repositories)
+        return obj
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """`: <error>` from the broker's JSON refusal body, or nothing.
+
+    The broker's busy 503 says what held the request (the slot cap, the child
+    memory budget, another refresh); without it the cron log reads only the
+    code. A body that is empty, not JSON, names no error, or is cut short by
+    the connection dropping mid-read adds nothing.
+    """
+    try:
+        raw = exc.read()
+        body = json.loads(raw) if raw else None
+    except (OSError, ValueError, http.client.HTTPException):
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return f": {error}" if isinstance(error, str) and error else ""
+
+
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
@@ -456,31 +741,44 @@ def refresh_git_credentials(
     proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
     if proxy_url:
         # In the agent sandbox: delegate to the credential sidecar.
-        # The sidecar manages bounded retries against Minty internally.
-        # The client uses a 60s timeout to allow the sidecar's retry budget
-        # to finish, and fails fast on any error without re-triggering retries.
-        url = proxy_url.rstrip("/") + "/v1/github/refresh"
+        # The sidecar manages bounded retries against Minty internally. The
+        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers the
+        # broker's wait for the refresh lock, its admission wait, its wait
+        # for a vcs verb's refresh it stepped aside for, and the helper's
+        # budget after them, and fails fast on any error without
+        # re-triggering retries.
+        # The forge-neutral route, naming the provider and the repository by
+        # its URL rather than as a bare slug: a broker serving more than one
+        # forge refuses a name without a host. `/v1/github/refresh` is kept on
+        # the broker as an alias for agent images older than this.
+        url = proxy_url.rstrip("/") + "/v1/forge/refresh"
         request = urllib.request.Request(
             url,
-            data=json.dumps({"repository": repository}).encode("utf-8"),
+            data=json.dumps(
+                {
+                    "provider": "github",
+                    "repository": f"https://{repo_ref.GITHUB_CANONICAL_HOST}/{repository}",
+                }
+            ).encode("utf-8"),
             # Empty in the sidecar deployment; carries the caller's projected
             # ServiceAccount token when the broker runs in its own Pod.
             headers={"Content-Type": "application/json", **authorization_headers()},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
                 if response.status == 200:
                     log(
                         f"GitHub credentials refreshed in credential sidecar for {repository}."
                     )
-                    return ""
+                    return RefreshToken("", ())
                 raise RuntimeError(
                     f"Credential sidecar rejected refresh: HTTP {response.status}"
                 )
         except urllib.error.HTTPError as exc:
             raise RuntimeError(
                 f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
+                f"{_http_error_detail(exc)}"
             ) from exc
         except Exception as exc:
             raise RuntimeError(
@@ -494,12 +792,12 @@ def refresh_git_credentials(
     # The `no_agent` cron jobs are what need this. They run as a plain Python
     # subprocess on the gateway rather than as a model turn, so they never touch
     # the terminal backend and never reach the sandbox the way a skill does —
-    # and once the gateway holds no credential, both branches around this one
-    # are dead there: CREDENTIAL_PROXY_URL is unset, and the direct mint below
-    # ends at `No such file or directory: 'gcloud'`. Putting the variable back
-    # on the gateway would fix it by restoring a credential path to the pod the
-    # split exists to empty. Taking the route the model's shell already takes
-    # does not.
+    # and once the gateway holds no credential, CREDENTIAL_PROXY_URL is unset
+    # there and the only route is this one. Putting the variable back on the
+    # gateway would restore a credential path to the pod the split exists to
+    # empty. Taking the route the model's shell already takes does not. The
+    # direct mint below is the broker container's own path and the standalone
+    # placement's; on the gateway, this forward runs before it is reached.
     #
     # The forwarded process re-enters this function in the sandbox, where
     # CREDENTIAL_PROXY_URL is set, so it takes the branch above and stops.
@@ -523,7 +821,7 @@ def refresh_git_credentials(
                 f"(exit {completed.returncode}): {(completed.stderr or '').strip()}"
             )
         log(f"GitHub credentials refreshed through the shell sandbox for {repository}.")
-        return ""
+        return RefreshToken("", ())
 
     oidc_token = broker_oidc_token()
 
@@ -569,20 +867,57 @@ def refresh_git_credentials(
             timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
-        subprocess.run(
-            ["gh", "auth", "setup-git"],
-            check=True,
+        # Stop rewriting the config on every refresh. The helper `gh auth setup-git`
+        # installs is static (!.../gh auth git-credential) and carries nothing token-specific.
+        # Skipping the call when credential.https://github.com.helper already has it
+        # removes the steady-state write, eliminating the .gitconfig lock collision window.
+        configured_helper = subprocess.run(
+            [
+                "git",
+                "config",
+                "--global",
+                "--get-all",
+                "credential.https://github.com.helper",
+            ],
             capture_output=True,
+            text=True,
             timeout=CLI_SETUP_TIMEOUT_SECONDS,
             env=env,
         )
+        if (
+            configured_helper.returncode != 0
+            or "gh auth git-credential" not in (configured_helper.stdout or "")
+        ):
+            subprocess.run(
+                ["gh", "auth", "setup-git"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=CLI_SETUP_TIMEOUT_SECONDS,
+                env=env,
+            )
+        # The identity note again on the last line: the sidecar keeps the tail
+        # of this output, and a long managed-repository list in the Minty line
+        # above would otherwise push the branch that minted out of its log.
         log(
             f"GitHub authentication successfully configured for repository: {repository}"
+            + (f" (identity token {identity_note['minted']})" if identity_note["minted"] else "")
         )
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip()
+        detail_msg = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"Failed to configure GitHub auth in gh CLI: {e}{detail_msg}"
+        ) from e
     except Exception as e:
-        raise RuntimeError(f"Failed to configure GitHub auth in gh CLI: {e}") from e
+        # With gh's stderr: the exit status alone cannot tell a token GitHub
+        # rejected from a config file gh could not write.
+        raise RuntimeError(
+            f"Failed to configure GitHub auth in gh CLI: {describe_failure(e)}"
+        ) from e
 
-    return token
+    scoped = tuple(f"{org_name}/{r}".lower() for r in repositories_to_scope)
+    return RefreshToken(token, scoped)
 
 
 def main():
@@ -602,7 +937,11 @@ def main():
         if args.read_only:
             print(mint_read_only_token(args.repository), end="")
             return
-        refresh_git_credentials(args.repository)
+        token = refresh_git_credentials(args.repository)
+        scoped = getattr(token, "scoped_repositories", None)
+        if isinstance(scoped, (list, tuple, set, frozenset)):
+            for r in scoped:
+                print(r)
     except Exception as e:
         log(f"FATAL: Failed to refresh git credentials: {e}")
         sys.exit(1)

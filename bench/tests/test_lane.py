@@ -31,12 +31,13 @@ TASKS = REPO_ROOT / "bench" / "tasks"
 # A presubmit case that requests no pull request, neither through its own
 # checks nor through the file's `requesting:` list, and a nightly case that
 # requests one (its objective is a pull_request_opened check). Not
-# obtainability-remediation-proposal: it is the file's placeholder, and its
-# own check (#2088) turns it into a requesting case in either merge order.
+# obtainability-remediation-proposal: it asks for a proposal, the lane file
+# no longer lists it among the requesting, and it is the case the
+# zero-allowance safeguard exists to watch.
 READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
 # The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,
-# so the listed path is tested without pinning the real file's placeholder,
+# so the listed path is tested without pinning the real file's entries,
 # whose contents scripts/test_eval_rosters.py owns.
 LISTED_COUNT = 2
 
@@ -141,6 +142,29 @@ def test_a_repository_outside_the_pinned_owner_is_refused_before_the_lease(tmp_p
     assert not (tmp_path / READ_ONLY_CASE).exists()
 
 
+def test_a_gitlab_project_is_its_full_path_nested_as_deep_as_its_groups(monkeypatch):
+    # GitLab nests groups, so a project is `group/sub/.../project`; the owner
+    # a lane entry pins is the top group, as the safeguard itself reads it.
+    safeguards = lane.load_lane_safeguards(LANE_FILE)
+    monkeypatch.setenv("BENCH_FORGE", "gitlab")
+    lane.check_repository(safeguards, "gke-agentic/kube-agents-evals-21-infra")
+    lane.check_repository(safeguards, "gke-agentic/pool/evals-21/infra")
+    with pytest.raises(lane.LaneSafeguardsError, match="is not under gke-agentic"):
+        lane.check_repository(safeguards, "someone/pool/infra")
+    for malformed in ("no-slash", "gke-agentic/x/", "gke-agentic//x", "/x", "gke-agentic/x?y", "gke-agentic/x#y", "gke-agentic/x\n"):
+        with pytest.raises(lane.LaneSafeguardsError, match="not a GitLab project path"):
+            lane.check_repository(safeguards, malformed)
+
+
+def test_a_third_segment_is_still_refused_on_github(monkeypatch):
+    monkeypatch.delenv("BENCH_FORGE", raising=False)
+    with pytest.raises(lane.LaneSafeguardsError, match="not an owner/name"):
+        lane.check_repository([], "gke-agentic/pool/infra")
+    monkeypatch.setenv("BENCH_FORGE", "bitbucket")
+    with pytest.raises(lane.LaneSafeguardsError, match="BENCH_FORGE"):
+        lane.check_repository([], "gke-agentic/x")
+
+
 def test_a_task_with_no_spec_gains_one(tmp_path):
     task_dir = tmp_path / "tasks" / "bare"
     task_dir.mkdir(parents=True)
@@ -194,6 +218,17 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     rc = lane.main(["--safeguards", str(listed_file), "--out-dir", str(tmp_path / "listed"), str(TASKS / READ_ONLY_CASE / "task.yaml")])
     assert rc == 0
     assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE} {tmp_path / 'listed' / READ_ONLY_CASE / 'task.yaml'}"]
+
+
+def test_list_requesting_prints_the_counts_and_writes_nothing(tmp_path, capsys):
+    """The api lane orders its second phase by this, with no copies made."""
+    listed_file = scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT})
+    rc = lane.main(["--safeguards", str(listed_file), "--list-requesting", str(TASKS / READ_ONLY_CASE / "task.yaml"), str(TASKS / REQUESTING_CASE / "task.yaml")])
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE}", f"1 {REQUESTING_CASE}"]
+    assert not any(tmp_path.rglob("task.yaml"))
+    with pytest.raises(SystemExit):
+        lane.main(["--safeguards", str(LANE_FILE), str(TASKS / READ_ONLY_CASE / "task.yaml")])
 
 
 def scratch_lane_file(tmp_path: Path, requesting: dict[str, int]) -> Path:

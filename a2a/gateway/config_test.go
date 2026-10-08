@@ -8,10 +8,13 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/capability"
 )
 
 // setBaseEnv pins the required env plus empty values for every optional
@@ -32,15 +35,22 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
+	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
 	t.Setenv("A2A_IDLE_TTL", "")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
 	t.Setenv("A2A_GCHAT_TOKEN_PATH", "")
 	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_SLACK_ALLOWED_USERS", "")
+	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "")
 	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
 	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_INJECT_TOKEN", "")
 	t.Setenv("A2A_INJECT_PRINCIPAL_MAP", "")
+	t.Setenv("A2A_DOOR_LISTEN", "")
+	t.Setenv("A2A_DOOR_TOKEN", "")
+	t.Setenv("A2A_DOOR_PRINCIPAL_MAP", "")
+	t.Setenv("A2A_DOOR_PUBLIC_URL", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -381,6 +391,7 @@ func TestFromEnvSessionTTL(t *testing.T) {
 		t.Fatal("expected refusal when SessionTTL <= TaskDeadline, got nil")
 	}
 }
+
 // pairs are exactly what a hand-enumerated switch leaves a hole in — the
 // two-backend switch this merged from only knew about one pair, and a fourth
 // backend must not be addable with a combination nobody checked. Exactly one
@@ -540,6 +551,78 @@ func TestFromEnvGchatBackendSelection(t *testing.T) {
 	}
 	if !cfg.GchatAllowAllUsers {
 		t.Fatal("A2A_GCHAT_ALLOW_ALL_USERS=true not honored")
+	}
+}
+
+// TestFromEnvSlackAllowlist: the Slack backend carries its allowlist the way
+// gchat does (TestFromEnvGchatBackendSelection): split on commas, trimmed,
+// empties dropped, case preserved (Slack member ids compare exactly), and
+// allow-all off unless stated.
+func TestFromEnvSlackAllowlist(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	t.Setenv("A2A_SLACK_ALLOWED_USERS", "U1, u2 ,")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.SlackAllowedUsers) != 2 || cfg.SlackAllowedUsers[0] != "U1" || cfg.SlackAllowedUsers[1] != "u2" {
+		t.Fatalf("allowed users = %v", cfg.SlackAllowedUsers)
+	}
+	if cfg.SlackAllowAllUsers {
+		t.Fatal("allow-all must be off unless stated")
+	}
+	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "true")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SlackAllowAllUsers {
+		t.Fatal("A2A_SLACK_ALLOW_ALL_USERS=true not honored")
+	}
+}
+
+// TestFromEnvSlackTokensStripLikeTheBroker: the broker reads the same Secret
+// keys with Python's str.strip() (credential_proxy.py, SLACK_BOT_TOKEN and
+// SLACK_APP_TOKEN), so a value with a trailing newline (a Secret made with
+// --from-file, or an `echo` without -n) worked under `today`. The gateway
+// strips the same set and nothing else: the separators U+001C-U+001F that
+// Python counts as whitespace and Go's unicode.IsSpace does not, and no
+// comma handling (a list stays one token, which auth.test then refuses).
+func TestFromEnvSlackTokensStripLikeTheBroker(t *testing.T) {
+	for _, tc := range []struct {
+		name, bot, app, wantBot, wantApp string
+	}{
+		{"trailing newline", "xoxb-1\n", "xapp-1\n", "xoxb-1", "xapp-1"},
+		{"trailing space", "xoxb-1 ", "xapp-1 ", "xoxb-1", "xapp-1"},
+		{"surrounding mixed", " \txoxb-1\r\n", "\u00a0xapp-1\u3000", "xoxb-1", "xapp-1"},
+		{"python-only separators", "\x1cxoxb-1\x1f", "xapp-1\x1d\x1e", "xoxb-1", "xapp-1"},
+		{"inner text untouched", "xoxb-A, xoxb-B\n", "xapp-1", "xoxb-A, xoxb-B", "xapp-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			t.Setenv("SLACK_BOT_TOKEN", tc.bot)
+			t.Setenv("SLACK_APP_TOKEN", tc.app)
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SlackBotToken != tc.wantBot || cfg.SlackAppToken != tc.wantApp {
+				t.Fatalf("tokens = %q, %q; want %q, %q", cfg.SlackBotToken, cfg.SlackAppToken, tc.wantBot, tc.wantApp)
+			}
+		})
+	}
+	// A whitespace-only value strips to empty, as the broker's does, so it
+	// counts as unset: half a pair is refused rather than armed.
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", " \n")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "arm Slack together") {
+		t.Fatalf("whitespace-only app token: err = %v, want the half-pair refusal", err)
 	}
 }
 
@@ -773,5 +856,130 @@ func TestFromEnvStrictEventsWriter(t *testing.T) {
 	}
 	if cfg.StrictEventsWriter {
 		t.Fatal("a near-miss value tightened the check; the safe direction is loose")
+	}
+}
+
+// TestDefaultAddresseeIsPlatform: "Sessions by default" phase 1 keeps the
+// platform agent as the default; /session is the per-conversation opt-in.
+func TestDefaultAddresseeIsPlatform(t *testing.T) {
+	setBaseEnv(t)                         // the file's shared FromEnv environment (NATS_URL, salt, principal map)
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "") // envOr treats empty as unset
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultAddressee != "platform" {
+		t.Fatalf("DefaultAddressee = %q, want platform", cfg.DefaultAddressee)
+	}
+}
+
+// The gateway half of the capability switch, asserted through FromEnv rather
+// than through a Config literal. The mint side and the check side are
+// rendered from one variable so they cannot drift, which only holds if each
+// end reads it the same way; this is the gateway end of that claim.
+func TestFromEnvCapabilityOptionalOnlyOnExactlyFalse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "a default install sets nothing", set: false, want: false},
+		{name: "empty is not consent", value: "", set: true, want: false},
+		{name: "the rollout window", value: "false", set: true, want: true},
+		{name: "explicitly required", value: "true", set: true, want: false},
+		{name: "a typo enforces", value: "False", set: true, want: false},
+		{name: "so does a lie", value: "0", set: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("A2A_CAPABILITY_REQUIRED", tc.value)
+			if !tc.set {
+				if err := os.Unsetenv("A2A_CAPABILITY_REQUIRED"); err != nil {
+					t.Fatalf("could not unset: %v", err)
+				}
+			}
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			if cfg.CapabilityOptional != tc.want {
+				t.Errorf("CapabilityOptional = %v, want %v with A2A_CAPABILITY_REQUIRED=%q (set=%v)",
+					cfg.CapabilityOptional, tc.want, tc.value, tc.set)
+			}
+		})
+	}
+}
+
+// TestAMalformedPodNamespaceIsAGatewayBootFailure covers the gateway's share
+// of a rule that all three components reading POD_NAMESPACE now get from
+// capability.ValidateNamespace. The gateway is the one with the most to lose:
+// it MINTS, so a ceiling built from a namespace nobody validated is inherited
+// by every hop of every task the install ever runs.
+//
+// The second row is why this is not redundant with the Entry check that
+// follows it. "a/b/c" builds "namespace/a/b/c", which Entry.Validate accepts
+// as namespace=a plus a second pair b/c — so before this check the gateway
+// booted clean and minted against a ceiling nobody chose. The first row
+// Entry.Validate would already have caught; keeping both is what shows the
+// check is doing work the existing one did not.
+//
+// The scope is set explicitly on the last row to pin the deliberate choice
+// that an explicit A2A_AUTHORITY_SCOPE does not excuse a malformed namespace:
+// it only stops the namespace from reaching the ceiling, and the gateway
+// reads POD_NAMESPACE for more than that.
+func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		namespace string
+		scope     capability.Scope
+		wantErr   bool
+	}{
+		{name: "odd separators are refused by the scope check too", namespace: "team/x", wantErr: true},
+		{name: "even separators validate as a different ceiling", namespace: "a/b/c", wantErr: true},
+		{name: "a real namespace boots", namespace: "kubeagents-system"},
+		{name: "an explicit scope does not excuse it", namespace: "team/x",
+			scope: capability.Scope("namespace/kubeagents-system"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Namespace: tc.namespace, AuthorityScope: tc.scope}
+			c.defaultCapabilityCeiling()
+			if err := c.validateCapabilityCeiling(); (err != nil) != tc.wantErr {
+				t.Fatalf("validateCapabilityCeiling with Namespace=%q scope=%q err = %v, wantErr %v",
+					tc.namespace, tc.scope, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestDelegationDepthMaxFromEnv: unset means 3; a value below 1 or a
+// non-integer refuses the boot, the way A2A_MAX_SESSIONS does, rather than
+// quietly clamping a typo into a different bound.
+func TestDelegationDepthMaxFromEnv(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationDepthMax != 3 {
+		t.Fatalf("default DelegationDepthMax = %d, want 3", cfg.DelegationDepthMax)
+	}
+
+	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "5")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationDepthMax != 5 {
+		t.Fatalf("DelegationDepthMax = %d, want 5", cfg.DelegationDepthMax)
+	}
+
+	for _, bad := range []string{"0", "-1", "junk"} {
+		t.Setenv("A2A_DELEGATION_DEPTH_MAX", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q accepted", bad)
+		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_DEPTH_MAX") {
+			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q: error %q does not name the variable", bad, err)
+		}
 	}
 }

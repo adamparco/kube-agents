@@ -217,6 +217,10 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # text cap all degrade to one-message-per-note, which is exactly what shipped
 # before and so looks like nothing is wrong. verify_kanban_progress_lines.py
 # therefore drives the patched runtime rather than grepping it.
+# With KAGE_SLACK_UX on, a Slack card's message settles to its last line, a
+# failure the wake will explain is held, and a recovery drops a held line; for
+# those it imports gateway/kanban_notifier.py at delivery time, a file copied in
+# further down, so an image without it reads as flag off.
 # The _WAKE_KINDS grep below pins upstream's module-level tuple as upstream
 # text, and nothing more: apply_kanban_notifier.py further down this stage
 # wraps the line that reads the tuple, not the tuple itself, so it is still in
@@ -246,6 +250,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
     grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'await _progress_silent_event(self, ev)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.runner, adapter, sub, ev.kind, ev, msg, metadata,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.progress_header = f"{self.board_tag}{tag}"' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers_notifier.py && \
@@ -486,10 +491,12 @@ RUN cd /opt/hermes && \
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
 # three edits to the same few lines of what is now
-# gateway/kanban_watchers_notifier.py. Three appliers meant four anchors into
-# one function and four ways for an upstream edit to break the build; this is
-# three -- the handoff, the wake set, and the incident row, which shared the
-# wake anchor until upstream split the per-event send loop from the wake step.
+# gateway/kanban_watchers_notifier.py. One applier owns all five anchors in
+# that file -- the handoff, the wake set, the incident row (which shared the
+# wake anchor until upstream split the per-event send loop from the wake step),
+# the completion message, and the wake step's outcome -- plus an unchanged pin
+# on the `self.platform_str` binding the completion message reads, so an
+# upstream edit that breaks one fails one build step that names it.
 #   * Clip: upstream hard-slices the handoff at 200/160 characters and discards
 #     every line after the first, which delivered a severed GitHub link -- a
 #     ledger URL cut to ".../is" -- on 2026-08-03. Both slices are swapped for a
@@ -519,6 +526,12 @@ RUN cd /opt/hermes && \
 #     instead, riding the next user message's api_content sidecar: no model
 #     turn, ~70 tokens, no new config key -- it fires only where
 #     kanban.wake_on_events suppressed a wake.
+#   * Quiet (KAGE_SLACK_UX, Slack only; flag off is upstream's text): the
+#     completion message drops its `done` head line, and a failure line the
+#     creator's wake will explain is held rather than posted. The wake step
+#     drops it once the wake is admitted for its kind, and posts it if the wake
+#     raises or never asked for the kind, so a failed wake does not by itself
+#     leave the failure untold (the module's section 6 lists what still does).
 #
 # The wake edit is now three greps rather than one because v2026.8.13 gave the
 # subscription its own `delivery_mode`, so the patched line is a parenthesized
@@ -533,7 +546,9 @@ RUN cd /opt/hermes && \
 # `self.send_passive = mode != "wake"` is still in the notifier's own source
 # (_KanbanNotification's constructor). That string belongs to upstream and no
 # applier writes it, so a rename is caught there -- before the patched line
-# reaches a notifier tick and raises AttributeError.
+# reaches a notifier tick and raises AttributeError. The applier pins
+# `self.platform_str`'s binding the same way, as an anchor substituted
+# unchanged.
 #
 # The first of those greps carries `passive_delivered=self.send_passive` rather
 # than stopping at `adapter=self.adapter`, and the argument is not cosmetic: it
@@ -572,6 +587,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -qF 'wake_configured=self.wake_agent,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_kanban_store_incident(ev, self.task, self.sub, posted=self.send_passive)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'return _kanban_completion_text(n.head, n.title, handoff, n.platform_str)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_kanban_tell_unexplained(self.runner, self.adapter, self.sub, set(), self._owner_scope)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
 sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \
@@ -697,6 +714,16 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
 #
+# Slack agent view, behind KAGE_SLACK_UX (off by default; off leaves both files
+# behaving as upstream). With it on, --agent-view describes the app by its
+# --name, and the adapter answers a new thread or DM open with three suggested
+# prompts when platforms.slack.extra.suggested_prompts is unset. The default
+# stays assistant view: agent view is one-way in Slack. Runs after the
+# reactions-scope patch below because both edit slack_cli.py; the verifier
+# drives the real manifest command and prompt reader with the flag off and on.
+# Rides this COPY and RUN too.
+# See the module docstring in deploy/docker/patches/apply_slack_agent_view.py.
+#
 # Slack: ask for the reactions scope the adapter already spends. `hermes slack
 # manifest` is the only description of the Slack app an installer ever writes --
 # the operator pastes that JSON in and clicks Save -- and its bot_scopes list
@@ -728,13 +755,98 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # Rides this COPY and RUN for the same budget reason as the block above.
 # See the module docstring in
 # deploy/docker/patches/apply_slack_reactions_scope.py.
+#
+# Slack: with KAGE_SLACK_UX on, track how the work each ask started settles,
+# reacting only with an x on one whose work failed (SHOW_ARRIVAL and
+# SHOWN_SETTLES hold the rest back), never removing one -- the credential
+# proxy refuses reactions.remove, so upstream's eyes-for-a-tick swap leaves
+# both. The two hooks gain a guard that hands over to
+# gateway/slack_ux_reactions.py; with the flag off they run
+# upstream's body untouched. slack_presenter.py is staged here only so the
+# verifier can import it; the image ships it under /opt/defaults/scripts. Also
+# rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
+#
+# Slack: with KAGE_SLACK_UX on, send agents.sessions.setStatus the enum it
+# accepts (processing/suspended/closed) instead of Hermes's free-text phrase,
+# which it refuses on every call; title a channel thread's session after its
+# first ask; and show a thread's delegated cards as one plan message with a row
+# per card, edited in place. The status setter and the message-event builder
+# gain a guard handing over to gateway/slack_ux_status.py; kanban_progress_lines
+# calls it for a Slack card. slack_status.py is staged for the verifier as
+# slack_presenter.py is. Also rides this COPY and RUN. See
+# deploy/docker/patches/slack_ux_status.py.
+#
+# Slack: with KAGE_SLACK_UX on, a click on one of our choice buttons runs as the
+# clicker's own reply in the thread, the clicked message rewritten to name who
+# chose what; it passes the
+# same authorization as a typed message. Registered after the plugin action
+# handlers by gateway/slack_ux_clicks.py; with the flag off nothing is
+# registered. Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_clicks.py.
+#
+# Slack: with KAGE_SLACK_UX on, a PR a card opened and a question a card is
+# blocked on (kind needs_input) each post as a message of their own, with url
+# or choice buttons. kanban_progress_lines calls gateway/slack_ux_moments.py,
+# and the notifier's wake notes a posted question so the Planning Agent does not
+# ask it again (apply_slack_ux_moments.py; the wake is unchanged with the flag
+# off). slack_moments.py is staged for the verifier as slack_presenter.py is.
+# Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_moments.py.
+#
+# Slack: with KAGE_SLACK_UX on, an incident's triage report edits its alert in
+# place into the headline, one button per option and the report folded, instead
+# of replying under it. The kanban notifier's deliver call gets the adapter
+# gateway/slack_ux_incident.py returns, which is the notifier's own with the
+# flag off. Anchors on apply_kanban_progress_lines' call above. Also rides this
+# COPY and RUN. See deploy/docker/patches/slack_ux_incident.py.
+# Slack: with KAGE_SLACK_UX on, the Planning Agent's reply to a blocked or failed
+# card's wake is drawn with its first sentence in bold and its closing question,
+# when it has one, as a choice button. The wake marks the thread, the wake's turn
+# claims the mark when it starts (_process_message_background, or the queued
+# follow-up), its final send carries the claim, _maybe_blocks draws it, and a
+# user's turn starting after the mark clears it (apply_slack_ux_failure.py; runs
+# after apply_slack_ux_moments.py, whose wake line it follows). Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_failure.py.
+# Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
+# boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
+# that routes on it, keep it), the opt-in heartbeat's tool trace (generic
+# phrase instead), the back-online notices, session-database warnings and
+# busy-input hint (not sent), and the restart/shutdown notices, slash-command
+# replies and other system replies (reworded in SlackAdapter.send and
+# edit_message; the steer and auth failure replies are replaced where they
+# are built, so no exception text reaches Slack). See
+# deploy/docker/patches/slack_boilerplate.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
      deploy/docker/patches/apply_slack_reactions_scope.py \
      deploy/docker/patches/verify_slack_reactions_scope.py \
+     deploy/docker/patches/apply_slack_ux_reactions.py \
+     deploy/docker/patches/verify_slack_ux_reactions.py \
+     deploy/docker/patches/slack_ux_reactions.py \
+     deploy/docker/patches/apply_slack_ux_status.py \
+     deploy/docker/patches/verify_slack_ux_status.py \
+     deploy/docker/patches/slack_ux_status.py \
+     deploy/docker/patches/apply_slack_ux_clicks.py \
+     deploy/docker/patches/verify_slack_ux_clicks.py \
+     deploy/docker/patches/slack_ux_clicks.py \
+     deploy/docker/patches/apply_slack_ux_moments.py \
+     deploy/docker/patches/verify_slack_ux_moments.py \
+     deploy/docker/patches/slack_ux_moments.py \
+     deploy/docker/patches/apply_slack_ux_incident.py \
+     deploy/docker/patches/verify_slack_ux_incident.py \
+     deploy/docker/patches/slack_ux_incident.py \
+     deploy/docker/patches/apply_slack_ux_failure.py \
+     deploy/docker/patches/verify_slack_ux_failure.py \
+     deploy/docker/patches/slack_ux_failure.py \
+     deploy/docker/patches/verify_kanban_progress_lines.py \
+     deploy/docker/patches/apply_slack_boilerplate.py \
+     deploy/docker/patches/verify_slack_boilerplate.py \
+     deploy/docker/patches/slack_boilerplate.py \
+     agents/platform/scripts/slack_presenter.py \
+     agents/platform/scripts/slack_status.py \
+     agents/platform/scripts/slack_moments.py \
      deploy/docker/patches/patchlib.py \
+     deploy/docker/patches/apply_slack_agent_view.py \
+     deploy/docker/patches/verify_slack_agent_view.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
@@ -745,10 +857,43 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
     grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_reactions.py /opt/hermes && \
+    grep -qF "_kage_slack_ux.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_status.py /opt/hermes/gateway/slack_ux_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_status.py /opt/hermes && \
+    grep -qF "_kage_slack_status.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_clicks.py /opt/hermes/gateway/slack_ux_clicks.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_clicks.py /opt/hermes && \
+    grep -qF "_kage_slack_clicks.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_moments.py /opt/hermes/gateway/slack_ux_moments.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_moments.py /opt/hermes && \
+    grep -qF "_kage_moments_wake_text(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_incident.py /opt/hermes/gateway/slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_incident.py /opt/hermes && \
+    grep -qF "_kage_slack_incident.adapter_for(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_failure.py /opt/hermes/gateway/slack_ux_failure.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_failure.py /opt/hermes && \
+    grep -qF "_kage_slack_failure.maybe_blocks(" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
+    grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
     cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
+    grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
+    grep -qF "_KAGE_SUGGESTED_PROMPTS = " /opt/hermes/plugins/platforms/slack/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_agent_view.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_clicks.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_moments.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_failure.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -1113,6 +1258,22 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # bridge names exit 75 `hermes-rate-limited`. Applied after kanban_guardrail_exit
 # because that patch inserts above this block and leaves the anchor alone. See
 # the module docstring in deploy/docker/patches/apply_quiet_rate_limit_exit.py.
+#
+# api_failure_reason_header is that patch's twin for the bridge's API executor:
+# a failed API-server turn answers with failed/partial and the error text but
+# not the failure_reason Hermes classified, so the bridge could not tell a turn
+# that gave up on a rate limit from the persona failing. One insertion after the
+# chat-completions handler builds its response headers adds
+# X-Hermes-Failure-Reason. See the module docstring in
+# deploy/docker/patches/apply_api_failure_reason_header.py.
+#
+# ssh_shared_master rides it too (#2174): every working environment in the pod
+# shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it when a
+# worker process that had run a command exited normally, cutting any sibling's
+# running command (exit 255, no output). cleanup() now leaves the shared master
+# to ControlPersist, and a foreground ssh exit 255 without the cwd marker carries
+# a hint when upstream attached none. See the module docstring in
+# deploy/docker/patches/apply_ssh_shared_master.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1126,6 +1287,11 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_mcp_toolset_names.py \
      deploy/docker/patches/apply_quiet_rate_limit_exit.py \
      deploy/docker/patches/verify_quiet_rate_limit_exit.py \
+     deploy/docker/patches/apply_api_failure_reason_header.py \
+     deploy/docker/patches/verify_api_failure_reason_header.py \
+     deploy/docker/patches/apply_ssh_shared_master.py \
+     deploy/docker/patches/verify_ssh_shared_master.py \
+     deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1133,6 +1299,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_rate_limit_retry_delay.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_mcp_toolset_names.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1142,11 +1310,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/turn_recovery.py && \
     grep -q 'mcp_names |= {f"mcp-{_kube_mcp_name}" for _kube_mcp_name in mcp_names}' /opt/hermes/cli.py && \
     grep -q 'kube-agents patch: quiet_rate_limit_exit' /opt/hermes/cli.py && \
+    grep -q 'kube-agents patch: api_failure_reason_header' /opt/hermes/gateway/platforms/api_server_openai_routes.py && \
+    grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_mcp_toolset_names.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
@@ -1709,6 +1882,10 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # reason in step 2a.
 COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
+# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
+COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
+
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
@@ -1735,10 +1912,17 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # that check allows, so a COPY/RUN pair of its own spends a third of what is
 # left. See the
 # module docstring for what a failure here means.
+#
+# check_skill_commands.py rides along the same way. It runs every shell block
+# in the SKILL.md files of the image's three skill trees through Hermes' Tirith
+# scan, which is why the Cluster Agent template is copied above this block
+# rather than below it.
+# It downloads the Tirith release it pins; see its module docstring.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
+     deploy/docker/check_skill_commands.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
@@ -1751,11 +1935,11 @@ assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % cap
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
+        agents/platform/skills=/opt/platform-template/skills \
+        agents/cluster/skills=/opt/cluster-template/skills \
+        a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
-
-# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
-# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
-COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
 # Plugins land in the shared plugin root regardless of which profile owns them —
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
@@ -1813,8 +1997,9 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 #     AGENTS.md, CAPABILITIES.md, governance/, cron/ and config.yaml sit beside
 #     skills/ and are force-synced into the platform profile on every boot by
 #     entrypoint step 2.6, and the cluster template's personas are re-copied into
-#     every cluster-* profile by its continuation. A rewritten SOUL.md is more
-#     load-bearing than any single SKILL.md.
+#     every cluster-* profile by its continuation, which also back-fills every
+#     key its config.yaml adds. A rewritten SOUL.md is more load-bearing than any
+#     single SKILL.md.
 #   - /opt/hermes/plugins (barriered by the stage's first RUN; listed for
 #     what it covers). It is the only path Hermes resolves plugins from, holding
 #     Python imported into the agent's own process — a strictly stronger capability
@@ -2010,6 +2195,14 @@ RUN set -eu; \
 # than its own because the chain is at the layer ceiling. It fails the build when
 # the copy stops working, and only warns when Hermes resolves ssh without the copy,
 # because the copy still agrees then and a failure would block the Hermes bump.
+#
+# It also asks that Hermes for the context-file cap each profile's shipped
+# config.yaml gives it, on the unknown-window path (no context_length), and fails
+# the build if that profile's SOUL.md is longer. Hermes keeps only the head and
+# tail of a file over the cap, so a persona that outgrows it, or a renamed or
+# ignored context_file_max_chars, would otherwise drop the middle of the prompt
+# with nothing but a log line. Each check runs in a scratch HERMES_HOME holding a
+# copy of the template's config.yaml, so Hermes writes nothing into the template.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
@@ -2021,7 +2214,23 @@ RUN set -eu; \
         exit 1; \
       fi; \
     done; \
-    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check
+    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check; \
+    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template; do \
+      config_dir="${profile%%:*}"; soul="${profile#*:}/SOUL.md"; \
+      scratch="$(mktemp -d)"; \
+      cp "${config_dir}/config.yaml" "${scratch}/config.yaml"; \
+      HERMES_HOME="${scratch}" /opt/hermes/.venv/bin/python3 -c "\
+import pathlib, sys; \
+from agent.prompt_builder import _get_context_file_max_chars; \
+from agent.title_generator import _auto_title_enabled; \
+soul, config = sys.argv[1], sys.argv[2]; \
+size = len(pathlib.Path(soul).read_text(encoding='utf-8').strip()); \
+cap = _get_context_file_max_chars(); \
+assert size <= cap, '%s is %d chars, over the %d-char context-file cap Hermes takes from %s, so the prompt would carry it truncated' % (soul, size, cap, config); \
+assert not _auto_title_enabled(), '%s leaves Hermes auto-titling enabled, risking 400 on Vertex minimal thinking (#2523)' % config" \
+        "${soul}" "${config_dir}/config.yaml"; \
+      rm -rf "${scratch}"; \
+    done
 
 USER 10000:10000
 

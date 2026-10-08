@@ -96,8 +96,16 @@ def scratch_root() -> Path:
 
 
 def default_into(repo: str) -> Path:
-    owner, _, name = repo.partition("/")
-    return scratch_root() / f"{owner}__{name}"
+    """Where a clone of `repo` lands when the caller names no directory.
+
+    GitHub's `owner/name` keeps the `owner__name` it always had. A name on
+    another forge carries its host and nests deeper, so every `/` is spelled
+    `%2F`: one directory, and no two names land in the same one.
+    """
+    if repo.count("/") == 1:
+        owner, _, name = repo.partition("/")
+        return scratch_root() / f"{owner}__{name}"
+    return scratch_root() / repo.replace("/", "%2F")
 
 
 def prepare_destination(into: Path, force: bool) -> Path:
@@ -338,9 +346,11 @@ def clone_directory(args) -> int:
                 "lease": lease,
                 "complete": True,
                 # Said rather than silently done. `--depth` is a broker-side
-                # clone option; this path is `git clone` through the shim and
+                # clone option; this path is a plain local `git clone`, which
                 # takes the full history, so a caller that asked for a shallow
-                # read got something else and should know which.
+                # read got something else and should know which. In the sandbox
+                # that `git` has no transport, so this fallback cannot clone
+                # there at all.
                 "depthIgnored": bool(args.depth),
             }
         )
@@ -365,8 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     def add_repo(sub):
-        sub.add_argument("--repo", required=True, help="owner/name")
-        sub.add_argument("--ref", help="branch to read; defaults to the remote's HEAD")
+        sub.add_argument(
+            "--repo", required=True,
+            help="owner/name on GitHub, or <host>/<path> on another forge this install serves",
+        )
+        sub.add_argument("--ref", help="branch to read; defaults to the base the broker pins the repository to, else the remote's HEAD")
         sub.add_argument(
             "--depth",
             type=int,
@@ -396,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
     searcher = commands.add_parser("grep", help="search the tracked files")
     searcher.add_argument("--handle", required=True)
     searcher.add_argument("--pattern", required=True)
-    searcher.add_argument("--prefix")
+    searcher.add_argument("--prefix", help="a directory or file, a path rather than a glob")
     searcher.add_argument("--regex", action="store_true", help="POSIX extended regex")
     searcher.add_argument("--ignore-case", action="store_true")
     searcher.set_defaults(func=handle_grep)

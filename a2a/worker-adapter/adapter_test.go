@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -32,7 +34,30 @@ var testPort atomic.Int64
 
 func init() { testPort.Store(26222) }
 
-func startServer(t *testing.T) string {
+// The steer tests' stub waits for the steer itself, then for a quiet spell.
+//
+// steerArrivalWait is how long it waits for a line carrying STEERWORD. It is
+// a ceiling, not a window: a passing run reads the steer the moment it lands
+// and moves on, so the value only decides how long a genuine loss takes to
+// report. A fixed idle window measured from the opening prompt was the old
+// shape, and it flaked on slow runners whenever delivery -- or, in
+// TestSteerSurvivesTheInConsumerBeingDropped, the consumer rebuild ahead of
+// it -- took longer than the window.
+//
+// steerDuplicateDrain is the quiet spell after the steer, during which a
+// duplicate delivery would still be read and counted. That is what lets
+// "steers=1" mean exactly once, not merely at least once.
+//
+// steerTaskDeadline replaces adapterConfig's TaskDeadline in those tests: the
+// stub may legitimately run for steerArrivalWait plus steerDuplicateDrain,
+// and a deadline under that would kill it before it reports.
+const (
+	steerArrivalWait    = 30 * time.Second
+	steerDuplicateDrain = 5 * time.Second
+	steerTaskDeadline   = steerArrivalWait + steerDuplicateDrain + 15*time.Second
+)
+
+func startServerOpt(t *testing.T, withVerifier bool) string {
 	t.Helper()
 	opts := &server.Options{
 		Host:      "127.0.0.1",
@@ -72,7 +97,85 @@ func startServer(t *testing.T) string {
 	}); err != nil {
 		t.Fatalf("provision TASKS: %v", err)
 	}
+	// `nats kv add cap`, history 1, the way the operator's provision Job
+	// makes it. Every test in this package now runs against a real
+	// capability: the executor's check is on by default here because it is
+	// on by default in the pod, and a suite that switched it off would
+	// prove the harness works and nothing about the control.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: capability.Bucket, History: 1}); err != nil {
+		t.Fatalf("provision cap: %v", err)
+	}
+	if withVerifier {
+		startVerifier(t, url)
+	}
 	return url
+}
+
+// startServer is the harness every test uses: a bus with the streams and
+// buckets the operator provisions, and the verifier running.
+func startServer(t *testing.T) string { return startServerOpt(t, true) }
+
+// startServerNoVerifier is the outage: everything provisioned, nothing
+// answering on the verify subject.
+func startServerNoVerifier(t *testing.T) string { return startServerOpt(t, false) }
+
+// startVerifier runs the real verifier service against the test server: the
+// same Service the verifier Deployment runs, resolving out of the same bucket.
+// Not a stub — a stub would answer "allowed" for chains that do not exist.
+func startVerifier(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url, nats.Name("cap-verifier-test"))
+	if err != nil {
+		t.Fatalf("verifier connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("verifier jetstream: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	store, err := capability.NewStore(ctx, js)
+	if err != nil {
+		t.Fatalf("verifier store: %v", err)
+	}
+	svc := &capability.Service{Resolver: &capability.Resolver{Store: store}, Log: slog.Default()}
+	sub, err := svc.Subscribe(ctx, nc)
+	if err != nil {
+		t.Fatalf("verifier subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+}
+
+// mintFor writes the root capability the gateway would have minted for this
+// task, naming the addressee as its delegate, and returns the reference.
+func mintFor(t *testing.T, c *lib.Client, taskID, addressee string) capability.Ref {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ref, err := capability.NewMinter(c.JetStream()).Mint(ctx, taskID, capability.Entry{
+		Tier:     capability.TierDeveloperTeam,
+		Scope:    capability.NamespaceScope(""),
+		Delegate: addressee,
+	})
+	if err != nil {
+		t.Fatalf("mint %s for %s: %v", taskID, addressee, err)
+	}
+	return ref
+}
+
+// authorityFor renders the authority block the gateway puts on a submission.
+// Only `grants` matters to the executor; the advisory halves are omitted
+// because nothing in this package reads them.
+func authorityFor(t *testing.T, ref capability.Ref) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"grants": map[string]any{"capability": ref},
+	})
+	if err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+	return raw
 }
 
 func testClient(t *testing.T, url string) *lib.Client {
@@ -109,11 +212,51 @@ func stub(t *testing.T, body string) []string {
 	return []string{"/bin/bash", path}
 }
 
+// steerCounterStub is a harness for the steer tests. It reads the opening
+// prompt, waits up to steerArrivalWait for a line carrying STEERWORD, reads
+// whatever else arrives until steerDuplicateDrain passes quietly, and then
+// answers one result per line read, the last one reporting
+// "turns=<lines> steers=<STEERWORD count>". A steer that never arrives
+// reports turns=1 steers=0 once the arrival wait runs out.
+func steerCounterStub(t *testing.T, sessionID string) []string {
+	t.Helper()
+	return stub(t, fmt.Sprintf(`
+echo '{"type":"system","subtype":"init","session_id":"%s"}'
+read first || exit 1
+count=1
+all="$first"
+while read -t %d line; do
+  count=$((count+1))
+  all="$all $line"
+  case "$line" in *STEERWORD*) break ;; esac
+done
+while read -t %d line; do
+  count=$((count+1))
+  all="$all $line"
+done
+steers=$(printf '%%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
+i=1
+while [ "$i" -lt "$count" ]; do
+  echo '{"type":"result","subtype":"success","result":"interim turn"}'
+  i=$((i+1))
+done
+printf '{"type":"result","subtype":"success","result":"turns=%%s steers=%%s"}\n' "$count" "$steers"
+`, sessionID, int(steerArrivalWait/time.Second), int(steerDuplicateDrain/time.Second)))
+}
+
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 
-// submit publishes a task submission the way the gateway does and returns
-// the origin envelope.
+// submit publishes a task submission the way the gateway does — including the
+// capability it minted for this task — and returns the origin envelope.
 func submit(t *testing.T, c *lib.Client, addressee, taskID, text string) *lib.Envelope {
+	t.Helper()
+	return submitWithAuthority(t, c, addressee, taskID, text,
+		authorityFor(t, mintFor(t, c, taskID, addressee)))
+}
+
+// submitWithAuthority is submit with the authority block chosen by the
+// caller, which is how the attacker tests forge one.
+func submitWithAuthority(t *testing.T, c *lib.Client, addressee, taskID, text string, authority json.RawMessage) *lib.Envelope {
 	t.Helper()
 	parts := []lib.Part{{Kind: "text", Text: text}}
 	if text == "" {
@@ -126,8 +269,12 @@ func submit(t *testing.T, c *lib.Client, addressee, taskID, text string) *lib.En
 	if err != nil {
 		t.Fatalf("marshal message: %v", err)
 	}
+	opts := []lib.EnvelopeOption{lib.WithTo(lib.Party{Session: addressee})}
+	if len(authority) > 0 {
+		opts = append(opts, lib.WithAuthority(authority))
+	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-"+taskID, "corr-"+taskID,
-		payload, lib.WithTo(lib.Party{Session: addressee}))
+		payload, opts...)
 	if err != nil {
 		t.Fatalf("submission envelope: %v", err)
 	}
@@ -282,6 +429,7 @@ func TestLifecycle_HappyPath(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
+read first || exit 1
 echo '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"pondering buses"}]}}'
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"drafting the haiku now"},{"type":"tool_use","name":"Write","input":{"file_path":"haiku.txt"}}]}}'
 echo '{"type":"result","subtype":"success","result":"buses hum softly / envelopes drift downstream / an ack, then silence"}'
@@ -364,24 +512,9 @@ func TestAssertion21_SteerReachesStdinExactlyOnce(t *testing.T) {
 	// The stub reads its stdin (the opening prompt, then anything steered),
 	// counts lines and STEERWORD occurrences, and answers one result per
 	// turn so the adapter's turn accounting settles.
-	harness := stub(t, `
-echo '{"type":"system","subtype":"init","session_id":"stub-steer"}'
-read first || exit 1
-count=1
-all="$first"
-while read -t 3 line; do
-  count=$((count+1))
-  all="$all $line"
-done
-steers=$(printf '%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
-i=1
-while [ "$i" -lt "$count" ]; do
-  echo '{"type":"result","subtype":"success","result":"interim turn"}'
-  i=$((i+1))
-done
-printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "$count" "$steers"
-`)
-	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
+	cfg := adapterConfig(url, taskID, session, steerCounterStub(t, "stub-steer"))
+	cfg.TaskDeadline = steerTaskDeadline
+	done := runAdapter(context.Background(), cfg)
 	waitState(t, c, session, taskID, lib.StateWorking)
 
 	// Build one steer envelope and publish it twice with distinct JetStream
@@ -422,7 +555,7 @@ printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "
 		}
 	}
 
-	out := waitOutcome(t, done, 45*time.Second)
+	out := waitOutcome(t, done, waitDeadline)
 	if out.err != nil || out.res.State != lib.StateCompleted {
 		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
 	}
@@ -633,6 +766,7 @@ func TestLifecycle_FailedWithEvidence(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-fail"}'
+read first || exit 1
 echo "stub exploded spectacularly" >&2
 exit 3
 `)
@@ -662,6 +796,7 @@ func TestLifecycle_HarnessErrorResult(t *testing.T) {
 
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-err"}'
+read first || exit 1
 echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"ran out of turns"}'
 `)
 	out := waitOutcome(t, runAdapter(context.Background(), adapterConfig(url, taskID, session, harness)), 30*time.Second)
@@ -679,7 +814,10 @@ echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"ran
 }
 
 // TestLifecycle_RejectedNoTextParts: a submission with no text parts is
-// refused before any harness spawn - terminal rejected.
+// refused before any harness spawn - terminal rejected, with the reason
+// token the bridge writes for the same refusal (`no-text-parts`). The token
+// is the first word after `reason: `, which is all the gateway's terminal
+// log line and the eval harness keep, so a prose reason would log as `no`.
 func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
@@ -695,6 +833,9 @@ func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 	task := foldTask(t, c, session, taskID)
 	if task.State != lib.StateRejected || !task.Final {
 		t.Fatalf("folded %+v", task)
+	}
+	if text := terminalText(t, url, session, taskID); !strings.HasPrefix(text, "reason: no-text-parts ") {
+		t.Fatalf("terminal message %q, want the token `reason: no-text-parts` then detail", text)
 	}
 }
 
@@ -795,24 +936,9 @@ func TestSteerSurvivesTheInConsumerBeingDropped(t *testing.T) {
 	const session, taskID = "chat-lynx-e5f6", "task-steer-recreate"
 	origin := submit(t, c, session, taskID, "opening prompt")
 
-	harness := stub(t, `
-echo '{"type":"system","subtype":"init","session_id":"stub-recreate"}'
-read first || exit 1
-count=1
-all="$first"
-while read -t 5 line; do
-  count=$((count+1))
-  all="$all $line"
-done
-steers=$(printf '%s' "$all" | grep -o STEERWORD | wc -l | tr -d ' ')
-i=1
-while [ "$i" -lt "$count" ]; do
-  echo '{"type":"result","subtype":"success","result":"interim turn"}'
-  i=$((i+1))
-done
-printf '{"type":"result","subtype":"success","result":"turns=%s steers=%s"}\n' "$count" "$steers"
-`)
-	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
+	cfg := adapterConfig(url, taskID, session, steerCounterStub(t, "stub-recreate"))
+	cfg.TaskDeadline = steerTaskDeadline
+	done := runAdapter(context.Background(), cfg)
 	waitState(t, c, session, taskID, lib.StateWorking)
 
 	nc, err := nats.Connect(url)

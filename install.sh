@@ -68,11 +68,41 @@ readonly NETWORK_POLICY_ENFORCEMENT_ANNOTATION="kubeagents.x-k8s.io/network-poli
 readonly NP_ENFORCEMENT_ENFORCED="enforced"
 readonly NP_ENFORCEMENT_ENABLED_BY_INSTALL="enabled-by-install"
 readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
+# Where read_recorded_install_env_values parks what one evaluation of
+# install.env found, mangled onto the key. A key the file can assign is a shell
+# name, so the mangled slot is one too.
+readonly RECORDED_VALUE_PREFIX="_RECORDED_INSTALL_ENV_VALUE_"
+readonly RECORDED_SET_PREFIX="_RECORDED_INSTALL_ENV_SET_"
+# The file those slots hold answers for, and the keys parked so far.
+RECORDED_INSTALL_ENV_FILE=""
+RECORDED_INSTALL_ENV_KEYS=""
 # The report field's key, and the value in the report until a run has decided.
 readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
 # Whether note_stale_network_policy_acceptance has spoken this run.
 NETWORK_POLICY_STALE_ACCEPTANCE_NOTED="false"
+# How check_flag_against_install_env compares a typed chat flag with the key
+# install.env records: a boolean read through is_truthy, a literal string, a
+# list read through hcl_csv_list (the form write_tfvars_from_state renders), or
+# a credential, whose value is never printed and whose home is the live Secret
+# rather than the file.
+readonly INSTALL_ENV_FLAG_KIND_BOOL="bool"
+readonly INSTALL_ENV_FLAG_KIND_STRING="string"
+readonly INSTALL_ENV_FLAG_KIND_LIST="list"
+readonly INSTALL_ENV_FLAG_KIND_CREDENTIAL="credential"
+# The keys among those that the Day-2 menu's chat screen edits and its Save &
+# Apply writes, so a refusal names --menu only where the menu can make the
+# edit. Not CHAT_TOPIC_NAME, which the panel saves as loaded and never asks
+# about, and not SLACK_ENABLED: the panel turns Slack on without asking for
+# the tokens, and its apply does not check for them.
+readonly INSTALL_ENV_KEYS_THE_MENU_SAVES="GOOGLE_CHAT_ENABLED ALLOWED_USERS GOOGLE_CHAT_HOME_CHANNEL"
+# The chat flags this run typed, one KEY|FLAG|KIND|PARAM|DEFAULT_VAR line each,
+# noted by parse_args; and the keys among them that install.env does not
+# assign, for record_flags_into_install_env to append once the run commits.
+INSTALL_ENV_FLAGS_TYPED=""
+INSTALL_ENV_KEYS_TO_RECORD=""
+# Those keys with their companions, toggles last (resolve_install_env_record_keys).
+INSTALL_ENV_RECORD_KEYS=""
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -186,8 +216,11 @@ unset _install_defaults_dir
 # something each flag has to remember to do and becomes the default path.
 #
 # An input the installer reads and does not rewrite. It creates one at the end
-# of a first install, when there is nothing there, and never touches it again:
-# a file the documentation tells you to edit and the next run overwrites is
+# of a first install, when there is nothing there, and after that changes no
+# line of it; the one thing it adds is a chat key the file lacks, from a chat
+# flag, with the settings a toggle recorded true brings
+# (record_flags_into_install_env). A file the documentation tells you to
+# edit and the next run overwrites is
 # exactly the complaint against vars.sh, whose header said "auto-generated"
 # while INSTALL.md told you to hand-edit it.
 #
@@ -284,7 +317,11 @@ bootstrap_install_env() {
   # next run from a clean shell. A first install, which has no file yet, keeps
   # the environment and records it; a typed --scope-* flag still overrides
   # for one run and is warned about.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  # The scoped service account pool's switch and cap for the same reason: an
+  # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
+  # accounts the next run from a clean shell deletes again.
+  unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -394,6 +431,8 @@ PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
 PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
 PARAM_SCOPE_SHARED_VPC_HOSTS="${SCOPE_SHARED_VPC_HOSTS:-}"
 PARAM_SCOPE_METRICS_SCOPES="${SCOPE_METRICS_SCOPES:-}"
+# Empty means the CRD's default cap (100); a value is spec.scope.maxProjects.
+PARAM_SCOPE_MAX_PROJECTS="${SCOPE_MAX_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
@@ -403,6 +442,27 @@ SCOPE_FLAG_PASSED="false"
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+# Not filled by resolve_shared_defaults, and PARAM_ENABLE_GKE_BACKUP_PLAN below
+# is the pattern: warn_flag_beats_unrecorded_file_value reads an empty PARAM as
+# "nobody chose", and that is the only thing that keeps the destroyed-ingress
+# warning off every install over a file predating this key. Filling it and
+# recovering the distinction with a separate "was it typed" marker reads the
+# flag alone, so an exported ENABLE_DRIFT_DETECTOR -- a documented route, above
+# install.env in precedence when the file does not name the key -- would
+# provision the ingress with no warning that the next upgrade.sh destroys it.
+# main() therefore exports this one conditionally, as it does the backup plan.
+PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
+# The same value again, under a name nothing downstream writes. That
+# conditional export in main() overwrites ENABLE_DRIFT_DETECTOR with the
+# chosen value, and it runs before bootstrap_install_env_file, so by the time
+# the warning below asks "does this shell ask for the detector", the answer it
+# would read back is this run's own flag. `--enable-drift-detector=false` in a
+# shell exporting true would then look like nobody had asked for it, the
+# warning would stay silent, and the next run from that shell -- seeding
+# PARAM from the export again -- would provision the ingress the operator
+# thought they had just declined. This line is the last moment the shell's
+# answer and the run's answer are distinguishable.
+SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
@@ -476,6 +536,15 @@ PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
 # as an empty MODEL_DEFAULT_NAME takes the provider's default model.
 PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
+# Empty takes the DEFAULT_LITELLM_REDACTION_* values in the tfvars generator.
+# The rules have no flag and are read from LITELLM_REDACTION_RULES directly.
+PARAM_LITELLM_REDACTION_ENABLED="${LITELLM_REDACTION_ENABLED:-}"
+PARAM_LITELLM_REDACTION_IP_ACTION="${LITELLM_REDACTION_IP_ACTION:-}"
+PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
+# Empty takes the SCOPED_SA_POOL_* defaults in installer_common.sh: the pool
+# disarmed, the cap the module's own.
+PARAM_SCOPED_SA_POOL_ENABLED="${SCOPED_SA_POOL_ENABLED:-}"
+PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${SCOPED_SA_POOL_MAX_ACCOUNTS:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 # Slack, seeded from the loaded configuration exactly as Google Chat is above,
 # and for the same reason: the chat interview reads these rather than the
@@ -530,6 +599,16 @@ Flags for AI Agents & Automation:
                                 whose prompt and output share one window
                                 (default: DEFAULT_MODEL_MAX_TOKENS, currently 0:
                                 no max_tokens is rendered)
+  --litellm-redaction[=BOOL]    Redact every request body the gateway forwards to the
+                                provider: credentials, IP literals and the rules in
+                                LITELLM_REDACTION_RULES (install.env only)
+                                (default: DEFAULT_LITELLM_REDACTION_ENABLED, currently false)
+  --litellm-redaction-ip-action=ACTION
+                                What redaction does with IP literals: pseudonym | mask | off
+                                (default: DEFAULT_LITELLM_REDACTION_IP_ACTION, currently pseudonym)
+  --litellm-redaction-ip-allow-cidrs=LIST
+                                Comma- or space-separated networks, in CIDR form, whose
+                                addresses the model still sees
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --gcp-project-id)
   --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
                                 (default: DEFAULT_VERTEX_LOCATION, currently global)
@@ -568,10 +647,23 @@ Flags for AI Agents & Automation:
                                 read roles (and roles/compute.viewer in the host, for the lookup)
   --scope-metrics-scopes=IDS    Metrics Scope scoping-project IDs; every project the scope
                                 monitors is in scope, resolved and granted the same way
+  --scope-max-projects=N        The most projects the reconcile lists per run, the management
+                                project included (spec.scope.maxProjects; 1 to 5000, 100 when
+                                unset); a project past it reads over-cap
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
                                 Clusters to leave unmanaged, each as project/location/cluster
+  --scoped-sa-pool-enabled[=BOOL]
+                                Arm the scoped service account pool: one reader service
+                                account per project in scope, which the credential broker
+                                selects from and refuses a cluster outside of. Members hold
+                                no IAM grant yet, so leave it off (default: false)
+  --scoped-sa-pool-max-accounts=N
+                                The most pool accounts the plan may create in the install's
+                                project: set it to the service-account quota headroom the
+                                project has free (default: the module's 100, GCP's default
+                                quota, which the agent's own accounts already share)
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -617,11 +709,22 @@ Flags for AI Agents & Automation:
   --enable-google-chat[=true|false]
                                 Enable Google Chat integration
   --enable-slack[=true|false]   Enable the Slack socket-mode relay. Non-interactively
-                                this requires --slack-bot-token and --slack-app-token
+                                this requires --slack-bot-token and --slack-app-token.
+                                Against an existing install.env, --enable-slack,
+                                --enable-google-chat, --google-chat and the
+                                --slack-*, --google-chat-allowed-users,
+                                --google-chat-home-channel, --google-chat-mode and
+                                --chat-topic-name flags must agree with the key the file
+                                assigns (a disagreement is refused: edit the key); a key
+                                the file lacks is recorded there, tokens excepted
   --enable-pubsub-platform[=true|false]
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
                                 Enable GKE Stockout Investigator AgentPlugin (default: false)
+  --enable-drift-detector[=true|false]
+                                Report cluster changes made outside git. Exports this
+                                project's GKE audit log to Pub/Sub and starts the
+                                detector that reads it (default: true)
   --google-chat-allowed-users=EMAILS
                                 Comma-separated user emails allowed to talk to the
                                 agent over Google Chat. Empty allows all users
@@ -666,7 +769,8 @@ Configuration file:
   install.env beside this script (override with KUBE_AGENTS_INSTALL_ENV) is
   loaded first, and a flag beats it. It is sourced with 'set -a', so a key it
   carries also beats an exported variable of the same name -- a flag is what
-  overrides a recorded value for one run. Start from install.env.example.
+  overrides a recorded value for one run, except the chat flags, which must
+  agree with it (see --enable-slack). Start from install.env.example.
   Anything it sets is inherited by later runs, so a re-run that omits a flag
   keeps the value rather than reverting it to the default above.
 EOF
@@ -722,12 +826,30 @@ validate_bool_flag_value() {
   fi
 }
 
+# The two chat flags with a default, given nothing. resolve_shared_defaults
+# turns an empty value into the default, so over an install.env recording
+# another topic or mode the refusal in check_flag_against_install_env would
+# name a value nobody typed and tell the operator to adopt it, and with no file
+# the run would apply the default where a wrapper meant to pass something.
+# Refused, like an empty toggle. A blank value (whitespace only) counts as
+# empty: resolve_shared_defaults would keep it, and a blank topic would be held
+# to the file or recorded into it.
+require_defaulted_flag_value() {
+  local flag="$1" value="${2:-}"
+  [ -z "${value//[[:space:]]/}" ] || return 0
+  print_error "${flag}= was given an empty value."
+  print_info "Pass ${flag} with a value, or leave it out to take the one install.env records (or the default)."
+  exit 1
+}
+
 # A scope flag given nothing cannot mean "leave the recorded scope alone" (the
 # flag is what overrides the file for one run) and must not mean "drop every
 # project" in silence: applied, an empty --scope-projects= would revoke the
 # scoped projects' roles and retire their profiles while install.env still
 # named them, and the next upgrade would add them back. Refused, like an empty
-# toggle; the file is where a scope is emptied on purpose.
+# toggle; the file is where a scope is emptied on purpose. The two gateway
+# redaction value flags take the same check: empty, they would replace the
+# recorded IP action or allowlist for one run without a word.
 require_scope_flag_value() {
   local flag="$1" value="${2:-}" key
   # A value that is nothing but separators (`,`, a space) renders the same
@@ -739,7 +861,11 @@ require_scope_flag_value() {
     --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
     --scope-shared-vpc-hosts) key="SCOPE_SHARED_VPC_HOSTS" ;;
     --scope-metrics-scopes) key="SCOPE_METRICS_SCOPES" ;;
+    --scope-max-projects) key="SCOPE_MAX_PROJECTS" ;;
     --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    --litellm-redaction-ip-action) key="LITELLM_REDACTION_IP_ACTION" ;;
+    --litellm-redaction-ip-allow-cidrs) key="LITELLM_REDACTION_IP_ALLOW_CIDRS" ;;
+    --scoped-sa-pool-max-accounts) key="SCOPED_SA_POOL_MAX_ACCOUNTS" ;;
     *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
   esac
   print_error "${flag}= was given an empty value."
@@ -762,6 +888,15 @@ parse_args() {
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
+      --litellm-redaction|--litellm-redaction=*)
+        PARAM_LITELLM_REDACTION_ENABLED="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_LITELLM_REDACTION_ENABLED"; shift ;;
+      --litellm-redaction-ip-action=*)
+        PARAM_LITELLM_REDACTION_IP_ACTION="${1#*=}"; PARAM_LITELLM_REDACTION_IP_ACTION_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_LITELLM_REDACTION_IP_ACTION"; shift ;;
+      --litellm-redaction-ip-allow-cidrs=*)
+        PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS="${1#*=}"
+        require_scope_flag_value "${1%%=*}" "$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
@@ -791,12 +926,25 @@ parse_args() {
       --scope-metrics-scopes=*)
         PARAM_SCOPE_METRICS_SCOPES="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_METRICS_SCOPES"; shift ;;
+      --scope-max-projects=*)
+        PARAM_SCOPE_MAX_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_MAX_PROJECTS"; shift ;;
       --scope-exclude-projects=*)
         PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
       --scope-exclude-clusters=*)
         PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
+      --scoped-sa-pool-enabled|--scoped-sa-pool-enabled=*)
+        SCOPE_FLAG_PASSED="true"
+        PARAM_SCOPED_SA_POOL_ENABLED="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_ENABLED"; shift ;;
+      # An empty cap cannot mean "the recorded one" (the flag overrides the
+      # file) and must not mean "no cap" in silence; refused like a scope flag.
+      --scoped-sa-pool-max-accounts=*)
+        SCOPE_FLAG_PASSED="true"
+        PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${1#*=}"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -818,6 +966,9 @@ parse_args() {
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
+      --enable-drift-detector|--enable-drift|--enable-drift-detector=*|--enable-drift=*)
+        PARAM_ENABLE_DRIFT_DETECTOR="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_DRIFT_DETECTOR"; shift ;;
       # Validated for emptiness here, ahead of resolve_shared_defaults.
       # PARAM_MEMORY is seeded from MEMORY and resolved with
       # ${PARAM_MEMORY:-$DEFAULT_MEMORY}, so `--memory=` out of a wrapper
@@ -842,20 +993,59 @@ parse_args() {
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
       --enable-google-chat|--google-chat|--enable-google-chat=*|--google-chat=*)
         PARAM_ENABLE_GOOGLE_CHAT="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GOOGLE_CHAT"
+        note_install_env_flag GOOGLE_CHAT_ENABLED "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_ENABLE_GOOGLE_CHAT DEFAULT_GOOGLE_CHAT_ENABLED
+        shift ;;
       --enable-slack|--enable-slack=*)
         PARAM_ENABLE_SLACK="$(flag_bool_value "$1")"
-        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"; shift ;;
-      --google-chat-allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
-      --slack-bot-token=*) PARAM_SLACK_BOT_TOKEN="${1#*=}"; shift ;;
-      --slack-app-token=*) PARAM_SLACK_APP_TOKEN="${1#*=}"; shift ;;
-      --slack-allowed-users=*) PARAM_SLACK_ALLOWED_USERS="${1#*=}"; shift ;;
-      --slack-home-channel=*) PARAM_SLACK_HOME_CHANNEL="${1#*=}"; shift ;;
-      --slack-home-channel-name=*) PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"; shift ;;
-      --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_SLACK"
+        note_install_env_flag SLACK_ENABLED "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_ENABLE_SLACK DEFAULT_SLACK_ENABLED
+        shift ;;
+      --google-chat-allowed-users=*)
+        PARAM_ALLOWED_USERS="${1#*=}"
+        note_install_env_flag ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_ALLOWED_USERS
+        shift ;;
+      --slack-bot-token=*)
+        PARAM_SLACK_BOT_TOKEN="${1#*=}"
+        note_install_env_flag SLACK_BOT_TOKEN "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" PARAM_SLACK_BOT_TOKEN
+        shift ;;
+      --slack-app-token=*)
+        PARAM_SLACK_APP_TOKEN="${1#*=}"
+        note_install_env_flag SLACK_APP_TOKEN "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" PARAM_SLACK_APP_TOKEN
+        shift ;;
+      --slack-allowed-users=*)
+        PARAM_SLACK_ALLOWED_USERS="${1#*=}"
+        note_install_env_flag SLACK_ALLOWED_USERS "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_LIST" PARAM_SLACK_ALLOWED_USERS
+        shift ;;
+      --slack-home-channel=*)
+        PARAM_SLACK_HOME_CHANNEL="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL
+        shift ;;
+      --slack-home-channel-name=*)
+        PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --chat-topic-name=*)
+        PARAM_CHAT_TOPIC_NAME="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_CHAT_TOPIC_NAME"
+        note_install_env_flag CHAT_TOPIC_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_CHAT_TOPIC_NAME DEFAULT_CHAT_TOPIC_NAME
+        shift ;;
       --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
-      --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
-      --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
+      --google-chat-mode=*)
+        PARAM_GOOGLE_CHAT_MODE="${1#*=}"
+        require_defaulted_flag_value "${1%%=*}" "$PARAM_GOOGLE_CHAT_MODE"
+        # Here and not only at step 6, so the step-2 install.env check never
+        # tells the operator to record a mode step 6 and variables.tf refuse.
+        if [[ ! "$PARAM_GOOGLE_CHAT_MODE" =~ ^(default|debug)$ ]]; then
+          print_error "--google-chat-mode must be either 'default' or 'debug'."
+          exit 1
+        fi
+        note_install_env_flag GOOGLE_CHAT_MODE "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_MODE DEFAULT_GOOGLE_CHAT_MODE
+        shift ;;
+      --google-chat-home-channel=*)
+        PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"
+        note_install_env_flag GOOGLE_CHAT_HOME_CHANNEL "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_GOOGLE_CHAT_HOME_CHANNEL
+        shift ;;
       --migrate-node-pools=*)
         PARAM_MIGRATE_NODE_POOLS="${1#*=}"
         PARAM_MIGRATE_NODE_POOLS_PASSED="true"
@@ -1314,86 +1504,198 @@ write_secret_env_var() {
 # are recomputed wherever they are used, and the cluster shape written here is
 # the one the interview asked for, never the probed TFVARS_CLUSTER_MODE, which
 # write_tfvars_from_state re-derives on every run.
+
+# What install.env records for a set of keys, and whether it records them at
+# all, from one evaluation of the file.
+#
+# Asks bash rather than parsing the file, because bash is the other reader and
+# the only one whose answer matters: bootstrap_install_env sources install.env
+# at startup and load_install_env again on every front door, into the
+# environment every guard here compares against. A reader that parses the line
+# instead has to reimplement the grammar bash applies to it -- assignment
+# prefixes and command words, redirections, `&>`, comments, quoting, backslash
+# escapes, parameter and command substitution, a reassignment later on the same
+# line -- and stay right about all of it.
+#
+# Sourced inside a function, because that is where both live readers source it,
+# and the scope changes the answer. `declare -x K=true` is a global at the top
+# level of a script and a local inside a function, so a top-level reader hands
+# back `true` for a line whose value dies with bootstrap_install_env's return
+# and never reaches write_tfvars_from_state. Matching the scope is what makes
+# "what the file records" mean "what a run that does not already hold the key
+# reads back from it" -- which is the question the guards ask, because the run
+# they warn about is a later one from a shell nobody here can see. It is not
+# "what this run read": see the `unset` paragraph below for the one class where
+# those two come apart.
+#
+# Set-ness travels with the value, so no caller needs a presence test of its
+# own. A `grep -E "^[[:space:]]*(export[[:space:]]+)?${key}="` beside this is
+# the second parser the function exists to remove, and the two disagree on
+# every spelling the pattern does not know -- `declare -x K=v`, `readonly K=v`,
+# the second assignment on one `export` -- which is how a file recording
+# exactly the flagged value earns "records no K".
+#
+# One evaluation for all of them, because the file is shell and a line may run
+# a command: a key whose value is a command substitution fetching a secret is
+# a network round-trip per evaluation, and the interview guard alone asks
+# about twenty-three keys. Answers stay cached until the file changes. A
+# caller reading through a command substitution primes the cache in a subshell
+# that then exits, so the callers that read several keys prime here first, in
+# their own shell, and their reads land warm.
+#
+# `unset` each key first, so a value coming back means the *file* assigned it.
+# Without that the caller's own exported ENABLE_DRIFT_DETECTOR would read back
+# as a recorded line, which is the one distinction the drift guard exists to
+# make. The rest of the environment is inherited on purpose: a file recording
+# `K=$OTHER` assigns whatever the real sourcing will assign, so the reader has
+# to see the same shell the install runs in.
+#
+# That `unset` is the one place this reader and the live ones part company, and
+# the class is `: ${K:=v}` and `K=${K:-v}`: the expansion fires here, where the
+# key was just unset, and does not fire in an install whose shell exports the
+# key already. The reader then reports `v` where this run read the export. It
+# is still the right answer to the question the guards ask -- a later run from
+# a shell without the export does get `v` -- but it is not what this run read,
+# and a guard comparing the two announces a divergence this shell does not
+# have. Kept rather than dropped: without the `unset` an exported key is
+# indistinguishable from a recorded line, which is the defect this guard exists
+# to catch, and answering both questions needs two evaluations and a caller
+# that knows which it wants. Pinned by
+# test_the_reader_and_the_install_diverge_on_a_default_assignment in
+# tests/test_install_script.py, and the recorded-spellings list next to
+# test_a_spelling_only_bash_sees_still_counts_as_recorded leaves `:=` out
+# rather than certifying an agreement that is not there.
+#
+# A subshell of this shell, then, and not a `bash -c` child, which inherits
+# only what is exported. install.defaults.env is sourced without `set -a`
+# (see the block above `main`), so every `DEFAULT_*` is one of this shell's
+# unexported variables and a child process cannot see any of them. A file
+# spelled `ENABLE_GVISOR=$DEFAULT_ENABLE_GVISOR` -- admitted, because the file
+# is shell -- then assigns `true` on the live path and empty in a child, and
+# the interview guard reports drift on every interactive run against a file
+# that agrees with the install.
+#
+# Executing the file is not a new exposure. The real shell sources it at
+# startup and every front door sources it again; a throwaway subshell that
+# reads keys back is strictly less than either.
+#
+# `%q` so a value carrying a newline still arrives as one line the caller can
+# eval, and `>/dev/null 2>&1` keeps a chatty file out of the caller's output.
+read_recorded_install_env_values() {
+  local file="${1:-}"
+  shift || true
+  [ -n "$file" ] && [ -f "$file" ] && [ "$#" -gt 0 ] || return 0
+
+  if [ "$RECORDED_INSTALL_ENV_FILE" != "$file" ]; then
+    local stale
+    for stale in $RECORDED_INSTALL_ENV_KEYS; do
+      unset "${RECORDED_VALUE_PREFIX}${stale}" "${RECORDED_SET_PREFIX}${stale}"
+    done
+    RECORDED_INSTALL_ENV_KEYS=""
+    RECORDED_INSTALL_ENV_FILE="$file"
+  fi
+
+  local key slot
+  local pending=()
+  for key in "$@"; do
+    slot="${RECORDED_SET_PREFIX}${key}"
+    [ -n "${!slot-}" ] || pending+=("$key")
+  done
+  [ "${#pending[@]}" -gt 0 ] || return 0
+
+  # The sourcing below runs under `set +u`, and the unset above is why. A file
+  # line that expands a requested key before assigning it -- K="$K,extra" --
+  # finds it unbound here and nowhere else: the live readers do not unset, so
+  # that line is answered by whatever the calling shell exports and the install
+  # carries on. Left under -u the assignment fails, the key stays unset, and the
+  # guard tells the operator the file records no K while the install is using
+  # the K it records. Unbound expands empty now, which is what the file assigns
+  # when nothing exports the key -- the question the unset was asked.
+  #
+  # The comment lives out here rather than beside the `set +u`: bash 3.2
+  # mis-scans some comment text inside a command substitution and swallows the
+  # rest of the file into it, with `bash -n` and shellcheck both clean.
+  eval "$(
+    {
+      # set -E propagates this script's ERR trap into the subshell, where a
+      # line of the file that exits non-zero would print an abort banner.
+      trap - ERR
+      # The keys as positional parameters, so the loop below survives a file
+      # that assigns to `key` or `pending` -- both of which are this
+      # function's locals and therefore visible here, unlike in a child.
+      set -- "${pending[@]}"
+      # `|| true`: unsetting a name the script made readonly fails, and the
+      # remaining keys still have answers owed to them.
+      for key in "$@"; do unset "$key" 2>/dev/null || true; done
+      source_as_the_install_does() {
+        set -a
+        set +u
+        # shellcheck disable=SC1090
+        . "$1" >/dev/null 2>&1 || true
+        set -u
+        set +a
+      }
+      source_as_the_install_does "$file"
+      for key in "$@"; do
+        if [ -n "${!key+x}" ]; then
+          printf "%s%s=1\n" "$RECORDED_SET_PREFIX" "$key"
+          printf "%s%s=%q\n" "$RECORDED_VALUE_PREFIX" "$key" "${!key}"
+        else
+          printf "%s%s=0\n" "$RECORDED_SET_PREFIX" "$key"
+          printf "%s%s=\n" "$RECORDED_VALUE_PREFIX" "$key"
+        fi
+      done
+    } 2>/dev/null || true
+  )"
+  RECORDED_INSTALL_ENV_KEYS="${RECORDED_INSTALL_ENV_KEYS}${RECORDED_INSTALL_ENV_KEYS:+ }${pending[*]}"
+}
+
 # The value install.env records for one key, empty when it records none.
-# Reads the file rather than the environment: install.env was sourced at
-# startup into these very names, and the interview has since overwritten them,
-# so the environment no longer remembers what the file said.
 #
 # Always returns 0. A `return 1` for "no such key" would be the natural
 # signature and is the wrong one here: this is called from a command
 # substitution, `set -E` propagates the ERR trap into that subshell, and the
 # trap fires on the non-zero return before the caller's `||` is ever consulted
-# -- printing an abort banner per absent key. Callers test presence separately.
-#
-# The value is unquoted the way sourcing the file would unquote it, because
-# both things that write install.env quote it. write_env_var here and
-# save_env_var in scripts/installer/installer_common.sh both serialise with
-# `printf '%s=%q\n'`, and %q renders the empty string as the two-character
-# literal '' and escapes anything the shell would treat specially -- so
-# `#gke-alerts` is written `\#gke-alerts`. Comparing a quoted recorded value
-# against an unquoted environment one reports every empty key as drifted, and
-# the line the banner prints for each (`KEY=`) changes nothing, so the next run
-# reports them again. That buries the
-# one case the warning exists for.
-#
-# A hand-authored file is the other half of the same problem and the reason
-# this cannot simply re-quote the current value and compare the quoted forms:
-# an operator writes `SLACK_HOME_CHANNEL="#gke-alerts"`, which %q would render
-# `\#gke-alerts`, and the two spellings of one value would not match.
-unquote_shell_value() {
-  local raw="${1:-}"
-  case "$raw" in
-    # Single quotes are literal all the way through, which is also how %q
-    # spells the empty string.
-    "'"*"'")
-      raw="${raw#\'}"
-      printf '%s' "${raw%\'}"
-      return 0
-      ;;
-    '"'*'"')
-      raw="${raw#\"}"
-      raw="${raw%\"}"
-      ;;
-  esac
-  # Outside single quotes a backslash escapes the next character. That is how
-  # %q writes '#', a space, and every other metacharacter.
-  printf '%s' "$raw" | sed 's/\\\(.\)/\1/g'
+# -- printing an abort banner per absent key. install_env_records_key is the
+# presence test, and it is safe because `if` suppresses the trap.
+recorded_install_env_value() {
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 0
+  read_recorded_install_env_values "$file" "$key"
+  local slot="${RECORDED_VALUE_PREFIX}${key}"
+  printf "%s" "${!slot-}"
 }
 
-recorded_install_env_value() {
-  local file="${1:-}" key="${2:-}" line=""
-  [ -n "$file" ] && [ -f "$file" ] || return 0
-  # install.env.example tells the operator `export K=V` is harmless, and every
-  # other reader of the file honours that: save_env_var, live_test_lease.py and
-  # project_config.py all skip an optional `export`. Matching it here keeps this
-  # reader in step -- missing the prefix skips the key silently, and in the
-  # direction of no warning at all.
-  # The `${line#*=}` below strips through the first `=`, so the longer prefix
-  # needs nothing further.
-  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
-  [ -n "$line" ] || return 0
-  line="${line#*=}"
-  unquote_shell_value "$line"
+# Whether install.env assigns the key at all, told apart from assigning it
+# empty, by the same evaluation that reads the value.
+install_env_records_key() {
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 1
+  read_recorded_install_env_values "$file" "$key"
+  local slot="${RECORDED_SET_PREFIX}${key}"
+  [ "${!slot-0}" = "1" ]
 }
 
 # Say so when an interactive answer changed something the file still records
 # differently.
 #
 # install.env is an input: install.sh creates one when there is none and never
-# rewrites it. The interview, though, still runs in full on every interactive
+# rewrites a line of it. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
-# tells them: "Left your install configuration as you wrote it" reads as
-# reassurance, and the Day-2 menu's Save & Apply is the only path that writes a
-# key back.
+# tells them: "Kept your install configuration" reads as reassurance, and the
+# Day-2 menu's Save & Apply is the only path that writes a changed key back.
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
-# needs the installer to treat it as read-only. Naming the drift costs nothing
-# and leaves the decision where it belongs.
+# needs the installer not to rewrite it. Naming the drift costs nothing
+# and leaves the decision where it belongs. The one write install.sh does make
+# is narrower: a chat key the file does not assign, appended from a chat flag
+# with the settings a toggle recorded true brings (record_flags_into_install_env);
+# it never changes a key the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1401,8 +1703,13 @@ recorded_install_env_value() {
 warn_unrecorded_interview_answers() {
   local file="${1:-}"
   [ -n "$file" ] && [ -f "$file" ] || return 0
-  # A non-interactive run typed nothing; its answers came from flags and this
-  # very file, so there is no drift to report that the operator did not author.
+  # A non-interactive run answered no prompt, so the drift this names (an
+  # answer typed at the interview) cannot happen there. A flag can still beat
+  # the file on such a run: the chat flags are refused, or queued for the
+  # record, before this runs (check_flags_against_install_env), and the other
+  # keys in the list below that have a flag (--model-max-tokens, --memory,
+  # --permission-set and the rest) still apply for one run with no warning on a
+  # non-interactive run.
   [ "$PARAM_NON_INTERACTIVE" != "true" ] || return 0
   has_controlling_tty || return 0
   [ "$PARAM_DRY_RUN" != "true" ] || return 0
@@ -1426,12 +1733,16 @@ warn_unrecorded_interview_answers() {
   #      and having the next run derive multiuser_memory from the unchanged file
   #      and tear the Hindsight API and its Postgres back down.
   local key recorded current drifted=""
-  for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
-    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
+  local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
+    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
+    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+  # One evaluation of the file for the whole list, in this shell, so the reads
+  # below land on the cache instead of re-running whatever the file's lines run.
+  read_recorded_install_env_values "$file" "${interview_keys[@]}"
+  for key in "${interview_keys[@]}"; do
+    install_env_records_key "$file" "$key" || continue
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
       MEMORY) current="${PARAM_MEMORY:-}" ;;
@@ -1443,7 +1754,7 @@ warn_unrecorded_interview_answers() {
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never rewrites it."
+  print_info "install.env is an input: install.sh reads it and never changes a key it sets."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1537,12 +1848,30 @@ note_stale_network_policy_acceptance() {
 #
 # repeat_on names the routes that accept the flag: --agent-namespace is taken
 # by install.sh, upgrade.sh and --menu; --enable-gke-backup-plan is install.sh-only.
+#
+# Pass empty_is_unrecorded=true for a key the generator resolves against a
+# shipped default that is true. write_tfvars_from_state reads every boolean as
+# ${KEY:-<default>}, so a bare `ENABLE_DRIFT_DETECTOR=` line provisions on the
+# next run exactly as a silent file does -- while is_truthy below reads that
+# same "" as off and returns before printing. The two readers would then
+# disagree about what an empty value means, and the one shape the turning-off
+# warning exists for is the shape it cannot see. Only a key whose default is
+# true is affected, which is why this is opt-in: for a default-false key an
+# empty line really does resolve to off, and the comparison is already right.
+# The "records no KEY" wording the else branch prints is accurate for it --
+# the line is there, the value is not, and "Set KEY=... in install.env" is
+# still the remedy.
 warn_flag_beats_unrecorded_file_value() {
-  local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}"
+  local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}" empty_is_unrecorded="${8:-false}"
   [ -n "$value" ] || return 0
-  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
-    local recorded
+  local recorded="" file_records_key="false"
+  if install_env_records_key "$file" "$key"; then
     recorded="$(recorded_install_env_value "$file" "$key")"
+    if [ "$empty_is_unrecorded" != "true" ] || [ -n "$recorded" ]; then
+      file_records_key="true"
+    fi
+  fi
+  if [ "$file_records_key" = "true" ]; then
     if [ "$compare_as_bool" = "true" ]; then
       if is_truthy "$recorded"; then
         is_truthy "$value" && return 0
@@ -1557,21 +1886,300 @@ warn_flag_beats_unrecorded_file_value() {
     print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
   fi
   print_info "$consequence"
+  # The bare form of a boolean flag means true (flag_bool_value), so "repeat
+  # --enable-drift-detector" told an operator who typed --enable-drift-detector=false
+  # to do the opposite of what they chose -- following it would re-provision
+  # the ingress the run they were warned about had just dropped, and the file
+  # still recording true would leave the guard silent about that. Render the
+  # value for a boolean whose chosen value is not true.
+  #
+  # Only for a boolean. A list flag's value is space-separated, so
+  # "--scope-projects=a b c" would not paste back as one argument, and the
+  # first remedy on this line already carries the value for it.
+  #
+  # `=false`, not the value as spelled. is_truthy reads `no`, `0`, `off` and
+  # `False` as off, and an exported ENABLE_GKE_BACKUP_PLAN=no arrives here
+  # verbatim -- but validate_bool_flag_value accepts only the literals `true`
+  # and `false`, so pasting the spelling back would print a remedy the
+  # installer rejects. The warning line above already carries what was given;
+  # this line has to be runnable.
+  local repeat_flag="$flag"
+  if [ "$compare_as_bool" = "true" ] && ! is_truthy "$value"; then
+    repeat_flag="${flag}=false"
+  fi
   # %q, because the scope keys are the first list-valued values through here and
   # a space-separated one printed bare would not paste back as one assignment.
-  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${flag} on ${repeat_on}."
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
+}
+
+# The chat flags are held to install.env rather than warned about. Each of them
+# configures something upgrade.sh renders from the file alone, and upgrade.sh
+# takes none of them, so one that beat the file for a single run would be undone
+# by the next upgrade with no one told: a Slack relay switched off, a home
+# channel or an allowlist put back. So against an existing install.env:
+#
+#   - a flag that disagrees with the key the file assigns is refused before
+#     anything is applied, naming the file and the key;
+#   - a flag whose key the file does not assign at all (a hand-written file, or
+#     one copied from install.env.example with the line commented out) has
+#     nothing to disagree with, and the value the run applies is appended to
+#     the file once the run commits, so upgrade.sh renders what is running;
+#     a toggle recorded true brings the integration's other settings the file
+#     lacks, the allowlist first among them, since an empty one admits everyone;
+#   - a flag that agrees changes nothing.
+#
+# Credentials are the exception to the second rule: a Slack token the file does
+# not carry is never written there, because its home is the live Secret, which
+# write_tfvars_from_state recovers it from on every later run, and
+# PERSIST_SECRETS_ON_DISK=false keeps credentials out of every file. A token the
+# file does carry is still held to it, since the file's copy is the one a later
+# run renders.
+#
+# A file the installer created assigns every one of these keys but the tokens,
+# so on such a file nothing is ever appended; only a refusal or a no-op can
+# follow. --chat-sub-name is left out: the subscription name is read back from
+# Terraform state, which outranks both the flag and the file on a running
+# install (write_tfvars_from_state). The same holds for an
+# install.env rendered for CI from a full set of variables. A rendered file
+# that omits a key gets the key appended, on the runner that owns the file.
+
+# The keys an integration renders beside its toggle, recorded with a toggle
+# recorded true where the file lacks them (record_flags_into_install_env). Not
+# the tokens, whose home is the live Secret, and not CHAT_SUB_NAME, which a
+# running install reads from Terraform state.
+install_env_toggle_companions() {
+  case "${1:-}" in
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
+    *) ;;
+  esac
+}
+
+# A chat flag this run typed, noted for check_flags_against_install_env. Its
+# value is read from the PARAM_* at check time, so a flag given twice is checked
+# at the value that won.
+note_install_env_flag() {
+  local key="$1" flag="$2" kind="$3" param="$4" default_var="${5:-}"
+  case $'\n'"$INSTALL_ENV_FLAGS_TYPED" in
+    *$'\n'"${key}|"*) return 0 ;;
+  esac
+  INSTALL_ENV_FLAGS_TYPED="${INSTALL_ENV_FLAGS_TYPED}${key}|${flag}|${kind}|${param}|${default_var}"$'\n'
+}
+
+# One flag against the key an existing install.env records. Returns 1, having
+# said why, when the two disagree; queues the key for
+# record_flags_into_install_env when the file does not assign it. A key with a
+# default that the file sets empty resolves to the default, as
+# write_tfvars_from_state reads it, so that is the value compared; the chat
+# strings pass no default, because for them empty is the value rendered.
+# Needs installer_common.sh sourced.
+check_flag_against_install_env() {
+  local file="$1" key="$2" flag="$3" kind="$4" value="$5" default="${6:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  if ! install_env_records_key "$file" "$key"; then
+    [ "$kind" != "$INSTALL_ENV_FLAG_KIND_CREDENTIAL" ] || return 0
+    case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+      *" ${key} "*) ;;
+      *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }${key}" ;;
+    esac
+    if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+      print_info "${file} assigns no ${key}; a run without --dry-run records the ${key} it applies there, from ${flag}."
+      local companions
+      companions="$(install_env_toggle_companions "$key")"
+      if [ -n "$companions" ]; then
+        print_info "If that is true, it also records the ${companions// /, } it applies, where ${file} assigns none."
+      fi
+    fi
+    return 0
+  fi
+  local recorded recorded_shown
+  recorded="$(recorded_install_env_value "$file" "$key")"
+  recorded_shown="${key}=$(printf '%q' "$recorded")"
+  if [ -z "$recorded" ] && [ -n "$default" ]; then
+    recorded="$default"
+    recorded_shown="${key} empty, which is ${default}"
+  fi
+  case "$kind" in
+    "$INSTALL_ENV_FLAG_KIND_BOOL")
+      if is_truthy "$recorded"; then
+        if is_truthy "$value"; then return 0; fi
+      else
+        if ! is_truthy "$value"; then return 0; fi
+      fi
+      ;;
+    "$INSTALL_ENV_FLAG_KIND_CREDENTIAL")
+      # Empty is not a value, recorded or typed: the generator recovers an
+      # empty credential from the live Secret, as it does a missing one. A
+      # typed empty is a wrapper's unset variable (provision_environment.sh
+      # passes --slack-bot-token="${SLACK_BOT_TOKEN:-}"), not a new token.
+      [ -n "$recorded" ] || return 0
+      [ -n "$value" ] || return 0
+      [ "$recorded" != "$value" ] || return 0
+      print_error "${flag} gives a different ${key} from the one ${file} records, so it would hold for this run only."
+      print_info "The next install.sh run without the flag, and every upgrade.sh, renders the ${key} the file records."
+      print_info "Replace ${key} in ${file} with the new value and re-run without ${flag}."
+      return 1
+      ;;
+    "$INSTALL_ENV_FLAG_KIND_LIST")
+      [ "$(hcl_csv_list "$recorded")" != "$(hcl_csv_list "$value")" ] || return 0
+      ;;
+    *)
+      [ "$recorded" != "$value" ] || return 0
+      ;;
+  esac
+  print_error "${flag}=$(printf '%q' "$value") disagrees with the install configuration, so it would hold for this run only: ${file} records ${recorded_shown}."
+  print_info "The next install.sh run without the flag, and every upgrade.sh, renders from the file and goes back to it. install.sh records a chat flag only where install.env assigns no such key; it does not change a key the file assigns."
+  local remedy
+  remedy="Set ${key}=$(printf '%q' "$value") in ${file}"
+  case " ${INSTALL_ENV_KEYS_THE_MENU_SAVES} " in
+    *" ${key} "*) remedy="${remedy}, or change it with './install.sh --menu'" ;;
+  esac
+  remedy="${remedy}, and re-run without ${flag}"
+  if [ "$key" = "SLACK_ENABLED" ] && is_truthy "$value"; then
+    remedy="${remedy}, passing --slack-bot-token and --slack-app-token (or answering their prompts on an interactive run)"
+  fi
+  print_info "${remedy}."
+  return 1
+}
+
+# Every chat flag this run typed, against an existing install.env. Each
+# disagreement is named before the run stops, so one run lists them all.
+check_flags_against_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" entry key flag kind param default_var default refused="false"
+  [ -n "$INSTALL_ENV_FLAGS_TYPED" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  # Read into arrays before anything evaluates the file, which a here-string
+  # still open on stdin would hand to any line of it that reads input.
+  local entries=() keys=()
+  while IFS= read -r entry; do
+    if [ -n "$entry" ]; then
+      entries+=("$entry")
+      keys+=("${entry%%|*}")
+    fi
+  done <<< "$INSTALL_ENV_FLAGS_TYPED"
+  # One evaluation of the file for every key, in this shell, so the reads
+  # below land on the cache.
+  read_recorded_install_env_values "$file" "${keys[@]}"
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r key flag kind param default_var <<< "$entry"
+    default=""
+    [ -z "$default_var" ] || default="${!default_var-}"
+    check_flag_against_install_env "$file" "$key" "$flag" "$kind" "${!param-}" "$default" || refused="true"
+  done
+  # A key to record into a file this run cannot write would fail at the record,
+  # which sits after the existing-cluster changes; say so now instead.
+  if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ] && [ ! -w "$file" ]; then
+    print_error "${file} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }, which this run would record there, and it is not writable."
+    print_info "Make it writable, or add the keys to it yourself, and re-run."
+    refused="true"
+  fi
+  [ "$refused" = "false" ]
+}
+
+# The keys check_flags_against_install_env found install.env not to assign,
+# appended with the value this run applies: the exported KEY that
+# write_tfvars_from_state rendered, which on an interactive run is the
+# interview's answer and not necessarily the flag. The one write install.sh
+# makes to an install.env it did not create, and only of keys the file lacks,
+# so nothing the operator wrote changes. main calls it on each route as the last
+# step before the handoff or the apply, past the confirmation and every step
+# that can stop the run, so a run refused, declined or failed before the apply,
+# and a --dry-run, leave the file as it was. An apply that then fails has
+# recorded what it was applying, which is what the next run should retry.
+#
+# Answering `n` at the step-11 confirmation records nothing. The pause message
+# names a lifecycle.sh apply, but `n` is also the answer of an operator who saw
+# something wrong in the summary and walked away, and a file that then records
+# the integration on would have the next upgrade.sh provision what they
+# declined. warn_install_env_keys_not_recorded names the lines instead.
+#
+# A toggle recorded true brings the settings of its integration that the file
+# also lacks (install_env_toggle_companions), with the values this run applied
+# to them. Without them the next upgrade.sh would render the integration on
+# with an empty allowlist, which admits everyone, and with no home channel,
+# when this run applied an allowlist the operator gave at the prompt or as an
+# export. The file install.sh writes on a first install records the toggle and
+# these keys together, and the Day-2 menu saves the Google Chat toggle with its
+# allowlist, topic and home channel; the tokens are still never written.
+record_flags_into_install_env() {
+  local file="${INSTALL_ENV_FILE:-}" key value
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  # A last line with no newline would run into the appended assignment.
+  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+    printf '\n' >> "$file"
+  fi
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    value="${!key-}"
+    write_env_var "$file" "$key" "$value"
+    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so later runs and upgrade.sh render it."
+  done
+  INSTALL_ENV_KEYS_TO_RECORD=""
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# The step-11 `n`: what record_flags_into_install_env would have appended, as
+# the lines to append, so an operator who does go on to apply the tfvars by
+# hand can make the file match first. Never a token: those are never queued.
+warn_install_env_keys_not_recorded() {
+  local file="${INSTALL_ENV_FILE:-}" key
+  [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  resolve_install_env_record_keys "$file"
+  print_warning "${file} assigns no ${INSTALL_ENV_RECORD_KEYS// /, }, and pausing here did not record them: a run abandoned at this prompt leaves the file as it was."
+  print_info "If you go on to run lifecycle.sh apply by hand, first add these lines to ${file}, so a later upgrade.sh renders what you applied:"
+  for key in $INSTALL_ENV_RECORD_KEYS; do
+    printf '    %s=%q\n' "$key" "${!key-}"
+  done
+}
+
+# The keys record_flags_into_install_env appends, in INSTALL_ENV_RECORD_KEYS:
+# the queued ones, each toggle queued true followed by the companions the file
+# lacks, and the toggles last. Computed in full before the first write, while
+# the file still reads as the run found it. The toggles go last: a write that
+# stops partway (Ctrl-C before the apply, a full disk) then leaves settings
+# with the integration off, never the integration on with no allowlist, which
+# admits everyone and which no re-run repairs, since the flag then agrees with
+# the file.
+resolve_install_env_record_keys() {
+  local file="$1" key companion record_keys="" toggles=""
+  # Every companion in one read of the file rather than one per key.
+  # shellcheck disable=SC2046
+  read_recorded_install_env_values "$file" $(install_env_toggle_companions SLACK_ENABLED) $(install_env_toggle_companions GOOGLE_CHAT_ENABLED)
+  for key in $INSTALL_ENV_KEYS_TO_RECORD; do
+    if [ -z "$(install_env_toggle_companions "$key")" ]; then
+      record_keys="${record_keys}${record_keys:+ }${key}"
+      continue
+    fi
+    toggles="${toggles}${toggles:+ }${key}"
+    is_truthy "${!key-}" || continue
+    for companion in $(install_env_toggle_companions "$key"); do
+      case " ${record_keys} ${INSTALL_ENV_KEYS_TO_RECORD} " in
+        *" ${companion} "*) continue ;;
+      esac
+      if ! install_env_records_key "$file" "$companion"; then
+        record_keys="${record_keys}${record_keys:+ }${companion}"
+      fi
+    done
+  done
+  INSTALL_ENV_RECORD_KEYS="${record_keys}${record_keys:+${toggles:+ }}${toggles}"
 }
 
 bootstrap_install_env_file() {
   local destination="${1:-}" image_tag="${2:-}"
   [ -n "$destination" ] || return 0
   if [ -f "$destination" ]; then
-    print_info "Left your install configuration as you wrote it: ${destination}"
+    print_info "Kept your install configuration: ${destination}"
+    # The chat flags check_flags_against_install_env queued: written only once
+    # this run goes on to the apply or the handoff (record_flags_into_install_env).
+    if [ -n "$INSTALL_ENV_KEYS_TO_RECORD" ] && [ "${PARAM_DRY_RUN:-false}" != "true" ]; then
+      print_info "${destination} assigns no ${INSTALL_ENV_KEYS_TO_RECORD// /, }: the values this run applies to them are recorded there if it goes on to the apply or the handoff."
+    fi
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
-    # The two flags that override a recorded value for one run. This function
-    # never rewrites an existing file, so only a first install can record either
-    # on the operator's behalf.
+    # The flags that override a recorded value for one run. This function
+    # never rewrites an existing file, so only a first install can record any of
+    # them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -1582,17 +2190,213 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    # Five consequence strings, unlike every other call here, which take one.
+    # This key is the only one whose consequence varies, and it varies on
+    # three things at once.
+    #
+    # Direction. Turning it ON leaves the loss for a later run; turning it OFF
+    # over something that asks for it on does the destroying now, and the later
+    # run re-reads that source and puts it back. The wrong one of those tells
+    # the operator the destruction is deferred at the moment it is about to
+    # happen.
+    #
+    # Whether anything is destroyed at all, which the TF_VAR_ block below
+    # explains.
+    #
+    # And whether the source a later run restores from is the shipped default
+    # rather than the file or the shell, which is the fifth string and the one
+    # the flipped default added: it is the only case where nothing ever asked
+    # for the trio, so it is the only one that cannot assert the trio is there
+    # to destroy.
+    #
+    # A string that covered every case would say nothing an operator could act
+    # on, and each of these is read by someone about to be surprised.
+    local drift_detector_chosen="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
+    local drift_detector_recorded drift_detector_consequence drift_detector_turning_off=""
+    # Both drift keys in one evaluation of the file, in this shell, so the two
+    # reads below and the guard's own presence test share it.
+    read_recorded_install_env_values "$destination" ENABLE_DRIFT_DETECTOR TF_VAR_enable_drift_pubsub
+    drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
+    # What a later run that passes no flag resolves the key to, and where it
+    # reads it back from. One cascade, because the guard's whole question is
+    # whether this run differs from that run, and a value and a source that
+    # disagree would name one thing and warn about another.
+    #
+    # The file when it records one; otherwise this shell's own export --
+    # PARAM_ENABLE_DRIFT_DETECTOR is seeded from the environment before
+    # parse_args overwrites it, so that export is what the next run from this
+    # shell chooses and what an upgrade.sh from it regenerates on.
+    # SHELL_ENABLE_DRIFT_DETECTOR rather than ENABLE_DRIFT_DETECTOR because
+    # main() has already overwritten the latter with this run's choice; the
+    # comment beside the capture has the consequence of reading the wrong one.
+    # Otherwise the shipped default, which is the arm that carries the weight
+    # now that DEFAULT_ENABLE_DRIFT_DETECTOR is true: saying nothing is on, so
+    # the file being silent no longer means a later run leaves the detector
+    # alone -- it means a later run turns it on.
+    #
+    # Emptiness decides each step, not truthiness, which it did not have to
+    # before. With the default false an unset export and an exported `false`
+    # both resolved to off, so conflating them was harmless; with the default
+    # true only the second is off, and reading a set-but-falsy export as
+    # "absent" would fall through to the default and claim a later run turns
+    # the detector on when that shell turns it off.
+    local drift_detector_restorer drift_detector_later drift_detector_later_is_default=""
+    if [ -n "$drift_detector_recorded" ]; then
+      drift_detector_later="$drift_detector_recorded"
+      drift_detector_restorer="$destination"
+    elif [ -n "${SHELL_ENABLE_DRIFT_DETECTOR:-}" ]; then
+      drift_detector_later="$SHELL_ENABLE_DRIFT_DETECTOR"
+      drift_detector_restorer="the ENABLE_DRIFT_DETECTOR=${SHELL_ENABLE_DRIFT_DETECTOR} this shell exports"
+    else
+      drift_detector_later="$DEFAULT_ENABLE_DRIFT_DETECTOR"
+      drift_detector_restorer="the shipped ENABLE_DRIFT_DETECTOR default (${DEFAULT_ENABLE_DRIFT_DETECTOR})"
+      drift_detector_later_is_default="true"
+    fi
+    # Warn only on a disagreement, in either direction. Both arms of this
+    # swapped when the default did. `--enable-drift-detector` over a file that
+    # records nothing used to be the reversal worth announcing and is now what
+    # the install does anyway, so it says nothing; `--enable-drift-detector=false`
+    # over that same file used to be the harmless one and is now the reversal,
+    # because the flag applies to this run and the next run reads the default
+    # and turns the detector back on. Getting this backwards is silent either
+    # way: a warning nobody needs, or an opt-out that expires without a word.
+    if [ -n "$drift_detector_chosen" ]; then
+      if is_truthy "$drift_detector_chosen"; then
+        if is_truthy "$drift_detector_later"; then
+          drift_detector_chosen=""
+        fi
+      elif is_truthy "$drift_detector_later"; then
+        drift_detector_turning_off="true"
+      else
+        drift_detector_chosen=""
+      fi
+    fi
+    # The other axis: whether dropping the two tfvars keys destroys the ingress
+    # at all. It does not on an install whose install.env carries a hand-written
+    # TF_VAR_enable_drift_pubsub=true line, which was the only front-door route
+    # to the ingress before this key existed. write_tfvars_from_state omits both
+    # drift keys rather than writing false precisely so that line keeps working,
+    # and a tfvars key beats TF_VAR_, so dropping them there stops the detector
+    # and leaves the sink, topic and subscription standing. Telling that
+    # operator their audit records are about to be deleted is how a warning gets
+    # discounted, and this is the population most likely to try the new key.
+    #
+    # Which source answers that depends on which apply the sentence is about,
+    # and the two branches below are about different ones.
+    #
+    # Turning off asks about the apply that is seconds away. Terraform reads
+    # TF_VAR_ out of the environment the front door hands it, and nothing on
+    # the way here unsets TF_VAR_* (load_install_env clears NAMESPACE and the
+    # five SCOPE_ keys, upgrade.sh clears three more, neither list reaches
+    # these), so a hand-written file line and a shell export both survive to
+    # `terraform apply` and either one keeps the trio standing through it.
+    # Reading only the file would tell the exporting operator this apply
+    # deletes their audit records when it does not, which is how a warning
+    # gets discounted.
+    #
+    # Turning on asks about a later run, and a later run is from whatever
+    # shell the operator is in by then, so only the file line counts. An
+    # operator who provisioned the ingress with
+    # `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has
+    # an upgrade.sh from a clean shell that regenerates tfvars with neither
+    # key, falls to the variable's false default and destroys the trio;
+    # promising them a sink that survives is the same discounting in the
+    # other direction. This function never rewrites an existing file, so a
+    # line read here is a line that is still there after.
+    #
+    # There is no caveat on the turning-off branch any more, and the default
+    # is why. It used to read "the first run from a shell exporting neither
+    # destroys them", which was true while a clean-shell run that found the
+    # file silent wrote neither tfvars key. Such a run now falls to
+    # DEFAULT_ENABLE_DRIFT_DETECTOR, writes both and provisions the trio, so
+    # on every path that could still reach the caveat the sentence is false --
+    # and it was spliced in front of a clause saying a later run starts the
+    # detector again, which it would now flatly contradict.
+    local drift_ingress_recorded
+    drift_ingress_recorded="$(recorded_install_env_value "$destination" TF_VAR_enable_drift_pubsub 2>/dev/null || true)"
+    local drift_ingress_keeper_file="" drift_ingress_keeper_now=""
+    if is_truthy "${drift_ingress_recorded:-false}"; then
+      drift_ingress_keeper_file="the TF_VAR_enable_drift_pubsub line in ${destination}"
+      drift_ingress_keeper_now="$drift_ingress_keeper_file"
+    elif is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
+      drift_ingress_keeper_now="TF_VAR_enable_drift_pubsub in this shell's environment"
+    fi
+    if [ -n "$drift_detector_turning_off" ]; then
+      if [ -n "$drift_ingress_keeper_now" ]; then
+        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; ${drift_ingress_keeper_now} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads. A later run without the flag re-reads ${drift_detector_restorer} and starts the detector again."
+      elif [ -n "$drift_detector_later_is_default" ]; then
+        # The default arm hedges the destroy where the other two assert it,
+        # and the file being silent is the reason. A recorded or exported
+        # value means some earlier run was told to provision the trio; the
+        # default means nothing was ever told anything, so the trio exists
+        # only if a run since this release already applied it -- which, for
+        # the first run after an upgrade, it has not. Asserting a destroy
+        # there would promise the operator the loss of audit records they do
+        # not have, and a warning that over-claims once is discounted after.
+        drift_detector_consequence="This run writes neither drift tfvars key, so the detector is off for it, and this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there if a run since the detector became the default provisioned them -- with -auto-approve and no plan shown first. A later run without the flag re-reads ${drift_detector_restorer} and provisions them again, empty."
+      else
+        drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads ${drift_detector_restorer} and provisions them again, empty."
+      fi
+    elif [ -n "$drift_ingress_keeper_file" ]; then
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it re-reads ${drift_detector_restorer}, writes neither and stops the detector; ${drift_ingress_keeper_file} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
+    else
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it re-reads ${drift_detector_restorer}, writes neither, and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
+    fi
+    # The trailing true is empty_is_unrecorded, and it is what keeps this call
+    # agreeing with the cascade above: that reads the recorded value with -n,
+    # so a bare ENABLE_DRIFT_DETECTOR= line falls through to the default arm
+    # and is already being warned about as a reversal. Without it the helper
+    # would read the same "" as a recorded `false`, agree with the flag and
+    # print nothing.
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
+      "$drift_detector_chosen" \
+      "$drift_detector_consequence" \
+      true \
+      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file and from whatever the calling shell still exports, so the file is the only remedy that does not depend on which shell runs the upgrade" \
+      true
+    # Gateway redaction: a flag turns it on for this run, and the next
+    # upgrade.sh or --menu apply regenerates from the file.
+    warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_ENABLED --litellm-redaction \
+      "${PARAM_LITELLM_REDACTION_ENABLED:-}" \
+      "A later run without it renders gateway redaction from what the file records, so the next upgrade.sh or --menu apply turns off redaction this run turned on." \
+      true \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_IP_ACTION --litellm-redaction-ip-action \
+      "${PARAM_LITELLM_REDACTION_IP_ACTION:-}" \
+      "A later run without it takes the IP action the file records, or pseudonym when it records none." \
+      false \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_IP_ALLOW_CIDRS --litellm-redaction-ip-allow-cidrs \
+      "${PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS:-}" \
+      "A later run without it takes the networks the file records, and the model stops seeing the addresses only this run allowed." \
+      false \
+      "every later install.sh run"
+    # The scoped service account pool: a flag arms or disarms it, or moves its
+    # cap, for this run, and the next upgrade.sh or --menu apply regenerates
+    # from the file and reverses it either way, so the consequence is read in
+    # both directions rather than assuming the flag armed.
+    warn_flag_beats_unrecorded_file_value "$destination" SCOPED_SA_POOL_ENABLED --scoped-sa-pool-enabled \
+      "${PARAM_SCOPED_SA_POOL_ENABLED:-}" \
+      "A later run without it renders the pool from what the file records, so the next upgrade.sh or --menu apply reverses this run's choice: pool accounts this run created are deleted and the broker disarmed, or accounts this run deleted are recreated and the broker re-armed." \
+      true \
+      "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" SCOPED_SA_POOL_MAX_ACCOUNTS --scoped-sa-pool-max-accounts \
+      "${PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS:-}" \
+      "A later run without it takes the cap the file records, or the module's 100 when it records none, and refuses a pool past that at plan." \
+      false \
+      "every later install.sh run"
     # The scope keys: a flag applies its declaration for this run, and the
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
     local scope_key scope_flag scope_value
-    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
       case "$scope_key" in
         SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
         SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
         SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
         SCOPE_SHARED_VPC_HOSTS) scope_flag="--scope-shared-vpc-hosts"; scope_value="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}" ;;
         SCOPE_METRICS_SCOPES) scope_flag="--scope-metrics-scopes"; scope_value="${PARAM_SCOPE_METRICS_SCOPES:-}" ;;
+        SCOPE_MAX_PROJECTS) scope_flag="--scope-max-projects"; scope_value="${PARAM_SCOPE_MAX_PROJECTS:-}" ;;
         SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
         *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
       esac
@@ -1615,7 +2419,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never rewrites it."
+    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -1630,6 +2434,10 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
+  write_env_var "$tmp" LITELLM_REDACTION_ENABLED "${LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  write_env_var "$tmp" LITELLM_REDACTION_IP_ACTION "${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+  write_env_var "$tmp" LITELLM_REDACTION_IP_ALLOW_CIDRS "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
+  write_env_var "$tmp" LITELLM_REDACTION_RULES "${LITELLM_REDACTION_RULES:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
@@ -1662,8 +2470,11 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
   write_env_var "$tmp" SCOPE_SHARED_VPC_HOSTS "${SCOPE_SHARED_VPC_HOSTS:-}"
   write_env_var "$tmp" SCOPE_METRICS_SCOPES "${SCOPE_METRICS_SCOPES:-}"
+  write_env_var "$tmp" SCOPE_MAX_PROJECTS "${SCOPE_MAX_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
+  write_env_var "$tmp" SCOPED_SA_POOL_ENABLED "${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
+  write_env_var "$tmp" SCOPED_SA_POOL_MAX_ACCOUNTS "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
@@ -1676,6 +2487,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
   # Recorded only when this run accepted it -- the decision, not the flag: a
   # flag passed against a cluster that already enforces accepted nothing. The
   # key is a standing decision about this cluster, and every later generator
@@ -2026,6 +2838,10 @@ resolve_shared_defaults() {
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  # No PARAM_ENABLE_DRIFT_DETECTOR. Empty has to survive this function and
+  # reach bootstrap_install_env_file's guard as "nobody chose"; its two
+  # readers, write_env_var below and the generator, each apply
+  # DEFAULT_ENABLE_DRIFT_DETECTOR themselves.
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -2120,6 +2936,27 @@ run_with_spinner() {
   local rc=0
   wait "$task_pid" || rc=$?
   return "$rc"
+}
+
+# lifecycle.sh writes two gitignored override files around each `terraform
+# import` -- a helm provider placeholder beside the composition and a scope
+# resolver pin inside that module's directory -- and removes them on an EXIT
+# trap and again at the start of every subcommand, because a lifecycle.sh
+# killed by a signal the trap cannot see leaves them behind. The dry run below
+# reads the same composition directly, through the checkout acquire_source_repo
+# reuses from run to run, and a plan that merged the scope pin would resolve
+# every declared selector to no members and preview the removal of the bindings
+# those members hold, under a banner calling it what a real run would do. So the
+# dry run clears them the way the engine does, through the engine's own
+# function, so the file names have one home. Runs in the composition directory
+# the caller has cd'd into; the subshell keeps the engine's `set -u`, its `cd`
+# and its definitions out of this script. lifecycle.sh is linted on its own.
+drop_stale_import_overrides() {
+  (
+    # shellcheck disable=SC1091
+    KUBE_AGENTS_SOURCE_ONLY=true source ./lifecycle.sh
+    drop_override
+  )
 }
 
 # The dry run's Terraform check. At file scope, rather than inside main(), so the
@@ -2618,16 +3455,16 @@ print_generate_only_handoff() {
   echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
   echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
   echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
-  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
-    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading APIs the"
-    echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
+  if [ -n "$(scope_selector_apis)" ]; then
+    echo -e "  # The plan $(scope_selector_apis_reason) by reading APIs the apply below is what"
+    echo -e "  # enables, so on a first install enable them first, or the plan is refused:"
     echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
   fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
   echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
-  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions)"
+  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions)"
   echo -e "  # is replaced by this apply, and the reconcile"
   echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
   if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
@@ -3316,6 +4153,18 @@ validate_model_max_tokens() {
   local value="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
   if [ -n "$value" ] && ! is_non_negative_integer "$value"; then
     print_error "--model-max-tokens must be a whole number of tokens (0 or empty leaves the gateway default unset), got '${value}'."
+    return 1
+  fi
+}
+
+# --litellm-redaction-ip-action: refused here so the message names the flag.
+# The tfvars generator checks again, while redaction is on, for upgrade.sh and
+# the menu, which regenerate from install.env without this interview. Needs
+# installer_common.sh sourced.
+validate_litellm_redaction_ip_action() {
+  local value="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+  if ! is_valid_redaction_ip_action "$value"; then
+    print_error "--litellm-redaction-ip-action must be one of pseudonym, mask, off, got '${value}'."
     return 1
   fi
 }
@@ -4047,11 +4896,19 @@ main() {
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
-    # The menu reloads install.env and reads the scope keys from it alone; a
-    # flag here would be validated and then dropped without a word.
+    # The menu reloads install.env and reads the scope keys, and the scoped
+    # service account pool's switch and cap, from it alone; a flag here would
+    # be validated and then dropped without a word.
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
-      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
-      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
+      exit 1
+    fi
+    # The chat flags likewise: the menu applies the keys install.env records
+    # and edits them on its own screens, so a flag here would be dropped.
+    if [ -n "$INSTALL_ENV_FLAGS_TYPED" ]; then
+      print_error "--menu takes no chat flag (--enable-slack, --enable-google-chat, --slack-*, --google-chat-allowed-users, --google-chat-home-channel, --google-chat-mode, --chat-topic-name): it applies the chat keys install.env records."
+      print_info "The menu's chat screen turns Google Chat on or off and edits its allowlist and home channel; set the other keys in install.env (to turn Slack on, SLACK_ENABLED=true, with the tokens on a plain install.sh run), or pass the flags to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -4138,6 +4995,10 @@ main() {
   acquire_source_repo repo_dir "$image_tag"
   source_provisioning_helpers "$repo_dir"
   resolve_shared_defaults
+  # The chat flags against an existing install.env, as soon as is_truthy and
+  # the defaults are loaded: a flag that disagrees with the file stops the run
+  # here, before the interview and long before anything is applied.
+  check_flags_against_install_env || exit 1
 
   # 3. Google Cloud Authentication Check
   print_step "3. Verifying Google Cloud Authentication"
@@ -4549,7 +5410,16 @@ main() {
     echo -e "  ${C_CYAN}-p ${PLATFORM_AGENT_HERMES_PROFILE} reaches the Platform Agent directly, bypassing the Planning${C_RESET}"
     echo -e "  ${C_CYAN}Agent front door where a chat message would have landed.${C_RESET}"
     echo ""
-    echo -e "  To add a chat platform later, re-run ${C_BOLD}./install.sh --enable-google-chat${C_RESET} or ${C_BOLD}./install.sh --enable-slack${C_RESET}."
+    # The file this install writes records both toggles as false, and a
+    # --enable-google-chat or --enable-slack that disagrees with it is refused
+    # (check_flag_against_install_env), so the key is the way to turn one on.
+    # It records both allowlists empty too, and install.sh does not change a
+    # key the file assigns, so the allowlist is set in the file beside the
+    # toggle.
+    echo -e "  To add a chat platform later, edit install.env and re-run ${C_BOLD}./install.sh${C_RESET}:"
+    echo -e "    Google Chat: ${C_BOLD}GOOGLE_CHAT_ENABLED=true${C_RESET} and ${C_BOLD}ALLOWED_USERS=${C_RESET}<emails> (or use ${C_BOLD}./install.sh --menu${C_RESET})"
+    echo -e "    Slack: ${C_BOLD}SLACK_ENABLED=true${C_RESET} and ${C_BOLD}SLACK_ALLOWED_USERS=${C_RESET}<user IDs>, re-run with --slack-bot-token and --slack-app-token"
+    echo -e "  An allowlist left empty admits every user. --enable-google-chat and --enable-slack are refused over a file that records the key the other way."
   }
 
   case "$chat_choice" in
@@ -4585,6 +5455,33 @@ main() {
   fi
   local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
   validate_model_max_tokens || exit 1
+  local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+  # Checked here as well as in the generator, so a bad value stops the run
+  # before the rest of the interview rather than after it. A misspelt toggle is
+  # refused rather than read as off. While redaction is off the recorded IP
+  # action and rules are inert, as in the generator; an IP action typed on this
+  # run is checked either way.
+  local redaction_enabled="${PARAM_LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  if ! is_bool_spelling "$redaction_enabled"; then
+    print_error "LITELLM_REDACTION_ENABLED='${redaction_enabled}' is neither true nor false. Fix it in install.env."
+    exit 1
+  fi
+  if is_truthy "$redaction_enabled" || [ "${PARAM_LITELLM_REDACTION_IP_ACTION_PASSED:-false}" = "true" ]; then
+    validate_litellm_redaction_ip_action || exit 1
+  fi
+  if is_truthy "$redaction_enabled" && [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
+    hcl_redaction_rules "$LITELLM_REDACTION_RULES" >/dev/null || exit 1
+  fi
+  # The scoped service account pool, checked here for the same reason as the
+  # toggle above: a misspelt switch is refused rather than read as off, and a
+  # cap the module would refuse is named with its key before the interview.
+  local scoped_sa_pool_enabled="${PARAM_SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
+  if ! is_bool_spelling "$scoped_sa_pool_enabled"; then
+    print_error "SCOPED_SA_POOL_ENABLED='${scoped_sa_pool_enabled}' is neither true nor false. Fix it in install.env."
+    exit 1
+  fi
+  local scoped_sa_pool_max_accounts="${PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS:-}"
+  require_scoped_sa_pool_max_accounts "$scoped_sa_pool_max_accounts" || exit 1
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
   # two are the only credentials it needs. The project defaults to the install
@@ -4853,7 +5750,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits need one and fail without it."
       fi
     fi
   else
@@ -4899,12 +5796,11 @@ main() {
   local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
   local scope_shared_vpc_hosts="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}"
   local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
+  local scope_max_projects="${PARAM_SCOPE_MAX_PROJECTS:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
-  # This rule is also written in init_var_platform_agent_permission_set
-  # (scripts/installer/common.sh), which has no caller left in the repository
-  # -- the numbered provision scripts that used to invoke it went with #797. So
-  # this is the only place it runs, not a duplicate of somewhere it also runs.
+  # This is the only place this rule runs: the installer library's copy went
+  # with the numbered provision scripts that called it (#797).
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
@@ -4921,6 +5817,10 @@ main() {
     print_error "--enable-gvisor must be either true or false."
     exit 1
   fi
+  # The cap's bounds are the CRD's; checked here, once installer_common.sh is
+  # sourced (parse_args refuses only an empty value), and again by the tfvars
+  # writer for a value install.env carries on the other front doors.
+  require_scope_max_projects "$scope_max_projects" || exit 1
   if [[ ! "$PARAM_ENABLE_WEBUI" =~ ^(true|false)$ ]]; then
     print_error "--enable-hermes-dashboard must be either true or false."
     exit 1
@@ -5127,11 +6027,11 @@ main() {
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
-  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
-  # in scripts/installer/common.sh.
+  # translates `none` back to Hermes' own spelling when it renders config.yaml.
   #
   # `multiuser_memory` is the default provider everywhere it is named with no
-  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # install to ask (the CRD default, install.defaults.env, and both profiles'
+  # config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
   # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither
@@ -5207,6 +6107,9 @@ main() {
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
   export MODEL_MAX_TOKENS="$model_max_tokens"
+  export LITELLM_REDACTION_ENABLED="$redaction_enabled"
+  export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
+  export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
@@ -5233,8 +6136,11 @@ main() {
   export SCOPE_ORGANIZATIONS="$scope_organizations"
   export SCOPE_SHARED_VPC_HOSTS="$scope_shared_vpc_hosts"
   export SCOPE_METRICS_SCOPES="$scope_metrics_scopes"
+  export SCOPE_MAX_PROJECTS="$scope_max_projects"
   export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
   export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
+  export SCOPED_SA_POOL_ENABLED="$scoped_sa_pool_enabled"
+  export SCOPED_SA_POOL_MAX_ACCOUNTS="$scoped_sa_pool_max_accounts"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
   # One release of overlap: the agent runtime and the chart still speak
@@ -5252,6 +6158,13 @@ main() {
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  # Conditional, like ENABLE_GKE_BACKUP_PLAN above and for the same reason:
+  # resolve_shared_defaults leaves this PARAM empty when nothing chose, so an
+  # unconditional export would write an empty value over whatever install.env
+  # said. The generator's DEFAULT_ENABLE_DRIFT_DETECTOR decides when it is.
+  if [ -n "${PARAM_ENABLE_DRIFT_DETECTOR:-}" ]; then
+    export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"
+  fi
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an
@@ -5397,6 +6310,9 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
+      # Before terraform first reads the configuration; the plan further down
+      # runs in this same directory and nothing between the two writes them.
+      drop_stale_import_overrides
       local tf_log=""
       tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
       local rc=0
@@ -5445,13 +6361,14 @@ main() {
           print_info "To remediate manually beforehand, update each legacy node pool:"
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
-      elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \
+      elif [ -n "$(scope_selector_apis)" ] \
         && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then
-        # The plan resolves a declared Shared VPC host or Metrics Scope by
+        # The plan resolves a declared Shared VPC host or Metrics Scope, and
+        # lists a folder's or organisation's members for an armed pool, by
         # reading APIs a real run enables prior to apply; a dry run enables
         # nothing, so its plan would be refused for a reason the real run
         # does not have. A listing that failed runs the plan and lets it speak.
-        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan resolves the declared Shared VPC host or Metrics Scope through it (a real run enables it prior to apply)."
+        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan $(scope_selector_apis_reason) through it (a real run enables it prior to apply)."
         print_info "To preview anyway, enable it first: gcloud services enable ${missing_apis} --project=${project_id}"
       else
         # Reached with an unenforcing cluster only under --accept-no-network-policy,
@@ -5507,7 +6424,11 @@ main() {
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
-        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        # Not a hand-off like `g`: `n` is also a decline, so nothing is
+        # recorded, and the operator is told which lines a hand-run apply
+        # needs in install.env.
+        warn_install_env_keys_not_recorded
+        print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
         exit 0
@@ -5518,6 +6439,9 @@ main() {
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
+    # Past every gate that can stop this route: a chat flag whose key the
+    # install.env lacks is recorded for the handoff.
+    record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
     exit 0
@@ -5590,6 +6514,10 @@ main() {
   local provisioning_log
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
+  # Past every gate that can stop this route (set -e makes each step above
+  # one): a chat flag whose key the install.env lacks is recorded for the
+  # apply.
+  record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
   # The one post-apply step Terraform cannot carry: the managed-OTel scope

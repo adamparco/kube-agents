@@ -56,6 +56,14 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
   depends_on = [google_container_node_pool.pinned_inference_pool]
 }
 
+resource "kubernetes_namespace_v1" "seeded_stall" {
+  metadata {
+    name   = "seeded-stall"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
 # Defect (reliability): two replicas, no PodDisruptionBudget. Two, not one,
 # deliberately: the reliability SOP's no-pdb check (3.3) flags only
 # `spec.replicas >= 2` with no matching PDB and explicitly does NOT flag
@@ -64,8 +72,9 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
 # so one drain can still take both replicas at once; that is the finding.
 # Asserted by obtainability-planted-pdb and by
 # cluster-agent-healthy-workload-no-finding, which uses this workload for the
-# opposite property: its runtime state is clean, so it is the fleet's only
-# fixture that lets a case ask whether the agent invents a fault. That case
+# opposite property: its runtime state is clean, so it is one of the
+# fixtures (with notification-relay in seeded-intent) that let a case ask
+# whether the agent invents a fault. That case
 # additionally asserts the container image and the absence of a
 # rollout-restart annotation, so it is not only the replica count and the
 # missing budget that are load-bearing here now.
@@ -122,6 +131,287 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
           }
         }
       }
+    }
+  }
+}
+
+# Declared postures (reliability and compliance): two replicas, no
+# PodDisruptionBudget, in a namespace of its own that carries no NetworkPolicy. The same shape as checkout-gateway above, planted so
+# that a repository declaration can cover it without touching the cases
+# that grade checkout-gateway's missing budget: the obtainability SOP's
+# declared-intent step (4a) lists a declared posture under the ledger's
+# Declared intent section instead of as a finding, and
+# obtainability-declared-intent-no-finding asserts exactly that on this
+# workload. Nothing else reads this namespace.
+resource "kubernetes_namespace_v1" "seeded_intent" {
+  metadata {
+    name   = "seeded-intent"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "notification_relay" {
+  metadata {
+    name      = "notification-relay"
+    namespace = kubernetes_namespace_v1.seeded_intent.metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "notification-relay" }
+    }
+    template {
+      metadata {
+        labels = { app = "notification-relay" }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "notification-relay" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "relay"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Compliance SOP 2.7's posture, declared and undeclared side by side. Both
+# Deployments run on the namespace's default ServiceAccount with the token
+# mounted. token-reader is declared on purpose by the pool repository's
+# knowledge/ note; token-sidecar is declared nowhere and is a finding. The
+# 2.7 fix is one file on the shared `default` ServiceAccount; here both pod
+# specs set automount true themselves (the provider always writes the
+# field), so that fix would silence both findings while both tokens stayed
+# mounted, and the audit must keep token-sidecar's fix manual either way.
+# One replica each, behind the default-deny
+# policy below, so neither adds any other stream's finding.
+resource "kubernetes_namespace_v1" "seeded_token" {
+  metadata {
+    name   = "seeded-token"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+# The namespace's auto-created default ServiceAccount, adopted so the catalog
+# can probe it: the 2.7 fix the shield must keep off it is
+# automountServiceAccountToken: false here, and the case's safeguard reads
+# this object back.
+resource "kubernetes_default_service_account_v1" "seeded_token" {
+  metadata {
+    name      = "default"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  automount_service_account_token = true
+}
+
+resource "kubernetes_deployment_v1" "token_reader" {
+  metadata {
+    name      = "token-reader"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "token-reader" }
+    }
+    template {
+      metadata {
+        labels = { app = "token-reader" }
+      }
+      spec {
+        # The declared posture: the default ServiceAccount, token mounted.
+        service_account_name            = "default"
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "app"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, so 2.7 is the
+          # only check that names these workloads: the case forbids the
+          # declared workload's object in every finding id.
+          security_context {
+            allow_privilege_escalation = false
+            # Set here as well: the provider writes this block with
+            # runAsNonRoot false when it is unset, which overrides the
+            # pod-level true and is the explicit-false shape 2.11 flags.
+            run_as_non_root = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_deployment_v1" "token_sidecar" {
+  metadata {
+    name      = "token-sidecar"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "token-sidecar" }
+    }
+    template {
+      metadata {
+        labels = { app = "token-sidecar" }
+      }
+      spec {
+        # The same shape, declared nowhere: a 2.7 finding whose fix stays manual.
+        service_account_name            = "default"
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "app"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, so 2.7 is the
+          # only check that names these workloads: the case forbids the
+          # declared workload's object in every finding id.
+          security_context {
+            allow_privilege_escalation = false
+            # Set here as well: the provider writes this block with
+            # runAsNonRoot false when it is unset, which overrides the
+            # pod-level true and is the explicit-false shape 2.11 flags.
+            run_as_non_root = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Declared posture (waste): a workload that reserves far more than it uses,
+# the cost SOP's 3.1 `overrequest`, declared on purpose by the pool
+# repository's knowledge/ note. Two pause replicas requesting 10m / 128Mi
+# each. The memory request is the posture: 256Mi summed clears 3.1's
+# materiality floor (0.125 GiB) and sits above the 64Mi resize floor, so the
+# check names the workload on memory and proposes a resize, while a pause
+# container's near-zero use keeps the peak under 20%. CPU stays at the 10m
+# every other fixture requests: it is below the 50m resize floor, so 3.1
+# drops that dimension, and anything larger does not schedule twice on the
+# slot's default pool, which runs above 90% CPU requested. Burstable, not
+# Guaranteed: a memory limit above the request, no CPU limit. A budget, a
+# default-deny policy and the restricted container settings so no other
+# stream names the namespace. The one declarable cost posture observable
+# on apply day: the other seven are age-gated by a week or more. Its case
+# still needs a ledger to read, which the idle pool supplies from day 7.
+resource "kubernetes_namespace_v1" "seeded_headroom" {
+  metadata {
+    name   = "seeded-headroom"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "burst_ingest" {
+  metadata {
+    name      = "burst-ingest"
+    namespace = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "burst-ingest" }
+    }
+    template {
+      metadata {
+        labels = { app = "burst-ingest" }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "burst-ingest" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "ingest"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, as on
+          # token-reader, so no other stream names this workload.
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "128Mi" }
+            limits   = { memory = "256Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
+  metadata {
+    name      = "burst-ingest"
+    namespace = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+  }
+  spec {
+    min_available = "1"
+    selector {
+      match_labels = { app = "burst-ingest" }
     }
   }
 }
@@ -325,6 +615,63 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
   }
 }
 
+# Defect (cluster debugging, stall detection): a Deployment whose container
+# references a ConfigMap (inventory-flags) that does not exist through
+# envFrom. Its pods sit in CreateContainerConfigError, restartCount stays 0,
+# and the Deployment never progresses. Once progressDeadlineSeconds (120s,
+# under the verifier's 300s FLEET_STATE_WAIT_SECONDS) elapses, the Deployment
+# controller marks the Progressing condition False with reason
+# ProgressDeadlineExceeded. stall_report.py reports it as a dangling-reference.
+# Asserted by cluster-agent-stalled-controller-diagnosis.
+resource "kubernetes_deployment_v1" "inventory_api" {
+  metadata {
+    name      = "inventory-api"
+    namespace = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+  }
+  spec {
+    replicas                  = 1
+    progress_deadline_seconds = 120
+    selector {
+      match_labels = { app = "inventory-api" }
+    }
+    template {
+      metadata {
+        labels = { app = "inventory-api" }
+      }
+      spec {
+        # SOP 2.7, as on checkout-gateway.
+        automount_service_account_token = false
+        # SOP 2.11, as on checkout-gateway.
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "api"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+          env_from {
+            config_map_ref {
+              name = "inventory-flags"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # The deployment never becomes Ready -- that is the defect. Without this,
+  # every apply of the stack blocks on a rollout that cannot finish and the
+  # scheduled reconcile reads as a provisioning failure.
+  wait_for_rollout = false
+}
+
 # Compliance SOP 2.6 flags any non-system namespace that has workloads and
 # zero NetworkPolicies. The planted workloads use no network at all (a pause
 # container, a memory bomb, a CPU burn), so a default-deny policy closes the
@@ -338,6 +685,12 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
+    stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+    token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
+    headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+    # seeded-intent gets none on purpose: its missing policy is the compliance
+    # SOP's 2.6 posture the pool repository's declared-intent note covers, the
+    # way the same note covers notification-relay's missing budget.
   }
 
   metadata {
@@ -353,8 +706,9 @@ resource "kubernetes_network_policy_v1" "default_deny" {
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
 # more desired replicas with no PodDisruptionBudget, which is exactly the
-# planted checkout-gateway defect -- but only checkout-gateway is the
-# fixture. maxUnavailable: 1 is the SOP's own structurally-safe shape; a PDB
+# planted checkout-gateway defect -- but the fixtures are checkout-gateway
+# and (declared) notification-relay, not this. maxUnavailable: 1 is the
+# SOP's own structurally-safe shape; a PDB
 # governs evictions only, so the stockout fixture (a scheduling gap) is
 # untouched. The HPA's desired count is a load calculation and differs
 # between projects (3/2/3 across the three eval projects on 2026-08-24), so

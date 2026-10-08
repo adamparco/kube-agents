@@ -24,8 +24,10 @@ import repo_ref
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
 from ..credentials import BrokeredCredential, Credential, MintedReadCredential, NoCredential
 from ..validate import (
+    MAX_PAGE_SIZE,
     repo_segments,
     validate_branch,
+    validate_comment_limit,
     validate_labels,
     validate_limit,
     validate_number,
@@ -40,6 +42,11 @@ from .errors import ERROR_OVERRIDES
 # diff instead of JSON.
 DIFF_MEDIA_TYPE = "application/vnd.github.v3.diff"
 
+
+# How many `/issues` pages one `issue-list` reads to get past the pull requests
+# GitHub mixes in. Enough for a label a few hundred proposals share; bounded
+# so a repository that is nearly all proposals cannot make one call unbounded.
+MAX_ISSUE_PAGES = 10
 
 # `repos/{r}/collaborators/{login}/permission` values that mean "may write".
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
@@ -66,13 +73,36 @@ class GitHubForge(Forge):
 
     @classmethod
     def for_config(cls, config: Mapping[str, Any]) -> Iterable[Forge]:
-        """Exactly one, always.
+        """One, or none when the install's forge configuration leaves GitHub out.
 
-        An install has one GitHub or it has none, and "none" is not a state
-        this repository has ever been in -- github.com is where it lives. The
-        argument is read only for the two privileged operations to hand the
-        credentials: `refresh` for the write token, `mint` for a read-only one.
+        With no forge configuration at all (`forges` absent or None) the
+        install predates it and is GitHub, as every install has been. With one,
+        GitHub is built only if an entry names it -- a GitLab-only install has
+        no GitHub to resolve a bare name to. The only host served is
+        github.com: an enterprise host is a declared host this forge does not
+        mint for yet, and is refused rather than quietly treated as
+        github.com. `refresh` and `mint` are the two privileged operations the
+        credentials are handed.
         """
+        entries = config.get("forges")
+        if entries is not None:
+            mine = [entry for entry in entries if entry.get("provider") == cls.name]
+            if not mine:
+                return ()
+            for entry in mine:
+                if entry.get("host") not in cls.hosts:
+                    raise ValueError(
+                        f"{entry.get('host')} is not a {cls.name} host this broker serves"
+                    )
+                # Refused rather than ignored: the same key narrows a forge
+                # whose credential reaches a whole host, and accepted here it
+                # would read as narrowing this one. The App installation's
+                # repository selection is what scopes this forge's token.
+                if entry.get("allowed_paths") is not None:
+                    raise ValueError(
+                        f"allowedPaths is not supported for {cls.name}: scope the "
+                        "App installation's repositories instead"
+                    )
         return (cls(refresh=config.get("refresh"), mint=config.get("mint")),)
 
     def read_credential(self, repo: str) -> Credential:
@@ -120,13 +150,32 @@ class GitHubForge(Forge):
         # requests it has already answered: a marker past the ceiling is a
         # marker it cannot see, so it answers the same request again on every
         # tick, forever. Saying so is what lets that caller refuse instead.
-        limit = validate_limit(payload.get("limit"))
-        nodes = api(
-            "GET",
-            f"repos/{repo}/issues/{number}/comments",
-            params={"per_page": limit},
+        limit = validate_comment_limit(payload.get("limit"))
+        nodes, truncated = self._conversation_pages(
+            api, f"repos/{repo}/issues/{number}/comments", limit
         )
-        return [translate.comment(node, "issue") for node in nodes], len(nodes) >= limit
+        return [translate.comment(node, "issue") for node in nodes], truncated
+
+    @staticmethod
+    def _conversation_pages(api: Callable, path: str, limit: int) -> tuple[list, bool]:
+        """Up to `limit` nodes from a comment endpoint, and whether it held more.
+
+        Page by page, because a limit past one page is exactly the case the
+        caller cares about. A caller whose limit fits one page makes one call,
+        as it always has; truncated when the last page it read was full.
+        """
+        per_page = min(limit, MAX_PAGE_SIZE)
+        nodes: list = []
+        page = 1
+        while True:
+            batch = api("GET", path, params={"per_page": per_page, "page": page}) or []
+            nodes += batch
+            full = len(batch) >= per_page
+            if not full or len(nodes) >= limit:
+                # A short last page can still overshoot a limit that is not a
+                # multiple of the page size; what is cut here is truncation too.
+                return nodes[:limit], full or len(nodes) > limit
+            page += 1
 
     def _proposal_comments(
         self, api: Callable, repo: str, number: int, payload: dict
@@ -139,12 +188,15 @@ class GitHubForge(Forge):
         # from as `kind`, because that decides whether it can be acknowledged
         # (a review summary has no reaction endpoint) and whether `path` and
         # `line` mean anything. Oldest first, across all three.
-        limit = validate_limit(payload.get("limit"))
-        params = {"per_page": limit}
+        limit = validate_comment_limit(payload.get("limit"))
         out, truncated = self._comments(api, repo, number, payload)
-        inline = api("GET", f"repos/{repo}/pulls/{number}/comments", params=params)
+        inline, inline_full = self._conversation_pages(
+            api, f"repos/{repo}/pulls/{number}/comments", limit
+        )
         out += [translate.comment(node, "review_comment") for node in inline]
-        reviews = api("GET", f"repos/{repo}/pulls/{number}/reviews", params=params)
+        reviews, reviews_full = self._conversation_pages(
+            api, f"repos/{repo}/pulls/{number}/reviews", limit
+        )
         out += [
             translate.comment(node, "review")
             for node in reviews
@@ -156,7 +208,7 @@ class GitHubForge(Forge):
         # the reviews page is judged on what the forge sent rather than on what
         # survived the body test -- a page of bodiless approvals is still a
         # page, and there may be an utterance behind it.
-        truncated = truncated or len(inline) >= limit or len(reviews) >= limit
+        truncated = truncated or inline_full or reviews_full
         # `ref` and not `id` as the tie-break: two of these three endpoints
         # number independently, so a conversation comment and a review comment
         # can share an id and the order between them would depend on which of
@@ -263,8 +315,120 @@ class GitHubForge(Forge):
         target = payload.get("target")
         if target is not None:
             params["base"] = validate_branch(target, "target")
+        labels = validate_labels(payload.get("labels"))
+        if labels and "head" in params:
+            # The branch is the narrower question, and `/pulls` answers it
+            # exactly; the label filter below reads only the label's newest
+            # hits. So read the branch's proposals a full page at a time and
+            # match the labels here, stopping once there is one match past the
+            # caller's page or the forge runs out; the caller's page and limit
+            # then count matches, not candidates. GitHub compares label names
+            # without regard to case.
+            query = {key: value for key, value in params.items() if key != "page"}
+            query["per_page"] = MAX_PAGE_SIZE
+            wanted = {label.casefold() for label in labels}
+            start = (page - 1) * limit
+            matches: list[dict[str, Any]] = []
+            forge_page = 1
+            while True:
+                nodes = api(
+                    "GET",
+                    f"repos/{repo}/pulls",
+                    params={**query, "page": forge_page} if forge_page > 1 else query,
+                )
+                matches += [
+                    item
+                    for item in (translate.proposal(node) for node in nodes)
+                    if wanted <= {label.casefold() for label in item["labels"]}
+                ]
+                if len(matches) > start + limit or len(nodes) < MAX_PAGE_SIZE:
+                    break
+                forge_page += 1
+            proposals = matches[start : start + limit]
+            return {
+                "proposals": proposals,
+                "count": len(proposals),
+                "truncated": len(matches) > start + limit,
+            }
+        if labels:
+            return self._proposals_labelled(api, repo, params, labels)
         nodes = api("GET", f"repos/{repo}/pulls", params=params)
         return listing([translate.proposal(node) for node in nodes], limit, "proposals")
+
+    def _proposals_labelled(
+        self, api: Callable, repo: str, params: dict[str, Any], labels: list[str]
+    ) -> dict[str, Any]:
+        """The proposals carrying every one of `labels`, a page at a time.
+
+        `/pulls` takes no label filter. The issues endpoint does, and on GitHub
+        a pull request is an issue, so the filter is asked there -- not of the
+        search API, whose index lags a write by seconds: a sweep that opens a
+        proposal and lists again would not find it and open a second one. The
+        issue shape carries no head, so each hit is read back as a pull
+        request. `base` is not an issue filter and is matched on what comes
+        back; a `head` never reaches here (see `proposal_list`).
+
+        Read back from the newest pages of `/pulls` rather than one request per
+        hit, because a label shared by every proposal a stream ever opened
+        names hundreds of them and a page of `/pulls` carries a hundred.
+        """
+        query: dict[str, Any] = {
+            "state": params["state"],
+            "per_page": params["per_page"],
+            "labels": ",".join(labels),
+        }
+        if "page" in params:
+            query["page"] = params["page"]
+        nodes = api("GET", f"repos/{repo}/issues", params=query)
+        wanted = [node["number"] for node in nodes if "pull_request" in node]
+        pulls = self._pulls_by_number(api, repo, params["state"], wanted)
+        proposals = [translate.proposal(pulls[number]) for number in wanted]
+        if "base" in params:
+            proposals = [item for item in proposals if item["target"] == params["base"]]
+        # Judged on what the forge sent, as `issue-list` is: a full page of
+        # issues filtered down to its pull requests is still a page.
+        return listing(proposals, params["per_page"], "proposals", returned=len(nodes))
+
+    def _pulls_by_number(
+        self, api: Callable, repo: str, state: str, numbers: list[int]
+    ) -> dict[int, dict]:
+        """The pull requests numbered `numbers`, read as few requests as it can.
+
+        Newest first through `/pulls`, stopping once every number is found or
+        the pages run older than the oldest one wanted. A label on a few old
+        proposals in a busy repository would have that scan wade through every
+        newer one, so it gets half as many pages as there are numbers left to
+        find, and whatever it has not found by then is read one at a time:
+        never much more than reading each one, and on a stream's own label a
+        page or two instead of hundreds.
+        """
+        found: dict[int, dict] = {}
+        left = set(numbers)
+        page = 1
+        while left and page <= len(left) // 2:
+            batch = api(
+                "GET",
+                f"repos/{repo}/pulls",
+                params={
+                    "state": state,
+                    "sort": "created",
+                    "direction": "desc",
+                    "per_page": MAX_PAGE_SIZE,
+                    "page": page,
+                },
+            ) or []
+            for node in batch:
+                if node.get("number") in left:
+                    found[node["number"]] = node
+                    left.discard(node["number"])
+            if len(batch) < MAX_PAGE_SIZE or (
+                left and batch[-1].get("number", 0) < min(left)
+            ):
+                break
+            page += 1
+        for number in sorted(left, reverse=True):
+            found[number] = api("GET", f"repos/{repo}/pulls/{number}")
+        return found
 
     def proposal_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))
@@ -416,21 +580,43 @@ class GitHubForge(Forge):
                 },
             )
             nodes = (found or {}).get("items") or []
+            issues = [node for node in nodes if "pull_request" not in node]
+            truncated = len(nodes) >= limit
         else:
-            nodes = api("GET", f"repos/{repo}/issues", params=params)
-        # GitHub's issues endpoint returns pull requests too -- a PR *is* an
-        # issue there. Nowhere else models it that way, and a caller that asked
-        # for issues and got proposals mixed in would have to know that. The
-        # `pull_request` key is how they are told apart.
-        issues = [node for node in nodes if "pull_request" not in node]
-        # `per_page` bounded what GitHub sent, not what survived the filter, so
-        # `truncated` is judged on the page rather than on the remainder.
-        return listing(
-            [translate.issue(node) for node in issues],
-            limit,
-            "issues",
-            returned=len(nodes),
-        )
+            issues, truncated = self._issue_pages(api, repo, params, limit)
+        kept = [translate.issue(node) for node in issues[:limit]]
+        return {"issues": kept, "count": len(kept), "truncated": truncated}
+
+    @staticmethod
+    def _issue_pages(
+        api: Callable, repo: str, params: dict[str, Any], limit: int
+    ) -> tuple[list[dict], bool]:
+        """Up to `limit` issues from `/issues`, and whether the forge held more back.
+
+        GitHub's issues endpoint returns pull requests too -- a PR *is* an
+        issue there. Nowhere else models it that way, and a caller that asked
+        for issues and got proposals mixed in would have to know that. The
+        `pull_request` key is how they are told apart, and it is applied after
+        the page is fetched, so a label proposals share can fill a whole page
+        with nothing to return. Reading that page as the answer is how a caller
+        concludes an issue it is looking for does not exist, so this reads on
+        until it has `limit` issues or the forge runs out, within a bound. The
+        pages are full-sized whatever `limit` is, so that bound reaches as far
+        for a caller asking for five as for one asking for a hundred.
+
+        Truncated when the last page read was full (the forge may hold more)
+        or more than `limit` issues survived. A short last page means the forge
+        ran out, so `limit` issues read there is the whole answer.
+        """
+        issues: list[dict] = []
+        query = {**params, "per_page": MAX_PAGE_SIZE}
+        for page in range(1, MAX_ISSUE_PAGES + 1):
+            nodes = api("GET", f"repos/{repo}/issues", params={**query, "page": page}) or []
+            issues += [node for node in nodes if "pull_request" not in node]
+            full = len(nodes) >= MAX_PAGE_SIZE
+            if len(issues) >= limit or not full:
+                break
+        return issues, full or len(issues) > limit
 
     def issue_view(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))

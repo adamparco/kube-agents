@@ -21,6 +21,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // mintableAccounts is every NATS account the callout will issue a user into.
@@ -46,9 +48,16 @@ const (
 	serviceAccountFields = 4
 )
 
-// Grants is one identity's subject permissions, deny-by-default: a subject
-// absent from both lists is refused by the server, and the lists are exact
-// rather than namespace wildcards wherever the deployment spec requires it.
+// Grants is one identity's subject permissions. The lists are exact rather
+// than namespace wildcards wherever the deployment spec requires it.
+//
+// Deny-by-default holds per side and only while that side has entries in it: a
+// subject absent from a NON-EMPTY list is refused by the server, but a side
+// with no entries at all is read by nats-server as "unrestricted" rather than
+// as "nothing", and the two sides are independent. So an entry granting one
+// subscribe and no publishes is a client that may publish anywhere. Neither
+// list may be empty; validate refuses that, and Service.authorize refuses it
+// again at the mint for grant sets that never came from a map.
 type Grants struct {
 	Publish   []string `json:"publish"`
 	Subscribe []string `json:"subscribe"`
@@ -91,6 +100,13 @@ type Identity struct {
 type IdentityMap struct {
 	Version    string     `json:"version"`
 	Identities []Identity `json:"identities"`
+
+	// users is the set of names Users returns, built by ParseIdentityMap.
+	// It lives on the map rather than beside it so the Store's one pointer
+	// swap installs the map and its reserved names together: a connection
+	// that resolved its identity against this map is checked against this
+	// map's users, never an older map's (see Service.reservedAs).
+	users map[string]struct{}
 }
 
 // ParseIdentityMap decodes a rendered map and rejects one it cannot serve
@@ -107,6 +123,10 @@ func ParseIdentityMap(raw []byte) (*IdentityMap, error) {
 	}
 	if err := m.validate(); err != nil {
 		return nil, err
+	}
+	m.users = make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		m.users[u] = struct{}{}
 	}
 	return &m, nil
 }
@@ -155,6 +175,13 @@ func (id Identity) validate() error {
 	if id.User == "" {
 		return fmt.Errorf("serviceAccount %q has no user", id.ServiceAccount)
 	}
+	// The user becomes the `_INBOX.<user>.>` prefix, and reservedAs compares
+	// pod names against it byte for byte. A dotted user `a.b` would sit inside
+	// the inbox of a pod named `a` without matching it, so the user must be
+	// the same single lowercase label a pod name is.
+	if !lib.ValidSubjectToken(id.User) {
+		return fmt.Errorf("user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", id.User)
+	}
 	if id.Account == "" {
 		return fmt.Errorf("user %q has no account", id.User)
 	}
@@ -172,12 +199,23 @@ func (id Identity) validate() error {
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 	switch id.Narrowing {
 	case "":
-		// An entry granting nothing at all is almost certainly a render
-		// bug, and serving it produces a client that connects and then
-		// hangs on its first reply — the hardest failure in this system to
-		// read from the outside. Refuse the map instead.
-		if !hasGrants {
-			return fmt.Errorf("user %q has no grants", id.User)
+		// An entry with an empty side is almost certainly a render bug,
+		// and serving it is not the harmless failure it looks like: an
+		// empty list is the server's spelling of "unrestricted", not of
+		// "nothing", and the sides are independent. A render that dropped
+		// the publish list would hand this principal the whole subject
+		// space to publish on — $JS.API.STREAM.DELETE.TASKS included —
+		// while its subscribes stayed correctly narrow, which is the
+		// version of this bug nobody would notice. Refuse the map instead.
+		//
+		// This is checked per side rather than across both because the
+		// server is per side. There is deliberately no way to spell "may
+		// publish nothing" here: Grants carries no deny list, so a
+		// principal that must not publish cannot be expressed as an empty
+		// allow list and has to be refused rather than silently widened.
+		if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
+			return fmt.Errorf("user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
+				id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
 		}
 	case NarrowingPod:
 		// The fail-closed shape, and the reason narrowing is a field
@@ -220,4 +258,22 @@ func (m *IdentityMap) Users() []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// servesUser reports whether name is a user of one of this map's entries.
+// ParseIdentityMap builds the set, and Store.Update installs nothing else, but
+// a map built any other way (a test writing the store directly) has no set; it
+// falls back to scanning the entries rather than reporting no users, so the
+// refusal fails closed.
+func (m *IdentityMap) servesUser(name string) bool {
+	if m.users == nil {
+		for _, id := range m.Identities {
+			if id.User == name {
+				return true
+			}
+		}
+		return false
+	}
+	_, ok := m.users[name]
+	return ok
 }
