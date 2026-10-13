@@ -164,6 +164,7 @@ rules:
   resources:
   - actionrecords/status
   - agentplugins/status
+  - agentprofiles/status
   - agents/status
   - approvalrosters/status
   - changepolicies/status
@@ -188,11 +189,9 @@ rules:
 - apiGroups:
   - kubeagents.x-k8s.io
   resources:
-  - agents
-  - platformagents
+  - agentprofiles
+  - platformagents/status
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
@@ -201,6 +200,7 @@ rules:
 - apiGroups:
   - kubeagents.x-k8s.io
   resources:
+  - agentprofiles/finalizers
   - agents/finalizers
   - platformagents/finalizers
   verbs:
@@ -208,8 +208,11 @@ rules:
 - apiGroups:
   - kubeagents.x-k8s.io
   resources:
-  - platformagents/status
+  - agents
+  - platformagents
   verbs:
+  - create
+  - delete
   - get
   - list
   - patch
